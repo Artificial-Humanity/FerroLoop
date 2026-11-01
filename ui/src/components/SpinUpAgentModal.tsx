@@ -35,22 +35,37 @@ export const SPIN_UP_VENDORS = [
 export interface SpinUpAgentModalProps {
   isOpen: boolean;
   onClose: () => void;
+  initialProject?: string | null;
   nodes?: EnrolledNode[];
   onSpinUp?: (req: SpinUpSessionRequest) => Promise<SpinUpSessionResponse>;
   onSpunUp?: (res: SpinUpSessionResponse) => void;
   apiClient?: HubApiClient;
 }
 
+export function resolveSpinUpProject(rawProject?: string | null): string {
+  const trimmed = (rawProject ?? "").trim().toLowerCase();
+  if (!trimmed || trimmed === "all") {
+    return "ferroloop";
+  }
+  const matched = SPIN_UP_PROJECTS.find(
+    (p) => p.value === trimmed || p.label.toLowerCase().includes(trimmed),
+  );
+  return matched ? matched.value : "ferroloop";
+}
+
 export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   isOpen,
   onClose,
+  initialProject = null,
   nodes = [],
   onSpinUp,
   onSpunUp,
   apiClient,
 }) => {
   const [persona, setPersona] = useState("");
-  const [project, setProject] = useState<string>("ferroloop");
+  const [project, setProject] = useState<string>(() =>
+    resolveSpinUpProject(initialProject),
+  );
   const [role, setRole] = useState<string>("assistant");
   const [vendor, setVendor] = useState<string>("claude");
   const [model, setModel] = useState("");
@@ -58,6 +73,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [hosted, setHosted] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setProject(resolveSpinUpProject(initialProject));
+    }
+  }, [initialProject, isOpen]);
 
   useEffect(() => {
     setError(null);
@@ -115,7 +136,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       setModel("");
       onClose();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to spin up agent session");
+      setError(err instanceof Error ? err.message : "Failed to create new agent session");
     } finally {
       setSubmitting(false);
     }
@@ -133,7 +154,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="Spin Up Agent Session"
+        aria-label="New Agent Session"
         data-testid="spin-up-agent-modal"
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
@@ -148,14 +169,14 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
           }}
         >
           <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
-            Spin Up Agent Session
+            New Agent Session
           </h2>
           <button
             type="button"
             className="fd-btn"
             onClick={onClose}
             disabled={submitting}
-            aria-label="Close Spin Up Modal"
+            aria-label="Close New Agent Modal"
           >
             ✕
           </button>
@@ -444,7 +465,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               data-testid="spin-up-submit-btn"
               disabled={submitting}
             >
-              {submitting ? "Spinning Up..." : "Spin Up Agent"}
+              {submitting ? "Creating Agent..." : "New Agent"}
             </button>
           </div>
         </form>

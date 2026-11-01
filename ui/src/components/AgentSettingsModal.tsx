@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import type { SessionQuotaUsage } from "../types/api";
-import { togglePinnedAgent, usePinnedState } from "./RosterSidebar";
+import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
   CANONICAL_PROJECTS,
   CREATE_CUSTOM_ROLE_VALUE,
@@ -236,13 +236,31 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               type="button"
               data-testid="agent-pin-toggle-btn"
               aria-pressed={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
+              title={
+                pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
+                  ? "Unpin Agent"
+                  : "Pin Agent"
+              }
+              aria-label={
+                pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
+                  ? "Unpin Agent"
+                  : "Pin Agent"
+              }
               className={`fd-btn${pinnedAgents.has((agentName || displayTarget).trim().toLowerCase()) ? " fd-btn-active" : ""}`}
-              style={{ fontSize: "11.5px", padding: "4px 8px" }}
+              style={{
+                padding: "4px 6px",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                lineHeight: 1,
+              }}
               onClick={() => togglePinnedAgent(agentName || displayTarget)}
             >
-              {pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
-                ? "📌 Unpin Agent"
-                : "📌 Pin Agent"}
+              <PinIcon
+                pinned={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
+                circled={true}
+                size={16}
+              />
             </button>
             <button
               type="button"

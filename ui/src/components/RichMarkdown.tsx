@@ -1118,7 +1118,7 @@ export const RichMarkdown: React.FC<RichMarkdownProps> = ({ text, onOpenArtifact
                   fontSize: "10px",
                   color: "var(--text-muted)",
                   borderBottom: "1px solid var(--border-subtle)",
-                  backgroundColor: "rgba(23, 30, 41, 0.7)",
+                  backgroundColor: "var(--bg-elevated)",
                 }}
               >
                 {lang}

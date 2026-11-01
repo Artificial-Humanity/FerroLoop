@@ -480,17 +480,20 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     expect(screen.getByTestId("session-cwd-badge")).toHaveTextContent(
       "~/Projects/Artificial-Humanity/FerroLoop",
     );
-    expect(screen.getByTestId("project-pin-toggle-btn")).toHaveTextContent("📌 Pin Project");
+    expect(screen.getByTestId("project-pin-toggle-btn")).toHaveAttribute(
+      "aria-label",
+      "Pin Project",
+    );
     expect(screen.getByTestId("bulk-action-prepare-btn")).toBeInTheDocument();
     expect(screen.getByTestId("bulk-action-teardown-btn")).toBeInTheDocument();
   });
 
-  it("omits System and Auth tabs when SettingsModal is opened from a Project cog (initialProject non-null)", () => {
+  it("omits System and Auth tabs when SettingsModal is opened from a Project cog (initialProject non-null) and matches project case-insensitively with scoped agent counts", () => {
     render(
       <SettingsModal
         isOpen={true}
         onClose={vi.fn()}
-        initialProject="FerroLoop"
+        initialProject="ferroloop"
         agents={[
           {
             id: "ag-ferris",
@@ -500,16 +503,134 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
             role: "lead",
             status: "idle",
           },
+          {
+            id: "ag-felix",
+            name_key: "felix",
+            display_name: "Felix",
+            project: "FerroLoop",
+            role: "ui-developer",
+            status: "idle",
+          },
+          {
+            id: "ag-jarvis",
+            name_key: "jarvis",
+            display_name: "JARVIS",
+            project: "AI-Lab-AMD",
+            role: "lab_manager",
+            status: "idle",
+          },
         ]}
       />,
     );
 
-    expect(screen.getByTestId("settings-tab-agents")).toBeInTheDocument();
+    // Tab and heading display scoped filtered count (2 Agents) instead of total fleet count (3 Agents)
+    expect(screen.getByTestId("settings-tab-agents")).toHaveTextContent("2 Agents");
+    expect(screen.getByTestId("settings-agents-heading")).toHaveTextContent("2 Agents");
+    // Case-insensitive initialProject="ferroloop" selects "FerroLoop" in dropdown
+    expect(
+      (screen.getByTestId("settings-project-filter-select") as HTMLSelectElement).value,
+    ).toBe("FerroLoop");
+    // Top button says "+ New Agent" and redundant project spin-up button is removed
+    expect(screen.getByTestId("settings-spin-up-btn")).toHaveTextContent("+ New Agent");
+    expect(screen.queryByTestId("settings-project-spin-up-btn")).toBeNull();
     expect(screen.queryByTestId("settings-tab-system")).toBeNull();
     expect(screen.queryByTestId("settings-tab-auth")).toBeNull();
     expect(screen.queryByTestId("settings-panel-system")).toBeNull();
     expect(screen.queryByTestId("settings-panel-auth")).toBeNull();
     expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
+
+    // Toggling project pin renders pin-icon-slash when pinned
+    const pinBtn = screen.getByTestId("project-pin-toggle-btn");
+    expect(pinBtn.querySelector('[data-testid="pin-icon-slash"]')).toBeNull();
+    fireEvent.click(pinBtn);
+    expect(pinBtn).toHaveAttribute("aria-label", "Unpin Project");
+    expect(pinBtn.querySelector('[data-testid="pin-icon-slash"]')).not.toBeNull();
+    fireEvent.click(pinBtn);
+  });
+
+  it("supports Screenshot & Attachment Retention schedule and on-demand prune / purge actions in System tab", async () => {
+    const pruneCalls: Array<Record<string, unknown>> = [];
+    let savedPatch: Record<string, unknown> | null = null;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/v1/settings") && method === "PUT") {
+        savedPatch = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        return new Response(
+          JSON.stringify({
+            theme_preference: "dark",
+            timezone: "UTC",
+            attachment_retention_days: savedPatch.attachment_retention_days ?? 14,
+            subsystems: {
+              ferrogate_enabled: true,
+              ferrostate_enabled: true,
+              ferrostep_enabled: true,
+            },
+            notifications: {
+              notify_on_pr_review: true,
+              notify_on_session_error: true,
+              notify_on_wire_urgent: true,
+              sound_enabled: false,
+            },
+            hub_connection: {
+              auto_reconnect_ws: true,
+              poll_interval_secs: 5,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url.endsWith("/api/v1/attachments/prune") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        pruneCalls.push(body);
+        return new Response(
+          JSON.stringify({
+            deleted_count: body.older_than_days === 0 ? 8 : 3,
+            deleted_bytes: body.older_than_days === 0 ? 64000 : 24000,
+            kept_count: body.older_than_days === 0 ? 0 : 5,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(<SettingsModal isOpen={true} onClose={vi.fn()} initialTab="system" apiClient={apiClient} />);
+
+    const retentionSelect = screen.getByTestId(
+      "settings-attachment-retention-select",
+    ) as HTMLSelectElement;
+    expect(retentionSelect.value).toBe("7");
+
+    fireEvent.change(retentionSelect, { target: { value: "14" } });
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+
+    await waitFor(() => {
+      expect(savedPatch?.attachment_retention_days).toBe(14);
+    });
+
+    fireEvent.click(screen.getByTestId("prune-expired-attachments-btn"));
+    await waitFor(() => {
+      expect(pruneCalls).toEqual([{}]);
+      expect(screen.getByTestId("attachment-prune-status")).toHaveTextContent(
+        /Cleaned up 3 expired screenshot\/attachment files/i,
+      );
+    });
+
+    fireEvent.click(screen.getByTestId("purge-all-attachments-btn"));
+    await waitFor(() => {
+      expect(pruneCalls).toEqual([{}, { older_than_days: 0 }]);
+      expect(screen.getByTestId("attachment-prune-status")).toHaveTextContent(
+        /Purged 8 screenshot\/attachment files/i,
+      );
+    });
   });
 
   it("supports AgentSettingsModal Re-Cast modal parity, custom role auto-prefix, and granular 409 create_area confirmation", async () => {
@@ -580,7 +701,10 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       />,
     );
 
-    expect(screen.getByTestId("agent-pin-toggle-btn")).toHaveTextContent("📌 Pin Agent");
+    expect(screen.getByTestId("agent-pin-toggle-btn")).toHaveAttribute(
+      "aria-label",
+      "Pin Agent",
+    );
     fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
     expect(screen.getByTestId("recast-modal")).toBeInTheDocument();
 

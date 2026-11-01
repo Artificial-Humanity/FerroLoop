@@ -5,11 +5,139 @@ import {
   type AgentLivenessItem,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type TranscriptTurn,
+  type WireInboxItem,
+  type WireMessage,
 } from "../types/api";
 
 export const COLLAPSED_PROJECTS_STORAGE_KEY = "fd_collapsed_projects";
 export const PINNED_PROJECTS_STORAGE_KEY = "fd_pinned_projects";
 export const PINNED_AGENTS_STORAGE_KEY = "fd_pinned_agents";
+
+export type UnreadSeverity = "normal" | "question" | "important";
+
+export interface AgentUnreadSummary {
+  count: number;
+  severity: UnreadSeverity;
+}
+
+export function mergeUnreadSeverity(
+  a: UnreadSeverity,
+  b: UnreadSeverity,
+): UnreadSeverity {
+  if (a === "important" || b === "important") return "important";
+  if (a === "question" || b === "question") return "question";
+  return "normal";
+}
+
+export function formatUnreadBadgeLabel(
+  count: number,
+  severity: UnreadSeverity = "normal",
+): string {
+  if (severity === "important") return `${count}!`;
+  if (severity === "question") return `${count}?`;
+  return `${count}`;
+}
+
+export function getUnreadBadgeClass(
+  severity: UnreadSeverity = "normal",
+): string {
+  return `fd-badge fd-unread-badge fd-unread-badge-${severity}`;
+}
+
+export function getUnreadBadgeStyle(
+  severity: UnreadSeverity = "normal",
+  compact = false,
+): React.CSSProperties {
+  const base: React.CSSProperties = compact
+    ? { fontWeight: 700, fontSize: "10px", padding: "1px 5px" }
+    : { fontWeight: 700 };
+  if (severity === "important") {
+    return {
+      ...base,
+      backgroundColor: "var(--status-danger)",
+      color: "#FFFFFF",
+      borderColor: "var(--status-danger)",
+    };
+  }
+  if (severity === "question") {
+    return {
+      ...base,
+      backgroundColor: "var(--status-info)",
+      color: "#0A0D12",
+      borderColor: "var(--status-info)",
+    };
+  }
+  return {
+    ...base,
+    backgroundColor: "var(--accent-primary)",
+    color: "#0A0D12",
+    borderColor: "var(--accent-primary)",
+  };
+}
+
+export function classifyTextUnreadSeverity(text: string): UnreadSeverity {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return "normal";
+  const withoutNegated = trimmed.replace(
+    /\b(no|zero|0|without)\s+(errors?|failures?|blockers?|failing|blocked)\b/gi,
+    "",
+  );
+  if (
+    /\b(blocker|blocked|urgent|error|failed|failure|fatal|panic)\b/i.test(
+      withoutNegated,
+    )
+  ) {
+    return "important";
+  }
+  const paragraphs = trimmed
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const lastParagraph = paragraphs[paragraphs.length - 1] ?? trimmed;
+  if (trimmed.endsWith("?") || lastParagraph.includes("?")) {
+    return "question";
+  }
+  return "normal";
+}
+
+export function classifyTurnUnreadSeverity(
+  turn: TranscriptTurn,
+): UnreadSeverity {
+  let severity: UnreadSeverity = "normal";
+  for (const tc of turn.tool_calls ?? []) {
+    const name = (tc.name || "").trim();
+    if (/ask_question|AskUserQuestion|question/i.test(name)) {
+      severity = mergeUnreadSeverity(severity, "question");
+    }
+  }
+  return mergeUnreadSeverity(
+    severity,
+    classifyTextUnreadSeverity(turn.content || ""),
+  );
+}
+
+export function classifyWireUnreadSeverity(
+  item: WireInboxItem | Partial<WireMessage>,
+): UnreadSeverity {
+  const msg = "message" in item && item.message ? item.message : (item as Partial<WireMessage>);
+  const urgency = (msg.urgency || "").toLowerCase();
+  const kind = (msg.kind || "").toLowerCase();
+  if (urgency === "urgent" || kind === "approval_request") {
+    return "important";
+  }
+  const textSeverity = mergeUnreadSeverity(
+    classifyTextUnreadSeverity(msg.subject || ""),
+    classifyTextUnreadSeverity(msg.body || ""),
+  );
+  if (textSeverity === "important") {
+    return "important";
+  }
+  if (kind === "ask" || textSeverity === "question") {
+    return "question";
+  }
+  return "normal";
+}
 
 const pinListeners = new Set<() => void>();
 
@@ -79,6 +207,44 @@ export function togglePinnedAgent(agentKey: string): boolean {
   return pinned;
 }
 
+export interface PinIconProps {
+  pinned?: boolean;
+  circled?: boolean;
+  size?: number;
+}
+
+export const PinIcon: React.FC<PinIconProps> = ({
+  pinned = false,
+  circled = true,
+  size = 16,
+}) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+    style={{ display: "inline-block", verticalAlign: "middle", flexShrink: 0 }}
+  >
+    {circled && <circle cx="12" cy="12" r="10" />}
+    <path d="M9 7h6l-1 4 2 2v1H8v-1l2-2-1-4z" />
+    <line x1="12" y1="14" x2="12" y2="18" />
+    {pinned && (
+      <line
+        x1="4.93"
+        y1="4.93"
+        x2="19.07"
+        y2="19.07"
+        data-testid="pin-icon-slash"
+      />
+    )}
+  </svg>
+);
+
 export function usePinnedState(): {
   pinnedProjects: Set<string>;
   pinnedAgents: Set<string>;
@@ -101,7 +267,8 @@ export interface RosterSidebarProps {
   agents: AgentRecord[];
   routes: DiscoveredSessionSummary[];
   liveness: AgentLivenessItem[];
-  unreadByAgent: Record<string, number>;
+  unreadByAgent: Record<string, number | AgentUnreadSummary>;
+  unreadSeverityByAgent?: Record<string, UnreadSeverity>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
@@ -133,6 +300,7 @@ interface EnrichedAgent {
   livenessState: "alive" | "stale" | "dead";
   adapter: string | null;
   unreadCount: number;
+  unreadSeverity: UnreadSeverity;
 }
 
 export function formatRoleLabel(role: string): string {
@@ -161,6 +329,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   routes,
   liveness,
   unreadByAgent,
+  unreadSeverityByAgent,
   selectedAgentName,
   onSelectAgent,
   onOpenAgentSettings,
@@ -267,7 +436,19 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
       const hasRoute = Boolean(route || livenessItem?.has_route);
       const livenessState = resolveLivenessState(livenessItem?.verdict, hasRoute);
       const adapter = route?.adapter ?? livenessItem?.adapter ?? null;
-      const unreadCount = unreadByAgent[key] ?? unreadByAgent[record.name_key] ?? 0;
+      const rawUnread = unreadByAgent[key] ?? unreadByAgent[record.name_key];
+      const unreadCount =
+        typeof rawUnread === "object" && rawUnread !== null
+          ? rawUnread.count
+          : typeof rawUnread === "number"
+            ? rawUnread
+            : 0;
+      const unreadSeverity: UnreadSeverity =
+        typeof rawUnread === "object" && rawUnread !== null
+          ? rawUnread.severity
+          : (unreadSeverityByAgent?.[key] ??
+            unreadSeverityByAgent?.[record.name_key] ??
+            "normal");
 
       return {
         record,
@@ -276,9 +457,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         livenessState,
         adapter,
         unreadCount,
+        unreadSeverity,
       };
     });
-  }, [agents, routes, liveness, unreadByAgent]);
+  }, [agents, routes, liveness, unreadByAgent, unreadSeverityByAgent]);
 
   const groupedByProject = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -300,10 +482,14 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     }
 
     for (const item of filtered) {
-      const proj = item.record.project || "Workspace";
-      const list = groups.get(proj) ?? [];
+      const rawProj = (item.record.project || "Workspace").trim();
+      const canonical =
+        CANONICAL_PROJECTS.find(
+          (p) => p.toLowerCase() === rawProj.toLowerCase(),
+        ) ?? rawProj;
+      const list = groups.get(canonical) ?? [];
       list.push(item);
-      groups.set(proj, list);
+      groups.set(canonical, list);
     }
 
     const entries = Array.from(groups.entries())
@@ -409,7 +595,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                   onClick={onOpenSpinUpModal}
                   style={{ padding: "3px 8px", fontSize: "11px" }}
                 >
-                  + Spin Up
+                  + New Agent
                 </button>
               )}
             </div>
@@ -443,7 +629,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             title="Open Settings (Agents, System, Auth)"
             style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
           >
-            ⚙ Settings
+            <span className="fd-gear-icon" aria-hidden="true" style={{ fontSize: "15px", lineHeight: 1 }}>
+              ⚙
+            </span>{" "}
+            Settings
           </button>
           <button
             type="button"
@@ -497,6 +686,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             const isGroupCollapsed = collapsedProjects.has(projectLower);
             const isGroupPinned = pinnedProjects.has(projectLower);
             const projectUnread = items.reduce((sum, a) => sum + a.unreadCount, 0);
+            const projectSeverity = items.reduce<UnreadSeverity>(
+              (acc, a) =>
+                a.unreadCount > 0
+                  ? mergeUnreadSeverity(acc, a.unreadSeverity)
+                  : acc,
+              "normal",
+            );
 
             return (
               <div
@@ -549,9 +745,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       <span
                         data-testid={`project-pinned-indicator-${projectLower}`}
                         title="Pinned Project"
-                        style={{ fontSize: "10px" }}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          color: "var(--accent-primary)",
+                        }}
                       >
-                        📌
+                        <PinIcon circled={false} size={12} />
                       </span>
                     )}
                     <span
@@ -569,26 +769,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     {projectUnread > 0 && (
                       <span
                         data-testid={`project-unread-badge-${projectLower}`}
-                        className="fd-badge"
-                        title={`${projectUnread} unread wire message${projectUnread === 1 ? "" : "s"} in ${project}`}
-                        style={{
-                          backgroundColor: "var(--accent-primary)",
-                          color: "#0A0D12",
-                          borderColor: "var(--accent-primary)",
-                          fontWeight: 700,
-                          fontSize: "10px",
-                          padding: "1px 5px",
-                        }}
+                        data-severity={projectSeverity}
+                        className={getUnreadBadgeClass(projectSeverity)}
+                        title={`${projectUnread} unread message${projectUnread === 1 ? "" : "s"} in ${project}`}
+                        style={getUnreadBadgeStyle(projectSeverity, true)}
                       >
-                        {projectUnread}
+                        {formatUnreadBadgeLabel(projectUnread, projectSeverity)}
                       </span>
                     )}
-                    <span style={{ fontSize: "10px", color: "var(--text-dim)" }}>
-                      {items.length}
-                    </span>
                     <button
                       type="button"
-                      className="fd-btn"
+                      className="fd-gear-btn fd-roster-project-gear-btn"
                       data-testid={`project-settings-btn-${projectLower}`}
                       title={`Project settings for ${project}`}
                       aria-label={`Project settings for ${project}`}
@@ -597,11 +788,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                         onOpenProjectSettings?.(project);
                       }}
                       style={{
-                        padding: "1px 5px",
-                        fontSize: "11px",
-                        minHeight: "20px",
+                        border: "none",
+                        background: "transparent",
+                        padding: "2px 4px",
+                        fontSize: "16px",
                         lineHeight: 1,
                         color: "var(--text-muted)",
+                        cursor: "pointer",
                       }}
                     >
                       ⚙
@@ -611,7 +804,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
                 {!isGroupCollapsed && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                    {items.map(({ record, livenessState, adapter, unreadCount }) => {
+                    {items.map(({ record, livenessState, adapter, unreadCount, unreadSeverity }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
@@ -677,9 +870,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                 <span
                                   data-testid={`agent-pinned-indicator-${key}`}
                                   title="Pinned Agent"
-                                  style={{ fontSize: "11px" }}
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    color: "var(--accent-primary)",
+                                  }}
                                 >
-                                  📌
+                                  <PinIcon circled={false} size={13} />
                                 </span>
                               )}
                             </div>
@@ -688,20 +885,16 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               {unreadCount > 0 && (
                                 <span
                                   data-testid={`unread-badge-${key}`}
-                                  className="fd-badge"
-                                  style={{
-                                    backgroundColor: "var(--accent-primary)",
-                                    color: "#0A0D12",
-                                    borderColor: "var(--accent-primary)",
-                                    fontWeight: 700,
-                                  }}
+                                  data-severity={unreadSeverity}
+                                  className={getUnreadBadgeClass(unreadSeverity)}
+                                  style={getUnreadBadgeStyle(unreadSeverity, false)}
                                 >
-                                  {unreadCount}
+                                  {formatUnreadBadgeLabel(unreadCount, unreadSeverity)}
                                 </span>
                               )}
                               <button
                                 type="button"
-                                className="fd-btn"
+                                className="fd-gear-btn fd-roster-gear-btn"
                                 data-testid={`agent-settings-btn-${key}`}
                                 title={`Settings for ${record.display_name}`}
                                 aria-label={`Settings for ${record.display_name}`}
@@ -712,11 +905,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   onClose?.();
                                 }}
                                 style={{
-                                  padding: "1px 5px",
-                                  fontSize: "11px",
-                                  minHeight: "20px",
+                                  border: "none",
+                                  background: "transparent",
+                                  padding: "2px 4px",
+                                  fontSize: "16px",
                                   lineHeight: 1,
                                   color: "var(--text-muted)",
+                                  cursor: "pointer",
                                 }}
                               >
                                 ⚙

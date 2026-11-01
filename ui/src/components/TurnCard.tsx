@@ -523,7 +523,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                     style={{
                       borderRadius: "var(--radius-sm)",
                       border: "1px solid var(--border-subtle)",
-                      backgroundColor: "rgba(13, 17, 24, 0.65)",
+                      backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
                       overflow: "hidden",
                     }}
                   >
@@ -576,9 +576,10 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                           margin: 0,
                           padding: "10px 12px",
                           borderTop: "1px solid var(--border-subtle)",
+                          backgroundColor: "var(--bg-input)",
                           fontSize: "11.5px",
                           lineHeight: 1.45,
-                          color: "var(--text-secondary)",
+                          color: "var(--text-primary)",
                           whiteSpace: "pre-wrap",
                           wordBreak: "break-word",
                           maxHeight: "340px",
@@ -601,7 +602,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           style={{
             borderRadius: "var(--radius-sm)",
             border: "1px solid var(--border-subtle)",
-            backgroundColor: "rgba(13, 17, 24, 0.65)",
+            backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
             overflow: "hidden",
           }}
         >
@@ -651,7 +652,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           style={{
             borderRadius: "var(--radius-sm)",
             border: "1px solid var(--border-subtle)",
-            backgroundColor: "rgba(13, 17, 24, 0.65)",
+            backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
             overflow: "hidden",
           }}
         >
@@ -696,7 +697,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           style={{
             borderRadius: "var(--radius-sm)",
             border: "1px solid var(--border-subtle)",
-            backgroundColor: "rgba(13, 17, 24, 0.65)",
+            backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
             overflow: "hidden",
           }}
         >
@@ -741,9 +742,10 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                 margin: 0,
                 padding: "10px 12px",
                 borderTop: "1px solid var(--border-subtle)",
+                backgroundColor: "var(--bg-input)",
                 fontSize: "11.5px",
                 lineHeight: 1.45,
-                color: "var(--text-secondary)",
+                color: "var(--text-primary)",
                 whiteSpace: "pre-wrap",
                 wordBreak: "break-word",
                 maxHeight: "340px",
@@ -814,7 +816,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                           color: "var(--text-muted)",
                           border: "none",
                           borderBottom: isExpanded ? "1px solid var(--border-subtle)" : "none",
-                          backgroundColor: "rgba(23, 30, 41, 0.7)",
+                          backgroundColor: "var(--bg-elevated)",
                           cursor: "pointer",
                           textAlign: "left",
                         }}
@@ -834,7 +836,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                             fontSize: "10px",
                             color: "var(--text-muted)",
                             borderBottom: "1px solid var(--border-subtle)",
-                            backgroundColor: "rgba(23, 30, 41, 0.7)",
+                            backgroundColor: "var(--bg-elevated)",
                           }}
                         >
                           {seg.language}
