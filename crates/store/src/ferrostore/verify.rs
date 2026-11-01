@@ -115,8 +115,9 @@ pub fn verify_redb_vs_ferrostore(
 /// Migrate the redb store at `redb_path` into a new FerroStore at `fls_path`,
 /// verified, as one switch:
 ///
-/// 1. migrate into the sibling `<name>.migrating-<pid>` (for `fl.fls`,
-///    `fl.fls.migrating-<pid>`), created 0600;
+/// 1. migrate into a new sibling `<name>.migrating-<pid>-<n>-<nonce>` (for
+///    `fl.fls`, `fl.fls.migrating-…`), created 0600 with `O_EXCL`: a name
+///    already taken is an error, never a file to reuse;
 /// 2. verify; a report that is not clean deletes that file, creates no
 ///    `fls_path`, and is returned as it is, so the caller keeps running on redb;
 /// 3. `fsync` the file; 4. move it to `fls_path`; 5. `fsync` the directory;
@@ -124,9 +125,64 @@ pub fn verify_redb_vs_ferrostore(
 ///
 /// Refuses when `fls_path` already exists or `redb_path` does not. The move is
 /// `link` then `unlink`, not `rename`: a `rename` would replace an `fls_path`
-/// another process created after the check, and `link` refuses to.
+/// another process created after the check, and `link` refuses to. The file
+/// linked is the one this call created and verified: its device and inode are
+/// taken when it is created and checked again before and after the link, and a
+/// mismatch is refused. This call only ever removes a temp file it created.
+///
+/// Once the link is made, `fls_path` is the store and the result is
+/// `Ok(report)`. A failure after that point is a warning on stderr, not an
+/// `Err`: a temp file that cannot be removed is left behind; a directory that
+/// cannot be synced leaves the new entry not yet durable; a `.redb` that cannot
+/// be made 0400 stays writable.
 pub fn migrate_verified(redb_path: &Path, fls_path: &Path) -> Result<ParityReport, StoreError> {
     migrate_verified_with(redb_path, fls_path, |_| Ok(()))
+}
+
+/// The device and inode of a file: what a path names at one moment.
+type FileId = (u64, u64);
+
+fn file_id(meta: &std::fs::Metadata) -> FileId {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+/// What `path` names now, without following a symlink. `None` when nothing.
+fn id_at(path: &Path) -> Option<FileId> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| file_id(&meta))
+}
+
+/// A temp name no other call uses: the process id, a per-process counter, and
+/// a nonce from the clock and a stack address (another process that reuses
+/// the pid still differs).
+fn temp_path(fls_path: &Path) -> Result<std::path::PathBuf, StoreError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = fls_path
+        .file_name()
+        .ok_or_else(|| backend(format!("{} has no file name", fls_path.display())))?;
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let marker = 0u8;
+    let addr = std::ptr::addr_of!(marker) as usize as u64;
+    let nonce = (nanos ^ addr.rotate_left(32)) & 0xffff_ffff;
+    let mut temp_name = name.to_os_string();
+    temp_name.push(format!(".migrating-{}-{n}-{nonce:08x}", std::process::id()));
+    Ok(fls_path.with_file_name(temp_name))
+}
+
+/// Remove `temp` only while it is still the file this call created.
+fn remove_own_temp(temp: &Path, ours: FileId) -> std::io::Result<()> {
+    if id_at(temp) == Some(ours) {
+        std::fs::remove_file(temp)
+    } else {
+        Ok(())
+    }
 }
 
 /// [`migrate_verified`] with `after_copy` run on the new store between the
@@ -149,23 +205,54 @@ pub(super) fn migrate_verified_with(
             redb_path.display()
         )));
     }
-    let name = fls_path
-        .file_name()
-        .ok_or_else(|| backend(format!("{} has no file name", fls_path.display())))?;
-    let mut temp_name = name.to_os_string();
-    temp_name.push(format!(".migrating-{}", std::process::id()));
-    let temp = fls_path.with_file_name(temp_name);
-    // A file under this process's id is left by a dead process of the same id.
-    match std::fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(backend(format!("remove {}: {err}", temp.display()))),
-    }
+    let temp = temp_path(fls_path)?;
+    migrate_into(redb_path, fls_path, &temp, after_copy)
+}
+
+/// [`migrate_verified`] through the temp file `temp`, for a test that must
+/// name it.
+#[cfg(test)]
+pub(super) fn migrate_verified_with_temp(
+    redb_path: &Path,
+    fls_path: &Path,
+    temp: &Path,
+) -> Result<ParityReport, StoreError> {
+    migrate_into(redb_path, fls_path, temp, |_| Ok(()))
+}
+
+/// Steps 1 to 6 of [`migrate_verified`], through `temp`, once the checks on
+/// `redb_path` and `fls_path` have passed.
+fn migrate_into(
+    redb_path: &Path,
+    fls_path: &Path,
+    temp: &Path,
+    after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
+) -> Result<ParityReport, StoreError> {
+    // `create_new` is `O_EXCL`: a taken name fails here and is not touched.
+    let held = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(temp)
+            .map_err(|err| backend(format!("create {}: {err}", temp.display())))?
+    };
+    let ours = file_id(
+        &held
+            .metadata()
+            .map_err(|err| backend(format!("stat {}: {err}", temp.display())))?,
+    );
+    let cleanup = |err: StoreError| -> StoreError {
+        let _ = remove_own_temp(temp, ours);
+        err
+    };
 
     let outcome = (|| {
         let src = RedbStore::open(redb_path)?;
         let report = {
-            let dst = FerroStore::open(&temp)?;
+            let dst = FerroStore::open(temp)?;
             super::migrate_redb_to_ferrostore(&src, &dst)?;
             after_copy(&dst)?;
             verify_redb_vs_ferrostore(&src, &dst)?
@@ -176,44 +263,81 @@ pub(super) fn migrate_verified_with(
     let report = match outcome {
         Ok(report) if report.is_clean() => report,
         Ok(report) => {
-            remove_temp(&temp)?;
+            remove_own_temp(temp, ours)
+                .map_err(|err| backend(format!("remove {}: {err}", temp.display())))?;
             return Ok(report);
         }
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp);
-            return Err(err);
-        }
+        Err(err) => return Err(cleanup(err)),
     };
 
-    let publish = (|| {
-        std::fs::File::open(&temp)
-            .and_then(|file| file.sync_all())
-            .map_err(|err| backend(format!("sync {}: {err}", temp.display())))?;
-        std::fs::hard_link(&temp, fls_path).map_err(|err| {
-            backend(format!(
-                "move {} to {}: {err}",
-                temp.display(),
-                fls_path.display()
-            ))
-        })?;
-        Ok::<(), StoreError>(())
-    })();
-    if let Err(err) = publish {
-        let _ = std::fs::remove_file(&temp);
-        return Err(err);
+    // Publish the inode that was migrated and verified, and no other.
+    let replaced = |when: &str| {
+        backend(format!(
+            "{} is no longer the file this migration verified ({when}): not published",
+            temp.display()
+        ))
+    };
+    if id_at(temp) != Some(ours) {
+        return Err(cleanup(replaced("before the link")));
     }
-    remove_temp(&temp)?;
-    super::sync_dir(&super::parent_dir(fls_path))?;
+    held.sync_all()
+        .map_err(|err| cleanup(backend(format!("sync {}: {err}", temp.display()))))?;
+    std::fs::hard_link(temp, fls_path).map_err(|err| {
+        cleanup(backend(format!(
+            "move {} to {}: {err}",
+            temp.display(),
+            fls_path.display()
+        )))
+    })?;
+    let linked = id_at(fls_path);
+    if linked != Some(ours) {
+        // The temp name was swapped between the check and the link, so the
+        // link this call made names that other file: take it back. An
+        // `fls_path` that is not the temp's file is not this call's link and
+        // is left alone.
+        if linked.is_some() && linked == id_at(temp) {
+            let _ = std::fs::remove_file(fls_path);
+        }
+        return Err(cleanup(replaced("after the link")));
+    }
+    drop(held);
+
+    // `fls_path` is the store from here on: what fails now is a warning.
+    if let Err(err) = remove_own_temp(temp, ours) {
+        warn(&format!(
+            "warning: {} is published, but its temp file {} was not removed: {err}",
+            fls_path.display(),
+            temp.display()
+        ));
+    }
+    if let Err(err) = super::sync_dir(&super::parent_dir(fls_path)) {
+        warn(&format!(
+            "warning: {} is published, but its directory was not synced, so a crash \
+             may still lose the new entry: {err}",
+            fls_path.display()
+        ));
+    }
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
-            .map_err(|err| backend(format!("chmod 0400 {}: {err}", redb_path.display())))?;
+        if let Err(err) =
+            std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
+        {
+            warn(&format!(
+                "warning: {} is published, but chmod 0400 {} failed, so the redb store \
+                 remains writable: {err}",
+                fls_path.display(),
+                redb_path.display()
+            ));
+        }
     }
     Ok(report)
 }
 
-fn remove_temp(temp: &Path) -> Result<(), StoreError> {
-    std::fs::remove_file(temp).map_err(|err| backend(format!("remove {}: {err}", temp.display())))
+/// One line on stderr, as the store's other warnings print: a closed stderr is
+/// not a panic.
+fn warn(text: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{text}");
 }
 
 // ---- hashing ----------------------------------------------------------------
@@ -498,11 +622,17 @@ fn table_parity(src: &RedbStore, state: &DocState) -> Result<Vec<TableParity>, S
     }
 
     // The schema version: redb's `meta.format_version`, FerroStore's `__meta`.
+    // Only a missing `meta` table means "no schema version"; any other open
+    // error is a read failure.
     let mut schema = Vec::new();
-    if let Ok(meta) = tx.open_table(TableDefinition::<&str, u64>::new(doc::META))
-        && let Some(version) = meta.get(doc::FORMAT_KEY).map_err(backend)?
-    {
-        schema.push((SCHEMA_KEY.to_string(), Value::from(version.value())));
+    match tx.open_table(TableDefinition::<&str, u64>::new(doc::META)) {
+        Ok(meta) => {
+            if let Some(version) = meta.get(doc::FORMAT_KEY).map_err(backend)? {
+                schema.push((SCHEMA_KEY.to_string(), Value::from(version.value())));
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(err) => return Err(backend(err)),
     }
     out.push(parity(
         SCHEMA_COLLECTION,

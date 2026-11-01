@@ -7,16 +7,20 @@ use crate::migrate::{migrate_verified, verify_redb_vs_ferrostore};
 use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
 use fl_core::at::At;
 use fl_core::conformance::{entry_iri, sample_attempt, sample_record_run};
+use fl_core::escalation::{Escalations, Mark};
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
 use fl_core::finding::Finding;
-use fl_core::ids::{GateId, ProjectId, RecordId, WorkflowId, WorkflowRunId, seq_iri};
+use fl_core::ids::{GateId, ProjectId, RecordId, RevisionId, WorkflowId, WorkflowRunId, seq_iri};
 use fl_core::model::{
     CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
 use fl_core::routing::RoutingMap;
 use fl_core::split::{CachedSegment, LedgerCache, Outbox};
 
-use fl_core::state::{HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs};
+use fl_core::state::{
+    HandoffEntry, SensitivityPatch, StatePayload, StateRevision, StateScope, StateSyncCursor,
+    UpsertStateArgs,
+};
 use fl_core::store::{
     AgentRegistry, Bindings, Catalog, Ledger, MessageStore, StateStore, Tracker, WorkflowStore,
 };
@@ -39,11 +43,28 @@ struct Populated {
     project: ProjectId,
     gate: GateId,
     record: RecordId,
+    /// Marked for escalation.
+    marked: RecordId,
+    /// Marked, then tombstoned.
+    gone: RecordId,
 }
 
-/// A redb store holding a row in nearly every table: catalog, tracker, ledger
-/// with ids, cut-over and published marks, ledger cache, routing, bindings,
-/// agents, state, FerroWire and workflows.
+fn handoff(summary: &str) -> StatePayload {
+    StatePayload::Handoff(HandoffEntry {
+        summary: summary.into(),
+        shipped: vec![],
+        in_flight: vec![],
+        blockers: vec![],
+        next_steps: vec![],
+        notes: None,
+    })
+}
+
+/// A redb store holding a row in every table but `imports`: catalog, tracker,
+/// ledger with ids, cut-over and published marks, ledger cache, routing,
+/// bindings, agents, state with a conflict and a sync cursor, escalation marks
+/// and tombstones, FerroWire and workflows. `imports` needs a store of its own
+/// ([`imported`]): a routed project is the only project in its store.
 fn populate(redb: &RedbStore) -> Populated {
     let project = redb.add_project("/work/app").unwrap();
     let kind = GateKind::Command(CommandSpec {
@@ -242,11 +263,109 @@ fn populate(redb: &RedbStore) -> Populated {
         at: At::from_unix_millis(11),
     })
     .unwrap();
+
+    // A state conflict: a local edit and a remote revision off one base.
+    let base = redb
+        .upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: "diverged".into(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: handoff("base"),
+            at: At::from_unix_millis(20),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    redb.upsert_state(UpsertStateArgs {
+        scope: StateScope::Workspace,
+        slug: "diverged".into(),
+        sensitivity: SensitivityPatch::Inherit,
+        payload: handoff("local"),
+        at: At::from_unix_millis(21),
+        by: "jarvis".into(),
+    })
+    .unwrap();
+    redb.import_state_revisions(
+        &[StateRevision {
+            revision_id: RevisionId(seq_iri(903)),
+            entry_id: base.id.clone(),
+            parent_revisions: vec![base.head_revision.clone()],
+            scope: base.scope.clone(),
+            concern: base.concern,
+            slug: base.slug.clone(),
+            sensitive: false,
+            ever_sensitive: false,
+            payload: handoff("remote"),
+            at: At::from_unix_millis(22),
+            by: "ferris".into(),
+        }],
+        At::from_unix_millis(23),
+    )
+    .unwrap();
+    assert_eq!(redb.list_conflicts().unwrap().len(), 1);
+    redb.set_sync_cursor(StateSyncCursor {
+        remote: "origin".into(),
+        branch: "fl/state".into(),
+        last_pushed_commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        last_revision_seq: 3,
+        last_registry_seq: 1,
+        last_wire_msg_seq: 2,
+        last_wire_rcpt_seq: 2,
+    })
+    .unwrap();
+
+    // Escalation, last: a mark blocks writes to its item. One record stays
+    // marked; another is marked, then tombstoned.
+    let mark = Mark {
+        by: "ferris".into(),
+        reason: "to GitHub".into(),
+        at_ms: 30,
+    };
+    let marked = redb.add_record(&project, "escalating").unwrap();
+    redb.mark(marked.iri(), &mark).unwrap();
+    let gone = redb.add_record(&project, "escalated").unwrap();
+    redb.mark(gone.iri(), &mark).unwrap();
+    redb.tombstone(gone.iri(), &entry_iri(91)).unwrap();
+
     Populated {
         project,
         gate,
         record,
+        marked,
+        gone,
     }
+}
+
+/// A redb store holding an imported project, and so an `imports` row,
+/// migrated into a new on-disk FerroStore.
+fn imported() -> (tempfile::TempDir, RedbStore, FerroStore, ProjectId) {
+    let dir = tempfile::tempdir().unwrap();
+    let author = RedbStore::open(&dir.path().join("author.redb")).unwrap();
+    let project = author.add_project("/author").unwrap();
+    author
+        .add_gate(
+            &project,
+            "fmt",
+            GateKind::Command(CommandSpec {
+                program: "true".into(),
+                args: vec![],
+                delivery: PopulationDelivery::Args,
+                timeout_secs: 5,
+                pass_codes: vec![0],
+            }),
+            Selector::Glob {
+                pattern: "**/*.rs".into(),
+            },
+            1,
+            "c1",
+            "o",
+        )
+        .unwrap();
+    let manifest = author.export_manifest(&project, "c1", 1, None).unwrap();
+    let redb = RedbStore::open(&dir.path().join("src.redb")).unwrap();
+    redb.import_manifest(&manifest, "/imported").unwrap();
+    let ferro = FerroStore::open(dir.path().join("dst.fls")).unwrap();
+    migrate_redb_to_ferrostore(&redb, &ferro).unwrap();
+    (dir, redb, ferro, project)
 }
 
 fn view<'a>(report: &'a ParityReport, prefix: &str) -> &'a verify::TableParity {
@@ -312,10 +431,14 @@ fn parity_is_clean_on_a_migrated_populated_store() {
         "ledger_heads",
         "ledger_segments",
         "routing",
+        "escalating",
+        "tombstones",
         "state_entries",
         "state_keys",
         "state_revisions",
         "state_revision_ids",
+        "state_conflicts",
+        "state_sync_cursors",
         "agents",
         "agent_by_name",
         "areas",
@@ -355,7 +478,8 @@ fn parity_is_clean_on_a_migrated_populated_store() {
         ("AgentRegistry::list_areas", 1),
         ("AgentRegistry::list_agents", 1),
         ("AgentRegistry::registry_events_after", 1),
-        ("StateStore::list_state", 2),
+        ("StateStore::list_state", 3),
+        ("StateStore::list_conflicts", 1),
         ("StateStore::state_revisions_after", 2),
         ("StateStore::state_revisions(", 1),
         ("MessageStore::list_wire_inbox", 2),
@@ -381,6 +505,43 @@ fn parity_is_clean_on_a_migrated_populated_store() {
             .iter()
             .any(|v| v.table == format!("Tracker::list_records({})", populated.project))
     );
+
+    // `imports` holds a row only in a store of its own.
+    let (_dir, redb, ferro, project) = imported();
+    let report = verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
+    assert!(report.is_clean(), "{:#?}", report.mismatches());
+    let imports = table(&report, "imports");
+    assert_eq!((imports.redb_rows, imports.ferro_rows), (1, 1));
+    assert!(ferro.imported_hash(&project).unwrap().is_some());
+}
+
+#[test]
+fn an_escalation_row_changed_after_migration_is_caught_by_its_table_hash() {
+    // `escalating` and `tombstones` have no list-style trait view: only the
+    // table hash sees them.
+    let (_dir, redb, ferro, populated) = migrated();
+    ferro
+        .delete_doc("escalating", populated.marked.iri().as_str())
+        .unwrap();
+    let report = verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
+    let escalating = table(&report, "escalating");
+    assert_eq!(escalating.ferro_rows + 1, escalating.redb_rows);
+    assert_eq!(mismatch_names(&report), vec!["escalating".to_string()]);
+
+    let (_dir, redb, ferro, populated) = migrated();
+    let mut tomb = ferro
+        .get_doc("tombstones", populated.gone.iri().as_str())
+        .unwrap()
+        .unwrap();
+    tomb["reason"] = json!("changed");
+    ferro
+        .put_doc("tombstones", populated.gone.iri().as_str(), &tomb)
+        .unwrap();
+    let report = verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
+    let tombstones = table(&report, "tombstones");
+    assert_eq!(tombstones.redb_rows, tombstones.ferro_rows);
+    assert_ne!(tombstones.redb_hash, tombstones.ferro_hash);
+    assert_eq!(mismatch_names(&report), vec!["tombstones".to_string()]);
 }
 
 #[test]
@@ -473,7 +634,12 @@ fn data_outside_the_copy_list_is_a_mismatch_on_either_side() {
 
     let (_dir, redb, ferro, _) = migrated();
     ferro
-        .put_doc("__meta", "schema_version", &json!(crate::FORMAT_VERSION))
+        .put_doc_unchecked(
+            "__meta",
+            "schema_version",
+            &json!(crate::FORMAT_VERSION),
+            false,
+        )
         .unwrap();
     let report = verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
     assert_eq!(mismatch_names(&report), vec!["__meta".to_string()]);
@@ -590,4 +756,146 @@ fn a_failed_step_after_the_copy_leaves_no_temp_file() {
     .unwrap_err();
     assert!(err.to_string().contains("injected failure"), "{err}");
     assert_eq!(entries(tmp.path()), vec!["fl.redb".to_string()]);
+}
+
+/// Run two verified migrations into `fls` at once, from `sources[0]` and
+/// `sources[1]`; each meets the other at a barrier between its copy and its
+/// verify when `meet` is set (two sources, so neither waits on the other's
+/// redb lock).
+fn race(
+    sources: [&Path; 2],
+    fls: &Path,
+    meet: bool,
+) -> Vec<Result<ParityReport, fl_core::StoreError>> {
+    use std::sync::{Arc, Barrier};
+    let start = Arc::new(Barrier::new(2));
+    let copied = Arc::new(Barrier::new(2));
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = sources
+            .into_iter()
+            .map(|source| {
+                let (start, copied) = (Arc::clone(&start), Arc::clone(&copied));
+                scope.spawn(move || {
+                    // Both pass the "target exists" check before either publishes.
+                    start.wait();
+                    verify::migrate_verified_with(source, fls, |_| {
+                        if meet {
+                            copied.wait();
+                        }
+                        Ok(())
+                    })
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Exactly one of `results` published `fls`, the other is an error, no temp
+/// file is left, and the published store verifies clean against `redb_path`.
+fn published_once(
+    results: &[Result<ParityReport, fl_core::StoreError>],
+    dir: &Path,
+    fls: &Path,
+    redb_path: &Path,
+    want: &[&str],
+) {
+    let published: Vec<&ParityReport> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(published.len(), 1, "{results:?}");
+    assert!(published[0].is_clean(), "{:#?}", published[0].mismatches());
+    assert!(results.iter().any(Result::is_err), "{results:?}");
+    let want: Vec<String> = want.iter().map(|name| name.to_string()).collect();
+    assert_eq!(entries(dir), want, "no temp file is left");
+    assert_eq!(mode(fls), 0o600);
+
+    // What was published is a whole store that verifies clean.
+    std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let redb = RedbStore::open(redb_path).unwrap();
+    let ferro = FerroStore::open(fls).unwrap();
+    let report = verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
+    assert!(report.is_clean(), "{:#?}", report.mismatches());
+}
+
+#[test]
+fn two_verified_migrations_of_one_target_publish_once_and_leave_no_temp_file() {
+    // One source: the redb lock orders the two, and the second finds the
+    // first's work done.
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    let results = race([&redb_path, &redb_path], &fls, false);
+    published_once(
+        &results,
+        tmp.path(),
+        &fls,
+        &redb_path,
+        &["fl.fls", "fl.redb"],
+    );
+
+    // Two copies of one source, both copied before either verifies: both
+    // temp files exist at once, both verify clean, and only one links.
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let copy = tmp.path().join("copy.redb");
+    std::fs::copy(&redb_path, &copy).unwrap();
+    let fls = tmp.path().join("fl.fls");
+    let results = race([&redb_path, &copy], &fls, true);
+    let lost = results
+        .iter()
+        .find_map(|r| r.as_ref().err())
+        .expect("one migration loses");
+    assert!(lost.to_string().contains("move"), "{lost}");
+    published_once(
+        &results,
+        tmp.path(),
+        &fls,
+        &redb_path,
+        &["copy.redb", "fl.fls", "fl.redb"],
+    );
+}
+
+#[test]
+fn a_taken_temp_name_is_an_error_and_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    // A temp name already taken by someone else.
+    let taken = tmp.path().join("fl.fls.migrating-taken");
+    std::fs::write(&taken, b"not ours").unwrap();
+    let err = verify::migrate_verified_with_temp(&redb_path, &fls, &taken).unwrap_err();
+    assert!(err.to_string().contains("create"), "{err}");
+    assert_eq!(std::fs::read(&taken).unwrap(), b"not ours");
+    assert!(!fls.exists());
+    assert_eq!(mode(&redb_path), 0o600);
+}
+
+#[test]
+fn a_temp_file_replaced_before_the_link_is_not_published_or_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    let dir = tmp.path().to_path_buf();
+    let err = verify::migrate_verified_with(&redb_path, &fls, |_| {
+        let temp = entries(&dir)
+            .into_iter()
+            .find(|name| name.contains(".migrating-"))
+            .expect("the temp file exists during the copy");
+        let impostor = dir.join("impostor");
+        std::fs::write(&impostor, b"unverified").unwrap();
+        std::fs::rename(&impostor, dir.join(temp)).unwrap();
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("no longer the file"), "{err}");
+    assert!(!fls.exists(), "nothing is published");
+    let left: Vec<String> = entries(tmp.path())
+        .into_iter()
+        .filter(|name| name.contains(".migrating-"))
+        .collect();
+    assert_eq!(left.len(), 1, "the file this call did not create is left");
+    assert_eq!(
+        std::fs::read(tmp.path().join(&left[0])).unwrap(),
+        b"unverified"
+    );
+    assert_eq!(mode(&redb_path), 0o600, "the redb stays writable");
 }

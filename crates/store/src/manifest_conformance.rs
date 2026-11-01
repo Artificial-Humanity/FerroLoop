@@ -77,16 +77,16 @@ impl ManifestSubject for FerroStore {
         self.import_manifest(m, root)
     }
     fn imported(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
-        self.suite_imported_hash(project)
+        self.imported_hash(project)
     }
     fn route(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
         self.set_routes(project, map)
     }
     fn routed(&self) -> Result<bool, StoreError> {
-        self.suite_holds_routing()
+        self.holds_routing()
     }
     fn holds(&self, id: &Iri) -> Result<bool, StoreError> {
-        self.suite_owns(id)
+        self.owns(id)
     }
     fn schema(&self) -> Result<Option<u64>, StoreError> {
         self.format_version()
@@ -673,6 +673,22 @@ fn ferrostore_on_disk_meets_the_manifest_contract() {
     manifest_contract(|| {
         let dir = tempfile::tempdir().unwrap();
         let s = FerroStore::open(dir.path().join("t.fls")).unwrap();
+        (s, dir)
+    });
+}
+
+/// A FerroStore migrated from a new redb store: it starts at redb's
+/// `FORMAT_VERSION`, not the newest constant, so every format-raise case
+/// raises it for real.
+#[test]
+fn ferrostore_migrated_from_a_new_redb_meets_the_manifest_contract() {
+    manifest_contract(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let redb = RedbStore::open(&dir.path().join("src.redb")).unwrap();
+        let s = FerroStore::open(dir.path().join("t.fls")).unwrap();
+        crate::migrate_redb_to_ferrostore(&redb, &s).unwrap();
+        assert_eq!(s.format_version().unwrap(), Some(crate::FORMAT_VERSION));
+        const { assert!(crate::FORMAT_VERSION < FORMAT_WITH_IMPORTS) };
         (s, dir)
     });
 }

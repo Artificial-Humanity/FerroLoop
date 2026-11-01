@@ -63,6 +63,27 @@ pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";
 /// migration writes it from redb's `meta.format_version`, and the verifier
 /// checks it as its own entry.
 pub(super) const SCHEMA_COLLECTION: &str = "__meta";
+/// A collection whose name starts with this belongs to the store: only its own
+/// transactions write it. Public `put_doc` / `delete_doc` refuse it, outbound
+/// sync batches leave it out, and an inbound sync batch that touches it is
+/// refused whole.
+pub(super) const RESERVED_PREFIX: &str = "__";
+
+/// `true` for a collection only the store itself writes ([`RESERVED_PREFIX`]).
+pub(super) fn is_reserved(collection: &str) -> bool {
+    collection.starts_with(RESERVED_PREFIX)
+}
+
+/// `Err` naming `collection` when it is reserved; `what` is the refused call.
+pub(super) fn refuse_reserved(collection: &str, what: &str) -> Result<(), StoreError> {
+    if is_reserved(collection) {
+        return Err(backend(format!(
+            "{what} refused: collection `{collection}` is reserved \
+             (a `{RESERVED_PREFIX}` collection is written only by the store itself)"
+        )));
+    }
+    Ok(())
+}
 /// `(SCHEMA_COLLECTION, SCHEMA_KEY)` holds the schema version: the same ladder
 /// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`).
 pub(super) const SCHEMA_KEY: &str = "schema_version";

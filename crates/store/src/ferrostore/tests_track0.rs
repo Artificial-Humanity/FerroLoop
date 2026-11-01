@@ -378,7 +378,12 @@ fn a_schema_newer_than_this_build_is_refused() {
     {
         let store = FerroStore::open(&path).unwrap();
         store
-            .put_doc("__meta", "schema_version", &json!(FORMAT_WITH_WORKFLOW + 1))
+            .put_doc_unchecked(
+                "__meta",
+                "schema_version",
+                &json!(FORMAT_WITH_WORKFLOW + 1),
+                false,
+            )
             .unwrap();
     }
     let err = match FerroStore::open(&path) {
@@ -401,7 +406,7 @@ fn a_schema_newer_than_this_build_is_refused() {
     {
         let store = FerroStore::open(&path).unwrap();
         store
-            .put_doc("__meta", "schema_version", &json!(1))
+            .put_doc_unchecked("__meta", "schema_version", &json!(1), false)
             .unwrap();
     }
     assert!(matches!(
@@ -418,7 +423,9 @@ fn a_store_from_before_schema_versioning_opens_and_raises_into_meta() {
     let path = tmp.path().join("store.fls");
     {
         let store = FerroStore::open(&path).unwrap();
-        store.delete_doc("__meta", "schema_version").unwrap();
+        store
+            .delete_doc_unchecked("__meta", "schema_version")
+            .unwrap();
     }
     let store = FerroStore::open(&path).unwrap();
     assert_eq!(store.format_version().unwrap(), None, "no version document");
@@ -435,7 +442,9 @@ fn a_store_from_before_schema_versioning_opens_and_raises_into_meta() {
     let path = tmp.path().join("legacy.fls");
     {
         let store = FerroStore::open(&path).unwrap();
-        store.delete_doc("__meta", "schema_version").unwrap();
+        store
+            .delete_doc_unchecked("__meta", "schema_version")
+            .unwrap();
         store
             .put_doc("meta", "format_version", &json!(FORMAT_WITH_ROUTING))
             .unwrap();
@@ -460,13 +469,302 @@ fn a_migration_copies_the_sources_schema_version() {
 fn the_schema_document_is_in_no_trait_listing() {
     use fl_core::store::{Catalog, StateStore, WorkflowStore};
     let store = FerroStore::in_memory();
+    // Not vacuous: the document is there to leak.
+    assert_eq!(
+        store.get_doc("__meta", "schema_version").unwrap(),
+        Some(json!(FORMAT_WITH_WORKFLOW))
+    );
     assert!(store.list_projects().unwrap().is_empty());
     assert!(store.list_state(None, None).unwrap().is_empty());
     assert!(store.list_workflow_defs(None).unwrap().is_empty());
     assert!(
         store
-            .query_by_field("meta", "schema_version", "8")
+            .query_by_field(
+                "__meta",
+                "schema_version",
+                &FORMAT_WITH_WORKFLOW.to_string()
+            )
             .unwrap()
             .is_empty()
     );
+}
+
+// ---- a first open cut short -------------------------------------------------
+
+/// The snapshot a new store's `init_empty` writes after the header.
+fn new_store_blob() -> Vec<u8> {
+    layout::encode_snapshot(0, &super::new_store_docs()).unwrap()
+}
+
+/// A file as `init_empty` leaves it when power is cut after the snapshot write
+/// and before slot 0: a zero header, then `tail`.
+fn cut_after_snapshot(path: &Path, tail: &[u8]) {
+    let mut bytes = vec![0u8; layout::HEADER_BYTES as usize];
+    bytes.extend_from_slice(tail);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn a_first_open_cut_short_after_its_snapshot_reopens_as_a_new_store() {
+    let blob = new_store_blob();
+    assert!(blob.len() > 1);
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, tail) in [
+        ("whole.fls", &blob[..]),
+        ("half.fls", &blob[..blob.len() / 2]),
+        ("one.fls", &blob[..1]),
+        ("none.fls", &blob[..0]),
+    ] {
+        let path = tmp.path().join(name);
+        cut_after_snapshot(&path, tail);
+        let store = FerroStore::open(&path).unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(
+            store.format_version().unwrap(),
+            Some(FORMAT_WITH_WORKFLOW),
+            "{name}"
+        );
+        store.put_doc("c", "a", &json!(1)).unwrap();
+        drop(store);
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(store.get_doc("c", "a").unwrap(), Some(json!(1)), "{name}");
+    }
+}
+
+#[test]
+fn a_zero_header_with_other_trailing_bytes_is_never_rewritten() {
+    let blob = new_store_blob();
+    let mut other = blob.clone();
+    let last = other.len() - 1;
+    other[last] ^= 0xff;
+    let mut longer = blob.clone();
+    longer.push(0);
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, tail) in [
+        ("differs.fls", other),
+        ("longer.fls", longer),
+        ("data.fls", b"real data".to_vec()),
+    ] {
+        let path = tmp.path().join(name);
+        cut_after_snapshot(&path, &tail);
+        let before = std::fs::read(&path).unwrap();
+        assert!(FerroStore::open(&path).is_err(), "{name} opened");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "{name} was rewritten"
+        );
+    }
+}
+
+#[test]
+fn ensure_superblock_says_when_it_initialized_the_file() {
+    // `open` syncs the directory on `true`, so a file an earlier open created
+    // and left without a superblock is made durable by the open that fills it.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("store.fls");
+    std::fs::write(&path, b"").unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(super::ensure_superblock(&file).unwrap(), "empty file");
+    assert!(
+        !super::ensure_superblock(&file).unwrap(),
+        "already has slot 0"
+    );
+    drop(file);
+    let path = tmp.path().join("cut.fls");
+    cut_after_snapshot(&path, &new_store_blob());
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert!(super::ensure_superblock(&file).unwrap(), "cut-short file");
+}
+
+// ---- reserved collections ---------------------------------------------------
+
+mod reserved {
+    use super::super::{FerroStore, SyncAdapter, SyncBatch, SyncMode, SyncOp};
+    use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
+    use fl_core::StoreError;
+    use fl_core::routing::RoutingMap;
+    use fl_core::store::Catalog;
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Recorder {
+        commits: Mutex<Vec<SyncBatch>>,
+        pull: Mutex<Vec<SyncBatch>>,
+        fetches: AtomicUsize,
+    }
+
+    impl SyncAdapter for Recorder {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+        fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+            self.commits.lock().unwrap().push(batch.clone());
+            Ok(())
+        }
+        fn pull_since(&self, _: u64) -> Result<Vec<SyncBatch>, StoreError> {
+            Ok(self.pull.lock().unwrap().clone())
+        }
+        fn fetch_document(&self, _: &str, _: &str) -> Result<Option<Value>, StoreError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(json!(1)))
+        }
+        fn prewarm(&self, _: &[&str]) -> Result<Vec<SyncBatch>, StoreError> {
+            Ok(self.pull.lock().unwrap().clone())
+        }
+    }
+
+    fn attached(store: FerroStore, mode: SyncMode) -> (FerroStore, Arc<Recorder>) {
+        let recorder = Arc::new(Recorder::default());
+        let store = store
+            .with_sync_adapter(mode, Arc::clone(&recorder) as Arc<dyn SyncAdapter>)
+            .unwrap();
+        (store, recorder)
+    }
+
+    fn assert_reserved(err: StoreError) {
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    /// A store migrated from a new redb: schema `FORMAT_VERSION`, so a trait
+    /// write raises it.
+    fn migrated(dir: &std::path::Path) -> FerroStore {
+        let redb = crate::RedbStore::open(&dir.join("src.redb")).unwrap();
+        let store = FerroStore::in_memory();
+        crate::migrate_redb_to_ferrostore(&redb, &store).unwrap();
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_VERSION));
+        store
+    }
+
+    #[test]
+    fn public_writes_to_a_reserved_collection_are_refused() {
+        let store = FerroStore::in_memory();
+        assert_reserved(
+            store
+                .put_doc("__meta", "schema_version", &json!(1))
+                .unwrap_err(),
+        );
+        assert_reserved(store.delete_doc("__meta", "schema_version").unwrap_err());
+        assert_reserved(store.put_doc("__other", "x", &json!(1)).unwrap_err());
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+        assert_eq!(store.read_state().unwrap().last_seq, 0, "nothing committed");
+        // One underscore is an ordinary collection.
+        store.put_doc("_meta", "x", &json!(1)).unwrap();
+    }
+
+    #[test]
+    fn writes_to_a_reserved_collection_over_the_socket_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("store.sock");
+        let server =
+            super::super::FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+        let client = super::super::server::connect_unix(&sock.display().to_string()).unwrap();
+        for (method, params) in [
+            (
+                "put_doc",
+                json!({"collection": "__meta", "id": "schema_version", "doc": 1}),
+            ),
+            (
+                "put_doc",
+                json!({"collection": "__meta", "id": "x", "doc": 1, "if_absent": true}),
+            ),
+            (
+                "delete_doc",
+                json!({"collection": "__meta", "id": "schema_version"}),
+            ),
+        ] {
+            assert_reserved(client.call(method, params).unwrap_err());
+        }
+        let remote = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+        assert_reserved(remote.put_doc("__meta", "x", &json!(1)).unwrap_err());
+        assert_eq!(remote.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+        drop(remote);
+        drop(client);
+        drop(server);
+    }
+
+    #[test]
+    fn a_raise_stays_local_and_out_of_the_sync_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, recorder) = attached(migrated(tmp.path()), SyncMode::WriteThrough);
+        let project = store.add_project("/p").unwrap();
+        store.set_routes(&project, &RoutingMap::starting()).unwrap();
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_ROUTING));
+        let commits = recorder.commits.lock().unwrap().clone();
+        assert_eq!(commits.len(), 2, "{commits:?}");
+        let collections: Vec<&str> = commits
+            .iter()
+            .flat_map(|batch| &batch.ops)
+            .filter_map(|op| match op {
+                SyncOp::PutDoc { collection, .. } | SyncOp::DeleteDoc { collection, .. } => {
+                    Some(collection.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(collections.contains(&"routing"), "{collections:?}");
+        assert!(
+            !collections.iter().any(|c| c.starts_with("__")),
+            "{collections:?}"
+        );
+        assert!(!store.has_pending_sync());
+        assert_eq!(store.synced_seq(), store.read_state().unwrap().last_seq);
+    }
+
+    #[test]
+    fn an_inbound_batch_that_writes_a_reserved_collection_is_refused_whole() {
+        for reserved in [
+            SyncOp::PutDoc {
+                collection: "__meta".into(),
+                id: "schema_version".into(),
+                doc: json!(FORMAT_VERSION),
+            },
+            SyncOp::DeleteDoc {
+                collection: "__meta".into(),
+                id: "schema_version".into(),
+            },
+        ] {
+            let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
+            *recorder.pull.lock().unwrap() = vec![SyncBatch {
+                seq: 1,
+                ops: vec![
+                    SyncOp::PutDoc {
+                        collection: "docs".into(),
+                        id: "a".into(),
+                        doc: json!(1),
+                    },
+                    reserved.clone(),
+                ],
+            }];
+            assert_reserved(store.sync_pull().unwrap_err());
+            assert_reserved(store.sync_prewarm(&["docs"]).unwrap_err());
+            assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+            let state = store.read_state().unwrap();
+            assert_eq!(state.last_seq, 0, "nothing applied");
+            assert!(
+                !state
+                    .docs
+                    .contains_key(&("docs".to_string(), "a".to_string())),
+                "the batch's other op is not applied either"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_document_is_never_filled_from_the_adapter() {
+        let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::LocalCache);
+        assert_eq!(store.get_doc("__meta", "missing").unwrap(), None);
+        assert_eq!(recorder.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(store.get_doc("docs", "missing").unwrap(), Some(json!(1)));
+        assert_eq!(recorder.fetches.load(Ordering::SeqCst), 1);
+    }
 }

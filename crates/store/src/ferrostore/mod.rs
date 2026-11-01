@@ -251,9 +251,11 @@ impl FerroStore {
             .write(true)
             .open(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        ensure_superblock(&write).map_err(|err| name_store(err, path))?;
+        let initialized = ensure_superblock(&write).map_err(|err| name_store(err, path))?;
         let (_, _, state) = read_consistent(&write).map_err(|err| name_store(err, path))?;
-        if created {
+        // Also when an earlier open created the file and stopped before its
+        // first superblock: the entry is only durable once the directory is.
+        if created || initialized {
             sync_dir(&parent_dir(path))?;
         }
         if let Some(found) = doc::schema_version_in(|collection, id| {
@@ -342,11 +344,27 @@ impl FerroStore {
         }
     }
 
+    /// Put one document. A reserved collection (a name starting `__`, such as
+    /// the schema version's `__meta`) is refused: only the store's own
+    /// transactions write it.
     pub fn put_doc(&self, collection: &str, id: &str, doc: &Value) -> Result<(), StoreError> {
         self.put_doc_inner(collection, id, doc, false)
     }
 
     fn put_doc_inner(
+        &self,
+        collection: &str,
+        id: &str,
+        doc: &Value,
+        silent: bool,
+    ) -> Result<(), StoreError> {
+        doc::refuse_reserved(collection, "put_doc")?;
+        self.put_doc_unchecked(collection, id, doc, silent)
+    }
+
+    /// `put_doc` without the reserved-collection check: for tests that must
+    /// plant a store's own bookkeeping.
+    fn put_doc_unchecked(
         &self,
         collection: &str,
         id: &str,
@@ -394,7 +412,15 @@ impl FerroStore {
         self.fill_doc_miss(collection, id)
     }
 
+    /// Delete one document. A reserved collection is refused, as in
+    /// [`Self::put_doc`].
     pub fn delete_doc(&self, collection: &str, id: &str) -> Result<(), StoreError> {
+        doc::refuse_reserved(collection, "delete_doc")?;
+        self.delete_doc_unchecked(collection, id)
+    }
+
+    /// `delete_doc` without the reserved-collection check, for tests.
+    fn delete_doc_unchecked(&self, collection: &str, id: &str) -> Result<(), StoreError> {
         let collection = collection.to_string();
         let id = id.to_string();
         self.commit(move |_| Ok((Op::Delete { collection, id }, ())), false)
@@ -1302,6 +1328,10 @@ impl FerroStore {
     }
 
     fn fill_doc_miss(&self, collection: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        // The store's own bookkeeping is local: never filled from a peer.
+        if doc::is_reserved(collection) {
+            return Ok(None);
+        }
         let adapter = {
             let slot = lock_mutex(&self.sync);
             match slot.mode {
@@ -1416,6 +1446,7 @@ impl FerroStore {
         doc: &Value,
         silent: bool,
     ) -> Result<IfAbsent, StoreError> {
+        doc::refuse_reserved(collection, "put_doc")?;
         let key = (collection.to_string(), id.to_string());
         match &self.inner {
             Inner::Remote(_) => Err(backend(
@@ -1567,12 +1598,13 @@ impl FerroStore {
             let queue = slot.adapter.is_some() && slot.mode.is_some();
             let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
             if queue {
-                for batch in prepared {
-                    slot.pending.push(SyncBatch {
-                        seq: batch.seq,
-                        ops: batch.ops.iter().map(SyncOp::from_op).collect(),
-                    });
-                }
+                // `prepare_sync_batches` refused any reserved op, so no
+                // prepared batch is left empty here.
+                slot.pending.extend(
+                    prepared
+                        .iter()
+                        .filter_map(|b| outbound_batch(b.seq, &b.ops)),
+                );
             }
             (seq, flush)
         };
@@ -1591,17 +1623,16 @@ impl FerroStore {
         if committed.ops.is_empty() {
             return None;
         }
-        let batch = SyncBatch {
-            seq: committed.seq,
-            ops: committed.ops.iter().map(SyncOp::from_op).collect(),
-        };
+        let outbound = outbound_batch(committed.seq, &committed.ops);
         let mut slot = lock_mutex(&self.sync);
-        if silent {
-            if slot.is_idle() && batch.seq > slot.synced_seq {
-                slot.synced_seq = batch.seq;
+        // A commit of reserved ops only has nothing to send: it counts as
+        // synced, the same as a silent commit.
+        let Some(batch) = outbound.filter(|_| !silent) else {
+            if slot.is_idle() && committed.seq > slot.synced_seq {
+                slot.synced_seq = committed.seq;
             }
             return None;
-        }
+        };
         let adapter = slot.adapter.clone()?;
         match slot.mode {
             Some(SyncMode::WriteThrough) => {
@@ -1787,6 +1818,14 @@ fn prepare_sync_batches(
                 batch.seq
             )));
         }
+        if let Some(collection) = batch.ops.iter().find_map(reserved_collection) {
+            return Err(backend(format!(
+                "sync batch {} writes reserved collection `{collection}`: \
+                 a `{}` collection is written only by the store itself",
+                batch.seq,
+                doc::RESERVED_PREFIX
+            )));
+        }
         let ops = batch
             .ops
             .iter()
@@ -1801,6 +1840,30 @@ fn prepare_sync_batches(
         });
     }
     Ok((scratch, prepared))
+}
+
+/// The reserved collection a document op writes, if any.
+fn reserved_collection(op: &SyncOp) -> Option<&str> {
+    match op {
+        SyncOp::PutDoc { collection, .. } | SyncOp::DeleteDoc { collection, .. }
+            if doc::is_reserved(collection) =>
+        {
+            Some(collection)
+        }
+        _ => None,
+    }
+}
+
+/// The batch a commit sends to a sync adapter: its ops, less any that write a
+/// reserved collection (the store's own bookkeeping, such as the `__meta`
+/// schema version, stays local). `None` when no op is left.
+fn outbound_batch(seq: u64, ops: &[Op]) -> Option<SyncBatch> {
+    let ops: Vec<SyncOp> = ops
+        .iter()
+        .map(SyncOp::from_op)
+        .filter(|op| reserved_collection(op).is_none())
+        .collect();
+    (!ops.is_empty()).then_some(SyncBatch { seq, ops })
 }
 
 fn publish_sync_batches(
@@ -2166,31 +2229,50 @@ fn name_store(err: StoreError, path: &Path) -> StoreError {
     }
 }
 
-// No valid slot yet. Publish slot 0 only for an empty file, or when every byte
-// already in a file no longer than the header is zero. A non-zero short file
-// is not rewritten, and neither is a longer file.
-fn ensure_superblock(file: &File) -> Result<(), StoreError> {
+// No valid slot yet. Publish slot 0 only for a file that can hold nothing but
+// an `init_empty` cut short: every header byte present is zero, and the bytes
+// after the header are none, or a prefix (up to all) of the snapshot
+// `init_empty` writes. Any other file is not rewritten: it could hold real
+// data, and `read_consistent` reports it. `true` when this call ran
+// `init_empty`.
+fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
     if parsed_superblock(file)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     if parsed_superblock(file)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let len = file.metadata().map_err(io_err)?.len();
-    if len > HEADER_BYTES {
-        return Ok(());
-    }
     if len == 0 {
-        return init_empty(file);
+        init_empty(file)?;
+        return Ok(true);
     }
-    let n = usize::try_from(len).map_err(|_| backend("short file length exceeds usize"))?;
+    let header_len = len.min(HEADER_BYTES);
+    let n = usize::try_from(header_len).map_err(|_| backend("header length exceeds usize"))?;
     let mut buf = vec![0u8; n];
     file.read_exact_at(&mut buf, 0).map_err(io_err)?;
     if buf.iter().any(|byte| *byte != 0) {
-        return Ok(());
+        return Ok(false);
     }
-    init_empty(file)
+    if len > HEADER_BYTES {
+        let blob = encode_snapshot(0, &new_store_docs())?;
+        let tail_len = len - HEADER_BYTES;
+        let Ok(tail) = usize::try_from(tail_len) else {
+            return Ok(false);
+        };
+        if tail > blob.len() {
+            return Ok(false);
+        }
+        let mut held = vec![0u8; tail];
+        file.read_exact_at(&mut held, HEADER_BYTES)
+            .map_err(io_err)?;
+        if held != blob[..tail] {
+            return Ok(false);
+        }
+    }
+    init_empty(file)?;
+    Ok(true)
 }
 
 fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreError> {

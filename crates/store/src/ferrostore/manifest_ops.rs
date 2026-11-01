@@ -280,26 +280,3 @@ fn apply_import(txn: &mut Txn, m: &Manifest, root: &str, plan: &Plan) -> Result<
     }
     doc::raise_format(txn, FORMAT_WITH_IMPORTS)
 }
-
-/// Read-only views the manifest conformance suite needs, under names that
-/// cannot collide with the public API.
-#[cfg(test)]
-impl FerroStore {
-    pub(crate) fn suite_imported_hash(
-        &self,
-        project: &ProjectId,
-    ) -> Result<Option<String>, StoreError> {
-        self.with_read(|txn| {
-            doc::check_kind(txn, &self.label, project.iri(), Kind::Project)?;
-            doc::get_json(txn, IMPORTS, project.iri().as_str())
-        })
-    }
-
-    pub(crate) fn suite_holds_routing(&self) -> Result<bool, StoreError> {
-        self.with_read(|txn| Ok(doc::holds_routing(txn)))
-    }
-
-    pub(crate) fn suite_owns(&self, id: &fl_core::iri::Iri) -> Result<bool, StoreError> {
-        self.with_read(|txn| doc::owns(txn, &self.label, id))
-    }
-}
