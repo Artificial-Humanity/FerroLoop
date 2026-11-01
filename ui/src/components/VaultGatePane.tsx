@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import type {
   DeleteGateSecretResponse,
   GateBridgeSummary,
@@ -86,6 +87,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   apiClient,
 }) => {
   const isOwner = authority?.tier === "owner";
+  const activeTimeZone = useActiveTimeZone();
 
   const [internalSecrets, setInternalSecrets] = useState<VaultSecretMetadata[]>([]);
   const [internalConnectors, setInternalConnectors] = useState<GateConnectorSummary[]>([]);
@@ -406,13 +408,20 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center", fontSize: "12px", color: "var(--text-muted)" }}>
                   <span>
                     Expires:{" "}
-                    <span className="fd-mono">{secret.expires_at ?? "Never"}</span>
+                    <span className="fd-mono" title={secret.expires_at ?? undefined}>
+                      {secret.expires_at
+                        ? formatTimestamp(secret.expires_at, activeTimeZone)
+                        : "Never"}
+                    </span>
                   </span>
                   {secret.allow_private_network && (
                     <span className="fd-badge">Private network</span>
                   )}
                   <span>
-                    Updated: <span className="fd-mono">{secret.updated_at}</span>
+                    Updated:{" "}
+                    <span className="fd-mono" title={secret.updated_at}>
+                      {formatTimestamp(secret.updated_at, activeTimeZone)}
+                    </span>
                   </span>
                 </div>
               </article>

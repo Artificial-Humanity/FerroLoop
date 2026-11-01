@@ -54,6 +54,7 @@ pub(crate) struct HubConnection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Settings {
     pub theme_preference: Theme,
+    pub timezone: String,
     pub subsystems: Subsystems,
     pub notifications: Notifications,
     pub hub_connection: HubConnection,
@@ -63,6 +64,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme_preference: Theme::Dark,
+            timezone: "UTC".to_string(),
             subsystems: Subsystems {
                 ferrogate_enabled: true,
                 ferrostate_enabled: true,
@@ -88,6 +90,7 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SettingsPatch {
     pub theme_preference: Option<Theme>,
+    pub timezone: Option<String>,
     pub subsystems: Option<SubsystemsPatch>,
     pub notifications: Option<NotificationsPatch>,
     pub hub_connection: Option<HubConnectionPatch>,
@@ -121,13 +124,42 @@ fn poll_interval_in_range(secs: u64) -> bool {
     (MIN_POLL_INTERVAL_SECS..=MAX_POLL_INTERVAL_SECS).contains(&secs)
 }
 
+fn normalize_timezone(raw: &str) -> Option<String> {
+    let tz = raw.trim();
+    if tz.is_empty() || tz.len() > 64 {
+        return None;
+    }
+    if tz.eq_ignore_ascii_case("utc") {
+        return Some("UTC".to_string());
+    }
+    if tz.eq_ignore_ascii_case("local") {
+        return Some("local".to_string());
+    }
+    if tz.starts_with('/') || tz.ends_with('/') || tz.contains("..") || tz.contains("//") {
+        return None;
+    }
+    if !tz
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-' | b'/'))
+    {
+        return None;
+    }
+    Some(tz.to_string())
+}
+
 impl Settings {
-    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval is out of
-    /// range.
+    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval or timezone
+    /// is invalid.
     pub(crate) fn merged(&self, patch: SettingsPatch) -> Result<Self, String> {
         let mut next = self.clone();
         if let Some(theme) = patch.theme_preference {
             next.theme_preference = theme;
+        }
+        if let Some(ref raw_tz) = patch.timezone {
+            let Some(tz) = normalize_timezone(raw_tz) else {
+                return Err(format!("invalid timezone: {raw_tz}"));
+            };
+            next.timezone = tz;
         }
         if let Some(p) = patch.subsystems {
             let s = &mut next.subsystems;
@@ -171,6 +203,13 @@ impl Settings {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
         {
             s.theme_preference = theme;
+        }
+        if let Some(tz) = root
+            .get("timezone")
+            .and_then(Value::as_str)
+            .and_then(normalize_timezone)
+        {
+            s.timezone = tz;
         }
         let flag = |group: &str, key: &str, slot: &mut bool| {
             if let Some(b) = root
@@ -256,6 +295,7 @@ fn save(home: &Path, settings: &Settings) -> io::Result<()> {
 }
 
 /// Why `update` did not apply a patch.
+#[derive(Debug)]
 pub(crate) enum UpdateError {
     /// The patch itself is invalid (client error).
     Invalid(String),
@@ -285,6 +325,7 @@ mod tests {
             serde_json::to_value(Settings::default()).unwrap(),
             json!({
                 "theme_preference": "dark",
+                "timezone": "UTC",
                 "subsystems": {
                     "ferrogate_enabled": true,
                     "ferrostate_enabled": true,
@@ -299,6 +340,60 @@ mod tests {
                 "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
             })
         );
+    }
+
+    #[test]
+    fn timezone_validates_patches_and_falls_back_on_stored_load() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+
+        for (input, expected) in [
+            ("UTC", "UTC"),
+            ("utc", "UTC"),
+            ("local", "local"),
+            ("America/New_York", "America/New_York"),
+            (
+                "America/Argentina/Buenos_Aires",
+                "America/Argentina/Buenos_Aires",
+            ),
+            ("Etc/GMT+5", "Etc/GMT+5"),
+            ("Etc/GMT-9", "Etc/GMT-9"),
+            ("Asia/Tokyo", "Asia/Tokyo"),
+        ] {
+            let out = update(tmp.path(), patch(json!({ "timezone": input }))).unwrap();
+            assert_eq!(out.timezone, expected);
+            assert_eq!(load(tmp.path()).timezone, expected);
+        }
+
+        let before = load(tmp.path());
+        for bad in [
+            "",
+            "   ",
+            "../etc/passwd",
+            "/America/New_York",
+            "America/New_York/",
+            "America//New_York",
+            "America/New York",
+            "America/New_York;rm -rf",
+            &"A".repeat(65),
+        ] {
+            let res = update(tmp.path(), patch(json!({ "timezone": bad })));
+            assert!(matches!(res, Err(UpdateError::Invalid(_))), "bad={bad:?}");
+        }
+        assert_eq!(load(tmp.path()), before);
+
+        let path = settings_path(tmp.path());
+        for bad_stored in [
+            json!(""),
+            json!("../escape"),
+            json!("/leading/slash"),
+            json!(42),
+            json!(null),
+        ] {
+            let doc = json!({ "timezone": bad_stored });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            assert_eq!(load(tmp.path()).timezone, "UTC", "stored={bad_stored}");
+        }
     }
 
     #[test]

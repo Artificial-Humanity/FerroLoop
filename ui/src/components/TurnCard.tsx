@@ -1,3 +1,4 @@
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { isSafeInlineImageUrl, isSafeLinkUrl } from "../lib/safeUrl";
 import React from "react";
 import type { TranscriptTurn } from "../types/api";
@@ -11,6 +12,15 @@ export interface TurnCardProps {
   /** True for the latest turn while the session is busy (live thinking). */
   isActive?: boolean;
   onOpenArtifact?: (pathOrUrl: string) => void;
+  /** Consecutive tool-output turns attached to this assistant tool-call turn. */
+  attachedToolOutputs?: TranscriptTurn[];
+}
+
+export function summarizeToolOutputContent(raw: string): string {
+  const lines = raw.split("\n");
+  const exitMatch = raw.match(/Command exited with code\s+\d+/i);
+  const suffix = exitMatch ? ` · ${exitMatch[0]}` : "";
+  return `Tool / Terminal Output (${lines.length} ${lines.length === 1 ? "line" : "lines"})${suffix}`;
 }
 
 /** One-line collapsed summary for a Wire message body. */
@@ -191,11 +201,91 @@ export function extractTurnAttachments(
   return { cleanedContent, attachments };
 }
 
+export function isPureToolOutputTurn(turn: TranscriptTurn): boolean {
+  const roleNormalized = (turn.role || "assistant").toLowerCase();
+  if (roleNormalized === "tool") {
+    return true;
+  }
+  const trimmedStart = (turn.content || "").trimStart();
+  if (/^Task id "[^"]+" finished with result:/i.test(trimmedStart)) {
+    return true;
+  }
+  const shouldStripAgyWrapper =
+    roleNormalized === "user" || roleNormalized === "system";
+  const strippedForNotice = shouldStripAgyWrapper
+    ? stripAgyUserRequestWrapper(turn.content || "").trimStart()
+    : trimmedStart;
+  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(trimmedStart);
+  const looksLikeSystemNotice =
+    hasSystemNoticePrefix(trimmedStart) || hasSystemNoticePrefix(strippedForNotice);
+  const looksLikeSubagentHandback =
+    (roleNormalized === "user" || roleNormalized === "wire:subagent") &&
+    (isSubagentHandbackContent(trimmedStart) ||
+      isSubagentHandbackContent(strippedForNotice));
+  const isUser =
+    roleNormalized === "user" &&
+    !looksLikeSystemCodeDump &&
+    !looksLikeSystemNotice &&
+    !looksLikeSubagentHandback;
+  const isWire = roleNormalized.startsWith("wire:") || looksLikeSubagentHandback;
+  const isSystem =
+    roleNormalized === "system" ||
+    (roleNormalized === "user" &&
+      !looksLikeSubagentHandback &&
+      (looksLikeSystemCodeDump || looksLikeSystemNotice));
+  return (
+    !isUser &&
+    !isSystem &&
+    !isWire &&
+    trimmedStart.startsWith("Created At:") &&
+    (!turn.tool_calls || turn.tool_calls.length === 0)
+  );
+}
+
+export function isOperatorUserTurn(turn: TranscriptTurn): boolean {
+  const roleNormalized = (turn.role || "assistant").toLowerCase();
+  if (roleNormalized !== "user") {
+    return false;
+  }
+  const trimmedStart = (turn.content || "").trimStart();
+  if (/^Task id "[^"]+" finished with result:/i.test(trimmedStart)) {
+    return false;
+  }
+  const strippedForNotice = stripAgyUserRequestWrapper(turn.content || "").trimStart();
+  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(trimmedStart);
+  const looksLikeSystemNotice =
+    hasSystemNoticePrefix(trimmedStart) || hasSystemNoticePrefix(strippedForNotice);
+  const looksLikeSubagentHandback =
+    isSubagentHandbackContent(trimmedStart) || isSubagentHandbackContent(strippedForNotice);
+  return (
+    !looksLikeSystemCodeDump &&
+    !looksLikeSystemNotice &&
+    !looksLikeSubagentHandback
+  );
+}
+
+export function isWireTurn(turn: TranscriptTurn): boolean {
+  const roleNormalized = (turn.role || "assistant").toLowerCase();
+  if (roleNormalized.startsWith("wire:")) {
+    return true;
+  }
+  if (roleNormalized === "user") {
+    const trimmedStart = (turn.content || "").trimStart();
+    const strippedForNotice = stripAgyUserRequestWrapper(turn.content || "").trimStart();
+    return (
+      isSubagentHandbackContent(trimmedStart) ||
+      isSubagentHandbackContent(strippedForNotice)
+    );
+  }
+  return false;
+}
+
 export const TurnCard: React.FC<TurnCardProps> = ({
   turn,
   agentDisplayName,
   isActive = false,
   onOpenArtifact,
+  attachedToolOutputs,
 }) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
   const trimmedStart = turn.content.trimStart();
@@ -247,7 +337,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
       (!turn.tool_calls || turn.tool_calls.length === 0));
 
   const [toolOutputExpanded, setToolOutputExpanded] = React.useState(false);
+  const [expandedAttachedToolOutputs, setExpandedAttachedToolOutputs] = React.useState<
+    Record<number, boolean>
+  >({});
   const [wireExpanded, setWireExpanded] = React.useState(false);
+  const activeTimeZone = useActiveTimeZone();
   const [systemExpanded, setSystemExpanded] = React.useState(false);
   const [expandedCodeBlocks, setExpandedCodeBlocks] = React.useState<Record<number, boolean>>({});
 
@@ -319,10 +413,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   const toolOutputSummary = React.useMemo(() => {
     if (!isToolOutput) return "";
     const raw = cleanedContent || turn.content || "";
-    const lines = raw.split("\n");
-    const exitMatch = raw.match(/Command exited with code\s+\d+/i);
-    const suffix = exitMatch ? ` · ${exitMatch[0]}` : "";
-    return `Tool / Terminal Output (${lines.length} ${lines.length === 1 ? "line" : "lines"})${suffix}`;
+    return summarizeToolOutputContent(raw);
   }, [isToolOutput, cleanedContent, turn.content]);
 
   const wireSummary = React.useMemo(() => {
@@ -385,10 +476,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         {turn.created_at && (
           <time
             dateTime={turn.created_at}
+            title={turn.created_at}
             className="fd-mono"
             style={{ fontSize: "11px", color: "var(--text-dim)" }}
           >
-            {turn.created_at}
+            {formatTimestamp(turn.created_at, activeTimeZone)}
           </time>
         )}
       </header>
@@ -397,7 +489,8 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
       )}
 
-      {toolCalls.length > 0 && (
+      {(toolCalls.length > 0 ||
+        (attachedToolOutputs && attachedToolOutputs.length > 0)) && (
         <div
           data-testid={`turn-tools-${turn.index}`}
           style={{ display: "flex", flexDirection: "column", gap: "4px" }}
@@ -409,6 +502,97 @@ export const TurnCard: React.FC<TurnCardProps> = ({
               index={idx}
             />
           ))}
+
+          {attachedToolOutputs && attachedToolOutputs.length > 0 && (
+            <div
+              data-testid={`turn-attached-tool-outputs-${turn.index}`}
+              style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+            >
+              {attachedToolOutputs.map((outTurn) => {
+                const { cleanedContent: outCleaned } = extractTurnAttachments(
+                  outTurn.content,
+                  { stripAgyWrapper: false },
+                );
+                const outText = outCleaned || outTurn.content || "";
+                const outSummary = summarizeToolOutputContent(outText);
+                const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
+                return (
+                  <div
+                    key={`attached-tool-output-${outTurn.index}`}
+                    data-testid={`turn-content-${outTurn.index}`}
+                    style={{
+                      borderRadius: "var(--radius-sm)",
+                      border: "1px solid var(--border-subtle)",
+                      backgroundColor: "rgba(13, 17, 24, 0.65)",
+                      overflow: "hidden",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      data-testid={`turn-tool-output-toggle-${outTurn.index}`}
+                      aria-expanded={outExpanded}
+                      onClick={() =>
+                        setExpandedAttachedToolOutputs((prev) => ({
+                          ...prev,
+                          [outTurn.index]: !prev[outTurn.index],
+                        }))
+                      }
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        padding: "6px 10px",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--text-secondary)",
+                        cursor: "pointer",
+                        fontSize: "11px",
+                        textAlign: "left",
+                      }}
+                    >
+                      <span
+                        className="fd-mono"
+                        style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                      >
+                        <span
+                          data-testid={`turn-tool-output-arrow-${outTurn.index}`}
+                          style={{ color: "var(--status-warn, #F59E0B)" }}
+                        >
+                          {outExpanded ? "▼" : "▶"}
+                        </span>
+                        <span>{outSummary}</span>
+                      </span>
+                      <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+                        {outExpanded ? "Hide output" : "Show output"}
+                      </span>
+                    </button>
+
+                    {outExpanded && (
+                      <pre
+                        className="fd-mono"
+                        style={{
+                          margin: 0,
+                          padding: "10px 12px",
+                          borderTop: "1px solid var(--border-subtle)",
+                          fontSize: "11.5px",
+                          lineHeight: 1.45,
+                          color: "var(--text-secondary)",
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                          maxHeight: "340px",
+                          overflowY: "auto",
+                        }}
+                      >
+                        {outText}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
@@ -537,7 +721,10 @@ export const TurnCard: React.FC<TurnCardProps> = ({
             }}
           >
             <span className="fd-mono" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ color: "var(--accent-primary)" }}>
+              <span
+                data-testid={`turn-tool-output-arrow-${turn.index}`}
+                style={{ color: "var(--status-warn, #F59E0B)" }}
+              >
                 {toolOutputExpanded ? "▼" : "▶"}
               </span>
               <span>{toolOutputSummary}</span>

@@ -7068,6 +7068,7 @@ default_target = "wire:felicity"
     fn default_settings_json() -> Value {
         json!({
             "theme_preference": "dark",
+            "timezone": "UTC",
             "subsystems": {
                 "ferrogate_enabled": true,
                 "ferrostate_enabled": true,

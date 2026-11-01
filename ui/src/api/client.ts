@@ -36,6 +36,8 @@ import {
   type PruneArtifactsResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
+  type RecastAgentRequest,
+  type RecastAgentResponse,
   type SessionQueueResponse,
   type SessionTranscriptResponse,
   type SetSessionModelResponse,
@@ -81,6 +83,7 @@ import {
   type RecordsListResponse,
 } from "../types/api";
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
+import { getActiveTimeZone, normalizeTimeZone } from "../lib/datetime";
 
 export function normalizeHubSettings(
   raw: unknown,
@@ -101,6 +104,8 @@ export function normalizeHubSettings(
       ? themeRaw
       : fallback.theme_preference;
 
+  const timezone = normalizeTimeZone(obj.timezone, fallback.timezone || "UTC");
+
   const subRaw =
     obj.subsystems && typeof obj.subsystems === "object"
       ? (obj.subsystems as Record<string, unknown>)
@@ -116,6 +121,7 @@ export function normalizeHubSettings(
 
   return {
     theme_preference,
+    timezone,
     subsystems: {
       ferrogate_enabled:
         typeof subRaw.ferrogate_enabled === "boolean"
@@ -749,6 +755,19 @@ export class HubApiClient {
     return this.getLiveness(staleAfterMs);
   }
 
+  public async recastAgent(
+    nameKey: string,
+    payload: RecastAgentRequest,
+  ): Promise<RecastAgentResponse> {
+    return this.request<RecastAgentResponse>(
+      `/api/v1/agents/${encodeURIComponent(nameKey.trim().toLowerCase())}/recast`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
   public async getSessions(): Promise<{ sessions: DiscoveredSessionSummary[] }> {
     return this.request<{ sessions: DiscoveredSessionSummary[] }>("/api/v1/sessions");
   }
@@ -1287,7 +1306,10 @@ export class HubApiClient {
 
   public async getSettings(): Promise<HubSettings> {
     const raw = await this.request<unknown>("/api/v1/settings");
-    return normalizeHubSettings(raw, DEFAULT_HUB_SETTINGS);
+    return normalizeHubSettings(raw, {
+      ...DEFAULT_HUB_SETTINGS,
+      timezone: getActiveTimeZone(),
+    });
   }
 
   public async updateSettings(
@@ -1842,4 +1864,12 @@ export async function listSlashCommands(
   client?: HubApiClient,
 ): Promise<{ commands: SlashCommandEntry[] }> {
   return (client ?? new HubApiClient()).listSlashCommands();
+}
+
+export async function recastAgent(
+  nameKey: string,
+  payload: RecastAgentRequest,
+  client?: HubApiClient,
+): Promise<RecastAgentResponse> {
+  return (client ?? new HubApiClient()).recastAgent(nameKey, payload);
 }
