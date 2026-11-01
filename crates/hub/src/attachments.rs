@@ -274,8 +274,8 @@ const MANUAL_PRUNE_WAIT: Duration = Duration::from_secs(5);
 /// however young: that includes one an in-flight upload has just written and one a queued
 /// (`send_now: false`) prompt still refers to by path. Deleted attachments break their image
 /// links in old chat transcripts. Waits up to 5 s for a running sweep, then `409`. Returns
-/// `{ "report", "older_than_days", "retention_disabled" }` and broadcasts `attachments.pruned`
-/// on the `attachments` channel.
+/// `{ "deleted_count", "deleted_bytes", "kept_count", "older_than_days", "retention_disabled" }`
+/// (flat) and broadcasts `attachments.pruned` on the `attachments` channel.
 pub(crate) fn handle_post_attachments_prune(
     state: &HubState,
     authority: &HubAuthority,
@@ -383,7 +383,9 @@ pub(crate) fn prune_attachments_waiting(
         }
     };
     let data = json!({
-        "report": report,
+        "deleted_count": report.deleted_count,
+        "deleted_bytes": report.deleted_bytes,
+        "kept_count": report.kept_count,
         "older_than_days": older_than_days,
         "retention_disabled": older_than_days.is_none(),
     });

@@ -7463,7 +7463,9 @@ default_target = "wire:felicity"
         assert_eq!(
             body,
             json!({
-                "report": { "deleted_count": 0, "deleted_bytes": 0, "kept_count": 3 },
+                "deleted_count": 0,
+                "deleted_bytes": 0,
+                "kept_count": 3,
                 "older_than_days": 30,
                 "retention_disabled": false,
             })
@@ -7496,7 +7498,9 @@ default_target = "wire:felicity"
         assert_eq!(
             resp.json_value().unwrap(),
             json!({
-                "report": { "deleted_count": 0, "deleted_bytes": 0, "kept_count": 2 },
+                "deleted_count": 0,
+                "deleted_bytes": 0,
+                "kept_count": 2,
                 "older_than_days": null,
                 "retention_disabled": true,
             })
@@ -7504,10 +7508,16 @@ default_target = "wire:felicity"
         assert!(five.exists() && one.exists());
 
         let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":3}"#);
+        let body = resp.json_value().unwrap();
         assert_eq!(
-            resp.json_value().unwrap()["report"],
-            json!({ "deleted_count": 1, "deleted_bytes": 5, "kept_count": 1 })
+            (
+                body["deleted_count"].clone(),
+                body["deleted_bytes"].clone(),
+                body["kept_count"].clone()
+            ),
+            (json!(1), json!(5), json!(1))
         );
+        assert!(body.get("report").is_none());
         assert!(!five.exists() && one.exists());
 
         // 0 purges everything, however young.
@@ -7515,8 +7525,8 @@ default_target = "wire:felicity"
         let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":0}"#);
         let body = resp.json_value().unwrap();
         assert_eq!(body["older_than_days"], 0);
-        assert_eq!(body["report"]["deleted_count"], 2);
-        assert_eq!(body["report"]["kept_count"], 0);
+        assert_eq!(body["deleted_count"], 2);
+        assert_eq!(body["kept_count"], 0);
         assert_eq!(
             fs::read_dir(tmp.path().join("attachments"))
                 .unwrap()
@@ -7708,7 +7718,7 @@ default_target = "wire:felicity"
             // An explicit age still works.
             let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":7}"#);
             assert_eq!(resp.status, 200, "{label}: {}", error_text(&resp));
-            assert_eq!(resp.json_value().unwrap()["report"]["deleted_count"], 1);
+            assert_eq!(resp.json_value().unwrap()["deleted_count"], 1);
             assert!(!old.exists(), "{label}");
         }
     }
@@ -7742,9 +7752,14 @@ default_target = "wire:felicity"
 
         let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":0}"#);
         assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
         assert_eq!(
-            resp.json_value().unwrap()["report"],
-            json!({ "deleted_count": 0, "deleted_bytes": 0, "kept_count": 2 })
+            (
+                body["deleted_count"].clone(),
+                body["deleted_bytes"].clone(),
+                body["kept_count"].clone()
+            ),
+            (json!(0), json!(0), json!(2))
         );
         assert_eq!(fs::read(&notes).unwrap(), b"notes");
         assert_eq!(fs::read(&readme).unwrap(), b"readme");

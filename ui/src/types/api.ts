@@ -188,6 +188,8 @@ export interface PruneAttachmentsResponse {
   deleted_count: number;
   deleted_bytes: number;
   kept_count: number;
+  older_than_days?: number | null;
+  retention_disabled?: boolean;
 }
 
 export interface HubSettings {
