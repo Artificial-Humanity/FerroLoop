@@ -2,6 +2,7 @@
 //! See `docs/ferrostore-spec.md`.
 
 mod columnar;
+mod compact;
 mod compat;
 mod container_io;
 mod doc;
@@ -30,6 +31,8 @@ mod tests;
 mod tests_cache;
 #[cfg(test)]
 mod tests_checkpoint;
+#[cfg(test)]
+mod tests_compact;
 #[cfg(test)]
 mod tests_cow;
 #[cfg(test)]
@@ -68,6 +71,7 @@ pub use columnar::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
     GateRunRollup, ZoneMap,
 };
+pub use compact::{AUTO_COMPACT_BYTES, StoreStats};
 pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
@@ -106,11 +110,78 @@ impl Drop for FlockGuard<'_> {
     }
 }
 
+/// `(dev, ino)`: which file a description reads, or a path names.
+type FileId = (u64, u64);
+
+/// One open description of the store file and the file it reads.
+#[derive(Clone)]
+struct Descriptor {
+    file: Arc<dyn ContainerIo>,
+    /// `(dev, ino)` of `file`, read once (`fstat`) when it was opened.
+    id: FileId,
+    /// The write description only: this handle made the directory entry
+    /// that names `file` durable (spec §5). `false` for a description opened
+    /// on a file that already existed (`open`, or a reopen after a swap):
+    /// another handle may have renamed it into place and failed its
+    /// directory sync, so after a crash the path could name the file before
+    /// it again. [`Disk::lock_current`] syncs the directory before the first
+    /// write through such a description. A read description never needs it.
+    name_durable: bool,
+}
+
+impl Descriptor {
+    fn new(file: Box<dyn ContainerIo>, path: &Path) -> Result<Self, StoreError> {
+        let file: Arc<dyn ContainerIo> = Arc::from(file);
+        let id = file
+            .file_id()
+            .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
+        Ok(Self {
+            file,
+            id,
+            name_durable: false,
+        })
+    }
+}
+
+/// The exclusive `flock` of one description, held until dropped. It owns
+/// the description, so the slot it came from can be swapped to another file
+/// (spec §5) while the lock is still held.
+struct HeldFlock {
+    file: Arc<dyn ContainerIo>,
+    /// `(dev, ino)` of `file`, which the path named once the lock was taken.
+    id: FileId,
+}
+
+impl HeldFlock {
+    fn acquire(descriptor: &Descriptor) -> Result<Self, StoreError> {
+        descriptor
+            .file
+            .lock_exclusive()
+            .map_err(|err| backend(format!("exclusive flock failed: {err}")))?;
+        Ok(Self {
+            file: Arc::clone(&descriptor.file),
+            id: descriptor.id,
+        })
+    }
+
+    fn file(&self) -> &dyn ContainerIo {
+        &*self.file
+    }
+}
+
+impl Drop for HeldFlock {
+    fn drop(&mut self) {
+        self.file.unlock();
+    }
+}
+
 enum Inner {
     /// The live state. A reader clones the `Arc`; a commit replaces it
     /// copy-on-write, so a reader's view never changes under it.
     Memory(Mutex<Arc<DocState>>),
-    Disk(Disk),
+    /// Boxed: a disk handle's descriptions, cache and group are much larger
+    /// than the other variants.
+    Disk(Box<Disk>),
     Remote(server::RemoteClient),
 }
 
@@ -177,14 +248,24 @@ enum SeqCommit {
 
 /// The two descriptions of one `.fls` file. Production holds `File`s; the
 /// crash harness holds simulated files (`container_io`, `crash_sim`).
+///
+/// Both descriptions are swappable (spec §5): a compaction renames a new
+/// file over the path, and every handle, this one or another process's,
+/// moves to it once it sees `stat(path)` differ from its description
+/// ([`Self::lock_current`] for a writer, [`Self::current_read`] for a
+/// reader). A description that is swapped out is closed only when its last
+/// user drops it, so a reader already reading the old file finishes on it.
 struct Disk {
-    write: Mutex<Box<dyn ContainerIo>>,
-    /// `(dev, ino)` of `write`, taken once at open.
-    write_id: (u64, u64),
-    /// Separate `O_RDONLY` description. Reads never flock it.
-    read: Box<dyn ContainerIo>,
-    /// `(dev, ino)` of `read`, taken once at open.
-    read_id: (u64, u64),
+    /// The file system the store lives on, to reopen the path after a swap.
+    fs: Arc<dyn ContainerFs>,
+    path: PathBuf,
+    /// The read-write description every commit and checkpoint goes through.
+    /// Swapped only with this mutex held, which every writer holds anyway.
+    write: Mutex<Descriptor>,
+    /// Separate `O_RDONLY` description. Reads never flock it. The mutex is
+    /// held only to clone or swap the `Arc`, never across file I/O, so a read
+    /// stays free of any lock a writer holds.
+    read: Mutex<Descriptor>,
     /// The last state this handle loaded or committed (spec §4.1). The mutex
     /// is held only to clone, take or swap the `Arc`, never across file I/O.
     cache: Mutex<Option<Arc<DiskCache>>>,
@@ -198,10 +279,18 @@ struct Disk {
     /// another threshold ([`checkpoint_due`]). Written only with the write
     /// mutex held.
     checkpoint_failed_at: AtomicU64,
+    /// The dead bytes at which the last auto-compaction failed, or 0: the
+    /// same back-off as [`Self::checkpoint_failed_at`], for compaction
+    /// (spec §5, [`compact::compact_due`]). Written only with the write
+    /// mutex held.
+    compact_failed_at: AtomicU64,
     /// [`AUTO_CHECKPOINT_BYTES`], lowered by a test so a small workload
     /// crosses it.
     #[cfg(test)]
     auto_checkpoint_floor: std::sync::atomic::AtomicU64,
+    /// [`AUTO_COMPACT_BYTES`], lowered by a test.
+    #[cfg(test)]
+    auto_compact_floor: std::sync::atomic::AtomicU64,
 }
 
 /// The WAL length a commit's auto-checkpoint (spec §4.4) never fires at or
@@ -258,9 +347,24 @@ impl Poison {
     /// itself reports the I/O error.
     fn sync_data(&self, file: &dyn ContainerIo) -> Result<(), StoreError> {
         file.sync_data().map_err(|err| {
-            self.set.store(true, Ordering::Release);
+            self.mark();
             io_err(err)
         })
+    }
+
+    /// [`Self::sync_data`] with `sync_all`, for a file that was just created
+    /// (a compaction's sibling, spec §5).
+    fn sync_all(&self, file: &dyn ContainerIo) -> Result<(), StoreError> {
+        file.sync_all().map_err(|err| {
+            self.mark();
+            io_err(err)
+        })
+    }
+
+    /// Poison the handle: a sync failed. A compaction's directory sync is
+    /// one (spec §5).
+    fn mark(&self) {
+        self.set.store(true, Ordering::Release);
     }
 }
 
@@ -290,14 +394,15 @@ impl Disk {
     /// slot it was published in, for a writer: the caller holds the `flock`,
     /// so the slots cannot change under the read and name the newest state.
     /// Reads the two slots, then [`Self::advance`]s the cache to them.
+    ///
+    /// The caller took the `flock` through [`Self::lock_current`], which
+    /// checked that the path still names `file` (spec §5): a compaction
+    /// cannot swap the file while the lock is held, so `file` is the store.
     fn refresh(
         &self,
         file: &dyn ContainerIo,
-        file_id: (u64, u64),
+        file_id: FileId,
     ) -> Result<(usize, Arc<DiskCache>), StoreError> {
-        // Spec §5 hook: once compaction can swap the inode under the path,
-        // this also compares `stat(path)` with `file_id` and reopens on a
-        // difference, before the cache is trusted.
         let cached = lock_mutex(&self.cache).clone();
         let (index, sb) = latest_superblock(file)?;
         debug_assert!(
@@ -316,11 +421,11 @@ impl Disk {
     /// slot 0 and starts a write of slot 1, and the reader's slot 1 read is
     /// torn. It then falls back to the slot 0 it read first, which can be
     /// older than a state this handle already holds. That older state is
-    /// never returned: when the cache holds a state of the same file at a
-    /// later epoch, the cache is the answer. It is a whole published state,
-    /// and its extents are still valid, because no extent is reused before
-    /// §5 compaction. §5 must keep this true: it swaps the file, which the
-    /// identity check catches, and never reuses an extent of the live inode.
+    /// never returned: when the cache holds a state at a later epoch, the
+    /// cache is the answer. It is a whole published state, and its extents
+    /// are still valid: no extent of a file is ever reused, and a §5
+    /// compaction writes a new file instead, which a handle that still holds
+    /// the old one's description goes on reading until it drops it.
     ///
     /// So a handle's reads never go back: each returns the cache it started
     /// from or a later state, and the cache only moves forward
@@ -331,21 +436,143 @@ impl Disk {
     ///
     /// A poisoned handle (see [`Poison`]) reads only its cache: after a failed
     /// sync the page cache may not match the disk.
+    ///
+    /// Before the slots are read, the read description is checked against
+    /// the path ([`Self::current_read`], spec §5): after a compaction the
+    /// path names a new file, and the read moves to it. A cached state of
+    /// the file just read at a later epoch is still the answer; a cached
+    /// state of another file is not, whatever its epoch: the file the path
+    /// names is read and replaces it, so a file put in place at a lower
+    /// epoch is seen at once ([`install_newer`]). A compaction's new file
+    /// starts at the old file's last epoch + 1, so across a compaction the
+    /// epoch rises too.
     fn refresh_read(&self) -> Result<Arc<DiskCache>, StoreError> {
+        Ok(self.refresh_read_on()?.0)
+    }
+
+    /// [`Self::refresh_read`], and the read description it read through.
+    fn refresh_read_on(&self) -> Result<(Arc<DiskCache>, Descriptor), StoreError> {
         let cached = lock_mutex(&self.cache).clone();
         if self.poison.is_set()
             && let Some(cached) = cached
         {
-            return Ok(cached);
+            let read = lock_mutex(&self.read).clone();
+            return Ok((cached, read));
         }
-        let (_, sb) = latest_superblock(&*self.read)?;
+        let read = self.current_read()?;
+        let (_, sb) = latest_superblock(&*read.file)?;
+        // A later epoch of the same file: the slot read fell back past a torn
+        // slot. A state of another file is no answer here: the path names
+        // the file just read ([`install_newer`]).
         if let Some(held) = &cached
-            && held.file_id == self.read_id
+            && held.file_id == read.id
             && held.sb.epoch > sb.epoch
         {
-            return Ok(Arc::clone(held));
+            return Ok((Arc::clone(held), read));
         }
-        self.advance(&*self.read, self.read_id, cached, sb)
+        let fresh = self.advance(&*read.file, read.id, cached, sb)?;
+        Ok((fresh, read))
+    }
+
+    /// The read description, moved to the file the path names now when a
+    /// compaction swapped it (spec §5): `stat(path)` is compared with the
+    /// description's `(dev, ino)`, and on a difference the path is opened
+    /// again. The swap is made only while the slot still holds the
+    /// description this call started from; a reader still using the old
+    /// description finishes on it.
+    ///
+    /// Nothing at the path is no swap: a compaction's rename replaces the
+    /// name in one step, so there is no newer file to move to, and the read
+    /// goes on through the file the description holds. A writer refuses it
+    /// ([`Self::lock_current`]): a commit into an unlinked file is lost.
+    fn current_read(&self) -> Result<Descriptor, StoreError> {
+        let held = lock_mutex(&self.read).clone();
+        let at_path = match self.fs.stat_id(&self.path) {
+            Ok(id) => id,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(held),
+            Err(err) => {
+                return Err(backend(format!("stat {}: {err}", self.path.display())));
+            }
+        };
+        if at_path == held.id {
+            return Ok(held);
+        }
+        let opened = self
+            .fs
+            .open_ro(&self.path)
+            .map_err(|err| backend(format!("open {}: {err}", self.path.display())))?;
+        let fresh = Descriptor::new(opened, &self.path)?;
+        let mut slot = lock_mutex(&self.read);
+        if Arc::ptr_eq(&slot.file, &held.file) {
+            *slot = fresh.clone();
+        }
+        Ok(fresh)
+    }
+
+    /// `(dev, ino)` of the file the store's path names now.
+    fn stat_path(&self) -> Result<FileId, StoreError> {
+        self.fs
+            .stat_id(&self.path)
+            .map_err(|err| backend(format!("stat {}: {err}", self.path.display())))
+    }
+
+    /// Take the `flock` on the file the path names now (spec §5): lock
+    /// `write`'s description, then compare `stat(path)` with it. When a
+    /// compaction swapped the file, unlock, reopen the path for both the
+    /// write and the read description, and try again. Without this, a
+    /// writer that waited on the old file's lock through the rename would
+    /// commit into the unlinked file and its write would be lost.
+    ///
+    /// The caller holds the write mutex, whose `write` this is. Once this
+    /// returns, no compaction can swap the file until the lock is dropped:
+    /// a compactor takes the same lock, on the same file, first.
+    ///
+    /// Every caller is a writer, so this is also where a handle makes the
+    /// name of the file it writes durable (spec §5): a handle never commits
+    /// into a file whose directory entry it has not itself made durable. A
+    /// compactor whose directory sync failed after its rename leaves the
+    /// path naming a file whose name a crash can still take back (to the
+    /// old, unlinked file, without every commit made into the new one). So
+    /// before the first write through a description that is not
+    /// [`Descriptor::name_durable`], under the lock and once the path is
+    /// known to name it, the directory is synced. A failure refuses the
+    /// write and poisons the handle, as every failed sync does ([`Poison`]):
+    /// after a failed `fsync` a later one can return success without the
+    /// entry having reached the disk, so no retry is trusted.
+    fn lock_current(&self, write: &mut Descriptor) -> Result<HeldFlock, StoreError> {
+        loop {
+            let held = HeldFlock::acquire(write)?;
+            if self.stat_path()? == write.id {
+                if !write.name_durable {
+                    self.fs.sync_dir(&parent_dir(&self.path)).map_err(|err| {
+                        self.poison.mark();
+                        backend(format!(
+                            "{} was not written: its directory entry could not be made \
+                                 durable before the first write through this handle, so a \
+                                 crash could lose the write: {err}",
+                            self.path.display()
+                        ))
+                    })?;
+                    write.name_durable = true;
+                }
+                return Ok(held);
+            }
+            drop(held);
+            self.reopen(write)?;
+        }
+    }
+
+    /// Open the path again for writes (into `write`) and reads (into the read
+    /// slot), after a compaction swapped the file under it. The new write
+    /// description is not [`Descriptor::name_durable`]: another handle made
+    /// the name.
+    fn reopen(&self, write: &mut Descriptor) -> Result<(), StoreError> {
+        let open_err = |err: io::Error| backend(format!("open {}: {err}", self.path.display()));
+        let rw = self.fs.open_rw(&self.path).map_err(open_err)?;
+        *write = Descriptor::new(rw, &self.path)?;
+        let ro = self.fs.open_ro(&self.path).map_err(open_err)?;
+        *lock_mutex(&self.read) = Descriptor::new(ro, &self.path)?;
+        Ok(())
     }
 
     /// The state `sb`, read through `file`, from `cached`:
@@ -393,7 +620,12 @@ impl Disk {
         {
             return Ok(Arc::clone(held));
         }
-        install_newer(&mut slot, Arc::clone(&fresh));
+        // The file the path names, as the last swap check found it. Taken
+        // under the cache mutex (never the other way round), so the
+        // compaction that moved it has either installed its state already
+        // or installs after this one.
+        let current = lock_mutex(&self.read).id;
+        install_newer(&mut slot, Arc::clone(&fresh), current);
         Ok(fresh)
     }
 
@@ -522,6 +754,9 @@ impl Disk {
         } else {
             new_sb.wal_length
         };
+        // The file the publish went to: `base` was read or written through
+        // the same locked description.
+        let file_id = base.file_id;
         let mut slot = lock_mutex(&self.cache);
         if !torn && slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
             *slot = None;
@@ -538,13 +773,14 @@ impl Disk {
             Change::State(state) => state,
         };
         let entry = Arc::new(DiskCache {
-            file_id: self.write_id,
+            file_id,
             sb: new_sb,
             state,
             wal_applied,
         });
         if !torn {
-            install_newer(&mut slot, Arc::clone(&entry));
+            // The writer checked under the `flock` that the path names it.
+            install_newer(&mut slot, Arc::clone(&entry), file_id);
         }
         entry
     }
@@ -559,26 +795,50 @@ impl Disk {
         floor
     }
 
+    /// [`AUTO_COMPACT_BYTES`]: the dead bytes an auto-compaction never fires
+    /// at or below (a test may lower it).
+    fn auto_compact_floor(&self) -> u64 {
+        #[cfg(test)]
+        let floor = self.auto_compact_floor.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let floor = AUTO_COMPACT_BYTES;
+        floor
+    }
+
     /// Install a checkpoint's result: the same state, a new superblock.
     fn install_checkpoint(&self, base: &DiskCache, new_sb: Superblock) {
         let entry = DiskCache {
-            file_id: self.write_id,
+            file_id: base.file_id,
             sb: new_sb,
             state: Arc::clone(&base.state),
             wal_applied: 0,
         };
-        install_newer(&mut lock_mutex(&self.cache), Arc::new(entry));
+        let current = entry.file_id;
+        install_newer(&mut lock_mutex(&self.cache), Arc::new(entry), current);
     }
 }
 
-/// Put `fresh` in the cache unless the cache already holds a state of this
-/// file at the same or a later epoch: a slow refresh never replaces a newer
-/// install. A state of another file always replaces it (spec §5 makes the
-/// newer file the only one a refresh reads).
-fn install_newer(slot: &mut Option<Arc<DiskCache>>, fresh: Arc<DiskCache>) {
+/// Put `fresh` in the cache when it is newer than what the cache holds.
+/// `current` is `(dev, ino)` of the file the path names, as this handle
+/// last found it (its read description, which every swap check moves).
+///
+/// - The same file: the later epoch wins, so a slow refresh never replaces
+///   a newer install.
+/// - Another file: the file the path names wins, whatever the epochs. A
+///   state of the current file replaces a state of any other file, so a
+///   file put in place at a *lower* epoch (a restore by rename, a file
+///   replaced by hand) is read as soon as a refresh finds it. A state of a
+///   file the path no longer names (a slow read through a description
+///   cloned before the swap) never replaces a state of the current one.
+///   When neither is the current file, the later epoch wins: along a
+///   compacted path's history the epoch only rises (spec §5).
+fn install_newer(slot: &mut Option<Arc<DiskCache>>, fresh: Arc<DiskCache>, current: FileId) {
     let replace = match slot.as_ref() {
         None => true,
-        Some(held) => held.file_id != fresh.file_id || fresh.sb.epoch > held.sb.epoch,
+        Some(held) if held.file_id == fresh.file_id => fresh.sb.epoch > held.sb.epoch,
+        Some(_) if fresh.file_id == current => true,
+        Some(held) if held.file_id == current => false,
+        Some(held) => fresh.sb.epoch > held.sb.epoch,
     };
     if replace {
         *slot = Some(fresh);
@@ -874,22 +1134,32 @@ impl FerroStore {
 
     /// [`Self::open`] through `fs`. Production passes [`RealFs`]; the crash
     /// harness passes its simulated disk.
-    fn open_with(fs: &dyn ContainerFs, path: &Path) -> Result<Self, StoreError> {
-        let created = fs.create_store_file(path)?;
+    ///
+    /// `path` is resolved once, after the file exists ([`ContainerFs::resolve`]):
+    /// every later operation on a name (the swap check, a compaction's
+    /// sibling, its rename and directory sync, the sweep of stale temps) is
+    /// made on the file's real path, in its own directory, so a store opened
+    /// through a symlink compacts in place and the link goes on naming it.
+    /// The handle's label stays `path` as given.
+    fn open_with(fs: &dyn ContainerFs, given: &Path) -> Result<Self, StoreError> {
+        let created = fs.create_store_file(given)?;
+        let resolved = fs.resolve(given)?;
+        let path = resolved.as_path();
         let write = fs
             .open_rw(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, path))?;
-        let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, path))?;
-        let write_id = write
-            .file_id()
-            .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
-        let seed = load_full(&*write, write_id, sb).map_err(|err| name_store(err, path))?;
+        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, given))?;
+        let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, given))?;
+        let mut write = Descriptor::new(write, path)?;
+        let seed = load_full(&*write.file, write.id, sb).map_err(|err| name_store(err, given))?;
         let state = &seed.state;
         // Also when an earlier open created the file and stopped before its
         // first superblock: the entry is only durable once the directory is.
+        // Any other open did not make the name, so its first write syncs the
+        // directory ([`Disk::lock_current`]).
         if created || initialized {
             fs.sync_dir(&parent_dir(path))?;
+            write.name_durable = true;
         }
         if let Some(found) =
             doc::schema_version_in(|collection, id| state.docs.get(collection, id).cloned())?
@@ -900,23 +1170,24 @@ impl FerroStore {
         let read = fs
             .open_ro(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        let read_id = read
-            .file_id()
-            .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
+        let read = Descriptor::new(read, path)?;
         Ok(Self::assemble(
-            Inner::Disk(Disk {
+            Inner::Disk(Box::new(Disk {
+                fs: fs.shared(),
+                path: resolved.clone(),
                 write: Mutex::new(write),
-                write_id,
-                read,
-                read_id,
+                read: Mutex::new(read),
                 cache: Mutex::new(Some(Arc::new(seed))),
                 group: group::Group::default(),
-                poison: Poison::new(path),
+                poison: Poison::new(given),
                 checkpoint_failed_at: AtomicU64::new(0),
+                compact_failed_at: AtomicU64::new(0),
                 #[cfg(test)]
                 auto_checkpoint_floor: std::sync::atomic::AtomicU64::new(AUTO_CHECKPOINT_BYTES),
-            }),
-            path.display().to_string(),
+                #[cfg(test)]
+                auto_compact_floor: std::sync::atomic::AtomicU64::new(AUTO_COMPACT_BYTES),
+            })),
+            given.display().to_string(),
         ))
     }
 
@@ -986,16 +1257,68 @@ impl FerroStore {
         disk.auto_checkpoint_floor.store(bytes, Ordering::Relaxed);
     }
 
+    /// Lower (or raise) this disk handle's auto-compaction floor
+    /// ([`AUTO_COMPACT_BYTES`]). `u64::MAX` turns auto-compaction off.
+    #[cfg(test)]
+    pub(super) fn set_auto_compact_floor(&self, bytes: u64) {
+        let Inner::Disk(disk) = &self.inner else {
+            panic!("auto-compaction is a disk handle's");
+        };
+        disk.auto_compact_floor.store(bytes, Ordering::Relaxed);
+    }
+
     /// Write a snapshot of the current state and start an empty WAL (spec
     /// §4.4), so a later open replays nothing. A commit also does this on
     /// its own once the WAL is longer than `max(snapshot_length, 4 MiB)`.
-    /// `mem://` writes nothing.
+    /// A checkpoint that leaves the file more than half dead and the dead
+    /// bytes over [`AUTO_COMPACT_BYTES`] is followed by a compaction
+    /// ([`Self::compact`]), in a lock window of its own. `mem://` writes
+    /// nothing.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         self.refuse_reentry()?;
         match &self.inner {
             Inner::Remote(remote) => remote.call_unit("checkpoint", json!({})),
             Inner::Memory(_) => Ok(()),
             Inner::Disk(disk) => checkpoint_disk(disk),
+        }
+    }
+
+    /// Rewrite the store as a new file holding one snapshot of the current
+    /// state and an empty WAL, and rename it over the old one (spec §5):
+    /// every extent an earlier checkpoint left dead is gone. Other handles,
+    /// in this process or another, move to the new file at their next
+    /// commit or read; a read already reading the old file finishes on it.
+    /// The new file's epoch is the old file's current epoch + 1, and
+    /// `last_seq` is kept. A failure before the rename leaves the old file
+    /// as it was and removes the new one; a failed `fsync` poisons the
+    /// handle (see [`Self::checkpoint`]). `mem://` is a no-op; a remote
+    /// handle asks its server.
+    pub fn compact(&self) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
+        match &self.inner {
+            Inner::Remote(remote) => remote.call_unit("compact", json!({})),
+            Inner::Memory(_) => Ok(()),
+            Inner::Disk(disk) => compact::compact_disk(disk),
+        }
+    }
+
+    /// The container's size accounting (see [`StoreStats`]), read without a
+    /// lock, as a read is. `mem://` has no file: every byte count is 0 and
+    /// the epoch is 0. A remote handle does not serve it.
+    pub fn stats(&self) -> Result<StoreStats, StoreError> {
+        self.refuse_reentry()?;
+        match &self.inner {
+            Inner::Remote(_) => Err(backend(
+                "a remote FerroStore does not serve stats: read them on the server",
+            )),
+            Inner::Memory(state) => Ok(StoreStats {
+                file_bytes: 0,
+                live_bytes: 0,
+                dead_bytes: 0,
+                epoch: 0,
+                last_seq: lock_mutex(state).last_seq,
+            }),
+            Inner::Disk(disk) => compact::stats(disk),
         }
     }
 
@@ -2166,15 +2489,16 @@ impl FerroStore {
             }
             Inner::Disk(disk) => {
                 let due = {
-                    let file = lock_mutex(&disk.write);
+                    let mut write = lock_mutex(&disk.write);
                     // Reads go on on a poisoned handle (see [`Poison`]): the
                     // adapter's document is returned, and not stored. Every
                     // sync is made under the write mutex, so this is exact.
                     if disk.poison.is_set() {
                         return Ok(Some(fetched));
                     }
-                    let _locked = FlockGuard::acquire(&**file)?;
-                    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+                    let locked = disk.lock_current(&mut write)?;
+                    let file = locked.file();
+                    let (index, base) = disk.refresh(file, locked.id)?;
                     let state = &base.state;
                     let mut sync = lock_mutex(&self.sync);
                     if !sync.is_idle() {
@@ -2190,7 +2514,7 @@ impl FerroStore {
                     };
                     let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                    let published = disk.publish_or_settle(&**file, index, &base, &[frame])?;
+                    let published = disk.publish_or_settle(file, index, &base, &[frame])?;
                     let due = match published {
                         Some(new_sb) => {
                             let done =
@@ -2755,16 +3079,17 @@ fn publish_sync_batches(
             Ok((seq, prepared, false))
         }
         Inner::Disk(disk) => {
-            let file = lock_mutex(&disk.write);
+            let mut write = lock_mutex(&disk.write);
             disk.poison.check()?;
-            let _locked = FlockGuard::acquire(&**file)?;
-            let (index, base) = disk.refresh(&**file, disk.write_id)?;
+            let locked = disk.lock_current(&mut write)?;
+            let file = locked.file();
+            let (index, base) = disk.refresh(file, locked.id)?;
             let (overlay, seq, prepared) = prepare_sync_batches(&base.state, batches)?;
             let mut frames = Vec::with_capacity(prepared.len());
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            let due = match disk.publish_or_settle(&**file, index, &base, &frames)? {
+            let due = match disk.publish_or_settle(file, index, &base, &frames)? {
                 Some(new_sb) => {
                     let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
                     checkpoint_due(disk, &done)
@@ -2841,13 +3166,20 @@ fn file_uri_path(rest: &str) -> String {
 
 /// Runs alone, not in a group (spec §4.3): it writes a new snapshot and
 /// starts an empty WAL, so there is nothing to batch. The write mutex keeps it
-/// apart from every group.
+/// apart from every group. A compaction the checkpoint makes due runs once
+/// its locks are released ([`compact::auto_compact`]).
 fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
-    let file = lock_mutex(&disk.write);
-    disk.poison.check()?;
-    let _locked = FlockGuard::acquire(&**file)?;
-    let (index, base) = disk.refresh(&**file, disk.write_id)?;
-    checkpoint_locked(disk, &**file, index, &base)
+    let compact_due = {
+        let mut write = lock_mutex(&disk.write);
+        disk.poison.check()?;
+        let locked = disk.lock_current(&mut write)?;
+        let (index, base) = disk.refresh(locked.file(), locked.id)?;
+        checkpoint_locked(disk, locked.file(), index, &base)?
+    };
+    if compact_due {
+        compact::auto_compact(disk);
+    }
+    Ok(())
 }
 
 /// Spec §4.4: whether the state `base` is due an auto-checkpoint: its WAL is
@@ -2885,34 +3217,46 @@ fn checkpoint_due(disk: &Disk, base: &DiskCache) -> bool {
 /// again once the WAL has grown by another threshold. Only the first failure
 /// of a run of failures is reported on stderr; a checkpoint that succeeds
 /// ends the run.
+///
+/// A checkpoint that leaves the file due a compaction (spec §5) is followed
+/// by one, in yet another lock window ([`compact::auto_compact`]).
 fn auto_checkpoint(disk: &Disk) {
-    let file = lock_mutex(&disk.write);
-    if disk.poison.is_set() {
-        return;
-    }
-    let mut wal = None;
-    let result = (|| -> Result<(), StoreError> {
-        let _locked = FlockGuard::acquire(&**file)?;
-        let (index, base) = disk.refresh(&**file, disk.write_id)?;
-        if !checkpoint_due(disk, &base) {
-            return Ok(());
+    let (compact_due, warning) = {
+        let mut write = lock_mutex(&disk.write);
+        if disk.poison.is_set() {
+            return;
         }
-        wal = Some(base.sb.wal_length);
-        checkpoint_locked(disk, &**file, index, &base)
-    })();
-    let Err(err) = result else {
-        return;
+        let mut wal = None;
+        let result = (|| -> Result<bool, StoreError> {
+            let locked = disk.lock_current(&mut write)?;
+            let (index, base) = disk.refresh(locked.file(), locked.id)?;
+            if !checkpoint_due(disk, &base) {
+                return Ok(false);
+            }
+            wal = Some(base.sb.wal_length);
+            checkpoint_locked(disk, locked.file(), index, &base)
+        })();
+        match result {
+            Ok(due) => (due, None),
+            // A refresh that failed before the WAL was read: the length the
+            // commit left is not known here, and the next due commit tries
+            // again.
+            Err(err) => match wal {
+                None => return,
+                Some(wal) => {
+                    let first = disk.checkpoint_failed_at.load(Ordering::Acquire) == 0;
+                    disk.checkpoint_failed_at
+                        .store(wal.max(1), Ordering::Release);
+                    (false, first.then_some(err))
+                }
+            },
+        }
     };
-    // A refresh that failed before the WAL was read: the length the
-    // commit left is not known here, and the next due commit tries again.
-    let Some(wal) = wal else {
-        return;
-    };
-    let first = disk.checkpoint_failed_at.load(Ordering::Acquire) == 0;
-    disk.checkpoint_failed_at
-        .store(wal.max(1), Ordering::Release);
-    if first {
+    if let Some(err) = warning {
         warn_auto_checkpoint(disk, &err);
+    }
+    if compact_due {
+        compact::auto_compact(disk);
     }
 }
 
@@ -2945,19 +3289,26 @@ pub(super) fn auto_checkpoint_warnings() -> usize {
 /// Write a snapshot of `base` and publish it into the slot after `index`.
 /// The caller holds the write mutex and the `flock`, and `base` is the
 /// state the slot `index` names. Success clears an auto-checkpoint failure
-/// ([`Disk::checkpoint_failed_at`]).
+/// ([`Disk::checkpoint_failed_at`]). `true` when the file it leaves is due a
+/// compaction (spec §5, [`compact::compact_due`]), which the caller runs
+/// once it has released its locks.
 fn checkpoint_locked(
     disk: &Disk,
     file: &dyn ContainerIo,
     index: usize,
     base: &DiskCache,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     disk.poison.check()?;
     let new_sb = write_checkpoint(disk, file, index, base)
         .inspect_err(|_| disk.settle_failed_publish(base))?;
     disk.install_checkpoint(base, new_sb);
     disk.checkpoint_failed_at.store(0, Ordering::Release);
-    Ok(())
+    // The new snapshot was written at the end of the file: the file now ends
+    // where it does.
+    let file_len = new_sb
+        .snapshot_offset
+        .saturating_add(new_sb.snapshot_length);
+    Ok(compact::compact_due(disk, file_len, &new_sb))
 }
 
 /// [`checkpoint_locked`]'s writes and syncs: the superblock it published.
@@ -2968,13 +3319,7 @@ fn write_checkpoint(
     base: &DiskCache,
 ) -> Result<Superblock, StoreError> {
     let (sb, state) = (base.sb, &*base.state);
-    let blob = if !state.vectors.is_empty() {
-        encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
-    } else if state.tables.is_empty() {
-        encode_snapshot(state.last_seq, &state.docs)?
-    } else {
-        encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)?
-    };
+    let blob = encode_state_snapshot(state)?;
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     let offset = allocate_extent(file, &sb, blob_len)?;
     file.write_at(&blob, offset).map_err(io_err)?;
@@ -2996,6 +3341,19 @@ fn write_checkpoint(
     write_slot(file, index ^ 1, &new_sb)?;
     disk.poison.sync_data(file)?;
     Ok(new_sb)
+}
+
+/// One snapshot blob of `state`, in the oldest snapshot version that holds
+/// it: `1` for documents only, `2` with column tables, `3` with any vector
+/// collection. A checkpoint and a compaction (spec §5) write the same blob.
+fn encode_state_snapshot(state: &DocState) -> Result<Vec<u8>, StoreError> {
+    if !state.vectors.is_empty() {
+        encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)
+    } else if state.tables.is_empty() {
+        encode_snapshot(state.last_seq, &state.docs)
+    } else {
+        encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)
+    }
 }
 
 fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<u64, StoreError> {

@@ -157,7 +157,8 @@ fn a_read_with_no_new_commit_reads_only_the_two_slots() {
                 is_slot_read(&(*offset, *len)),
                 "a read with no new commit read an extent: {op}"
             ),
-            IoOp::Len { .. } => {}
+            // The §5 swap check: `stat` of the path.
+            IoOp::Len { .. } | IoOp::StatId { .. } => {}
             other => panic!("a read did more than read the slots: {other}"),
         }
     }
@@ -298,16 +299,23 @@ fn a_cache_read_through_another_file_is_not_trusted() {
         inodes: vec![bytes.clone(), bytes],
     };
     let fs = SimFs::new(&image, None);
-    let mut store = open(&fs);
+    let store = open(&fs);
     assert_eq!(store.get_doc("c", "b").unwrap(), Some(json!(2)));
-    // What §5's reopen does after a swap: the read description now names
-    // another file. The cache was filled through inode 0.
-    let Inner::Disk(disk) = &mut store.inner else {
+    // A swap under the path, as §5's rename makes: the path now names
+    // another file at the same epoch. The cache was filled through inode 0,
+    // and the read's `stat` check reopens the path on inode 1.
+    fs.rename(copy, Path::new(STORE)).unwrap();
+    let Inner::Disk(disk) = &store.inner else {
         panic!("a disk store");
     };
-    disk.read = fs.open_ro(copy).unwrap();
-    disk.read_id = disk.read.file_id().unwrap();
-    assert_ne!(disk.read_id, disk.write_id);
+    assert_eq!(
+        crate::ferrostore::lock_mutex(&disk.cache)
+            .as_ref()
+            .unwrap()
+            .file_id
+            .1,
+        0
+    );
     let sb = live_sb(&fs);
     let mark = fs.trace().len();
     assert_eq!(store.get_doc("c", "b").unwrap(), Some(json!(2)));

@@ -166,6 +166,16 @@ fn id_at(path: &Path) -> Option<FileId> {
 /// a nonce from the clock and a stack address (another process that reuses
 /// the pid still differs).
 fn temp_path(fls_path: &Path) -> Result<std::path::PathBuf, StoreError> {
+    unique_temp_path(fls_path, TEMP_MARK)
+}
+
+/// [`temp_path`] with another `mark` between the file name and the numbers:
+/// `<name><mark><pid>-<n>-<nonce>`. A compaction's sibling uses
+/// `.compact-` (spec §5).
+pub(super) fn unique_temp_path(
+    fls_path: &Path,
+    mark: &str,
+) -> Result<std::path::PathBuf, StoreError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = fls_path
@@ -180,26 +190,27 @@ fn temp_path(fls_path: &Path) -> Result<std::path::PathBuf, StoreError> {
     let addr = std::ptr::addr_of!(marker) as usize as u64;
     let nonce = (nanos ^ addr.rotate_left(32)) & 0xffff_ffff;
     let mut temp_name = name.to_os_string();
-    temp_name.push(format!("{TEMP_MARK}{}-{n}-{nonce:08x}", std::process::id()));
+    temp_name.push(format!("{mark}{}-{n}-{nonce:08x}", std::process::id()));
     Ok(fls_path.with_file_name(temp_name))
 }
 
 /// What [`temp_path`] puts between the target's file name and its numbers.
 const TEMP_MARK: &str = ".migrating-";
 
-/// A temp file left this long without a write is a crashed migration's.
+/// A temp file left this long without a write is a crashed migration's (or
+/// a crashed compaction's, spec §5).
 const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// `candidate` is a name [`temp_path`] makes for a target named `target`:
-/// `<target>.migrating-<pid>-<n>-<nonce>`, decimal pid and counter, and an
-/// eight-digit lowercase hex nonce.
-fn is_temp_name_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr) -> bool {
+/// `candidate` is a name [`unique_temp_path`] makes for a target named
+/// `target` with `mark`: `<target><mark><pid>-<n>-<nonce>`, decimal pid and
+/// counter, and an eight-digit lowercase hex nonce.
+fn is_temp_name_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr, mark: &str) -> bool {
     let (Some(candidate), Some(target)) = (candidate.to_str(), target.to_str()) else {
         return false;
     };
     let Some(numbers) = candidate
         .strip_prefix(target)
-        .and_then(|rest| rest.strip_prefix(TEMP_MARK))
+        .and_then(|rest| rest.strip_prefix(mark))
     else {
         return false;
     };
@@ -222,6 +233,15 @@ fn is_temp_name_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr) -> bo
 /// [`migrate_verified`]). Never an error: what cannot be read or removed is a
 /// warning, and the migration goes on.
 fn sweep_stale_temps(fls_path: &Path) {
+    sweep_stale_temps_marked(fls_path, TEMP_MARK, "migration");
+}
+
+/// [`sweep_stale_temps`] for the temps [`unique_temp_path`] makes with
+/// `mark`: regular files beside `fls_path`, not symlinks, whose names have
+/// that form for this `fls_path`, owned by this user and not modified for
+/// [`STALE_TEMP_AGE`]. `what` names the operation in a warning. A
+/// compaction (spec §5) sweeps its own `.compact-` temps this way.
+pub(super) fn sweep_stale_temps_marked(fls_path: &Path, mark: &str, what: &str) {
     use std::os::unix::fs::MetadataExt;
     let Some(target) = fls_path.file_name() else {
         return;
@@ -233,7 +253,7 @@ fn sweep_stale_temps(fls_path: &Path) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
             warn(&format!(
-                "warning: stale migration temp files in {} were not swept: {err}",
+                "warning: stale {what} temp files in {} were not swept: {err}",
                 dir.display()
             ));
             return;
@@ -247,13 +267,13 @@ fn sweep_stale_temps(fls_path: &Path) {
             Ok(entry) => entry,
             Err(err) => {
                 warn(&format!(
-                    "warning: stale migration temp files in {} were not all swept: {err}",
+                    "warning: stale {what} temp files in {} were not all swept: {err}",
                     dir.display()
                 ));
                 return;
             }
         };
-        if !is_temp_name_for(&entry.file_name(), target) {
+        if !is_temp_name_for(&entry.file_name(), target, mark) {
             continue;
         }
         let path = entry.path();
@@ -271,7 +291,7 @@ fn sweep_stale_temps(fls_path: &Path) {
         }
         if let Err(err) = std::fs::remove_file(&path) {
             warn(&format!(
-                "warning: the stale migration temp file {} was not removed: {err}",
+                "warning: the stale {what} temp file {} was not removed: {err}",
                 path.display()
             ));
         }

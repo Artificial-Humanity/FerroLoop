@@ -12,7 +12,9 @@
 //! 3. **Survivors.** For each cut, every combination of fates of the ops not
 //!    yet durable (kept, dropped, torn: see `crash_sim`) is one case, up to
 //!    [`FATE_CAP`] combinations; past that, a sample seeded from [`SEED`]
-//!    and the cut. No case in today's workload reaches the cap.
+//!    and the cut. One cut of today's workload reaches the cap: inside the
+//!    compaction of step 6, the sibling's snapshot and slot writes are
+//!    pending together before its sync (a file no name yet makes the store).
 //! 4. **Checks** ([`check_recovery`]), on each survivor image, reopened
 //!    through the normal `FerroStore::open` path on the simulated disk:
 //!    - no two valid slots share an epoch, and no slot is from a newer build;
@@ -28,7 +30,12 @@
 //!    - a state past the starting one is published in a format-2 slot;
 //!    - one more commit after recovery lands, and reads back after a reopen;
 //!    - a cut inside the group commit of step 5 leaves the whole group or
-//!      none of it, and acknowledges all three writers or none.
+//!      none of it, and acknowledges all three writers or none;
+//!    - a cut inside the compaction of step 6 leaves exactly one file as the
+//!      store, the old one or the new one: no other name (a leftover
+//!      `.compact-` temp included) names the store's inode, and a leftover
+//!      temp is never what `open` reads (the reopened state is checked
+//!      above, through the store's own name).
 //! 5. **Reference-run checks:** every container write and sync runs under the
 //!    file's `flock`, which is not released between a write and the slot sync
 //!    that publishes it ([`check_locks`]); and when an operation is
@@ -38,7 +45,7 @@
 //!
 //! - **A new workload step:** a [`Step`] in [`WORKLOAD`] (or a scenario's own
 //!   list). Each acknowledged call goes through [`Ctx::op`]; nothing else is
-//!   needed. Compaction (§5) has its marked place in [`WORKLOAD`].
+//!   needed. Compaction (§5) is step 6 of [`WORKLOAD`].
 //! - **A new kind of I/O op:** a method on `ContainerIo`/`ContainerFs`, an
 //!   [`IoOp`] variant, and its fates in `SimFs::pending` (`crash_sim`).
 //! - **Group commit (§4.3):** [`three_writers`] makes one real group.
@@ -254,12 +261,10 @@ const WORKLOAD: &[Step] = &[
         name: "5 three writers",
         run: three_writers,
     },
-    // EXTENSION POINT, spec §3.5 step 6: compaction. When §5 lands, add
-    //     Step { name: "6 compaction", run: compaction },
-    // with `compaction` calling `ctx.op("6 compaction", || store.compact())`.
-    // Its I/O (the sibling file, its fsync, the rename, the directory sync)
-    // goes through the seam, so every op it does becomes a cut point and the
-    // checks below apply unchanged. Give `pending` a case for any new op.
+    Step {
+        name: "6 compaction",
+        run: compaction,
+    },
     Step {
         name: "7 commits after the checkpoint",
         run: tail,
@@ -463,6 +468,22 @@ fn second_handle(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
     })?;
     ctx.op("second handle reads the first's commit", || {
         expect_doc(&other, "other", "w", json!(4))
+    })
+}
+
+/// Spec §3.5 step 6, a compaction (§5): the sibling's create, its writes
+/// and sync, the rename over the store and the directory sync are each a cut
+/// point. A handle opened before the compaction (another process, as far as
+/// the store can tell) then writes: its swap check must move it to the new
+/// inode, or its acknowledged commit lands in the unlinked file.
+fn compaction(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    let other = ctx.op("open a handle before the compaction", || ctx.open_other())?;
+    ctx.op("6 compaction", || store.compact())?;
+    ctx.op("the older handle writes after the swap", || {
+        other.put_doc("notes", "swapped", &json!({"by": "the older handle"}))
+    })?;
+    ctx.op("the compactor reads it", || {
+        expect_doc(store, "notes", "swapped", json!({"by": "the older handle"}))
     })
 }
 
@@ -809,6 +830,7 @@ fn check_recovery(
             }
         }
     }
+    check_one_store(image)?;
     let fs = SimFs::new(image, None);
     let store = FerroStore::open_with(&fs, path).map_err(|err| format!("reopen failed: {err}"))?;
     let version = store
@@ -867,6 +889,41 @@ fn check_recovery(
     Ok(matched)
 }
 
+/// Spec §5: after a cut at any step of a compaction, exactly one file is the
+/// store. No name but the store's own names its inode (the sibling is either
+/// still under its temp name, or renamed over the store and gone from the
+/// temp name), and every leftover name is a `.compact-` temp of this store.
+fn check_one_store(image: &Image) -> Result<(), String> {
+    let path = Path::new(STORE);
+    let Some(store_ino) = image.names.get(path) else {
+        return Ok(());
+    };
+    for (name, ino) in &image.names {
+        if name == path {
+            continue;
+        }
+        if !is_compact_temp(name) {
+            return Err(format!("an unexpected name {} survived", name.display()));
+        }
+        if ino == store_ino {
+            return Err(format!(
+                "the leftover temp {} names the store's inode: two names, one store",
+                name.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A name a compaction of [`STORE`] gives its sibling.
+fn is_compact_temp(name: &Path) -> bool {
+    name.parent() == Path::new(STORE).parent()
+        && name
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("store.fls.compact-"))
+}
+
 /// A cut inside step 5's group: all three writers acknowledged or none, and
 /// the state the whole group or none of it.
 fn check_group(
@@ -906,6 +963,10 @@ struct Report {
     /// The most ops pending at one cut.
     max_pending: usize,
     sampled_cuts: usize,
+    /// Cases left with a `.compact-` temp beside the store (§5).
+    leftover_temps: usize,
+    /// Cases whose store is a compaction's new inode, not the first file.
+    swapped_stores: usize,
     failures: Vec<String>,
     failed_cases: usize,
 }
@@ -950,6 +1011,14 @@ fn run_scenario(scenario: &Scenario) -> Report {
             report.cases += 1;
             report.torn_cases += usize::from(fate.iter().any(|fate| *fate >= 2));
             let image = fs.survivor(&pending, fate);
+            report.leftover_temps +=
+                usize::from(image.names.keys().any(|name| is_compact_temp(name)));
+            report.swapped_stores += usize::from(
+                image
+                    .names
+                    .get(Path::new(STORE))
+                    .is_some_and(|ino| *ino != 0),
+            );
             let checked = check_recovery(scenario, &reference, acked, started, &image)
                 .and_then(|matched| check_group(&reference, acked, started, matched));
             if let Err(why) = checked {
@@ -1016,13 +1085,16 @@ fn describe_failure(
 fn assert_clean(scenario: &Scenario, report: &Report, elapsed: Duration) {
     println!(
         "crash harness [{}]: {} cut points, {} cases ({} with a torn write; at most {} ops \
-         pending at a cut; {} cuts sampled), {:.2?}",
+         pending at a cut; {} cuts sampled; {} with a leftover compaction temp; {} on a \
+         compacted inode), {:.2?}",
         scenario.name,
         report.cuts,
         report.cases,
         report.torn_cases,
         report.max_pending,
         report.sampled_cuts,
+        report.leftover_temps,
+        report.swapped_stores,
         elapsed
     );
     assert!(
@@ -1078,6 +1150,12 @@ fn every_cut_of_the_new_store_workload_recovers_to_an_acknowledged_prefix() {
     let report = run_scenario(&scenario);
     assert_floors(&report, 100);
     assert_clean(&scenario, &report, start.elapsed());
+    // Step 6 is no vacuous pass: some cuts leave the sibling under its temp
+    // name, and some leave it as the store.
+    assert!(
+        report.leftover_temps > 0 && report.swapped_stores > 0,
+        "no cut exercised the compaction's rename: {report:?}"
+    );
     // The cuts inside step 5 that §4.3 names exist, so the loop above tried
     // each: between the frames, after their sync, between the slot write and
     // its sync, and after it.
