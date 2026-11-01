@@ -3915,6 +3915,17 @@ fn handle_dynamic_api_routes(
         return operators::handle_delete_operator(state, authority, segments[4]);
     }
 
+    // /api/v1/agents/:name/recast
+    if method == "POST"
+        && segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "agents"
+        && segments[4] == "recast"
+    {
+        return crate::agents::handle_post_agent_recast(state, authority, req, segments[3]);
+    }
+
     // /api/v1/records/:id/move
     if method == "POST"
         && segments.len() == 5
