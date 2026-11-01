@@ -462,9 +462,20 @@ impl Disk {
     /// again. The swap is made only while the slot still holds the
     /// description this call started from; a reader still using the old
     /// description finishes on it.
+    ///
+    /// Nothing at the path is no swap: a compaction's rename replaces the
+    /// name in one step, so there is no newer file to move to, and the read
+    /// goes on through the file the description holds. A writer refuses it
+    /// ([`Self::lock_current`]): a commit into an unlinked file is lost.
     fn current_read(&self) -> Result<Descriptor, StoreError> {
         let held = lock_mutex(&self.read).clone();
-        let at_path = self.stat_path()?;
+        let at_path = match self.fs.stat_id(&self.path) {
+            Ok(id) => id,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(held),
+            Err(err) => {
+                return Err(backend(format!("stat {}: {err}", self.path.display())));
+            }
+        };
         if at_path == held.id {
             return Ok(held);
         }

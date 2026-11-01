@@ -229,8 +229,35 @@ fn code_index_vector_workload() {
         let store = open_timed(&path, "reopen (snapshot)");
         search_latency(&store, "after snapshot open");
     }
+    let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
     println!(
         "file after checkpoint: {:.1} MiB",
-        std::fs::metadata(&path).unwrap().len() as f64 / (1 << 20) as f64
+        mib(std::fs::metadata(&path).unwrap().len())
     );
+
+    // Compaction (spec §5): one snapshot in a new file, renamed over the old.
+    {
+        let store = FerroStore::open(&path).unwrap();
+        let before = store.stats().unwrap();
+        let t = Instant::now();
+        store.compact().unwrap();
+        let took = t.elapsed();
+        let after = store.stats().unwrap();
+        println!(
+            "compact: {:.0} ms; file {:.1} MiB ({:.1} MiB live, {:.1} MiB dead) -> {:.1} MiB \
+             ({:.1} MiB dead)",
+            ms(took),
+            mib(before.file_bytes),
+            mib(before.live_bytes),
+            mib(before.dead_bytes),
+            mib(after.file_bytes),
+            mib(after.dead_bytes)
+        );
+        assert_eq!(after.dead_bytes, 0);
+        assert_eq!(after.file_bytes, std::fs::metadata(&path).unwrap().len());
+    }
+    {
+        let store = open_timed(&path, "reopen (compacted)");
+        search_latency(&store, "after compacted open");
+    }
 }

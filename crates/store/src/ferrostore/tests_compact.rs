@@ -721,6 +721,19 @@ fn a_failed_directory_sync_after_the_rename_poisons_the_handle() {
     assert_eq!(view(&open(&fs).read_state().unwrap()), view(&state));
 }
 
+#[test]
+fn a_store_whose_path_is_removed_still_reads_and_refuses_a_write() {
+    let fs = SimFs::default();
+    let store = open(&fs);
+    store.put_doc("c", "a", &json!(1)).unwrap();
+    super::container_io::ContainerFs::unlink(&fs, Path::new(STORE)).unwrap();
+    // No compaction removes the name: the read goes on through its file.
+    assert_eq!(store.get_doc("c", "a").unwrap(), Some(json!(1)));
+    // A commit into the unlinked file would be lost: refused.
+    let err = store.put_doc("c", "b", &json!(2)).unwrap_err();
+    assert!(err.to_string().contains("stat"), "{err}");
+}
+
 // ---- leftover temps ------------------------------------------------------------
 
 fn age_by(path: &Path, age: Duration) {

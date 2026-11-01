@@ -35,7 +35,7 @@ Each slot is 4096 bytes. Every slot this build writes is container format `2`.
 | --- | --- | --- |
 | `0..8` | bytes | Magic `FERRSTR1` |
 | `8..12` | `u32` | Container format version: `2` (format `1` is still read) |
-| `12..20` | `u64` | `epoch`, monotonic, starting at `1` |
+| `12..20` | `u64` | `epoch`, monotonic, starting at `1`, and monotonic across compactions (see Compaction) |
 | `20..24` | `u32` | CRC-32 of this 4096-byte block with bytes `20..24` set to zero |
 | `24..32` | `u64` | `snapshot_offset` (absolute) |
 | `32..40` | `u64` | `snapshot_length` |
@@ -75,9 +75,11 @@ Version `2` is written only when at least one column table exists and no vector 
 
 Version `3` is written when any vector collection exists, including an empty one. After the documents it stores the version `2` table section. `table_count` may be `0`. It then stores `u32` collection count, which must be at least `1` (0 is corrupt), and collections in name order. Each collection is a length-prefixed name, `u32` dim, `u8` storage tag (`1` f32, `2` f16, `3` i8), `u8` metric tag (`1` cosine, `2` l2, `3` dot), `u32` M, `u32` ef_construction, `u32` ef_search, `u32` vector count, then vectors in id order. Each vector is a length-prefixed id, a length-prefixed byte string, a `u8` metadata flag (`0` absent, `1` present) and, when the flag is `1`, a length-prefixed UTF-8 JSON value. Then an entry flag (`0` or `1`) and, when it is `1`, a length-prefixed entry id. Then, for each vector in id order, a `u8` level and, for each layer `0..=level`, a `u32` neighbor count and that many length-prefixed neighbor ids. Decode checks names, ranges, byte length, known tags, that the level matches the deterministic HNSW formula, and that neighbors exist, are unique, are not self, respect the layer's max links, and are bidirectional. Each layer's neighbor list must already be ordered by graph distance, then id. The entry id must be the canonical live node (highest level, then lowest id) when the collection is non-empty. The entry flag is `0` when it is empty. A bad snapshot is corrupt.
 
-`checkpoint` writes a new blob at an offset at or past the end of the file, and past both the live snapshot and the live WAL, so it does not overlap either. It `fsync`s the blob, then publishes a superblock that points `snapshot_offset` / `snapshot_length` at the new blob, sets `snapshot_seq` to the last committed sequence, sets `wal_offset` to the end of the new blob, and sets `wal_length` to `0`. A crash after the blob is written and before that publish leaves readers on the previous superblock.
+`checkpoint` writes a new blob at an offset at or past the end of the file, and past both the live snapshot and the live WAL, so it does not overlap either. No extent of a file is ever reused: the snapshot and WAL a checkpoint replaces stay in the file as dead bytes until a compaction (see Compaction). It `fsync`s the blob, then publishes a superblock that points `snapshot_offset` / `snapshot_length` at the new blob, sets `snapshot_seq` to the last committed sequence, sets `wal_offset` to the end of the new blob, and sets `wal_length` to `0`. A crash after the blob is written and before that publish leaves readers on the previous superblock.
 
 A commit also checkpoints on its own (auto-checkpoint) when the state it published has a WAL longer than `max(snapshot_length, 4 MiB)` (`AUTO_CHECKPOINT_BYTES`). A reopen then replays at most that much WAL. The checkpoint runs outside the commit's lock window: the writer first releases the commit gate, the write lock and `LOCK_EX`, wakes every group member with its own result, and delivers its own `WriteThrough` batch. Only then does it take the write lock and `LOCK_EX` again, refresh, and checkpoint if the refreshed state is still past the threshold (another handle may have checkpointed meanwhile). So no other commit's result waits for the checkpoint; the writer's own call returns after it. This applies after a group commit (the group's leader checkpoints), a sync-batch apply (after its `WriteThrough` flush) and a cache fill; a write that published nothing does not checkpoint, and neither does a state whose WAL ends torn. A failed auto-checkpoint does not fail the commit: the commit returns its own result. A failed `fsync` in the checkpoint poisons the handle, as any failed `fsync` does. Any other failure (a full disk, an encode error) leaves the file and the cache as they were and records the WAL length at the failure: the handle tries again only once the WAL has grown past that length by another `max(snapshot_length, 4 MiB)`, so a failure that persists costs one attempt per threshold of WAL, not one per commit. The first failure of a run is a warning on stderr; later ones are not, until a checkpoint (auto or manual) succeeds. `checkpoint` stays public.
+
+A checkpoint, manual or automatic, that leaves the file due a compaction is followed by one, in a lock window of its own (see Compaction).
 
 An empty snapshot (`snapshot_length == 0`) contributes no documents. Its sequence is the superblock's `snapshot_seq`. On `mem://`, `checkpoint` is a successful no-op.
 
@@ -113,6 +115,33 @@ Replay walks the committed range:
 
 Secondary indexes and BM25 statistics are rebuilt from the documents after replay. They are not written to the WAL. The in-process subscriber list is not written either.
 
+## Compaction
+
+`FerroStore::compact` writes the current state into a new sibling file and renames it over the store, so the dead bytes earlier checkpoints left are given back. A file's *live bytes* are the 8192-byte header plus the live `snapshot_length` and `wal_length`; its *dead bytes* are its length less its live bytes. `FerroStore::stats` returns both, the file length, the live epoch and `last_seq`, read without a lock as a read is (`mem://`: every byte count and the epoch are `0`; a remote handle does not serve it).
+
+First, before it takes any lock, the compactor removes this store's stale compaction temps: regular files beside it, not symlinks, named `<name>.compact-<pid>-<n>-<nonce>` (decimal pid and counter, eight lowercase hex digits), owned by this user and not modified for 24 hours. The rule and the code are the migration's (`<name>.migrating-…`), with another mark. A sweep that fails is a warning on stderr.
+
+Then it holds the write mutex and the exclusive `flock` of the file the path names (taken as every writer takes it, see Concurrency) for the whole of:
+
+1. Refresh, as a commit does.
+2. Create `<name>.compact-<pid>-<n>-<nonce>` with `O_CREAT | O_EXCL`, mode `0600`, and take its own `flock`. A store path that is a symlink is refused: the sibling of a link is not beside the file.
+3. Write slot 0 and one snapshot at `8192`, leaving slot 1 zeros and the WAL empty. The slot's `epoch` is the old file's current epoch `+ 1`; `snapshot_seq` is the state's `last_seq`, so `last_seq` is kept. The snapshot is the one `checkpoint` would write.
+4. `fsync` the new file (`sync_all`: it was just created).
+5. `rename` it over `<name>`.
+6. `fsync` the directory.
+7. Install the state in this handle's cache and move this handle's descriptions to the new file.
+8. Release the new file's lock, then the old file's lock.
+
+A failure before the rename removes the new file and leaves the old one as it was. A failed `fsync` (of the new file or of the directory) poisons the handle, as any failed `fsync` does (see Concurrency). A failed directory sync comes after the rename: the path already names the new file, and its name may not be durable. The new file's lock is held until the directory sync is done, so no writer commits into it before its name is durable. `mem://` compaction is a successful no-op. A remote handle calls the `compact` RPC.
+
+A leftover temp is never opened as the store: `open` reads only the store's own name. A cut at any step leaves exactly one file under that name, the old one or the new one, each a whole store with every acknowledged commit; the temp, when it survives, is swept by a later compaction once it is 24 hours old.
+
+**Auto-compaction.** A checkpoint (manual or automatic) whose published file has more dead bytes than `max(live bytes, AUTO_COMPACT_BYTES)` (more than half the file, and more than 64 MiB) is followed by a compaction. It runs in a lock window of its own, once the checkpoint has released its locks (and, after a commit, once every member of the group has its result), refreshes, and compacts only when the refreshed file is still due. A failed auto-compaction does not fail the checkpoint or the commit before it. A failed `fsync` poisons the handle; any other failure leaves the old file as the store and records the dead bytes at the failure: the handle tries again only once the dead bytes have grown past that by another `max(live bytes, AUTO_COMPACT_BYTES)`. The first failure of a run is a warning on stderr; later ones are not, until a compaction succeeds.
+
+**Swap detection.** Every path that takes the `flock` compares, once it holds the lock, `stat(path)` `(dev, ino)` with `fstat` of its description. When they differ, a compaction has renamed a new file over the path: the writer releases the lock, opens the path again for both its write and its read description, and tries again. A read refresh compares the same two before it reads the slots, and reopens its read description on a difference. A path that names nothing is no swap (a compaction's rename replaces the name in one step): a read goes on through its description, and a writer refuses, since a commit into an unlinked file would be lost. A description that is swapped out is closed once its last user drops it, so a read already reading the old file finishes on it; the old inode lives until its last descriptor closes.
+
+**Epochs across files.** The old file is never published after the rename: every writer checks the path under the old file's lock, which the compactor holds through the rename. So the epoch orders every published state along the path's history, across compactions. A handle's cache keeps the state with the higher epoch, whichever file it was read from; a slow read of the old file never replaces a state of the new one. A handle's reads never go back, across a compaction too.
+
 ## Concurrency
 
 The write descriptor is opened read/write. `flock` is the libc call (`LOCK_EX = 2`, `LOCK_UN = 8`) on that descriptor. It is held only across the critical section, not for the life of the handle.
@@ -131,7 +160,9 @@ Commit:
 
 `checkpoint` holds the same exclusive lock while it reads, writes the new snapshot, and publishes. An auto-checkpoint takes that lock again once the commit that crossed the threshold has released it (see Snapshot).
 
-Readers open a separate `O_RDONLY` description and do not `flock`. A read loads both superblocks, selects the highest valid epoch, loads that snapshot, and applies WAL frames with `seq > snapshot_seq`. A torn superblock fails its CRC and is ignored. Two `FerroStore::open` handles on one path both succeed; the second open is not `StoreError::Unreachable`. A reader observes a writer's committed document without taking a file lock.
+Step 2 takes `LOCK_EX` on the file the path names: once the lock is held, `stat(path)` is compared with the description's `(dev, ino)`, and a difference (a compaction renamed a new file over the path) releases the lock, reopens the path for both descriptions and starts again (see Compaction). A compaction holds the lock of the file it replaces until the new file is renamed over it and the directory is synced.
+
+Readers open a separate `O_RDONLY` description and do not `flock`. A read first compares `stat(path)` with that description and reopens it when a compaction swapped the file. It then loads both superblocks, selects the highest valid epoch, loads that snapshot, and applies WAL frames with `seq > snapshot_seq`. A torn superblock fails its CRC and is ignored. Two `FerroStore::open` handles on one path both succeed; the second open is not `StoreError::Unreachable`. A reader observes a writer's committed document without taking a file lock.
 
 `mem://` uses the same document map and the same APIs, with no file and no `flock`.
 
@@ -191,6 +222,7 @@ Each call is one JSON object:
 | `poll_mq_group` | `topic`, `group`, `limit` | array of `{"seq", "key", "payload"}` |
 | `ack_mq` | `topic`, `group`, `seq` | `null` |
 | `checkpoint` | none | `null` |
+| `compact` | none | `null`. The server compacts its store (see Compaction) |
 | `subscribe_mq` | `topic` | `null`, then push frames |
 | `read_state` | none | `{"last_seq": <u64>, "docs": [{"collection", "id", "doc"}, ...], "tables": [...], "vectors": [...]}`. Documents are in `(collection, id)` order. A stored JSON `null` is `"doc": null`. Missing documents are omitted. `tables` is name order: `{name, columns: [{name, ty}], groups}`, and each group is an array of bytes `0..=255`. `vectors` is name order. Each collection is `{name, dim, storage, metric, m, ef_construction, ef_search, vectors, entry, links}`. `storage` is `f32`, `f16`, or `i8`. `metric` is `cosine`, `l2`, or `dot`. Each stored vector is `{id, bytes, metadata?}` with `bytes` an array of integers `0..=255`. `metadata` is omitted when absent and present, including JSON `null`, when stored. `entry` is the entry id or `null`. `links` is `{id, level, layers}` and each layer is an array of neighbor ids |
 | `create_vector_collection` | `name`, `dim`, `storage`, `metric`, `m`, `ef_construction`, `ef_search` | `null` |

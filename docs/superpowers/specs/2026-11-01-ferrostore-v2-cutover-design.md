@@ -267,15 +267,19 @@ A remote CAS retry is bounded to 8 attempts, with jittered exponential backoff f
 
 ## 5. Track 1: compaction by sibling inode
 
-**When it runs.** `compact()` runs when the dead bytes are more than half of the file and more than 64 MiB, or on demand through `ferrostore compact`.
+**When it runs.** `FerroStore::compact()` runs on demand (and through `ferrostore compact`, §7). Auto-compaction follows a checkpoint whose file has more dead bytes than live ones (more than half the file) and more than 64 MiB (`AUTO_COMPACT_BYTES`). *Dead bytes* are the file length less the live extents (the header, the live snapshot and the live WAL); `FerroStore::stats()` reports them. Auto-compaction takes a lock window of its own after the checkpoint's, as §4.4 does, never inside a group's. A failed fsync poisons the handle; any other failure leaves the old file, backs off by another threshold of dead bytes and warns once per run.
 
-**The compactor's steps.** While it holds `flock` on the **current** inode, the compactor:
+**The compactor's steps.** It first sweeps this store's stale `.compact-` temps (24 hours, the migration's rule). While it holds the write mutex and `flock` on the **current** inode, the compactor:
 1. Refreshes.
-2. Writes `<name>.fls.compact-<pid>`, created 0600, containing a v2 header, a snapshot of the current state and an empty WAL.
-3. Calls `fsync` on that file.
-4. Renames it over `<name>.fls`.
-5. Calls `fsync` on the directory.
-6. Only then releases the old inode's lock.
+2. Creates `<name>.fls.compact-<pid>-<n>-<nonce>` with `O_EXCL`, mode 0600, and takes that file's own `flock`. A store path that is a symlink is refused.
+3. Writes a v2 header (slot 0 only), a snapshot of the current state and an empty WAL. The epoch is the old file's current epoch + 1; `last_seq` is kept.
+4. Calls `fsync` (`sync_all`) on that file.
+5. Renames it over `<name>.fls`.
+6. Calls `fsync` on the directory.
+7. Installs the state in its own cache and moves its own descriptors to the new file.
+8. Only then releases the new file's lock and the old inode's lock.
+
+A failure before the rename removes the temp and leaves the old file untouched. The new file's own lock keeps any writer from committing into it before its name is durable.
 
 **Swap detection is mandatory on every path.**
 - After a writer takes `flock` on its descriptor, it compares `stat(path)` `(dev, ino)` with `fstat(fd)`.
@@ -283,12 +287,15 @@ A remote CAS retry is bounded to 8 attempts, with jittered exponential backoff f
 - A reader refresh makes the same check before it trusts its cache.
 - Without this check, a writer on the old inode would commit into an unlinked file and the write would be lost.
 
-**Readers.** A reader already reading the old inode finishes on it. The old inode stays valid until its last descriptor closes.
+**Readers.** A reader already reading the old inode finishes on it. The old inode stays valid until its last descriptor closes. Descriptors are `Arc`s swapped under short mutexes, so reads stay lock-free.
+
+**Epochs across inodes.** The old inode is never published after the rename, and the new one starts one epoch past it, so the epoch orders states along the path's history. The cache keeps the higher epoch whatever inode it came from: an install from the old inode never replaces a state of the new one, and reads stay monotonic across the swap.
 
 **Tests.**
-- Compaction runs while another process (a forked test helper) keeps writing. Every acknowledged write is present afterwards.
+- Compaction runs while another process (the test binary re-run as a child writer) keeps writing. Every acknowledged write is present afterwards.
 - A writer blocked on the old inode's lock during the rename lands its write in the new file.
-- The crash harness covers each step of the compaction.
+- A reader part way through a tail read of the old inode finishes on it, then moves to the new inode and never goes back.
+- The crash harness covers each step of the compaction, and checks that exactly one file is the store after recovery.
 
 ---
 
