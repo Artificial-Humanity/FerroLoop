@@ -5,7 +5,7 @@
 //! store; `ferrostore`: `--store`).
 
 use super::bench::{self, BenchOptions, BenchTarget, Workload};
-use super::data::{self, Credentials, Query, Target};
+use super::data::{self, Create, Credentials, Query, Target};
 use super::serve::{self, ServeOptions};
 use super::{Output, Result, Scratch, SiblingScratch, Wording, inspect, to_json};
 use clap::Args;
@@ -73,7 +73,7 @@ impl GetArgs {
     /// The document as JSON on stdout; exit 1 when there is none. Creates no
     /// store.
     pub fn run(&self, target: &Target, w: &Wording) -> Result<(Output, i32)> {
-        let store = data::open_target(target, &self.client.credentials(), false, "get", w)?;
+        let store = data::open_target(target, &self.client.credentials(), Create::Never, "get", w)?;
         data::get(&store, &self.collection, &self.id, w)?.output()
     }
 }
@@ -94,10 +94,10 @@ pub struct PutArgs {
 
 impl PutArgs {
     /// Put the document; `{"collection", "id", "put": true}` on stdout. A
-    /// store path with nothing at it gets a new `.fls`.
-    pub fn run(&self, target: &Target, w: &Wording) -> Result<(Output, i32)> {
+    /// store path with nothing at it gets a new `.fls` as `create` allows.
+    pub fn run(&self, target: &Target, create: Create, w: &Wording) -> Result<(Output, i32)> {
         let doc = data::read_doc(&self.json, std::io::stdin().lock())?;
-        let store = data::open_target(target, &self.client.credentials(), true, "put", w)?;
+        let store = data::open_target(target, &self.client.credentials(), create, "put", w)?;
         let report = data::put(&store, &self.collection, &self.id, &doc, w)?;
         json_output(&report)
     }
@@ -141,7 +141,13 @@ impl QueryArgs {
             self.k,
             w,
         )?;
-        let store = data::open_target(target, &self.client.credentials(), false, "query", w)?;
+        let store = data::open_target(
+            target,
+            &self.client.credentials(),
+            Create::Never,
+            "query",
+            w,
+        )?;
         json_output(&data::query(&store, &self.collection, &query, w)?)
     }
 }
@@ -208,12 +214,13 @@ impl ServeArgs {
         }
     }
 
-    /// Serve the store `path` names until SIGINT or SIGTERM: one ready line
-    /// on stdout once it listens (the URI to connect to), one line on stderr
-    /// when it stops.
-    pub fn run(&self, path: &Path, w: &Wording) -> Result<i32> {
+    /// Serve the store `path` names (created, when nothing is there, as
+    /// `create` allows) until SIGINT or SIGTERM: one ready line on stdout
+    /// once it listens (the URI to connect to), one line on stderr when it
+    /// stops.
+    pub fn run(&self, path: &Path, create: Create, w: &Wording) -> Result<i32> {
         let json = self.json;
-        let (_, signal) = serve::serve(path, &self.options(), w, |serving| {
+        let (_, signal) = serve::serve(path, &self.options(), create, w, |serving| {
             let text = if json {
                 serving.json_line()?
             } else {
@@ -269,8 +276,12 @@ pub struct BenchArgs {
     #[arg(long, value_name = "LIST", default_value = "ferro,redb")]
     pub engines: String,
     /// Run on this existing FerroStore instead of fresh stores (put, get and
-    /// scan only, in a collection of its own that is emptied afterwards).
-    /// Needs --i-know-it-writes.
+    /// scan only, in a collection of its own, `ferrostore-bench-<pid>-<n>`,
+    /// that is emptied afterwards). Needs --i-know-it-writes. A run that is
+    /// killed part way leaves up to N documents in that collection (the next
+    /// `bench --path` on the store removes them, once that process is gone),
+    /// and the writes can start the store's own automatic checkpoint or
+    /// compaction.
     #[arg(long, value_name = "STORE")]
     pub path: Option<PathBuf>,
     /// Confirm that --path writes to that store.

@@ -408,14 +408,20 @@ fn get_put_and_query_round_trip_on_an_embedded_store() {
     let sb = Sandbox::new();
     let fls = sb.fls();
     let store = s(&fls);
-    // Nothing is there: get refuses and creates nothing; put creates it.
+    // Nothing is there: get refuses and creates nothing, and so does put
+    // without --create; put --create creates it.
     let out = sb.run(&["get", "--store", store, "docs", "a"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not create one"));
     assert!(!fls.exists());
+    let out = sb.run(&["put", "--store", store, "docs", "a", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only with --create"));
+    assert!(!fls.exists());
 
     let put = sb.json(&[
         "put",
+        "--create",
         "--store",
         store,
         "docs",
@@ -534,10 +540,18 @@ impl Server {
     }
 
     /// SIGTERM, then the exit status and stderr.
-    fn stop(mut self) -> (std::process::ExitStatus, String) {
+    fn stop(self) -> (std::process::ExitStatus, String) {
+        self.stop_with(&[libc::SIGTERM])
+    }
+
+    /// `signals`, one after the other at once, then the exit status and
+    /// stderr.
+    fn stop_with(mut self, signals: &[libc::c_int]) -> (std::process::ExitStatus, String) {
         let pid = i32::try_from(self.child.id()).unwrap();
-        // SAFETY: `pid` is this test's own live child.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        for &signal in signals {
+            // SAFETY: `pid` is this test's own child, not yet waited for.
+            assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        }
         let status = self.child.wait().unwrap();
         let mut err = String::new();
         std::io::Read::read_to_string(&mut self.child.stderr.take().unwrap(), &mut err).unwrap();
@@ -549,7 +563,7 @@ impl Server {
 fn get_and_put_over_a_unix_socket_served_by_ferrostore_serve() {
     let sb = Sandbox::new();
     let fls = sb.fls();
-    let (server, ready) = Server::start(&sb, &["serve", "--store", s(&fls)]);
+    let (server, ready) = Server::start(&sb, &["serve", "--create", "--store", s(&fls)]);
     let socket = sb.dir("stores").join("fl.fls.sock");
     let uri = format!("unix://{}", socket.display());
     assert_eq!(
@@ -604,6 +618,7 @@ fn get_and_put_over_ws_on_loopback_with_a_psk() {
         &sb,
         &[
             "serve",
+            "--create",
             "--store",
             s(&fls),
             "--tcp",
@@ -947,4 +962,267 @@ fn bench_touches_an_existing_store_only_when_told_twice() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["__meta", "docs"]);
+}
+
+// ---- what put and serve create ----
+
+/// The pid of a child that has exited and been reaped: no live process.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    // SAFETY: signal 0 sends nothing.
+    let rc = unsafe { libc::kill(i32::try_from(pid).unwrap(), 0) };
+    assert_eq!(rc, -1, "pid {pid} was reused");
+    pid
+}
+
+#[test]
+fn put_and_serve_never_create_a_fls_beside_a_lone_redb() {
+    let sb = Sandbox::new();
+    redb_store(&sb.redb());
+    let fls = sb.fls();
+    let socket = sb.dir("home").join("s.sock");
+    // However the store is named: `fl.fls` and `fl.redb` are the same pair.
+    for store in [s(&fls), s(&sb.redb())] {
+        for args in [
+            vec!["put", "--create", "--store", store, "docs", "a", "1"],
+            vec!["put", "--store", store, "docs", "a", "1"],
+            vec!["serve", "--create", "--store", store],
+            vec![
+                "serve",
+                "--create",
+                "--store",
+                store,
+                "--socket",
+                s(&socket),
+            ],
+        ] {
+            let out = sb.run(&args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("migrate it first") && err.contains("`ferrostore migrate`"),
+                "{args:?}: {err}"
+            );
+            assert_eq!(sb.stores(), ["fl.redb"], "{args:?}");
+            assert!(!socket.exists());
+        }
+    }
+}
+
+#[test]
+fn put_and_serve_create_no_store_while_it_is_being_migrated() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(fl_store::MigrationLock::path_for(&fls))
+        .unwrap();
+    lock.try_lock().unwrap();
+    for args in [
+        vec!["put", "--create", "--store", s(&fls), "docs", "a", "1"],
+        vec!["serve", "--create", "--store", s(&fls)],
+    ] {
+        let out = sb.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("is being migrated"), "{args:?}: {err}");
+        assert!(!fls.exists(), "{args:?}");
+    }
+    drop(lock);
+    sb.ok(&["put", "--create", "--store", s(&fls), "docs", "a", "1"]);
+    assert!(fls.exists());
+}
+
+#[test]
+fn create_makes_a_store_only_in_a_directory_that_exists() {
+    let sb = Sandbox::new();
+    let typo = sb.dir("stores").join("typo").join("fl.fls");
+    for args in [
+        vec!["put", "--create", "--store", s(&typo), "docs", "a", "1"],
+        vec!["serve", "--create", "--store", s(&typo)],
+    ] {
+        let out = sb.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("only in a directory that exists"), "{err}");
+        assert!(!sb.dir("stores").join("typo").exists(), "{args:?}");
+    }
+    // No --create: a missing store is refused, even in a directory that is.
+    let out = sb.run(&["serve", "--store", s(&sb.fls())]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only with --create"));
+    assert!(sb.stores().is_empty());
+}
+
+#[test]
+fn migrate_and_verify_sweep_the_copies_a_killed_run_left() {
+    let sb = Sandbox::new();
+    redb_store(&sb.redb());
+    let dead = dead_pid();
+    let me = std::process::id();
+    let stores = sb.dir("stores");
+    let stale = stores.join(format!(".fl.redb.scratch-{dead}-1"));
+    let live = stores.join(format!(".fl.redb.scratch-{me}-2"));
+    let plant = || {
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("fl.redb"), b"a copy").unwrap();
+    };
+    plant();
+    std::fs::create_dir(&live).unwrap();
+    sb.ok(&["migrate", "--dry-run", "--store", s(&sb.redb())]);
+    assert!(
+        !stale.exists(),
+        "a dead run's copy outlived migrate --dry-run"
+    );
+    assert!(live.is_dir(), "a live run's copy was removed");
+    plant();
+    sb.ok(&["migrate", "--store", s(&sb.redb())]);
+    assert!(!stale.exists(), "a dead run's copy outlived migrate");
+    plant();
+    sb.ok(&["verify", "--store", s(&sb.redb())]);
+    assert!(!stale.exists(), "a dead run's copy outlived verify");
+    assert!(live.is_dir());
+}
+
+#[test]
+fn a_second_signal_during_shutdown_does_not_kill_serve() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    for signals in [
+        [libc::SIGINT, libc::SIGINT, libc::SIGINT],
+        [libc::SIGINT, libc::SIGINT, libc::SIGTERM],
+    ] {
+        let (server, ready) = Server::start(&sb, &["serve", "--create", "--store", s(&fls)]);
+        assert!(ready.starts_with("serving "), "{ready}");
+        let (status, err) = server.stop_with(&signals);
+        assert_eq!(status.code(), Some(0), "{status:?}: {err}");
+        assert!(
+            err == "stopped on SIGINT\n" || err == "stopped on SIGTERM\n",
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn bench_path_empties_the_collections_a_killed_run_left() {
+    let sb = Sandbox::new();
+    ferro_store(&sb.fls());
+    let dead = format!("ferrostore-bench-{}-1", dead_pid());
+    let live = format!("ferrostore-bench-{}-2", std::process::id());
+    {
+        let store = FerroStore::open(sb.fls()).unwrap();
+        for i in 0..3 {
+            store
+                .put_doc(&dead, &format!("doc-{i}"), &serde_json::json!({"i": i}))
+                .unwrap();
+        }
+        store
+            .put_doc(&live, "doc-0", &serde_json::json!({"i": 0}))
+            .unwrap();
+    }
+    sb.json(&[
+        "bench",
+        "--n",
+        "2",
+        "--path",
+        s(&sb.fls()),
+        "--i-know-it-writes",
+        "--engines",
+        "ferro",
+        "--workload",
+        "put",
+        "--json",
+    ]);
+    let inspected = sb.json(&["inspect", s(&sb.fls()), "--json"]);
+    let names: Vec<&str> = inspected["contents"]["collections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["__meta", "docs", live.as_str()]);
+}
+
+#[test]
+fn get_and_put_over_wss_with_a_psk_and_a_ca_file() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    let tls = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ferrostore/testdata/tls");
+    let key = sb.dir("home").join("server.key");
+    std::fs::copy(tls.join("server.key"), &key).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cert = tls.join("server.pem");
+    let ca = tls.join("ca.pem");
+    let psk = psk_file(&sb);
+    let (server, ready) = Server::start(
+        &sb,
+        &[
+            "serve",
+            "--create",
+            "--store",
+            s(&fls),
+            "--tcp",
+            "127.0.0.1:0",
+            "--tls-cert",
+            s(&cert),
+            "--tls-key",
+            s(&key),
+            "--psk-file",
+            s(&psk),
+            "--server-id",
+            "lab",
+        ],
+    );
+    // `serving <fls> on wss://127.0.0.1:<port> (auth: psk)`
+    let prefix = format!("serving {} on wss://127.0.0.1:", fls.display());
+    let port: u16 = ready
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(" (auth: psk)\n"))
+        .unwrap_or_else(|| panic!("ready line: {ready:?}"))
+        .parse()
+        .unwrap();
+    let uri = format!("wss://127.0.0.1:{port}");
+
+    let creds = [
+        "--ca-file",
+        s(&ca),
+        "--psk-file",
+        s(&psk),
+        "--server-id",
+        "lab",
+    ];
+    let mut put = vec!["put", "--store", &uri, "docs", "a", r#"{"over": "wss"}"#];
+    put.extend(creds);
+    sb.ok(&put);
+    let mut get = vec!["get", "--store", &uri, "docs", "a"];
+    get.extend(creds);
+    assert_eq!(sb.json(&get)["over"], "wss");
+    // Without the CA the server's certificate is not trusted.
+    let out = sb.run(&[
+        "get",
+        "--store",
+        &uri,
+        "--psk-file",
+        s(&psk),
+        "--server-id",
+        "lab",
+        "docs",
+        "a",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let (status, err) = server.stop();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(
+        FerroStore::open(&fls)
+            .unwrap()
+            .get_doc("docs", "a")
+            .unwrap(),
+        Some(serde_json::json!({"over": "wss"}))
+    );
 }

@@ -13,8 +13,12 @@
 //! program; the arguments of the commands both programs share are declared
 //! once, in `args` (feature `cli`).
 //!
-//! Only `put` and `serve` create a store (a new `.fls`, mode 0600), and only
-//! when nothing is at its path: a lone `.redb` is refused, never migrated. A
+//! Only `put` and `serve` create a store (a new `.fls`, mode 0600), as the
+//! caller's [`Create`] allows (`ferrostore`: only with `--create`, in a
+//! directory that exists; `fl store`: the bound store, as every `fl` command
+//! makes it), only when nothing is at its path, and only while holding the
+//! store's migration lock: a `.redb` beside the missing `.fls` is refused,
+//! never migrated, whether the path names the `.redb` or the `.fls`. A
 //! path that names nothing is reported ([`status`]) or refused (every other
 //! command), never opened. [`migrate`] creates the one `.fls` it is asked to; a
 //! dry run and [`verify`] work on a private copy of the `.redb` and never write
@@ -140,8 +144,8 @@ pub mod serve;
 
 pub use bench::{BenchOptions, BenchReport, BenchTarget, Workload, bench};
 pub use data::{
-    Credentials, GetReport, PutReport, Query, QueryReport, Target, get, open_target, put, query,
-    read_doc,
+    Create, Credentials, GetReport, PutReport, Query, QueryReport, Target, get, open_target, put,
+    query, read_doc,
 };
 pub use inspect::inspect;
 pub use serve::{ServeOptions, Serving, serve};
@@ -190,6 +194,12 @@ impl SiblingScratch {
     /// A new directory `.<file name>.scratch-<pid>-<n>` in the directory of
     /// `store`, made mode 0700 and refused when the name exists.
     pub fn beside(store: &Path) -> Result<Self> {
+        let (dir, name) = Self::place(store);
+        Self::make(dir, &name)
+    }
+
+    /// The directory and name [`beside`](Self::beside) uses for `store`.
+    fn place(store: &Path) -> (&Path, String) {
         let dir = match store.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
@@ -197,7 +207,20 @@ impl SiblingScratch {
         let name = store
             .file_name()
             .map_or_else(|| "store".into(), |n| n.to_string_lossy().into_owned());
-        Self::make(dir, &name)
+        (dir, name)
+    }
+
+    /// Remove the directories [`beside`](Self::beside) made for `store` and
+    /// that a process left behind because it was killed (SIGKILL, the OOM
+    /// killer, a SIGINT during the copy) before it could remove them: every
+    /// `.<file name>.scratch-<pid>-<n>` in the store's directory that is a
+    /// directory (a symlink is never followed or removed), is owned by this
+    /// user, and whose `<pid>` names no live process. Run at the start of
+    /// `migrate` and `verify`. Nothing here stops the command: what could not
+    /// be removed is returned, one warning line each.
+    pub fn sweep_beside(store: &Path) -> Vec<String> {
+        let (dir, name) = Self::place(store);
+        sweep_stale(dir, &format!(".{name}.scratch-"))
     }
 
     /// A new directory `.ferrostore.scratch-<pid>-<n>` inside `dir`, made
@@ -226,6 +249,75 @@ impl SiblingScratch {
             removed: false,
         })
     }
+}
+
+/// Whether `pid` names a live process (`kill(pid, 0)` other than `ESRCH`; a
+/// process of another user is alive too). A pid that cannot be one (0, or
+/// past `i32`) is taken as alive, so nothing is removed for it.
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // SAFETY: signal 0 sends nothing; it only checks that `pid` exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// The pid in `<pid>-<digits>`, the tail of a name made with
+/// `<prefix><pid>-<n>`.
+pub(crate) fn pid_of_tail(tail: &str) -> Option<u32> {
+    let (pid, n) = tail.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(pid) && digits(n)).then(|| pid.parse().ok())?
+}
+
+/// Remove each directory in `dir` named `<prefix><pid>-<n>`, owned by this
+/// user, whose pid is not alive. See [`SiblingScratch::sweep_beside`].
+fn sweep_stale(dir: &Path, prefix: &str) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut warnings = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warnings.push(format!(
+                "warning: could not look for stale scratch directories in {}: {e}",
+                dir.display()
+            ));
+            return warnings;
+        }
+    };
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(tail) = name.to_str().and_then(|n| n.strip_prefix(prefix)) else {
+            continue;
+        };
+        let Some(pid) = pid_of_tail(tail) else {
+            continue;
+        };
+        let path = entry.path();
+        // Not followed: a symlink is not a directory here.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() || meta.uid() != uid || pid_alive(pid) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_dir_all(&path) {
+            warnings.push(format!(
+                "warning: could not remove the stale scratch directory {} (left by process \
+                 {pid}, which is gone): {e}",
+                path.display()
+            ));
+        }
+    }
+    warnings
 }
 
 impl Scratch for SiblingScratch {
@@ -1208,6 +1300,62 @@ impl VerifyReport {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// The pid of a child that has exited and been reaped: no live process.
+    pub(crate) fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!pid_alive(pid), "pid {pid} was reused");
+        pid
+    }
+
+    #[test]
+    fn a_killed_commands_scratch_directory_is_swept_and_a_live_ones_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("s.redb");
+        let dead = dead_pid();
+        let me = std::process::id();
+        assert!(pid_alive(me));
+        let stale = dir.path().join(format!(".s.redb.scratch-{dead}-1"));
+        let live = dir.path().join(format!(".s.redb.scratch-{me}-2"));
+        let other_store = dir.path().join(format!(".t.redb.scratch-{dead}-3"));
+        for d in [&stale, &live, &other_store] {
+            std::fs::create_dir(d).unwrap();
+        }
+        std::fs::write(stale.join("copy.redb"), b"x").unwrap();
+        // A symlink and a file with a stale name are not removed, nor what
+        // the link points at.
+        let target = dir.path().join("kept");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("f"), b"y").unwrap();
+        let link = dir.path().join(format!(".s.redb.scratch-{dead}-4"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = dir.path().join(format!(".s.redb.scratch-{dead}-5"));
+        std::fs::write(&file, b"z").unwrap();
+
+        assert!(SiblingScratch::sweep_beside(&store).is_empty());
+        assert!(!stale.exists(), "the dead process's copy was kept");
+        assert!(live.is_dir(), "a live process's copy was removed");
+        assert!(other_store.is_dir(), "another store's copy was removed");
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+        assert!(target.join("f").exists());
+        assert!(file.exists());
+        // A real scratch directory of this process is left alone too.
+        let mine = SiblingScratch::beside(&store).unwrap();
+        assert!(SiblingScratch::sweep_beside(&store).is_empty());
+        assert!(mine.path().is_dir());
+        mine.close().unwrap();
+    }
+
+    #[test]
+    fn a_pid_is_read_from_a_scratch_name_tail() {
+        assert_eq!(pid_of_tail("123-456"), Some(123));
+        assert_eq!(pid_of_tail("123-"), None);
+        assert_eq!(pid_of_tail("x-1"), None);
+        assert_eq!(pid_of_tail("1-2-3"), None);
+        assert!(pid_alive(0), "pid 0 is never swept");
+    }
 
     #[test]
     fn ensure_room_needs_the_size_plus_ten_percent_per_copy() {

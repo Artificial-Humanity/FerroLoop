@@ -18,6 +18,7 @@ use crate::{BackendKind, FerroStore, VectorMetric, VectorStorage};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -220,9 +221,12 @@ pub fn bench<S: Scratch>(
                     w.command
                 );
             }
-            let store = super::data::open_local(path, false, "bench", w)?;
+            let store = super::data::open_local(path, super::data::Create::Never, "bench", w)?;
+            for warning in sweep_stale_collections(&store, path) {
+                let _ = writeln!(std::io::stderr(), "{warning}");
+            }
             let collection = format!(
-                "ferrostore-bench-{}-{}",
+                "{BENCH_PREFIX}{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -260,6 +264,52 @@ pub fn bench<S: Scratch>(
         results,
         skipped,
     })
+}
+
+/// The name of the collection a `bench --path` run writes, before its
+/// `<pid>-<n>`.
+const BENCH_PREFIX: &str = "ferrostore-bench-";
+
+/// Empty every `ferrostore-bench-<pid>-<n>` collection of `store` (the store
+/// `path` names) whose process is gone: what a `bench --path` that was killed
+/// before it could remove its documents left. A live process's run is left
+/// alone. What could not be emptied is returned, one warning line each.
+fn sweep_stale_collections(store: &FerroStore, path: &Path) -> Vec<String> {
+    let physical = crate::physical_path(path, BackendKind::Ferro);
+    let names: Vec<String> = match crate::ferrostore::inspect_at(&physical) {
+        Ok(report) => report
+            .contents
+            .map(|c| c.collections.into_iter().map(|c| c.name).collect())
+            .unwrap_or_default(),
+        Err(e) => {
+            return vec![format!(
+                "warning: could not look for stale bench collections in {}: {e}",
+                physical.display()
+            )];
+        }
+    };
+    let mut warnings = Vec::new();
+    for name in names {
+        let Some(pid) = name.strip_prefix(BENCH_PREFIX).and_then(super::pid_of_tail) else {
+            continue;
+        };
+        if super::pid_alive(pid) {
+            continue;
+        }
+        let emptied = store.transaction(|txn| {
+            for (id, _) in txn.scan(&name) {
+                txn.delete_doc(&name, &id)?;
+            }
+            Ok(())
+        });
+        if let Err(e) = emptied {
+            warnings.push(format!(
+                "warning: could not empty the stale bench collection `{name}` (left by process \
+                 {pid}, which is gone): {e}"
+            ));
+        }
+    }
+    warnings
 }
 
 fn run_fresh(

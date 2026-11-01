@@ -224,3 +224,70 @@ fn serve_serves_the_bound_store_to_get_and_put_over_connect() {
     );
     drop(server);
 }
+
+/// Bytes and mtime of a file.
+fn fingerprint(path: &Path) -> (Vec<u8>, std::time::SystemTime) {
+    (
+        std::fs::read(path).unwrap(),
+        std::fs::metadata(path).unwrap().modified().unwrap(),
+    )
+}
+
+#[test]
+fn put_serve_get_and_query_refuse_a_store_rolled_back_to_redb() {
+    let sb = Sandbox::new();
+    sb.json(&["put", "docs", "a", "1"]);
+    let before = fingerprint(&sb.fls());
+    for args in [
+        vec!["put", "docs", "b", "2"],
+        vec!["get", "docs", "a"],
+        vec!["query", "docs", "kind", "fox"],
+        vec!["serve"],
+    ] {
+        let out = sb
+            .fl(&args)
+            .env("FL_STORE_BACKEND", "redb")
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("the bound store is on redb (FL_STORE_BACKEND=redb)")
+                && err.contains("--connect"),
+            "{args:?}: {err}"
+        );
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert_eq!(fingerprint(&sb.fls()), before, "{args:?} touched the .fls");
+    }
+    assert!(!sb.dir("stores").join("fl.fls.sock").exists());
+}
+
+#[test]
+fn put_and_serve_never_create_a_fls_beside_a_lone_redb() {
+    let sb = Sandbox::new();
+    fl_store::RedbStore::open(&sb.dir("stores").join("fl.redb")).unwrap();
+    for db in ["fl.fls", "fl.redb"] {
+        for args in [vec!["put", "docs", "a", "1"], vec!["serve"]] {
+            let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("fl"))
+                .env("HOME", sb.dir("home"))
+                .env("XDG_CONFIG_HOME", sb.dir("config"))
+                .env("XDG_DATA_HOME", sb.dir("data"))
+                .env("XDG_RUNTIME_DIR", sb.dir("run"))
+                .env("TMPDIR", sb.dir("tmp"))
+                .env_remove("FL_DB")
+                .env_remove("FL_STORE_BACKEND")
+                .current_dir(sb.dir("home"))
+                .arg("--db")
+                .arg(sb.dir("stores").join(db))
+                .arg("store")
+                .args(&args)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(2), "{db} {args:?}");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(err.contains("`fl store migrate`"), "{db} {args:?}: {err}");
+            assert!(!sb.fls().exists(), "{db} {args:?} created the .fls");
+        }
+    }
+}

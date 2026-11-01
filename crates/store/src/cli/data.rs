@@ -98,15 +98,35 @@ impl Credentials {
     }
 }
 
+/// Whether a command may create the `.fls` a path names when nothing is
+/// there. Whatever it says, a `.fls` is never created beside a `.redb`
+/// (however the path is spelled: `x.fls` and `x.redb` both name that pair),
+/// and only while holding the store's migration lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Create {
+    /// Never: a missing store is refused (`get`, `query`, `bench --path`).
+    Never,
+    /// Not without `--create`: a missing store is refused, naming the flag
+    /// (`ferrostore put` and `serve` without it).
+    NeedsFlag,
+    /// A new `.fls` in a directory that exists; a missing parent directory is
+    /// refused (`ferrostore put --create`, `serve --create`).
+    InExistingDir,
+    /// A new `.fls`, and its missing parent directories (mode 0700): `fl
+    /// store put` and `serve` on the bound store, as every `fl` command
+    /// creates it.
+    WithParents,
+}
+
 /// Open the FerroStore `target` names. A path is opened embedded, on the
 /// ferro engine whatever the environment says: a lone `.redb` is refused
-/// (never migrated), and a missing `.fls` is created only when `create`
+/// (never migrated), and a missing `.fls` is created only as `create` says
 /// (else refused, naming `what`, the command). A URI connects with
 /// `credentials`, which a path refuses.
 pub fn open_target(
     target: &Target,
     credentials: &Credentials,
-    create: bool,
+    create: Create,
     what: &str,
     w: &Wording,
 ) -> Result<FerroStore> {
@@ -129,26 +149,133 @@ pub fn open_target(
 }
 
 /// The `.fls` that `path` names, opened embedded. See [`open_target`].
-pub(crate) fn open_local(path: &Path, create: bool, what: &str, w: &Wording) -> Result<FerroStore> {
+///
+/// A `.fls` that exists is opened. A missing one is refused when a redb store
+/// is beside it (`path` itself when it is not the `.fls`, or the sibling
+/// `.redb` of the `.fls`, so `x.fls` and `x.redb` are refused alike): every
+/// `fl` process bound to that store would otherwise open the new, empty
+/// `.fls` instead of migrating the `.redb`. Otherwise it is created as
+/// `create` allows, while holding the store's migration lock (see
+/// [`creation_lock`]), and the checks are made again under the lock.
+pub(crate) fn open_local(
+    path: &Path,
+    create: Create,
+    what: &str,
+    w: &Wording,
+) -> Result<FerroStore> {
     let physical = physical_path(path, BackendKind::Ferro);
-    if !present(&physical) {
-        if path != physical && path.exists() {
-            refuse!(
-                "{} holds a redb store and {} does not exist yet: migrate it first (`{} migrate`)",
-                path.display(),
-                physical.display(),
-                w.command
-            );
+    if present(&physical) {
+        return Ok(FerroStore::open(&physical)?);
+    }
+    refuse_beside_redb(path, &physical, w)?;
+    let cmd = w.command;
+    let parent = match physical.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    match create {
+        Create::Never => refuse!(
+            "no store at {}; `{cmd} {what}` does not create one",
+            physical.display()
+        ),
+        Create::NeedsFlag => refuse!(
+            "no store at {}; `{cmd} {what}` creates one only with --create",
+            physical.display()
+        ),
+        Create::InExistingDir => {
+            if !parent.is_dir() {
+                refuse!(
+                    "no directory {} for the store {}; `{cmd} {what} --create` makes a store \
+                     only in a directory that exists",
+                    parent.display(),
+                    physical.display()
+                );
+            }
         }
-        if !create {
-            refuse!(
-                "no store at {}; `{} {what}` does not create one",
-                physical.display(),
-                w.command
-            );
+        Create::WithParents => {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&parent)
+                .map_err(|e| Error::context(format!("could not make {}", parent.display()), e))?;
         }
     }
+    let _lock = creation_lock(&physical)?;
+    // Under the lock: a migration that finished meanwhile left its `.fls`
+    // (opened as it is); a `.redb` that appeared meanwhile is refused.
+    if !present(&physical) {
+        refuse_beside_redb(path, &physical, w)?;
+    }
     Ok(FerroStore::open(&physical)?)
+}
+
+/// Refuse when the `.fls` `physical` is missing and a redb store is beside
+/// it: `path`, when it is another file than the `.fls`, or `x.redb` beside
+/// `x.fls`, however the store was named.
+fn refuse_beside_redb(path: &Path, physical: &Path, w: &Wording) -> Result<()> {
+    let sibling = physical.with_extension("redb");
+    let redb = [path, sibling.as_path()]
+        .into_iter()
+        .find(|p| *p != physical && present(p));
+    if let Some(redb) = redb {
+        refuse!(
+            "{} holds a redb store and {} does not exist yet: migrate it first (`{} migrate`), \
+             and nothing was created",
+            redb.display(),
+            physical.display(),
+            w.command
+        );
+    }
+    Ok(())
+}
+
+/// The migration lock of the store whose `.fls` is `physical`, taken without
+/// waiting, for as long as the returned file is open: a held lock is refused
+/// (a migration of this store is running, and will make the `.fls` itself).
+///
+/// It is the same lock as [`crate::MigrationLock`] (whose `acquire` is
+/// private to `any.rs`): the same file, [`crate::MigrationLock::path_for`]
+/// (`<fls>.migrate.lock`, left in place as that lock leaves it), opened the
+/// same way (read-write, mode 0600, `O_NOFOLLOW`, created if missing) and
+/// the same exclusive `flock` (`File::try_lock`), so a migration and a
+/// creation exclude each other.
+fn creation_lock(physical: &Path) -> Result<std::fs::File> {
+    use std::fs::TryLockError;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = crate::MigrationLock::path_for(physical);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| {
+            Error::context(
+                format!("could not take the migration lock {}", path.display()),
+                e,
+            )
+        })?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => refuse!(
+                "{} is being migrated (another process holds {}): no store was created; run \
+                 this again once the migration is done",
+                physical.display(),
+                path.display()
+            ),
+            Err(TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(TryLockError::Error(e)) => {
+                return Err(Error::context(
+                    format!("could not take the migration lock {}", path.display()),
+                    e,
+                ));
+            }
+        }
+    }
 }
 
 /// Refuse a reserved (`__`) collection, as the store refuses a write to one.
@@ -494,18 +621,100 @@ mod tests {
     fn reserved_collections_are_refused_and_nothing_is_created() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.fls");
-        let Err(err) = open_local(&path, false, "get", &W) else {
+        let Err(err) = open_local(&path, Create::Never, "get", &W) else {
             panic!("get created a store");
         };
         let err = err.to_string();
         assert!(err.contains("does not create one"), "{err}");
         assert!(!path.exists());
-        let store = open_local(&path, true, "put", &W).unwrap();
+        let store = open_local(&path, Create::InExistingDir, "put", &W).unwrap();
         for what in ["get", "put", "query"] {
             let err = refuse_reserved("__meta", what, &W).unwrap_err().to_string();
             assert!(err.contains("reserved"), "{err}");
         }
         assert!(get(&store, "__meta", "schema_version", &W).is_err());
         assert!(put(&store, "__meta", "x", &Value::Null, &W).is_err());
+    }
+
+    const EVERY_CREATE: [Create; 4] = [
+        Create::Never,
+        Create::NeedsFlag,
+        Create::InExistingDir,
+        Create::WithParents,
+    ];
+
+    #[test]
+    fn a_lone_redb_is_refused_however_the_store_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        crate::RedbStore::open(&redb).unwrap();
+        for named in [&fls, &redb] {
+            for create in EVERY_CREATE {
+                let Err(err) = open_local(named, create, "put", &W) else {
+                    panic!("{} {create:?} created a store", named.display());
+                };
+                let err = err.to_string();
+                assert!(err.contains("migrate it first"), "{err}");
+                assert!(!fls.exists(), "{} {create:?}", named.display());
+            }
+        }
+        // Not even the migration lock was made.
+        assert!(!crate::MigrationLock::path_for(&fls).exists());
+    }
+
+    #[test]
+    fn a_store_is_not_created_while_its_migration_lock_is_held() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fls = dir.path().join("s.fls");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(crate::MigrationLock::path_for(&fls))
+            .unwrap();
+        held.try_lock().unwrap();
+        for create in [Create::InExistingDir, Create::WithParents] {
+            let err = open_local(&fls, create, "serve", &W)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("is being migrated"), "{err}");
+            assert!(!fls.exists());
+        }
+        held.unlock().unwrap();
+        // Released: created, and the lock file is left in place.
+        open_local(&fls, Create::InExistingDir, "serve", &W).unwrap();
+        assert!(fls.exists());
+        assert!(crate::MigrationLock::path_for(&fls).exists());
+    }
+
+    #[test]
+    fn creation_follows_the_create_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let fls = dir.path().join("s.fls");
+        let err = open_local(&fls, Create::NeedsFlag, "put", &W)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("only with --create"), "{err}");
+        assert!(!fls.exists());
+        let deep = dir.path().join("typo").join("s.fls");
+        let err = open_local(&deep, Create::InExistingDir, "put", &W)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("only in a directory that exists"), "{err}");
+        assert!(!dir.path().join("typo").exists());
+        open_local(&deep, Create::WithParents, "put", &W).unwrap();
+        assert!(deep.exists());
+        // An existing store opens under every policy.
+        for create in EVERY_CREATE {
+            open_local(&fls, Create::InExistingDir, "put", &W).unwrap();
+            open_local(&fls, create, "get", &W).unwrap();
+        }
     }
 }

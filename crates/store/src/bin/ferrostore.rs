@@ -10,7 +10,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs, emit};
-use fl_store::cli::{self as store_cli, Output, SiblingScratch, Target, Wording};
+use fl_store::cli::{self as store_cli, Create, Output, SiblingScratch, Target, Wording};
 use fl_store::{BackendKind, choose_backend};
 use std::path::PathBuf;
 
@@ -44,6 +44,24 @@ struct StoreTarget {
     /// unix://, ws:// or wss:// URI of a served one.
     #[arg(long, short = 's', value_name = "PATH|URI")]
     store: String,
+}
+
+#[derive(Args)]
+struct CreateFlag {
+    /// Create the store (a new `.fls`, mode 0600) when nothing is at the path.
+    /// Its directory must exist; a `.fls` is never made beside a `.redb`.
+    #[arg(long)]
+    create: bool,
+}
+
+impl CreateFlag {
+    fn policy(&self) -> Create {
+        if self.create {
+            Create::InExistingDir
+        } else {
+            Create::NeedsFlag
+        }
+    }
 }
 
 #[derive(Args)]
@@ -118,10 +136,12 @@ enum Cmd {
         json: bool,
     },
     /// Serve a store on a Unix socket, or on TCP as ws:// or wss://, until
-    /// SIGINT or SIGTERM. Creates the `.fls` when nothing is at the path.
+    /// SIGINT or SIGTERM. A missing store is refused unless --create is given.
     Serve {
         #[command(flatten)]
         store: StorePath,
+        #[command(flatten)]
+        create: CreateFlag,
         #[command(flatten)]
         args: ServeArgs,
     },
@@ -132,10 +152,13 @@ enum Cmd {
         #[command(flatten)]
         args: GetArgs,
     },
-    /// Put one document, given as JSON or on stdin (`-`).
+    /// Put one document, given as JSON or on stdin (`-`). A missing store is
+    /// refused unless --create is given.
     Put {
         #[command(flatten)]
         store: StoreTarget,
+        #[command(flatten)]
+        create: CreateFlag,
         #[command(flatten)]
         args: PutArgs,
     },
@@ -208,6 +231,7 @@ fn run(cmd: Cmd) -> store_cli::Result<i32> {
             json,
         } => {
             let pair = store_cli::migrate_pair(&store.store, w)?;
+            sweep(pair.redb());
             let report =
                 store_cli::migrate(&pair, dry_run, || SiblingScratch::beside(pair.redb()))?;
             if json {
@@ -219,6 +243,7 @@ fn run(cmd: Cmd) -> store_cli::Result<i32> {
         }
         Cmd::Verify { store, json } => {
             let pair = store_cli::verify_pair(&store.store, w)?;
+            sweep(pair.redb());
             let report = store_cli::verify(&pair, || SiblingScratch::beside(pair.redb()))?;
             if json {
                 println!("{}", store_cli::to_json(&report)?);
@@ -227,13 +252,21 @@ fn run(cmd: Cmd) -> store_cli::Result<i32> {
             }
             Ok(report.exit_code())
         }
-        Cmd::Serve { store, args } => args.run(&store.store, w),
+        Cmd::Serve {
+            store,
+            create,
+            args,
+        } => args.run(&store.store, create.policy(), w),
         Cmd::Get { store, args } => {
             let (out, code) = args.run(&Target::parse(&store.store)?, w)?;
             printed(out, code)
         }
-        Cmd::Put { store, args } => {
-            let (out, code) = args.run(&Target::parse(&store.store)?, w)?;
+        Cmd::Put {
+            store,
+            create,
+            args,
+        } => {
+            let (out, code) = args.run(&Target::parse(&store.store)?, create.policy(), w)?;
             printed(out, code)
         }
         Cmd::Query { store, args } => {
@@ -248,6 +281,15 @@ fn run(cmd: Cmd) -> store_cli::Result<i32> {
             let (out, code) = args.run(|| SiblingScratch::within(&std::env::temp_dir()), w)?;
             printed(out, code)
         }
+    }
+}
+
+/// Remove the private copies an earlier `migrate --dry-run` or `verify` on
+/// this store left beside it when it was killed; what could not be removed
+/// is a warning on stderr, and the command goes on.
+fn sweep(redb: &std::path::Path) {
+    for warning in SiblingScratch::sweep_beside(redb) {
+        eprintln!("{warning}");
     }
 }
 

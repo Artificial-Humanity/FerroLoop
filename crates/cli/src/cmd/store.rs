@@ -15,7 +15,7 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs};
-use fl_store::cli::{self as store_cli, Scratch, Target, Wording};
+use fl_store::cli::{self as store_cli, Create, Scratch, Target, Wording};
 use fl_store::{BACKEND_ENV, BackendKind, choose_backend};
 use std::path::Path;
 
@@ -123,9 +123,14 @@ pub struct Connect {
 }
 
 impl Connect {
-    fn target(&self, path: &Path) -> Result<Target> {
+    /// The bound store `path` (on the ferro engine, see [`on_ferro`]), or the
+    /// `--connect` URI.
+    fn target(&self, path: &Path, what: &str) -> Result<Target> {
         match &self.connect {
-            None => Ok(Target::Path(path.to_path_buf())),
+            None => {
+                on_ferro(path, what)?;
+                Ok(Target::Path(path.to_path_buf()))
+            }
             Some(uri) => match Target::parse(uri)? {
                 Target::Path(_) => bail!(
                     "--connect takes a unix://, ws:// or wss:// URI; a path is given with --db"
@@ -142,6 +147,20 @@ fn engine(path: &Path) -> Result<BackendKind> {
         path,
         std::env::var(BACKEND_ENV).ok().as_deref(),
     )?)
+}
+
+/// Refuse `fl store <what>` on the bound store `path` when the environment
+/// puts it on redb (`FL_STORE_BACKEND=redb`, the rollback switch): those
+/// commands work on its `.fls`, which every other `fl` command then leaves
+/// alone, so a write there would split the store.
+fn on_ferro(path: &Path, what: &str) -> Result<()> {
+    if engine(path)? == BackendKind::Redb {
+        bail!(
+            "the bound store is on redb ({BACKEND_ENV}=redb); `fl store {what}` works on \
+             FerroStore (put, serve, get and query all do): unset {BACKEND_ENV}, or use --connect"
+        );
+    }
+    Ok(())
 }
 
 pub fn run(path: &Path, cmd: Cmd) -> Result<i32> {
@@ -189,10 +208,15 @@ pub fn run(path: &Path, cmd: Cmd) -> Result<i32> {
             }
             Ok(report.exit_code())
         }
-        Cmd::Serve { args } => Ok(args.run(path, &FL)?),
-        Cmd::Get { connect, args } => printed(args.run(&connect.target(path)?, &FL)?),
-        Cmd::Put { connect, args } => printed(args.run(&connect.target(path)?, &FL)?),
-        Cmd::Query { connect, args } => printed(args.run(&connect.target(path)?, &FL)?),
+        Cmd::Serve { args } => {
+            on_ferro(path, "serve")?;
+            Ok(args.run(path, Create::WithParents, &FL)?)
+        }
+        Cmd::Get { connect, args } => printed(args.run(&connect.target(path, "get")?, &FL)?),
+        Cmd::Put { connect, args } => {
+            printed(args.run(&connect.target(path, "put")?, Create::WithParents, &FL)?)
+        }
+        Cmd::Query { connect, args } => printed(args.run(&connect.target(path, "query")?, &FL)?),
         Cmd::Inspect { args } => printed(args.run(path, &FL)?),
         Cmd::Bench { args } => printed(args.run(scratch_dir, &FL)?),
     }

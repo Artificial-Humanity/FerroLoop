@@ -8,12 +8,15 @@
 //! start inherits the mask and no default handler kills the process part way
 //! through a write. Once the server listens, the thread waits for one of the
 //! two (`sigwait`), then drops the server (it stops accepting, closes its
-//! connections and removes its socket) and the store, and returns.
+//! connections and removes its socket) and the store, and returns. The two
+//! stay blocked after it returns, for the life of the thread: a second
+//! SIGINT during the shutdown, or while the caller prints its last line,
+//! stays pending and kills nothing, and the process exits as it means to.
 //!
 //! Nothing secret is printed: the report names files and the methods in
 //! force, never a key, a token or a hash.
 
-use super::data::open_local;
+use super::data::{Create, open_local};
 use super::{Error, Result, Wording, line};
 use crate::{
     BackendKind, FerroStoreServer, ServerAuth, default_socket_path_for_store, physical_path,
@@ -130,13 +133,15 @@ fn server_auth(options: &ServeOptions) -> Result<ServerAuth> {
     Ok(auth)
 }
 
-/// Serve the store `path` names (its `.fls`, created 0600 when nothing is
-/// there; a lone `.redb` is refused) under `options`. `ready` is called once
-/// the server listens; then this waits for SIGINT or SIGTERM, shuts the
-/// server down, and returns the report with the signal's name.
+/// Serve the store `path` names (its `.fls`; when nothing is there, created
+/// 0600 as `create` allows; a lone `.redb` is refused) under `options`.
+/// `ready` is called once the server listens; then this waits for SIGINT or
+/// SIGTERM, shuts the server down, and returns the report with the signal's
+/// name. SIGINT and SIGTERM are left blocked in the calling thread.
 pub fn serve(
     path: &Path,
     options: &ServeOptions,
+    create: Create,
     w: &Wording,
     ready: impl FnOnce(&Serving) -> Result<()>,
 ) -> Result<(Serving, &'static str)> {
@@ -144,7 +149,7 @@ pub fn serve(
     // Before the store or the server starts a thread.
     let signals = Signals::block()?;
     let auth = server_auth(options)?;
-    let store = open_local(path, true, "serve", w)?;
+    let store = open_local(path, create, "serve", w)?;
     let physical = physical_path(path, BackendKind::Ferro);
     let mut methods = Vec::new();
     let (server, uri, tls) = match &options.tcp {
@@ -185,31 +190,30 @@ pub fn serve(
 }
 
 /// SIGINT and SIGTERM, blocked in the calling thread (and so in every thread
-/// it starts) until dropped, when the previous mask comes back.
+/// it starts). Never unblocked again: dropping this leaves the mask as it is,
+/// so a second signal during the shutdown is not delivered.
 struct Signals {
     set: libc::sigset_t,
-    previous: libc::sigset_t,
 }
 
 impl Signals {
     fn block() -> Result<Self> {
         // SAFETY: `sigemptyset` and `sigaddset` initialise and fill the set
-        // they are given; `pthread_sigmask` reads `set` and writes `previous`,
-        // both valid for the call.
+        // they are given; `pthread_sigmask` reads `set`, valid for the call,
+        // and writes no old mask (null).
         unsafe {
             let mut set: libc::sigset_t = std::mem::zeroed();
-            let mut previous: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&raw mut set);
             libc::sigaddset(&raw mut set, libc::SIGINT);
             libc::sigaddset(&raw mut set, libc::SIGTERM);
-            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous);
+            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
             if rc != 0 {
                 return Err(Error::context(
                     "could not block SIGINT and SIGTERM",
                     std::io::Error::from_raw_os_error(rc),
                 ));
             }
-            Ok(Self { set, previous })
+            Ok(Self { set })
         }
     }
 
@@ -233,19 +237,6 @@ impl Signals {
                 libc::SIGINT => "SIGINT",
                 _ => "SIGTERM",
             });
-        }
-    }
-}
-
-impl Drop for Signals {
-    fn drop(&mut self) {
-        // SAFETY: `previous` is the mask `block` read.
-        unsafe {
-            libc::pthread_sigmask(
-                libc::SIG_SETMASK,
-                &raw const self.previous,
-                std::ptr::null_mut(),
-            );
         }
     }
 }
