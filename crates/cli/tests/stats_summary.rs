@@ -39,9 +39,14 @@ impl Env {
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
             .current_dir(self.home.path());
-        if kind == BackendKind::Ferro {
-            c.env("FL_STORE_BACKEND", "ferro");
-        }
+        // Name the engine: neither leg depends on the default.
+        c.env(
+            "FL_STORE_BACKEND",
+            match kind {
+                BackendKind::Ferro => "ferro",
+                BackendKind::Redb => "redb",
+            },
+        );
         c.arg("--db").arg(self.logical());
         c
     }

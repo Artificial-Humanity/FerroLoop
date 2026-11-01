@@ -527,7 +527,7 @@ const ROOT: &str = "0123456789abcdef0123456789abcdef01234567";
 /// `fl github ledger init` will.
 fn with_ledger_root(db: &Path, repo: &str, node: &str, commit: &str) {
     use fl_core::store::Bindings;
-    let s = fl_store::RedbStore::open(db).unwrap();
+    let s = fl_store::open_store(db).unwrap();
     s.bind_node_id(repo, node).unwrap();
     s.set_ledger_root(node, commit).unwrap();
 }
@@ -577,7 +577,7 @@ fn a_bound_projects_export_carries_its_ledger_root_and_an_import_records_it() {
         .assert()
         .success();
     use fl_core::store::Bindings;
-    let imported = fl_store::RedbStore::open(&other.data.path().join("fl/fl.redb")).unwrap();
+    let imported = fl_store::open_store(&other.data.path().join("fl/fl.redb")).unwrap();
     assert_eq!(imported.ledger_root("R_1").unwrap().as_deref(), Some(ROOT));
 }
 
@@ -673,7 +673,7 @@ fn an_export_of_a_project_in_another_projects_store_is_refused_when_that_store_h
         .assert()
         .success();
     let other_project = {
-        let s = fl_store::RedbStore::open(&b).unwrap();
+        let s = fl_store::open_store(&b).unwrap();
         s.list_projects().unwrap()[0].id.iri().to_string()
     };
     with_ledger_root(&b, "acme/widgets", "R_9", ROOT);

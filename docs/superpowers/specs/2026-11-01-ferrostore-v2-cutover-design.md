@@ -150,6 +150,8 @@ After step 4 the `.fls` is the store. A later failure in cleanup, `fsync` or `ch
 
 The `.redb` stays open, and so keeps redb's exclusive lock, from before step 1 until after step 6. No other process can write it after it is copied. Before step 1, the call removes this target's own temp files that a crash left: regular files, owned by the current user, not modified for 24 hours.
 
+**Default engine.** `open_store` opens FerroStore unless `FL_STORE_BACKEND=redb` is set. The first open of a store that has only a `.redb` runs the sequence above. `FL_STORE_BACKEND=redb` is the rollback: `chmod 600` the `.redb` and set the variable. A hub or wire daemon that is still on redb must be stopped, or moved to the FerroStore engine in the same step, before the first FerroStore-engine command: two processes on different engines for one logical store is the case the migration lock guards against.
+
 **Acceptance.** A dry run against a copy of the real `~/.local/share/fl/fl.redb` gives `is_clean()`. Record the row counts and the time taken in the PR.
 
 **Reserved collections.** Collections whose names start with `__` belong to the store, and `__meta` is one of them. The public document API refuses them.

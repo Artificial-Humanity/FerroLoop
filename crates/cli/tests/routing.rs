@@ -1780,7 +1780,7 @@ fn a_record_whose_area_was_removed_elsewhere_stays_protected() {
 /// the map does not declare.
 fn local_record_named(home: &Path, area: &str) {
     use fl_core::store::{Catalog, Tracker};
-    let s = fl_store::RedbStore::open(&home.join("fl.redb")).unwrap();
+    let s = fl_store::open_store(&home.join("fl.redb")).unwrap();
     let p = s.list_projects().unwrap().remove(0).id;
     s.add_record_with_area(&p, "made under an older map", Some(area))
         .unwrap();
@@ -2109,7 +2109,7 @@ fn second_project(g: &R, tracker: &str) -> (tempfile::TempDir, String) {
         .success();
     let id = {
         use fl_core::store::Catalog;
-        let s = fl_store::RedbStore::open(&home.join("b.redb")).unwrap();
+        let s = fl_store::open_store(&home.join("b.redb")).unwrap();
         s.list_projects().unwrap().remove(0).id.iri().to_string()
     };
     (b, id)
@@ -2149,7 +2149,7 @@ fn an_id_held_by_another_store_beside_one_no_store_holds_is_not_the_routers() {
     ]);
     let finding = {
         use fl_core::store::{Catalog, Tracker};
-        let s = fl_store::RedbStore::open(&g.home.path().join("b.redb")).unwrap();
+        let s = fl_store::open_store(&g.home.path().join("b.redb")).unwrap();
         let p = s.list_projects().unwrap().remove(0).id;
         s.list_findings(&p).unwrap().remove(0).id.iri().to_string()
     };
@@ -2193,16 +2193,19 @@ fn an_id_held_by_another_store_beside_one_no_store_holds_is_not_the_routers() {
     ]);
     let ours = {
         use fl_core::store::{Catalog, Tracker};
-        let s = fl_store::RedbStore::open(&db).unwrap();
+        let s = fl_store::open_store(&db).unwrap();
         let p = s.list_projects().unwrap().remove(0).id;
         s.list_findings(&p).unwrap().remove(0).id.iri().to_string()
     };
-    // The routed store's own refusal, which searched it alone.
+    // The routed store's own refusal, which searched it alone. It names the file the engine keeps
+    // the store in.
     let said = g.refused(&["finding", "reproduce", &ours, "--gate", gate]);
+    let kind = fl_store::choose_backend(&db, std::env::var(fl_store::BACKEND_ENV).ok().as_deref())
+        .unwrap();
     assert!(
         said.contains(&format!(
             "no store holds {gate} (searched: {})",
-            db.display()
+            fl_store::physical_path(&db, kind).display()
         )),
         "{said}"
     );

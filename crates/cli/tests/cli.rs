@@ -176,15 +176,20 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
     );
 
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", d.path()).arg("--db").arg(&nested);
+    c.env("XDG_CONFIG_HOME", d.path())
+        .env_remove("FL_STORE_BACKEND")
+        .arg("--db")
+        .arg(&nested);
     let repo = git_repo();
     c.args(["project", "add", &repo.path().display().to_string()])
         .assert()
         .success();
 
+    // The default engine keeps the store at the sibling `.fls`.
+    let created = fl_store::physical_path(&nested, fl_store::DEFAULT_BACKEND);
     assert!(
-        nested.exists(),
-        "store file should have been created at {nested:?}"
+        created.exists(),
+        "store file should have been created at {created:?}"
     );
 }
 
@@ -214,9 +219,11 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
         .assert()
         .success();
 
+    // The default engine keeps the store at the sibling `.fls`.
+    let created = fl_store::physical_path(&nested, fl_store::DEFAULT_BACKEND);
     assert!(
-        nested.exists(),
-        "store file should have been created at {nested:?}"
+        created.exists(),
+        "store file should have been created at {created:?}"
     );
 }
 

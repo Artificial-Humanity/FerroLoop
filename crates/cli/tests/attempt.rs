@@ -198,7 +198,7 @@ fn all_five_adapters_run_record_telemetry_paths_touched_and_liveness() {
                 .and(contains("tokens=100/25\tcost=5000 micro-USD")),
         );
 
-    let store = fl_store::RedbStore::open(Path::new(&db)).unwrap();
+    let store = fl_store::open_store(Path::new(&db)).unwrap();
     let projects = store.list_projects().unwrap();
     let attempts = store
         .attempts(&ProjectId(projects[0].id.iri().clone()))
@@ -270,7 +270,7 @@ fn stats_reports_partial_cost_floor_and_regret_audit_challenge() {
         .success();
 
     {
-        let store = fl_store::RedbStore::open(Path::new(&db)).unwrap();
+        let store = fl_store::open_store(Path::new(&db)).unwrap();
         let proj = store.list_projects().unwrap()[0].id.clone();
         let g_fast = store
             .add_gate(
