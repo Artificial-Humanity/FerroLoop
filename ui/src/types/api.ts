@@ -195,7 +195,6 @@ export interface PruneAttachmentsResponse {
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;
-  attachment_retention_days?: number;
   subsystems: {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
