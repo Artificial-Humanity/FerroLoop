@@ -302,6 +302,25 @@ export interface AgentRecord {
   by?: string;
 }
 
+export interface RecastAgentRequest {
+  project: string;
+  role: string;
+  extra_areas?: string[];
+  create_area?: boolean;
+  replace_lead?: boolean;
+  dry_run?: boolean;
+}
+
+export interface RecastAgentResponse {
+  agent?: AgentRecord;
+  before?: AgentRecord;
+  after?: AgentRecord;
+  retires_lead?: string | null;
+  creates_areas?: string[];
+  open_prs_tier_changes?: unknown[];
+  invalidated_review_markers?: unknown[];
+}
+
 export interface AreaRecord {
   area_key: string;
   name: string;

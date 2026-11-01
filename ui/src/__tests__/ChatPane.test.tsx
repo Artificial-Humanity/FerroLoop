@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import {
@@ -58,7 +58,9 @@ describe("ChatPane", () => {
     );
 
     expect(
-      screen.getByText(/Check the status of AI-Lab-0 services and inspect the worktree\./i),
+      within(screen.getByTestId("turn-card-0")).getByText(
+        /Check the status of AI-Lab-0 services and inspect the worktree\./i,
+      ),
     ).toBeInTheDocument();
     expect(screen.getByText(/All AI-Lab-0 services are healthy\./i)).toBeInTheDocument();
     expect(screen.getByText(/systemctl status fl-hub/i)).toBeInTheDocument();
@@ -1334,5 +1336,95 @@ describe("Resizable chat composer (Record 57)", () => {
 
     const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
     expect(select.value).toBe("gemini-4-argon");
+  });
+
+  it("renders docked since-last-prompt-bar with activity summary, expands step details, and scrolls to prompt turn on jump", () => {
+    const activityTurns: TranscriptTurn[] = [
+      {
+        index: 10,
+        role: "user",
+        content: "Update SettingsModal.tsx with the 3-tab layout and run UI tests.",
+        thinking: null,
+        tool_calls: [],
+        created_at: "2026-11-01T16:10:00Z",
+      },
+      {
+        index: 11,
+        role: "assistant",
+        content: "Editing SettingsModal.tsx and running Vitest now.",
+        thinking: null,
+        tool_calls: [
+          {
+            name: "edit_file",
+            arguments: {
+              Path: "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/ui/src/components/SettingsModal.tsx",
+            },
+          },
+          {
+            name: "run_command",
+            arguments: {
+              CommandLine: "npm --prefix ui test",
+            },
+          },
+        ],
+        created_at: "2026-11-01T16:10:05Z",
+      },
+      {
+        index: 12,
+        role: "wire:ferris",
+        content: "[WIRE from ferris · normal] Looks good, proceed.",
+        thinking: null,
+        tool_calls: [],
+        created_at: "2026-11-01T16:10:12Z",
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="felix"
+        agentDisplayName="Felix"
+        adapter="antigravity"
+        sessionId="sess-felix-01"
+        turns={activityTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const bar = screen.getByTestId("since-last-prompt-bar");
+    expect(bar).toBeInTheDocument();
+    expect(screen.getByTestId("since-last-prompt-text")).toHaveTextContent(
+      "Update SettingsModal.tsx with the 3-tab layout and run UI tests.",
+    );
+
+    const counts = screen.getByTestId("since-last-prompt-counts");
+    expect(counts).toHaveTextContent("1 reply");
+    expect(counts).toHaveTextContent("2 tool calls");
+    expect(counts).toHaveTextContent("1 file touched");
+    expect(counts).toHaveTextContent("1 wire");
+
+    // Collapsed by default
+    const toggle = screen.getByTestId("since-last-prompt-toggle");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("since-last-prompt-details")).toBeNull();
+
+    // Expand details
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const details = screen.getByTestId("since-last-prompt-details");
+    expect(details).toBeInTheDocument();
+    expect(
+      screen.getByTestId("since-last-prompt-file-SettingsModal.tsx"),
+    ).toBeInTheDocument();
+
+    // Clicking "↑ Jump to prompt" scrolls turn-card-10 into view
+    const promptCard = screen.getByTestId("turn-card-10");
+    const scrollIntoViewMock = vi.fn();
+    promptCard.scrollIntoView = scrollIntoViewMock;
+
+    fireEvent.click(screen.getByTestId("since-last-prompt-jump-btn"));
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({
+      behavior: "smooth",
+      block: "center",
+    });
   });
 });

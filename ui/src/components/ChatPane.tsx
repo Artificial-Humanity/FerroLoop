@@ -17,10 +17,174 @@ import {
   type SlashCommandEntry,
   type TranscriptTurn,
 } from "../types/api";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
 import { ThinkingBlock } from "./ThinkingBlock";
-import { isPureToolOutputTurn, TurnCard } from "./TurnCard";
+import {
+  extractTurnAttachments,
+  isOperatorUserTurn,
+  isPureToolOutputTurn,
+  isWireTurn,
+  summarizeWireContent,
+  TurnCard,
+} from "./TurnCard";
+
+export interface SinceLastPromptStep {
+  id: string;
+  turnIndex: number;
+  kind: "reply" | "tool" | "file" | "wire";
+  label: string;
+}
+
+export interface SinceLastPromptSummary {
+  promptTurnIndex: number;
+  promptCreatedAt?: string | null;
+  promptText: string;
+  assistantRepliesCount: number;
+  toolCallsCount: number;
+  toolSummaries: Array<{ name: string; count: number; turnIndex: number }>;
+  wireMessagesCount: number;
+  touchedFiles: Array<{ path: string; basename: string; turnIndex: number }>;
+  steps: SinceLastPromptStep[];
+}
+
+const FILE_MODIFYING_TOOL_REGEX =
+  /^(?:edit_file|write_file|replace_in_file|create_file|multi_edit|patch|notebook_edit)$/i;
+
+export function computeSinceLastPromptSummary(
+  turns: TranscriptTurn[],
+): SinceLastPromptSummary | null {
+  let lastUserPos = -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (isOperatorUserTurn(turns[i])) {
+      lastUserPos = i;
+      break;
+    }
+  }
+  if (lastUserPos < 0) {
+    return null;
+  }
+
+  const lastUserTurn = turns[lastUserPos];
+  const { cleanedContent } = extractTurnAttachments(lastUserTurn.content || "", {
+    stripAgyWrapper: true,
+  });
+  const promptText =
+    (cleanedContent || lastUserTurn.content || "").trim() || "(empty prompt)";
+
+  let assistantRepliesCount = 0;
+  let toolCallsCount = 0;
+  let wireMessagesCount = 0;
+  const toolMap = new Map<string, { count: number; turnIndex: number }>();
+  const fileMap = new Map<string, { path: string; basename: string; turnIndex: number }>();
+  const steps: SinceLastPromptStep[] = [];
+
+  const subsequentTurns = turns.slice(lastUserPos + 1);
+  for (const t of subsequentTurns) {
+    if (isWireTurn(t)) {
+      wireMessagesCount++;
+      const roleNormalized = (t.role || "").toLowerCase();
+      const sender = roleNormalized.startsWith("wire:")
+        ? t.role.slice(5)
+        : "subagent";
+      steps.push({
+        id: `wire-${t.index}`,
+        turnIndex: t.index,
+        kind: "wire",
+        label: summarizeWireContent(t.content || "", sender),
+      });
+      continue;
+    }
+
+    const roleNormalized = (t.role || "assistant").toLowerCase();
+    if (roleNormalized === "assistant" && !isPureToolOutputTurn(t)) {
+      const toolCalls = t.tool_calls ?? [];
+      toolCalls.forEach((tc, idx) => {
+        toolCallsCount++;
+        const name = tc.name || "tool";
+        const existingTool = toolMap.get(name);
+        if (existingTool) {
+          existingTool.count += 1;
+          existingTool.turnIndex = t.index;
+        } else {
+          toolMap.set(name, { count: 1, turnIndex: t.index });
+        }
+
+        const args =
+          tc.arguments && typeof tc.arguments === "object"
+            ? (tc.arguments as Record<string, unknown>)
+            : {};
+        const rawPath =
+          args.Path ?? args.path ?? args.file_path ?? args.TargetFile;
+        if (
+          typeof rawPath === "string" &&
+          rawPath.trim().length > 0 &&
+          FILE_MODIFYING_TOOL_REGEX.test(name)
+        ) {
+          const cleanPath = rawPath.trim();
+          const basename = cleanPath.split("/").pop() || cleanPath;
+          fileMap.set(cleanPath, {
+            path: cleanPath,
+            basename,
+            turnIndex: t.index,
+          });
+          steps.push({
+            id: `file-${t.index}-${idx}`,
+            turnIndex: t.index,
+            kind: "file",
+            label: `${name}: ${basename}`,
+          });
+        } else {
+          steps.push({
+            id: `tool-${t.index}-${idx}`,
+            turnIndex: t.index,
+            kind: "tool",
+            label: `Tool: ${name}`,
+          });
+        }
+      });
+
+      const { cleanedContent: replyClean } = extractTurnAttachments(
+        t.content || "",
+        { stripAgyWrapper: false },
+      );
+      const replyTrimmed = replyClean.trim();
+      if (replyTrimmed.length > 0) {
+        assistantRepliesCount++;
+        const firstLine =
+          replyTrimmed
+            .split("\n")
+            .find((line) => line.trim().length > 0)
+            ?.trim() ?? replyTrimmed;
+        const snippet =
+          firstLine.length > 76 ? `${firstLine.slice(0, 76)}…` : firstLine;
+        steps.push({
+          id: `reply-${t.index}`,
+          turnIndex: t.index,
+          kind: "reply",
+          label: `Reply (#${t.index}): ${snippet}`,
+        });
+      }
+    }
+  }
+
+  return {
+    promptTurnIndex: lastUserTurn.index,
+    promptCreatedAt: lastUserTurn.created_at ?? null,
+    promptText,
+    assistantRepliesCount,
+    toolCallsCount,
+    toolSummaries: Array.from(toolMap.entries()).map(([name, info]) => ({
+      name,
+      count: info.count,
+      turnIndex: info.turnIndex,
+    })),
+    wireMessagesCount,
+    touchedFiles: Array.from(fileMap.values()),
+    steps,
+  };
+}
 
 export interface CoalescedTurnGroup {
   turn: TranscriptTurn;
@@ -459,6 +623,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
+  const [sinceLastPromptExpanded, setSinceLastPromptExpanded] =
+    React.useState<boolean>(false);
+  const activeTimeZone = useActiveTimeZone();
   const targetSessionOrAgent = sessionId || agentName || "";
   const initialDraftRef = React.useRef<SessionDraft | null>(null);
   if (initialDraftRef.current === null) {
@@ -1188,7 +1355,43 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   React.useEffect(() => {
     setVisibleTurnLimit(100);
+    setSinceLastPromptExpanded(false);
   }, [targetSessionOrAgent]);
+
+  const sinceLastPrompt = React.useMemo(
+    () => computeSinceLastPromptSummary(effectiveTurns),
+    [effectiveTurns],
+  );
+
+  const scrollToTurnIndex = React.useCallback(
+    (turnIndex: number) => {
+      const container = scrollContainerRef.current;
+      const tryScroll = () => {
+        const root = container ?? document;
+        const card = root.querySelector<HTMLElement>(
+          `[data-testid="turn-card-${turnIndex}"]`,
+        );
+        if (card) {
+          if (typeof card.scrollIntoView === "function") {
+            card.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+          return true;
+        }
+        return false;
+      };
+      if (tryScroll()) {
+        return;
+      }
+      // If the turn is inside hidden older history, expand the visible window first.
+      if (filteredTurns.length > visibleTurnLimit) {
+        setVisibleTurnLimit(filteredTurns.length);
+        requestAnimationFrame(() => {
+          tryScroll();
+        });
+      }
+    },
+    [filteredTurns.length, visibleTurnLimit],
+  );
 
   const lastTurnKey = React.useMemo(
     () => computeLastTurnKey(filteredTurns),
@@ -1662,6 +1865,317 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Docked "Since Your Last Prompt" Activity Bar */}
+      {sinceLastPrompt && (
+        <div
+          data-testid="since-last-prompt-bar"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            backgroundColor: "var(--bg-surface)",
+            borderBottom: "1px solid var(--border-subtle)",
+            padding: "6px 16px",
+            gap: "6px",
+            flexShrink: 0,
+            zIndex: 2,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "10px",
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              type="button"
+              data-testid="since-last-prompt-toggle"
+              aria-expanded={sinceLastPromptExpanded}
+              onClick={() => setSinceLastPromptExpanded((prev) => !prev)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                flex: 1,
+                minWidth: 0,
+                background: "transparent",
+                border: "none",
+                padding: "2px 0",
+                color: "var(--text-primary)",
+                cursor: "pointer",
+                textAlign: "left",
+                fontFamily: "inherit",
+              }}
+              title="Click to expand or collapse activity since your last prompt"
+            >
+              <span
+                style={{
+                  fontSize: "10px",
+                  color: "var(--accent-primary, #3B82F6)",
+                  flexShrink: 0,
+                }}
+              >
+                {sinceLastPromptExpanded ? "▾" : "▸"}
+              </span>
+              <span
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  color: "var(--text-secondary)",
+                  whiteSpace: "nowrap",
+                  flexShrink: 0,
+                }}
+              >
+                Your last message (#{sinceLastPrompt.promptTurnIndex}
+                {sinceLastPrompt.promptCreatedAt
+                  ? ` · ${formatTimestamp(sinceLastPrompt.promptCreatedAt, activeTimeZone)}`
+                  : ""}
+                ):
+              </span>
+              <span
+                data-testid="since-last-prompt-text"
+                style={{
+                  fontSize: "12px",
+                  color: "var(--text-primary)",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  display: "-webkit-box",
+                  WebkitLineClamp: sinceLastPromptExpanded ? 4 : 2,
+                  WebkitBoxOrient: "vertical",
+                  lineHeight: 1.35,
+                  flex: 1,
+                  minWidth: "120px",
+                }}
+              >
+                {sinceLastPrompt.promptText || "(attachment / empty prompt)"}
+              </span>
+            </button>
+
+            <div
+              data-testid="since-last-prompt-counts"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                flexWrap: "wrap",
+                flexShrink: 0,
+              }}
+            >
+              <span
+                className="fd-badge fd-mono"
+                style={{ fontSize: "10px", padding: "1px 6px" }}
+                title="Assistant replies since your last prompt"
+              >
+                {sinceLastPrompt.assistantRepliesCount}{" "}
+                {sinceLastPrompt.assistantRepliesCount === 1 ? "reply" : "replies"}
+              </span>
+              <span
+                className="fd-badge fd-mono"
+                style={{
+                  fontSize: "10px",
+                  padding: "1px 6px",
+                  color:
+                    sinceLastPrompt.toolCallsCount > 0
+                      ? "var(--status-warn, #F59E0B)"
+                      : "var(--text-muted)",
+                }}
+                title={
+                  sinceLastPrompt.toolSummaries.length > 0
+                    ? sinceLastPrompt.toolSummaries
+                        .map((t) => (t.count > 1 ? `${t.name} ×${t.count}` : t.name))
+                        .join(", ")
+                    : "Tool calls since your last prompt"
+                }
+              >
+                {sinceLastPrompt.toolCallsCount}{" "}
+                {sinceLastPrompt.toolCallsCount === 1 ? "tool call" : "tool calls"}
+                {sinceLastPrompt.toolSummaries.length > 0 && (
+                  <span style={{ opacity: 0.85, marginLeft: "4px" }}>
+                    (
+                    {sinceLastPrompt.toolSummaries
+                      .slice(0, 3)
+                      .map((t) => (t.count > 1 ? `${t.name} ×${t.count}` : t.name))
+                      .join(", ")}
+                    {sinceLastPrompt.toolSummaries.length > 3
+                      ? ` +${sinceLastPrompt.toolSummaries.length - 3}`
+                      : ""}
+                    )
+                  </span>
+                )}
+              </span>
+              {sinceLastPrompt.touchedFiles.length > 0 && (
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="since-last-prompt-files-badge"
+                  style={{
+                    fontSize: "10px",
+                    padding: "1px 6px",
+                    color: "var(--diff-add-text, #10B981)",
+                  }}
+                  title={sinceLastPrompt.touchedFiles.map((f) => f.path).join("\n")}
+                >
+                  {sinceLastPrompt.touchedFiles.length}{" "}
+                  {sinceLastPrompt.touchedFiles.length === 1
+                    ? "file touched"
+                    : "files touched"}
+                </span>
+              )}
+              {sinceLastPrompt.wireMessagesCount > 0 && (
+                <span
+                  className="fd-badge fd-mono"
+                  style={{ fontSize: "10px", padding: "1px 6px" }}
+                >
+                  {sinceLastPrompt.wireMessagesCount} wire
+                </span>
+              )}
+              <button
+                type="button"
+                className="fd-btn fd-mono"
+                data-testid="since-last-prompt-jump-btn"
+                onClick={() => scrollToTurnIndex(sinceLastPrompt.promptTurnIndex)}
+                style={{ fontSize: "11px", padding: "2px 8px" }}
+                title={`Scroll to your prompt at turn #${sinceLastPrompt.promptTurnIndex}`}
+              >
+                ↑ Jump to prompt
+              </button>
+            </div>
+          </div>
+
+          {sinceLastPromptExpanded && (
+            <div
+              data-testid="since-last-prompt-details"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                paddingTop: "6px",
+                borderTop: "1px solid var(--border-subtle)",
+                maxHeight: "180px",
+                overflowY: "auto",
+              }}
+            >
+              {sinceLastPrompt.touchedFiles.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    className="fd-mono"
+                    style={{
+                      fontSize: "10px",
+                      fontWeight: 600,
+                      color: "var(--text-muted)",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Files touched:
+                  </span>
+                  {sinceLastPrompt.touchedFiles.map((file) => (
+                    <button
+                      key={file.path}
+                      type="button"
+                      className="fd-badge fd-mono"
+                      data-testid={`since-last-prompt-file-${file.basename}`}
+                      onClick={() => scrollToTurnIndex(file.turnIndex)}
+                      title={`${file.path} (turn #${file.turnIndex})`}
+                      style={{
+                        fontSize: "10px",
+                        padding: "1px 6px",
+                        cursor: "pointer",
+                        color: "var(--diff-add-text, #10B981)",
+                      }}
+                    >
+                      {file.basename} · #{file.turnIndex}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {sinceLastPrompt.steps.length === 0 ? (
+                <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                  Waiting for agent activity after this prompt…
+                </div>
+              ) : (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "3px",
+                  }}
+                >
+                  {sinceLastPrompt.steps.map((step) => (
+                    <button
+                      key={step.id}
+                      type="button"
+                      data-testid={`since-last-prompt-step-${step.id}`}
+                      onClick={() => scrollToTurnIndex(step.turnIndex)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        background: "transparent",
+                        border: "none",
+                        padding: "2px 6px",
+                        borderRadius: "4px",
+                        color: "var(--text-secondary)",
+                        fontSize: "11px",
+                        cursor: "pointer",
+                        textAlign: "left",
+                        fontFamily: "inherit",
+                      }}
+                    >
+                      <span
+                        style={{
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        <span
+                          className="fd-mono"
+                          style={{
+                            color:
+                              step.kind === "tool"
+                                ? "var(--status-warn, #F59E0B)"
+                                : step.kind === "file"
+                                  ? "var(--diff-add-text, #10B981)"
+                                  : step.kind === "wire"
+                                    ? "var(--accent-primary, #3B82F6)"
+                                    : "var(--text-muted)",
+                            marginRight: "6px",
+                          }}
+                        >
+                          [{step.kind}]
+                        </span>
+                        {step.label}
+                      </span>
+                      <span
+                        className="fd-mono"
+                        style={{
+                          fontSize: "10px",
+                          color: "var(--text-muted)",
+                          flexShrink: 0,
+                        }}
+                      >
+                        #{step.turnIndex}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Transcript Stream */}
       <div

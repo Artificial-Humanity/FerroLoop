@@ -71,12 +71,12 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     const tabBar = screen.getByTestId("cockpit-tab-bar");
     expect(within(tabBar).getAllByRole("tab")).toHaveLength(9);
 
-    // Tier 1: Agent Context
+    // Tier 1: Agent Context (header-agent-settings-btn removed; per-agent settings lives in RosterSidebar & SettingsModal)
     const agentNav = within(tabBar).getByTestId("tier-agent-nav");
     expect(within(agentNav).getByText("Ferris")).toBeInTheDocument();
     expect(within(agentNav).getByRole("tab", { name: /^Chat$/i })).toBeInTheDocument();
     expect(within(agentNav).getByRole("tab", { name: /^Wire Mail$/i })).toBeInTheDocument();
-    expect(within(agentNav).getByTestId("header-agent-settings-btn")).toBeInTheDocument();
+    expect(within(agentNav).queryByTestId("header-agent-settings-btn")).toBeNull();
 
     // Tier 2: Project Context
     const projectNav = within(tabBar).getByTestId("tier-project-nav");
@@ -155,9 +155,10 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(scopeBadge).toHaveAttribute("data-tier", "agent");
     expect(scopeBadge).toHaveTextContent("Scope: Agent · Ferris");
 
-    // Switch to Git & PRs (Project tier)
+    // Switch to Git & PRs (Project tier) -> opens right split panel while keeping ChatPane mounted
     const tabBar = screen.getByTestId("cockpit-tab-bar");
-    fireEvent.click(within(tabBar).getByRole("tab", { name: /^Git & PRs$/i }));
+    const gitTabBtn = within(tabBar).getByRole("tab", { name: /^Git & PRs$/i });
+    fireEvent.click(gitTabBtn);
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
       "project",
@@ -165,8 +166,18 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: Project · FerroLoop",
     );
+    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
-    // Switch to Hub & Arch (System tier)
+    // Clicking the same right-panel tab again closes the right split panel and returns to Chat
+    fireEvent.click(gitTabBtn);
+    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
+      "data-tier",
+      "agent",
+    );
+
+    // Switch to Hub & Arch (System tier) -> opens right split panel on Hub & Arch
     fireEvent.click(within(tabBar).getByRole("tab", { name: /^Hub & Arch$/i }));
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
@@ -175,11 +186,8 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: System · AI-Lab-0",
     );
-
-    // Click header-agent-settings-btn -> opens AgentSettingsModal for selected agent
-    fireEvent.click(screen.getByTestId("header-agent-settings-btn"));
-    const modal = await screen.findByTestId("agent-settings-modal");
-    expect(modal).toHaveTextContent(/Ferris/);
+    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
     unmount();
   });

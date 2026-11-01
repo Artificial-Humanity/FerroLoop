@@ -242,6 +242,44 @@ export function isPureToolOutputTurn(turn: TranscriptTurn): boolean {
   );
 }
 
+export function isOperatorUserTurn(turn: TranscriptTurn): boolean {
+  const roleNormalized = (turn.role || "assistant").toLowerCase();
+  if (roleNormalized !== "user") {
+    return false;
+  }
+  const trimmedStart = (turn.content || "").trimStart();
+  if (/^Task id "[^"]+" finished with result:/i.test(trimmedStart)) {
+    return false;
+  }
+  const strippedForNotice = stripAgyUserRequestWrapper(turn.content || "").trimStart();
+  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(trimmedStart);
+  const looksLikeSystemNotice =
+    hasSystemNoticePrefix(trimmedStart) || hasSystemNoticePrefix(strippedForNotice);
+  const looksLikeSubagentHandback =
+    isSubagentHandbackContent(trimmedStart) || isSubagentHandbackContent(strippedForNotice);
+  return (
+    !looksLikeSystemCodeDump &&
+    !looksLikeSystemNotice &&
+    !looksLikeSubagentHandback
+  );
+}
+
+export function isWireTurn(turn: TranscriptTurn): boolean {
+  const roleNormalized = (turn.role || "assistant").toLowerCase();
+  if (roleNormalized.startsWith("wire:")) {
+    return true;
+  }
+  if (roleNormalized === "user") {
+    const trimmedStart = (turn.content || "").trimStart();
+    const strippedForNotice = stripAgyUserRequestWrapper(turn.content || "").trimStart();
+    return (
+      isSubagentHandbackContent(trimmedStart) ||
+      isSubagentHandbackContent(strippedForNotice)
+    );
+  }
+  return false;
+}
+
 export const TurnCard: React.FC<TurnCardProps> = ({
   turn,
   agentDisplayName,

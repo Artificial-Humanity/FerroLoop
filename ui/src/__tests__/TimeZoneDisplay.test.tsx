@@ -295,4 +295,148 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       expect(matches.length).toBeGreaterThanOrEqual(5);
     });
   });
+
+  it("renders 3-tab SettingsModal (Agents, System, Auth) and supports agent re-casting with lead replacement confirmation", async () => {
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    const recastRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/v1/settings") && method === "GET") {
+        return json({
+          theme: "dark",
+          timezone: "UTC",
+          poll_interval_secs: 5,
+          enable_ferrogate: true,
+          enable_ferrostate: true,
+          enable_ferrostep: false,
+          notifications: {
+            notify_urgent_wire: true,
+            notify_gate_approvals: true,
+            notify_session_errors: true,
+          },
+          installed_products: [],
+        });
+      }
+      if (url.endsWith("/api/v1/auth/operators")) {
+        return json({ operators: [], mfa_require_step_up_for_gate: true });
+      }
+      if (url.endsWith("/api/v1/cloud/adapters")) {
+        return json({ adapters: [] });
+      }
+      if (url.endsWith("/api/v1/agents/felix/recast") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        recastRequests.push({ url, body });
+        if (!body.replace_lead) {
+          return json(
+            {
+              error: "Project FerroLoop already has lead Ferris; pass replace_lead=true to confirm",
+            },
+            409,
+          );
+        }
+        return json({
+          status: "recast",
+          agent: {
+            name_key: "felix",
+            display_name: "Felix",
+            project: String(body.project ?? "FerroLoop"),
+            role: String(body.role ?? "lead"),
+            adapter: "antigravity",
+          },
+          retires_lead: "ferris",
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const onSelectCockpitTab = vi.fn();
+    const onClose = vi.fn();
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={onClose}
+        apiClient={apiClient}
+        agents={[
+          {
+            id: "ag-ferris",
+            name_key: "ferris",
+            display_name: "Ferris",
+            project: "FerroLoop",
+            role: "lead",
+            status: "idle",
+          },
+          {
+            id: "ag-felix",
+            name_key: "felix",
+            display_name: "Felix",
+            project: "FerroLoop",
+            role: "ui-developer",
+            status: "idle",
+          },
+        ]}
+        onSelectCockpitTab={onSelectCockpitTab}
+      />,
+    );
+
+    // 3-tab bar and "<N> Agents" heading
+    expect(screen.getByTestId("settings-tab-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-tab-agents")).toHaveTextContent("2 Agents");
+    expect(screen.getByTestId("settings-agents-heading")).toHaveTextContent("2 Agents");
+    expect(screen.getByTestId("settings-tab-system")).toHaveTextContent("System");
+    expect(screen.getByTestId("settings-tab-auth")).toHaveTextContent("Auth");
+
+    // Re-cast felix -> lead triggers 409 confirmation first, then succeeds with replace_lead: true
+    const roleSelect = screen.getByTestId("recast-role-select-felix") as HTMLSelectElement;
+    fireEvent.change(roleSelect, { target: { value: "lead" } });
+    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+
+    const confirmBtn = await screen.findByTestId("recast-confirm-lead-btn-felix");
+    expect(confirmBtn).toBeInTheDocument();
+    fireEvent.click(confirmBtn);
+
+    await waitFor(() => {
+      expect(recastRequests.length).toBe(2);
+      expect(recastRequests[0].body.replace_lead).toBe(false);
+      expect(recastRequests[1].body.replace_lead).toBe(true);
+    });
+
+    // Switch to System tab and launch Vault & Gate console
+    fireEvent.click(screen.getByTestId("settings-tab-system"));
+    fireEvent.click(screen.getByTestId("settings-open-gate-btn"));
+    expect(onSelectCockpitTab).toHaveBeenCalledWith("gate");
+    expect(onClose).toHaveBeenCalled();
+
+    // Multi-select checkboxes and Select All / Clear Selection update bulk action labels
+    fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact All");
+    fireEvent.click(screen.getByTestId("agent-select-checkbox-felix"));
+    expect(screen.getByTestId("settings-selected-agents-count")).toHaveTextContent("1 selected");
+    expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact Selected (1)");
+    expect(screen.getByTestId("bulk-clear-btn")).toHaveTextContent("Clear Selected (1)");
+    expect(screen.getByTestId("bulk-reforge-btn")).toHaveTextContent("Reforge Selected (1)");
+
+    // Select All (2) -> Clear Selection
+    fireEvent.click(screen.getByTestId("settings-agents-select-all-btn"));
+    expect(screen.getByTestId("settings-selected-agents-count")).toHaveTextContent("2 selected");
+    expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact Selected (2)");
+    fireEvent.click(screen.getByTestId("settings-agents-select-all-btn"));
+    expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact All");
+
+    // Project filter renders scoped Project Summary Card
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
+      target: { value: "FerroLoop" },
+    });
+    expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-project-summary-name")).toHaveTextContent("FerroLoop");
+    expect(screen.getByTestId("settings-project-summary-lead")).toHaveTextContent("Lead: Ferris");
+  });
 });

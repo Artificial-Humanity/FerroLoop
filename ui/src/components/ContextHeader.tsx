@@ -145,7 +145,10 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   }, [authority]);
 
   const renderTabButton = (tab: { id: CockpitTab; label: string }) => {
-    const isActive = activeTab === tab.id;
+    const isActive =
+      tab.id === "chat"
+        ? activeTab === "chat" && !splitView
+        : splitView && activeTab === tab.id;
     return (
       <button
         key={tab.id}
@@ -247,24 +250,25 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             </div>
           )}
 
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            {AGENT_TIER_TABS.map(renderTabButton)}
+          <div
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            {renderTabButton({ id: "chat", label: "Chat" })}
           </div>
 
-          <button
-            type="button"
-            data-testid="header-agent-settings-btn"
-            className="fd-btn"
-            onClick={() => onOpenAgentSettings?.()}
-            disabled={!selectedAgent}
-            title={
-              selectedAgent
-                ? `Agent settings for ${selectedAgent.display_name}`
-                : "Select an agent to configure settings"
-            }
-          >
-            ⚙ Agent Settings
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+            {renderTabButton({ id: "mail", label: "Wire Mail" })}
+          </div>
         </div>
 
         <span className="fd-tier-divider" aria-hidden="true" />
@@ -305,19 +309,41 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           </div>
         </div>
 
-        <span className="fd-tier-divider" aria-hidden="true" />
-
-        {/* Tier 3: System Context */}
+        {/* Tier 3: Compact Global Controls (System consoles, Nodes, Spin Up, and Auth moved inside SettingsModal) */}
         <div
           className={`fd-tier-group fd-tier-system${activeTier === "system" ? " is-active-tier" : ""}`}
           data-testid="tier-system-nav"
           data-active-tier={activeTier === "system" ? "true" : undefined}
+          style={{ marginLeft: "auto", position: "relative" }}
         >
-          <span className="fd-tier-label">System</span>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            {SYSTEM_TIER_TABS.map(renderTabButton)}
+          <div
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            <span className="fd-tier-label">System</span>
+            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              {SYSTEM_TIER_TABS.map(renderTabButton)}
+            </div>
           </div>
+
+          {activeTier === "system" && (
+            <span
+              className="fd-badge"
+              data-testid="active-system-view-pill"
+              style={{ fontWeight: 600 }}
+            >
+              System · {COCKPIT_TABS.find((t) => t.id === activeTab)?.label ?? activeTab}
+            </span>
+          )}
 
           <div
             data-testid="system-utility-bar"
@@ -326,38 +352,75 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               alignItems: "center",
               gap: "6px",
               flexWrap: "wrap",
-              marginLeft: "4px",
             }}
           >
-            <span
-              className="fd-badge"
-              title={wsConnected ? "WebSocket Connected" : "WebSocket Disconnected"}
+            <div
+              style={{
+                position: "absolute",
+                width: "1px",
+                height: "1px",
+                padding: 0,
+                margin: "-1px",
+                overflow: "hidden",
+                clip: "rect(0, 0, 0, 0)",
+                whiteSpace: "nowrap",
+                border: 0,
+              }}
             >
-              <span className={`fd-dot ${wsConnected ? "fd-dot-alive" : "fd-dot-dead"}`} />
-              WS
-            </span>
+              <span
+                className="fd-badge"
+                title={wsConnected ? "WebSocket Connected" : "WebSocket Disconnected"}
+              >
+                <span className={`fd-dot ${wsConnected ? "fd-dot-alive" : "fd-dot-dead"}`} />
+                WS
+              </span>
 
-            {onOpenNodesModal && (
+              {onOpenNodesModal && (
+                <button
+                  type="button"
+                  data-testid="nodes-modal-btn"
+                  className="fd-btn"
+                  onClick={onOpenNodesModal}
+                >
+                  <span className={`fd-dot ${onlineNodesCount > 0 ? "fd-dot-alive" : "fd-dot-dead"}`} />
+                  <span>{onlineNodesCount > 0 ? `Nodes (${onlineNodesCount})` : "Nodes"}</span>
+                </button>
+              )}
+
               <button
                 type="button"
-                data-testid="nodes-modal-btn"
+                data-testid="header-spin-up-btn"
                 className="fd-btn"
-                onClick={onOpenNodesModal}
+                onClick={() => onOpenSpinUpModal?.()}
+                title="Spin up a new agent session"
               >
-                <span className={`fd-dot ${onlineNodesCount > 0 ? "fd-dot-alive" : "fd-dot-dead"}`} />
-                <span>{onlineNodesCount > 0 ? `Nodes (${onlineNodesCount})` : "Nodes"}</span>
+                + Spin Up
               </button>
-            )}
 
-            <button
-              type="button"
-              data-testid="header-spin-up-btn"
-              className="fd-btn"
-              onClick={() => onOpenSpinUpModal?.()}
-              title="Spin up a new agent session"
-            >
-              + Spin Up
-            </button>
+              <button
+                type="button"
+                data-testid="authority-status-btn"
+                className="fd-btn"
+                onClick={onOpenPairingModal}
+              >
+                <span
+                  className={`fd-dot ${
+                    authority?.tier === "owner"
+                      ? "fd-dot-alive"
+                      : authority?.tier === "peer"
+                        ? "fd-dot-stale"
+                        : "fd-dot-dead"
+                  }`}
+                />
+                <span>{authorityText}</span>
+              </button>
+
+              {authority && onLogout && (
+                <button type="button" className="fd-btn fd-btn-danger" onClick={onLogout}>
+                  Sign Out
+                </button>
+              )}
+            </div>
 
             {onOpenSettingsModal && (
               <button
@@ -365,8 +428,9 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
                 data-testid="settings-modal-btn"
                 className="fd-btn"
                 onClick={onOpenSettingsModal}
+                title="Open Settings (Agents, System, Auth)"
               >
-                Settings
+                ⚙ Settings
               </button>
             )}
 
@@ -380,30 +444,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             >
               ?
             </button>
-
-            <button
-              type="button"
-              data-testid="authority-status-btn"
-              className="fd-btn"
-              onClick={onOpenPairingModal}
-            >
-              <span
-                className={`fd-dot ${
-                  authority?.tier === "owner"
-                    ? "fd-dot-alive"
-                    : authority?.tier === "peer"
-                      ? "fd-dot-stale"
-                      : "fd-dot-dead"
-                }`}
-              />
-              <span>{authorityText}</span>
-            </button>
-
-            {authority && onLogout && (
-              <button type="button" className="fd-btn fd-btn-danger" onClick={onLogout}>
-                Sign Out
-              </button>
-            )}
 
             {onToggleTheme && (
               <button

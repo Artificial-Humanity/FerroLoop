@@ -36,6 +36,8 @@ import {
   type PruneArtifactsResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
+  type RecastAgentRequest,
+  type RecastAgentResponse,
   type SessionQueueResponse,
   type SessionTranscriptResponse,
   type SetSessionModelResponse,
@@ -751,6 +753,19 @@ export class HubApiClient {
 
   public async getAgentsLiveness(staleAfterMs?: number): Promise<LivenessResponse> {
     return this.getLiveness(staleAfterMs);
+  }
+
+  public async recastAgent(
+    nameKey: string,
+    payload: RecastAgentRequest,
+  ): Promise<RecastAgentResponse> {
+    return this.request<RecastAgentResponse>(
+      `/api/v1/agents/${encodeURIComponent(nameKey.trim().toLowerCase())}/recast`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload),
+      },
+    );
   }
 
   public async getSessions(): Promise<{ sessions: DiscoveredSessionSummary[] }> {
@@ -1849,4 +1864,12 @@ export async function listSlashCommands(
   client?: HubApiClient,
 ): Promise<{ commands: SlashCommandEntry[] }> {
   return (client ?? new HubApiClient()).listSlashCommands();
+}
+
+export async function recastAgent(
+  nameKey: string,
+  payload: RecastAgentRequest,
+  client?: HubApiClient,
+): Promise<RecastAgentResponse> {
+  return (client ?? new HubApiClient()).recastAgent(nameKey, payload);
 }
