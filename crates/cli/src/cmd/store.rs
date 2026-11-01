@@ -46,8 +46,7 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
     let meta = std::fs::metadata(&physical).ok();
     let exists = meta.is_some();
     let size = meta.as_ref().map(std::fs::Metadata::len);
-    // A lone `.redb` beside a ferro selection: `open_store` refuses it with a
-    // migrate message, so say so here too.
+    // A lone `.redb` beside a ferro selection: `open_store` migrates it, so say so.
     let redb_beside = kind == BackendKind::Ferro && !exists && path != physical && path.exists();
 
     // FerroStore has no format version to read yet; redb's is read from the
@@ -107,7 +106,7 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
     if redb_beside {
         println!(
             "note: {} holds a redb store and the selected engine is ferro; \
-             migrate it first, or set {BACKEND_ENV}=redb to keep using it",
+             the next command that opens it migrates it (or run `fl store migrate`)",
             path.display()
         );
     }
@@ -121,7 +120,9 @@ fn checkpoint(path: &Path) -> Result<i32> {
         return Ok(0);
     }
     let physical = physical_path(path, kind);
-    if !fl_store::store_exists(path) {
+    // The physical file, not `store_exists`: a lone `.redb` would be migrated
+    // by the open below, and a checkpoint must not do that.
+    if !physical.exists() {
         bail!(
             "no store at {}; `fl store checkpoint` does not create one",
             physical.display()

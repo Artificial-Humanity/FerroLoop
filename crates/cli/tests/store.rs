@@ -318,45 +318,29 @@ fn ferro_with_an_explicit_db_an_iri_lookup_is_not_owned_and_creates_nothing() {
 }
 
 #[test]
-fn ferro_leaves_a_stray_redb_unopened_and_says_to_migrate() {
+fn ferro_migrates_a_stray_redb_on_first_use_and_keeps_it_read_only() {
+    use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
-    open_with(&env.logical(), BackendKind::Redb);
+    {
+        let store = fl_store::open_redb(&env.logical()).unwrap();
+        fl_core::Catalog::add_project(&store, "/work/app").unwrap();
+    }
     let proj = bind_project(&env, &env.logical());
-    let bytes = std::fs::read(env.logical()).unwrap();
-    let mtime = std::fs::metadata(env.logical())
-        .unwrap()
-        .modified()
-        .unwrap();
-    let before = snapshot(&[env.home.path(), env.stores.path(), proj.path()]);
 
-    // A command that needs the bound store is refused with the remedy.
     env.ferro()
         .current_dir(proj.path())
         .args(["project", "list"])
         .assert()
-        .failure()
-        .stderr(contains("migrate"));
-    // An IRI lookup opens nothing and is not owned.
-    env.ferro()
-        .current_dir(proj.path())
-        .args(["gate", "show", STRANGER])
-        .assert()
-        .code(2);
+        .success()
+        .stdout(contains("/work/app"));
 
-    assert_eq!(std::fs::read(env.logical()).unwrap(), bytes);
     assert_eq!(
-        std::fs::metadata(env.logical())
-            .unwrap()
-            .modified()
-            .unwrap(),
-        mtime
+        env.files(),
+        vec!["fl.fls".to_string(), "fl.redb".to_string()]
     );
-    assert_eq!(
-        before,
-        snapshot(&[env.home.path(), env.stores.path(), proj.path()]),
-        "the stray redb or the tree was touched"
-    );
-    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&env.physical_ferro()), 0o600);
+    assert_eq!(mode(&env.logical()), 0o400);
 }
 
 #[test]

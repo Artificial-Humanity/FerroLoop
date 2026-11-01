@@ -98,6 +98,12 @@ pub struct StoreOptions {
     /// Times to retry a redb file another process holds, 15 ms apart.
     /// FerroStore is multi-process safe and ignores it.
     pub retries: u32,
+    /// Whether a ferro selection beside a lone `.redb` migrates it (verified,
+    /// see [`crate::migrate::migrate_verified`]) instead of refusing. Default
+    /// `true`. When the migration cannot run or does not verify, the store
+    /// opens on the `.redb` with a warning, so every process that cannot
+    /// migrate keeps using one engine.
+    pub auto_migrate: bool,
 }
 
 impl Default for StoreOptions {
@@ -105,6 +111,7 @@ impl Default for StoreOptions {
         Self {
             backend: None,
             retries: 200,
+            auto_migrate: true,
         }
     }
 }
@@ -121,27 +128,103 @@ pub fn open_store_with(path: &Path, options: &StoreOptions) -> Result<AnyStore, 
         None => choose_backend(path, std::env::var(BACKEND_ENV).ok().as_deref())?,
     };
     let physical = physical_path(path, kind);
-    let label = physical.display().to_string();
-    let backend_store = match kind {
-        BackendKind::Redb => {
-            Backend::Redb(RedbStore::open_with_retries(&physical, options.retries)?)
-        }
-        BackendKind::Ferro => {
-            if !physical.exists() && path != physical && path.exists() {
-                return Err(backend(format!(
-                    "{} holds a redb store and {} does not exist yet: migrate it first, \
-                     or set {BACKEND_ENV}=redb to keep using the .redb file",
-                    path.display(),
-                    physical.display()
-                )));
-            }
-            Backend::Ferro(Box::new(FerroStore::open(&physical)?))
-        }
+    let (backend_store, label) = match kind {
+        BackendKind::Redb => (
+            Backend::Redb(RedbStore::open_with_retries(&physical, options.retries)?),
+            physical.display().to_string(),
+        ),
+        BackendKind::Ferro => open_ferro(path, &physical, options)?,
     };
     Ok(AnyStore {
         backend: backend_store,
         label,
     })
+}
+
+/// Whether `err` is redb saying another holder has the file: the case an open
+/// retries, and the case a migration cannot run in. (FerroStore is
+/// multi-process safe and never reports it.)
+pub fn is_redb_busy(err: &StoreError) -> bool {
+    let StoreError::Unreachable { cause, .. } = err else {
+        return false;
+    };
+    cause.contains("Database already open") || cause.contains("Cannot acquire lock")
+}
+
+/// One line on stderr; a closed stderr is not a panic.
+fn warn(text: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{text}");
+}
+
+/// Open the ferro store at `physical`, the file of the logical `path`.
+///
+/// A lone `.redb` beside it (`physical` absent, `path` a different file that
+/// exists) is migrated first when `options.auto_migrate` is set. A migration
+/// that cannot run or does not verify leaves no `.fls`: the store opens on the
+/// `.redb` instead, so that every process which cannot migrate agrees on one
+/// engine. A `.fls` that appears meanwhile (another process migrated first)
+/// is opened.
+fn open_ferro(
+    path: &Path,
+    physical: &Path,
+    options: &StoreOptions,
+) -> Result<(Backend, String), StoreError> {
+    let ferro = |physical: &Path| -> Result<(Backend, String), StoreError> {
+        Ok((
+            Backend::Ferro(Box::new(FerroStore::open(physical)?)),
+            physical.display().to_string(),
+        ))
+    };
+    let lone_redb = !physical.exists() && path != physical && path.exists();
+    if !lone_redb {
+        return ferro(physical);
+    }
+    if !options.auto_migrate || !path.is_file() {
+        return Err(backend(format!(
+            "{} holds a redb store and {} does not exist yet: migrate it first \
+             (`fl store migrate`), or set {BACKEND_ENV}=redb to keep using the .redb file",
+            path.display(),
+            physical.display()
+        )));
+    }
+    let stay_on_redb = |why: String| -> Result<(Backend, String), StoreError> {
+        warn(&format!(
+            "warning: {} stays on redb: {why}; no {} was created",
+            path.display(),
+            physical.display()
+        ));
+        Ok((
+            Backend::Redb(RedbStore::open_with_retries(path, options.retries)?),
+            path.display().to_string(),
+        ))
+    };
+    // A process still holding the redb must not wait out a migration's own
+    // 3 s of retries: ask once. (Dropped at once; the migration opens it again.)
+    let attempt = RedbStore::open_with_retries(path, 0)
+        .map(drop)
+        .and_then(|()| crate::migrate::migrate_verified(path, physical));
+    match attempt {
+        Ok(report) if report.is_clean() => ferro(physical),
+        Ok(report) => {
+            let first = report.mismatches().into_iter().next();
+            let why = match first {
+                Some(t) => format!(
+                    "the migration did not verify (first mismatch: `{}`, redb {} rows, ferro {} \
+                     rows); run `fl store migrate` for the full report",
+                    t.table, t.redb_rows, t.ferro_rows
+                ),
+                None => "the migration did not verify".to_string(),
+            };
+            stay_on_redb(why)
+        }
+        Err(err) if is_redb_busy(&err) => stay_on_redb(
+            "another process still holds the redb store, so it cannot be migrated yet".to_string(),
+        ),
+        // Another process migrated first.
+        Err(_) if std::fs::symlink_metadata(physical).is_ok() => ferro(physical),
+        Err(err) => Err(err),
+    }
 }
 
 /// Open the redb store at `path` whatever the environment says. For tests and
@@ -158,18 +241,20 @@ pub fn open_redb(path: &Path) -> Result<AnyStore, StoreError> {
 
 /// Whether the store named by the logical `path` exists under the engine that
 /// [`choose_backend`] selects for it (the process environment's
-/// [`BACKEND_ENV`] included): the physical file of that engine, nothing else.
-/// An unusable environment value counts as "check the path itself".
-///
-/// A lone `.redb` beside a ferro selection reports `false` here; callers that
-/// go on to [`open_store`] it get its refusal, which tells the user to migrate.
+/// [`BACKEND_ENV`] included): the physical file of that engine, or, under a
+/// ferro selection, the lone `.redb` that [`open_store`] migrates (or, when it
+/// cannot, keeps opening as redb). Opening either never creates an empty
+/// store. An unusable environment value counts as "check the path itself".
 pub fn store_exists(path: &Path) -> bool {
     store_exists_with(path, std::env::var(BACKEND_ENV).ok().as_deref())
 }
 
 fn store_exists_with(path: &Path, env: Option<&str>) -> bool {
     match choose_backend(path, env) {
-        Ok(kind) => physical_path(path, kind).exists(),
+        Ok(kind) => {
+            let physical = physical_path(path, kind);
+            physical.exists() || (kind == BackendKind::Ferro && path != physical && path.is_file())
+        }
         Err(_) => path.exists(),
     }
 }
@@ -509,6 +594,10 @@ delegate! {
 mod tests {
     use super::*;
     use fl_core::conformance::{Single, SplitOver};
+    use fl_core::{
+        CommandSpec, HandoffEntry, MessageKind, MessageUrgency, PopulationDelivery,
+        SensitivityPatch, StatePayload, WireAddress,
+    };
     use tempfile::TempDir;
 
     /// A store of each engine, with the directory it lives in kept alive.
@@ -696,17 +785,335 @@ mod tests {
             &path,
             &StoreOptions {
                 backend: Some(BackendKind::Ferro),
+                auto_migrate: false,
                 ..StoreOptions::default()
             },
         )
         .err()
         .expect("must refuse");
-        assert!(err.to_string().contains("migrate"), "{err}");
+        assert!(err.to_string().contains("fl store migrate"), "{err}");
         assert!(
             err.to_string().contains("FL_STORE_BACKEND=redb"),
             "names the remedy: {err}"
         );
         assert!(!dir.path().join("s.fls").exists(), "nothing was created");
+    }
+
+    fn handoff(summary: &str) -> StatePayload {
+        StatePayload::Handoff(HandoffEntry {
+            summary: summary.into(),
+            shipped: vec![],
+            in_flight: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            notes: None,
+        })
+    }
+
+    /// A project, a gate, a record, a state entry and a wire message, written
+    /// through the traits.
+    fn populate(store: &RedbStore) -> (ProjectId, GateId, RecordId) {
+        let project = store.add_project("/work/app").unwrap();
+        let gate = store
+            .add_gate(
+                &project,
+                "fmt",
+                GateKind::Command(CommandSpec {
+                    program: "true".into(),
+                    args: vec![],
+                    delivery: PopulationDelivery::Args,
+                    timeout_secs: 5,
+                    pass_codes: vec![0],
+                }),
+                Selector::Glob {
+                    pattern: "**/*.rs".into(),
+                },
+                1,
+                "c1",
+                "o",
+            )
+            .unwrap();
+        let record = store.add_record(&project, "keep this").unwrap();
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "rule".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: handoff("v1"),
+                at: At::from_unix_millis(10),
+                by: "jarvis".into(),
+            })
+            .unwrap();
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("ferris".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "first".into(),
+                body: "hello".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap();
+        (project, gate, record)
+    }
+
+    fn assert_populated(store: &AnyStore, project: &ProjectId, gate: &GateId, record: &RecordId) {
+        assert_eq!(
+            store.get_project(project).unwrap().unwrap().root,
+            "/work/app"
+        );
+        assert_eq!(store.get_gate(gate).unwrap().unwrap().name, "fmt");
+        assert!(store.get_record(record).unwrap().is_some());
+        let entry = store
+            .get_state_by_key(&StateScope::Workspace, StateConcern::Handoff, "rule")
+            .unwrap()
+            .expect("the state entry");
+        assert_eq!(entry.slug, "rule");
+        let inbox = store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("ferris".into()),
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].message.subject, "first");
+    }
+
+    fn ferro_opts(auto_migrate: bool) -> StoreOptions {
+        StoreOptions {
+            backend: Some(BackendKind::Ferro),
+            auto_migrate,
+            retries: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lone_redb_is_migrated_once_and_kept_read_only() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        let (project, gate, record) = {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src)
+        };
+
+        let store = open_store_with(&redb, &ferro_opts(true)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        assert_populated(&store, &project, &gate, &record);
+        drop(store);
+        assert_eq!(mode(&fls), 0o600);
+        assert_eq!(mode(&redb), 0o400);
+        // Opening a redb file rewrites its internal pages, so the bytes before
+        // the migration are not comparable; what the migration leaves is.
+        let kept = std::fs::read(&redb).unwrap();
+        let kept_mtime = std::fs::metadata(&redb).unwrap().modified().unwrap();
+        // Its content is still all there: read a writable copy of it.
+        let copy = dir.path().join("copy.redb");
+        std::fs::copy(&redb, &copy).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_populated(&open_redb(&copy).unwrap(), &project, &gate, &record);
+        std::fs::remove_file(&copy).unwrap();
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("migrating")),
+            "no temp file is left"
+        );
+
+        // A second open finds the .fls: it does not migrate again.
+        let meta = std::fs::metadata(&fls).unwrap();
+        let again = open_store_with(&redb, &ferro_opts(true)).unwrap();
+        assert_eq!(again.kind(), BackendKind::Ferro);
+        assert_populated(&again, &project, &gate, &record);
+        drop(again);
+        let after = std::fs::metadata(&fls).unwrap();
+        assert_eq!(after.ino(), meta.ino());
+        assert_eq!(after.mtime(), meta.mtime());
+        assert_eq!(after.mtime_nsec(), meta.mtime_nsec());
+        assert_eq!(std::fs::read(&redb).unwrap(), kept);
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().modified().unwrap(),
+            kept_mtime
+        );
+        assert_eq!(mode(&redb), 0o400);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_redb_beside_its_fls_is_never_opened_for_write() {
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        drop(RedbStore::open(&redb).unwrap());
+        drop(open_store_with(&redb, &ferro_opts(true)).unwrap());
+        assert_eq!(mode(&redb), 0o400);
+        let before = std::fs::metadata(&redb).unwrap().modified().unwrap();
+        drop(open_store_with(&redb, &ferro_opts(true)).unwrap());
+        drop(open_store_with(&redb, &ferro_opts(false)).unwrap());
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().modified().unwrap(),
+            before
+        );
+        assert_eq!(mode(&redb), 0o400);
+    }
+
+    #[test]
+    fn a_redb_another_store_holds_stays_on_redb_and_creates_no_fls() {
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        drop(RedbStore::open(&redb).unwrap());
+        // redb takes an exclusive file lock per open, so a second open in this
+        // process is refused exactly as another process's would be.
+        let holder = RedbStore::open(&redb).unwrap();
+        let refused = RedbStore::open_with_retries(&redb, 0).err().expect("held");
+        assert!(is_redb_busy(&refused), "{refused}");
+        let err = open_store_with(&redb, &ferro_opts(true))
+            .err()
+            .expect("the holder still has the file");
+        assert!(is_redb_busy(&err), "{err}");
+        assert!(!fls.exists(), "no .fls was created");
+        drop(holder);
+
+        // Held for a moment, then released: the migration finds it busy and
+        // does not run; the fallback waits its retries and opens the redb.
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let path = redb.clone();
+        let holder = std::thread::spawn(move || {
+            let store = RedbStore::open(&path).unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(store);
+        });
+        held_rx.recv().unwrap();
+        let store = open_store_with(
+            &redb,
+            &StoreOptions {
+                retries: 200,
+                ..ferro_opts(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(store.label().ends_with("s.redb"), "{}", store.label());
+        assert!(!fls.exists(), "no .fls was created");
+        holder.join().unwrap();
+        drop(store);
+
+        // Free again: the same call migrates.
+        let store = open_store_with(&redb, &ferro_opts(true)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        assert!(fls.exists());
+    }
+
+    #[test]
+    fn a_migration_that_does_not_verify_stays_on_redb_and_creates_no_fls() {
+        use redb::TableDefinition;
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        let (project, _gate, _record) = {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src)
+        };
+        // A table the copy does not know: the verifier reports it, so the
+        // migration is not clean.
+        {
+            let db = redb::Database::create(&redb).unwrap();
+            let tx = db.begin_write().unwrap();
+            {
+                let mut t = tx
+                    .open_table(TableDefinition::<&str, &str>::new("zz_unknown"))
+                    .unwrap();
+                t.insert("k", "v").unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let store = open_store_with(&redb, &ferro_opts(true)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert_eq!(
+            store.get_project(&project).unwrap().unwrap().root,
+            "/work/app"
+        );
+        assert!(!fls.exists(), "no .fls was created");
+        drop(store);
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("migrating")),
+            "no temp file is left"
+        );
+        #[cfg(unix)]
+        assert_eq!(mode(&redb), 0o600, "the redb stays writable");
+    }
+
+    #[test]
+    fn the_busy_error_is_classified_by_cause() {
+        let busy = |cause: &str| StoreError::Unreachable {
+            store: "s".into(),
+            cause: cause.into(),
+        };
+        assert!(is_redb_busy(&busy(
+            "Database already open. Cannot acquire lock."
+        )));
+        assert!(is_redb_busy(&busy("Cannot acquire lock")));
+        assert!(!is_redb_busy(&busy("Permission denied")));
+        assert!(!is_redb_busy(&backend("Database already open")));
+    }
+
+    #[test]
+    fn a_fls_that_appears_first_is_opened_not_migrated_over() {
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        let (project, _gate, _record) = {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src)
+        };
+        // Another process migrated first: its .fls (here with nothing from
+        // the redb in it) is the store. (The branch for an `Err` from a
+        // migration that lost the race to a `.fls` needs two processes to
+        // reach; this is the state it leaves.)
+        drop(FerroStore::open(&fls).unwrap());
+        let store = open_store_with(&redb, &ferro_opts(true)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        assert!(store.get_project(&project).is_err());
+    }
+
+    #[test]
+    fn turning_auto_migration_off_refuses_and_leaves_the_redb_alone() {
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        drop(RedbStore::open(&redb).unwrap());
+        let before = std::fs::read(&redb).unwrap();
+        let err = open_store_with(&redb, &ferro_opts(false))
+            .err()
+            .expect("must refuse");
+        assert!(err.to_string().contains("fl store migrate"), "{err}");
+        assert!(!dir.path().join("s.fls").exists());
+        assert_eq!(std::fs::read(&redb).unwrap(), before);
     }
 
     #[test]
@@ -841,18 +1248,29 @@ mod tests {
         // Nothing yet, under either engine.
         assert!(!store_exists_with(&logical, None));
         assert!(!store_exists_with(&logical, Some("ferro")));
-        // A redb file exists for redb, but not for a ferro selection.
+        // A redb file exists for redb; under a ferro selection it is the store
+        // that open_store migrates, so it exists there too.
         drop(open_redb(&logical).unwrap());
         assert!(store_exists_with(&logical, None));
         assert!(store_exists_with(&logical, Some("redb")));
-        assert!(!store_exists_with(&logical, Some("ferro")));
-        // open_store refuses the lone .redb under a ferro selection; callers
-        // surface that message.
+        assert!(store_exists_with(&logical, Some("ferro")));
+        // A directory named like the redb is not a store.
+        let dir_named = dir.path().join("d.redb");
+        std::fs::create_dir(&dir_named).unwrap();
+        assert!(store_exists_with(&dir_named, None));
+        assert!(!store_exists_with(&dir_named, Some("ferro")));
         let ferro = StoreOptions {
             backend: Some(BackendKind::Ferro),
+            auto_migrate: false,
             ..StoreOptions::default()
         };
+        // Without auto-migration the lone .redb is refused, not created over.
         assert!(open_store_with(&logical, &ferro).is_err());
+        assert!(!dir.path().join("s.fls").exists());
+        let ferro = StoreOptions {
+            auto_migrate: true,
+            ..ferro
+        };
         // A ferro store of its own: the logical `.redb` name maps to the
         // sibling .fls, and an explicit .fls path needs no environment.
         let fresh = dir.path().join("f.redb");
