@@ -2608,9 +2608,21 @@ mod tests {
             broken["symbols"][0]["name"], "hub_widget_builder",
             "{broken}"
         );
+        // The engine's own error for this file is the `cause` a direct search
+        // reports; none of its text may reach the body.
+        let direct = fl_store::search_code(
+            &fl_store::open_store(&store_path).unwrap(),
+            &fl_core::scan_code_index(tmp.path()),
+            fl_core::CodeSearchKind::Search,
+            "hub_widget_builder",
+            10,
+            fl_store::IndexPolicy::ReadOnly,
+        );
+        let cause = direct.cause.expect("the corrupt sidecar has a cause");
+        assert!(!cause.is_empty());
         assert!(
-            !broken.to_string().contains("superblock"),
-            "engine text leaked"
+            !broken.to_string().contains(&cause),
+            "engine text leaked: {cause}"
         );
     }
 
@@ -2727,9 +2739,21 @@ mod tests {
             "{broken}"
         );
         assert_eq!(names(&broken)[0], "hub_widget_builder", "{broken}");
+        // The engine's own error for this file is the `cause` a direct search
+        // reports; none of its text may reach the body.
+        let direct = fl_store::search_code(
+            &fl_store::open_store(&store_path).unwrap(),
+            &fl_core::scan_code_index(tmp.path()),
+            fl_core::CodeSearchKind::Search,
+            "hub_widget_builder",
+            10,
+            fl_store::IndexPolicy::ReadOnly,
+        );
+        let cause = direct.cause.expect("the corrupt sidecar has a cause");
+        assert!(!cause.is_empty());
         assert!(
-            !broken.to_string().contains("superblock"),
-            "engine text leaked"
+            !broken.to_string().contains(&cause),
+            "engine text leaked: {cause}"
         );
     }
 

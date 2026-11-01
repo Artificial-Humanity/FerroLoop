@@ -385,8 +385,11 @@ fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, Str
 }
 
 /// Run `queries` over one scanned `index`. One [`CodeSession`] serves the whole
-/// batch: the code sidecar is opened once, synced once (its deadline bounds the
-/// batch, not each subquery) and searched by each subquery. The second value is
+/// batch: the code sidecar is opened once, synced once and searched by each
+/// subquery. The sync budget and its 5 s deadline apply once to the batch, not
+/// to each subquery, and the sync is not repeated if the file is swapped
+/// mid-batch. If the sidecar fails, the rest of the batch is answered exactly,
+/// with the same note, and the file is not opened again. The second value is
 /// how many times the sidecar was opened (a test hook).
 fn run_batch_queries(
     store: &AnyStore,

@@ -95,12 +95,20 @@
 //! **Held handles.** Opening the sidecar costs far more than searching it, so
 //! a caller with many searches opens it once. [`CodeSession`] searches one
 //! [`CodeIndex`] against a [`CodeSidecar`] (the opened store): the sidecar is
-//! opened once, an [`IndexPolicy::Sync`] sync runs once (so `SYNC_DEADLINE`
-//! bounds the session, not each search), and the id map is built once.
+//! opened once, an [`IndexPolicy::Sync`] sync runs once (so the `budget` and
+//! `SYNC_DEADLINE` above bound the session, not each search), and the id map is
+//! built once. The sync is not repeated if the file is swapped and opened again
+//! during the session; the new file is searched as it is. After the first
+//! failure of the sidecar path the session answers its remaining searches
+//! exactly, with the same fallback note, and does not open the file again.
 //! [`CodeSidecarCache`] keeps a few read-only handles for a long-running
 //! reader (the Hub): it never creates or writes a sidecar, and a handle
 //! checks its path before each use, so a deleted, emptied or replaced file is
-//! noticed and a vector a CLI search synced meanwhile is read.
+//! noticed and a vector a CLI search synced meanwhile is read. The cache is
+//! bounded by count, not by size: it keeps at most 4 handles, and each holds
+//! its whole decoded sidecar in memory (about 120 MB at 21,000 symbols), so
+//! the worst case is about 480 MB. The Hub searches only the sidecar of
+//! `config.store_path`, so one handle is live in practice.
 //! [`search_code`] and [`search_code_with`] are a session of one search.
 //!
 //! Any failure on the FerroStore path (sidecar open, index, search) falls back
@@ -124,7 +132,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// Vectors one CLI or MCP call may plan (and embed). A cap on the work per
@@ -336,6 +344,15 @@ fn backend(msg: impl Into<String>) -> StoreError {
     StoreError::Backend(msg.into())
 }
 
+/// The text to replay a failure as a [`StoreError::Backend`] without the
+/// engine prefix twice.
+fn failure_text(err: &StoreError) -> String {
+    match err {
+        StoreError::Backend(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// Identity of a file on disk: device and inode.
 type FileId = (u64, u64);
 
@@ -353,11 +370,13 @@ struct Held {
 /// file for write and creates it when it is absent; a [`IndexPolicy::ReadOnly`]
 /// handle never creates or writes it. Each use checks the path first
 /// (`lstat`, no read): a file that is gone, empty, a symlink or not a regular
-/// file drops the held store, and a file that is not the one the store was
-/// opened on (a replacement, a restore) is opened again. A held store sees
-/// what another process commits meanwhile: its reads follow the superblock,
-/// and a compaction swap. Any engine error during a search drops the held
-/// store as well, so the next use opens afresh.
+/// file drops the held store, and a file whose device and inode differ from
+/// the ones the store was opened on (a replacement, a restore, a compaction
+/// swap by rename) drops the held store and opens the new file. A held store
+/// reads what another process commits to the same file meanwhile. An engine
+/// error during a search drops the store that failed (not a newer one another
+/// thread has opened since), so the next use opens afresh. A lock poisoned by a
+/// panic is recovered with nothing held, so it costs one open and no more.
 pub struct CodeSidecar {
     path: PathBuf,
     writable: bool,
@@ -389,23 +408,37 @@ impl CodeSidecar {
 
     /// A handle on the sidecar of `store`, or `None` for a store with no
     /// sidecar ([`sidecar_path`]).
-    pub fn for_store(store: &AnyStore, policy: IndexPolicy) -> Option<Self> {
+    pub(crate) fn for_store(store: &AnyStore, policy: IndexPolicy) -> Option<Self> {
         sidecar_path(store).map(|path| Self::new(path, policy))
     }
 
     /// The sidecar file this handle names.
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     /// How many times this handle has opened the file.
-    pub fn opens(&self) -> usize {
+    pub(crate) fn opens(&self) -> usize {
         self.opens.load(Ordering::Relaxed)
     }
 
-    /// Drop the held store. The next use opens the file again.
-    fn forget(&self) {
-        if let Ok(mut held) = self.held.lock() {
+    /// The held state. The state is only an `Option`, so a lock poisoned by a
+    /// panic is recovered: the guard is taken, nothing is held (the next use
+    /// opens afresh) and the poison is cleared.
+    fn lock_held(&self) -> MutexGuard<'_, Option<Held>> {
+        self.held.lock().unwrap_or_else(|poisoned| {
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            self.held.clear_poison();
+            guard
+        })
+    }
+
+    /// Drop the held store if it is `failed`, the one that errored. A store
+    /// another thread has opened since is a different one and is kept.
+    fn forget(&self, failed: &Arc<FerroStore>) {
+        let mut held = self.lock_held();
+        if held.as_ref().is_some_and(|h| Arc::ptr_eq(&h.ferro, failed)) {
             *held = None;
         }
     }
@@ -414,10 +447,7 @@ impl CodeSidecar {
     /// was opened on, otherwise a fresh open. `Ok(None)`: no sidecar to read
     /// (a read-only handle on an absent or empty file).
     fn acquire(&self) -> Result<Option<Arc<FerroStore>>, StoreError> {
-        let mut held = self
-            .held
-            .lock()
-            .map_err(|_| backend("the code sidecar handle lock is poisoned"))?;
+        let mut held = self.lock_held();
         let meta = match std::fs::symlink_metadata(&self.path) {
             Ok(meta) => Some(meta),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
@@ -457,8 +487,9 @@ impl CodeSidecar {
     }
 }
 
-/// Most sidecar handles a [`CodeSidecarCache`] keeps by default.
-pub const CODE_SIDECAR_CACHE_CAPACITY: usize = 4;
+/// Most sidecar handles a [`CodeSidecarCache`] keeps by default. Each holds
+/// its whole decoded sidecar in memory (about 120 MB at 21,000 symbols).
+const CODE_SIDECAR_CACHE_CAPACITY: usize = 4;
 
 /// A small, bounded, least-recently-used set of **read-only** sidecar
 /// handles, keyed by the sidecar path, for a long-running reader (the Hub).
@@ -493,17 +524,20 @@ impl CodeSidecarCache {
         }
     }
 
-    /// Handles held now.
+    /// Handles held now (a test hook).
+    #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.entries.lock().map_or(0, |e| e.len())
     }
 
-    /// Whether no handle is held.
+    /// Whether no handle is held (a test hook).
+    #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Opens made by the handles held now (a test hook).
+    #[doc(hidden)]
     pub fn opens(&self) -> usize {
         self.entries
             .lock()
@@ -560,8 +594,11 @@ impl CodeSidecarCache {
 
 /// Searches of one [`CodeIndex`] against one sidecar handle: the sidecar is
 /// opened once, an [`IndexPolicy::Sync`] sync runs once (the first search that
-/// reaches the vector leg; its [`SYNC_DEADLINE`] applies to the session, not
-/// to each search), and the id map of the index is built once.
+/// reaches the vector leg; its `budget` and [`SYNC_DEADLINE`] apply to the
+/// session, not to each search), and the id map of the index is built once. A
+/// sync is not repeated if the file is swapped and opened again mid-session.
+/// After the first failure of the sidecar path, the later searches of the
+/// session skip the sidecar: they answer exactly with the same note and cause.
 /// [`search_code_with`] is a session of one search.
 pub struct CodeSession<'a> {
     embedder: &'a dyn Embedder,
@@ -574,6 +611,9 @@ pub struct CodeSession<'a> {
     collection: String,
     /// What the one sync did, or the error that ended it.
     synced: RefCell<Option<Result<CodeSyncStats, String>>>,
+    /// The first failure of the sidecar path (open, sync or search), kept so
+    /// the later searches of the session do not open the file again.
+    failed: RefCell<Option<String>>,
     by_id: OnceCell<HashMap<String, CodeSymbolRef<'a>>>,
 }
 
@@ -598,7 +638,9 @@ impl<'a> CodeSession<'a> {
         Self::new(store, default_embedder(), index, policy)
     }
 
-    /// How many times the session's sidecar handle has opened the file.
+    /// How many times the session's sidecar handle has opened the file (a
+    /// test hook).
+    #[doc(hidden)]
     pub fn sidecar_opens(&self) -> usize {
         self.sidecar.as_ref().map_or(0, |s| s.opens())
     }
@@ -631,6 +673,7 @@ impl<'a> CodeSession<'a> {
             sidecar,
             collection: code_vector_collection_name(embedder, index),
             synced: RefCell::new(None),
+            failed: RefCell::new(None),
             by_id: OnceCell::new(),
         }
     }
@@ -684,7 +727,7 @@ impl<'a> CodeSession<'a> {
                 Ok(())
             }
             Err(err) => {
-                *done = Some(Err(err.to_string()));
+                *done = Some(Err(failure_text(&err)));
                 Err(err)
             }
         }
@@ -704,6 +747,23 @@ impl<'a> CodeSession<'a> {
         if !index.scanned() {
             return Ok(None);
         }
+        // A failed session does not open the file again for each search.
+        if let Some(msg) = &*self.failed.borrow() {
+            return Err(backend(msg.clone()));
+        }
+        let ranked = self.hybrid_via_sidecar(&query_vec, query, limit);
+        if let Err(err) = &ranked {
+            *self.failed.borrow_mut() = Some(failure_text(err));
+        }
+        ranked.map(Some)
+    }
+
+    fn hybrid_via_sidecar(
+        &self,
+        query_vec: &[f32],
+        query: &str,
+        limit: usize,
+    ) -> Result<RankedCode, StoreError> {
         let sidecar = self.sidecar.as_ref().ok_or_else(|| {
             backend("the code vector index needs a store with a file of its own; this one has none")
         })?;
@@ -713,12 +773,14 @@ impl<'a> CodeSession<'a> {
             ));
         }
         let ferro = sidecar.acquire()?;
-        let ranked = self.hybrid_on(ferro.as_deref(), &query_vec, query, limit);
-        if ranked.is_err() {
-            // A handle that failed is not trusted again: the next search opens.
-            sidecar.forget();
+        let ranked = self.hybrid_on(ferro.as_deref(), query_vec, query, limit);
+        if ranked.is_err()
+            && let Some(failed) = &ferro
+        {
+            // The store that failed is not trusted again: the next use opens.
+            sidecar.forget(failed);
         }
-        ranked.map(Some)
+        ranked
     }
 
     fn hybrid_on(
@@ -1822,7 +1884,7 @@ pub fn lunch_menu_planner() {}
     }
 
     #[test]
-    fn a_session_applies_the_sync_deadline_once_for_the_batch() {
+    fn a_session_applies_the_budget_and_one_sync_to_the_whole_batch() {
         let (_root, index) = tree();
         let (_rd, _redb, fd, ferro) = pair();
         // Budget 1: the first search syncs one file and leaves the rest;
@@ -1925,32 +1987,117 @@ pub fn lunch_menu_planner() {}
     }
 
     #[test]
-    fn a_poisoned_handle_lock_falls_back_with_a_cause() {
+    fn a_poisoned_handle_lock_is_recovered_and_the_handle_works_again() {
         let (_root, index) = tree();
         let (_rd, _redb, fd, ferro) = pair();
         run(&ferro, &index, SYNC, "checkpoint");
         let held = Arc::new(CodeSidecar::new(sidecar(&fd), IndexPolicy::ReadOnly));
+        let search = || {
+            CodeSession::with_sidecar(
+                &ferro,
+                default_embedder(),
+                &index,
+                IndexPolicy::ReadOnly,
+                Arc::clone(&held),
+            )
+            .search(CodeSearchKind::Search, "tokenise", 10)
+        };
+        assert!(names(&search()).contains(&"tokenize_input"));
+        assert_eq!(held.opens(), 1);
+
         let poisoner = Arc::clone(&held);
         let _ = std::thread::spawn(move || {
             let _guard = poisoner.held.lock().unwrap();
             panic!("poison the handle lock");
         })
         .join();
-        let r = CodeSession::with_sidecar(
-            &ferro,
-            default_embedder(),
-            &index,
-            IndexPolicy::ReadOnly,
-            held,
-        )
-        .search(CodeSearchKind::Search, "checkpoint", 10);
-        assert_eq!(r.mode, SearchMode::Bm25);
-        assert_eq!(r.note.as_deref(), Some(FALLBACK_NOTE));
-        assert!(r.cause.as_deref().unwrap().contains("poisoned"));
-        assert_eq!(
-            r.outcome,
-            index.search(CodeSearchKind::Search, "checkpoint", 10)
+        assert!(held.held.is_poisoned());
+
+        // Not a permanent fallback: the next use recovers, opens once, and
+        // the use after that holds the new store.
+        for _ in 0..2 {
+            let r = search();
+            assert_eq!(r.mode, SearchMode::Knowledge);
+            assert_eq!(r.note, None);
+            assert_eq!(r.cause, None);
+            assert!(names(&r).contains(&"tokenize_input"));
+        }
+        assert!(!held.held.is_poisoned());
+        assert_eq!(held.opens(), 2, "one reopen after the poison, no more");
+    }
+
+    /// Replace the file with a copy of itself: a different inode while the
+    /// old one is still held, so no inode is reused.
+    fn swap_file(path: &Path) {
+        let tmp = path.with_extension("swap");
+        std::fs::copy(path, &tmp).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    #[test]
+    fn forget_keeps_a_store_another_thread_opened_since() {
+        let (_root, index) = tree();
+        let (_rd, _redb, fd, ferro) = pair();
+        run(&ferro, &index, SYNC, "checkpoint");
+        let path = sidecar(&fd);
+        let held = CodeSidecar::new(path.clone(), IndexPolicy::ReadOnly);
+        let first = held.acquire().unwrap().unwrap();
+        swap_file(&path);
+        let second = held.acquire().unwrap().unwrap();
+        assert_eq!(held.opens(), 2);
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        // The first store failed for a thread that still holds it; the handle
+        // has moved on to the second one, which stays.
+        held.forget(&first);
+        assert!(Arc::ptr_eq(&held.acquire().unwrap().unwrap(), &second));
+        assert_eq!(held.opens(), 2, "a good handle was thrown away");
+        // The store that is held does go when it is the one that failed.
+        held.forget(&second);
+        held.acquire().unwrap().unwrap();
+        assert_eq!(held.opens(), 3);
+    }
+
+    #[test]
+    fn a_failed_sync_is_remembered_and_the_batch_does_not_reopen_the_sidecar() {
+        let (_root, index) = tree();
+        let (_rd, _redb, fd, ferro) = pair();
+        // The 1st embed is the query's, the 2nd is the first symbol's: its
+        // vector has the wrong length, so the engine refuses the sync.
+        let flaky = FlakyEmbedder {
+            inner: HashingEmbedder::default(),
+            calls: std::cell::Cell::new(0),
+            fail_at: 2,
+        };
+        let session = CodeSession::new(&ferro, &flaky, &index, SYNC);
+        let queries = [
+            "checkpoint",
+            "tokenise",
+            "chekpoint",
+            "arbitrate gpu",
+            "queue",
+        ];
+        let mut causes = Vec::new();
+        for query in queries {
+            let r = session.search(CodeSearchKind::Search, query, 10);
+            assert_eq!(r.mode, SearchMode::Bm25, "{query}");
+            assert_eq!(r.note.as_deref(), Some(FALLBACK_NOTE), "{query}");
+            assert_eq!(
+                r.outcome,
+                index.search(CodeSearchKind::Search, query, 10),
+                "{query}"
+            );
+            causes.push(r.cause.expect("cause kept"));
+        }
+        assert!(
+            causes[0].contains("vector values have length"),
+            "{causes:?}"
         );
+        assert!(causes.windows(2).all(|w| w[0] == w[1]), "{causes:?}");
+        assert_eq!(session.sidecar_opens(), 1, "a sub-query reopened the file");
+        assert_eq!(session.sync_stats(), CodeSyncStats::default());
+        // The sidecar is only the file the one open made.
+        assert!(sidecar(&fd).is_file());
     }
 
     #[test]

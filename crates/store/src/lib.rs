@@ -35,8 +35,8 @@ pub use any::{
     physical_path, store_exists, store_identity,
 };
 pub use code_knowledge::{
-    CODE_SIDECAR_CACHE_CAPACITY, CodeSession, CodeSidecar, CodeSidecarCache,
-    DEFAULT_CODE_SYNC_BUDGET, RankedCode, search_code, search_code_with, sidecar_path,
+    CodeSession, CodeSidecar, CodeSidecarCache, DEFAULT_CODE_SYNC_BUDGET, RankedCode, search_code,
+    search_code_with, sidecar_path,
 };
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
