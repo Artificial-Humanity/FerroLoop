@@ -41,8 +41,11 @@
 //! waits for it.
 //!
 //! `status` never opens a store that can write or migrate: FerroStore sizes are
-//! read with [`ferro_stats_at`], and a redb file is opened only to read its
-//! format version, on the redb engine, with no retries.
+//! read with [`ferro_stats_at`]. A non-empty `.redb` is opened read-only
+//! (`RedbStore::open_read_only`, no retries): it takes a shared lock, writes and
+//! creates nothing, and works on a 0400 file. A file that needs repair, or has
+//! no store tables, is reported ("could not read it"), never repaired or
+//! initialised.
 
 use crate::migrate::{ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore};
 use crate::{
@@ -434,7 +437,10 @@ pub(crate) fn engine_options(kind: BackendKind) -> StoreOptions {
 }
 
 /// The engine, files and format version of the store `path` names, on the
-/// engine `kind`. Read-only: see the [module documentation](self).
+/// engine `kind`. Read-only: see the [module documentation](self). Because it
+/// opens the redb read-only, `status` does not print the stderr warnings an
+/// ordinary redb open prints (a `.fls` beside the `.redb`, loose file
+/// permissions); it must change and say nothing beyond its report.
 pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
     let physical = physical_path(path, kind);
     let meta = std::fs::metadata(&physical).ok();
