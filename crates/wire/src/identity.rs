@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fl_core::agent::{AgentRole, AgentStatus};
 use fl_core::at::At;
@@ -69,9 +69,19 @@ pub struct RouteEntry {
     pub updated_at: At,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`RouteTable::discover_routes`] calls made on this thread.
+    pub(crate) static DISCOVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteTable {
     pub entries: BTreeMap<String, RouteEntry>,
+    /// When [`RouteTable::discover_routes`] last scanned this host; `None` until it has. Kept in
+    /// memory only (never in the routes file), so a fresh process starts due for a scan.
+    #[serde(skip)]
+    last_discovery: Option<Instant>,
 }
 
 pub fn default_routes_path() -> PathBuf {
@@ -307,6 +317,8 @@ impl RouteTable {
     /// changed it meanwhile (a concurrent `RegisterRoute`), in which case the live entry wins.
     /// Everything else merges as in [`RouteTable::merge_newer`].
     pub fn merge_dispatch_result(&mut self, base: &Self, working: Self) {
+        // A scan made on the working copy counts for the live table too.
+        self.last_discovery = self.last_discovery.max(working.last_discovery);
         for (key, base_entry) in &base.entries {
             if !working.entries.contains_key(key) && self.entries.get(key) == Some(base_entry) {
                 self.entries.remove(key);
@@ -322,7 +334,10 @@ impl RouteTable {
         }
         // Also support flat map `{ "<persona>": RouteEntry }` or legacy agent-bus route map
         if let Ok(entries) = serde_json::from_str::<BTreeMap<String, RouteEntry>>(&raw) {
-            return Some(RouteTable { entries });
+            return Some(RouteTable {
+                entries,
+                last_discovery: None,
+            });
         }
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
             && let Some(obj) = val.as_object()
@@ -349,7 +364,10 @@ impl RouteTable {
                 }
             }
             if !entries.is_empty() {
-                return Some(RouteTable { entries });
+                return Some(RouteTable {
+                    entries,
+                    last_discovery: None,
+                });
             }
         }
         None
@@ -455,8 +473,29 @@ impl RouteTable {
         self.get(persona).map(|e| e.route.clone()) != before
     }
 
+    /// `true` when no discovery has run yet, or the last one was more than `interval` ago.
+    pub fn discovery_due(&self, interval: Duration) -> bool {
+        self.last_discovery
+            .is_none_or(|last| last.elapsed() > interval)
+    }
+
+    /// Test seam: pretend the last discovery ran at `at`.
+    #[cfg(test)]
+    pub(crate) fn set_last_discovery(&mut self, at: Option<Instant>) {
+        self.last_discovery = at;
+    }
+
     /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
     pub fn discover_routes(&mut self, home_override: Option<&Path>, at: At) {
+        self.last_discovery = Some(Instant::now());
+        #[cfg(test)]
+        {
+            DISCOVERIES.with(|n| n.set(n.get() + 1));
+            // A unit test never scans the real home.
+            if home_override.is_none() {
+                return;
+            }
+        }
         if home_override.is_none()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
         {
@@ -3900,6 +3939,34 @@ mod tests {
             live.get("changed").is_some(),
             "a route re-registered during the dispatch survives"
         );
+    }
+
+    /// The daemon dispatches on a copy of its table: a scan made on that copy must reach the live
+    /// table, or every dispatch would find the live table due and rescan.
+    #[test]
+    fn merge_dispatch_result_carries_the_working_copys_discovery_time_back() {
+        let interval = Duration::from_secs(60);
+        let mut live = RouteTable::default();
+        let base = live.clone();
+        let mut working = base.clone();
+        working.discover_routes(None, At::from_unix_millis(10));
+        assert!(live.discovery_due(interval));
+        live.merge_dispatch_result(&base, working);
+        assert!(
+            !live.discovery_due(interval),
+            "the scan was not carried back"
+        );
+        // An older scan on the working copy does not move the live time back.
+        let stale = Instant::now()
+            .checked_sub(interval * 2)
+            .expect("clock older than the interval");
+        let mut old = live.clone();
+        old.set_last_discovery(Some(stale));
+        live.merge_dispatch_result(&base, old);
+        assert!(!live.discovery_due(interval));
+        // The time is never written to the routes file.
+        let json = serde_json::to_string(&live).unwrap();
+        assert!(!json.contains("last_discovery"), "{json}");
     }
 
     #[test]

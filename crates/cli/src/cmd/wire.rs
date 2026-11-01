@@ -17,8 +17,8 @@ use fl_core::iri::Iri;
 use fl_core::state::StateScope;
 use fl_core::store::{AgentRegistry, MessageStore, StoreError};
 use fl_wire::daemon::{
-    DEFAULT_LOCAL_CONNECT_TIMEOUT, DaemonConfig, LocalClient, LocalEvent, LocalRequest,
-    LocalResponse, default_socket_path, spawn_daemon,
+    DEFAULT_LOCAL_RPC_TIMEOUT, DaemonConfig, LocalClient, LocalEvent, LocalRequest, LocalResponse,
+    default_socket_path, spawn_daemon,
 };
 use fl_wire::dispatcher::dispatch_message_for_store;
 use fl_wire::identity::{
@@ -330,7 +330,7 @@ pub fn resolve_caller(
 
 pub fn record_caller_route(env: &StateEnv<'_>, persona: &str, route: VendorRoute) {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT) {
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
         let _ = client.request(&LocalRequest::RegisterRoute {
             persona: persona.to_string(),
             route,
@@ -361,7 +361,7 @@ pub fn execute_send(
     args: SendWireArgs,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT) {
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
         match client.request(&LocalRequest::Send { args })? {
             LocalResponse::Sent { message, receipts } => return Ok((message, receipts)),
             other => return Err(format!("unexpected daemon response: {other:?}")),
@@ -382,7 +382,7 @@ pub fn execute_read(
     ack: bool,
 ) -> Result<Vec<WireInboxItem>, String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT) {
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
         match client.request(&LocalRequest::Read { filter, ack })? {
             LocalResponse::Inbox { items } => return Ok(items),
             other => return Err(format!("unexpected daemon response: {other:?}")),
@@ -415,7 +415,7 @@ pub fn execute_ack(
     recipient: String,
 ) -> Result<Vec<DeliveryReceipt>, String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT) {
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
         match client.request(&LocalRequest::Ack {
             message_ids,
             recipient,
@@ -496,7 +496,7 @@ pub fn wait_for_reply(
     let sock = resolve_socket_path(env, None);
     let deadline = Instant::now() + timeout;
 
-    if let Ok(mut sub_client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT)
+    if let Ok(mut sub_client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
         && sub_client
             .subscribe(Some(recipient.to_string()), Some(ask_id.clone()))
             .is_ok()
@@ -821,7 +821,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             let deadline = Instant::now() + wait_dur;
             let sock = resolve_socket_path(env, None);
 
-            if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT)
+            if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
                 && sub.subscribe(Some(persona.clone()), None).is_ok()
             {
                 while Instant::now() < deadline {
@@ -898,7 +898,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
         }
         WireCmd::Status { json } => {
             let sock = resolve_socket_path(env, None);
-            if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT)
+            if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
                 && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status)
             {
                 if json {
@@ -1371,7 +1371,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
 fn run_listen_loop(env: &StateEnv<'_>, explicit_from: Option<&str>) -> Result<i32, (i32, String)> {
     let persona = resolve_caller(env, explicit_from, None);
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_CONNECT_TIMEOUT)
+    if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
         && sub.subscribe(Some(persona.clone()), None).is_ok()
     {
         loop {

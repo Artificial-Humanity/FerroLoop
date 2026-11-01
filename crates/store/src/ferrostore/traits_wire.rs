@@ -123,6 +123,27 @@ fn receipt_matches(
     rcpt.recipient_id.as_str() == trimmed || rcpt.recipient_name.eq_ignore_ascii_case(trimmed)
 }
 
+/// [`receipt_matches`], looking up `rcpt`'s redirect only when its raw id
+/// does not already match. Equivalent to resolving first: `agent_id` from
+/// [`recipient_candidates`] is already resolved (terminal), so a raw id equal
+/// to it resolves to itself, and no other clause reads the resolved id.
+fn receipt_matches_resolving(
+    txn: &super::Txn,
+    label: &str,
+    rcpt: &DeliveryReceipt,
+    agent_id: Option<&Iri>,
+    name_key: Option<&str>,
+    raw_query: &str,
+) -> Result<bool, StoreError> {
+    if receipt_matches(rcpt, &rcpt.recipient_id, agent_id, name_key, raw_query) {
+        return Ok(true);
+    }
+    let resolved = doc::resolve_iri(txn, label, &rcpt.recipient_id)?;
+    Ok(receipt_matches(
+        rcpt, &resolved, agent_id, name_key, raw_query,
+    ))
+}
+
 fn inbox_rows(txn: &super::Txn) -> Result<Vec<(String, String, DeliveryReceipt)>, StoreError> {
     let mut out = Vec::new();
     for (id, doc) in txn.scan(WIRE_INBOX) {
@@ -275,21 +296,21 @@ impl MessageStore for FerroStore {
             };
             let mut items = Vec::new();
             for (_recipient, _message, rcpt) in inbox_rows(txn)? {
-                if let (Some(query), Some((agent_id, name_key))) = (&filter.recipient, &candidates)
+                // Before any recipient match: the status needs no lookup.
+                if filter.unread_only
+                    && matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
                 {
-                    let rcpt_resolved = doc::resolve_iri(txn, &self.label, &rcpt.recipient_id)?;
-                    if !receipt_matches(
+                    continue;
+                }
+                if let (Some(query), Some((agent_id, name_key))) = (&filter.recipient, &candidates)
+                    && !receipt_matches_resolving(
+                        txn,
+                        &self.label,
                         &rcpt,
-                        &rcpt_resolved,
                         agent_id.as_ref(),
                         name_key.as_deref(),
                         query,
-                    ) {
-                        continue;
-                    }
-                }
-                if filter.unread_only
-                    && matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+                    )?
                 {
                     continue;
                 }
@@ -379,14 +400,14 @@ impl MessageStore for FerroStore {
                 if message != message_id.as_str() {
                     continue;
                 }
-                let rcpt_resolved = doc::resolve_iri(txn, &self.label, &rcpt.recipient_id)?;
-                if receipt_matches(
+                if receipt_matches_resolving(
+                    txn,
+                    &self.label,
                     &rcpt,
-                    &rcpt_resolved,
                     agent_id.as_ref(),
                     name_key.as_deref(),
                     &recipient,
-                ) {
+                )? {
                     matched = Some((rec_key, rcpt));
                     break;
                 }
