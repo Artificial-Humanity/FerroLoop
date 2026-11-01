@@ -32,7 +32,7 @@
 //! sits on the declaration line.
 //!
 //! **Where the vectors live: a sidecar file.** A scan of this repository finds
-//! about 15,000 symbols, and every read of a FerroStore decodes the whole
+//! about 21,500 symbols, and every read of a FerroStore decodes the whole
 //! store, so putting them in the primary store would slow every read of it.
 //! They go to `<primary>.code.fls` instead (`fl.fls` -> `fl.code.fls`), made
 //! mode 0600 beside the primary by [`FerroStore::open`]. It holds derived
@@ -41,14 +41,24 @@
 //! `<slug>.fls` with a slug of letters, digits, `-` and `_`, and `foo.code`
 //! is not one.
 //!
-//! **What is stored**, in the sidecar: one vector per symbol in the
-//! per-embedding-space collection `code_vec_<8 hex of sha256(space_id)>`
-//! (metadata `{path, rev}`, the id a hash of path, kind, name and start line),
-//! and one index document `code_vec_index/<collection>` mapping each file path
-//! to `{digest, ids}`: the SHA-256 of the file's lines and the ids of the
-//! vectors it owns. A file whose digest is unchanged is left alone; a changed
-//! file has its stale vectors deleted and its new ones written; a file gone
-//! from the tree has its vectors deleted.
+//! **What is stored**, in the sidecar, per scanned root: one vector per symbol
+//! in the collection `code_vec_<8 hex of sha256(space_id)>_<16 hex of
+//! sha256(root)>` (metadata `{path}`, the id a hash of path, kind, name and
+//! start line), and one index document `code_vec_index/<collection>` mapping
+//! each file path to `{digest, ids}`: the SHA-256 of the file's lines and the
+//! ids of the vectors it owns. A file whose digest is unchanged is left alone;
+//! a changed file has its stale vectors deleted and its new ones written; a
+//! file gone from the tree has its vectors deleted.
+//!
+//! **The root keys everything.** Paths in the document are relative to the
+//! scanned root, so two roots hold `src/lib.rs` each, and a search with
+//! another root (or a subdirectory) must not read the first tree as deleted.
+//! The root is the [`CodeIndex::root`] (canonical when the filesystem can say
+//! so), and its hash is part of the collection name: each root has its own
+//! vectors and its own document, symbol ids are scoped by that collection, and
+//! roots coexist in one sidecar without touching each other. A root that is
+//! not searched again leaves its collection behind; the sidecar is derived
+//! data, and deleting it clears them all.
 //!
 //! The document is written *ahead* of the vectors, as in
 //! [`crate::knowledge`]: before a file is touched, ids that might come to
@@ -66,18 +76,21 @@
 //! Vectors are written in batches of [`UPSERT_BATCH`] through
 //! [`FerroStore::upsert_vectors`] (a batch is one commit and one copy of the
 //! collection, and is all or nothing), a changed file's stale vectors are
-//! deleted in one transaction per batch, and a sync that wrote at least one
-//! batch ends with a [`FerroStore::checkpoint`]: the engine replays every
-//! logged vector insert through HNSW on open, so an unfolded bulk build would
-//! make the next open slow.
+//! deleted in one transaction per batch, the vectors of files gone from the
+//! tree in groups of about a batch, and a sync that wrote at least one batch
+//! ends with a [`FerroStore::checkpoint`]: the engine replays every logged
+//! vector insert through HNSW on open, so an unfolded bulk build would make
+//! the next open slow.
 //!
 //! [`IndexPolicy::Sync`] writes at most `budget` new vectors per call (a whole
 //! file at a time; a file larger than the budget goes alone) and starts no new
-//! file once `SYNC_DEADLINE` has passed, so one search never waits for a whole
-//! cold build (about 11,000 symbols take about 40 seconds). What is left is
-//! found lexically and indexed by the next searches, each of which makes
-//! progress. [`IndexPolicy::ReadOnly`] writes nothing and never creates the
-//! sidecar: without one the vector leg is empty.
+//! group of deletes or file once `SYNC_DEADLINE` has passed (the first unit of
+//! work is always done), so one search never waits for a whole cold build
+//! (about 21,500 symbols take about 50 seconds in all, 5 to 6 seconds per
+//! call). Deletes draw no budget: it caps embedding work. What is left is found
+//! lexically and indexed by the next searches, each of which makes progress.
+//! [`IndexPolicy::ReadOnly`] writes nothing and never creates the sidecar:
+//! without one the vector leg is empty.
 //!
 //! Any failure on the FerroStore path (sidecar open, index, search) falls back
 //! to the exact answer with a fixed [`RankedCode::note`] and the engine's
@@ -102,11 +115,12 @@ use std::time::{Duration, Instant};
 /// Vectors one CLI or MCP call may plan (and embed). A cap on the work per
 /// call; the deadline below is what normally ends a call.
 pub const DEFAULT_CODE_SYNC_BUDGET: usize = 4096;
-/// Longest a sync spends writing vectors, checked before each file after the
-/// first. A batched upsert costs about 3.4 ms per vector, so this admits
-/// about 1,500 vectors per call and a cold build of this repository (about
-/// 11,000 symbols) takes a handful of searches, none of which waits for the
-/// whole build. Files not reached are left to a later search, like files over
+/// Longest a sync spends writing, checked before each file or group of deletes
+/// after the first. A batched upsert costs about 2.4 ms per vector (embedding
+/// included), so this admits about 2,000 vectors per call, and a cold build of
+/// this repository (about 21,500 symbols, about 50 seconds in all) takes a
+/// handful of searches of 5 to 6 seconds each, none of which waits for the
+/// whole build. Work not reached is left to a later search, like files over
 /// the budget.
 const SYNC_DEADLINE: Duration = Duration::from_secs(5);
 /// Most matches the lexical leg keeps before fusion.
@@ -185,17 +199,21 @@ pub(crate) struct CodeSyncStats {
     pub written: usize,
     /// Vectors deleted (stale, or their file is gone).
     pub deleted: usize,
-    /// Symbols of changed or new files left to a later search by the budget.
+    /// Symbols left to a later search by the budget or the deadline: those of
+    /// changed or new files not written, and the ids of gone files not yet
+    /// deleted.
     pub pending: usize,
 }
 
 /// The sidecar file of the primary store `store`: `<primary>.code.fls`. `None`
 /// for a store with no file of its own (in memory, or served over a socket).
 pub fn sidecar_path(store: &AnyStore) -> Option<PathBuf> {
-    let label = Path::new(store.as_ferro()?.label());
-    (label.extension().and_then(|e| e.to_str()) == Some(crate::any::FERRO_EXTENSION)
-        && label.file_name().is_some())
-    .then(|| label.with_extension(SIDECAR_EXTENSION))
+    // The path the store was opened with, never its label: the label is
+    // `Path::display`, which is lossy for a name that is not UTF-8.
+    let file = store.ferro_file()?;
+    (file.extension().and_then(|e| e.to_str()) == Some(crate::any::FERRO_EXTENSION)
+        && file.file_name().is_some())
+    .then(|| file.with_extension(SIDECAR_EXTENSION))
 }
 
 /// Search `index` on `store` with the default embedder. See the module
@@ -254,16 +272,29 @@ pub(crate) fn search_code_stats(
     }
 }
 
-/// The vector collection for an embedding space: another space or dimension
-/// never shares one.
-pub fn code_vector_collection_name(embedder: &dyn Embedder) -> String {
-    let digest = Sha256::digest(embedder.space_id().as_bytes());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    format!("code_vec_{hex}")
+fn hex_prefix(bytes: &[u8], take: usize) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .take(take)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
-/// A stable id for a symbol (or a matched line): a hash of its path, kind,
-/// name and start line.
+/// The vector collection for an embedding space and a scanned root: another
+/// space, dimension or root never shares one. The root is the index's own
+/// ([`CodeIndex::root`]; an index not made by a scan has none and shares the
+/// root-less collection).
+pub fn code_vector_collection_name(embedder: &dyn Embedder, index: &CodeIndex) -> String {
+    let space = hex_prefix(embedder.space_id().as_bytes(), 4);
+    let root = index
+        .root()
+        .map_or(&[][..], |r| r.as_os_str().as_encoded_bytes());
+    format!("code_vec_{space}_{}", hex_prefix(root, 8))
+}
+
+/// An id for a symbol (or a matched line): a hash of its path, kind, name and
+/// start line. It is unique within one collection, and the collection is per
+/// root, so the same relative path in two roots never shares an id.
 fn symbol_id(path: &str, kind: &str, name: &str, start_line: u64) -> String {
     let mut hasher = Sha256::new();
     for part in [path, kind, name] {
@@ -318,7 +349,7 @@ fn hybrid(
     let path = sidecar_path(store).ok_or_else(|| {
         backend("the code vector index needs a store with a file of its own; this one has none")
     })?;
-    let collection = code_vector_collection_name(embedder);
+    let collection = code_vector_collection_name(embedder, index);
     let sidecar = match policy {
         IndexPolicy::Sync { .. } => Some(open_sidecar_for_write(&path)?),
         IndexPolicy::ReadOnly => open_sidecar_if_present(&path)?,
@@ -401,6 +432,13 @@ fn hybrid(
 
 /// Open or create the sidecar. A symlink is refused: the file is private
 /// derived data, never an alias for another path.
+///
+/// Known gap: the check and the open are two steps, and `FerroStore::open`
+/// takes a path, not a file descriptor, so there is no `O_NOFOLLOW` open. A
+/// process that can write the store's directory can swap the file for a
+/// symlink between them. The sidecar holds derived data only (no code bodies),
+/// and a process that can write that directory can already replace the primary
+/// store, so the check stops a stale or stray link, not an attacker.
 fn open_sidecar_for_write(path: &Path) -> Result<FerroStore, StoreError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -418,6 +456,12 @@ fn open_sidecar_for_write(path: &Path) -> Result<FerroStore, StoreError> {
 
 /// Open the sidecar only if it exists and has content. An absent or empty
 /// file is `None` (an empty vector leg), and nothing is created or written.
+///
+/// The same gap as [`open_sidecar_for_write`] applies, and one more: the file
+/// can be deleted, or filled by a concurrent writer, between the check and
+/// the open. A file deleted in between is created and given its first
+/// superblock by `FerroStore::open` (an empty, valid sidecar, which the next
+/// sync fills); a file filled in between is simply read.
 fn open_sidecar_if_present(path: &Path) -> Result<Option<FerroStore>, StoreError> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -498,23 +542,69 @@ impl IndexDoc {
         json!({ "space": space, "files": files })
     }
 
-    /// Read the freshest document, apply `changes` (`None` removes a path) and
-    /// write it back, in one transaction: no other writer commits between the
-    /// read and the write. Paths this call did not touch keep whatever
-    /// another writer recorded.
+    /// Read the freshest document, apply `changes` and write it back, in one
+    /// transaction: no other writer commits between the read and the write.
+    /// Paths this call did not touch keep whatever another writer recorded.
+    ///
+    /// A path whose freshest record lists an id the change does not account
+    /// for (see [`Change::known`]) was written by a concurrent sync after this
+    /// one planned its change. Its ids are never dropped: the record then
+    /// carries them under [`PENDING_DIGEST`], and the next sync repairs it,
+    /// deleting those that no longer belong. A removal is then kept as well.
     fn update(
         ferro: &FerroStore,
         collection: &str,
         space: u64,
-        changes: &BTreeMap<String, Option<FileRecord>>,
+        changes: &Changes,
     ) -> Result<(), StoreError> {
         ferro.transaction(|txn| {
             let mut fresh = Self::parse(txn.get_doc(INDEX_DOC_COLLECTION, collection), space);
-            for (path, rec) in changes {
-                match rec {
-                    Some(rec) => fresh.files.insert(path.clone(), rec.clone()),
-                    None => fresh.files.remove(path),
-                };
+            for (path, change) in changes {
+                let known: HashSet<&str> = change
+                    .known
+                    .iter()
+                    .chain(change.record.iter().flat_map(|rec| &rec.ids))
+                    .map(String::as_str)
+                    .collect();
+                let unknown: Vec<String> = fresh
+                    .files
+                    .get(path)
+                    .map(|cur| {
+                        cur.ids
+                            .iter()
+                            .filter(|id| !known.contains(id.as_str()))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match (&change.record, unknown.is_empty()) {
+                    (Some(rec), true) => {
+                        fresh.files.insert(path.clone(), rec.clone());
+                    }
+                    (Some(rec), false) => {
+                        let mut ids = rec.ids.clone();
+                        ids.extend(unknown);
+                        fresh.files.insert(
+                            path.clone(),
+                            FileRecord {
+                                digest: PENDING_DIGEST.to_string(),
+                                ids,
+                            },
+                        );
+                    }
+                    (None, true) => {
+                        fresh.files.remove(path);
+                    }
+                    (None, false) => {
+                        fresh.files.insert(
+                            path.clone(),
+                            FileRecord {
+                                digest: PENDING_DIGEST.to_string(),
+                                ids: unknown,
+                            },
+                        );
+                    }
+                }
             }
             txn.put_doc(INDEX_DOC_COLLECTION, collection, &fresh.to_json(space))
         })
@@ -527,6 +617,8 @@ struct FileWork {
     digest: String,
     /// The file has no declarations: nothing is listed for it.
     no_symbols: bool,
+    /// How many declarations the file has, counted the way `pending` counts.
+    symbols: usize,
     /// `(id, vector)` for every symbol with a non-zero vector.
     vectors: Vec<(String, Vec<f32>)>,
     /// Ids the document lists for the file now.
@@ -537,7 +629,35 @@ impl FileWork {
     fn new_ids(&self) -> Vec<String> {
         self.vectors.iter().map(|(id, _)| id.clone()).collect()
     }
+
+    /// Every id this writer accounts for: the ones listed before and the new.
+    fn known_ids(&self) -> Vec<String> {
+        let mut ids = self.old_ids.clone();
+        ids.extend(self.new_ids());
+        ids
+    }
 }
+
+/// A change to one path of the index document.
+struct Change {
+    /// The record to write; `None` removes the path.
+    record: Option<FileRecord>,
+    /// Ids this writer accounts for: listed in `record`, or deleted by it. An
+    /// id the freshest document lists for the path that is in neither was put
+    /// there by a concurrent writer, and is kept (see [`IndexDoc::update`]).
+    known: Vec<String>,
+}
+
+impl Change {
+    fn set(record: FileRecord, known: Vec<String>) -> Self {
+        Self {
+            record: Some(record),
+            known,
+        }
+    }
+}
+
+type Changes = BTreeMap<String, Change>;
 
 /// Bring the sidecar up to date with `index`, writing at most `budget` new
 /// vectors (a whole file at a time; the first file is taken even if it alone
@@ -623,6 +743,7 @@ pub(crate) fn sync_files_batched(
             path: file.path().to_string(),
             digest,
             no_symbols: symbols.is_empty(),
+            symbols: symbols.len(),
             vectors,
             old_ids: known.map(|rec| rec.ids.clone()).unwrap_or_default(),
         });
@@ -637,17 +758,20 @@ pub(crate) fn sync_files_batched(
     }
 
     // Record intent first. An id the document already lists stays listed.
-    let mut changes: BTreeMap<String, Option<FileRecord>> = BTreeMap::new();
+    let mut changes: Changes = BTreeMap::new();
     let mut intent = false;
     for (path, rec) in &gone {
         if rec.digest != PENDING_DIGEST {
             intent = true;
             changes.insert(
                 (*path).clone(),
-                Some(FileRecord {
-                    digest: PENDING_DIGEST.to_string(),
-                    ids: rec.ids.clone(),
-                }),
+                Change::set(
+                    FileRecord {
+                        digest: PENDING_DIGEST.to_string(),
+                        ids: rec.ids.clone(),
+                    },
+                    rec.ids.clone(),
+                ),
             );
         }
     }
@@ -664,10 +788,13 @@ pub(crate) fn sync_files_batched(
             ids.extend(fresh);
             changes.insert(
                 item.path.clone(),
-                Some(FileRecord {
-                    digest: PENDING_DIGEST.to_string(),
-                    ids,
-                }),
+                Change::set(
+                    FileRecord {
+                        digest: PENDING_DIGEST.to_string(),
+                        ids,
+                    },
+                    item.known_ids(),
+                ),
             );
         }
     }
@@ -679,31 +806,48 @@ pub(crate) fn sync_files_batched(
     }
     changes.clear();
 
-    // Write. Stop at the first error but still finalise what succeeded. The
-    // files go in groups of about `batch` vectors; a group is written, its
-    // stale vectors deleted, and only then are its files finalised.
+    // Write. Stop at the first error but still finalise what succeeded. Files
+    // gone from the tree go first, in groups of about `batch` ids; the files
+    // to write follow, in groups of about `batch` vectors, each group written,
+    // its stale vectors deleted, and only then its files finalised. Both stop
+    // at the deadline, after the first unit of work of the whole sync.
     let mut failure: Option<StoreError> = None;
     'files: {
-        if !gone.is_empty() {
-            let ids: Vec<&str> = gone
-                .iter()
-                .flat_map(|(_, rec)| rec.ids.iter().map(String::as_str))
-                .collect();
-            if let Err(err) = delete_vectors(ferro, collection, &ids) {
+        let mut did_work = false;
+        let mut cut_off = false;
+        let groups = gone_groups(&gone, batch);
+        for (n, group) in groups.iter().enumerate() {
+            if n > 0 && started.elapsed() >= deadline {
+                // Still listed as pending: a later sync takes it up again.
+                stats.pending += group_ids(&groups[n..]);
+                cut_off = true;
+                break;
+            }
+            if let Err(err) = delete_gone_group(ferro, collection, group, batch, &mut stats) {
                 failure = Some(err);
                 break 'files;
             }
-            stats.deleted += ids.len();
-            for (path, _) in &gone {
-                changes.insert((*path).clone(), None);
+            for (path, rec) in group {
+                changes.insert(
+                    (*path).clone(),
+                    Change {
+                        record: None,
+                        known: rec.ids.clone(),
+                    },
+                );
             }
+            did_work = true;
+        }
+        if cut_off {
+            stats.pending += work.iter().map(|w| w.symbols).sum::<usize>();
+            break 'files;
         }
         let mut group: Vec<&FileWork> = Vec::new();
         let mut buffered = 0usize;
         for (done, item) in work.iter().enumerate() {
-            if done > 0 && started.elapsed() >= deadline {
+            if (did_work || done > 0) && started.elapsed() >= deadline {
                 // Still listed as pending: a later sync takes it up again.
-                stats.pending += work[done..].iter().map(|w| w.vectors.len()).sum::<usize>();
+                stats.pending += work[done..].iter().map(|w| w.symbols).sum::<usize>();
                 break;
             }
             buffered += item.vectors.len();
@@ -738,6 +882,54 @@ pub(crate) fn sync_files_batched(
     }
 }
 
+/// The files gone from the tree, in groups that hold about `batch` ids (a
+/// file is never split, so a file with more ids than that is a group alone).
+fn gone_groups<'a>(
+    gone: &[(&'a String, &'a FileRecord)],
+    batch: usize,
+) -> Vec<Vec<(&'a String, &'a FileRecord)>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    let mut ids = 0usize;
+    for &(path, rec) in gone {
+        ids += rec.ids.len();
+        group.push((path, rec));
+        if ids >= batch {
+            groups.push(std::mem::take(&mut group));
+            ids = 0;
+        }
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
+/// How many ids the files of `groups` list.
+fn group_ids(groups: &[Vec<(&String, &FileRecord)>]) -> usize {
+    groups.iter().flatten().map(|(_, rec)| rec.ids.len()).sum()
+}
+
+/// Delete the vectors of one group of gone files, in transactions of at most
+/// `batch` ids.
+fn delete_gone_group(
+    ferro: &FerroStore,
+    collection: &str,
+    group: &[(&String, &FileRecord)],
+    batch: usize,
+    stats: &mut CodeSyncStats,
+) -> Result<(), StoreError> {
+    let ids: Vec<&str> = group
+        .iter()
+        .flat_map(|(_, rec)| rec.ids.iter().map(String::as_str))
+        .collect();
+    for chunk in ids.chunks(batch) {
+        delete_vectors(ferro, collection, chunk)?;
+        stats.deleted += chunk.len();
+    }
+    Ok(())
+}
+
 /// Write the vectors of `group` in commits of at most `batch`, delete the ids
 /// its files no longer own in one transaction, and record each file as done in
 /// `changes`. On `Err` nothing is recorded: the group's files stay pending,
@@ -748,17 +940,12 @@ fn write_group(
     group: &[&FileWork],
     batch: usize,
     stats: &mut CodeSyncStats,
-    changes: &mut BTreeMap<String, Option<FileRecord>>,
+    changes: &mut Changes,
 ) -> Result<(), StoreError> {
     let mut items: Vec<(&str, &[f32], Value)> = Vec::new();
     for item in group {
-        let rev = stamp(&item.digest);
         for (id, values) in &item.vectors {
-            items.push((
-                id.as_str(),
-                values.as_slice(),
-                json!({ "path": item.path, "rev": rev }),
-            ));
+            items.push((id.as_str(), values.as_slice(), json!({ "path": item.path })));
         }
     }
     for chunk in items.chunks(batch) {
@@ -779,16 +966,27 @@ fn write_group(
                 .filter(|id| !current.contains(id)),
         );
     }
-    if !stale.is_empty() {
-        delete_vectors(ferro, collection, &stale)?;
-        stats.deleted += stale.len();
+    for chunk in stale.chunks(batch) {
+        delete_vectors(ferro, collection, chunk)?;
+        stats.deleted += chunk.len();
     }
     for item in group {
-        let record = (!item.no_symbols).then(|| FileRecord {
-            digest: item.digest.clone(),
-            ids: item.new_ids(),
-        });
-        changes.insert(item.path.clone(), record);
+        let known = item.known_ids();
+        let change = if item.no_symbols {
+            Change {
+                record: None,
+                known,
+            }
+        } else {
+            Change::set(
+                FileRecord {
+                    digest: item.digest.clone(),
+                    ids: item.new_ids(),
+                },
+                known,
+            )
+        };
+        changes.insert(item.path.clone(), change);
     }
     Ok(())
 }
@@ -886,8 +1084,8 @@ pub fn lunch_menu_planner() {}
         FerroStore::open(sidecar(dir)).unwrap()
     }
 
-    fn col() -> String {
-        code_vector_collection_name(default_embedder())
+    fn col(index: &CodeIndex) -> String {
+        code_vector_collection_name(default_embedder(), index)
     }
 
     fn vector_count(ferro: &FerroStore, index: &CodeIndex) -> usize {
@@ -896,7 +1094,7 @@ pub fn lunch_menu_planner() {}
             .flat_map(|f| f.symbols())
             .filter(|s| {
                 ferro
-                    .get_vector(&col(), &id_of_symbol(s))
+                    .get_vector(&col(index), &id_of_symbol(s))
                     .ok()
                     .flatten()
                     .is_some()
@@ -1078,7 +1276,7 @@ pub fn lunch_menu_planner() {}
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600);
         // The primary store holds none of it.
-        let missing = ferro.as_ferro().unwrap().get_vector(&col(), "x");
+        let missing = ferro.as_ferro().unwrap().get_vector(&col(&index), "x");
         assert!(
             missing
                 .unwrap_err()
@@ -1234,7 +1432,7 @@ pub fn lunch_menu_planner() {}
         assert!(names(&r).contains(&"fresh_symbol_here"));
         for id in &old_ids {
             // checkpoint_store moved no lines, so its id is the same and is back.
-            let gone = side.get_vector(&col(), id).unwrap().is_none();
+            let gone = side.get_vector(&col(&index), id).unwrap().is_none();
             let kept = changed
                 .files()
                 .flat_map(|f| f.symbols().map(|s| id_of_symbol(&s)).collect::<Vec<_>>())
@@ -1247,7 +1445,8 @@ pub fn lunch_menu_planner() {}
         let fewer = scan_code_index(root.path());
         let (_, stats) = run(&ferro, &fewer, SYNC, "fresh symbol");
         assert_eq!((stats.written, stats.deleted), (0, 2), "{stats:?}");
-        let doc = IndexDoc::load(&side, &col(), stamp(&default_embedder().space_id())).unwrap();
+        let doc =
+            IndexDoc::load(&side, &col(&index), stamp(&default_embedder().space_id())).unwrap();
         assert_eq!(doc.files.keys().collect::<Vec<_>>(), ["src/store.rs"]);
         // The vector leg no longer returns the deleted file's symbols.
         let (r, _) = run(&ferro, &fewer, SYNC, "arbitrate gpu queue");
@@ -1293,16 +1492,17 @@ pub fn lunch_menu_planner() {}
         let stats = sync_files(
             &side,
             default_embedder(),
-            &col(),
+            &col(&index),
             &index,
             100,
             Duration::ZERO,
         )
         .unwrap();
         assert_eq!((stats.written, stats.pending), (2, 5), "{stats:?}");
-        let doc = IndexDoc::load(&side, &col(), stamp(&default_embedder().space_id())).unwrap();
+        let doc =
+            IndexDoc::load(&side, &col(&index), stamp(&default_embedder().space_id())).unwrap();
         assert_eq!(doc.files["src/store.rs"].digest, PENDING_DIGEST);
-        let stats = sync_files(&side, default_embedder(), &col(), &index, 100, LONG).unwrap();
+        let stats = sync_files(&side, default_embedder(), &col(&index), &index, 100, LONG).unwrap();
         assert_eq!((stats.written, stats.pending), (5, 0), "{stats:?}");
         assert_eq!(vector_count(&side, &index), 7);
     }
@@ -1347,19 +1547,20 @@ pub fn lunch_menu_planner() {}
         };
         // A batch of 2: gpu.rs commits alone, then store.rs's batch of 5 is
         // refused whole (a batch is all or nothing).
-        let err = sync_files_batched(&side, &flaky, &col(), &index, 100, LONG, 2).unwrap_err();
+        let err =
+            sync_files_batched(&side, &flaky, &col(&index), &index, 100, LONG, 2).unwrap_err();
         assert!(
             err.to_string().contains("vector values have length"),
             "{err}"
         );
-        let doc = IndexDoc::load(&side, &col(), space).unwrap();
+        let doc = IndexDoc::load(&side, &col(&index), space).unwrap();
         // Finalised: gpu.rs. Pending, listing every id that might exist: store.rs.
         assert_ne!(doc.files["src/gpu.rs"].digest, PENDING_DIGEST);
         assert_eq!(doc.files["src/store.rs"].digest, PENDING_DIGEST);
         let listed: HashSet<&String> = doc.files.values().flat_map(|f| &f.ids).collect();
         for sym in index.files().flat_map(|f| f.symbols().collect::<Vec<_>>()) {
             let id = id_of_symbol(&sym);
-            let has = side.get_vector(&col(), &id).unwrap().is_some();
+            let has = side.get_vector(&col(&index), &id).unwrap().is_some();
             assert!(
                 !has || listed.contains(&id),
                 "{} committed but unlisted",
@@ -1372,19 +1573,25 @@ pub fn lunch_menu_planner() {}
         // cleaned up, from the pending record.
         write(root.path(), "src/store.rs", "pub fn only_one() {}\n");
         let changed = scan_code_index(root.path());
-        let stats = sync_files(&side, default_embedder(), &col(), &changed, 100, LONG).unwrap();
+        let stats =
+            sync_files(&side, default_embedder(), &col(&index), &changed, 100, LONG).unwrap();
         assert_eq!(stats.written, 1);
         // All five ids the pending record lists are deleted (the four that
         // never committed are no-ops), so nothing half-written stays.
         assert_eq!(stats.deleted, 5, "{stats:?}");
         assert_eq!(vector_count(&side, &changed), 3);
         let all: usize = side
-            .search_vectors(&col(), &default_embedder().embed("only_one"), 100, None)
+            .search_vectors(
+                &col(&index),
+                &default_embedder().embed("only_one"),
+                100,
+                None,
+            )
             .unwrap()
             .len();
         assert_eq!(all, 3, "no orphan vector remains");
         assert_eq!(
-            sync_files(&side, default_embedder(), &col(), &changed, 100, LONG).unwrap(),
+            sync_files(&side, default_embedder(), &col(&index), &changed, 100, LONG).unwrap(),
             CodeSyncStats::default()
         );
     }
@@ -1399,8 +1606,8 @@ pub fn lunch_menu_planner() {}
             calls: std::cell::Cell::new(0),
             fail_at: 3,
         };
-        sync_files(&side, &flaky, &col(), &index, 100, LONG).unwrap_err();
-        let stats = sync_files(&side, default_embedder(), &col(), &index, 100, LONG).unwrap();
+        sync_files(&side, &flaky, &col(&index), &index, 100, LONG).unwrap_err();
+        let stats = sync_files(&side, default_embedder(), &col(&index), &index, 100, LONG).unwrap();
         assert!(stats.written >= 5, "{stats:?}");
         assert_eq!(vector_count(&side, &index), 7);
     }
@@ -1417,18 +1624,26 @@ pub fn lunch_menu_planner() {}
         for batch in [1, 2, 3, 5, 7, 256] {
             let d = TempDir::new().unwrap();
             let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
-            let stats =
-                sync_files_batched(&side, default_embedder(), &col(), &index, 100, LONG, batch)
-                    .unwrap();
+            let stats = sync_files_batched(
+                &side,
+                default_embedder(),
+                &col(&index),
+                &index,
+                100,
+                LONG,
+                batch,
+            )
+            .unwrap();
             assert_eq!((stats.written, stats.pending), (7, 0), "batch {batch}");
             let got: HashSet<String> = side
-                .search_vectors(&col(), &default_embedder().embed("store"), 100, None)
+                .search_vectors(&col(&index), &default_embedder().embed("store"), 100, None)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect();
             assert_eq!(got, want, "batch {batch}");
-            let doc = IndexDoc::load(&side, &col(), stamp(&default_embedder().space_id())).unwrap();
+            let doc =
+                IndexDoc::load(&side, &col(&index), stamp(&default_embedder().space_id())).unwrap();
             let listed: HashSet<String> = doc.files.values().flat_map(|f| f.ids.clone()).collect();
             assert_eq!(listed, want, "batch {batch}");
             assert!(doc.files.values().all(|f| f.digest != PENDING_DIGEST));
@@ -1451,22 +1666,49 @@ pub fn lunch_menu_planner() {}
         let path = d.path().join("s.code.fls");
         {
             let side = FerroStore::open(&path).unwrap();
-            let stats = sync_files(&side, default_embedder(), &col(), &index, 1000, LONG).unwrap();
+            let stats =
+                sync_files(&side, default_embedder(), &col(&index), &index, 1000, LONG).unwrap();
             assert_eq!(stats.written, 480);
             assert_eq!(vector_count(&side, &index), 480);
         }
+        // 480 vectors are well under the engine's own 4 MiB trigger, so only
+        // the checkpoint after the bulk build can have emptied the log.
+        assert_eq!(
+            crate::ferrostore::wal_length_on_disk(&path),
+            0,
+            "the log was not folded into a snapshot"
+        );
         let side = FerroStore::open(&path).unwrap();
         assert_eq!(vector_count(&side, &index), 480);
-        let quiet = sync_files(&side, default_embedder(), &col(), &index, 1000, LONG).unwrap();
+        let quiet =
+            sync_files(&side, default_embedder(), &col(&index), &index, 1000, LONG).unwrap();
         assert_eq!(quiet, CodeSyncStats::default());
     }
 
     #[test]
-    fn two_concurrent_index_document_merges_both_survive() {
+    fn a_small_sync_leaves_the_log_alone() {
+        // The control for the test above: below one batch nothing checkpoints.
+        let (_root, index) = tree();
         let d = TempDir::new().unwrap();
-        let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
+        let path = d.path().join("s.code.fls");
+        let side = FerroStore::open(&path).unwrap();
+        let stats = sync_files(&side, default_embedder(), &col(&index), &index, 100, LONG).unwrap();
+        assert_eq!(stats.written, 7);
+        assert!(crate::ferrostore::wal_length_on_disk(&path) > 0);
+    }
+
+    #[test]
+    fn two_concurrent_index_document_merges_both_survive() {
+        let (_root, index) = tree();
+        let d = TempDir::new().unwrap();
+        let path = d.path().join("s.code.fls");
+        // Two handles on one file, as two processes would be.
+        let (first, second) = (
+            FerroStore::open(&path).unwrap(),
+            FerroStore::open(&path).unwrap(),
+        );
         let space = stamp(&default_embedder().space_id());
-        let c = col();
+        let c = col(&index);
         let rec = |n: usize| FileRecord {
             digest: format!("d{n}"),
             ids: vec![format!("id{n}")],
@@ -1475,21 +1717,355 @@ pub fn lunch_menu_planner() {}
         // view; every path must be in the document at the end.
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            for who in 0..2usize {
-                let (side, c, barrier, rec) = (&side, &c, &barrier, &rec);
+            for (who, side) in [&first, &second].into_iter().enumerate() {
+                let (c, barrier, rec) = (&c, &barrier, &rec);
                 scope.spawn(move || {
                     for round in 0..40usize {
                         barrier.wait();
                         let n = who * 1000 + round;
-                        let mut changes = BTreeMap::new();
-                        changes.insert(format!("src/w{who}_{round}.rs"), Some(rec(n)));
+                        let r = rec(n);
+                        let mut changes = Changes::new();
+                        changes.insert(
+                            format!("src/w{who}_{round}.rs"),
+                            Change::set(r.clone(), r.ids),
+                        );
                         IndexDoc::update(side, c, space, &changes).unwrap();
                     }
                 });
             }
         });
-        let doc = IndexDoc::load(&side, &c, space).unwrap();
+        let doc = IndexDoc::load(&first, &c, space).unwrap();
         assert_eq!(doc.files.len(), 80, "a concurrent merge lost an update");
+    }
+
+    /// A record with digest `digest` and ids `ids`.
+    fn record(digest: &str, ids: &[&str]) -> FileRecord {
+        FileRecord {
+            digest: digest.to_string(),
+            ids: ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_concurrent_syncs_ids_for_the_same_path_are_never_orphaned() {
+        let (_root, index) = tree();
+        let d = TempDir::new().unwrap();
+        let path = d.path().join("s.code.fls");
+        let (mine, other) = (
+            FerroStore::open(&path).unwrap(),
+            FerroStore::open(&path).unwrap(),
+        );
+        let space = stamp(&default_embedder().space_id());
+        let c = col(&index);
+        let one = |change: Change| {
+            let mut changes = Changes::new();
+            changes.insert("src/a.rs".to_string(), change);
+            changes
+        };
+        // I planned from a document that listed `old`; meanwhile another
+        // process synced the same path to a different text and listed `theirs`.
+        IndexDoc::update(
+            &mine,
+            &c,
+            space,
+            &one(Change::set(record("d0", &["old"]), vec![])),
+        )
+        .unwrap();
+        let planned = IndexDoc::load(&mine, &c, space).unwrap();
+        IndexDoc::update(
+            &other,
+            &c,
+            space,
+            &one(Change::set(
+                record("dT", &["old", "theirs"]),
+                vec!["old".to_string(), "theirs".to_string()],
+            )),
+        )
+        .unwrap();
+        assert_eq!(planned.files["src/a.rs"].ids, ["old"]);
+
+        // My intent record lists `old` and `mine`; it must not drop `theirs`.
+        let intent = Change::set(
+            record(PENDING_DIGEST, &["old", "mine"]),
+            vec!["old".to_string(), "mine".to_string()],
+        );
+        IndexDoc::update(&mine, &c, space, &one(intent)).unwrap();
+        let doc = IndexDoc::load(&other, &c, space).unwrap();
+        let got = &doc.files["src/a.rs"];
+        assert_eq!(got.digest, PENDING_DIGEST);
+        let ids: HashSet<&str> = got.ids.iter().map(String::as_str).collect();
+        assert_eq!(ids, HashSet::from(["old", "mine", "theirs"]));
+
+        // My final record names `mine` only (`old` was deleted, so it is
+        // accounted for), but `theirs` is not mine to drop: the path stays
+        // pending with it, for the next sync to repair.
+        let done = Change::set(
+            record("dM", &["mine"]),
+            vec!["old".to_string(), "mine".to_string()],
+        );
+        IndexDoc::update(&mine, &c, space, &one(done)).unwrap();
+        let doc = IndexDoc::load(&other, &c, space).unwrap();
+        let got = &doc.files["src/a.rs"];
+        assert_eq!(got.digest, PENDING_DIGEST);
+        let ids: HashSet<&str> = got.ids.iter().map(String::as_str).collect();
+        assert_eq!(ids, HashSet::from(["mine", "theirs"]));
+
+        // A removal of a path another process just rewrote is kept as pending.
+        let gone = Change {
+            record: None,
+            known: vec!["mine".to_string()],
+        };
+        IndexDoc::update(&mine, &c, space, &one(gone)).unwrap();
+        let doc = IndexDoc::load(&other, &c, space).unwrap();
+        assert_eq!(doc.files["src/a.rs"], record(PENDING_DIGEST, &["theirs"]));
+
+        // With nothing unaccounted for, the record is applied and removal removes.
+        let clean = Change::set(record("dM", &["theirs"]), vec!["theirs".to_string()]);
+        IndexDoc::update(&mine, &c, space, &one(clean)).unwrap();
+        assert_eq!(
+            IndexDoc::load(&other, &c, space).unwrap().files["src/a.rs"],
+            record("dM", &["theirs"])
+        );
+        let gone = Change {
+            record: None,
+            known: vec!["theirs".to_string()],
+        };
+        IndexDoc::update(&other, &c, space, &one(gone)).unwrap();
+        assert!(IndexDoc::load(&mine, &c, space).unwrap().files.is_empty());
+    }
+
+    /// Two files in two roots with the same relative path and the same text.
+    fn twin_roots() -> (TempDir, TempDir) {
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        for root in [&a, &b] {
+            write(
+                root.path(),
+                "src/lib.rs",
+                "pub fn shared_name() {}\npub fn second() {}\n",
+            );
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn roots_coexist_in_one_sidecar_and_never_delete_each_other() {
+        let a = TempDir::new().unwrap();
+        write(a.path(), "src/lib.rs", "pub fn alpha_fn() {}\n");
+        write(a.path(), "src/more.rs", "pub fn alpha_more() {}\n");
+        let b = TempDir::new().unwrap();
+        write(b.path(), "lib/other.rs", "pub fn beta_fn() {}\n");
+        let (index_a, index_b) = (scan_code_index(a.path()), scan_code_index(b.path()));
+        let (_rd, _redb, fd, ferro) = pair();
+        assert_ne!(col(&index_a), col(&index_b));
+
+        let (_, first) = run(&ferro, &index_a, SYNC, "alpha");
+        assert_eq!((first.written, first.deleted), (2, 0), "{first:?}");
+        let side = open_side(&fd);
+        let before = std::fs::read(sidecar(&fd)).unwrap();
+        assert_eq!(vector_count(&side, &index_a), 2);
+
+        // B is a different tree: none of A's files is "gone" from it.
+        let (r, other) = run(&ferro, &index_b, SYNC, "beta");
+        assert_eq!((other.written, other.deleted), (1, 0), "{other:?}");
+        assert_eq!(names(&r), ["beta_fn"]);
+        let side = open_side(&fd);
+        assert_eq!(
+            vector_count(&side, &index_a),
+            2,
+            "B's search deleted A's vectors"
+        );
+        assert_eq!(vector_count(&side, &index_b), 1);
+        assert_ne!(before, std::fs::read(sidecar(&fd)).unwrap());
+
+        // And back to A: nothing to write, nothing to delete, still answers.
+        let (r, again) = run(&ferro, &index_a, SYNC, "alpha");
+        assert_eq!(again, CodeSyncStats::default());
+        let mut found = names(&r);
+        found.sort_unstable();
+        assert_eq!(found, ["alpha_fn", "alpha_more"]);
+        let (_, again) = run(&ferro, &index_b, SYNC, "beta");
+        assert_eq!(again, CodeSyncStats::default());
+        let side = open_side(&fd);
+        assert_eq!(vector_count(&side, &index_a), 2);
+        assert_eq!(vector_count(&side, &index_b), 1);
+
+        // A subdirectory of A is a root of its own, too.
+        let sub = scan_code_index(&a.path().join("src"));
+        assert_ne!(col(&sub), col(&index_a));
+        let (_, subsync) = run(&ferro, &sub, SYNC, "alpha");
+        assert_eq!(subsync.deleted, 0, "{subsync:?}");
+        assert_eq!(vector_count(&open_side(&fd), &index_a), 2);
+    }
+
+    #[test]
+    fn the_same_relative_path_in_two_roots_does_not_collide() {
+        let (a, b) = twin_roots();
+        let (index_a, index_b) = (scan_code_index(a.path()), scan_code_index(b.path()));
+        let (_rd, _redb, fd, ferro) = pair();
+        // Same path, kind, name and line: the same symbol id in both roots.
+        let id_a: Vec<String> = index_a
+            .files()
+            .flat_map(|f| f.symbols().map(|s| id_of_symbol(&s)).collect::<Vec<_>>())
+            .collect();
+        let id_b: Vec<String> = index_b
+            .files()
+            .flat_map(|f| f.symbols().map(|s| id_of_symbol(&s)).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(id_a, id_b);
+        run(&ferro, &index_a, SYNC, "shared");
+        run(&ferro, &index_b, SYNC, "shared");
+        let side = open_side(&fd);
+        assert_eq!(vector_count(&side, &index_a), 2);
+        assert_eq!(vector_count(&side, &index_b), 2);
+
+        // B edits the file: its stale vector goes, A's copy stays.
+        write(b.path(), "src/lib.rs", "pub fn second() {}\n");
+        let index_b = scan_code_index(b.path());
+        let (_, stats) = run(&ferro, &index_b, SYNC, "second");
+        assert_eq!(stats.deleted, 2, "{stats:?}");
+        let side = open_side(&fd);
+        assert_eq!(vector_count(&side, &index_b), 1);
+        assert_eq!(
+            vector_count(&side, &index_a),
+            2,
+            "B's edit reached A's vectors"
+        );
+        let space = stamp(&default_embedder().space_id());
+        let doc_a = IndexDoc::load(&side, &col(&index_a), space).unwrap();
+        assert_eq!(doc_a.files["src/lib.rs"].ids.len(), 2);
+        // Removing B's file deletes only B's.
+        std::fs::remove_file(b.path().join("src/lib.rs")).unwrap();
+        let (_, stats) = run(&ferro, &scan_code_index(b.path()), SYNC, "second");
+        assert_eq!(stats.deleted, 1, "{stats:?}");
+        assert_eq!(vector_count(&open_side(&fd), &index_a), 2);
+    }
+
+    #[test]
+    fn the_root_is_its_canonical_path() {
+        let a = TempDir::new().unwrap();
+        write(a.path(), "src/lib.rs", "pub fn one() {}\n");
+        let direct = scan_code_index(a.path());
+        let dotted = scan_code_index(&a.path().join("src").join(".."));
+        assert_eq!(
+            col(&direct),
+            col(&dotted),
+            "an alias of a root is another root"
+        );
+        // A path that cannot be canonicalized is used as given.
+        let missing = scan_code_index(&a.path().join("missing"));
+        assert_eq!(missing.root(), Some(a.path().join("missing").as_path()));
+        assert_ne!(col(&missing), col(&direct));
+    }
+
+    #[test]
+    fn files_gone_from_a_root_are_deleted_in_bounded_groups() {
+        let root = TempDir::new().unwrap();
+        for f in 0..6 {
+            write(
+                root.path(),
+                &format!("src/f{f}.rs"),
+                &format!("pub fn a_{f}() {{}}\npub fn b_{f}() {{}}\n"),
+            );
+        }
+        let index = scan_code_index(root.path());
+        let d = TempDir::new().unwrap();
+        let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
+        let c = col(&index);
+        let space = stamp(&default_embedder().space_id());
+        let stats = sync_files(&side, default_embedder(), &c, &index, 100, LONG).unwrap();
+        assert_eq!(stats.written, 12);
+
+        for f in 0..6 {
+            std::fs::remove_file(root.path().join(format!("src/f{f}.rs"))).unwrap();
+        }
+        let empty = scan_code_index(root.path());
+        // Groups of about 2 ids: a file each. No time left: the first group
+        // is still deleted, the rest wait and are reported as pending.
+        let stats = sync_files_batched(
+            &side,
+            default_embedder(),
+            &c,
+            &empty,
+            100,
+            Duration::ZERO,
+            2,
+        )
+        .unwrap();
+        assert_eq!((stats.deleted, stats.pending), (2, 10), "{stats:?}");
+        let doc = IndexDoc::load(&side, &c, space).unwrap();
+        assert_eq!(
+            doc.files.len(),
+            5,
+            "only the deleted group left the document"
+        );
+        assert_eq!(
+            doc.files
+                .values()
+                .filter(|r| r.digest == PENDING_DIGEST)
+                .count(),
+            5
+        );
+        // The next syncs take them up, one group per call here, then none.
+        let mut total = 2;
+        for left in (0..5).rev() {
+            let stats = sync_files_batched(
+                &side,
+                default_embedder(),
+                &c,
+                &empty,
+                100,
+                Duration::ZERO,
+                2,
+            )
+            .unwrap();
+            total += stats.deleted;
+            assert_eq!(IndexDoc::load(&side, &c, space).unwrap().files.len(), left);
+        }
+        assert_eq!(total, 12);
+        let leftover = side
+            .search_vectors(&c, &default_embedder().embed("a_0"), 100, None)
+            .unwrap();
+        assert!(leftover.is_empty(), "{leftover:?}");
+        // With time, one call deletes everything it can in groups.
+        write(root.path(), "src/x.rs", "pub fn x() {}\n");
+        let one = scan_code_index(root.path());
+        sync_files(&side, default_embedder(), &c, &one, 100, LONG).unwrap();
+        let stats = sync_files(&side, default_embedder(), &c, &empty, 100, LONG).unwrap();
+        assert_eq!((stats.deleted, stats.pending), (1, 0));
+    }
+
+    #[test]
+    fn the_sidecar_path_is_made_from_the_real_path_of_the_store() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = TempDir::new().unwrap();
+        // A directory name that is not UTF-8: `display()` would turn it to U+FFFD.
+        let odd = dir.path().join(OsStr::from_bytes(b"caf\xe9"));
+        std::fs::create_dir(&odd).unwrap();
+        let store = open_store_with(
+            &odd.join("k.redb"),
+            &StoreOptions {
+                backend: Some(BackendKind::Ferro),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        let want = odd.join("k.code.fls");
+        let got = sidecar_path(&store).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got.parent().unwrap(), odd);
+        // And it works end to end.
+        let (_root, index) = tree();
+        let r = search_code(
+            &store,
+            &index,
+            CodeSearchKind::Search,
+            "checkpoint",
+            5,
+            SYNC,
+        );
+        assert_eq!(r.mode, SearchMode::Knowledge, "{:?}", r.cause);
+        assert!(want.exists());
     }
 
     #[test]

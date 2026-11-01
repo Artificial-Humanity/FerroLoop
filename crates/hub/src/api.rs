@@ -2083,6 +2083,11 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     // A request that reads never writes the code vector index: it answers from
     // whatever a CLI or MCP search has already indexed.
     let ranked = fl_store::search_code(&store, &index, kind, &query, limit, IndexPolicy::ReadOnly);
+    // The engine's error behind a fallback goes to the operator's stderr, never
+    // into the JSON body.
+    if let Some(line) = ranked.unavailable_line() {
+        eprintln!("{line}");
+    }
     let token_gain = match record_token_gain_query(
         &*store,
         ranked.outcome.tokens_saved_this_query,

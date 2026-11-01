@@ -72,7 +72,7 @@ use std::sync::OnceLock;
 /// Smallest number of nearest vectors asked of the index.
 const MIN_CANDIDATES: usize = 200;
 /// Reciprocal-rank-fusion constant.
-pub(crate) const RRF_K: f64 = 60.0;
+const RRF_K: f64 = 60.0;
 /// A vector-only hit needs at least this cosine to the query, measured
 /// against the entry's summary or its whole text.
 pub(crate) const MIN_VECTOR_COSINE: f32 = 0.25;
@@ -94,7 +94,7 @@ const INDEX_DOC_COLLECTION: &str = "state_vec_index";
 /// local engine's wording. A Remote engine may word it differently; its
 /// missing-collection error is then not recognised, the search fails over to
 /// BM25 and the real cause is kept in [`RankedHits::cause`].
-pub(crate) const MISSING_COLLECTION: &str = "no vector collection";
+const MISSING_COLLECTION: &str = "no vector collection";
 /// Index-document `rev` meaning "a vector may exist for this id, its revision
 /// is unknown". Outside the 53-bit range of [`stamp`], so no entry hashes to it.
 const PENDING_REV: u64 = 1 << 53;
@@ -1603,16 +1603,21 @@ mod tests {
     #[test]
     fn two_concurrent_index_doc_merges_both_survive() {
         let d = TempDir::new().unwrap();
-        let store = open_ferro(&d);
-        let ferro = store.as_ferro().unwrap();
+        // Two handles on one file, as two processes would be.
+        let path = d.path().join("k.fls");
+        let (first, second) = (
+            FerroStore::open(&path).unwrap(),
+            FerroStore::open(&path).unwrap(),
+        );
         let (col, space) = ("state_vec_concurrent", 9);
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            for who in 0..2u64 {
+            for (who, ferro) in [&first, &second].into_iter().enumerate() {
                 let barrier = &barrier;
                 scope.spawn(move || {
                     for round in 0..40u64 {
                         barrier.wait();
+                        let who = who as u64;
                         let changes =
                             HashMap::from([(format!("w{who}-{round}"), who * 1000 + round)]);
                         IndexDoc::update(ferro, col, space, &changes).unwrap();
@@ -1620,7 +1625,7 @@ mod tests {
                 });
             }
         });
-        let doc = IndexDoc::load(ferro, col, space).unwrap();
+        let doc = IndexDoc::load(&first, col, space).unwrap();
         assert_eq!(doc.revs.len(), 80, "a concurrent merge lost an update");
     }
 

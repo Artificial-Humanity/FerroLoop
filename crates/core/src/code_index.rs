@@ -186,9 +186,19 @@ impl<'a> CodeSymbolRef<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndex {
     files: Vec<IndexedFile>,
+    /// The scanned root, canonicalized when that works and as given when it
+    /// does not. `None` only for an index that was not made by a scan.
+    root: Option<PathBuf>,
 }
 
 impl CodeIndex {
+    /// The root this index was scanned from: what a ranker that keeps derived
+    /// data per index keys it by, so that two roots never share it. The path is
+    /// canonical when the filesystem could canonicalize it, otherwise as given.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
     pub fn files_indexed(&self) -> u64 {
         self.files.len() as u64
     }
@@ -468,16 +478,21 @@ fn line_hit(file: &IndexedFile, line_no: u64, line: &str) -> CodeSymbolHit {
 /// skipped at any depth; non-UTF-8 files and files over
 /// [`MAX_CODE_FILE_BYTES`] are skipped. A missing root yields an empty index.
 pub fn scan_code_index(root: &Path) -> CodeIndex {
+    let identity = Some(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    let empty = || CodeIndex {
+        files: Vec::new(),
+        root: identity.clone(),
+    };
     let mut paths: Vec<PathBuf> = Vec::new();
     match fs::symlink_metadata(root) {
-        Ok(md) if md.file_type().is_symlink() => return CodeIndex::default(),
+        Ok(md) if md.file_type().is_symlink() => return empty(),
         Ok(md) if md.is_file() => {
             if has_indexed_extension(root) {
                 paths.push(root.to_path_buf());
             }
         }
         Ok(_) => collect_files(root, &mut paths),
-        Err(_) => return CodeIndex::default(),
+        Err(_) => return empty(),
     }
     paths.sort();
     let root_is_file = paths.len() == 1 && root.is_file();
@@ -498,7 +513,10 @@ pub fn scan_code_index(root: &Path) -> CodeIndex {
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    CodeIndex { files }
+    CodeIndex {
+        files,
+        root: identity,
+    }
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1316,6 +1334,25 @@ mod tests {
             outcome_from_hits(Vec::new(), 2, 3).tokens_saved_this_query,
             0
         );
+    }
+
+    #[test]
+    fn the_index_remembers_its_canonical_root() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/a.rs", "pub fn one() {}\n");
+        let canonical = fs::canonicalize(tmp.path()).unwrap();
+        let dotted = tmp.path().join("src").join("..");
+        assert_eq!(
+            scan_code_index(tmp.path()).root(),
+            Some(canonical.as_path())
+        );
+        assert_eq!(scan_code_index(&dotted).root(), Some(canonical.as_path()));
+        // A root that cannot be canonicalized is kept as given, empty or not.
+        let missing = tmp.path().join("missing");
+        let none = scan_code_index(&missing);
+        assert_eq!(none.root(), Some(missing.as_path()));
+        assert_eq!(none.files_indexed(), 0);
+        assert_eq!(CodeIndex::default().root(), None);
     }
 
     #[test]
