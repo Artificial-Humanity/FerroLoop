@@ -23,8 +23,16 @@
 //! - **`sync_data` and `sync_all`** make every pending write and `set_len` of
 //!   that file durable. They are modelled the same: Linux `fdatasync` also
 //!   makes a change of size durable. Neither makes a directory entry durable.
-//! - **Directory entries** (create, `rename`, `link`, `unlink`) not yet
-//!   followed by a `sync_dir` of their directory: each kept or dropped.
+//! - **Directory entries** (create, `create_new`, `rename`, `link`,
+//!   `unlink`) not yet followed by a `sync_dir` of their directory: each
+//!   kept or dropped.
+//! - **`stat`** of a name (`stat_id`) and `fstat` (`file_id`, `len`) read
+//!   the live names and files: recorded, refused after a cut, never pending.
+//! - **Temp names** ([`ContainerFs::temp_path`]) are made without an
+//!   operation, deterministically: the same workload names the same temps,
+//!   so a cut run's trace is a prefix of the reference run's. The sweep of
+//!   stale temps does nothing: the simulated disk has no clock, so no temp
+//!   is stale (the real sweep is tested on a real directory).
 //! - **`flock`** is an exclusive lock per file, held by one description at a
 //!   time: [`ContainerIo::lock_exclusive`] waits for it, as `flock(LOCK_EX)`
 //!   does across processes. A lock is not on disk: it is no cut point and a
@@ -74,6 +82,8 @@ pub(super) const SIM_DEV: u64 = 0x51_4D;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum IoOp {
     Create { path: PathBuf },
+    CreateNew { path: PathBuf, mode: u32 },
+    StatId { path: PathBuf },
     OpenRw { path: PathBuf },
     OpenRo { path: PathBuf },
     Read { ino: usize, offset: u64, len: u64 },
@@ -95,6 +105,10 @@ impl fmt::Display for IoOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IoOp::Create { path } => write!(f, "create {}", path.display()),
+            IoOp::CreateNew { path, mode } => {
+                write!(f, "create_new {} {mode:o}", path.display())
+            }
+            IoOp::StatId { path } => write!(f, "stat {}", path.display()),
             IoOp::OpenRw { path } => write!(f, "open-rw {}", path.display()),
             IoOp::OpenRo { path } => write!(f, "open-ro {}", path.display()),
             IoOp::Read { ino, offset, len } => write!(f, "read ino{ino} @{offset}+{len}"),
@@ -266,6 +280,9 @@ impl Sim {
 struct Locks {
     held: Mutex<BTreeMap<usize, usize>>,
     freed: Condvar,
+    /// How many descriptions wait for each file's lock, for a test that
+    /// must know a writer is blocked.
+    waiting: Mutex<BTreeMap<usize, usize>>,
 }
 
 /// The files and names a cut leaves, or that a test starts from. Inode
@@ -435,6 +452,17 @@ impl SimFs {
         sim.lock_events.push((at, event));
     }
 
+    /// How many descriptions are waiting for the lock of `ino` now.
+    pub(super) fn lock_waiters(&self, ino: usize) -> usize {
+        self.locks
+            .waiting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Whether power has been cut.
     pub(super) fn is_cut(&self) -> bool {
         self.lock().cut
@@ -541,6 +569,59 @@ impl SimFs {
 }
 
 impl ContainerFs for SimFs {
+    fn shared(&self) -> Arc<dyn ContainerFs> {
+        Arc::new(self.clone())
+    }
+
+    fn create_new(&self, path: &Path, mode: u32) -> io::Result<Box<dyn ContainerIo>> {
+        let ino = {
+            let mut sim = self.lock();
+            sim.step(IoOp::CreateNew {
+                path: path.to_path_buf(),
+                mode,
+            })?;
+            if sim.names.contains_key(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{}: exists", path.display()),
+                ));
+            }
+            let ino = sim.inodes.len();
+            sim.inodes.push(Inode::default());
+            sim.names.insert(path.to_path_buf(), ino);
+            sim.pending_dir.push(DirOp::Create {
+                path: path.to_path_buf(),
+                ino,
+            });
+            ino
+        };
+        Ok(self.handle(ino, true))
+    }
+
+    fn stat_id(&self, path: &Path) -> io::Result<(u64, u64)> {
+        self.lock().step(IoOp::StatId {
+            path: path.to_path_buf(),
+        })?;
+        Ok((SIM_DEV, self.inode_of(path)? as u64))
+    }
+
+    fn temp_path(&self, target: &Path, mark: &str) -> Result<PathBuf, StoreError> {
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| backend(format!("{} has no file name", target.display())))?;
+        let sim = self.lock();
+        // The first free name: a leftover temp a survivor image holds is not
+        // reused, and the same workload makes the same names.
+        let path = (0u64..)
+            .map(|n| target.with_file_name(format!("{name}{mark}0-{n}-00000000")))
+            .find(|path| !sim.names.contains_key(path))
+            .expect("a free temp name");
+        Ok(path)
+    }
+
+    fn sweep_stale_temps(&self, _target: &Path, _mark: &str, _what: &str) {}
+
     fn create_store_file(&self, path: &Path) -> Result<bool, StoreError> {
         let mut sim = self.lock();
         sim.step(IoOp::Create {
@@ -785,14 +866,27 @@ impl ContainerIo for SimFile {
             .held
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while held
-            .get(&self.ino)
-            .is_some_and(|holder| *holder != self.description)
-        {
-            held = locks
-                .freed
-                .wait(held)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let busy = |held: &BTreeMap<usize, usize>| {
+            held.get(&self.ino)
+                .is_some_and(|holder| *holder != self.description)
+        };
+        if busy(&held) {
+            let count = |delta: isize| {
+                let mut waiting = locks
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let entry = waiting.entry(self.ino).or_default();
+                *entry = entry.saturating_add_signed(delta);
+            };
+            count(1);
+            while busy(&held) {
+                held = locks
+                    .freed
+                    .wait(held)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            count(-1);
         }
         // Logged once held, in the order the locks were taken.
         held.insert(self.ino, self.description);

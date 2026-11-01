@@ -886,7 +886,14 @@ fn a_temp_file_replaced_before_the_link_is_not_published_or_removed() {
         Ok(())
     })
     .unwrap_err();
-    assert!(err.to_string().contains("no longer the file"), "{err}");
+    // The verify's own reads already refuse the swap: they check the path
+    // (spec §5) and find a file that is no store. The check before the link
+    // is the backstop for a swap after the last read.
+    assert!(
+        err.to_string().contains("no longer the file")
+            || err.to_string().contains("no valid FerroStore superblock"),
+        "{err}"
+    );
     assert!(!fls.exists(), "nothing is published");
     let left: Vec<String> = entries(tmp.path())
         .into_iter()

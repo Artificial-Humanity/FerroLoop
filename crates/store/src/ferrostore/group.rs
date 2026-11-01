@@ -51,8 +51,8 @@ use super::container_io::ContainerIo;
 use super::layout::{Op, backend, encode_frame};
 use super::state::{DocState, Overlay, publish_overlay};
 use super::{
-    Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, auto_checkpoint,
-    checkpoint_due, lock_mutex, wait_mutex,
+    Change, Committed, Disk, DiskCache, FerroStore, Registered, auto_checkpoint, checkpoint_due,
+    lock_mutex, wait_mutex,
 };
 use fl_core::StoreError;
 use std::any::Any;
@@ -372,12 +372,16 @@ impl FerroStore {
             results: Vec::new(),
         };
         let _gate = lock_mutex(&self.commit_gate);
-        let file = lock_mutex(&disk.write);
-        // A poisoned handle runs no body: the whole group is refused.
-        let locked = disk.poison.check().and_then(|()| {
-            let flock = FlockGuard::acquire(&**file)?;
-            Ok((flock, disk.refresh(&**file, disk.write_id)?))
-        });
+        let mut write = lock_mutex(&disk.write);
+        // A poisoned handle runs no body: the whole group is refused. The
+        // `flock` is taken on the file the path names now (spec §5).
+        let locked = match disk.poison.check() {
+            Ok(()) => disk.lock_current(&mut write).and_then(|flock| {
+                let refreshed = disk.refresh(flock.file(), flock.id)?;
+                Ok((flock, refreshed))
+            }),
+            Err(err) => Err(err),
+        };
         lead.members = disk.group.take();
         lead.results = lead.members.iter().map(|_| None).collect();
         debug_assert!(
@@ -391,7 +395,7 @@ impl FerroStore {
                 lead.fail_rest(&err);
                 false
             }
-            Ok((_flock, (index, base))) => {
+            Ok((flock, (index, base))) => {
                 let running = Running {
                     index,
                     base,
@@ -402,7 +406,7 @@ impl FerroStore {
                 // Spec §4.4: only whether the checkpoint is due is decided
                 // here. It runs outside this lock window, so no member's
                 // result waits for it.
-                self.run_group(disk, &**file, &mut lead, me, own, running)
+                self.run_group(disk, flock.file(), &mut lead, me, own, running)
                     .is_some_and(|done| done.published && checkpoint_due(disk, &done.base))
             }
         }

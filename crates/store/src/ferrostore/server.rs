@@ -641,6 +641,10 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             store.checkpoint()?;
             Ok(Value::Null)
         }
+        "compact" => {
+            store.compact()?;
+            Ok(Value::Null)
+        }
         "create_column_table" => {
             let columns = columnar::parse_columns(
                 params
