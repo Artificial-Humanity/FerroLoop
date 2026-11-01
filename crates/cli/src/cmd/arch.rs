@@ -156,6 +156,13 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
+/// The repository's top-level `submodules/` directory mounts standalone repositories (see
+/// `docs/getting-started.md`). Their crates are not workspace packages of this repository, so
+/// the scan must not read their manifests or sources, populated or not.
+fn is_submodule_mount(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() == 1 && entry.file_name() == "submodules"
+}
+
 fn infer_architecture_model(cwd: &Path) -> Result<ArchitectureModel, (i32, String)> {
     let raw_dir_name = cwd
         .file_name()
@@ -175,9 +182,11 @@ fn infer_architecture_model(cwd: &Path) -> Result<ArchitectureModel, (i32, Strin
         .filter_entry(|e| {
             e.depth() == 0
                 || !e.file_type().is_dir()
-                || e.file_name()
+                || (e
+                    .file_name()
                     .to_str()
                     .is_none_or(|name| !should_skip_dir(name))
+                    && !is_submodule_mount(e))
         })
         .flatten()
     {

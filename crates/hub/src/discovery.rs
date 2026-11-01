@@ -3332,6 +3332,13 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
+/// The repository's top-level `submodules/` directory mounts standalone repositories (see
+/// `docs/getting-started.md`). Their crates are not workspace packages of this repository, so
+/// the scan must not read their manifests or sources, populated or not.
+fn is_submodule_mount(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() == 1 && entry.file_name() == "submodules"
+}
+
 /// Scan `repo_root` for Cargo package dependencies, Rust source crate references, and
 /// repository files for architecture conformance checking (spec §1.3).
 pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, String> {
@@ -3346,9 +3353,11 @@ pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, St
         .filter_entry(|e| {
             e.depth() == 0
                 || !e.file_type().is_dir()
-                || e.file_name()
+                || (e
+                    .file_name()
                     .to_str()
                     .is_none_or(|name| !should_skip_dir(name))
+                    && !is_submodule_mount(e))
         })
         .flatten()
     {
@@ -3420,9 +3429,11 @@ pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, St
         .filter_entry(|e| {
             e.depth() == 0
                 || !e.file_type().is_dir()
-                || e.file_name()
+                || (e
+                    .file_name()
                     .to_str()
                     .is_none_or(|name| !should_skip_dir(name))
+                    && !is_submodule_mount(e))
         })
         .flatten()
     {
@@ -3515,6 +3526,49 @@ pub fn scan_cargo_architecture_conformance(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn arch_scan_ignores_the_submodules_mount_but_not_a_nested_directory_of_that_name() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"submodules\"]\n",
+        );
+        write(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"pkg-a\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "crates/a/submodules/Cargo.toml",
+            "[package]\nname = \"pkg-nested\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "submodules/Standalone/Cargo.toml",
+            "[package]\nname = \"pkg-standalone\"\nversion = \"0.1.0\"\n",
+        );
+        write("submodules/Standalone/src/lib.rs", "use pkg_a::x;\n");
+
+        let scan = scan_workspace_for_arch(root).unwrap();
+        let packages: BTreeSet<&str> = scan
+            .package_deps
+            .iter()
+            .map(|d| d.from_package.as_str())
+            .collect();
+        assert_eq!(packages, BTreeSet::from(["pkg-a", "pkg-nested"]));
+        assert!(
+            scan.source_refs
+                .iter()
+                .all(|r| !r.from_path.starts_with("submodules/")),
+            "{:?}",
+            scan.source_refs
+        );
+    }
 
     #[test]
     fn parse_jsonl_transcript_normalizes_antigravity_claude_and_codex_turns() {

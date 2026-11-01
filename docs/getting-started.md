@@ -743,8 +743,9 @@ FerroState, FerroWire, FerroTrack and FerroGate. Each is mounted as a git submod
 the `https` URLs).
 
 The submodules are optional and the build does not use them. The workspace in `Cargo.toml`
-does not list them, `cargo` and `fl arch check` skip them, and a clone that did not fetch them
-builds and tests the same. The crates in `crates/` are the code that is built here; the
+lists `submodules` under `exclude` (so `cargo` run inside one treats it as its own workspace),
+`fl arch check` does not scan that directory, and a clone that did not fetch them builds and
+tests the same. The crates in `crates/` are the code that is built here; the
 submodules only pin the standalone repositories next to it.
 
 ```
