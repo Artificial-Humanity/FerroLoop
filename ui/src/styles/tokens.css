@@ -297,6 +297,14 @@ body,
   color: var(--text-secondary);
 }
 
+button.fd-badge {
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+button.fd-badge:hover:not(:disabled) {
+  border-color: var(--border-accent);
+}
+
 .fd-quota-badge.is-exhausted {
   border-color: var(--diff-del-border);
   background-color: var(--diff-del-bg);
