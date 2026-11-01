@@ -10,9 +10,13 @@ import {
   PINNED_AGENTS_STORAGE_KEY,
   PINNED_PROJECTS_STORAGE_KEY,
   RosterSidebar,
+  classifyTextUnreadSeverity,
+  classifyTurnUnreadSeverity,
+  classifyWireUnreadSeverity,
   togglePinnedAgent,
   togglePinnedProject,
 } from "../components/RosterSidebar";
+import { computeUnreadSeverityByAgent } from "../App";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
@@ -302,6 +306,162 @@ describe("RosterSidebar", () => {
       "agent-row-felicia",
       "agent-row-felicity",
     ]);
+  });
+
+  it("omits muted project agent count, renders borderless ⚙ buttons, and formats unread badges as <N>, <N>?, and <N>! with ! > ? > normal project rollup", () => {
+    const customAgents: AgentRecord[] = [
+      ...DEFAULT_WORKSPACE_AGENTS,
+      {
+        id: "urn:fl:agent:felix",
+        name_key: "felix",
+        display_name: "Felix",
+        project: "FerroLoop",
+        role: "ui-developer",
+        status: "active",
+      },
+      {
+        id: "urn:fl:agent:felicity",
+        name_key: "felicity",
+        display_name: "Felicity",
+        project: "FerroLoop",
+        role: "assistant",
+        status: "active",
+      },
+    ];
+
+    const { rerender } = render(
+      <RosterSidebar
+        agents={customAgents}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{ ferris: 2, felix: 1, jarvis: 4 }}
+        unreadSeverityByAgent={{
+          ferris: "normal",
+          felix: "question",
+          jarvis: "normal",
+        }}
+        selectedAgentName="jarvis"
+        onSelectAgent={() => {}}
+      />,
+    );
+
+    // Project group header does not show a muted total agent count next to the project name
+    const sonoraToggle = screen.getByTestId("project-group-toggle-sonora");
+    expect(sonoraToggle).toHaveTextContent("Sonora");
+    expect(sonoraToggle.textContent?.replace(/[▸▾]/g, "").trim()).toBe("Sonora");
+
+    // Borderless ⚙ cog buttons on project and agent rows
+    const projCog = screen.getByTestId("project-settings-btn-ferroloop");
+    const agentCog = screen.getByTestId("agent-settings-btn-ferris");
+    expect(projCog).toHaveClass("fd-gear-btn");
+    expect(projCog).not.toHaveClass("fd-btn");
+    expect(projCog.style.background).toBe("transparent");
+    expect(agentCog).toHaveClass("fd-gear-btn");
+    expect(agentCog).not.toHaveClass("fd-btn");
+    expect(agentCog.style.background).toBe("transparent");
+
+    // Agent unread badges: jarvis -> "4" (normal), ferris -> "2" (normal), felix -> "1?" (question)
+    expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("4");
+    expect(screen.getByTestId("unread-badge-jarvis")).toHaveAttribute(
+      "data-severity",
+      "normal",
+    );
+    expect(screen.getByTestId("unread-badge-ferris")).toHaveTextContent("2");
+    expect(screen.getByTestId("unread-badge-felix")).toHaveTextContent("1?");
+    expect(screen.getByTestId("unread-badge-felix")).toHaveAttribute(
+      "data-severity",
+      "question",
+    );
+
+    // Project unread badge for FerroLoop rolls up ferris (normal, 2) + felix (question, 1) -> "3?"
+    const ferroBadge = screen.getByTestId("project-unread-badge-ferroloop");
+    expect(ferroBadge).toHaveTextContent("3?");
+    expect(ferroBadge).toHaveAttribute("data-severity", "question");
+
+    // When felicity has an important/blocker unread message (2!), FerroLoop project badge upgrades to "5!"
+    rerender(
+      <RosterSidebar
+        agents={customAgents}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{ ferris: 2, felix: 1, felicity: 2, jarvis: 4 }}
+        unreadSeverityByAgent={{
+          ferris: "normal",
+          felix: "question",
+          felicity: "important",
+          jarvis: "normal",
+        }}
+        selectedAgentName="jarvis"
+        onSelectAgent={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId("unread-badge-felicity")).toHaveTextContent("2!");
+    expect(screen.getByTestId("unread-badge-felicity")).toHaveAttribute(
+      "data-severity",
+      "important",
+    );
+    expect(screen.getByTestId("project-unread-badge-ferroloop")).toHaveTextContent("5!");
+    expect(screen.getByTestId("project-unread-badge-ferroloop")).toHaveAttribute(
+      "data-severity",
+      "important",
+    );
+  });
+
+  it("classifies text, transcript turns, and wire messages into normal, question, and important severities", () => {
+    expect(classifyTextUnreadSeverity("Completed build and 280 tests passing with zero errors.")).toBe("normal");
+    expect(classifyTextUnreadSeverity("Should we target main or uat for this PR?")).toBe("question");
+    expect(classifyTextUnreadSeverity("BLOCKER: Database migration failed with exit code 1.")).toBe("important");
+
+    expect(
+      classifyTurnUnreadSeverity({
+        index: 1,
+        role: "assistant",
+        content: "Please choose an option.",
+        tool_calls: [{ name: "ask_question", arguments: "{}" }],
+      }),
+    ).toBe("question");
+
+    expect(
+      classifyWireUnreadSeverity({
+        id: "msg-1",
+        sender_name: "ferris",
+        to: "felix",
+        subject: "Quick check",
+        body: "Can you verify the contrast ratio?",
+        urgency: "normal",
+      }),
+    ).toBe("question");
+
+    expect(
+      classifyWireUnreadSeverity({
+        id: "msg-2",
+        sender_name: "jarvis",
+        to: "ferris",
+        subject: "GPU alert",
+        body: "Node offline",
+        urgency: "urgent",
+      }),
+    ).toBe("important");
+
+    const severities = computeUnreadSeverityByAgent(
+      {
+        ferris: [
+          { index: 0, role: "assistant", content: "Initial turn", tool_calls: [] },
+          { index: 1, role: "assistant", content: "Do you approve this layout?", tool_calls: [] },
+        ],
+        felix: [
+          { index: 0, role: "assistant", content: "Initial turn", tool_calls: [] },
+          { index: 1, role: "assistant", content: "FATAL: build failed on missing import.", tool_calls: [] },
+        ],
+      },
+      { ferris: 0, felix: 0 },
+      [],
+    );
+    expect(severities).toEqual({
+      ferris: "question",
+      felix: "important",
+    });
   });
 });
 

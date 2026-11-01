@@ -16,7 +16,13 @@ import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
-import { RosterSidebar } from "./components/RosterSidebar";
+import {
+  RosterSidebar,
+  classifyTurnUnreadSeverity,
+  classifyWireUnreadSeverity,
+  mergeUnreadSeverity,
+  type UnreadSeverity,
+} from "./components/RosterSidebar";
 import {
   SettingsModal,
   executeScopedBulkSessionAction,
@@ -236,6 +242,51 @@ export function computeUnreadByAgent(
   return counts;
 }
 
+export function computeUnreadSeverityByAgent(
+  transcriptsByAgent: Record<string, TranscriptTurn[]>,
+  lastSeenAssistantTurnIndex: Record<string, number>,
+  wireMessages?: WireInboxItem[],
+): Record<string, UnreadSeverity> {
+  const severities: Record<string, UnreadSeverity> = {};
+  for (const [agentKey, turns] of Object.entries(transcriptsByAgent)) {
+    const lastSeen = lastSeenAssistantTurnIndex[agentKey];
+    if (lastSeen === undefined) continue;
+    const unseen = turns.filter(
+      (turn) => isUserDirectedAssistantTurn(turn) && turn.index > lastSeen,
+    );
+    if (unseen.length > 0) {
+      let sev: UnreadSeverity = "normal";
+      for (const turn of unseen) {
+        sev = mergeUnreadSeverity(sev, classifyTurnUnreadSeverity(turn));
+        if (sev === "important") break;
+      }
+      severities[agentKey.toLowerCase()] = sev;
+    }
+  }
+  if (Array.isArray(wireMessages)) {
+    for (const item of wireMessages) {
+      const receiptStatus = (item.receipt?.status || "").toLowerCase();
+      const allAcked =
+        receiptStatus === "acked" ||
+        Boolean(item.receipt?.acked_at) ||
+        (Array.isArray(item.receipts) &&
+          item.receipts.length > 0 &&
+          item.receipts.every(
+            (r) => (r.status || "").toLowerCase() === "acked" || Boolean(r.acked_at),
+          ));
+      if (allAcked) continue;
+      const recipient = (item.message?.to || "").trim().toLowerCase();
+      if (!recipient || recipient === "all") continue;
+      const msgSev = classifyWireUnreadSeverity(item);
+      severities[recipient] = mergeUnreadSeverity(
+        severities[recipient] ?? "normal",
+        msgSev,
+      );
+    }
+  }
+  return severities;
+}
+
 function readInitialLastSeenAssistantTurn(): Record<string, number> {
   try {
     if (typeof window !== "undefined" && window.localStorage) {
@@ -286,6 +337,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
   const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
+  const [spinUpInitialProject, setSpinUpInitialProject] = useState<string | null>(null);
   const [agentSettingsOpen, setAgentSettingsOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
@@ -1006,6 +1058,16 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     [transcriptsByAgent, lastSeenAssistantTurnIndex],
   );
 
+  const unreadSeverityByAgent = useMemo<Record<string, UnreadSeverity>>(
+    () =>
+      computeUnreadSeverityByAgent(
+        transcriptsByAgent,
+        lastSeenAssistantTurnIndex,
+        wireMessages,
+      ),
+    [transcriptsByAgent, lastSeenAssistantTurnIndex, wireMessages],
+  );
+
   const handlePairWithCode = async (code: string) => {
     setPairingError(null);
     const res = await apiClient.pair({ code });
@@ -1474,6 +1536,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         routes={routes}
         liveness={liveness}
         unreadByAgent={unreadByAgent}
+        unreadSeverityByAgent={unreadSeverityByAgent}
         selectedAgentName={selectedAgent?.name_key ?? null}
         onSelectAgent={(nameKey) => {
           const nextKey = nameKey.trim().toLowerCase();
@@ -1662,7 +1725,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
       <SpinUpAgentModal
         isOpen={spinUpModalOpen}
-        onClose={() => setSpinUpModalOpen(false)}
+        onClose={() => {
+          setSpinUpModalOpen(false);
+          setSpinUpInitialProject(null);
+        }}
+        initialProject={spinUpInitialProject}
         nodes={nodes}
         onSpinUp={handleSpinUpSession}
         apiClient={apiClient}
@@ -1682,7 +1749,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         activeCockpitTab={activeTab}
         onSelectCockpitTab={handleSelectTab}
         onOpenNodesModal={() => setNodesModalOpen(true)}
-        onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
+        onOpenSpinUpModal={(proj) => {
+          setSpinUpInitialProject(proj ?? null);
+          setSpinUpModalOpen(true);
+        }}
         onOpenPairingModal={() => setPairingOpen(true)}
         onOpenAgentSettings={(nameKey) => {
           setSettingsModalOpen(false);

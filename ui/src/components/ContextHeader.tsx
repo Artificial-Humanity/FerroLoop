@@ -360,9 +360,9 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               data-testid="header-spin-up-btn"
               className="fd-btn"
               onClick={() => onOpenSpinUpModal?.()}
-              title="Spin up a new agent session"
+              title="Create a new agent session"
             >
-              + Spin Up
+              + New Agent
             </button>
             <button
               type="button"
