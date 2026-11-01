@@ -87,6 +87,11 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::hub::HubCmd,
     },
+    /// Look at, and tend, the engine file behind the bound store.
+    Store {
+        #[command(subcommand)]
+        cmd: cmd::store::Cmd,
+    },
     /// Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway.
     #[command(visible_alias = "gateway")]
     Vault {
@@ -118,6 +123,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Store { .. }
             | Command::Vault { .. } => Vec::new(),
         }
     }
@@ -156,6 +162,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Store { .. }
             | Command::Vault { .. } => false,
         }
     }
@@ -188,6 +195,7 @@ impl Command {
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
+            | Command::Store { .. }
             | Command::Vault { .. } => false,
         }
     }
@@ -913,6 +921,22 @@ fn run(cli: Cli) -> Result<i32> {
             };
         }
         Cli {
+            db,
+            command: Command::Store { cmd },
+        } => {
+            // The bound store, found without creating anything: `--db`, then
+            // the store the current directory's config entry names, then the
+            // default. No directory is made and no file is opened here.
+            let path = match explicit_db(db) {
+                Some(p) => p,
+                None => match config::bound_entry(&cfg.projects, &cwd)? {
+                    Some(entry) => entry.store,
+                    None => default_state_store_path()?,
+                },
+            };
+            return cmd::store::run(&path, cmd);
+        }
+        Cli {
             db: _,
             command: Command::Vault { cmd },
         } => {
@@ -1288,6 +1312,7 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Wire { .. }
         | Command::Arch { .. }
         | Command::Hub { .. }
+        | Command::Store { .. }
         | Command::Vault { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
