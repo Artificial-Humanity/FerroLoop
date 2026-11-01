@@ -149,3 +149,89 @@ fn state_install_registers_ferrostate_in_project_files() {
         "{mcp_json}"
     );
 }
+
+fn code_search(
+    cfg: &tempfile::TempDir,
+    db: &Path,
+    root: &Path,
+    query: &str,
+) -> assert_cmd::assert::Assert {
+    fl(cfg, db, root)
+        .args([
+            "state",
+            "code-search",
+            query,
+            "--root",
+            root.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+}
+
+fn stdout_json(a: &assert_cmd::assert::Assert) -> Value {
+    serde_json::from_slice(&a.get_output().stdout).unwrap()
+}
+
+#[test]
+fn code_search_on_ferro_adds_mode_and_finds_a_typo_that_redb_misses() {
+    let cfg = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_widget(root.path());
+
+    // redb: today's JSON, no `mode`, no `note`, no sidecar.
+    let redb_db = cfg.path().join("t.redb");
+    let plain = code_search(&cfg, &redb_db, root.path(), "widget alpa");
+    let plain_json = stdout_json(&plain);
+    assert!(plain_json.get("mode").is_none() && plain_json.get("note").is_none());
+    assert_eq!(
+        plain_json["symbols"].as_array().unwrap().len(),
+        0,
+        "{plain_json}"
+    );
+    assert!(!cfg.path().join("t.code.fls").exists());
+
+    // ferro (an explicit `.fls` path): the vector leg finds it and says so.
+    let db = cfg.path().join("t.fls");
+    let found = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa"));
+    assert_eq!(found["mode"], "knowledge", "{found}");
+    assert!(found.get("note").is_none(), "{found}");
+    assert_eq!(found["symbols"][0]["name"], "widget_alpha", "{found}");
+    assert!(
+        found["tokens_saved_this_query"].as_u64().unwrap() > 0,
+        "{found}"
+    );
+    assert_eq!(found["token_gain"]["queries_count"], 1, "{found}");
+    // The vectors went to the sidecar beside the store, privately.
+    let sidecar = cfg.path().join("t.code.fls");
+    assert!(sidecar.is_file());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // A corrupt sidecar: the exact answer, a generic note, the cause on stderr only.
+    std::fs::write(&sidecar, vec![0xA5u8; 4096]).unwrap();
+    let broken = code_search(&cfg, &db, root.path(), "widget_alpha");
+    let broken_json = stdout_json(&broken);
+    assert!(broken_json.get("mode").is_none(), "{broken_json}");
+    assert_eq!(
+        broken_json["note"], "code index unavailable; searched without vectors",
+        "{broken_json}"
+    );
+    assert_eq!(
+        broken_json["symbols"][0]["name"], "widget_alpha",
+        "{broken_json}"
+    );
+    let stderr = String::from_utf8(broken.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("fl: code index unavailable: "), "{stderr}");
+    assert!(!broken_json.to_string().contains(stderr.trim()));
+
+    // Delete it: the next search rebuilds it.
+    std::fs::remove_file(&sidecar).unwrap();
+    let again = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa"));
+    assert_eq!(again["mode"], "knowledge", "{again}");
+    assert_eq!(again["symbols"][0]["name"], "widget_alpha", "{again}");
+    assert!(sidecar.is_file());
+}

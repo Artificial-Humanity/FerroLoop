@@ -61,8 +61,10 @@
 //! and the write is still lost, and the placeholder covers what that leaves.
 //!
 //! [`IndexPolicy::Sync`] writes at most `budget` new vectors per call (a whole
-//! file at a time; a file larger than the budget goes alone) and the rest are
-//! found lexically and indexed by later searches. [`IndexPolicy::ReadOnly`]
+//! file at a time; a file larger than the budget goes alone) and for at most
+//! three seconds (checked between files), because the engine's upsert costs
+//! time proportional to the vectors already stored. What is left is found
+//! lexically and indexed by later searches. [`IndexPolicy::ReadOnly`]
 //! writes nothing and never creates the sidecar: without one the vector leg
 //! is empty.
 //!
@@ -84,9 +86,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Vectors one CLI or MCP call may write.
 pub const DEFAULT_CODE_SYNC_BUDGET: usize = 512;
+/// Longest a sync spends writing vectors, checked between files: every upsert
+/// costs time proportional to the vectors already in the sidecar, so a count
+/// budget alone could hold a search for minutes. Files not reached are left
+/// to a later search, like files over the budget.
+const SYNC_DEADLINE: Duration = Duration::from_secs(3);
 /// Most matches the lexical leg keeps before fusion.
 const LEXICAL_CAP: usize = 10_000;
 /// Smallest number of nearest vectors asked of the index.
@@ -302,7 +310,7 @@ fn hybrid(
         IndexPolicy::ReadOnly => open_sidecar_if_present(&path)?,
     };
     if let (IndexPolicy::Sync { budget }, Some(ferro)) = (policy, &sidecar) {
-        *stats = sync_files(ferro, embedder, &collection, index, budget)?;
+        *stats = sync_files(ferro, embedder, &collection, index, budget, SYNC_DEADLINE)?;
     }
     let by_id: HashMap<String, CodeSymbolRef<'_>> = index
         .files()
@@ -507,7 +515,8 @@ impl FileWork {
 
 /// Bring the sidecar up to date with `index`, writing at most `budget` new
 /// vectors (a whole file at a time; the first file is taken even if it alone
-/// is larger). A budget of 0 writes none. One read of the index document says
+/// is larger) and for at most `deadline` (checked between files; the first
+/// file is always done). A budget of 0 writes none. One read of the index document says
 /// which files are current; embedding happens only for files that are not.
 ///
 /// The document is written before the vectors it describes (see the module
@@ -519,7 +528,9 @@ pub(crate) fn sync_files(
     collection: &str,
     index: &CodeIndex,
     budget: usize,
+    deadline: Duration,
 ) -> Result<CodeSyncStats, StoreError> {
+    let started = Instant::now();
     let space = stamp(&embedder.space_id());
     let doc = IndexDoc::load(ferro, collection, space)?;
     let mut stats = CodeSyncStats::default();
@@ -631,7 +642,12 @@ pub(crate) fn sync_files(
             }
             changes.insert((*path).clone(), None);
         }
-        for item in &work {
+        for (done, item) in work.iter().enumerate() {
+            if done > 0 && started.elapsed() >= deadline {
+                // Still listed as pending: a later sync takes it up again.
+                stats.pending += work[done..].iter().map(|w| w.vectors.len()).sum::<usize>();
+                break;
+            }
             let rev = stamp(&item.digest);
             for (id, values) in &item.vectors {
                 let meta = json!({ "path": item.path, "rev": rev });
@@ -680,6 +696,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
+    const LONG: Duration = Duration::from_secs(600);
     const SYNC: IndexPolicy = IndexPolicy::Sync {
         budget: DEFAULT_CODE_SYNC_BUDGET,
     };
@@ -956,15 +973,12 @@ pub fn lunch_menu_planner() {}
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o600);
         // The primary store holds none of it.
-        assert_eq!(
-            ferro
-                .as_ferro()
-                .unwrap()
-                .get_vector(&col(), "x")
+        let missing = ferro.as_ferro().unwrap().get_vector(&col(), "x");
+        assert!(
+            missing
                 .unwrap_err()
                 .to_string()
-                .contains("no vector collection"),
-            true
+                .contains("no vector collection")
         );
     }
 
@@ -1165,6 +1179,29 @@ pub fn lunch_menu_planner() {}
         assert_eq!(vector_count(&open_side(&fd2), &index), 2);
     }
 
+    #[test]
+    fn the_deadline_stops_between_files_and_the_next_sync_finishes() {
+        let (_root, index) = tree();
+        let d = TempDir::new().unwrap();
+        let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
+        // Zero time: the first file (gpu.rs, 2 symbols) is still done, store.rs waits.
+        let stats = sync_files(
+            &side,
+            default_embedder(),
+            &col(),
+            &index,
+            100,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!((stats.written, stats.pending), (2, 5), "{stats:?}");
+        let doc = IndexDoc::load(&side, &col(), stamp(&default_embedder().space_id())).unwrap();
+        assert_eq!(doc.files["src/store.rs"].digest, PENDING_DIGEST);
+        let stats = sync_files(&side, default_embedder(), &col(), &index, 100, LONG).unwrap();
+        assert_eq!((stats.written, stats.pending), (5, 0), "{stats:?}");
+        assert_eq!(vector_count(&side, &index), 7);
+    }
+
     /// Embeds like the default embedder, in the same space, but returns a
     /// vector of the wrong length for the `fail_at`th call (1-based), so that
     /// one `upsert_vector` is refused by the engine.
@@ -1203,7 +1240,7 @@ pub fn lunch_menu_planner() {}
             calls: std::cell::Cell::new(0),
             fail_at: 4,
         };
-        let err = sync_files(&side, &flaky, &col(), &index, 100).unwrap_err();
+        let err = sync_files(&side, &flaky, &col(), &index, 100, LONG).unwrap_err();
         assert!(
             err.to_string().contains("vector values have length"),
             "{err}"
@@ -1228,7 +1265,7 @@ pub fn lunch_menu_planner() {}
         // cleaned up, from the pending record.
         write(root.path(), "src/store.rs", "pub fn only_one() {}\n");
         let changed = scan_code_index(root.path());
-        let stats = sync_files(&side, default_embedder(), &col(), &changed, 100).unwrap();
+        let stats = sync_files(&side, default_embedder(), &col(), &changed, 100, LONG).unwrap();
         assert_eq!(stats.written, 1);
         // All five ids the pending record lists are deleted (the four that
         // never committed are no-ops), so nothing half-written stays.
@@ -1240,7 +1277,7 @@ pub fn lunch_menu_planner() {}
             .len();
         assert_eq!(all, 3, "no orphan vector remains");
         assert_eq!(
-            sync_files(&side, default_embedder(), &col(), &changed, 100).unwrap(),
+            sync_files(&side, default_embedder(), &col(), &changed, 100, LONG).unwrap(),
             CodeSyncStats::default()
         );
     }
@@ -1255,8 +1292,8 @@ pub fn lunch_menu_planner() {}
             calls: std::cell::Cell::new(0),
             fail_at: 3,
         };
-        sync_files(&side, &flaky, &col(), &index, 100).unwrap_err();
-        let stats = sync_files(&side, default_embedder(), &col(), &index, 100).unwrap();
+        sync_files(&side, &flaky, &col(), &index, 100, LONG).unwrap_err();
+        let stats = sync_files(&side, default_embedder(), &col(), &index, 100, LONG).unwrap();
         assert!(stats.written >= 5, "{stats:?}");
         assert_eq!(vector_count(&side, &index), 7);
     }
