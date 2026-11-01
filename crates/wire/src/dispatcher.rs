@@ -27,6 +27,11 @@ pub enum SessionResetMode {
 /// Maximum automatic push delivery attempts before leaving a message `Pending` for explicit poll.
 pub const MAX_DELIVER: u32 = 5;
 
+/// A dispatch rescans the host's session files when its route table's last full discovery is
+/// older than this, even when every recipient has a route. That bounds how long a route can point
+/// at a replaced session that still accepts input, and how long dead routes stay listed.
+pub const ROUTE_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
 pub fn format_push_header(msg: &WireMessage) -> String {
     format!(
         "[fl-wire {}/{}] from {} (id: {}, thread: {}): {}",
@@ -1791,15 +1796,20 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             && rcpt.attempts < MAX_DELIVER
     };
-    // Discovery scans every vendor's session files: run it only when a receipt still to deliver
-    // has no route under its normalized persona key (a name that cannot be a key never gets
-    // one). A route that is present but stale is rediscovered below, when its push fails.
-    let missing_route = receipts.iter().any(|rcpt| {
-        deliverable(rcpt)
-            && normalize_persona(&rcpt.recipient_name).is_some()
-            && routes.get(&rcpt.recipient_name).is_none()
-    });
-    if home_override.is_some() || missing_route {
+    // Discovery scans every vendor's session files, so it runs only for a receipt still to
+    // deliver under a name that can be a persona key, and then only when that receipt has no
+    // route, or the last discovery is older than `ROUTE_REDISCOVERY_INTERVAL`. The interval
+    // bounds how long a stale route that still accepts input keeps its old target and how long
+    // dead routes stay listed. A stale route that refuses the push is rediscovered below.
+    let routable = |rcpt: &DeliveryReceipt| {
+        deliverable(rcpt) && normalize_persona(&rcpt.recipient_name).is_some()
+    };
+    let missing_route = receipts
+        .iter()
+        .any(|rcpt| routable(rcpt) && routes.get(&rcpt.recipient_name).is_none());
+    let stale_table =
+        || routes.discovery_due(ROUTE_REDISCOVERY_INTERVAL) && receipts.iter().any(routable);
+    if home_override.is_some() || missing_route || stale_table() {
         routes.discover_routes(home_override, now.clone());
     }
     let mut updated = Vec::new();
@@ -4015,6 +4025,8 @@ mod tests {
             VendorRoute::Webhook { socket_path: sock },
             At::from_unix_millis(5),
         );
+        // A discovery just ran, so the table is not due for another.
+        routes.set_last_discovery(Some(Instant::now()));
         let before = discoveries();
         let updated =
             dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(20));
@@ -4058,6 +4070,8 @@ mod tests {
                 ..store.list_wire_receipts(&msg.id).unwrap()[0].clone()
             };
             store.import_wire_batch(&[], &[rcpt]).unwrap();
+            // Even a table due for its periodic scan skips it.
+            routes.set_last_discovery(None);
             let before = discoveries();
             let _ = dispatch_message_for_store(
                 &store,
@@ -4083,6 +4097,7 @@ mod tests {
             ..base
         };
         store.import_wire_batch(&[], &[odd, done]).unwrap();
+        routes.set_last_discovery(None);
         let before = discoveries();
         let _ =
             dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(50));
@@ -4155,14 +4170,65 @@ mod tests {
             },
             At::from_unix_millis(5),
         );
+        routes.set_last_discovery(Some(Instant::now()));
         let before = discoveries();
         let updated =
             dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(20));
-        // No discovery up front (the route is present); one after the failed push, through
-        // `refresh_persona`.
+        // No discovery up front (the route is present and the table is not due); one after the
+        // failed push, through `refresh_persona`.
         assert_eq!(discoveries(), before + 1);
         assert_eq!(updated.len(), 1, "{updated:?}");
         assert_eq!(updated[0].status, DeliveryStatus::Pending);
         assert_eq!(updated[0].attempts, 1);
+    }
+
+    /// A route that is present can still be stale (its persona moved to a new session while the
+    /// old one still accepts input): a dispatch rescans once the last discovery is older than
+    /// `ROUTE_REDISCOVERY_INTERVAL`, and only then.
+    #[test]
+    fn a_routed_send_rediscovers_once_the_last_discovery_is_older_than_the_interval() {
+        let tmp = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let ago = |d: Duration| Instant::now().checked_sub(d).expect("clock older than d");
+        let second = Duration::from_secs(1);
+        for (case, last, expected) in [
+            ("never discovered", None, 1),
+            (
+                "inside the interval",
+                Some(ago(ROUTE_REDISCOVERY_INTERVAL - second)),
+                0,
+            ),
+            (
+                "past the interval",
+                Some(ago(ROUTE_REDISCOVERY_INTERVAL + second)),
+                1,
+            ),
+        ] {
+            let msg = mail_to(&store, "synthetic-recipient-i");
+            let (sock, pushed) = webhook(tmp.path(), &format!("{}.sock", case.replace(' ', "-")));
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "synthetic-recipient-i",
+                VendorRoute::Webhook { socket_path: sock },
+                At::from_unix_millis(5),
+            );
+            routes.set_last_discovery(last);
+            let before = discoveries();
+            let updated = dispatch_message_for_store(
+                &store,
+                &mut routes,
+                None,
+                &msg,
+                At::from_unix_millis(20),
+            );
+            assert_eq!(discoveries(), before + expected, "{case}");
+            assert!(
+                !routes.discovery_due(ROUTE_REDISCOVERY_INTERVAL),
+                "{case}: the table must not be due right after this dispatch"
+            );
+            assert_eq!(updated.len(), 1, "{case}: {updated:?}");
+            assert_eq!(updated[0].status, DeliveryStatus::Acked, "{case}");
+            assert!(pushed.join().unwrap().contains("discovery"), "{case}");
+        }
     }
 }

@@ -945,6 +945,7 @@ where
         }
     }
     if config.socket_path.exists() {
+        // Connect-only liveness probe: it sends no request, so its short read/write timeout never applies.
         if LocalClient::connect(&config.socket_path, Duration::from_millis(50)).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -1023,8 +1024,8 @@ where
                     // A listener in non-blocking mode can hand out non-blocking streams
                     // (BSD and macOS do); the reads below expect blocking ones.
                     let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT));
                     let Ok(mut writer) = stream.try_clone() else {
                         return;
                     };
@@ -1680,7 +1681,9 @@ mod tests {
         });
         assert_eq!(status_personas(), vec!["lmcfarlin-e6"]);
 
-        // Any send runs a dispatch, whose discovery prunes the derived route.
+        // Any send runs a dispatch. With a home override every dispatch discovers (in production
+        // the first one does, then one per `ROUTE_REDISCOVERY_INTERVAL`); that discovery prunes
+        // the derived route.
         request(LocalRequest::Send {
             args: mail("synthetic-recipient", "prune"),
         });
