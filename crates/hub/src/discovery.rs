@@ -1165,7 +1165,7 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
             (Some(model), effort)
         }
         None => {
-            let effort = settings_model.as_deref().and_then(&settings_effort);
+            let effort = settings_model.as_deref().and_then(settings_effort);
             (settings_model, effort)
         }
     };
