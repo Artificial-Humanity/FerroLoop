@@ -260,24 +260,46 @@ fn push_claude_tmux(
     msg: &WireMessage,
 ) -> Result<(), String> {
     let record = read_claude_session_record(pid, key_path);
-    let pane = if pid != 0 {
-        tmux_pane_for_pid(pid).ok_or_else(|| format!("no tmux pane holds claude pid {pid}"))?
-    } else {
-        let key_json = read_claude_key(pid, socket_path, key_path)
+    let pane = claude_live_pane(pid, record.as_ref(), || {
+        read_claude_key(pid, socket_path, key_path)
             .ok()
-            .map(|(_, v)| v);
-        key_json
-            .as_ref()
-            .and_then(claude_live_tmux_pane)
-            .or_else(|| record.as_ref().and_then(claude_live_tmux_pane))
-            .ok_or_else(|| "no live tmux pane for this session".to_string())?
-    };
+            .map(|(_, v)| v)
+    })
+    .ok_or_else(|| {
+        if pid != 0 {
+            format!("no tmux pane holds claude pid {pid}")
+        } else {
+            "no live tmux pane for this session".to_string()
+        }
+    })?;
     if !claude_session_idle(record.as_ref()) {
         return Err(format!(
             "session in pane {pane} is not idle; leaving the message pending"
         ));
     }
     deliver_via_tmux_paste_opts(&pane, &sanitize_for_paste(&format_push_message(msg)), true)
+}
+
+/// The live tmux pane (`%<n>`) a Claude session runs in.
+///
+/// With a real `pid` the pane is the one whose process tree holds that pid
+/// ([`tmux_pane_for_pid`]); a recorded pane is never trusted on its own, because pane ids restart
+/// after a tmux server restart and a session under another tmux server maps to an unrelated
+/// `%N`. Only `pid == 0` (tests and hand-registered routes) reads the recorded `tmux` field, from
+/// the session key file and then the `<pid>.json` record. Claude Code writes the field to the
+/// record, not to the key file.
+fn claude_live_pane(
+    pid: u32,
+    record: Option<&serde_json::Value>,
+    key_json: impl FnOnce() -> Option<serde_json::Value>,
+) -> Option<String> {
+    if pid != 0 {
+        return tmux_pane_for_pid(pid);
+    }
+    key_json()
+        .as_ref()
+        .and_then(claude_live_tmux_pane)
+        .or_else(|| record.and_then(claude_live_tmux_pane))
 }
 
 /// The pid of `pid`'s parent process, read from `/proc/<pid>/stat`.
@@ -1585,7 +1607,7 @@ fn read_claude_key(
     Ok((kpath, key_json))
 }
 
-/// The live tmux pane id (`%<n>`) a Claude route's session key file names, or `None` for any
+/// The live tmux pane id (`%<n>`) a Claude route's session runs in (see [`claude_live_pane`]), or `None` for any
 /// other vendor, a stopped process, an unreadable key file, or a pane that is not alive.
 /// An interrupt of a session the hub does not host uses it as the pane to send `Escape` to.
 pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
@@ -1601,8 +1623,12 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
         return None;
     }
-    let (_, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref()).ok()?;
-    claude_live_tmux_pane(&key_json)
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    claude_live_pane(*pid, record.as_ref(), || {
+        read_claude_key(*pid, socket_path, key_path.as_deref())
+            .ok()
+            .map(|(_, v)| v)
+    })
 }
 
 pub fn dispatch_operator_prompt_to_route(
@@ -1627,7 +1653,11 @@ pub fn dispatch_operator_prompt_to_route(
             // an owner sender may take this path: it must stay out of reach of any caller
             // that is merely authenticated as a peer.
             if is_owner_sender(sender_name)
-                && let Some(pane) = claude_live_tmux_pane(&key_json)
+                && let Some(pane) = claude_live_pane(
+                    *pid,
+                    read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+                    || Some(key_json.clone()),
+                )
             {
                 return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
             }
@@ -2530,6 +2560,68 @@ mod tests {
         let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
         assert_eq!(rcpt.status, DeliveryStatus::Acked);
         assert_eq!(reader.join().unwrap().len(), 2);
+        let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    #[test]
+    fn owner_prompt_and_interrupt_pane_come_from_the_process_tree_not_the_key_file() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        // The pane process is this test process; the claude pid is its child. The key file
+        // names a different pane (%12), as a stale or foreign-server record would.
+        let panes = format!("%3 1\n%7 {}", std::process::id());
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux_panes(tmp.path(), &panes, false);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let key_path = tmp.path().join("pid.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-t","tmux":"Wendy:@6.%12"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: child.id(),
+            session_id: "s-owner".into(),
+            socket_path: tmp.path().join("gone.sock"),
+            key_path: Some(key_path),
+        };
+
+        let live = claude_route_live_pane(&route);
+        let sent = dispatch_operator_prompt_to_route(&route, "owner", "Check the queue");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(live.as_deref(), Some("%7"));
+        sent.unwrap();
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("send-keys -t %7 Enter"), "{cmds}");
+        assert!(!cmds.contains("%12 Enter"), "{cmds}");
+        assert!(
+            fs::read_to_string(&tmux_stdin)
+                .unwrap()
+                .contains("Check the queue")
+        );
+    }
+
+    #[test]
+    fn owner_prompt_pane_with_a_real_pid_in_no_pane_is_not_pasted() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux_panes(tmp.path(), "%3 1", false);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let key_path = tmp.path().join("pid.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-t","tmux":"Wendy:@6.%12"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: child.id(),
+            session_id: "s-owner".into(),
+            socket_path: tmp.path().join("gone.sock"),
+            key_path: Some(key_path),
+        };
+        let live = claude_route_live_pane(&route);
+        let sent = dispatch_operator_prompt_to_route(&route, "owner", "hello");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(live, None);
+        assert!(sent.is_err(), "no pane and no socket: nothing is delivered");
         let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
         assert!(!cmds.contains("paste-buffer"), "{cmds}");
     }

@@ -725,3 +725,59 @@ fn agent_msg_hydrate_runs_agent_hydrate_and_forwards_its_exit_status() {
         "Kayla --replace"
     );
 }
+
+#[test]
+fn agent_msg_register_replace_keeps_an_existing_lab_manager_and_never_raises_anyone() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let register = |name: &str, project: &str, role: &str, extra: Option<&str>, replace: bool| {
+        let mut cmd = env.cmd_for(&agent_msg_bin);
+        cmd.args(["register", name, "--project", project, "--role", role]);
+        if let Some(extra) = extra {
+            cmd.args(["--extra-areas", extra]);
+        }
+        if replace {
+            cmd.arg("--replace");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let roster = || -> Value {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .args(["roster", "--json"])
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let find = |roster: &Value, key: &str| -> Value {
+        roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name_key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {roster}"))
+            .clone()
+    };
+
+    register("Manager", "lab", "lab_manager", Some("agents,notes"), false);
+    register("Worker", "other", "assistant", None, false);
+    // A reforge-style re-registration as lead.
+    register("Manager", "lab", "lead", None, true);
+    register("Worker", "other", "lead", None, true);
+
+    let r = roster();
+    let manager = find(&r, "manager");
+    assert_eq!(manager["role"], "lab_manager", "{manager}");
+    assert_eq!(
+        manager["extra_areas"],
+        serde_json::json!(["agents", "notes"])
+    );
+    // Only an existing lab manager is preserved: asking for lead raises nobody, and the name
+    // is irrelevant.
+    assert_eq!(find(&r, "worker")["role"], "lead");
+}

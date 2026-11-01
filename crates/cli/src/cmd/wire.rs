@@ -26,7 +26,7 @@ use fl_wire::identity::{
 };
 use serde_json::{Value, json};
 
-use crate::cmd::agent::{now_at, resolve_agent, sync_registry_markdown};
+use crate::cmd::agent::{now_at, preserve_on_replace, resolve_agent, sync_registry_markdown};
 use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -1284,6 +1284,18 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             let store = env
                 .open_for_scope(Some(&StateScope::Workspace))
                 .map_err(|e| (1, e))?;
+            let existing = if replace {
+                store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?
+            } else {
+                None
+            };
+            let (parsed_role, extras) = preserve_on_replace(
+                existing.as_ref(),
+                replace,
+                parsed_role,
+                extras,
+                extra_areas.is_some(),
+            );
             match store.register_agent(RegisterAgentArgs {
                 display_name: name,
                 email: None,
