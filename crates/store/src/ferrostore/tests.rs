@@ -305,13 +305,10 @@ fn unpublished_snapshot_past_the_live_extent_keeps_committed_documents() {
     let mut docs = BTreeMap::new();
     docs.insert(("docs".into(), "kept".into()), json!({ "n": 99 }));
     docs.insert(("docs".into(), "ghost".into()), json!({ "n": 7 }));
-    let blob = layout::encode_snapshot(99, &docs).unwrap();
+    let blob = layout::encode_snapshot(99, &docs.into()).unwrap();
     let snap = layout::decode_snapshot(&blob).unwrap();
     assert_eq!(snap.seq, 99);
-    assert_eq!(
-        snap.docs.get(&("docs".into(), "ghost".into())).unwrap()["n"],
-        7
-    );
+    assert_eq!(snap.docs.get("docs", "ghost").unwrap()["n"], 7);
 
     {
         let file = OpenOptions::new()
@@ -1841,7 +1838,7 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     let mut state = super::state::DocState::at_seq(10);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     let err = super::state::apply_frames(
         &mut state,
         10,
@@ -1849,17 +1846,14 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     )
     .unwrap_err();
     assert_corrupt(err);
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
     assert_eq!(state.docs.len(), 1);
     assert_eq!(state.last_seq, 10);
 
     let mut state = super::state::DocState::at_seq(10);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     let err = super::state::apply_frames(
         &mut state,
         10,
@@ -1867,17 +1861,14 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
     )
     .unwrap_err();
     assert_corrupt(err);
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
     assert_eq!(state.docs.len(), 1);
     assert_eq!(state.last_seq, 10);
 
     let mut state = super::state::DocState::at_seq(2);
     state
         .docs
-        .insert(("docs".into(), "kept".into()), json!("kept"));
+        .insert("docs".into(), "kept".into(), json!("kept").into());
     super::state::apply_frames(
         &mut state,
         2,
@@ -1888,16 +1879,10 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         ],
     )
     .unwrap();
-    assert_eq!(
-        state.docs.get(&("docs".into(), "kept".into())),
-        Some(&json!("kept"))
-    );
-    assert_eq!(
-        state.docs.get(&("docs".into(), "new".into())),
-        Some(&json!("new"))
-    );
-    assert!(!state.docs.contains_key(&("docs".into(), "skip-a".into())));
-    assert!(!state.docs.contains_key(&("docs".into(), "skip-b".into())));
+    assert_eq!(state.docs.get("docs", "kept"), Some(&json!("kept")));
+    assert_eq!(state.docs.get("docs", "new"), Some(&json!("new")));
+    assert!(!state.docs.contains("docs", "skip-a"));
+    assert!(!state.docs.contains("docs", "skip-b"));
     assert_eq!(state.last_seq, 3);
 
     let mut state = super::state::DocState::at_seq(5);
@@ -1928,14 +1913,8 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         &[(1, vec![put("one")]), (2, vec![put("two")])],
     )
     .unwrap();
-    assert_eq!(
-        state.docs.get(&("docs".into(), "one".into())),
-        Some(&json!("one"))
-    );
-    assert_eq!(
-        state.docs.get(&("docs".into(), "two".into())),
-        Some(&json!("two"))
-    );
+    assert_eq!(state.docs.get("docs", "one"), Some(&json!("one")));
+    assert_eq!(state.docs.get("docs", "two"), Some(&json!("two")));
     assert_eq!(state.last_seq, 2);
 }
 
@@ -2951,8 +2930,8 @@ fn a_row_group_that_does_not_decode_is_not_written() {
 
 #[test]
 fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
-    let docs: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
-    let tables: BTreeMap<String, super::columnar::ColumnTable> = BTreeMap::new();
+    let docs = super::state::Docs::default();
+    let tables = super::state::Tables::new();
     let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
     let err = match layout::decode_snapshot(&blob) {
         Ok(_) => panic!("version-2 snapshot with no tables opened"),
@@ -2960,13 +2939,14 @@ fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
     };
     assert!(err.to_string().contains("no column tables"), "{err}");
 
-    let mut tables = BTreeMap::new();
+    let mut tables = super::state::Tables::new();
     tables.insert(
         "t".into(),
         super::columnar::ColumnTable {
             columns: int_column(),
             groups: vec![vec![0, 0, 0, 0]],
-        },
+        }
+        .into(),
     );
     let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
     let err = match layout::decode_snapshot(&blob) {

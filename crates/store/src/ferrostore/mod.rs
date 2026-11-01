@@ -24,6 +24,8 @@ mod crash_sim;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_cow;
+#[cfg(test)]
 mod tests_crash;
 #[cfg(test)]
 mod tests_track0;
@@ -41,8 +43,8 @@ use layout::{
 };
 use serde_json::{Value, json};
 use state::{
-    DocState, MQ_HIGH_WATER_ID, apply_commit, apply_frames, commit_ops, mq_hw_collection,
-    mq_message_collection, next_mq_seq, stage_ops, unread_mq,
+    DocState, Docs, MQ_HIGH_WATER_ID, Overlay, apply_commit, apply_frames, commit_ops,
+    mq_hw_collection, mq_message_collection, next_mq_seq, publish_overlay, stage_ops, unread_mq,
 };
 
 pub use columnar::{
@@ -52,7 +54,7 @@ pub use columnar::{
 pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -111,7 +113,9 @@ impl Drop for FlockGuard {
 }
 
 enum Inner {
-    Memory(Mutex<DocState>),
+    /// The live state. A reader clones the `Arc`; a commit replaces it
+    /// copy-on-write, so a reader's view never changes under it.
+    Memory(Mutex<Arc<DocState>>),
     Disk(Disk),
     Remote(server::RemoteClient),
 }
@@ -156,27 +160,51 @@ struct Disk {
     read: Box<dyn ContainerIo>,
 }
 
-/// One transaction: a clone of the document map plus the ops that produced it.
-/// `get` / `put` / `delete` / `scan` all see earlier writes in this transaction.
+/// One transaction: an overlay of pending changes on a shared base state,
+/// plus the ops that produced them. The base is never changed.
+///
+/// `get` / `put` / `delete` / `scan` all see earlier writes in this
+/// transaction. Every write is staged through [`Overlay::stage`], which checks
+/// it as applying it would, so a commit applies the overlay as it is.
 struct Txn {
-    docs: BTreeMap<(String, String), Value>,
-    tables: BTreeMap<String, columnar::ColumnTable>,
-    vectors: BTreeMap<String, vector::VectorCollection>,
+    base: Arc<DocState>,
+    overlay: Overlay,
     ops: Vec<Op>,
+    /// A staged op failed part way. The body saw that error; a body that
+    /// carries on regardless still cannot commit.
+    failed: bool,
 }
 
 impl Txn {
+    fn new(base: Arc<DocState>) -> Self {
+        Self {
+            base,
+            overlay: Overlay::default(),
+            ops: Vec::new(),
+            failed: false,
+        }
+    }
+
+    /// The state this transaction started from, without its own changes. A
+    /// read transaction stages nothing, so this is everything it sees.
+    fn base(&self) -> &DocState {
+        &self.base
+    }
+
+    /// The document at `(collection, id)`, borrowed.
+    fn doc(&self, collection: &str, id: &str) -> Option<&Value> {
+        self.overlay.doc(&self.base, collection, id)
+    }
+
     fn get(&self, collection: &str, id: &str) -> Option<Value> {
-        self.docs
-            .get(&(collection.to_string(), id.to_string()))
-            .cloned()
+        self.doc(collection, id).cloned()
     }
 
     fn put(&mut self, collection: impl Into<String>, id: impl Into<String>, doc: Value) {
         let collection = collection.into();
         let id = id.into();
-        self.docs
-            .insert((collection.clone(), id.clone()), doc.clone());
+        self.overlay
+            .put(collection.clone(), id.clone(), Arc::new(doc.clone()));
         self.ops.push(Op::Put {
             collection,
             id,
@@ -187,21 +215,62 @@ impl Txn {
     fn delete(&mut self, collection: impl Into<String>, id: impl Into<String>) {
         let collection = collection.into();
         let id = id.into();
-        self.docs.remove(&(collection.clone(), id.clone()));
+        self.overlay.delete(collection.clone(), id.clone());
         self.ops.push(Op::Delete { collection, id });
+    }
+
+    /// Every document in `collection`, borrowed, in document-id order.
+    fn visit(&self, collection: &str, f: impl FnMut(&str, &Value)) {
+        self.overlay.visit(&self.base, collection, f);
     }
 
     /// Every document in `collection`, in document-id order.
     fn scan(&self, collection: &str) -> Vec<(String, Value)> {
-        let start = (collection.to_string(), String::new());
         let mut out = Vec::new();
-        for ((coll, id), doc) in self.docs.range(start..) {
-            if coll != collection {
-                break;
-            }
-            out.push((id.clone(), doc.clone()));
-        }
+        self.visit(collection, |id, doc| {
+            out.push((id.to_string(), doc.clone()))
+        });
         out
+    }
+
+    /// Stage a column-table or vector op (or a document op). `Err` stages
+    /// nothing the commit could use: the transaction will not commit.
+    fn stage(&mut self, op: Op) -> Result<(), StoreError> {
+        if let Err(err) = self.overlay.stage(&self.base, &op) {
+            self.failed = true;
+            return Err(err);
+        }
+        self.ops.push(op);
+        Ok(())
+    }
+
+    /// The columns of column table `name`, with this transaction's creates.
+    fn table_columns(&self, name: &str) -> Option<&[ColumnDef]> {
+        self.overlay.table_columns(&self.base, name)
+    }
+
+    /// Vector collection `name`, with this transaction's changes.
+    fn vector(&self, name: &str) -> Option<&vector::VectorCollection> {
+        self.overlay.vector(&self.base, name)
+    }
+
+    fn has_tables(&self) -> bool {
+        self.overlay.has_tables(&self.base)
+    }
+
+    fn has_vectors(&self) -> bool {
+        self.overlay.has_vectors(&self.base)
+    }
+
+    /// The ops and the overlay to commit. Drops this transaction's hold on
+    /// the base, so a base nobody else holds is changed in place.
+    fn finish(self) -> Result<(Vec<Op>, Overlay), StoreError> {
+        if self.failed {
+            return Err(backend(
+                "a transaction whose staged op failed cannot commit",
+            ));
+        }
+        Ok((self.ops, self.overlay))
     }
 }
 
@@ -243,7 +312,10 @@ impl FerroStore {
             docs: new_store_docs(),
             ..DocState::default()
         };
-        Self::assemble(Inner::Memory(Mutex::new(state)), "mem://".to_string())
+        Self::assemble(
+            Inner::Memory(Mutex::new(Arc::new(state))),
+            "mem://".to_string(),
+        )
     }
 
     /// Open or create a `.fls` file. A second open of the same path succeeds.
@@ -274,12 +346,9 @@ impl FerroStore {
         if created || initialized {
             fs.sync_dir(&parent_dir(path))?;
         }
-        if let Some(found) = doc::schema_version_in(|collection, id| {
-            state
-                .docs
-                .get(&(collection.to_string(), id.to_string()))
-                .cloned()
-        })? {
+        if let Some(found) =
+            doc::schema_version_in(|collection, id| state.docs.get(collection, id).cloned())?
+        {
             crate::check_format(Some(found))?;
         }
         fs.warn_if_loose(path);
@@ -416,11 +485,7 @@ impl FerroStore {
             return self.fill_doc_miss(collection, id);
         }
         let state = self.read_state()?;
-        if let Some(doc) = state
-            .docs
-            .get(&(collection.to_string(), id.to_string()))
-            .cloned()
-        {
+        if let Some(doc) = state.docs.get(collection, id).cloned() {
             return Ok(Some(doc));
         }
         self.fill_doc_miss(collection, id)
@@ -477,19 +542,10 @@ impl FerroStore {
         let name = name.to_string();
         let columns = columns.to_vec();
         self.with_write(move |txn| {
-            columnar::check_new_table(&txn.tables, &name, &columns)?;
-            txn.tables.insert(
-                name.clone(),
-                columnar::ColumnTable {
-                    columns: columns.clone(),
-                    groups: Vec::new(),
-                },
-            );
-            txn.ops.push(Op::CreateColumnTable {
+            txn.stage(Op::CreateColumnTable {
                 name: name.clone(),
                 columns: columns.clone(),
-            });
-            Ok(())
+            })
         })
     }
 
@@ -502,22 +558,17 @@ impl FerroStore {
         let name = name.to_string();
         let rows = rows.to_vec();
         self.with_write(move |txn| {
-            let Some(table) = txn.tables.get(&name) else {
+            let Some(columns) = txn.table_columns(&name) else {
                 return Err(backend(format!("no column table `{name}`")));
             };
             if rows.is_empty() {
                 return Ok(());
             }
-            let bytes = columnar::encode_row_group(&table.columns, &rows)?;
-            let Some(table) = txn.tables.get_mut(&name) else {
-                return Err(backend(format!("no column table `{name}`")));
-            };
-            table.groups.push(bytes.clone());
-            txn.ops.push(Op::AppendColumnGroup {
+            let bytes = columnar::encode_row_group(columns, &rows)?;
+            txn.stage(Op::AppendColumnGroup {
                 name: name.clone(),
                 bytes,
-            });
-            Ok(())
+            })
         })
     }
 
@@ -542,7 +593,7 @@ impl FerroStore {
         let name = name.to_string();
         let filters = filters.to_vec();
         self.with_read(move |txn| {
-            let Some(table) = txn.tables.get(&name) else {
+            let Some(table) = txn.base().tables.get(&name) else {
                 return Err(backend(format!("no column table `{name}`")));
             };
             columnar::scan_groups(&table.columns, &table.groups, &filters)
@@ -593,12 +644,12 @@ impl FerroStore {
         let name = name.to_string();
         self.with_write(move |txn| {
             vector::check_create(&name, dim, storage, m, ef_construction, ef_search)?;
-            if txn.vectors.contains_key(&name) {
+            if txn.vector(&name).is_some() {
                 return Err(backend(format!(
                     "vector collection `{name}` already exists"
                 )));
             }
-            txn.ops.push(Op::CreateVectorCollection {
+            txn.stage(Op::CreateVectorCollection {
                 name: name.clone(),
                 dim,
                 storage,
@@ -606,8 +657,7 @@ impl FerroStore {
                 m,
                 ef_construction,
                 ef_search,
-            });
-            Ok(())
+            })
         })
     }
 
@@ -624,7 +674,7 @@ impl FerroStore {
         let values = values.to_vec();
         let metadata = metadata.cloned();
         self.with_write(move |txn| {
-            let Some(col) = txn.vectors.get(&collection) else {
+            let Some(col) = txn.vector(&collection) else {
                 return Err(backend(format!("no vector collection `{collection}`")));
             };
             let dim = col.dim;
@@ -637,13 +687,12 @@ impl FerroStore {
                 )));
             }
             let bytes = vector::quantize(storage, &values)?;
-            txn.ops.push(Op::UpsertVector {
+            txn.stage(Op::UpsertVector {
                 collection: collection.clone(),
                 id: id.clone(),
                 bytes,
                 metadata: metadata.clone(),
-            });
-            Ok(())
+            })
         })
     }
 
@@ -652,15 +701,14 @@ impl FerroStore {
         let collection = collection.to_string();
         let id = id.to_string();
         self.with_write(move |txn| {
-            if !txn.vectors.contains_key(&collection) {
+            if txn.vector(&collection).is_none() {
                 return Err(backend(format!("no vector collection `{collection}`")));
             }
             vector::check_vector_id(&id)?;
-            txn.ops.push(Op::DeleteVector {
+            txn.stage(Op::DeleteVector {
                 collection: collection.clone(),
                 id: id.clone(),
-            });
-            Ok(())
+            })
         })
     }
 
@@ -679,7 +727,7 @@ impl FerroStore {
         let collection = collection.to_string();
         let id = id.to_string();
         self.with_read(move |txn| {
-            let Some(col) = txn.vectors.get(&collection) else {
+            let Some(col) = txn.vector(&collection) else {
                 return Err(backend(format!("no vector collection `{collection}`")));
             };
             vector::check_vector_id(&id)?;
@@ -718,7 +766,7 @@ impl FerroStore {
         let collection = collection.to_string();
         let values = values.to_vec();
         self.with_read(move |txn| {
-            let Some(col) = txn.vectors.get(&collection) else {
+            let Some(col) = txn.vector(&collection) else {
                 return Err(backend(format!("no vector collection `{collection}`")));
             };
             vector::search(col, &values, limit, ef)
@@ -766,8 +814,8 @@ impl FerroStore {
         let values = values.to_vec();
         self.with_read(move |txn| {
             state::search_hybrid(
-                &txn.docs,
-                &txn.vectors,
+                &txn.base().docs,
+                &txn.base().vectors,
                 &doc_collection,
                 &vector_collection,
                 &query,
@@ -808,8 +856,8 @@ impl FerroStore {
         let values = values.to_vec();
         self.with_read(move |txn| {
             state::search_knowledge(
-                &txn.docs,
-                &txn.vectors,
+                &txn.base().docs,
+                &txn.base().vectors,
                 &doc_collection,
                 &vector_collection,
                 &query,
@@ -859,7 +907,7 @@ impl FerroStore {
         // One `with_write`: the message and the high-water share a WAL frame.
         // A crash must not persist either document alone.
         let (record, store_seq) = self.with_write_outcome(move |txn| {
-            let seq = next_mq_seq(&txn.docs, &topic_owned)?;
+            let seq = next_mq_seq(txn, &topic_owned)?;
             let record = MqRecord {
                 seq,
                 key: key_owned.clone(),
@@ -1074,21 +1122,17 @@ impl FerroStore {
         &self,
         body: impl FnOnce(&Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let state = self.read_state()?;
-        let txn = Txn {
-            docs: state.docs,
-            tables: state.tables,
-            vectors: state.vectors,
-            ops: Vec::new(),
-        };
+        let txn = Txn::new(self.read_state()?);
         body(&txn)
     }
 
-    fn read_state(&self) -> Result<DocState, StoreError> {
+    /// The current state. Memory shares the live `Arc`: a later commit
+    /// replaces it and leaves this one as it was.
+    fn read_state(&self) -> Result<Arc<DocState>, StoreError> {
         match &self.inner {
-            Inner::Memory(state) => Ok(lock_mutex(state).clone()),
-            Inner::Disk(disk) => Ok(read_consistent(&*disk.read)?.2),
-            Inner::Remote(remote) => remote.read_state(),
+            Inner::Memory(state) => Ok(Arc::clone(&lock_mutex(state))),
+            Inner::Disk(disk) => Ok(Arc::new(read_consistent(&*disk.read)?.2)),
+            Inner::Remote(remote) => Ok(Arc::new(remote.read_state()?)),
         }
     }
 
@@ -1171,10 +1215,10 @@ impl FerroStore {
         }
     }
 
-    /// Run `body` against a cloned document map.
+    /// Run `body` in a transaction: an overlay on the current state.
     ///
     /// Memory holds the document mutex for the whole call. Disk takes `LOCK_EX`,
-    /// re-reads a consistent snapshot, then builds the transaction from that
+    /// re-reads a consistent snapshot, then builds the transaction over that
     /// state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
     /// and publishes one superblock. `Err` or an empty op list writes nothing.
     /// A remote handle compare-and-swaps those ops and runs `body` again when
@@ -1195,27 +1239,23 @@ impl FerroStore {
     ) -> Result<(T, Option<u64>), StoreError> {
         match &self.inner {
             Inner::Remote(remote) => loop {
-                let state = remote.read_state()?;
+                let state = Arc::new(remote.read_state()?);
                 let seq_base = state.last_seq;
-                let mut txn = Txn {
-                    docs: state.docs,
-                    tables: state.tables,
-                    vectors: state.vectors,
-                    ops: Vec::new(),
-                };
+                let mut txn = Txn::new(state);
                 let result = body(&mut txn)?;
-                if txn.ops.is_empty() {
+                let (ops, _) = txn.finish()?;
+                if ops.is_empty() {
                     return Ok((result, None));
                 }
                 let committed = {
                     let _gate = lock_mutex(&self.commit_gate);
-                    if !remote.commit_ops(seq_base, &txn.ops, false)? {
+                    if !remote.commit_ops(seq_base, &ops, false)? {
                         None
                     } else {
                         let seq = seq_base
                             .checked_add(1)
                             .ok_or_else(|| backend("transaction sequence overflow"))?;
-                        let committed = Committed { seq, ops: txn.ops };
+                        let committed = Committed { seq, ops };
                         let registered = self.register_committed(&committed, false);
                         Some((result, seq, registered))
                     }
@@ -1230,22 +1270,20 @@ impl FerroStore {
                     let _gate = lock_mutex(&self.commit_gate);
                     let (result, committed) = {
                         let mut state = lock_mutex(slot);
-                        let mut txn = Txn {
-                            docs: state.docs.clone(),
-                            tables: state.tables.clone(),
-                            vectors: state.vectors.clone(),
-                            ops: Vec::new(),
-                        };
+                        let mut txn = Txn::new(Arc::clone(&state));
                         let result = body(&mut txn)?;
-                        let ops = std::mem::take(&mut txn.ops);
-                        commit_ops(&mut state, &ops)?;
+                        // Ends the transaction's hold on the base: with no
+                        // reader holding it either, the commit is in place.
+                        let (ops, overlay) = txn.finish()?;
                         let committed = if ops.is_empty() {
                             None
                         } else {
-                            Some(Committed {
-                                seq: state.last_seq,
-                                ops,
-                            })
+                            let seq = state
+                                .last_seq
+                                .checked_add(1)
+                                .ok_or_else(|| backend("transaction sequence overflow"))?;
+                            publish_overlay(&mut state, overlay, seq);
+                            Some(Committed { seq, ops })
                         };
                         (result, committed)
                     };
@@ -1406,9 +1444,9 @@ impl FerroStore {
                 let mut state = lock_mutex(slot);
                 let mut sync = lock_mutex(&self.sync);
                 if !sync.is_idle() {
-                    return Ok(state.docs.get(&key).cloned());
+                    return Ok(state.docs.get(&key.0, &key.1).cloned());
                 }
-                if let Some(existing) = state.docs.get(&key).cloned() {
+                if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
                     return Ok(Some(existing));
                 }
                 let op = Op::Put {
@@ -1429,9 +1467,9 @@ impl FerroStore {
                 let (index, sb, state) = read_consistent(&**file)?;
                 let mut sync = lock_mutex(&self.sync);
                 if !sync.is_idle() {
-                    return Ok(state.docs.get(&key).cloned());
+                    return Ok(state.docs.get(&key.0, &key.1).cloned());
                 }
-                if let Some(existing) = state.docs.get(&key).cloned() {
+                if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
                     return Ok(Some(existing));
                 }
                 let op = Op::Put {
@@ -1439,7 +1477,7 @@ impl FerroStore {
                     id: key.1.clone(),
                     doc: fetched.clone(),
                 };
-                let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
+                let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
                 append_frame(&**file, index, &sb, &frame)?;
                 if sync.is_idle() && seq > sync.synced_seq {
@@ -1471,7 +1509,7 @@ impl FerroStore {
                     let _gate = lock_mutex(&self.commit_gate);
                     let committed = {
                         let mut state = lock_mutex(slot);
-                        if let Some(existing) = state.docs.get(&key).cloned() {
+                        if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
                             return Ok(IfAbsent {
                                 wrote: false,
                                 doc: existing,
@@ -1511,7 +1549,7 @@ impl FerroStore {
                         let file = lock_mutex(&disk.write);
                         let _locked = FlockGuard::acquire(file.lock_fd())?;
                         let (index, sb, state) = read_consistent(&**file)?;
-                        if let Some(existing) = state.docs.get(&key).cloned() {
+                        if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
                             return Ok(IfAbsent {
                                 wrote: false,
                                 doc: existing,
@@ -1523,7 +1561,7 @@ impl FerroStore {
                             id: key.1,
                             doc: doc.clone(),
                         };
-                        let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
+                        let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
                         let frame = encode_frame(seq, std::slice::from_ref(&op))?;
                         append_frame(&**file, index, &sb, &frame)?;
                         (seq, op)
@@ -1814,11 +1852,13 @@ struct PreparedBatch {
     ops: Vec<Op>,
 }
 
+/// Every batch staged in one overlay over `state`, the sequence after the last
+/// batch, and the ops of each batch as applied. `state` is not changed.
 fn prepare_sync_batches(
     state: &DocState,
     batches: &[SyncBatch],
-) -> Result<(DocState, Vec<PreparedBatch>), StoreError> {
-    let mut scratch = state.clone();
+) -> Result<(Overlay, u64, Vec<PreparedBatch>), StoreError> {
+    let mut overlay = Overlay::default();
     let mut expect = state.last_seq;
     let mut prepared = Vec::with_capacity(batches.len());
     for batch in batches {
@@ -1831,12 +1871,8 @@ fn prepare_sync_batches(
                 batch.seq
             )));
         }
-        let mut version = doc::schema_version_in(|collection, id| {
-            scratch
-                .docs
-                .get(&(collection.to_string(), id.to_string()))
-                .cloned()
-        })?;
+        let mut version =
+            doc::schema_version_in(|collection, id| overlay.doc(state, collection, id).cloned())?;
         let mut ops = Vec::with_capacity(batch.ops.len());
         for op in &batch.ops {
             if let Some(op) = admit_inbound(op, &mut version)? {
@@ -1845,14 +1881,16 @@ fn prepare_sync_batches(
         }
         // Every op may have been dropped: the sequence still advances, as an
         // empty frame, so the next batch is still the next commit.
-        scratch = stage_ops(scratch, &ops)?;
+        for op in &ops {
+            overlay.stage(state, op)?;
+        }
         expect = next;
         prepared.push(PreparedBatch {
             seq: batch.seq,
             ops,
         });
     }
-    Ok((scratch, prepared))
+    Ok((overlay, expect, prepared))
 }
 
 /// Whether an inbound sync op is applied. `version` is the schema version the
@@ -1910,22 +1948,21 @@ fn publish_sync_batches(
         )),
         Inner::Memory(slot) => {
             let mut state = lock_mutex(slot);
-            let (next, prepared) = prepare_sync_batches(&state, batches)?;
-            let seq = next.last_seq;
-            *state = next;
+            let (overlay, seq, prepared) = prepare_sync_batches(&state, batches)?;
+            publish_overlay(&mut state, overlay, seq);
             Ok((seq, prepared))
         }
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
             let _locked = FlockGuard::acquire(file.lock_fd())?;
             let (index, sb, state) = read_consistent(&**file)?;
-            let (next, prepared) = prepare_sync_batches(&state, batches)?;
+            let (_, seq, prepared) = prepare_sync_batches(&state, batches)?;
             let mut frames = Vec::with_capacity(prepared.len());
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
             publish_frames(&**file, index, &sb, &frames)?;
-            Ok((next.last_seq, prepared))
+            Ok((seq, prepared))
         }
     }
 }
@@ -2003,7 +2040,7 @@ fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<SeqC
     if ops.is_empty() {
         return Ok(SeqCommit::Same);
     }
-    let seq = stage_ops(state, ops)?.last_seq;
+    let (_, seq) = stage_ops(&state, ops)?;
     let frame = encode_frame(seq, ops)?;
     append_frame(&**file, index, &sb, &frame)?;
     Ok(SeqCommit::Wrote(Committed {
@@ -2019,21 +2056,21 @@ fn with_write_disk<T>(
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.lock_fd())?;
     let (index, sb, state) = read_consistent(&**file)?;
-    let baseline = state.clone();
-    let mut txn = Txn {
-        docs: state.docs,
-        tables: state.tables,
-        vectors: state.vectors,
-        ops: Vec::new(),
-    };
+    let seq_base = state.last_seq;
+    let mut txn = Txn::new(Arc::new(state));
     let result = body(&mut txn)?;
-    if txn.ops.is_empty() {
+    // The overlay was checked op by op as it was staged. It is dropped here:
+    // the next read decodes the file again.
+    let (ops, _) = txn.finish()?;
+    if ops.is_empty() {
         return Ok((result, None));
     }
-    let seq = stage_ops(baseline, &txn.ops)?.last_seq;
-    let frame = encode_frame(seq, &txn.ops)?;
+    let seq = seq_base
+        .checked_add(1)
+        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let frame = encode_frame(seq, &ops)?;
     append_frame(&**file, index, &sb, &frame)?;
-    Ok((result, Some(Committed { seq, ops: txn.ops })))
+    Ok((result, Some(Committed { seq, ops })))
 }
 
 fn commit_disk<T>(
@@ -2044,7 +2081,7 @@ fn commit_disk<T>(
     let _locked = FlockGuard::acquire(file.lock_fd())?;
     let (index, sb, state) = read_consistent(&**file)?;
     let (op, extra) = build(&state)?;
-    let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
+    let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
     append_frame(&**file, index, &sb, &frame)?;
     Ok((extra, Committed { seq, ops: vec![op] }))
@@ -2178,14 +2215,12 @@ fn append_frame(
 /// The documents a new store starts with: its schema version, the newest on
 /// the ladder. They sit in the snapshot at sequence 0, so a new store still
 /// has `last_seq` 0 and no WAL frame.
-fn new_store_docs() -> BTreeMap<(String, String), Value> {
-    let mut docs = BTreeMap::new();
+fn new_store_docs() -> Docs {
+    let mut docs = Docs::default();
     docs.insert(
-        (
-            doc::SCHEMA_COLLECTION.to_string(),
-            doc::SCHEMA_KEY.to_string(),
-        ),
-        json!(crate::FORMAT_WITH_WORKFLOW),
+        doc::SCHEMA_COLLECTION.to_string(),
+        doc::SCHEMA_KEY.to_string(),
+        Arc::new(json!(crate::FORMAT_WITH_WORKFLOW)),
     );
     docs
 }

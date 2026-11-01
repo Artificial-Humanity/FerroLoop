@@ -603,12 +603,10 @@ const COPIED: [&str; 45] = [
 ];
 
 fn ferro_collection(state: &DocState, collection: &str) -> Rows {
-    let start = (collection.to_string(), String::new());
     state
         .docs
-        .range(start..)
-        .take_while(|((held, _), _)| held == collection)
-        .map(|((_, id), doc)| (id.clone(), doc.clone()))
+        .in_collection(collection)
+        .map(|(id, doc)| (id.clone(), doc.clone()))
         .collect()
 }
 
@@ -676,10 +674,10 @@ fn table_parity(src: &RedbStore, state: &DocState) -> Result<Vec<TableParity>, S
     let mut unlisted: Rows = state
         .docs
         .iter()
-        .filter(|((collection, _), _)| {
-            collection != SCHEMA_COLLECTION && !listed.contains(collection.as_str())
+        .filter(|(collection, _, _)| {
+            *collection != SCHEMA_COLLECTION && !listed.contains(collection.as_str())
         })
-        .map(|((collection, id), doc)| (pair(collection, id), doc.clone()))
+        .map(|(collection, id, doc)| (pair(collection, id), doc.clone()))
         .collect();
     unlisted.extend(
         state

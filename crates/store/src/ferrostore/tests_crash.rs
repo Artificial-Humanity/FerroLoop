@@ -77,23 +77,31 @@ struct Logical {
 }
 
 impl Logical {
-    fn of(state: DocState) -> Self {
+    fn of(state: &DocState) -> Self {
         Self {
             last_seq: state.last_seq,
-            docs: state.docs,
+            docs: state
+                .docs
+                .iter()
+                .map(|(collection, id, doc)| ((collection.clone(), id.clone()), doc.clone()))
+                .collect(),
             tables: state
                 .tables
-                .into_iter()
-                .map(|(name, table)| (name, (table.columns, table.groups)))
+                .iter()
+                .map(|(name, table)| (name.clone(), (table.columns.clone(), table.groups.clone())))
                 .collect(),
-            vectors: state.vectors,
+            vectors: state
+                .vectors
+                .iter()
+                .map(|(name, col)| (name.clone(), (**col).clone()))
+                .collect(),
         }
     }
 
     fn read(store: &FerroStore) -> Result<Self, String> {
         store
             .read_state()
-            .map(Self::of)
+            .map(|state| Self::of(&state))
             .map_err(|err| format!("read_state failed: {err}"))
     }
 
@@ -401,8 +409,9 @@ fn init_blob() -> Vec<u8> {
 fn v1_image() -> Image {
     let mut docs = new_store_docs();
     docs.insert(
-        ("notes".to_string(), "old".to_string()),
-        json!({"from": "v1"}),
+        "notes".to_string(),
+        "old".to_string(),
+        json!({"from": "v1"}).into(),
     );
     let blob = encode_snapshot(0, &docs).unwrap();
     let frame = encode_frame(

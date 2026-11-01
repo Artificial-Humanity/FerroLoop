@@ -6,14 +6,14 @@
 
 use super::columnar;
 use super::layout::{Op, backend};
-use super::state::DocState;
+use super::state::{DocState, Docs, Tables, Vectors};
 use super::vector;
 use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::iri::Iri;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -764,7 +764,7 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
                 )?,
             )?,
         ),
-        "read_state" => Ok(doc_state_value(&store.read_state()?)),
+        "read_state" => Ok(doc_state_value(&*store.read_state()?)),
         "commit_ops" => {
             let expected_seq = param_u64(params, "expected_seq")?;
             let ops = parse_ops(
@@ -875,7 +875,7 @@ fn doc_state_value(state: &DocState) -> Value {
     let docs = state
         .docs
         .iter()
-        .map(|((collection, id), doc)| {
+        .map(|(collection, id, doc)| {
             json!({
                 "collection": collection,
                 "id": id,
@@ -900,7 +900,7 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
         .get("docs")
         .and_then(Value::as_array)
         .ok_or_else(|| backend("read_state result is missing docs"))?;
-    let mut docs = BTreeMap::new();
+    let mut docs = Docs::default();
     for item in items {
         let collection = param_str(item, "collection")?.to_string();
         let id = param_str(item, "id")?.to_string();
@@ -908,14 +908,14 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
             .get("doc")
             .cloned()
             .ok_or_else(|| backend("read_state doc is missing doc"))?;
-        docs.insert((collection, id), doc);
+        docs.insert(collection, id, Arc::new(doc));
     }
     let tables = match value.get("tables") {
-        None => BTreeMap::new(),
+        None => Tables::new(),
         Some(tables) => columnar::parse_tables(tables)?,
     };
     let vectors = match value.get("vectors") {
-        None => BTreeMap::new(),
+        None => Vectors::new(),
         Some(vectors) => vector::parse_vectors(vectors)?,
     };
     Ok(DocState {
@@ -1641,28 +1641,26 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut tables = BTreeMap::new();
+        let mut tables = Tables::new();
         tables.insert(
             "t".into(),
             ColumnTable {
                 columns: columns.clone(),
                 groups: vec![blob.clone()],
-            },
+            }
+            .into(),
         );
-        let mut docs = BTreeMap::new();
-        docs.insert(("c".into(), "id".into()), Value::Null);
+        let mut docs = Docs::default();
+        docs.insert("c".into(), "id".into(), Value::Null.into());
         let state = DocState {
             docs,
             tables,
-            vectors: BTreeMap::new(),
+            vectors: Vectors::new(),
             last_seq: 4,
         };
         let parsed = parse_doc_state(&doc_state_value(&state)).unwrap();
         assert_eq!(parsed.last_seq, 4);
-        assert_eq!(
-            parsed.docs.get(&("c".into(), "id".into())),
-            Some(&Value::Null)
-        );
+        assert_eq!(parsed.docs.get("c", "id"), Some(&Value::Null));
         assert_eq!(parsed.tables.get("t").unwrap().groups, vec![blob.clone()]);
         assert_eq!(parsed.tables.get("t").unwrap().columns, columns);
 

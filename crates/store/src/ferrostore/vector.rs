@@ -4,11 +4,13 @@
 //! the dequantized `f32` values, accumulated in `f64`.
 
 use super::columnar::check_name;
+use super::state::Vectors;
 use fl_core::StoreError;
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::sync::Arc;
 
 const MAX_VECTOR_BYTES: u32 = 8 * 1024 * 1024;
 const MAX_LEVEL: u8 = 16;
@@ -1384,7 +1386,7 @@ pub(super) fn parse_values(value: &Value) -> Result<Vec<f32>, StoreError> {
     Ok(out)
 }
 
-pub(super) fn vectors_json(collections: &BTreeMap<String, VectorCollection>) -> Value {
+pub(super) fn vectors_json(collections: &Vectors) -> Value {
     Value::Array(
         collections
             .iter()
@@ -1434,9 +1436,7 @@ fn collection_json(name: &str, col: &VectorCollection) -> Value {
     })
 }
 
-pub(super) fn parse_vectors(
-    value: &Value,
-) -> Result<BTreeMap<String, VectorCollection>, StoreError> {
+pub(super) fn parse_vectors(value: &Value) -> Result<Vectors, StoreError> {
     let items = value
         .as_array()
         .ok_or_else(|| backend("vectors is not an array"))?;
@@ -1449,7 +1449,7 @@ pub(super) fn parse_vectors(
             .to_string();
         let col = parse_collection(item)?;
         validate_graph(&name, &col)?;
-        if collections.insert(name.clone(), col).is_some() {
+        if collections.insert(name.clone(), Arc::new(col)).is_some() {
             return Err(backend(format!("duplicate vector collection `{name}`")));
         }
     }
