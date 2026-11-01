@@ -68,7 +68,9 @@ const SAMPLE_PRS: PullRequestItem[] = [
     required_tier: "lead",
     reviews: [
       {
-        reviewer_login: "ferris",
+        id: 1,
+        author_login: "ferroloop[bot]",
+        author_id: 341521384,
         state: "APPROVED",
         body: "LGTM — verified against live hub routes.",
       },

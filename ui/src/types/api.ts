@@ -651,11 +651,16 @@ export interface PrCommitSummary {
   author_login?: string;
 }
 
+/** A pull request review, as the Hub reads it (`fl_core::pr_policy::PrReviewSummary`). */
 export interface PrReviewSummary {
-  reviewer_login: string;
+  id: number;
+  author_login: string;
+  /** The author's numeric GitHub user id; absent for a deleted account. The Hub counts an
+   * agent approval from the Reviewer App by this id, not by login. */
+  author_id?: number | null;
   state: string;
   body: string;
-  commit_id?: string;
+  commit_id?: string | null;
 }
 
 export interface PullRequestItem {
