@@ -1146,7 +1146,30 @@ fn put_and_serve_create_no_store_while_it_is_being_migrated() {
         assert!(!fls.exists(), "{args:?}");
     }
     drop(lock);
-    sb.ok(&["put", "--create", "--store", s(&fls), "docs", "a", "1"]);
+    // Another test thread in this binary may be between fork and exec of its
+    // own child: that child holds a copy of every open fd (O_CLOEXEC closes
+    // them only at exec), so it shares this open file description and keeps
+    // the flock alive for a moment after `drop(lock)`. Retry the put for a
+    // bounded time; each failed attempt must be the exact refusal.
+    let put = ["put", "--create", "--store", s(&fls), "docs", "a", "1"];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let out = sb.run(&put);
+        if out.status.success() {
+            break;
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.code() == Some(2) && err.contains("is being migrated"),
+            "{put:?}: {}\n{err}",
+            out.status
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lock was still held 5 s after it was dropped: {err}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(fls.exists());
 }
 
