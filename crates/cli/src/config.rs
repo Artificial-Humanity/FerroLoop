@@ -8,7 +8,7 @@
 //! project's records in a store nobody chose.
 
 use anyhow::{Context, Result, bail};
-use fl_core::pr_policy::DEFAULT_REVIEWER_APP_LOGINS;
+use fl_core::pr_policy::{DEFAULT_REVIEWER_APP_IDS, ReviewerApps};
 use fl_core::state::{StateScope, validate_slug};
 use fl_core::telemetry::{AdapterKind, RateCard};
 use fl_exec::state_sync::StateSyncTarget;
@@ -161,26 +161,48 @@ pub enum Credential {
 pub struct GithubApp {
     pub app_id: u64,
     pub private_key: PathBuf,
-    /// GitHub logins whose reviews may carry an `fl-review` agent marker, normally the Reviewer
-    /// App's `<slug>[bot]`. A marker from any other login counts for nothing, so an outsider
-    /// cannot claim to be an agent. `None` (key absent) means
-    /// [`DEFAULT_REVIEWER_APP_LOGINS`]; `[]` means no agent review counts. Read it through
-    /// [`reviewer_logins`], which also covers a config with no `[github]` table.
+    /// GitHub user ids whose reviews may carry an `fl-review` agent marker, normally the
+    /// Reviewer App's bot user. A marker from any other account counts for nothing, so an
+    /// outsider cannot claim to be an agent. Read it through [`reviewer_apps`].
+    #[serde(default)]
+    pub reviewer_ids: Option<Vec<u64>>,
+    /// GitHub logins whose reviews may carry an `fl-review` agent marker, matched without
+    /// case. A login is not stable identity: GitHub frees an App's old slug when the App is
+    /// renamed, so prefer `reviewer_ids`. Read it through [`reviewer_apps`].
     #[serde(default)]
     pub reviewer_logins: Option<Vec<String>>,
 }
 
-/// The logins whose reviews may carry an agent marker (`[github] reviewer_logins`), or
-/// [`DEFAULT_REVIEWER_APP_LOGINS`] when the table or the key is absent. `verify-ci` can run on a
-/// machine with no App credentials, so a missing `[github]` is not an error.
-pub fn reviewer_logins(app: Option<&GithubApp>) -> Vec<String> {
-    match app.and_then(|a| a.reviewer_logins.as_ref()) {
-        Some(logins) => logins.clone(),
-        None => DEFAULT_REVIEWER_APP_LOGINS
-            .iter()
-            .map(|l| (*l).to_string())
-            .collect(),
+/// The accounts whose reviews may carry an agent marker (`[github] reviewer_ids` and
+/// `reviewer_logins`). When neither key is set, or there is no `[github]` table, it is
+/// [`ReviewerApps::default`]: the ids in [`DEFAULT_REVIEWER_APP_IDS`] and no logins. When
+/// either key is set, the two keys are the whole set and an absent key is empty, so
+/// `reviewer_logins = []` or `reviewer_ids = []` alone means no agent review counts.
+/// `verify-ci` can run on a machine with no App credentials, so a missing `[github]` is not an
+/// error.
+pub fn reviewer_apps(app: Option<&GithubApp>) -> ReviewerApps {
+    match app {
+        Some(GithubApp {
+            reviewer_ids,
+            reviewer_logins,
+            ..
+        }) if reviewer_ids.is_some() || reviewer_logins.is_some() => ReviewerApps {
+            ids: reviewer_ids.clone().unwrap_or_default(),
+            logins: reviewer_logins.clone().unwrap_or_default(),
+        },
+        _ => ReviewerApps::default(),
     }
+}
+
+/// The warning `load` prints once when `[github] reviewer_logins` names any login.
+fn reviewer_logins_warning(path: &Path) -> String {
+    format!(
+        "warning: {}: `github.reviewer_logins` matches reviews by login, which can be spoofed \
+         after a GitHub App is renamed: GitHub frees the old slug for anyone to register. \
+         Prefer `github.reviewer_ids`, the App bot's numeric user id (the default is {:?})",
+        path.display(),
+        DEFAULT_REVIEWER_APP_IDS
+    )
 }
 
 /// Whether `login` is a GitHub login, or an App's `<slug>[bot]`: letters, digits and `-`, then an
@@ -553,10 +575,21 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
                 bail!(
                     "{}: `github.reviewer_logins` entry `{login}` is not a GitHub login; use \
                      letters, digits and `-` (at most 64 characters), with an optional trailing \
-                     `[bot]`, for example `ferroloop-test[bot]`",
+                     `[bot]`, for example `ferroloop[bot]`",
                     path.display()
                 );
             }
+        }
+        if app.reviewer_ids.iter().flatten().any(|&id| id == 0) {
+            bail!(
+                "{}: `github.reviewer_ids` entry `0` is not a GitHub user id; use the App \
+                 bot's id from `gh api 'users/<slug>[bot]' --jq .id`",
+                path.display()
+            );
+        }
+        if app.reviewer_logins.as_ref().is_some_and(|l| !l.is_empty()) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| eprintln!("{}", reviewer_logins_warning(path)));
         }
     }
     for m in &file.mcp {
@@ -863,31 +896,101 @@ mod tests {
 
     const GITHUB_TABLE: &str = "[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n";
 
+    fn apps_of(text: &str) -> ReviewerApps {
+        reviewer_apps(load_text(text).unwrap().github.as_ref())
+    }
+
     fn logins_of(text: &str) -> Vec<String> {
-        reviewer_logins(load_text(text).unwrap().github.as_ref())
+        apps_of(text).logins
     }
 
     #[test]
-    fn reviewer_logins_default_to_the_reviewer_app_login() {
-        let default = vec!["ferroloop-test[bot]".to_string()];
+    fn reviewer_apps_default_to_the_reviewer_app_id_and_no_logins() {
+        let default = ReviewerApps {
+            ids: DEFAULT_REVIEWER_APP_IDS.to_vec(),
+            logins: Vec::new(),
+        };
+        assert_eq!(default.ids, [341_521_384]);
         // No `[github]` table at all (verify-ci on a machine with no App credentials).
-        assert_eq!(logins_of(""), default);
-        // A `[github]` table without the key keeps working and takes the default.
-        assert_eq!(logins_of(GITHUB_TABLE), default);
-        assert_eq!(reviewer_logins(None), default);
+        assert_eq!(apps_of(""), default);
+        // A `[github]` table with neither key keeps working and takes the default.
+        assert_eq!(apps_of(GITHUB_TABLE), default);
+        assert_eq!(reviewer_apps(None), default);
     }
 
     #[test]
-    fn reviewer_logins_can_be_replaced_or_emptied() {
-        let with = |list: &str| format!("{GITHUB_TABLE}reviewer_logins = {list}\n");
+    fn reviewer_ids_alone_replace_the_default_with_no_logins() {
+        let with = |list: &str| format!("{GITHUB_TABLE}reviewer_ids = {list}\n");
         assert_eq!(
-            logins_of(&with(
-                "[\"other-app[bot]\", \" Second[BOT] \", \"human-1\"]"
-            )),
-            ["other-app[bot]", "Second[BOT]", "human-1"]
+            apps_of(&with("[7, 341521384]")),
+            ReviewerApps {
+                ids: vec![7, 341_521_384],
+                logins: Vec::new(),
+            }
         );
         // An empty list is deliberate: no agent review counts.
-        assert_eq!(logins_of(&with("[]")), Vec::<String>::new());
+        assert_eq!(apps_of(&with("[]")), ReviewerApps::none());
+    }
+
+    #[test]
+    fn reviewer_logins_alone_replace_the_default_with_no_ids() {
+        let with = |list: &str| format!("{GITHUB_TABLE}reviewer_logins = {list}\n");
+        assert_eq!(
+            apps_of(&with(
+                "[\"other-app[bot]\", \" Second[BOT] \", \"human-1\"]"
+            )),
+            ReviewerApps {
+                ids: Vec::new(),
+                logins: vec![
+                    "other-app[bot]".into(),
+                    "Second[BOT]".into(),
+                    "human-1".into()
+                ],
+            }
+        );
+        // An empty list is deliberate: no agent review counts, not even the default id.
+        assert_eq!(apps_of(&with("[]")), ReviewerApps::none());
+    }
+
+    #[test]
+    fn reviewer_ids_and_logins_together_are_the_whole_set() {
+        let text =
+            format!("{GITHUB_TABLE}reviewer_ids = [5]\nreviewer_logins = [\"other-app[bot]\"]\n");
+        assert_eq!(
+            apps_of(&text),
+            ReviewerApps {
+                ids: vec![5],
+                logins: vec!["other-app[bot]".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_reviewer_id_is_refused() {
+        let err = load_text(&format!("{GITHUB_TABLE}reviewer_ids = [5, 0]\n")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`github.reviewer_ids` entry `0`"),
+            "{err:#}"
+        );
+        for bad in ["5", "[\"5\"]", "[-1]", "[1.5]", "[\"ferroloop[bot]\"]"] {
+            assert!(
+                load_text(&format!("{GITHUB_TABLE}reviewer_ids = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reviewer_logins_warning_names_the_spoofing_risk_and_reviewer_ids() {
+        let msg = reviewer_logins_warning(Path::new("/c/config.toml"));
+        for part in [
+            "/c/config.toml",
+            "spoofed",
+            "renamed",
+            "`github.reviewer_ids`",
+        ] {
+            assert!(msg.contains(part), "{part}: {msg}");
+        }
     }
 
     #[test]
