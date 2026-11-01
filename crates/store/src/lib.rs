@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod any;
+pub mod code_knowledge;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod knowledge;
@@ -32,6 +33,9 @@ pub use any::{
     MigrationLock, StoreOptions, Unmigrated, choose_backend, ferro_stats_at, forget_fallback,
     is_redb_busy, migrate_locked, open_redb, open_store, open_store_for_scan, open_store_with,
     physical_path, store_exists, store_identity,
+};
+pub use code_knowledge::{
+    DEFAULT_CODE_SYNC_BUDGET, RankedCode, search_code, search_code_with, sidecar_path,
 };
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,

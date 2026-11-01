@@ -110,6 +110,78 @@ struct IndexedFile {
     symbols: Vec<IndexedSymbol>,
 }
 
+/// A read-only view of one indexed file.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeFileRef<'a> {
+    file: &'a IndexedFile,
+}
+
+impl<'a> CodeFileRef<'a> {
+    /// Path relative to the scanned root, `/`-separated.
+    pub fn path(&self) -> &'a str {
+        &self.file.path
+    }
+
+    /// Lower-case hex SHA-256 of the file's lines, each followed by `\n`.
+    /// It changes exactly when the indexed text changes.
+    pub fn content_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for line in &self.file.lines {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The declarations extracted from the file, in source order.
+    pub fn symbols(&self) -> impl Iterator<Item = CodeSymbolRef<'a>> + use<'a> {
+        let file = self.file;
+        file.symbols
+            .iter()
+            .map(move |sym| CodeSymbolRef { file, sym })
+    }
+}
+
+/// A read-only view of one declaration.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeSymbolRef<'a> {
+    file: &'a IndexedFile,
+    sym: &'a IndexedSymbol,
+}
+
+impl<'a> CodeSymbolRef<'a> {
+    pub fn name(&self) -> &'a str {
+        &self.sym.name
+    }
+
+    pub fn kind(&self) -> &'a str {
+        &self.sym.kind
+    }
+
+    pub fn path(&self) -> &'a str {
+        &self.file.path
+    }
+
+    pub fn start_line(&self) -> u64 {
+        self.sym.start_line
+    }
+
+    pub fn signature(&self) -> &'a str {
+        &self.sym.signature
+    }
+
+    /// The same hit a search returns for this declaration: snippet and token
+    /// estimates included.
+    pub fn hit(&self) -> CodeSymbolHit {
+        symbol_hit(self.file, self.sym)
+    }
+}
+
 /// A scanned workspace: the indexed files in relative-path order.
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndex {
@@ -128,14 +200,9 @@ impl CodeIndex {
     /// Run one search. `limit == 0`, or an empty query for `Def`/`Search`,
     /// returns no symbols (the scan counts are still reported).
     pub fn search(&self, kind: CodeSearchKind, q: &str, limit: usize) -> CodeSearchOutcome {
-        let mut out = CodeSearchOutcome {
-            symbols: Vec::new(),
-            tokens_saved_this_query: 0,
-            files_indexed: self.files_indexed(),
-            symbols_indexed: self.symbols_indexed(),
-        };
+        let (files, symbols) = (self.files_indexed(), self.symbols_indexed());
         if limit == 0 {
-            return out;
+            return outcome_from_hits(Vec::new(), files, symbols);
         }
         let query = q.trim();
         let hits: Vec<CodeSymbolHit> = match kind {
@@ -155,9 +222,13 @@ impl CodeIndex {
             }
             CodeSearchKind::Outline => self.search_outline(query, limit),
         };
-        out.tokens_saved_this_query = tokens_saved_per_file(&hits);
-        out.symbols = hits;
-        out
+        outcome_from_hits(hits, files, symbols)
+    }
+
+    /// The indexed files in relative-path order, for a ranker that keeps
+    /// derived data per file.
+    pub fn files(&self) -> impl Iterator<Item = CodeFileRef<'_>> {
+        self.files.iter().map(|file| CodeFileRef { file })
     }
 
     fn search_def(&self, query: &str, limit: usize) -> Vec<CodeSymbolHit> {
@@ -289,6 +360,22 @@ pub fn search_code_index(
     limit: usize,
 ) -> CodeSearchOutcome {
     scan_code_index(root).search(kind, q, limit)
+}
+
+/// The outcome of a search that returned `hits`: `tokens_saved_this_query`
+/// is computed per distinct file from those hits, so every ranker (the
+/// built-in tiers or an external one) books token gain by the same rule.
+pub fn outcome_from_hits(
+    hits: Vec<CodeSymbolHit>,
+    files_indexed: u64,
+    symbols_indexed: u64,
+) -> CodeSearchOutcome {
+    CodeSearchOutcome {
+        tokens_saved_this_query: tokens_saved_per_file(&hits),
+        symbols: hits,
+        files_indexed,
+        symbols_indexed,
+    }
 }
 
 fn tokens_saved_per_file(hits: &[CodeSymbolHit]) -> u64 {
@@ -1202,6 +1289,75 @@ mod tests {
         let naive_per_hit_sum: u64 = out.symbols.iter().map(|s| s.tokens_saved).sum();
         assert!(out.tokens_saved_this_query < naive_per_hit_sum);
         assert!(out.tokens_saved_this_query > 0);
+    }
+
+    #[test]
+    fn outcome_from_hits_books_the_gain_like_search_and_in_any_order() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.rs", "pub fn one() {}\npub fn two() {}\n");
+        write(tmp.path(), "b.rs", "pub fn three() {}\n");
+        let index = scan_code_index(tmp.path());
+        let found = index.search(CodeSearchKind::Outline, ".rs", 10);
+        assert_eq!(found.symbols.len(), 3);
+        let again = outcome_from_hits(
+            found.symbols.clone(),
+            found.files_indexed,
+            found.symbols_indexed,
+        );
+        assert_eq!(again, found);
+        let mut reversed = found.symbols.clone();
+        reversed.reverse();
+        let shuffled = outcome_from_hits(reversed, 2, 3);
+        assert_eq!(
+            shuffled.tokens_saved_this_query,
+            found.tokens_saved_this_query
+        );
+        assert_eq!(
+            outcome_from_hits(Vec::new(), 2, 3).tokens_saved_this_query,
+            0
+        );
+    }
+
+    #[test]
+    fn file_views_expose_paths_digests_and_symbols_in_order() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "b.rs", "pub fn beta() {}\n");
+        write(tmp.path(), "a.rs", "pub fn alpha() {}\npub struct Gamma;\n");
+        let index = scan_code_index(tmp.path());
+        let files: Vec<_> = index.files().collect();
+        assert_eq!(
+            files.iter().map(|f| f.path()).collect::<Vec<_>>(),
+            ["a.rs", "b.rs"]
+        );
+        let syms: Vec<_> = files[0].symbols().collect();
+        assert_eq!(
+            syms.iter()
+                .map(|s| (s.name(), s.kind(), s.path(), s.start_line()))
+                .collect::<Vec<_>>(),
+            [("alpha", "fn", "a.rs", 1), ("Gamma", "struct", "a.rs", 2)]
+        );
+        assert_eq!(
+            syms[0].hit(),
+            index.search(CodeSearchKind::Def, "alpha", 5).symbols[0]
+        );
+        // The digest follows the text: stable on a rescan, new when a line changes.
+        let digest = files[0].content_digest();
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            scan_code_index(tmp.path())
+                .files()
+                .next()
+                .unwrap()
+                .content_digest(),
+            digest
+        );
+        write(tmp.path(), "a.rs", "pub fn alpha() {}\npub struct Delta;\n");
+        let changed = scan_code_index(tmp.path());
+        assert_ne!(changed.files().next().unwrap().content_digest(), digest);
+        assert_eq!(
+            changed.files().nth(1).unwrap().content_digest(),
+            files[1].content_digest()
+        );
     }
 
     #[test]
