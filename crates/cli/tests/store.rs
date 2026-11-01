@@ -1133,6 +1133,30 @@ fn a_command_that_names_no_engine_uses_ferro_and_migrates_a_redb_only_home() {
     // `FL_STORE_BACKEND=redb` is the rollback: it still names the redb engine.
     let v = status_json(env.redb(), &env.logical());
     assert_eq!(v["engine"], "redb");
+
+    // Rolling back by hand (`chmod 600` and the redb engine) opens the old `.redb` beside a
+    // `.fls` that was written after it: the warning says the `.fls` is NEWER.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let redb = env.logical();
+        std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Make the order certain, whatever the clock's granularity.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&redb)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+            .unwrap();
+    }
+    env.redb()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stderr(contains("NEWER"))
+        .stderr(contains("fl.fls"))
+        .stderr(contains("fl store verify"));
 }
 
 #[test]

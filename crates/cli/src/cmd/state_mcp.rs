@@ -1713,33 +1713,47 @@ mod tests {
     use super::*;
     use fl_core::MemStore;
 
-    /// Two paths that name one store open once: the primary store is held (a redb file opens
-    /// once per process), so a second open of an alias of it would fail after the retries.
-    /// Symlinks stand in for the `.redb`/`.fls` alias, which needs the process environment.
+    fn alias_entry(
+        dir: &std::path::Path,
+        name: &str,
+        store: &std::path::Path,
+    ) -> crate::config::Entry {
+        crate::config::Entry {
+            name: Some(name.into()),
+            root: dir.join(name),
+            store: store.to_path_buf(),
+            tracker: None,
+            state: None,
+        }
+    }
+
+    /// A store reached through two configured paths (here a symlink to the `.fls` file) is the
+    /// same store: `open_workflow_store` takes the same-store branch and does not scan the alias
+    /// as a second store. The primary is made with the ferro engine explicitly (a `.fls` path),
+    /// so the alias resolves to the primary's physical file on any engine selection.
     #[test]
     fn open_workflow_store_does_not_reopen_the_primary_through_an_alias() {
         let dir = tempfile::tempdir().unwrap();
-        let primary = dir.path().join("proj.redb");
-        let alias = dir.path().join("alias.redb");
-        fl_store::open_redb(&primary).unwrap();
+        let primary = dir.path().join("proj.fls");
+        let alias = dir.path().join("alias.fls");
+        fl_store::open_store_with(
+            &primary,
+            &fl_store::StoreOptions {
+                backend: Some(fl_store::BackendKind::Ferro),
+                ..fl_store::StoreOptions::default()
+            },
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&primary, &alias).unwrap();
+        assert!(
+            crate::same_store(&primary, &alias),
+            "the alias names the primary's file"
+        );
 
         let cfg = crate::config::Config {
             projects: vec![
-                crate::config::Entry {
-                    name: Some("proj".into()),
-                    root: dir.path().join("proj"),
-                    store: primary.clone(),
-                    tracker: None,
-                    state: None,
-                },
-                crate::config::Entry {
-                    name: Some("other".into()),
-                    root: dir.path().join("other"),
-                    store: alias.clone(),
-                    tracker: None,
-                    state: None,
-                },
+                alias_entry(dir.path(), "proj", &primary),
+                alias_entry(dir.path(), "other", &alias),
             ],
             ..crate::config::Config::default()
         };
@@ -1750,26 +1764,68 @@ mod tests {
             cfg: &cfg,
             cwd: dir.path(),
         };
-        let started = std::time::Instant::now();
         let store = open_workflow_store(
             &env,
             Some("proj"),
             Some("https://github.com/acme/widgets/issues/1"),
         )
         .expect("an alias of the primary is not opened again");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        // The label names the file the engine keeps the store in.
-        let kind = fl_store::choose_backend(
-            &primary,
-            std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+        assert_eq!(store.label(), primary.display().to_string());
+    }
+
+    /// The same-store branch, proved: a primary that stays on redb holds its file, so scanning
+    /// the same file again through another path would fail (a redb file opens once at a time).
+    /// A directory that cannot be written leaves the lone `.redb` unmigrated (no migration lock
+    /// can be made), and a symlinked directory is the alias. Without the dedupe in
+    /// `open_workflow_store` the scan of the alias is refused and the call errors.
+    #[test]
+    fn open_workflow_store_skips_a_scan_of_the_primary_held_on_redb() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Gives the directory back its write bit so the temp dir can be removed.
+        struct Writable(PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let primary = real.join("proj.redb");
+        drop(fl_store::open_redb(&primary).unwrap());
+        let alias_dir = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias_dir).unwrap();
+        let alias = alias_dir.join("proj.redb");
+        let _writable = Writable(real.clone());
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(real.join("probe")).is_ok() {
+            return; // a user who can write anywhere (root) cannot make the directory read-only
+        }
+        assert!(crate::same_store(&primary, &alias));
+
+        let cfg = crate::config::Config {
+            projects: vec![
+                alias_entry(dir.path(), "proj", &primary),
+                alias_entry(dir.path(), "other", &alias),
+            ],
+            ..crate::config::Config::default()
+        };
+        // The workspace store is the alias too.
+        let env = StateEnv {
+            explicit_db: None,
+            default_store: &alias,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+        let store = open_workflow_store(
+            &env,
+            Some("proj"),
+            Some("https://github.com/acme/widgets/issues/1"),
         )
-        .unwrap();
-        assert_eq!(
-            store.label(),
-            fl_store::physical_path(&primary, kind)
-                .display()
-                .to_string()
-        );
+        .expect("the alias of the primary is not scanned");
+        // Still on redb: no .fls was made.
+        assert_eq!(store.label(), primary.display().to_string());
+        assert!(!real.join("proj.fls").exists());
     }
 
     /// `fl_code_search` and `fl_batch_search` on a FerroStore (an explicit `.fls`

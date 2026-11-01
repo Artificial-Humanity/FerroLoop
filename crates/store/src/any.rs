@@ -281,16 +281,30 @@ pub fn forget_fallback(path: &Path) {
 /// Warn, once per process per store, that a `.fls` sits beside a `.redb` that
 /// is being opened with the redb engine. After a migration the redb is kept
 /// read-only; if it was made writable again and written, the `.fls` no longer
-/// matches it.
+/// matches it. When the `.fls` was written after the `.redb`, the warning says
+/// the `.fls` is newer: this process is then working on the older copy, and
+/// any process on the ferro engine still works on the newer one.
 fn warn_if_fls_beside(redb: &Path, sink: &dyn Fn(&str)) {
     let fls = redb.with_extension(FERRO_EXTENSION);
     if fls == redb || std::fs::symlink_metadata(&fls).is_err() {
         return;
     }
     if first_time("fls-beside-redb", &memory_key(redb)) {
+        let fls_is_newer = match (
+            std::fs::metadata(&fls).and_then(|m| m.modified()),
+            std::fs::metadata(redb).and_then(|m| m.modified()),
+        ) {
+            (Ok(fls_time), Ok(redb_time)) => fls_time > redb_time,
+            _ => false,
+        };
+        let differ = if fls_is_newer {
+            "the .fls is NEWER than the .redb, so the two differ: writes made on the ferro \
+             engine are not in the redb"
+        } else {
+            "if the redb was made writable again after a migration, the two may differ"
+        };
         sink(&format!(
-            "warning: {} exists beside {}, which is opened with the redb engine: if the redb \
-             was made writable again after a migration, the two may differ; run \
+            "warning: {} exists beside {}, which is opened with the redb engine: {differ}; run \
              `fl store verify` to compare them",
             fls.display(),
             redb.display()
@@ -2518,6 +2532,44 @@ mod tests {
         // A ferro open of the same store is not a redb-engine open.
         drop(open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &said.sink()).unwrap());
         assert_eq!(said.all().len(), 1);
+    }
+
+    #[test]
+    fn the_redb_engine_warning_says_the_fls_is_newer_when_it_is() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let t1 = t0 + std::time::Duration::from_secs(3600);
+        let redb_opts = StoreOptions {
+            backend: Some(BackendKind::Redb),
+            ..StoreOptions::default()
+        };
+        let set_mtime = |path: &Path, time: std::time::SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        // (mtime of the .redb, mtime of the .fls, whether the warning says NEWER)
+        for (redb_time, fls_time, newer) in [(t0, t1, true), (t1, t0, false)] {
+            let dir = TempDir::new().unwrap();
+            let redb = dir.path().join("s.redb");
+            let fls = dir.path().join("s.fls");
+            drop(RedbStore::open(&redb).unwrap());
+            drop(FerroStore::open(&fls).unwrap());
+            set_mtime(&redb, redb_time);
+            set_mtime(&fls, fls_time);
+            let said = Lines::default();
+            drop(open_store_sink(&redb, &redb_opts, &said.sink()).unwrap());
+            let lines = said.all();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0].contains("NEWER"), newer, "{lines:?}");
+            assert!(lines[0].contains("s.fls"), "{lines:?}");
+            assert!(lines[0].contains("fl store verify"), "{lines:?}");
+            if !newer {
+                assert!(lines[0].contains("may differ"), "{lines:?}");
+            }
+        }
     }
 
     #[test]

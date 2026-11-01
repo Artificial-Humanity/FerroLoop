@@ -95,19 +95,31 @@ fn store_extension_with(env: Option<&str>) -> String {
         .to_string()
 }
 
+/// The engine selection a request reads the project files by: the hub's own selection when it has
+/// one (`store_backend`, set only by tests), else `FL_STORE_BACKEND`. It is the same selection the
+/// `open_*` functions open the stores with.
+fn engine_env(state: &HubState) -> Option<String> {
+    match state.store_backend {
+        Some(fl_store::BackendKind::Redb) => Some("redb".to_string()),
+        Some(fl_store::BackendKind::Ferro) => Some("ferro".to_string()),
+        None => std::env::var(fl_store::BACKEND_ENV).ok(),
+    }
+}
+
 /// The logical path of the per-project store (`<slug>.redb`) when its physical file exists as a
 /// plain file. A symlink or anything else that is not a regular file is refused, so the slug
 /// cannot be used to reach another path.
 ///
 /// Under the FerroStore engine a project that still has only its `<slug>.redb` (not yet
 /// migrated) is an error, not `None`: `None` sends the request to the hub store, which would
-/// take a write meant for the project.
-fn project_redb(home: &Path, slug: &str) -> Result<Option<PathBuf>, HttpResponse> {
-    project_redb_with(
-        home,
-        slug,
-        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
-    )
+/// take a write meant for the project. The hub never migrates a project store: the first `fl`
+/// command that opens it, or `fl store migrate`, does.
+fn project_redb(
+    state: &HubState,
+    home: &Path,
+    slug: &str,
+) -> Result<Option<PathBuf>, HttpResponse> {
+    project_redb_with(home, slug, engine_env(state).as_deref())
 }
 
 /// [`project_redb`] with the value of `FL_STORE_BACKEND` passed in.
@@ -183,7 +195,7 @@ fn open_project_store<'a>(
     slug: &str,
 ) -> Result<OpenedStore<'a>, HttpResponse> {
     let own = match hub_home_dir(state) {
-        Some(home) => project_redb(&home, slug)?,
+        Some(home) => project_redb(state, &home, slug)?,
         None => None,
     };
     match own {
@@ -199,10 +211,15 @@ fn open_project_store<'a>(
     }
 }
 
-/// Every project this hub can show: each `<slug>.redb` beside the hub store (not `fl.redb`, not
-/// a symlink, only well-formed lowercase slugs), plus the default. Reads at most 200 entries.
-pub(crate) fn available_projects(home: Option<&Path>) -> Vec<String> {
-    available_projects_with(home, std::env::var(fl_store::BACKEND_ENV).ok().as_deref())
+/// Every project this hub can show: each project store file of the selected engine
+/// (`<slug>.fls` under FerroStore, `<slug>.redb` under redb) beside the hub store (not the hub
+/// store itself, not a symlink, only well-formed lowercase slugs), plus the default. Reads at
+/// most 200 entries.
+///
+/// Under FerroStore a project that still has only its `<slug>.redb` is not listed (its records
+/// answer `409`) until a `fl` command, or `fl store migrate`, opens it and makes the `.fls`.
+fn available_projects(state: &HubState, home: Option<&Path>) -> Vec<String> {
+    available_projects_with(home, engine_env(state).as_deref())
 }
 
 /// [`available_projects`] with the value of `FL_STORE_BACKEND` passed in.
@@ -380,7 +397,7 @@ pub(crate) fn handle_get_records(state: &HubState, req: &HttpRequest) -> HttpRes
             200,
             json!({
                 "project": slug,
-                "available_projects": available_projects(hub_home_dir(state).as_deref()),
+                "available_projects": available_projects(state, hub_home_dir(state).as_deref()),
                 "records": records,
                 "summary": summary,
             }),
@@ -914,7 +931,11 @@ mod tests {
 
     /// A store at `path` holding one project and one record per `(title, state)`.
     fn seed(path: &Path, records: &[(&str, State)]) -> (AnyStore, ProjectId, Vec<RecordId>) {
-        let store = fl_store::open_store(path).unwrap();
+        seed_on(fl_store::open_store(path).unwrap(), records)
+    }
+
+    /// [`seed`] on a store already opened (so a test can pick the engine).
+    fn seed_on(store: AnyStore, records: &[(&str, State)]) -> (AnyStore, ProjectId, Vec<RecordId>) {
         let project = store.add_project("/workspace/seed").unwrap();
         let ids = records
             .iter()
@@ -925,6 +946,18 @@ mod tests {
             })
             .collect();
         (store, project, ids)
+    }
+
+    /// Open the store at `path` on the named engine, whatever the environment says.
+    fn open_on(kind: fl_store::BackendKind, path: &Path) -> AnyStore {
+        fl_store::open_store_with(
+            path,
+            &fl_store::StoreOptions {
+                backend: Some(kind),
+                ..fl_store::StoreOptions::default()
+            },
+        )
+        .unwrap()
     }
 
     fn seed_hub(state: &HubState, records: &[(&str, State)]) -> Vec<RecordId> {
@@ -1072,8 +1105,13 @@ mod tests {
     fn available_projects_lists_stores_but_not_the_hub_store_and_always_the_default() {
         let tmp = TempDir::new().unwrap();
         let dir = fl_dir(&tmp);
-        assert_eq!(available_projects(Some(tmp.path())), vec!["ferroloop"]);
-        assert_eq!(available_projects(None), vec!["ferroloop"]);
+        let mut state = test_state(&tmp);
+        state.store_backend = Some(fl_store::BackendKind::Ferro);
+        assert_eq!(
+            available_projects(&state, Some(tmp.path())),
+            vec!["ferroloop"]
+        );
+        assert_eq!(available_projects(&state, None), vec!["ferroloop"]);
         for name in [
             "fl.fls",
             "zeta.fls",
@@ -1089,13 +1127,13 @@ mod tests {
         fs::write(tmp.path().join("target.fls"), b"x").unwrap();
         std::os::unix::fs::symlink(tmp.path().join("target.fls"), dir.join("linked.fls")).unwrap();
         assert_eq!(
-            available_projects(Some(tmp.path())),
+            available_projects(&state, Some(tmp.path())),
             vec!["alpha", "ferroloop", "zeta"]
         );
         // `ferroloop.fls` present does not list it twice.
         fs::write(dir.join("ferroloop.fls"), b"x").unwrap();
         assert_eq!(
-            available_projects(Some(tmp.path())),
+            available_projects(&state, Some(tmp.path())),
             vec!["alpha", "ferroloop", "zeta"]
         );
     }
@@ -1359,13 +1397,28 @@ mod tests {
 
     #[test]
     fn creating_a_record_in_doing_in_a_project_store_leaves_the_store_format_alone() {
+        creating_a_record_in_doing_leaves_the_format_alone(fl_store::BackendKind::Ferro);
+    }
+
+    /// The rollback engine keeps the precondition the format check needs: a new redb store is
+    /// older than the routing format, so a raise would show.
+    #[test]
+    fn creating_a_record_in_doing_in_a_redb_project_store_leaves_the_store_format_alone() {
+        creating_a_record_in_doing_leaves_the_format_alone(fl_store::BackendKind::Redb);
+    }
+
+    fn creating_a_record_in_doing_leaves_the_format_alone(kind: fl_store::BackendKind) {
         let tmp = TempDir::new().unwrap();
-        let state = test_state(&tmp);
+        let mut state = test_state(&tmp);
+        state.store_backend = Some(kind);
         let path = fl_dir(&tmp).join("foo.redb");
         let format_before = {
-            let (store, _, _) = seed(&path, &[("existing", State::Todo)]);
+            let (store, _, _) = seed_on(open_on(kind, &path), &[("existing", State::Todo)]);
             store.format_version().unwrap()
         };
+        if kind == fl_store::BackendKind::Redb {
+            assert!(format_before < Some(fl_store::FORMAT_WITH_ROUTING));
+        }
         let req = owner("POST", "/api/v1/records")
             .with_json_body(&json!({ "project": "FOO", "title": "board", "state": "doing" }));
         let (status, body) = call(&state, &req);
@@ -1377,7 +1430,7 @@ mod tests {
         let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
         assert_eq!(titles(&listed), vec!["existing", "board"]);
         assert!(
-            !fl_store::store_exists(&state.config.store_path),
+            !state.config.store_path.exists(),
             "the hub store was not used"
         );
         // An empty area is no area.
@@ -1385,19 +1438,32 @@ mod tests {
             .with_json_body(&json!({ "project": "foo", "title": "x", "area": "  " }));
         assert_eq!(call(&state, &none).1["record"]["area"], Value::Null);
         // ⚠ Creating a record is not a format upgrade: an older fl still reads the store.
-        let store = fl_store::open_store(&path).unwrap();
+        let store = open_on(kind, &path);
         assert_eq!(store.format_version().unwrap(), format_before);
     }
 
     #[test]
     fn a_create_with_an_area_is_a_422_and_writes_nothing() {
+        a_create_with_an_area_writes_nothing(fl_store::BackendKind::Ferro);
+    }
+
+    #[test]
+    fn a_create_with_an_area_in_a_redb_project_store_is_a_422_and_writes_nothing() {
+        a_create_with_an_area_writes_nothing(fl_store::BackendKind::Redb);
+    }
+
+    fn a_create_with_an_area_writes_nothing(kind: fl_store::BackendKind) {
         let tmp = TempDir::new().unwrap();
-        let state = test_state(&tmp);
+        let mut state = test_state(&tmp);
+        state.store_backend = Some(kind);
         let path = fl_dir(&tmp).join("foo.redb");
         let format_before = {
-            let (store, _, _) = seed(&path, &[("existing", State::Todo)]);
+            let (store, _, _) = seed_on(open_on(kind, &path), &[("existing", State::Todo)]);
             store.format_version().unwrap()
         };
+        if kind == fl_store::BackendKind::Redb {
+            assert!(format_before < Some(fl_store::FORMAT_WITH_ROUTING));
+        }
         for area in ["frontend", " frontend ", "Bad Area", "a\u{0}b"] {
             let req = owner("POST", "/api/v1/records").with_json_body(
                 &json!({ "project": "foo", "title": "board", "area": area, "state": "doing" }),
@@ -1411,7 +1477,7 @@ mod tests {
         }
         let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
         assert_eq!(titles(&listed), vec!["existing"]);
-        let store = fl_store::open_store(&path).unwrap();
+        let store = open_on(kind, &path);
         assert_eq!(store.format_version().unwrap(), format_before);
     }
 
