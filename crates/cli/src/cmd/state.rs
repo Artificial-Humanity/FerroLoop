@@ -1586,9 +1586,7 @@ mod tests {
     use fl_core::MemStore;
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
 
-    /// Two paths that name one store open once: the primary store is held (a redb file opens
-    /// once per process), so a second open of an alias of it would fail after the retries.
-    /// Symlinks stand in for the `.redb`/`.fls` alias, which needs the process environment.
+    /// `scan_owns` answers for a store it can open, and fails (never "not mine") on one it cannot.
     #[test]
     fn scan_owns_answers_for_a_store_and_fails_on_one_it_cannot_open() {
         use fl_core::Catalog;
@@ -1607,6 +1605,9 @@ mod tests {
         assert!(scan_owns(&not_a_store, &stranger).is_err());
     }
 
+    /// Two paths that name one store open once: the primary store is held (a redb file opens
+    /// once per process), so a second open of an alias of it would fail after the retries.
+    /// Symlinks stand in for the `.redb`/`.fls` alias, which needs the process environment.
     #[test]
     fn open_for_id_or_key_does_not_reopen_the_primary_through_an_alias() {
         let dir = tempfile::tempdir().unwrap();
