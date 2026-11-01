@@ -5,6 +5,7 @@
 mod agents;
 pub mod api;
 mod artifacts;
+mod attachments;
 pub mod auth;
 pub mod cloud_adapters;
 pub mod commands;
@@ -23,6 +24,7 @@ pub mod ws;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -179,6 +181,8 @@ pub struct HubState {
     /// A few read-only handles on the code vector sidecar, so a code search does not open the
     /// sidecar again every time. They never create or write it.
     pub(crate) code_sidecars: Arc<fl_store::CodeSidecarCache>,
+    /// Set while an attachment sweep runs, so only one runs at a time (see [`attachments`]).
+    pub(crate) attachment_sweep_running: Arc<AtomicBool>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -286,6 +290,7 @@ impl HubState {
             probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
             store_backend: None,
             code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
+            attachment_sweep_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -7082,6 +7087,7 @@ default_target = "wire:felicity"
                 "sound_enabled": false,
             },
             "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+            "attachment_retention_days": 7,
         })
     }
 
@@ -7283,6 +7289,274 @@ default_target = "wire:felicity"
         assert_eq!(frame.event, "settings.updated");
         assert_eq!(frame.data, resp.json_value().unwrap());
         assert_eq!(frame.data["theme_preference"], "light");
+    }
+
+    // --- Attachment retention ----------------------------------------------------------------
+
+    const ATTACH_PRUNE_URL: &str = "/api/v1/attachments/prune";
+    const DAY_SECS: u64 = 24 * 60 * 60;
+
+    fn seed_aged_attachment(tmp: &TempDir, name: &str, bytes: &[u8], age_days: u64) -> PathBuf {
+        let dir = tmp.path().join("attachments");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        let when = std::time::SystemTime::now() - Duration::from_secs(age_days * DAY_SECS);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        path
+    }
+
+    fn prune_attachments(state: &HubState, token: &str, body: &[u8]) -> HttpResponse {
+        handle_http_request(
+            state,
+            &HttpRequest::new("POST", ATTACH_PRUNE_URL)
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_body(body.to_vec()),
+        )
+    }
+
+    fn upload_attachment(state: &HubState, name: &str) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG new upload");
+        let resp = handle_http_request(
+            state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", format!("Bearer {OWNER}"))
+                .with_json_body(&json!({
+                    "prompt": "see attached",
+                    "attachments": [{ "name": name, "media_type": "image/png", "data_base64": b64 }],
+                })),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        resp.json_value().unwrap()["attachments"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn attachments_prune_is_owner_only_and_validates_its_body() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 30);
+
+        let peer = prune_attachments(&state, PEER, br#"{"older_than_days":0}"#);
+        assert_eq!(peer.status, 403);
+        assert_eq!(
+            error_text(&peer),
+            "only Owner authority may prune attachments"
+        );
+        let unauth = handle_http_request(&state, &HttpRequest::new("POST", ATTACH_PRUNE_URL));
+        assert_eq!(unauth.status, 401);
+
+        for bad in [
+            &br#"{"older_than_days":366}"#[..],
+            br#"{"older_than_days":-1}"#,
+            br#"{"older_than_days":"7"}"#,
+            br#"{"older_than":7}"#,
+            br#"{"older_than_days":1,"extra":true}"#,
+            br#"[1]"#,
+            b"{ nope",
+        ] {
+            let resp = prune_attachments(&state, OWNER, bad);
+            assert_eq!(
+                resp.status,
+                400,
+                "{}: {}",
+                String::from_utf8_lossy(bad),
+                error_text(&resp)
+            );
+        }
+        assert!(old.exists(), "a refused prune deletes nothing");
+    }
+
+    #[test]
+    fn attachments_prune_uses_explicit_days_the_setting_and_purges_all_on_zero() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let ten = seed_aged_attachment(&tmp, "ten.png", b"1234567890", 10);
+        let five = seed_aged_attachment(&tmp, "five.png", b"12345", 5);
+        let one = seed_aged_attachment(&tmp, "one.png", b"1", 1);
+        let mut rx = state.subscribe();
+
+        // Explicit days: nothing is older than 30.
+        let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":30}"#);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "report": { "deleted_count": 0, "deleted_bytes": 0, "kept_count": 3 },
+                "older_than_days": 30,
+                "retention_disabled": false,
+            })
+        );
+        let frame = rx.try_recv().expect("attachments.pruned frame");
+        assert_eq!(frame.channel, "attachments");
+        assert_eq!(frame.event, "attachments.pruned");
+        assert_eq!(frame.data, body);
+
+        // Omitted: the saved setting (default 7) applies. An empty body is the same as `{}`.
+        for empty in [&b""[..], b"{}"] {
+            let resp = prune_attachments(&state, OWNER, empty);
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap()["older_than_days"], 7);
+        }
+        assert!(!ten.exists());
+        assert!(five.exists() && one.exists());
+
+        // Retention 0 and no explicit days: nothing is deleted and the response says so.
+        let put = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "attachment_retention_days": 0 }),
+        );
+        assert_eq!(put.status, 200, "{}", error_text(&put));
+        assert_eq!(put.json_value().unwrap()["attachment_retention_days"], 0);
+        let resp = prune_attachments(&state, OWNER, b"");
+        assert_eq!(
+            resp.json_value().unwrap(),
+            json!({
+                "report": { "deleted_count": 0, "deleted_bytes": 0, "kept_count": 2 },
+                "older_than_days": null,
+                "retention_disabled": true,
+            })
+        );
+        assert!(five.exists() && one.exists());
+
+        let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":3}"#);
+        assert_eq!(
+            resp.json_value().unwrap()["report"],
+            json!({ "deleted_count": 1, "deleted_bytes": 5, "kept_count": 1 })
+        );
+        assert!(!five.exists() && one.exists());
+
+        // 0 purges everything, however young.
+        upload_attachment(&state, "fresh.png");
+        let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":0}"#);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["older_than_days"], 0);
+        assert_eq!(body["report"]["deleted_count"], 2);
+        assert_eq!(body["report"]["kept_count"], 0);
+        assert_eq!(
+            fs::read_dir(tmp.path().join("attachments"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn settings_put_refuses_attachment_retention_above_365() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let resp = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "attachment_retention_days": 366 }),
+        );
+        assert_eq!(resp.status, 400);
+        assert!(error_text(&resp).contains("attachment_retention_days"));
+        let resp = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "attachment_retention_days": 365 }),
+        );
+        assert_eq!(resp.status, 200);
+        let got = call(&state, "GET", "/api/v1/settings", PEER, &json!({}));
+        assert_eq!(got.json_value().unwrap()["attachment_retention_days"], 365);
+    }
+
+    #[test]
+    fn an_upload_sweeps_expired_attachments_in_the_background_but_keeps_the_new_one() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 10);
+        let young = seed_aged_attachment(&tmp, "young.png", b"young", 2);
+
+        let new_path = upload_attachment(&state, "new.png");
+
+        // Bounded wait for the background sweep: it deletes `old` and then clears its flag.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (old.exists()
+            || state
+                .attachment_sweep_running
+                .load(std::sync::atomic::Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!old.exists(), "the upload's sweep removes the expired file");
+        assert!(young.exists());
+        assert!(
+            Path::new(&new_path).exists(),
+            "the new upload is never swept"
+        );
+    }
+
+    #[test]
+    fn no_automatic_sweep_runs_when_retention_is_zero_or_a_sweep_is_running() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 30);
+
+        // A sweep already running: neither entry point starts another.
+        state
+            .attachment_sweep_running
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(attachments::spawn_attachment_sweep(&state).is_none());
+        assert!(attachments::run_attachment_sweep(&state).is_none());
+        state
+            .attachment_sweep_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        assert!(old.exists());
+
+        // Retention 0: no sweep thread, and an upload leaves the old file alone.
+        let put = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "attachment_retention_days": 0 }),
+        );
+        assert_eq!(put.status, 200);
+        assert!(attachments::spawn_attachment_sweep(&state).is_none());
+        assert!(attachments::run_attachment_sweep(&state).is_none());
+        upload_attachment(&state, "new.png");
+        assert!(
+            !state
+                .attachment_sweep_running
+                .load(std::sync::atomic::Ordering::Acquire),
+            "no sweep was started"
+        );
+        assert!(old.exists());
+
+        // Back on: a direct sweep (the hourly and start-up path) removes it.
+        let put = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "attachment_retention_days": 7 }),
+        );
+        assert_eq!(put.status, 200);
+        let report = attachments::run_attachment_sweep(&state).expect("sweep ran");
+        assert_eq!(report.deleted_count, 1);
+        assert_eq!(report.kept_count, 1);
+        assert!(!old.exists());
+        let handle = attachments::spawn_attachment_sweep(&state).expect("sweep thread");
+        assert_eq!(handle.join().unwrap().deleted_count, 0);
     }
 
     // --- Records 52 and 53: cloud adapter settings -------------------------------------------

@@ -14,6 +14,10 @@ use crate::artifacts::write_file_atomic;
 
 pub(crate) const MIN_POLL_INTERVAL_SECS: u64 = 2;
 pub(crate) const MAX_POLL_INTERVAL_SECS: u64 = 300;
+/// How long `FerroDeck` chat attachments are kept when no setting says otherwise.
+pub(crate) const DEFAULT_ATTACHMENT_RETENTION_DAYS: u64 = 7;
+/// The longest attachment retention a patch may set.
+pub(crate) const MAX_ATTACHMENT_RETENTION_DAYS: u64 = 365;
 
 /// Serialises every settings read-modify-write.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
@@ -58,6 +62,11 @@ pub(crate) struct Settings {
     pub subsystems: Subsystems,
     pub notifications: Notifications,
     pub hub_connection: HubConnection,
+    /// Days the hub keeps uploaded chat attachments (`0..=365`, default 7). The hub deletes an
+    /// attachment older than this after an upload and on its periodic sweep. `0` turns automatic
+    /// deletion off. Expiry does not check whether a message still refers to the file, so an
+    /// expired attachment breaks its image link in old chat transcripts.
+    pub attachment_retention_days: u64,
 }
 
 impl Default for Settings {
@@ -80,6 +89,7 @@ impl Default for Settings {
                 auto_reconnect_ws: true,
                 poll_interval_secs: 10,
             },
+            attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
         }
     }
 }
@@ -94,6 +104,8 @@ pub(crate) struct SettingsPatch {
     pub subsystems: Option<SubsystemsPatch>,
     pub notifications: Option<NotificationsPatch>,
     pub hub_connection: Option<HubConnectionPatch>,
+    /// See [`Settings::attachment_retention_days`]. A value above 365 is refused.
+    pub attachment_retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -124,6 +136,10 @@ fn poll_interval_in_range(secs: u64) -> bool {
     (MIN_POLL_INTERVAL_SECS..=MAX_POLL_INTERVAL_SECS).contains(&secs)
 }
 
+fn retention_in_range(days: u64) -> bool {
+    days <= MAX_ATTACHMENT_RETENTION_DAYS
+}
+
 fn normalize_timezone(raw: &str) -> Option<String> {
     let tz = raw.trim();
     if tz.is_empty() || tz.len() > 64 {
@@ -148,8 +164,8 @@ fn normalize_timezone(raw: &str) -> Option<String> {
 }
 
 impl Settings {
-    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval or timezone
-    /// is invalid.
+    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval, timezone
+    /// or attachment retention is invalid.
     pub(crate) fn merged(&self, patch: SettingsPatch) -> Result<Self, String> {
         let mut next = self.clone();
         if let Some(theme) = patch.theme_preference {
@@ -188,6 +204,15 @@ impl Settings {
                 }
                 next.hub_connection.poll_interval_secs = secs;
             }
+        }
+        if let Some(days) = patch.attachment_retention_days {
+            if !retention_in_range(days) {
+                return Err(format!(
+                    "attachment_retention_days must be between 0 and \
+                     {MAX_ATTACHMENT_RETENTION_DAYS}"
+                ));
+            }
+            next.attachment_retention_days = days;
         }
         Ok(next)
     }
@@ -268,6 +293,13 @@ impl Settings {
         {
             s.hub_connection.poll_interval_secs = secs;
         }
+        if let Some(days) = root
+            .get("attachment_retention_days")
+            .and_then(Value::as_u64)
+            .filter(|days| retention_in_range(*days))
+        {
+            s.attachment_retention_days = days;
+        }
         s
     }
 }
@@ -338,8 +370,81 @@ mod tests {
                     "sound_enabled": false,
                 },
                 "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+                "attachment_retention_days": 7,
             })
         );
+    }
+
+    #[test]
+    fn attachment_retention_defaults_to_seven_when_the_file_lacks_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file written before the field existed.
+        let doc = json!({
+            "theme_preference": "light",
+            "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.attachment_retention_days, 7);
+        assert_eq!(loaded.theme_preference, Theme::Light);
+        // Stored values outside the contract fall back to the default too.
+        for (stored, want) in [
+            (json!(0), 0),
+            (json!(30), 30),
+            (json!(365), 365),
+            (json!(366), 7),
+            (json!(-1), 7),
+            (json!("30"), 7),
+            (json!(2.5), 7),
+        ] {
+            let doc = json!({ "attachment_retention_days": stored });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            assert_eq!(load(tmp.path()).attachment_retention_days, want, "{stored}");
+        }
+    }
+
+    #[test]
+    fn attachment_retention_patch_sets_accepts_zero_and_refuses_above_365() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let out = update(
+            tmp.path(),
+            patch(json!({ "attachment_retention_days": 30 })),
+        )
+        .unwrap();
+        assert_eq!(out.attachment_retention_days, 30);
+        assert_eq!(load(tmp.path()).attachment_retention_days, 30);
+
+        let res = update(
+            tmp.path(),
+            patch(json!({ "attachment_retention_days": 366 })),
+        );
+        let Err(UpdateError::Invalid(msg)) = res else {
+            panic!("366 must be refused");
+        };
+        assert!(msg.contains("attachment_retention_days"), "{msg}");
+        assert_eq!(load(tmp.path()).attachment_retention_days, 30);
+
+        for ok in [0, 365] {
+            let out = update(
+                tmp.path(),
+                patch(json!({ "attachment_retention_days": ok })),
+            )
+            .unwrap();
+            assert_eq!(out.attachment_retention_days, ok);
+            assert_eq!(load(tmp.path()).attachment_retention_days, ok);
+        }
+        for bad in [json!(-1), json!("7"), json!(1.5)] {
+            assert!(
+                serde_json::from_value::<SettingsPatch>(
+                    json!({ "attachment_retention_days": bad })
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -198,6 +198,8 @@ export interface HubSettings {
     auto_reconnect_ws: boolean;
     poll_interval_secs: number;
   };
+  /** Days the hub keeps chat attachments (0..=365, default 7; 0 = never auto-delete). */
+  attachment_retention_days?: number;
 }
 
 export const DEFAULT_HUB_SETTINGS: HubSettings = {
