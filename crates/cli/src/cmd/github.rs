@@ -6,7 +6,7 @@ use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::Iri;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -54,7 +54,7 @@ pub fn run(
     ctx: &Ctx<'_>,
     cmd: Cmd,
     root: Option<&Path>,
-    ws_store: &RedbStore,
+    ws_store: &AnyStore,
     binding: Option<&config::TrackerBinding>,
     github_app: Option<&config::GithubApp>,
     default_project: Option<&str>,

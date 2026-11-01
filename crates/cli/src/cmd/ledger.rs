@@ -350,7 +350,6 @@ mod tests {
     use super::*;
     use fl_github::fake::FakeGithub;
     use fl_github::{Client, EnvToken, Repo};
-    use fl_store::RedbStore;
 
     // Spec §6.1 step 4: `init` without the project's root refuses; it never
     // passes over the manifest and goes on to GitHub.
@@ -362,7 +361,7 @@ mod tests {
             Box::new(EnvToken::from_lookup(|_| Some("t".into())).unwrap()),
         );
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let repo = Repo {
             full_name: "acme/widgets".into(),
             node_id: "R_1".into(),

@@ -1461,7 +1461,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, WireConfig};
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
-    use fl_store::RedbStore;
 
     #[test]
     fn test_wire_cli_send_read_ack_reply_and_agent_msg_compat() {
@@ -1489,7 +1488,7 @@ mod tests {
 
         // Pre-populate two agents directly in the store so we don't capture live env routes
         {
-            let store = RedbStore::open(&db).unwrap();
+            let store = fl_store::open_redb(&db).unwrap();
             store
                 .register_agent(RegisterAgentArgs {
                     display_name: "Kacey".into(),

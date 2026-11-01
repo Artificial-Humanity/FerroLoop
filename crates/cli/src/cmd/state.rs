@@ -20,7 +20,7 @@ use fl_core::state::{
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 
 use crate::cmd::agent::{now_at, write_atomic_non_symlink};
 use crate::config::Config;
@@ -778,7 +778,7 @@ impl<'a> StateEnv<'a> {
         StateScope::Workspace
     }
 
-    pub fn open_for_scope(&self, scope: Option<&StateScope>) -> Result<RedbStore, String> {
+    pub fn open_for_scope(&self, scope: Option<&StateScope>) -> Result<AnyStore, String> {
         let path = if let Some(db) = self.explicit_db {
             db.to_path_buf()
         } else if let Some(sc) = scope {
@@ -792,14 +792,14 @@ impl<'a> StateEnv<'a> {
             fl_store::private::create_private_dir_all(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        RedbStore::open(&path).map_err(|e| format!("{}: {e}", path.display()))
+        fl_store::open_store(&path).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     pub fn open_for_id_or_key(
         &self,
         id_or_key: &str,
         scope: Option<&StateScope>,
-    ) -> Result<RedbStore, String> {
+    ) -> Result<AnyStore, String> {
         let primary_path = if let Some(db) = self.explicit_db {
             db.to_path_buf()
         } else if let Some(sc) = scope {
@@ -813,7 +813,7 @@ impl<'a> StateEnv<'a> {
             fl_store::private::create_private_dir_all(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let primary = RedbStore::open(&primary_path)
+        let primary = fl_store::open_store(&primary_path)
             .map_err(|e| format!("{}: {e}", primary_path.display()))?;
         if self.explicit_db.is_some() {
             return Ok(primary);
@@ -825,18 +825,18 @@ impl<'a> StateEnv<'a> {
             return Ok(primary);
         }
         let ws_path = self.cfg.workspace_state_store(self.default_store);
-        if ws_path != primary_path && ws_path.exists() {
-            let other = RedbStore::open(&ws_path).map_err(|e| e.to_string())?;
+        if ws_path != primary_path && fl_store::store_exists(&ws_path) {
+            let other = fl_store::open_store(&ws_path).map_err(|e| e.to_string())?;
             if other.owns(&iri).map_err(|e| e.to_string())? {
                 return Ok(other);
             }
         }
         for entry in &self.cfg.projects {
             let path = &entry.store;
-            if path == &primary_path || !path.exists() {
+            if path == &primary_path || !fl_store::store_exists(path) {
                 continue;
             }
-            let other = RedbStore::open(path).map_err(|e| e.to_string())?;
+            let other = fl_store::open_store(path).map_err(|e| e.to_string())?;
             if other.owns(&iri).map_err(|e| e.to_string())? {
                 return Ok(other);
             }

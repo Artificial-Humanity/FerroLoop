@@ -9,11 +9,11 @@ use fl_github::GithubLedger;
 use fl_github::ledger::disclose::{self, Visibility};
 use fl_github::ledger::layout::decision_subject;
 use fl_github::ledger::render::{self, Catalogued, DecisionView};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 
 /// What the local catalog says of `project`: each gate's name, and each
 /// transition's gates. A comment names gates by it (spec §4.2).
-pub fn catalogued(store: &RedbStore, project: &ProjectId) -> Result<Catalogued, StoreError> {
+pub fn catalogued(store: &AnyStore, project: &ProjectId) -> Result<Catalogued, StoreError> {
     let mut cat = Catalogued::default();
     for g in store.list_gates(project)? {
         cat.names.insert(g.id, g.name);
@@ -135,7 +135,7 @@ pub fn after(ctx: &Ctx<'_>, project: &ProjectId, completed: bool) {
 }
 
 fn post_one(
-    store: &RedbStore,
+    store: &AnyStore,
     gl: &GithubLedger<'_>,
     project: &ProjectId,
     flush: &Flush,
@@ -153,7 +153,7 @@ fn post_one(
 /// the repository's visibility exactly as the flush published them
 /// (decision 2).
 fn local_view(
-    store: &RedbStore,
+    store: &AnyStore,
     gl: &GithubLedger<'_>,
     project: &ProjectId,
     flush: &Flush,
@@ -282,7 +282,7 @@ mod tests {
     fn the_catalog_a_comment_reads_holds_only_the_projects_own_gates() {
         use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let gate = |p: &ProjectId, name: &str| {
             let kind = GateKind::Command(CommandSpec {
                 program: "true".into(),
@@ -328,7 +328,7 @@ mod tests {
             Box::new(EnvToken::from_lookup(|_| Some("t".into())).unwrap()),
         );
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let project = store.add_project("/r").unwrap();
         let repo = Repo {
             full_name: "acme/widgets".into(),
@@ -380,7 +380,7 @@ mod tests {
             Box::new(EnvToken::from_lookup(|_| Some("t".into())).unwrap()),
         );
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let project = store.add_project("/r").unwrap();
         let repo = Repo {
             full_name: "acme/widgets".into(),

@@ -5,7 +5,7 @@ use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{Regret, State, Transition};
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -59,7 +59,7 @@ impl Cmd {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &AnyStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add {
             project,

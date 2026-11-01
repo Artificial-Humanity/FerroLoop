@@ -195,7 +195,28 @@ fn resolve_hub_store_path(env: &StateEnv<'_>) -> PathBuf {
     env.cfg.workspace_state_store(env.default_store)
 }
 
+/// The hub's functions (`fl_hub`) still take a `RedbStore`, so `fl hub` runs on
+/// redb only until the hub moves to `AnyStore`. A path or environment that
+/// selects FerroStore is refused by name rather than opened as the wrong file.
 fn open_hub_store_with_retry(store_path: &Path) -> Result<RedbStore, (i32, String)> {
+    match fl_store::choose_backend(
+        store_path,
+        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+    ) {
+        Ok(fl_store::BackendKind::Redb) => {}
+        Ok(fl_store::BackendKind::Ferro) => {
+            return Err((
+                2,
+                format!(
+                    "`fl hub` does not run on the FerroStore engine yet; the store at {} selects \
+                     it. Unset {} (or point the hub at a .redb store)",
+                    store_path.display(),
+                    fl_store::BACKEND_ENV
+                ),
+            ));
+        }
+        Err(e) => return Err((2, e.to_string())),
+    }
     if let Some(dir) = store_path.parent()
         && !dir.as_os_str().is_empty()
     {

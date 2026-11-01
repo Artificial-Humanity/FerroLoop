@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use ctx::Ctx;
 use fl_core::{CatalogChecked, Iri, KindRouted, StoreError};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -238,7 +238,7 @@ fn api_override_host(url: &str) -> Result<String> {
 fn open_github(
     b: &config::TrackerBinding,
     app: Option<&config::GithubApp>,
-    store: &RedbStore,
+    store: &AnyStore,
 ) -> Result<fl_github::GithubTracker> {
     let api = match std::env::var("FL_GITHUB_API_URL") {
         Err(_) => fl_github::DEFAULT_API.to_string(),
@@ -376,17 +376,17 @@ fn choose_store(
         }
         // Never create a store while searching: only files that exist are
         // stores.
-        candidates.retain(|c| c.exists());
+        candidates.retain(|c| fl_store::store_exists(c));
         return choose_among(&candidates, iris);
     }
 
     // ⚠ Confined mode has exactly one candidate —
     // `bound` itself — but looking up an IRI must never create a store
-    // (`RedbStore::open` calls `Database::create`, which does). If `bound`
+    // (`open_store` creates the file if it is missing). If `bound`
     // does not exist yet, every id in `iris` is `NotOwned` by construction;
     // report the first one, naming `bound` as searched, without ever
     // opening it.
-    if !bound.exists() {
+    if !fl_store::store_exists(bound) {
         return Err(StoreError::NotOwned {
             id: iris[0].clone(),
             searched: vec![bound.display().to_string()],
@@ -399,10 +399,10 @@ fn choose_store(
 /// Whether the store at `bound` exists and holds a routing map. ⚠ Never
 /// creates a store: only a file that exists is opened.
 fn bound_is_routed(bound: &Path) -> Result<bool> {
-    if !bound.exists() {
+    if !fl_store::store_exists(bound) {
         return Ok(false);
     }
-    let store = RedbStore::open(bound)
+    let store = fl_store::open_store(bound)
         .with_context(|| format!("could not open the store at {}", bound.display()))?;
     Ok(store.holds_routing()?)
 }
@@ -422,9 +422,9 @@ fn held_elsewhere(
     }
     if let Some(ws_store) = state_store
         && !same_store(ws_store, bound)
-        && ws_store.exists()
+        && fl_store::store_exists(ws_store)
     {
-        let s = RedbStore::open(ws_store)
+        let s = fl_store::open_store(ws_store)
             .with_context(|| format!("could not open the store at {}", ws_store.display()))?;
         for id in iris {
             if s.owns(id)? {
@@ -433,10 +433,10 @@ fn held_elsewhere(
         }
     }
     for e in entries {
-        if same_store(&e.store, bound) || !e.store.exists() {
+        if same_store(&e.store, bound) || !fl_store::store_exists(&e.store) {
             continue;
         }
-        let s = RedbStore::open(&e.store)
+        let s = fl_store::open_store(&e.store)
             .with_context(|| format!("could not open the store at {}", e.store.display()))?;
         for id in iris {
             if s.owns(id)? {
@@ -464,7 +464,7 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
         for c in candidates {
             // ⚠ A store that cannot be opened is an ERROR here, not a
             // "doesn't have it": skipping it would search less than it says.
-            let s = RedbStore::open(c)
+            let s = fl_store::open_store(c)
                 .with_context(|| format!("could not open the store at {}", c.display()))?;
             if s.owns(id)? {
                 owners.push(c.clone());
@@ -818,7 +818,7 @@ fn run(cli: Cli) -> Result<i32> {
                 Some(p) => p,
                 None if matches!(cmd, cmd::agent::AgentCmd::Liveness { .. }) => {
                     match config::bound_entry(&cfg.projects, &cwd)? {
-                        Some(entry) if entry.store.exists() => entry.store,
+                        Some(entry) if fl_store::store_exists(&entry.store) => entry.store,
                         _ => cfg.workspace_state_store(&default_store),
                     }
                 }
@@ -830,7 +830,7 @@ fn run(cli: Cli) -> Result<i32> {
                 fl_store::private::create_private_dir_all(dir)
                     .with_context(|| format!("could not create {}", dir.display()))?;
             }
-            let store = RedbStore::open(&store_path)
+            let store = fl_store::open_store(&store_path)
                 .with_context(|| format!("could not open the store at {}", store_path.display()))?;
             return match cmd::agent::run(&store, cmd) {
                 Ok(()) => Ok(0),
@@ -1038,7 +1038,7 @@ fn run(cli: Cli) -> Result<i32> {
             bound.display()
         );
     }
-    let store = RedbStore::open(&path)
+    let store = fl_store::open_store(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
     // A store in which any project routes its items between two tiers
     // (routing spec §1.3), whatever its maps hold.
@@ -1239,7 +1239,7 @@ fn run(cli: Cli) -> Result<i32> {
                         fl_store::private::create_private_dir_all(dir)
                             .with_context(|| format!("could not create {}", dir.display()))?;
                     }
-                    Some(RedbStore::open(&ws_store_path).with_context(|| {
+                    Some(fl_store::open_store(&ws_store_path).with_context(|| {
                         format!("could not open the store at {}", ws_store_path.display())
                     })?)
                 }
@@ -1274,7 +1274,7 @@ fn run(cli: Cli) -> Result<i32> {
                         fl_store::private::create_private_dir_all(dir)
                             .with_context(|| format!("could not create {}", dir.display()))?;
                     }
-                    Some(RedbStore::open(&ws_store_path).with_context(|| {
+                    Some(fl_store::open_store(&ws_store_path).with_context(|| {
                         format!("could not open the store at {}", ws_store_path.display())
                     })?)
                 }

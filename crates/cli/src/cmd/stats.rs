@@ -8,7 +8,7 @@ use fl_core::split::{Coverage, SplitLedger};
 use fl_core::store::{Catalog, Ledger};
 use fl_core::telemetry::{RegretChallenge, RegretMetric, audit_transition_regret};
 use fl_core::{Iri, Kind};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -72,7 +72,7 @@ struct StatsJson {
     regret_audit: Vec<RegretChallenge>,
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
+pub fn run(store: &AnyStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
     let project = ProjectId(refs::resolve(
         store,
         store.label(),
