@@ -15,23 +15,33 @@
 //!   `missing_areas`, and nothing is written.
 //! - A 200 carries `agent`, `retires_lead` (the retired Lead's display name or `null`),
 //!   `creates_areas` (the areas this call created) and, when a Lead was retired, the full
-//!   `retired_lead` record. The `agents:recast` event carries the same fields.
+//!   `retired_lead` record. The `agents:recast` event carries the same fields. A recast that
+//!   does not make the agent a Lead never reports a retired Lead.
+//! - Recasting a project's only Lead away leaves the project with no Lead. PR policy then falls
+//!   back to the LabManager tier.
+//! - Recast does not enforce LabManager uniqueness. The store has no such rule, and PR policy
+//!   uses the first active `lab_manager`.
 //!
 //! The checks and the write use one store guard. The guard holds the hub's `store_lock`, so no
 //! other hub request can write between the checks and the write. A separate process (the `fl`
 //! CLI) can still write to a FerroStore file in that gap. For that case the response reports the
 //! Lead that the write actually retired, read back after the write, not the one the checks saw.
+//! The read-back runs only for a Lead recast. It checks the Lead that sat in the project before
+//! the write (by id). Only when no Lead sat there does it fall back to the store's mark for this
+//! call's `at` and `by`.
 
 use fl_core::agent::{AgentRecord, AgentRole, AgentStatus, RegisterAgentArgs};
+use fl_core::at::At;
+use fl_core::ids::AgentId;
 use fl_core::state::validate_slug;
 use fl_core::store::{AgentRegistry, StoreError};
 use fl_exec::stamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::HubState;
 use crate::api::{HttpRequest, HttpResponse, percent_decode};
 use crate::auth::HubAuthority;
+use crate::{HubState, HubStoreGuard};
 
 fn error_json(status: u16, message: &str) -> HttpResponse {
     HttpResponse::json(status, json!({ "error": message }))
@@ -151,26 +161,29 @@ pub(crate) fn handle_post_agent_recast(
 
     // Lead: `register_agent` with `replace: true` retires the sitting Lead without asking, so
     // the caller must confirm with `replace_lead`.
-    let mut sitting_lead = None;
-    if body.role == AgentRole::Lead && !body.replace_lead {
+    // The active Lead that sits in the target project now (the agent itself excluded). A Lead
+    // recast needs it for the conflict check and, after the write, to name the retired Lead.
+    let mut lead_before = None;
+    if body.role == AgentRole::Lead {
         let agents = match store.list_agents(None, false) {
             Ok(agents) => agents,
             Err(e) => return store_error(&e),
         };
-        sitting_lead = agents.into_iter().find(|a| {
+        lead_before = agents.into_iter().find(|a| {
             a.status == AgentStatus::Active
                 && a.project == project
                 && a.role == AgentRole::Lead
                 && a.name_key != existing.name_key
         });
     }
+    let sitting_lead = lead_before.as_ref().filter(|_| !body.replace_lead);
 
     // One 409 lists every unconfirmed conflict, so a single confirm resolves them all. Nothing
     // is written.
     if areas_unconfirmed || sitting_lead.is_some() {
         let mut messages = Vec::new();
         let mut payload = serde_json::Map::new();
-        if let Some(lead) = &sitting_lead {
+        if let Some(lead) = sitting_lead {
             messages.push(format!(
                 "project `{project}` already has an active Lead: {} ({}); \
                  pass replace_lead=true to confirm",
@@ -210,17 +223,15 @@ pub(crate) fn handle_post_agent_recast(
         Err(e) => return store_error(&e),
     };
 
-    // The Lead this write retired, read back from the store: `register_agent` stamps it with
-    // this call's `at` and `by`.
-    let retired_lead = match store.list_agents(None, true) {
-        Ok(agents) => agents.into_iter().find(|a| {
-            a.status == AgentStatus::Retired
-                && a.role == AgentRole::Lead
-                && a.project == updated.project
-                && a.name_key != updated.name_key
-                && a.updated_at == at
-                && a.by == by
-        }),
+    let retired_lead = match retired_lead_after(
+        &store,
+        &body.role,
+        lead_before.as_ref().map(|lead| &lead.id),
+        &updated,
+        &at,
+        &by,
+    ) {
+        Ok(lead) => lead,
         Err(e) => return store_error(&e),
     };
     drop(store);
@@ -247,6 +258,39 @@ pub(crate) fn handle_post_agent_recast(
     }
     state.broadcast("agents", "recast", event);
     HttpResponse::json(200, response)
+}
+
+/// The Lead that a recast write retired, read back from the store.
+///
+/// Only a Lead recast can retire a Lead, so any other role returns `None` at once. This stops one
+/// call from reporting a retirement that another call made in the same millisecond. When a Lead
+/// sat in the project before the write, that Lead is re-read by id and reported only if it is now
+/// retired. When none sat there, a Lead that is retired now with this call's `at` and `by` is the
+/// result of a write by another process between the checks and the write.
+fn retired_lead_after(
+    store: &HubStoreGuard<'_>,
+    new_role: &AgentRole,
+    lead_before: Option<&AgentId>,
+    updated: &AgentRecord,
+    at: &At,
+    by: &str,
+) -> Result<Option<AgentRecord>, StoreError> {
+    if *new_role != AgentRole::Lead {
+        return Ok(None);
+    }
+    if let Some(id) = lead_before {
+        return Ok(store
+            .get_agent(id)?
+            .filter(|lead| lead.status == AgentStatus::Retired));
+    }
+    Ok(store.list_agents(None, true)?.into_iter().find(|a| {
+        a.status == AgentStatus::Retired
+            && a.role == AgentRole::Lead
+            && a.project == updated.project
+            && a.name_key != updated.name_key
+            && a.updated_at == *at
+            && a.by == by
+    }))
 }
 
 #[cfg(test)]
@@ -505,6 +549,92 @@ mod tests {
         assert_eq!(sent[0].data["creates_areas"], json!([]));
         assert_eq!(sent[0].data["from"]["role"], "assistant");
         assert_eq!(sent[0].data["to"]["role"], "lead");
+    }
+
+    #[test]
+    fn a_non_lead_recast_never_reports_a_retirement_from_the_same_millisecond() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ferris = register(&state, "Ferris", "ferroloop", AgentRole::Lead);
+        let ada = register(&state, "Ada", "ferroloop", AgentRole::Assistant);
+        // Another call retires the Lead with the same `at` and `by` as this call would use.
+        let at = stamp::now();
+        let store = state.open_store().unwrap();
+        store.retire_agent(&ferris.id, at.clone(), "owner").unwrap();
+
+        for role in [AgentRole::Assistant, AgentRole::LabManager] {
+            assert_eq!(
+                retired_lead_after(&store, &role, None, &ada, &at, "owner").unwrap(),
+                None,
+                "{role:?}"
+            );
+            assert_eq!(
+                retired_lead_after(&store, &role, Some(&ferris.id), &ada, &at, "owner").unwrap(),
+                None,
+                "{role:?}"
+            );
+        }
+        drop(store);
+
+        let (status, body) = owner_recast(
+            &state,
+            "ada",
+            &json!({ "project": "ferroloop", "role": "lab_manager" }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["retires_lead"], Value::Null);
+        assert!(body.get("retired_lead").is_none());
+    }
+
+    #[test]
+    fn a_lead_recast_reports_exactly_the_lead_that_sat_there() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ferris = register(&state, "Ferris", "ferroloop", AgentRole::Lead);
+        let other = register(&state, "Olga", "other", AgentRole::Lead);
+        let felix = register(&state, "Felix", "ferroloop", AgentRole::Assistant);
+        let at = stamp::now();
+        let store = state.open_store().unwrap();
+        // A Lead of another project, retired in the same millisecond by another call.
+        store.retire_agent(&other.id, at.clone(), "owner").unwrap();
+        // The sitting Lead is still active: nothing to report.
+        assert_eq!(
+            retired_lead_after(
+                &store,
+                &AgentRole::Lead,
+                Some(&ferris.id),
+                &felix,
+                &at,
+                "owner"
+            )
+            .unwrap(),
+            None
+        );
+        drop(store);
+
+        let (status, body) = owner_recast(
+            &state,
+            "felix",
+            &json!({ "project": "ferroloop", "role": "lead", "replace_lead": true }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["retired_lead"]["id"], json!(ferris.id));
+        assert_eq!(body["retires_lead"], "Ferris");
+    }
+
+    #[test]
+    fn a_lead_recast_with_no_lead_before_reports_a_cross_process_retirement() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ferris = register(&state, "Ferris", "ferroloop", AgentRole::Lead);
+        let felix = register(&state, "Felix", "ferroloop", AgentRole::Assistant);
+        let at = stamp::now();
+        let store = state.open_store().unwrap();
+        let retired = store.retire_agent(&ferris.id, at.clone(), "owner").unwrap();
+        assert_eq!(
+            retired_lead_after(&store, &AgentRole::Lead, None, &felix, &at, "owner").unwrap(),
+            Some(retired)
+        );
     }
 
     #[test]
