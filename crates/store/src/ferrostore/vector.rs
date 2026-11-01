@@ -1303,16 +1303,18 @@ fn normalize(hits: &[(String, f64)]) -> BTreeMap<String, f64> {
 /// loading a graph that a search or a later delete repair would walk off.
 ///
 /// It does not check that each neighbor list is ordered by (distance, id): that is
-/// [`validate_graph_full`]. Open does not need it. A search's results do not depend on it for
-/// correctness: every hit is a live vector with an exactly computed score, whatever order the
-/// lists are in (the order only steers which near nodes an approximate search visits first).
-/// No graph operation trusts it either: `prune`, `make_room` and `repair_layer` rank the
-/// links they choose from by distance, and every list an upsert or a delete touches is
-/// re-sorted (`sort_layer`). The order is a canonical-form property, so that every replica
-/// holds the same bytes: `link_layer` and `sort_layer` write it, the snapshot encoder checks
-/// it in full before writing, and the snapshot CRC protects the bytes after. Checking it
-/// again on open cost one dequantize and one distance per link, most of the open time of a
-/// large collection.
+/// [`validate_graph_full`]. Open skips it because a search's results do not depend on it:
+/// every hit is a live vector with an exactly computed score, and the final result set of
+/// `search_layer` is the same whatever order the lists are in (the order only steers which
+/// near nodes an approximate search visits first). Delete-repair determinism does depend on
+/// it: `remove_node` hands the deleted node's list, in stored order, to `repair_layer`, which
+/// visits it in that order and changes the graph at each step. So the order is enforced at
+/// write time (`link_layer` and `sort_layer` write it), and the snapshot encoder checks it
+/// in full before every snapshot write (`encode_snapshot_v3` calls [`validate_graph_full`]).
+/// A misordered but CRC-valid snapshot (only a writer bug can make one) is therefore
+/// accepted on open, and the next checkpoint fails with the full check's error. The CRC
+/// protects the bytes after the write. Checking the order on open cost one dequantize and
+/// one distance per link, most of the open time of a large collection.
 ///
 /// The checks run on integer indices into the collection: one id lookup per link, and a
 /// reciprocity check that scans the neighbor's list of indices, with no allocation per link.
@@ -1324,6 +1326,10 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
 /// from the vector, then by id ([`cmp_distance_then_id`], the order `sort_layer` writes). The
 /// snapshot encoder runs this before every snapshot it writes, and tests run it; it costs one
 /// distance per link, so open runs [`validate_graph`] only.
+///
+/// Cost: the check dequantizes the whole collection into one `Vec<f32>` of `n * dim * 4`
+/// bytes, so a checkpoint's peak memory is that much above the stored state: 1x the stored
+/// bytes for f32, 2x for f16, 4x for i8.
 pub(super) fn validate_graph_full(name: &str, col: &VectorCollection) -> Result<(), StoreError> {
     let Some(graph) = checked_graph(name, col)? else {
         return Ok(());
@@ -1347,6 +1353,9 @@ impl GraphIndex<'_> {
         &self.links[self.spans[self.first[node] + layer].clone()]
     }
 
+    /// The order check of [`validate_graph_full`]. It dequantizes every vector into one
+    /// `Vec<f32>` (`n * dim * 4` bytes) that lives for the whole check: on every checkpoint
+    /// that is extra peak memory of 1x the stored vector bytes for f32, 2x for f16, 4x for i8.
     fn check_order(&self, col: &VectorCollection) -> Result<(), StoreError> {
         let dim = usize::try_from(col.dim).map_err(|_| corrupt("vector dim does not fit"))?;
         let mut values = Vec::with_capacity(self.records.len().saturating_mul(dim));
@@ -1369,7 +1378,9 @@ impl GraphIndex<'_> {
                             != Ordering::Less
                     {
                         return Err(corrupt(format!(
-                            "vector `{}` neighbors on layer {layer} are not ordered by distance",
+                            "vector `{}` neighbors on layer {layer} are not ordered by distance: \
+                             the collection's neighbor order is not canonical and must be \
+                             rebuilt (re-sort needed)",
                             self.ids[node]
                         )));
                     }
@@ -1963,6 +1974,16 @@ mod tests {
         *list(&mut col, &id, 0) = (0..=max_links(2, 0)).map(|n| format!("g{n}")).collect();
         refused(&col, "too many neighbors");
 
+        // The same on an upper layer, where the limit is `m`, not `2 * m`: a list one over it
+        // is still under layer 0's limit, so a check that used that limit would accept it.
+        assert!(max_links(2, 1) < max_links(2, 0));
+        let (upper, _) = with_room(&good, 1, 1);
+        assert!(good.vectors[&upper].level >= 1);
+        let mut col = good.clone();
+        *list(&mut col, &upper, 1) = (0..=max_links(2, 1)).map(|n| format!("g{n}")).collect();
+        assert!(col.vectors[&upper].neighbors[1].len() <= max_links(2, 0));
+        refused(&col, "too many neighbors on layer 1");
+
         // A layer-1 node linking to a node that stops at layer 0.
         let (upper, _) = with_room(&good, 1, 1);
         let ground = good
@@ -2006,6 +2027,41 @@ mod tests {
         let mut col = good.clone();
         col.entry = Some("ghost".into());
         refused(&col, "entry point is not live");
+    }
+
+    /// A list out of order passes open's check, and the full check and the snapshot encoder
+    /// refuse it with a message that says the order is not canonical and a re-sort is needed.
+    #[test]
+    fn a_misordered_list_fails_the_full_check_and_the_encoder_with_a_re_sort_message() {
+        let good = built();
+        let id = good
+            .vectors
+            .iter()
+            .find(|(_, rec)| rec.neighbors[0].len() >= 2)
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let mut col = good.clone();
+        list(&mut col, &id, 0).reverse();
+        validate_graph("v", &col).unwrap();
+        let vectors: super::super::state::Vectors =
+            BTreeMap::from([("v".to_string(), std::sync::Arc::new(col.clone()))]);
+        let encoded = super::super::layout::encode_snapshot_v3(
+            1,
+            &Default::default(),
+            &Default::default(),
+            &vectors,
+        );
+        for err in [
+            validate_graph_full("v", &col).unwrap_err(),
+            encoded.unwrap_err(),
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("corrupt"), "{text}");
+            assert!(text.contains(&format!("vector `{id}`")), "{text}");
+            assert!(text.contains("not ordered by distance"), "{text}");
+            assert!(text.contains("not canonical"), "{text}");
+            assert!(text.contains("re-sort needed"), "{text}");
+        }
     }
 
     /// The f16 finiteness check reads the bits: exponent 31 (infinity, NaN) is refused, the
