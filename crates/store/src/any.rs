@@ -337,6 +337,26 @@ impl MigrationLock {
         PathBuf::from(name)
     }
 
+    /// Take the lock for the store whose `.fls` is `physical`, creating the lock
+    /// file if need be, and wait about `wait` for its holder (a non-zero wait can
+    /// overshoot by up to one poll interval, 25 ms; `Duration::ZERO` is exactly
+    /// one attempt). The lock is held until the returned value is dropped.
+    ///
+    /// For a caller outside this module that creates a `.fls` (the
+    /// `ferrostore` binary's `put` and `serve`): it excludes a migration of the
+    /// same store exactly as the engine's own open does. A holder that stays
+    /// past `wait` gives `ErrorKind::TimedOut`; a symlink at the lock path
+    /// gives a hard error (`O_NOFOLLOW`). The lock file is left in place.
+    pub fn acquire_within(physical: &Path, wait: std::time::Duration) -> std::io::Result<Self> {
+        match Self::acquire_for(physical, true, wait)? {
+            Some(lock) => Ok(lock),
+            // `create` is true, so the file is made and there is always a lock.
+            None => Err(std::io::Error::other(
+                "the migration lock file was not created",
+            )),
+        }
+    }
+
     /// Take the lock, waiting up to [`LOCK_WAIT`] for its holder. With `create`
     /// false, a lock file that does not exist is not created: `Ok(None)`, and
     /// nobody can be holding it.
@@ -2305,6 +2325,56 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn acquire_within_creates_the_lock_file_and_excludes_every_other_taker() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let fls = dir.path().join("s.fls");
+        let lock_path = MigrationLock::path_for(&fls);
+        assert!(!lock_path.exists());
+
+        // Free: taken at once with no wait, the file made 0600.
+        let held = MigrationLock::acquire_within(&fls, std::time::Duration::ZERO).unwrap();
+        let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // Held: a second taker with no wait is refused as `TimedOut`, naming the file,
+        // and so is the engine's own acquire (the same lock).
+        let err = MigrationLock::acquire_within(&fls, std::time::Duration::ZERO)
+            .err()
+            .expect("the lock is held");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains(&lock_path.display().to_string()));
+        let engine_err = MigrationLock::acquire_for(&fls, false, std::time::Duration::ZERO)
+            .err()
+            .expect("the engine's own acquire must see this holder");
+        assert_eq!(
+            engine_err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "{engine_err}"
+        );
+
+        // Released: taken again, and the file is left in place.
+        drop(held);
+        let again = MigrationLock::acquire_within(&fls, std::time::Duration::ZERO).unwrap();
+        drop(again);
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn acquire_within_refuses_a_symlink_at_the_lock_path() {
+        let dir = TempDir::new().unwrap();
+        let fls = dir.path().join("s.fls");
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, MigrationLock::path_for(&fls)).unwrap();
+        let err = MigrationLock::acquire_within(&fls, std::time::Duration::ZERO)
+            .err()
+            .expect("a symlinked lock path is refused");
+        assert_ne!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
     }
 
     #[test]
