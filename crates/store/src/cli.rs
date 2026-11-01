@@ -35,7 +35,7 @@
 use crate::migrate::{ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore};
 use crate::{
     AnyStats, BackendKind, COMPACT_FERRO_ONLY, FerroStore, RedbSharedLock, RedbStore, StoreOptions,
-    ferro_stats_at, is_redb_busy, migrate_locked, physical_path,
+    Unmigrated, ferro_stats_at, is_redb_busy, migrate_locked, physical_path,
 };
 use fl_core::store::StoreError;
 use serde::Serialize;
@@ -222,6 +222,17 @@ pub struct StatusReport {
     pub sizes_note: Option<String>,
 }
 
+/// How every command here opens a store: on the engine `kind` the caller
+/// chose, never on the environment (this library reads none), and refusing
+/// rather than migrating a lone `.redb`.
+fn engine_options(kind: BackendKind) -> StoreOptions {
+    StoreOptions {
+        backend: Some(kind),
+        unmigrated: Unmigrated::Refuse,
+        ..StoreOptions::default()
+    }
+}
+
 /// The engine, files and format version of the store `path` names, on the
 /// engine `kind`. Read-only: see the [module documentation](self).
 pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
@@ -249,7 +260,7 @@ pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
             // No retries: a store another process holds is reported, not waited on.
             let options = StoreOptions {
                 retries: 0,
-                ..StoreOptions::default()
+                ..engine_options(BackendKind::Redb)
             };
             match crate::open_store_with(path, &options).and_then(|s| s.format_version()) {
                 Ok(Some(v)) => (FormatVersion::Known(v), None),
@@ -395,7 +406,7 @@ pub fn checkpoint(path: &Path, kind: BackendKind, w: &Wording) -> Result<Checkpo
             w.command
         );
     }
-    let store = crate::open_store(path)?;
+    let store = crate::open_store_with(path, &engine_options(kind))?;
     let Some(ferro) = store.as_ferro() else {
         refuse!("the store at {} is not a FerroStore", physical.display());
     };
@@ -512,7 +523,7 @@ pub fn compact(path: &Path, kind: BackendKind, w: &Wording) -> Result<CompactRep
             w.command
         );
     }
-    let store = crate::open_store(path)?;
+    let store = crate::open_store_with(path, &engine_options(kind))?;
     if store.as_ferro().is_none() {
         refuse!("the store at {} is not a FerroStore", physical.display());
     }
@@ -555,11 +566,25 @@ impl CompactReport {
 
 // ---- migrate and verify ----
 
-/// The `.redb` and `.fls` of one store.
+/// The `.redb` and `.fls` of one store. Made only by [`migrate_pair`] and
+/// [`verify_pair`], which check the files; the fields are read through
+/// [`Pair::redb`] and [`Pair::fls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pair {
-    pub redb: PathBuf,
-    pub fls: PathBuf,
+    redb: PathBuf,
+    fls: PathBuf,
+}
+
+impl Pair {
+    /// The `.redb` file.
+    pub fn redb(&self) -> &Path {
+        &self.redb
+    }
+
+    /// The `.fls` file.
+    pub fn fls(&self) -> &Path {
+        &self.fls
+    }
 }
 
 /// The `.redb` and `.fls` of the store named `path`, which must name the
@@ -1174,6 +1199,103 @@ mod tests {
         let v = serde_json::to_value(&report).unwrap();
         assert_eq!(v["after"]["file_bytes"], 400);
         assert!(report.text().contains("dead bytes: 600 -> 0"));
+    }
+
+    /// The tests below only tell an engine chosen by `kind` from one chosen by
+    /// the environment when `FL_STORE_BACKEND` is unset (the default is then
+    /// ferro). They never set it; a harness that did makes them skip.
+    fn env_is_unset() -> bool {
+        let value = std::env::var_os(crate::BACKEND_ENV);
+        if value.is_some() {
+            eprintln!("skipped: {} is set in the test process", crate::BACKEND_ENV);
+        }
+        value.is_none()
+    }
+
+    #[test]
+    fn every_command_opens_on_the_callers_engine_and_refuses_to_migrate() {
+        for kind in [BackendKind::Redb, BackendKind::Ferro] {
+            let options = engine_options(kind);
+            assert_eq!(options.backend, Some(kind));
+            assert_eq!(options.unmigrated, Unmigrated::Refuse);
+        }
+    }
+
+    #[test]
+    fn status_on_redb_neither_migrates_nor_chmods_with_the_environment_unset() {
+        if !env_is_unset() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("s.redb");
+        drop(RedbStore::open(&redb).unwrap());
+        std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let report = status(&redb, BackendKind::Redb);
+        assert_eq!(report.engine, BackendKind::Redb);
+        assert!(report.exists);
+        assert!(
+            matches!(report.format_version, FormatVersion::Known(_)),
+            "{:?} {:?}",
+            report.format_version,
+            report.format_note
+        );
+        assert!(!dir.path().join("s.fls").exists(), "status made a .fls");
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "status changed the .redb's mode"
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_compact_open_the_ferro_file_the_caller_named() {
+        if !env_is_unset() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        drop(RedbStore::open(&redb).unwrap());
+        drop(FerroStore::open(&fls).unwrap());
+        std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let w = Wording {
+            command: "t",
+            redb_path_hint: "h",
+        };
+        assert!(
+            checkpoint(&redb, BackendKind::Ferro, &w)
+                .unwrap()
+                .checkpointed
+        );
+        assert!(matches!(
+            compact(&redb, BackendKind::Ferro, &w).unwrap(),
+            CompactReport::Compacted { .. }
+        ));
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // A lone `.redb` is refused, not migrated, whatever the environment.
+        let lone = dir.path().join("lone.redb");
+        drop(RedbStore::open(&lone).unwrap());
+        assert!(checkpoint(&lone, BackendKind::Ferro, &w).is_err());
+        assert!(compact(&lone, BackendKind::Ferro, &w).is_err());
+        assert!(!dir.path().join("lone.fls").exists());
+    }
+
+    #[test]
+    fn a_pair_is_read_through_its_getters() {
+        let w = Wording {
+            command: "t",
+            redb_path_hint: "h",
+        };
+        let err = migrate_pair(Path::new("/d/s.fls"), &w)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names a .fls file"), "{err}");
+        let p = pair(Path::new("/d/s.redb"), "migrate", &w).unwrap();
+        assert_eq!(p.redb(), Path::new("/d/s.redb"));
+        assert_eq!(p.fls(), Path::new("/d/s.fls"));
     }
 
     #[test]
