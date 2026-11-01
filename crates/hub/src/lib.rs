@@ -3067,8 +3067,8 @@ mod tests {
         let mut stringy = review("ferroloop[bot]", None);
         stringy["author_id"] = json!(APP_ID.to_string());
         assert_eq!(merge_with(stringy).status, 400);
-        // The shape the FerroDeck type used to declare (`reviewer_login`, no `id`, no
-        // `author_login`) is not a review the Hub accepts.
+        // A review in the pre-`PrReviewSummary` UI shape (`reviewer_login`, no `id`, no
+        // `author_login`) is not one the Hub accepts.
         let old_ui_shape = json!({
             "reviewer_login": "ferroloop[bot]",
             "state": "APPROVED",
