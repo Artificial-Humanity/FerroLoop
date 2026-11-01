@@ -1,5 +1,8 @@
-//! The engine-independent core of the store tool commands: `status`,
-//! `checkpoint`, `compact`, `migrate` (with its dry run) and `verify`.
+//! The engine-independent core of the store tool commands, shared by `fl
+//! store` and the `ferrostore` binary so the two never drift: `status`,
+//! `checkpoint`, `compact`, `migrate` (with its dry run) and `verify` here;
+//! `get`, `put` and `query` in [`data`]; `serve` in [`serve`](mod@serve);
+//! `inspect` in [`inspect`](mod@inspect); `bench` in [`bench`](mod@bench).
 //!
 //! Each command is a function that takes explicit inputs (the store path, the
 //! engine already chosen, the caller's [`Wording`]) and returns a typed report.
@@ -7,26 +10,31 @@
 //! serialises as the command's `--json` object ([`to_json`]), so every program
 //! built on this module (`fl store`, the `ferrostore` binary) prints the same
 //! thing. Argument parsing, and how a program finds its store, stay with the
-//! program.
+//! program; the arguments of the commands both programs share are declared
+//! once, in `args` (feature `cli`).
 //!
-//! No command creates a store: a path that names nothing is reported
-//! ([`status`]) or refused ([`checkpoint`], [`migrate`], [`verify`]), never
-//! opened. [`migrate`] creates the one `.fls` it is asked to; a dry run and
-//! [`verify`] work on a private copy of the `.redb` and never write the real
-//! files (opening a redb file rewrites its internal pages, so they do not open
-//! the real one).
+//! Only `put` and `serve` create a store (a new `.fls`, mode 0600), and only
+//! when nothing is at its path: a lone `.redb` is refused, never migrated. A
+//! path that names nothing is reported ([`status`]) or refused (every other
+//! command), never opened. [`migrate`] creates the one `.fls` it is asked to; a
+//! dry run and [`verify`] work on a private copy of the `.redb` and never write
+//! the real files (opening a redb file rewrites its internal pages, so they do
+//! not open the real one). `inspect` only reads. `bench` works on fresh stores
+//! of its own unless it is told, twice, to use an existing one.
 //!
 //! Cost of the private copy: it is made in the [`Scratch`] directory the
 //! caller provides (for `fl store`, the system temp directory: `$TMPDIR`, else
-//! `/tmp`, which is often RAM-backed), and it is made while this process holds
-//! a shared lock on the `.redb`, which stops any writer (a hub or daemon on
-//! redb) until the copy is done. `verify` makes one copy of the redb; a dry run
-//! makes the copy and then a `.fls` of the same size. Each command first checks
-//! that the filesystem has room (the size of each file plus 10%) and refuses,
-//! naming `$TMPDIR`, when it does not. A real `migrate` copies nothing: it
-//! writes the new `.fls` beside the `.redb` through [`migrate_locked`], which
-//! takes the same lock as an automatic migration, so a ferro process that opens
-//! the store meanwhile waits for it.
+//! `/tmp`, which is often RAM-backed; for `ferrostore`, a private directory
+//! beside the store, [`SiblingScratch`]), and it is made while this process
+//! holds a shared lock on the `.redb`, which stops any writer (a hub or daemon
+//! on redb) until the copy is done. `verify` makes one copy of the redb; a dry
+//! run makes the copy and then a `.fls` of the same size. Each command first
+//! checks that the filesystem has room (the size of each file plus 10%) and
+//! refuses, with the scratch directory's [`Scratch::room_hint`], when it does
+//! not. A real `migrate` copies nothing: it writes the new `.fls` beside the
+//! `.redb` through [`migrate_locked`], which takes the same lock as an
+//! automatic migration, so a ferro process that opens the store meanwhile
+//! waits for it.
 //!
 //! `status` never opens a store that can write or migrate: FerroStore sizes are
 //! read with [`ferro_stats_at`], and a redb file is opened only to read its
@@ -118,9 +126,25 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 macro_rules! refuse {
     ($($arg:tt)*) => {
-        return Err(Error::Refused(format!($($arg)*)))
+        return Err($crate::cli::Error::Refused(format!($($arg)*)))
     };
 }
+
+// Declared after `refuse!`, which they use.
+#[cfg(feature = "cli")]
+pub mod args;
+pub mod bench;
+pub mod data;
+pub mod inspect;
+pub mod serve;
+
+pub use bench::{BenchOptions, BenchReport, BenchTarget, Workload, bench};
+pub use data::{
+    Credentials, GetReport, PutReport, Query, QueryReport, Target, get, open_target, put, query,
+    read_doc,
+};
+pub use inspect::inspect;
+pub use serve::{ServeOptions, Serving, serve};
 
 // ---- what the caller supplies ----
 
@@ -130,7 +154,7 @@ pub struct Wording<'a> {
     /// What a person types before a subcommand: `fl store`, `ferrostore`.
     pub command: &'a str,
     /// Where the `.redb` path comes from, named when a `.fls` path is given
-    /// instead: for `fl store`, "the bound store, or --db <file>.redb".
+    /// instead: for `fl store`, `the bound store, or --db <file>.redb`.
     pub redb_path_hint: &'a str,
 }
 
@@ -141,6 +165,90 @@ pub trait Scratch {
     fn path(&self) -> &Path;
     /// Remove the directory and everything in it.
     fn close(self) -> std::io::Result<()>;
+    /// What a refusal for want of room tells the person to do: by default,
+    /// to point `$TMPDIR` elsewhere (a directory in the system temp
+    /// directory).
+    fn room_hint(&self) -> &str {
+        TMPDIR_HINT
+    }
+}
+
+/// The default [`Scratch::room_hint`].
+pub const TMPDIR_HINT: &str = "point $TMPDIR at a bigger filesystem";
+
+/// A private (0700) directory beside a store file, for a program that keeps
+/// its private copies on the store's own filesystem rather than in the
+/// system temp directory (often RAM-backed). Removed by [`Scratch::close`],
+/// or on drop when a command fails first.
+#[derive(Debug)]
+pub struct SiblingScratch {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl SiblingScratch {
+    /// A new directory `.<file name>.scratch-<pid>-<n>` in the directory of
+    /// `store`, made mode 0700 and refused when the name exists.
+    pub fn beside(store: &Path) -> Result<Self> {
+        let dir = match store.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let name = store
+            .file_name()
+            .map_or_else(|| "store".into(), |n| n.to_string_lossy().into_owned());
+        Self::make(dir, &name)
+    }
+
+    /// A new directory `.ferrostore.scratch-<pid>-<n>` inside `dir`, made
+    /// mode 0700 and refused when the name exists.
+    pub fn within(dir: &Path) -> Result<Self> {
+        Self::make(dir, "ferrostore")
+    }
+
+    fn make(dir: &Path, name: &str) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!(".{name}.scratch-{}-{nanos}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| {
+                Error::context(
+                    format!("could not make a private directory in {}", dir.display()),
+                    e,
+                )
+            })?;
+        Ok(Self {
+            path,
+            removed: false,
+        })
+    }
+}
+
+impl Scratch for SiblingScratch {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn close(mut self) -> std::io::Result<()> {
+        self.removed = true;
+        std::fs::remove_dir_all(&self.path)
+    }
+
+    fn room_hint(&self) -> &str {
+        "free space on the store's filesystem (the copy is made beside the store)"
+    }
+}
+
+impl Drop for SiblingScratch {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// `report` as the command's pretty-printed JSON object, keys sorted.
@@ -225,7 +333,7 @@ pub struct StatusReport {
 /// How every command here opens a store: on the engine `kind` the caller
 /// chose, never on the environment (this library reads none), and refusing
 /// rather than migrating a lone `.redb`.
-fn engine_options(kind: BackendKind) -> StoreOptions {
+pub(crate) fn engine_options(kind: BackendKind) -> StoreOptions {
     StoreOptions {
         backend: Some(kind),
         unmigrated: Unmigrated::Refuse,
@@ -636,14 +744,14 @@ fn still_writable_notice(fls: &Path, redb: &Path) -> String {
     )
 }
 
-/// Refuse, in words, when `free` bytes cannot hold `copies` files of `size`
-/// bytes plus 10% each.
-fn ensure_room(dir: &Path, free: u64, size: u64, copies: u64) -> Result<()> {
+/// Refuse, in words ending with `hint`, when `free` bytes cannot hold
+/// `copies` files of `size` bytes plus 10% each.
+fn ensure_room(dir: &Path, free: u64, size: u64, copies: u64, hint: &str) -> Result<()> {
     let need = copies.saturating_mul(size.saturating_add(size / 10));
     if free < need {
         refuse!(
             "not enough free space in {} for the private copy: {free} bytes free, {need} needed \
-             ({copies} file(s) of {size} bytes, plus 10%); point $TMPDIR at a bigger filesystem",
+             ({copies} file(s) of {size} bytes, plus 10%); {hint}",
             dir.display()
         );
     }
@@ -654,8 +762,9 @@ fn ensure_room(dir: &Path, free: u64, size: u64, copies: u64) -> Result<()> {
 /// a shared lock on the original, so no writer changes it mid-copy (a hub or
 /// daemon on redb waits for the copy). The original is only read. `copies` is
 /// how many files of that size the command will keep in `dir` in all; the
-/// filesystem must have room for them, plus 10%, or nothing is copied.
-fn copy_redb(redb: &Path, dir: &Path, copies: u64) -> Result<PathBuf> {
+/// filesystem must have room for them, plus 10%, or nothing is copied (the
+/// refusal ends with `hint`).
+fn copy_redb(redb: &Path, dir: &Path, copies: u64, hint: &str) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let _lock = lock_redb(redb)?;
     let size = std::fs::metadata(redb)
@@ -663,7 +772,7 @@ fn copy_redb(redb: &Path, dir: &Path, copies: u64) -> Result<PathBuf> {
         .len();
     // A filesystem that cannot report its free space is not a reason to refuse.
     if let Ok(free) = crate::private::available_bytes(dir) {
-        ensure_room(dir, free, size, copies)?;
+        ensure_room(dir, free, size, copies, hint)?;
     }
     let Some(name) = redb.file_name() else {
         refuse!("{} has no file name", redb.display());
@@ -873,7 +982,7 @@ pub fn migrate<S: Scratch>(
     let started = Instant::now();
     let (report, scratch) = if dry_run {
         let dir = scratch()?;
-        let copy = copy_redb(redb, dir.path(), 2)?;
+        let copy = copy_redb(redb, dir.path(), 2, dir.room_hint())?;
         let copy_fls = physical_path(&copy, BackendKind::Ferro);
         let report = migrate_verified(&copy, &copy_fls)
             .map_err(|e| Error::context(format!("dry run on a copy of {}", redb.display()), e))?;
@@ -1036,7 +1145,7 @@ pub fn verify<S: Scratch>(
     let Pair { redb, fls } = pair;
     let started = Instant::now();
     let dir = scratch()?;
-    let copy = copy_redb(redb, dir.path(), 1)?;
+    let copy = copy_redb(redb, dir.path(), 1, dir.room_hint())?;
     let report = {
         let src = RedbStore::open_with_retries(&copy, 0).map_err(|e| {
             Error::context(format!("could not open a copy of {}", redb.display()), e)
@@ -1104,9 +1213,11 @@ mod tests {
     fn ensure_room_needs_the_size_plus_ten_percent_per_copy() {
         let dir = Path::new("/scratch");
         // 1000 bytes + 10% = 1100 per copy.
-        assert!(ensure_room(dir, 1100, 1000, 1).is_ok());
-        assert!(ensure_room(dir, 2200, 1000, 2).is_ok());
-        let err = ensure_room(dir, 1099, 1000, 1).unwrap_err().to_string();
+        assert!(ensure_room(dir, 1100, 1000, 1, TMPDIR_HINT).is_ok());
+        assert!(ensure_room(dir, 2200, 1000, 2, TMPDIR_HINT).is_ok());
+        let err = ensure_room(dir, 1099, 1000, 1, TMPDIR_HINT)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("not enough free space in /scratch"), "{err}");
         assert!(err.contains("1100 needed"), "{err}");
         assert!(err.contains("$TMPDIR"), "{err}");
@@ -1115,11 +1226,13 @@ mod tests {
             err.contains("1100 needed (1 file(s) of 1000 bytes, plus 10%)"),
             "{err}"
         );
-        let err = ensure_room(dir, 2199, 1000, 2).unwrap_err().to_string();
+        let err = ensure_room(dir, 2199, 1000, 2, TMPDIR_HINT)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("2200 needed"), "{err}");
         // An empty file needs nothing; sizes near u64::MAX do not wrap.
-        assert!(ensure_room(dir, 0, 0, 2).is_ok());
-        assert!(ensure_room(dir, u64::MAX - 1, u64::MAX, 2).is_err());
+        assert!(ensure_room(dir, 0, 0, 2, TMPDIR_HINT).is_ok());
+        assert!(ensure_room(dir, u64::MAX - 1, u64::MAX, 2, TMPDIR_HINT).is_err());
     }
 
     #[test]
@@ -1146,14 +1259,14 @@ mod tests {
         drop(RedbStore::open(&redb).unwrap());
         let scratch = tempfile::tempdir().unwrap();
         // Room enough on a test machine for one copy: it is made, writable.
-        let copy = copy_redb(&redb, scratch.path(), 1).unwrap();
+        let copy = copy_redb(&redb, scratch.path(), 1, TMPDIR_HINT).unwrap();
         assert_eq!(
             std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
             0o600
         );
         // More copies than any filesystem has room for: refused, nothing copied.
         let other = tempfile::tempdir().unwrap();
-        let err = copy_redb(&redb, other.path(), u64::MAX / 4)
+        let err = copy_redb(&redb, other.path(), u64::MAX / 4, TMPDIR_HINT)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not enough free space"), "{err}");

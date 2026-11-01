@@ -417,16 +417,23 @@ The wire bytes, the configuration and the bind rules are in `docs/ferrostore-spe
 
 ## 7. The standalone `ferrostore` binary
 
-**Where it lives.** `crates/store/src/bin/ferrostore.rs` is a thin argument parser over a library module, `fl_store::cli`. `fl store <cmd>` in `crates/cli` calls the same module, so the two never drift.
+**Where it lives.** `crates/store/src/bin/ferrostore.rs` is a thin argument parser over a library module, `fl_store::cli`. `fl store <cmd>` in `crates/cli` calls the same module, so the two never drift. The arguments of the commands both programs share (`serve`, `get`, `put`, `query`, `inspect`, `bench`) are declared once, in `fl_store::cli::args`. The binary and those arguments need `clap`, behind the `cli` feature of `fl-store`, which is on by default. A library consumer that needs neither turns it off.
 
 | Command | What it does |
 |---|---|
-| `serve` | Unix, `ws` or `wss` server under the auth and bind policy in §6 |
-| `get` / `put` / `query` | Doc get and put, and `query_by_field` / BM25 / vector query, as JSON on stdout |
+| `serve` | Unix, `ws` or `wss` server under the auth and bind policy in §6, until SIGINT or SIGTERM |
+| `get` / `put` / `query` | Doc get and put, and `query_by_field` / BM25 / vector query, as JSON on stdout, on a path (embedded) or a `unix://`, `ws://` or `wss://` URI |
+| `status` | Engine, files, sizes and format version, read-only |
 | `checkpoint` / `compact` | §4.4 and §5 |
 | `migrate` / `verify` | §3.4 |
-| `inspect` | Superblocks, epochs, format, engine and schema versions, extents, dead bytes and per-collection counts |
+| `inspect` | Superblocks, epochs, format, engine and schema versions, extents, dead bytes and per-collection counts, read-only |
 | `bench` | Put, get, scan and vector-search workloads against FerroStore and redb. Reports p50, p99 and throughput. SQLite and Turso come in Track 4. |
+
+**What the binary decides for itself.** The store comes from `--store` (and the `inspect` argument). The engine of `status`, `checkpoint` and `compact` comes from `--engine`. `ferrostore` never reads `FL_STORE_BACKEND`. The private copies of `migrate --dry-run` and `verify` are made in a `0700` directory beside the store, on its own filesystem, not in a RAM-backed `/tmp`.
+
+**Safety.** `inspect` reads the file through an `O_RDONLY` descriptor and takes no lock, so it never writes, migrates or repairs. `bench` works on fresh stores in a private directory. It runs on an existing store only with `--path` and `--i-know-it-writes`, and then only on FerroStore, in a collection of its own that it empties afterwards. `serve` blocks SIGINT and SIGTERM before it starts a thread, waits for one with `sigwait`, then drops the server, which removes its socket. No command prints a secret.
+
+The flags, the output and the exit codes are in `docs/ferrostore-spec.md` (Command line).
 
 **Syncing the standalone repo.** Syncing this into `Artificial-Humanity/FerroStore` is a push to a public repo. Ferris or the owner does that push.
 

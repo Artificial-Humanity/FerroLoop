@@ -278,6 +278,25 @@ pub(super) fn parse_superblock(buf: &[u8]) -> SlotRead {
     })
 }
 
+/// The header fields a slot records, read as they lie (the CRC is not
+/// checked: [`parse_superblock`] says whether the slot is valid), for
+/// `ferrostore inspect`. `None` without the magic. The engine and `incompat`
+/// bits are `None` for a version above [`FORMAT_VERSION`], whose layout past
+/// byte 24 this build does not know; format 1 records neither, so it reads as
+/// engine 0 with no bits.
+pub(super) fn slot_header(buf: &[u8]) -> Option<(u32, Option<(u32, u64)>)> {
+    if buf.len() != SLOT_LEN || buf.get(..8) != Some(SUPER_MAGIC.as_slice()) {
+        return None;
+    }
+    let version = u32_at(buf, 8)?;
+    let fields = match version {
+        FORMAT_V1 => Some((ENGINE_SNAPSHOT_WAL, 0)),
+        FORMAT_V2 => Some((u32_at(buf, 64)?, u64_at(buf, 68)?)),
+        _ => None,
+    };
+    Some((version, fields))
+}
+
 /// The container version recorded in a slot, CRC or not. For inspection.
 #[cfg(test)]
 pub(super) fn slot_version(buf: &[u8]) -> Option<u32> {

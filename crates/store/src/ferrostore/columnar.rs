@@ -755,6 +755,12 @@ fn value_type(value: &ColumnValue) -> Option<ColumnType> {
     }
 }
 
+/// The rows one encoded row group holds: its leading count, read without
+/// decoding the group (for `ferrostore inspect`).
+pub(super) fn group_row_count(blob: &[u8]) -> Result<u64, StoreError> {
+    Ok(u64::from(Cur::new(blob).u32()?))
+}
+
 fn index_group<'a>(blob: &'a [u8], columns: &[ColumnDef]) -> Result<IndexedGroup<'a>, StoreError> {
     index_group_with(blob, columns, &Limits::DEFAULT)
 }
