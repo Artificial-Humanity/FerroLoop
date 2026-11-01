@@ -301,6 +301,95 @@ fn status_has_null_live_and_dead_bytes_where_the_engine_cannot_say() {
 }
 
 #[test]
+fn status_leaves_an_empty_and_a_garbage_fls_untouched_and_reports_null_sizes() {
+    let garbage: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    for bytes in [Vec::new(), vec![0u8; 100], vec![0u8; 8192 + 64], garbage] {
+        let env = Env::new();
+        std::fs::write(env.physical_ferro(), &bytes).unwrap();
+        let before = snapshot(&[env.stores.path()]);
+        let v = status_json(env.ferro(), &env.logical());
+        assert_eq!(v["exists"], true, "{v}");
+        assert_eq!(v["live_bytes"], Value::Null, "{v}");
+        assert_eq!(v["dead_bytes"], Value::Null, "{v}");
+        assert_eq!(v["size_bytes"], bytes.len(), "{v}");
+        assert!(
+            v["sizes_note"].as_str().unwrap().contains("could not read"),
+            "{v}"
+        );
+        env.ferro()
+            .arg("--db")
+            .arg(env.logical())
+            .args(["store", "status"])
+            .assert()
+            .success()
+            .stdout(contains("live/dead:      -"))
+            .stderr("");
+        assert_eq!(snapshot(&[env.stores.path()]), before, "status wrote");
+        assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+    }
+}
+
+#[test]
+fn status_works_on_a_read_only_fls_and_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let rw = status_json(env.ferro(), &env.logical());
+    let path = env.physical_ferro();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let before = snapshot(&[env.stores.path()]);
+    let out = env
+        .ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["live_bytes"], rw["live_bytes"], "{v}");
+    assert_eq!(v["dead_bytes"], rw["dead_bytes"], "{v}");
+    assert_eq!(mode(&path) & 0o777, 0o400);
+    assert_eq!(snapshot(&[env.stores.path()]), before);
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+}
+
+#[test]
+fn status_size_is_the_sum_of_the_live_and_dead_bytes_of_one_reading() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let v = status_json(env.ferro(), &env.logical());
+    assert_eq!(
+        v["size_bytes"].as_u64().unwrap(),
+        v["live_bytes"].as_u64().unwrap() + v["dead_bytes"].as_u64().unwrap(),
+        "{v}"
+    );
+}
+
+#[test]
+fn compact_on_ferro_leaves_no_lock_or_sibling_file() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .success();
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+}
+
+#[test]
 fn compact_on_ferro_gives_back_the_dead_bytes() {
     let env = Env::new();
     ferro_with_dead_extents(&env.physical_ferro());

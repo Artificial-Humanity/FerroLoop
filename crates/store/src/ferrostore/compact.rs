@@ -113,17 +113,25 @@ pub(super) fn compact_due(disk: &Disk, file_len: u64, sb: &Superblock) -> bool {
     failed_at == 0 || dead < failed_at || dead - failed_at > threshold
 }
 
-/// [`super::FerroStore::stats`] of a disk handle.
-pub(super) fn stats(disk: &Disk) -> Result<StoreStats, StoreError> {
-    let (cache, read) = disk.refresh_read_on()?;
-    let file_bytes = read.file.len().map_err(io_err)?;
-    Ok(StoreStats {
+/// The accounting of a `file_bytes`-byte file whose live superblock and
+/// state `cache` holds. The one place a [`StoreStats`] is built, so a handle's
+/// [`super::FerroStore::stats`] and the read-only [`super::FerroStore::stats_at`]
+/// cannot count differently.
+pub(super) fn store_stats(file_bytes: u64, cache: &DiskCache) -> StoreStats {
+    StoreStats {
         file_bytes,
         live_bytes: live_bytes(&cache.sb),
         dead_bytes: dead_bytes(file_bytes, &cache.sb),
         epoch: cache.sb.epoch,
         last_seq: cache.state.last_seq,
-    })
+    }
+}
+
+/// [`super::FerroStore::stats`] of a disk handle.
+pub(super) fn stats(disk: &Disk) -> Result<StoreStats, StoreError> {
+    let (cache, read) = disk.refresh_read_on()?;
+    let file_bytes = read.file.len().map_err(io_err)?;
+    Ok(store_stats(file_bytes, &cache))
 }
 
 /// [`super::FerroStore::compact`] of a disk handle: compact now, due or not.

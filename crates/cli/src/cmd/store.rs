@@ -25,8 +25,8 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use fl_store::migrate::{ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore};
 use fl_store::{
-    BACKEND_ENV, BackendKind, FerroStore, RedbSharedLock, RedbStore, StoreOptions, choose_backend,
-    is_redb_busy, migrate_locked, physical_path,
+    BACKEND_ENV, BackendKind, COMPACT_FERRO_ONLY, FerroStore, RedbSharedLock, RedbStore,
+    StoreOptions, choose_backend, ferro_stats_at, is_redb_busy, migrate_locked, physical_path,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -100,7 +100,7 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
     let physical = physical_path(path, kind);
     let meta = std::fs::metadata(&physical).ok();
     let exists = meta.is_some();
-    let size = meta.as_ref().map(std::fs::Metadata::len);
+    let mut size = meta.as_ref().map(std::fs::Metadata::len);
     // A lone `.redb` beside a ferro selection: `open_store` migrates it, so say so.
     let redb_beside = kind == BackendKind::Ferro && !exists && path != physical && path.exists();
 
@@ -128,11 +128,16 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
 
     // FerroStore knows which bytes of its file are live and which an earlier
     // checkpoint left dead; redb does not say, and a missing store has none.
-    // Opened with `FerroStore::open` on the physical file, so status never
-    // migrates a redb or creates a store.
+    // Read with `ferro_stats_at`: read-only, no lock, nothing created or
+    // initialised, so status is safe beside a live store and on a 0400 file,
+    // and a file that is not a store yet is reported, not turned into one.
+    // The size comes from the same read, so the three figures agree.
     let (live_bytes, dead_bytes, sizes_note) = match (kind, exists) {
-        (BackendKind::Ferro, true) => match ferro_sizes(&physical) {
-            Ok((live, dead)) => (Some(live), Some(dead), None),
+        (BackendKind::Ferro, true) => match ferro_stats_at(&physical) {
+            Ok(st) => {
+                size = Some(st.file_bytes);
+                (st.live_bytes, st.dead_bytes, None)
+            }
             Err(e) => (None, None, Some(format!("could not read them: {e}"))),
         },
         _ => (None, None, None),
@@ -151,6 +156,9 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
         });
         if redb_beside {
             out["redb_beside_ferro"] = json!(true);
+        }
+        if let Some(note) = &sizes_note {
+            out["sizes_note"] = json!(note);
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
@@ -218,12 +226,6 @@ fn checkpoint(path: &Path) -> Result<i32> {
     Ok(0)
 }
 
-/// `(live, dead)` bytes of the existing FerroStore file `physical`.
-fn ferro_sizes(physical: &Path) -> Result<(u64, u64)> {
-    let stats = FerroStore::open(physical)?.stats()?;
-    Ok((stats.live_bytes, stats.dead_bytes))
-}
-
 /// `fl store compact`. Mirrors `checkpoint`: redb is reported and left alone,
 /// a missing `.fls` is refused (a lone `.redb` is not migrated just to be
 /// compacted), and the physical file is the one opened.
@@ -231,8 +233,7 @@ fn compact(path: &Path, json_out: bool) -> Result<i32> {
     let kind = engine(path)?;
     let physical = physical_path(path, kind);
     if kind == BackendKind::Redb {
-        let msg = "compaction applies to the FerroStore (.fls) engine only; \
-                   redb is not compacted, nothing to do";
+        let msg = format!("{COMPACT_FERRO_ONLY}, nothing to do");
         if json_out {
             let out = json!({
                 "command": "compact",
@@ -259,31 +260,58 @@ fn compact(path: &Path, json_out: bool) -> Result<i32> {
     }
     let before = store.stats()?;
     store.compact()?;
-    let after = store.stats()?;
+    // The store is compacted from here on. A failed second reading is not a
+    // failed compaction: report the compaction and leave `after` unknown.
+    let after = store.stats().ok();
     if json_out {
-        let size = |s: &fl_store::AnyStats| {
-            json!({
-                "file_bytes": s.file_bytes,
-                "live_bytes": s.live_bytes,
-                "dead_bytes": s.dead_bytes,
-            })
-        };
-        let out = json!({
-            "command": "compact",
-            "engine": kind.as_str(),
-            "physical_path": physical.display().to_string(),
-            "compacted": true,
-            "before": size(&before),
-            "after": size(&after),
-        });
+        let out = compact_json(&physical, &before, after.as_ref());
         println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(0);
+    } else {
+        println!("{}", compact_text(&physical, &before, after.as_ref()));
     }
-    let dead = |s: &fl_store::AnyStats| s.dead_bytes.map_or_else(|| "-".into(), |d| d.to_string());
-    println!("compacted {}", physical.display());
-    println!("file bytes: {} -> {}", before.file_bytes, after.file_bytes);
-    println!("dead bytes: {} -> {}", dead(&before), dead(&after));
     Ok(0)
+}
+
+/// The `--json` report of a compaction that ran. `after` is `null` when the
+/// reading after it failed.
+fn compact_json(
+    physical: &Path,
+    before: &fl_store::AnyStats,
+    after: Option<&fl_store::AnyStats>,
+) -> Value {
+    let size = |s: &fl_store::AnyStats| {
+        json!({
+            "file_bytes": s.file_bytes,
+            "live_bytes": s.live_bytes,
+            "dead_bytes": s.dead_bytes,
+        })
+    };
+    json!({
+        "command": "compact",
+        "engine": BackendKind::Ferro.as_str(),
+        "physical_path": physical.display().to_string(),
+        "compacted": true,
+        "before": size(before),
+        "after": after.map_or(Value::Null, size),
+    })
+}
+
+/// The text report of a compaction that ran; `-` where `after` is unknown.
+fn compact_text(
+    physical: &Path,
+    before: &fl_store::AnyStats,
+    after: Option<&fl_store::AnyStats>,
+) -> String {
+    let dash = || "-".to_string();
+    let dead = |s: &fl_store::AnyStats| s.dead_bytes.map_or_else(dash, |d| d.to_string());
+    format!(
+        "compacted {}\nfile bytes: {} -> {}\ndead bytes: {} -> {}",
+        physical.display(),
+        before.file_bytes,
+        after.map_or_else(dash, |a| a.file_bytes.to_string()),
+        dead(before),
+        after.map_or_else(dash, dead),
+    )
 }
 
 /// The `.redb` and `.fls` of the store named `path`, which must name the
@@ -688,5 +716,33 @@ mod tests {
             assert_eq!(mode_is_read_only(&file), read_only, "{mode:o}");
         }
         assert!(!mode_is_read_only(&dir.path().join("missing")));
+    }
+
+    use fl_store::AnyStats;
+
+    fn stats(file: u64, dead: u64) -> AnyStats {
+        AnyStats {
+            engine: BackendKind::Ferro,
+            file_bytes: file,
+            live_bytes: Some(file - dead),
+            dead_bytes: Some(dead),
+        }
+    }
+
+    #[test]
+    fn a_compaction_whose_second_reading_failed_is_reported_with_after_unknown() {
+        let path = Path::new("/s/fl.fls");
+        let before = stats(1000, 600);
+        let v = compact_json(path, &before, None);
+        assert_eq!(v["compacted"], true);
+        assert_eq!(v["before"]["dead_bytes"], 600);
+        assert_eq!(v["after"], Value::Null);
+        let text = compact_text(path, &before, None);
+        assert!(text.contains("file bytes: 1000 -> -"), "{text}");
+        assert!(text.contains("dead bytes: 600 -> -"), "{text}");
+        let after = stats(400, 0);
+        let v = compact_json(path, &before, Some(&after));
+        assert_eq!(v["after"]["file_bytes"], 400);
+        assert!(compact_text(path, &before, Some(&after)).contains("dead bytes: 600 -> 0"));
     }
 }
