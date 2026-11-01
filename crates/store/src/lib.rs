@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod any;
+pub mod cli;
 pub mod code_knowledge;
 pub mod ferrostore;
 pub mod ferrowire;
