@@ -34,7 +34,7 @@ const CANDIDATES: usize = 200;
 const RRF_K: u32 = 60;
 /// A vector-only hit needs at least this cosine to the query, measured
 /// against the entry's summary or its whole text.
-const MIN_VECTOR_COSINE: f32 = 0.30;
+const MIN_VECTOR_COSINE: f32 = 0.25;
 /// Longest fallback snippet, in characters.
 const SNIPPET_CHARS: usize = 160;
 
@@ -510,9 +510,9 @@ mod tests {
         let (_rd, redb, _fd, ferro) = pair();
         let redb_entries = seed(&redb);
         let ferro_entries = seed(&ferro);
-        // A lone misspelled word scores about 0.26 against the title: under
-        // the 0.30 bar, so it is not asserted here.
-        for q in ["checkpoints", "checkpointing"] {
+        // A lone misspelled word scores about 0.26 against the summary: just
+        // over the 0.25 bar.
+        for q in ["checkpoints", "checkpointing", "chekpoint"] {
             let r = rank_state_entries(&redb, &redb_entries, q, None, None, 5);
             assert!(r.hits.is_empty(), "redb found `{q}`: {:?}", slugs(&r));
             let f = rank_state_entries(&ferro, &ferro_entries, q, None, None, 5);

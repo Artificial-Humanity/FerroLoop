@@ -1927,10 +1927,12 @@ fn redact_search_hit(mut hit: StateSearchHit, is_owner: bool) -> StateSearchHit 
     hit
 }
 
-/// Rank hub search candidates: internal hub entries excluded, full ranked
-/// count returned before `limit` truncation, sensitive hits redacted for
-/// non-owners (entry and snippet).
+/// Rank hub search candidates: internal hub entries excluded before ranking,
+/// full ranked count returned before `limit` truncation, sensitive hits
+/// redacted for non-owners (entry and snippet) after ranking. The ranker
+/// follows the store's engine: BM25 on redb, knowledge search on FerroStore.
 fn search_state_for_hub(
+    store: &AnyStore,
     entries: &[StateEntry],
     query: &str,
     scope: Option<&StateScope>,
@@ -1943,8 +1945,7 @@ fn search_state_for_hub(
         .filter(|e| !is_internal_hub_entry(e))
         .cloned()
         .collect();
-    // The hub holds a redb store, so its ranker is BM25.
-    let ranked = fl_store::rank_bm25(&candidates, query, scope, concern, limit);
+    let ranked = fl_store::rank_state_entries(store, &candidates, query, scope, concern, limit);
     let hits: Vec<StateSearchHit> = ranked
         .hits
         .into_iter()
@@ -2001,6 +2002,7 @@ fn handle_get_state_search(
     };
 
     let (hits, total_hits) = search_state_for_hub(
+        store,
         &entries,
         &query,
         scope.as_ref(),
@@ -6258,6 +6260,122 @@ mod tests {
         }
     }
 
+    /// A throwaway store on the given engine, engine passed explicitly.
+    fn test_store(kind: fl_store::BackendKind) -> (tempfile::TempDir, AnyStore) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = fl_store::open_store_with(
+            &dir.path().join("hub.store"),
+            &fl_store::StoreOptions {
+                backend: Some(kind),
+                ..fl_store::StoreOptions::default()
+            },
+        )
+        .unwrap();
+        (dir, store)
+    }
+
+    fn put_memory(
+        store: &AnyStore,
+        slug: &str,
+        summary: &str,
+        body: &str,
+        sensitive: bool,
+        at: u64,
+    ) {
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: slug.to_string(),
+                sensitivity: if sensitive {
+                    SensitivityPatch::SetSensitive
+                } else {
+                    SensitivityPatch::Inherit
+                },
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: summary.to_string(),
+                    body: body.to_string(),
+                }),
+                at: At::from_unix_millis(at),
+                by: "test".to_string(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn hub_search_on_ferro_finds_stem_and_typo_queries_and_keeps_redaction() {
+        let (_dir, store) = test_store(fl_store::BackendKind::Ferro);
+        put_memory(
+            &store,
+            "build-cache",
+            "checkpoint the build cache",
+            "Nightly job writes a checkpoint of the build cache to disk.",
+            false,
+            1_001,
+        );
+        put_memory(
+            &store,
+            "secret-cache",
+            "checkpoint the build cache",
+            "Nightly job writes a checkpoint, secretbodytoken, to disk.",
+            true,
+            1_002,
+        );
+        put_memory(
+            &store,
+            "hub-session-abc123",
+            "checkpoint the internal session",
+            "Internal checkpoint state of the hub session.",
+            false,
+            1_003,
+        );
+        put_memory(
+            &store,
+            "lunch-notes",
+            "meeting notes about lunch",
+            "The team agreed on sandwiches for the offsite.",
+            false,
+            1_004,
+        );
+        let entries = store.list_state(None, None).unwrap();
+        assert!(entries.iter().any(|e| e.slug == "hub-session-abc123"));
+
+        // A stem query and a lone typo, which BM25 cannot match.
+        for q in ["checkpointing", "chekpoint"] {
+            let (hits, total) = search_state_for_hub(&store, &entries, q, None, None, 10, false);
+            let slugs: Vec<&str> = hits.iter().map(|h| h.entry.slug.as_str()).collect();
+            assert!(slugs.contains(&"build-cache"), "`{q}` found {slugs:?}");
+            assert!(
+                !slugs.contains(&"hub-session-abc123"),
+                "internal hub entry leaked for `{q}`: {slugs:?}"
+            );
+            assert!(!slugs.contains(&"lunch-notes"), "`{q}` found {slugs:?}");
+            assert_eq!(total, hits.len(), "`{q}`");
+
+            // Non-owner: the sensitive hit is redacted, entry and snippet.
+            let secret = hits
+                .iter()
+                .find(|h| h.entry.slug == "secret-cache")
+                .unwrap_or_else(|| panic!("sensitive hit missing for `{q}`: {slugs:?}"));
+            assert_eq!(secret.snippet, "[REDACTED]", "`{q}`");
+            let serialized = serde_json::to_string(secret).unwrap();
+            assert!(!serialized.contains("secretbodytoken"), "{serialized}");
+
+            // Owner sees the real entry.
+            let (owner, _) = search_state_for_hub(&store, &entries, q, None, None, 10, true);
+            let secret = owner
+                .iter()
+                .find(|h| h.entry.slug == "secret-cache")
+                .unwrap();
+            assert_ne!(secret.snippet, "[REDACTED]", "`{q}`");
+            assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
+        }
+    }
+
     fn sensitive_handoff_entry(n: u64) -> StateEntry {
         StateEntry {
             id: StateId(seq_iri(n)),
@@ -6291,9 +6409,10 @@ mod tests {
         let public = memory_entry(2, "public-note", "zephyr public note", false);
         let internal = memory_entry(3, "hub-session-abc123", "zephyr internal", false);
         let entries = vec![public, internal, secret];
+        let (_dir, store) = test_store(fl_store::BackendKind::Redb);
 
         // Non-owner: sensitive entry and snippet redacted, internal excluded.
-        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        let (hits, total) = search_state_for_hub(&store, &entries, "zephyr", None, None, 10, false);
         assert_eq!(total, 2, "internal hub entry must be excluded: {hits:?}");
         let secret_hit = hits
             .iter()
@@ -6309,7 +6428,7 @@ mod tests {
 
         // Owner sees full sensitive hit.
         let (owner_hits, owner_total) =
-            search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+            search_state_for_hub(&store, &entries, "zephyr", None, None, 10, true);
         assert_eq!(owner_total, 2);
         let owner_secret = owner_hits
             .iter()
@@ -6323,12 +6442,14 @@ mod tests {
         );
 
         // Limit 0 returns no hits but keeps the full ranked count.
-        let (none, total_zero) = search_state_for_hub(&entries, "zephyr", None, None, 0, true);
+        let (none, total_zero) =
+            search_state_for_hub(&store, &entries, "zephyr", None, None, 0, true);
         assert!(none.is_empty());
         assert_eq!(total_zero, 2);
 
         // Truncation keeps total before the cap.
-        let (one, total_one) = search_state_for_hub(&entries, "zephyr", None, None, 1, true);
+        let (one, total_one) =
+            search_state_for_hub(&store, &entries, "zephyr", None, None, 1, true);
         assert_eq!(one.len(), 1);
         assert_eq!(total_one, 2);
     }
@@ -6343,6 +6464,7 @@ mod tests {
         ];
         let entry = sensitive_handoff_entry(10);
         let entries = vec![entry.clone()];
+        let (_dir, store) = test_store(fl_store::BackendKind::Redb);
 
         // List path: redact_sensitive_entry clears all four handoff lists.
         let redacted = redact_sensitive_entry(entry.clone());
@@ -6359,7 +6481,7 @@ mod tests {
         }
 
         // Search path: non-owner hit leaks no list-only token.
-        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        let (hits, total) = search_state_for_hub(&store, &entries, "zephyr", None, None, 10, false);
         assert_eq!(total, 1);
         let hit = &hits[0];
         assert_eq!(hit.snippet, "[REDACTED]");
@@ -6374,7 +6496,8 @@ mod tests {
         }
 
         // Owner still sees the list contents.
-        let (owner_hits, _) = search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+        let (owner_hits, _) =
+            search_state_for_hub(&store, &entries, "zephyr", None, None, 10, true);
         let serialized_owner = serde_json::to_string(&owner_hits[0]).unwrap();
         for token in SECRET_TOKENS {
             assert!(serialized_owner.contains(token), "{serialized_owner}");
