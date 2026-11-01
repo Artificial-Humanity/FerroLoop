@@ -129,7 +129,8 @@ pub fn open_store_with(path: &Path, options: &StoreOptions) -> Result<AnyStore, 
         BackendKind::Ferro => {
             if !physical.exists() && path != physical && path.exists() {
                 return Err(backend(format!(
-                    "{} holds a redb store and {} does not exist yet: migrate it first",
+                    "{} holds a redb store and {} does not exist yet: migrate it first, \
+                     or set {BACKEND_ENV}=redb to keep using the .redb file",
                     path.display(),
                     physical.display()
                 )));
@@ -166,9 +167,10 @@ impl From<RedbStore> for AnyStore {
 
 impl From<FerroStore> for AnyStore {
     fn from(store: FerroStore) -> Self {
+        let label = store.label().to_string();
         Self {
             backend: Backend::Ferro(Box::new(store)),
-            label: "memory".to_string(),
+            label,
         }
     }
 }
@@ -569,6 +571,10 @@ mod tests {
         .err()
         .expect("must refuse");
         assert!(err.to_string().contains("migrate"), "{err}");
+        assert!(
+            err.to_string().contains("FL_STORE_BACKEND=redb"),
+            "names the remedy: {err}"
+        );
         assert!(!dir.path().join("s.fls").exists(), "nothing was created");
     }
 
@@ -587,6 +593,44 @@ mod tests {
         assert!(store.label().ends_with("s.fls"), "{}", store.label());
         let (redb, _g) = on(BackendKind::Redb);
         assert!(redb.label().ends_with("s.redb"), "{}", redb.label());
+    }
+
+    #[test]
+    fn an_in_memory_any_store_takes_its_label_from_the_ferrostore() {
+        assert_eq!(
+            AnyStore::in_memory().label(),
+            FerroStore::in_memory().label()
+        );
+    }
+
+    #[test]
+    fn set_routes_makes_the_store_hold_routing_on_both_engines() {
+        for kind in both() {
+            let (store, _g) = on(kind);
+            let project = store.add_project("/repo").unwrap();
+            assert!(!store.holds_routing().unwrap(), "{kind:?}");
+            store.set_routes(&project, &RoutingMap::starting()).unwrap();
+            assert!(store.holds_routing().unwrap(), "{kind:?}");
+            assert_eq!(
+                store.routes(&project).unwrap(),
+                Some(RoutingMap::starting()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_imported_project_is_refused_by_name() {
+        let (author, _g) = on(BackendKind::Redb);
+        let project = author.add_project("/repo").unwrap();
+        let manifest = author.export_manifest(&project, "c0ffee", 1, None).unwrap();
+        let (other, _g2) = on(BackendKind::Redb);
+        other.import_manifest(&manifest, "/elsewhere").unwrap();
+        let err = other.refuse_if_imported(&project, "x").unwrap_err();
+        assert!(
+            matches!(err, StoreError::Imported { action: "x", .. }),
+            "{err}"
+        );
     }
 
     #[test]
