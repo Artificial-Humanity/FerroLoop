@@ -4,13 +4,11 @@
 //! the dequantized `f32` values, accumulated in `f64`.
 
 use super::columnar::check_name;
-use super::state::Vectors;
 use fl_core::StoreError;
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
-use std::sync::Arc;
 
 const MAX_VECTOR_BYTES: u32 = 8 * 1024 * 1024;
 const MAX_LEVEL: u8 = 16;
@@ -100,6 +98,66 @@ impl VectorCollection {
             vectors: BTreeMap::new(),
             entry: None,
         }
+    }
+}
+
+/// A vector collection's parameters, without its vectors: what a write body
+/// needs to check a vector op, and what a remote transaction reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct VectorParams {
+    pub(super) dim: u32,
+    pub(super) storage: VectorStorage,
+    pub(super) metric: VectorMetric,
+    pub(super) m: u32,
+    pub(super) ef_construction: u32,
+    pub(super) ef_search: u32,
+}
+
+impl VectorParams {
+    pub(super) fn of(col: &VectorCollection) -> Self {
+        Self {
+            dim: col.dim,
+            storage: col.storage,
+            metric: col.metric,
+            m: col.m,
+            ef_construction: col.ef_construction,
+            ef_search: col.ef_search,
+        }
+    }
+
+    pub(super) fn to_json(self) -> Value {
+        json!({
+            "dim": self.dim,
+            "storage": storage_name(self.storage),
+            "metric": metric_name(self.metric),
+            "m": self.m,
+            "ef_construction": self.ef_construction,
+            "ef_search": self.ef_search,
+        })
+    }
+
+    pub(super) fn parse(value: &Value) -> Result<Self, StoreError> {
+        let number = |key: &str| -> Result<u32, StoreError> {
+            value
+                .get(key)
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| backend(format!("vector parameters are missing `{key}`")))
+        };
+        let name = |key: &str| -> Result<&str, StoreError> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| backend(format!("vector parameters are missing `{key}`")))
+        };
+        Ok(Self {
+            dim: number("dim")?,
+            storage: storage_from_name(name("storage")?)?,
+            metric: metric_from_name(name("metric")?)?,
+            m: number("m")?,
+            ef_construction: number("ef_construction")?,
+            ef_search: number("ef_search")?,
+        })
     }
 }
 
@@ -1503,10 +1561,6 @@ fn checked_graph<'a>(
     Ok(Some(graph))
 }
 
-fn bytes_json(bytes: &[u8]) -> Value {
-    Value::Array(bytes.iter().copied().map(Value::from).collect())
-}
-
 fn finite_number(value: f64, what: &str) -> Result<Value, StoreError> {
     let number = Number::from_f64(value).ok_or_else(|| backend(format!("{what} is not finite")))?;
     Ok(Value::Number(number))
@@ -1542,189 +1596,6 @@ pub(super) fn parse_values(value: &Value) -> Result<Vec<f32>, StoreError> {
         out.push(value);
     }
     Ok(out)
-}
-
-pub(super) fn vectors_json(collections: &Vectors) -> Value {
-    Value::Array(
-        collections
-            .iter()
-            .map(|(name, col)| collection_json(name, col))
-            .collect(),
-    )
-}
-
-fn collection_json(name: &str, col: &VectorCollection) -> Value {
-    let vectors = col
-        .vectors
-        .iter()
-        .map(|(id, record)| {
-            let mut item = Map::new();
-            item.insert("id".into(), Value::String(id.clone()));
-            item.insert("bytes".into(), bytes_json(&record.bytes));
-            if let Some(metadata) = &record.metadata {
-                item.insert("metadata".into(), metadata.clone());
-            }
-            Value::Object(item)
-        })
-        .collect::<Vec<_>>();
-    let links = col
-        .vectors
-        .iter()
-        .map(|(id, record)| {
-            json!({
-                "id": id,
-                "level": record.level,
-                "layers": record.neighbors.iter().map(|layer| {
-                    Value::Array(layer.iter().cloned().map(Value::String).collect())
-                }).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "name": name,
-        "dim": col.dim,
-        "storage": storage_name(col.storage),
-        "metric": metric_name(col.metric),
-        "m": col.m,
-        "ef_construction": col.ef_construction,
-        "ef_search": col.ef_search,
-        "vectors": vectors,
-        "entry": col.entry,
-        "links": links,
-    })
-}
-
-pub(super) fn parse_vectors(value: &Value) -> Result<Vectors, StoreError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| backend("vectors is not an array"))?;
-    let mut collections = BTreeMap::new();
-    for item in items {
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("vector collection is missing name"))?
-            .to_string();
-        let col = parse_collection(item)?;
-        // A remote's state, with no CRC over it: the full check, order included.
-        validate_graph_full(&name, &col)?;
-        if collections.insert(name.clone(), Arc::new(col)).is_some() {
-            return Err(backend(format!("duplicate vector collection `{name}`")));
-        }
-    }
-    Ok(collections)
-}
-
-fn json_u32(value: &Value, key: &str) -> Result<u32, StoreError> {
-    let number = value
-        .get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| backend(format!("missing integer field `{key}`")))?;
-    u32::try_from(number).map_err(|_| backend(format!("field `{key}` does not fit")))
-}
-
-fn parse_collection(value: &Value) -> Result<VectorCollection, StoreError> {
-    let dim = json_u32(value, "dim")?;
-    let storage = storage_from_name(
-        value
-            .get("storage")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("vector collection is missing storage"))?,
-    )?;
-    let metric = metric_from_name(
-        value
-            .get("metric")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("vector collection is missing metric"))?,
-    )?;
-    let m = json_u32(value, "m")?;
-    let ef_construction = json_u32(value, "ef_construction")?;
-    let ef_search = json_u32(value, "ef_search")?;
-    let mut col = VectorCollection::empty(dim, storage, metric, m, ef_construction, ef_search);
-    let vectors = value
-        .get("vectors")
-        .and_then(Value::as_array)
-        .ok_or_else(|| backend("vector collection is missing vectors"))?;
-    for item in vectors {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("vector is missing id"))?
-            .to_string();
-        let bytes = super::columnar::parse_bytes(
-            item.get("bytes")
-                .ok_or_else(|| backend("vector is missing bytes"))?,
-        )?;
-        let metadata = item.get("metadata").cloned();
-        if col
-            .vectors
-            .insert(
-                id.clone(),
-                VectorRecord {
-                    bytes,
-                    metadata,
-                    level: 0,
-                    neighbors: Vec::new(),
-                },
-            )
-            .is_some()
-        {
-            return Err(backend(format!("duplicate vector id `{id}`")));
-        }
-    }
-    col.entry = match value.get("entry") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) => Some(id.clone()),
-        _ => return Err(backend("vector entry is not a string")),
-    };
-    let links = value
-        .get("links")
-        .and_then(Value::as_array)
-        .ok_or_else(|| backend("vector collection is missing links"))?;
-    let mut seen = BTreeSet::new();
-    for item in links {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("vector link is missing id"))?
-            .to_string();
-        if !seen.insert(id.clone()) {
-            return Err(backend(format!("duplicate vector links for `{id}`")));
-        }
-        let level = item
-            .get("level")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| backend("vector link is missing level"))?;
-        let level = u8::try_from(level).map_err(|_| backend("vector level does not fit"))?;
-        let layers = item
-            .get("layers")
-            .and_then(Value::as_array)
-            .ok_or_else(|| backend("vector link is missing layers"))?;
-        let mut neighbors = Vec::with_capacity(layers.len());
-        for layer in layers {
-            let ids = layer
-                .as_array()
-                .ok_or_else(|| backend("vector layer is not an array"))?;
-            let mut nids = Vec::with_capacity(ids.len());
-            for nid in ids {
-                nids.push(
-                    nid.as_str()
-                        .ok_or_else(|| backend("vector neighbor is not a string"))?
-                        .to_string(),
-                );
-            }
-            neighbors.push(nids);
-        }
-        let Some(record) = col.vectors.get_mut(&id) else {
-            return Err(backend(format!("vector links name missing id `{id}`")));
-        };
-        record.level = level;
-        record.neighbors = neighbors;
-    }
-    if seen.len() != col.vectors.len() {
-        return Err(backend("vector links do not cover the collection"));
-    }
-    Ok(col)
 }
 
 pub(super) fn hits_json(hits: &[(String, f64)]) -> Result<Value, StoreError> {

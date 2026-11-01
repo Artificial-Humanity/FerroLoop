@@ -308,14 +308,45 @@ A failure before the rename removes the temp and leaves the old file untouched. 
 
 ### 6.1 Operations run on the server
 
-`read_state` and `commit_if_seq` are removed from the client protocol.
-- Every public `FerroStore` method and every trait method becomes one RPC: `{"op": "<trait>.<method>", "params": …, "req": <u128 id>}`.
-- The server runs it against its embedded store. Concurrency comes from §4.3, so multiple writers are conflict-safe on the server.
-- A client never rebuilds a `Txn`.
+`read_state` and `commit_if_seq` are removed from the client protocol. A remote client never receives the whole state.
 
-**Exactly-once writes.** Write RPCs carry `req`. The server keeps a bounded table of recent `req` ids and their results (10 000 entries or 10 minutes). A retried write returns the first result and is not applied twice.
+**Why not one RPC per trait method.** Most of the 13 traits' roughly 110 methods are bodies over one small set of `Txn` read primitives:
+- `get`, `visit`/`scan` of a collection, `query_by_field`;
+- `table_columns`, a column scan;
+- `vector` (a collection's parameters, `get_vector`, search);
+- `next_mq_seq`;
+- the schema version.
 
-**Result size.** The 16 MiB frame cap stays. A result that would exceed it is an error that names the operation. Large list methods get pagination in a follow-up, tracked as a known limit.
+So making those primitives remote covers every trait method, and also public `transaction` bodies, which are closures and cannot run on the server. One RPC per method would cover only the trait methods. Typed per-method RPCs stay possible later as fast paths for hot read-only methods.
+
+**Remote `Txn`: lazy reads at a pinned snapshot.**
+- **Opening a session.** A remote `with_read`, `with_write_outcome` or `transaction` opens a *read session*. The server pins its current `Arc<DocState>` under a session id and returns it with `last_seq` as `base_seq`. Holding the `Arc` is cheap because of copy-on-write (§4.2).
+- **Lifetime.** A session ends when it commits, aborts or closes. Otherwise it expires after 30 s idle, or 5 minutes after it opened however often it is read. At most 64 sessions are open per connection, and 1024 per server. Opening a session first drops the expired ones (so do a close, a commit that ends a session and every 64th read); a connection or server still full refuses the new session and keeps the open ones. A read in an expired session fails with `read session expired, retry`, and the client takes it as a lost attempt (§4.5).
+- **Reads.** Each read primitive is one RPC against the pinned snapshot. So every read in one body sees one consistent state, the same guarantee an embedded `Txn` gives.
+- **Writes** are staged in the client's overlay, as on disk today.
+- **The read set.** The client records each read: the key, plus a 32-byte hash of the canonical result. For `get`, the key is the collection and id, and the hash covers the value or its absence. For a scan or a query, the key is the collection or the query, and the hash covers the whole ordered result.
+
+**Commit: optimistic concurrency, validated by value.**
+- **The request.** `commit_txn { session, base_seq, reads: [(key, hash)], ops, req }`.
+- **Validation.** The server runs this as an ordinary write body through group commit (§4.3). Inside the write lock it recomputes every read against the current committed state and compares the hashes:
+  - If all are equal, it commits `ops`.
+  - If any differs, nothing is written and the reply is `lost`.
+- **Why this is serializable.** The transaction's reads return the same values at the commit point, and validation and commit are atomic under the lock. A scan or query is validated on its whole result, so phantoms are caught.
+- **Retry.** The client retries a lost commit with a new session, up to the §4.5 bound (8 attempts, then `Conflict`).
+- **Read-only bodies** close their session without a commit.
+
+**Vectors in a remote transaction.**
+- Vector writes (`upsert_vector`, `delete_vector`, create) are staged as ops. The server applies HNSW, and the client never holds a collection.
+- A body that reads a vector it wrote in the same transaction is refused remotely with a named error. That case is rare, and supporting it would mean shipping the collection.
+- Vector search and `get_vector` are read primitives validated by result hash.
+
+**Exactly-once writes.** `commit_txn` and every public write RPC carry `req`. The server keeps a bounded table of recent `req` ids and their results, holding 10 000 entries for up to 10 minutes. A retried `req` returns the first result and is not applied twice. That covers a transport retry after a lost reply. A CAS retry (`lost`) gets a fresh `req`. A running `req`, or one answered less than two call timeouts ago, is never evicted; a table full of those refuses a new `req` with `dedup table full, retry`.
+
+**The schema version.** A remote commit may carry a put or delete of `("__meta", "schema_version")` and no other reserved op. Against the committed state before its ops, a put that raises the version on the ladder is applied. A lowering or equal put, or a delete, is applied only when that state holds nothing outside `__meta` (the migration's empty-target case); otherwise the commit fails with a named error and writes nothing. So no remote commit lowers the version of a store with data.
+
+**Result size.** The 16 MiB frame cap stays. A read primitive whose result would exceed it is an error that names the primitive and the collection. Paginated scans are a follow-up and a known limit.
+
+**Cost.** A body makes one round trip per distinct read, and repeated reads of the same key in one session are served from the client's cache. On a Unix socket that costs tens of microseconds per read. A body that scans a large collection still moves that collection, but nothing else.
 
 ### 6.2 Authentication
 
@@ -335,6 +366,7 @@ A failure before the rename removes the temp and leaves the old file untouched. 
 - **Bearer token** in the `Authorization` header of the `ws`/`wss` upgrade.
   - The server stores only SHA-256 hashes of tokens, in a 0600 token file.
   - Each token has a scope: `read`, `write` or `admin`. `admin` covers compact, checkpoint and migrate.
+  - `commit_txn` needs `write` even with empty `ops`: it takes the write lock, and its answer says whether the read hashes still match.
 
 A failed authentication closes the connection after a fixed delay. It says nothing about which check failed.
 

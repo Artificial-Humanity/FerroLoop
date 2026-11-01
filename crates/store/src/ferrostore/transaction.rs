@@ -3,7 +3,7 @@
 
 use super::columnar::{self, ColumnDef, ColumnValue};
 use super::layout::{Op, backend};
-use super::{FerroStore, Txn, VectorMetric, VectorStorage, doc, state, vector};
+use super::{FerroStore, Txn, VectorMetric, VectorStorage, doc, session, vector};
 use fl_core::StoreError;
 use serde_json::Value;
 
@@ -61,13 +61,7 @@ impl Transaction<'_> {
     /// Ids in `collection` whose top-level `field` matches `value`, in
     /// ascending order: the same match as [`FerroStore::query_by_field`].
     pub fn query_by_field(&self, collection: &str, field: &str, value: &str) -> Vec<String> {
-        let mut ids = Vec::new();
-        self.txn.visit(collection, |id, doc| {
-            if state::field_matches(doc, field, value) {
-                ids.push(id.to_string());
-            }
-        });
-        ids
+        self.txn.query_by_field(collection, field, value)
     }
 
     /// See [`FerroStore::create_column_table`].
@@ -93,7 +87,7 @@ impl Transaction<'_> {
     /// `true` when vector collection `name` exists, with this transaction's
     /// creates. Never creates it.
     pub fn has_vector_collection(&self, name: &str) -> bool {
-        self.txn.vector(name).is_some()
+        self.txn.vector_params(name).is_some()
     }
 
     /// See [`FerroStore::create_vector_collection`].
@@ -162,9 +156,14 @@ impl FerroStore {
     /// body runs under the store's write lock: on disk it joins a group
     /// commit (spec §4.3), under the file's `flock`, against the state other
     /// handles committed. A read inside the body and the write that depends
-    /// on it see no commit between them. On a remote handle the commit is a
-    /// compare-and-swap on the server's sequence, and `body` runs again
-    /// when another writer committed first.
+    /// on it see no commit between them. On a remote handle `body` reads one
+    /// snapshot through a read session on the server, and the commit sends
+    /// its writes with what it read: the server commits only when every read
+    /// (a document, a scan, a query, a vector) still has the value `body`
+    /// saw, so the transaction is serializable, and otherwise `body` runs
+    /// again over a new snapshot. A remote body cannot read back a vector
+    /// collection it wrote in the same transaction: [`Transaction::get_vector`]
+    /// on it is an error, because the server applies vector writes.
     ///
     /// **`body` must be free of side effects**: it may run more than once
     /// (on a remote handle, at most 8 times, after which the transaction is
@@ -217,7 +216,7 @@ impl Txn {
         if rows.is_empty() {
             return Ok(());
         }
-        let bytes = columnar::encode_row_group(columns, rows)?;
+        let bytes = columnar::encode_row_group(&columns, rows)?;
         self.stage(Op::AppendColumnGroup {
             name: name.to_string(),
             bytes,
@@ -236,7 +235,7 @@ impl Txn {
         ef_search: u32,
     ) -> Result<(), StoreError> {
         vector::check_create(name, dim, storage, m, ef_construction, ef_search)?;
-        if self.vector(name).is_some() {
+        if self.vector_params(name).is_some() {
             return Err(backend(format!(
                 "vector collection `{name}` already exists"
             )));
@@ -261,10 +260,10 @@ impl Txn {
         collection: &str,
         items: &[(&str, &[f32], Option<&Value>)],
     ) -> Result<(), StoreError> {
-        let Some(col) = self.vector(collection) else {
+        let Some(params) = self.vector_params(collection) else {
             return Err(backend(format!("no vector collection `{collection}`")));
         };
-        let (dim, storage) = (col.dim, col.storage);
+        let (dim, storage) = (params.dim, params.storage);
         let mut checked = Vec::with_capacity(items.len());
         for (id, values, metadata) in items {
             vector::check_vector_id(id)?;
@@ -292,7 +291,7 @@ impl Txn {
         collection: &str,
         id: &str,
     ) -> Result<(), StoreError> {
-        if self.vector(collection).is_none() {
+        if self.vector_params(collection).is_none() {
             return Err(backend(format!("no vector collection `{collection}`")));
         }
         vector::check_vector_id(id)?;
@@ -303,12 +302,36 @@ impl Txn {
     }
 
     /// Dequantized values and metadata. `Ok(None)` when the id is missing.
+    ///
+    /// A remote transaction asks its session, and refuses a collection it
+    /// created or changed itself: the server applies those changes, so the
+    /// client has nothing to read them back from (spec §6.1).
     pub(super) fn read_vector(
         &self,
         collection: &str,
         id: &str,
     ) -> Result<Option<StoredVector>, StoreError> {
-        let Some(col) = self.vector(collection) else {
+        if let Some(remote) = self.remote_base() {
+            if remote.written_vectors.contains(collection) {
+                return Err(backend(format!(
+                    "remote transaction cannot read back its own vector writes \
+                     (vector collection `{collection}`)"
+                )));
+            }
+            let Some(held) = remote.read(session::ReadKey::GetVector {
+                collection: collection.to_string(),
+                id: id.to_string(),
+            }) else {
+                return Err(backend(format!(
+                    "the remote read of vector collection `{collection}` failed"
+                )));
+            };
+            if let Some(err) = held.get("err").and_then(Value::as_str) {
+                return Err(backend(err));
+            }
+            return vector::parse_get(&held);
+        }
+        let Some(col) = self.local_vector(collection)? else {
             return Err(backend(format!("no vector collection `{collection}`")));
         };
         vector::check_vector_id(id)?;

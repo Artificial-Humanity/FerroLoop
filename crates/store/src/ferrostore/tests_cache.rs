@@ -529,8 +529,13 @@ fn a_reader_never_sees_a_mixed_state_while_writers_commit() {
                             .with_read(|txn| {
                                 let a = txn.get("pair", "a").and_then(|v| v.as_u64());
                                 let b = txn.get("pair", "b").and_then(|v| v.as_u64());
-                                assert_eq!(a, b, "a mixed state at seq {}", txn.base().last_seq);
-                                Ok((txn.base().last_seq, a.unwrap_or(0)))
+                                assert_eq!(
+                                    a,
+                                    b,
+                                    "a mixed state at seq {}",
+                                    txn.local_base().unwrap().last_seq
+                                );
+                                Ok((txn.local_base().unwrap().last_seq, a.unwrap_or(0)))
                             })
                             .unwrap();
                         assert!(seen.0 >= last.0, "last_seq went back: {last:?} -> {seen:?}");

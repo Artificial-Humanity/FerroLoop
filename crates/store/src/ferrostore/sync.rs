@@ -8,7 +8,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-/// One committed mutation, in the same shape `commit_ops` carries.
+/// One committed mutation, in the shape of an [`Op`] a commit carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SyncOp {

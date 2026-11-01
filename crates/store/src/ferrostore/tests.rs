@@ -3401,14 +3401,14 @@ fn exercise_vector_rpc(client: &FerroStore, file: &Path) {
     ] {
         assert!(matches!(search, StoreError::Backend(_)), "{search}");
     }
-    let remote = client.read_state().unwrap();
+    // The client never receives the whole state (spec §6.1); the file the
+    // server wrote holds the graph its upserts built.
+    assert!(client.read_state().is_err());
     let disk = FerroStore::open(file).unwrap().read_state().unwrap();
-    assert_eq!(remote.vectors, disk.vectors);
-    assert_eq!(remote.docs, disk.docs);
-    assert_eq!(remote.last_seq, disk.last_seq);
-    assert!(remote.vectors["emb"].entry.is_some());
+    assert_eq!(client.last_seq().unwrap(), disk.last_seq);
+    assert!(disk.vectors["emb"].entry.is_some());
     assert!(
-        remote.vectors["emb"]
+        disk.vectors["emb"]
             .vectors
             .values()
             .any(|record| record.neighbors.iter().any(|layer| !layer.is_empty()))
@@ -3820,12 +3820,14 @@ fn vector_rpc_works_over_unix_and_ws() {
     let err = raw.call("search_hybrid", bad_k).unwrap_err();
     assert!(err.to_string().contains("k"), "{err}");
 
-    let seq = client.read_state().unwrap().last_seq;
+    // Vector ops in a `commit_txn` are checked and applied on the server,
+    // HNSW and all, as a local write applies them.
+    let seq = client.last_seq().unwrap();
     let err = raw
         .call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [{
                     "op": "upsert_vector",
                     "collection": "missing",
@@ -3836,7 +3838,7 @@ fn vector_rpc_works_over_unix_and_ws() {
         )
         .unwrap_err();
     assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert_eq!(client.read_state().unwrap().last_seq, seq);
+    assert_eq!(client.last_seq().unwrap(), seq);
 
     let bytes: Vec<u64> = 0.5f32
         .to_le_bytes()
@@ -3846,9 +3848,9 @@ fn vector_rpc_works_over_unix_and_ws() {
         .collect();
     assert_eq!(
         raw.call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [
                     {
                         "op": "upsert_vector",
@@ -3866,17 +3868,17 @@ fn vector_rpc_works_over_unix_and_ws() {
             }),
         )
         .unwrap(),
-        json!(true)
+        json!({"committed": true, "seq": seq + 1})
     );
     let (values, metadata) = client.get_vector("emb", "from-bytes").unwrap().unwrap();
     assert_eq!(values, vec![0.5, 0.25]);
     assert_eq!(metadata, Some(serde_json::Value::Null));
-    let seq = client.read_state().unwrap().last_seq;
+    let seq = client.last_seq().unwrap();
     assert_eq!(
         raw.call(
-            "commit_ops",
+            "commit_txn",
             json!({
-                "expected_seq": seq,
+                "reads": [],
                 "ops": [{
                     "op": "create_vector_collection",
                     "name": "extra",
@@ -3890,7 +3892,7 @@ fn vector_rpc_works_over_unix_and_ws() {
             }),
         )
         .unwrap(),
-        json!(true)
+        json!({"committed": true, "seq": seq + 1})
     );
     client
         .upsert_vector("extra", "q", &[1.0, -1.0], None)

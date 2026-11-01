@@ -1,8 +1,8 @@
-//! Spec §4.5: the bounded remote compare-and-swap retry, and write bodies
-//! free of side effects.
+//! Spec §4.5: the bounded retry of a remote commit, and write bodies free
+//! of side effects.
 //!
-//! The retry hook (`retry::hook`) sees each remote compare-and-swap attempt
-//! before it is sent and may lose it, as a commit by another writer would.
+//! The retry hook (`retry::hook`) sees each remote commit attempt before it
+//! is sent and may lose it, as a commit by another writer would.
 
 use super::retry::{BACKOFF_CAP, BACKOFF_FIRST, Backoff, Cas, REMOTE_ATTEMPTS, hook};
 use super::{FerroStore, FerroStoreServer};
@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// A served in-memory store; the guard keeps the server and its socket.
-struct Served {
+pub(super) struct Served {
     server: FerroStoreServer,
     uri: String,
     _dir: tempfile::TempDir,
@@ -120,7 +120,7 @@ fn a_remote_write_that_loses_every_attempt_is_a_conflict_after_eight() {
         let got = lose_every_attempt(served.uri.clone(), write);
         assert!(got.conflict, "{name}: {}", got.error);
         assert!(
-            got.error.contains("8 compare-and-swap attempts"),
+            got.error.contains("8 commit attempts"),
             "{name}: {}",
             got.error
         );
@@ -374,7 +374,7 @@ fn every_body_twice() -> (hook::Installed, Rc<RefCell<Twice>>) {
     let installed = hook::install(
         move |cas: &Cas<'_>| {
             let site = site_of(cas);
-            let known = format!("{:?}", cas.base);
+            let known = format!("{:?}", cas.known);
             let ops = fresh_ids_renamed(&format!("{:?}", cas.ops), &known);
             let mut seen = seen.borrow_mut();
             match cas.attempt {
@@ -415,13 +415,13 @@ fn every_body_twice() -> (hook::Installed, Rc<RefCell<Twice>>) {
 
 /// A fresh served store for one conformance case: the client, then the
 /// guard that keeps its server.
-fn fresh_remote() -> (FerroStore, Served) {
+pub(super) fn fresh_remote() -> (FerroStore, Served) {
     let served = served();
     (client(&served), served)
 }
 
 /// The store contracts over a remote handle.
-fn run_contracts() {
+pub(super) fn run_contracts() {
     use fl_core::conformance::{Single, SplitOver};
     let single = || {
         let (s, g) = fresh_remote();
@@ -448,7 +448,7 @@ fn run_contracts() {
 }
 
 /// The public writes of `FerroStore` the contracts do not reach.
-fn run_public_writes() {
+pub(super) fn run_public_writes() {
     use super::{ColumnDef, ColumnType, ColumnValue, VectorMetric, VectorStorage};
     let (store, _guard) = fresh_remote();
     store.put_doc("docs", "a", &json!({"n": 1})).unwrap();

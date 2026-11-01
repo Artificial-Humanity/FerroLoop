@@ -2,15 +2,13 @@
 
 use super::Txn;
 use super::doc::{self, ATTEMPTS, GATE_RUNS};
-use super::state::Tables;
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::log::{Attempt, GateRun};
 use fl_core::verdict::Verdict;
 use serde_json::{Number, Value, json};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 
 const CODEC_DELTA: u8 = 1;
 const CODEC_DELTA_RLE: u8 = 2;
@@ -1997,54 +1995,6 @@ fn json_u64(value: &Value, key: &str) -> Result<u64, StoreError> {
         .ok_or_else(|| backend(format!("missing integer field `{key}`")))
 }
 
-pub(super) fn tables_json(tables: &Tables) -> Value {
-    Value::Array(
-        tables
-            .iter()
-            .map(|(name, table)| {
-                json!({
-                    "name": name,
-                    "columns": table.columns.iter().map(column_def_json).collect::<Vec<_>>(),
-                    "groups": table.groups.iter().map(|group| bytes_json(group)).collect::<Vec<_>>(),
-                })
-            })
-            .collect(),
-    )
-}
-
-pub(super) fn parse_tables(value: &Value) -> Result<Tables, StoreError> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| backend("tables is not an array"))?;
-    let mut tables = BTreeMap::new();
-    for item in items {
-        let name = item
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| backend("table is missing name"))?
-            .to_string();
-        let columns = parse_columns(
-            item.get("columns")
-                .ok_or_else(|| backend("table is missing columns"))?,
-        )?;
-        let groups_json = item
-            .get("groups")
-            .and_then(Value::as_array)
-            .ok_or_else(|| backend("table is missing groups"))?;
-        let mut groups = Vec::with_capacity(groups_json.len());
-        for group in groups_json {
-            groups.push(parse_bytes(group)?);
-        }
-        if tables
-            .insert(name.clone(), Arc::new(ColumnTable { columns, groups }))
-            .is_some()
-        {
-            return Err(backend(format!("duplicate column table `{name}`")));
-        }
-    }
-    Ok(tables)
-}
-
 pub(super) fn parse_bytes(value: &Value) -> Result<Vec<u8>, StoreError> {
     let items = value
         .as_array()
@@ -2058,10 +2008,6 @@ pub(super) fn parse_bytes(value: &Value) -> Result<Vec<u8>, StoreError> {
         out.push(byte);
     }
     Ok(out)
-}
-
-fn bytes_json(bytes: &[u8]) -> Value {
-    Value::Array(bytes.iter().copied().map(Value::from).collect())
 }
 
 #[cfg(test)]
