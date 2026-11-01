@@ -10,11 +10,11 @@ use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::routing::{GithubTier, Tier};
 use fl_core::store::{Handles, Ledger, Roles, StoreError, Tracker};
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use std::cell::RefCell;
 
 pub struct Ctx<'a> {
-    pub store: &'a RedbStore,
+    pub store: &'a AnyStore,
     /// The local store, or the GitHub tracker behind `CatalogChecked`.
     pub tracker: &'a dyn Tracker,
     /// Where runs, attempts and decisions are recorded: the local store,
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn the_roles_bind_the_ledger_the_command_was_given() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let flushes = Flushes::default();
         let ctx = Ctx {
             store: &store,

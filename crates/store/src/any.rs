@@ -144,6 +144,72 @@ pub fn open_store_with(path: &Path, options: &StoreOptions) -> Result<AnyStore, 
     })
 }
 
+/// Open the redb store at `path` whatever the environment says. For tests and
+/// for tools that must read a `.redb` file regardless of `FL_STORE_BACKEND`.
+pub fn open_redb(path: &Path) -> Result<AnyStore, StoreError> {
+    open_store_with(
+        path,
+        &StoreOptions {
+            backend: Some(BackendKind::Redb),
+            ..StoreOptions::default()
+        },
+    )
+}
+
+/// Whether the store named by the logical `path` exists under the engine that
+/// [`choose_backend`] selects for it (the process environment's
+/// [`BACKEND_ENV`] included): the physical file of that engine, nothing else.
+/// An unusable environment value counts as "check the path itself".
+///
+/// A lone `.redb` beside a ferro selection reports `false` here; callers that
+/// go on to [`open_store`] it get its refusal, which tells the user to migrate.
+pub fn store_exists(path: &Path) -> bool {
+    store_exists_with(path, std::env::var(BACKEND_ENV).ok().as_deref())
+}
+
+fn store_exists_with(path: &Path, env: Option<&str>) -> bool {
+    match choose_backend(path, env) {
+        Ok(kind) => physical_path(path, kind).exists(),
+        Err(_) => path.exists(),
+    }
+}
+
+/// The identity of the store named `path` under the process environment: the
+/// physical file of the selected engine, with symlinks resolved. Two paths
+/// name the same store exactly when their identities are equal, so a
+/// configured `x.redb` and an explicit `x.fls` agree under FerroStore, and a
+/// symlinked alias agrees with its target. A file that does not exist yet has
+/// its directory resolved instead. An unusable engine selection falls back to
+/// the path itself, as [`store_exists`] does.
+pub fn store_identity(path: &Path) -> PathBuf {
+    store_identity_with(path, std::env::var(BACKEND_ENV).ok().as_deref())
+}
+
+fn store_identity_with(path: &Path, env: Option<&str>) -> PathBuf {
+    let physical = match choose_backend(path, env) {
+        Ok(kind) => physical_path(path, kind),
+        Err(_) => path.to_path_buf(),
+    };
+    if let Ok(resolved) = physical.canonicalize() {
+        return resolved;
+    }
+    // Absent file: resolve the directory it would be created in.
+    match (physical.parent(), physical.file_name()) {
+        (Some(dir), Some(name)) => {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            match dir.canonicalize() {
+                Ok(resolved) => resolved.join(name),
+                Err(_) => physical,
+            }
+        }
+        _ => physical,
+    }
+}
+
 enum Backend {
     Ferro(Box<FerroStore>),
     Redb(RedbStore),
@@ -534,6 +600,75 @@ mod tests {
     }
 
     #[test]
+    fn store_identity_is_the_logical_path_on_redb() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let redb = root.join("a.redb");
+        // Absent: the directory is resolved, the name kept.
+        assert_eq!(store_identity_with(&redb, None), redb);
+        assert_eq!(store_identity_with(&redb, Some("redb")), redb);
+        // A sibling .fls is a different store under redb.
+        assert_ne!(
+            store_identity_with(&redb, None),
+            store_identity_with(&root.join("a.fls"), None)
+        );
+        std::fs::write(&redb, b"x").unwrap();
+        assert_eq!(store_identity_with(&redb, None), redb);
+    }
+
+    #[test]
+    fn store_identity_is_the_physical_file_on_ferro() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let redb = root.join("a.redb");
+        let fls = root.join("a.fls");
+        // Both absent: the raw physical path.
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+        assert_eq!(store_identity_with(&fls, None), fls);
+        assert_eq!(
+            store_identity_with(&redb, Some("ferro")),
+            store_identity_with(&fls, None)
+        );
+        // A stale .redb beside it does not change the answer.
+        std::fs::write(&redb, b"stale").unwrap();
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+        std::fs::write(&fls, b"x").unwrap();
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_identity_sees_through_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias_dir = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias_dir).unwrap();
+        // An absent file in an aliased directory.
+        assert_eq!(
+            store_identity_with(&alias_dir.join("a.redb"), Some("ferro")),
+            store_identity_with(&real.join("a.fls"), None)
+        );
+        // An existing file reached through a file symlink.
+        std::fs::write(real.join("a.fls"), b"x").unwrap();
+        std::os::unix::fs::symlink(real.join("a.fls"), root.join("link.fls")).unwrap();
+        assert_eq!(
+            store_identity_with(&root.join("link.fls"), None),
+            real.join("a.fls")
+        );
+        assert_eq!(
+            store_identity_with(&alias_dir.join("a.redb"), Some("ferro")),
+            store_identity_with(&root.join("link.fls"), None)
+        );
+        // An unusable engine selection falls back to the path itself.
+        assert_eq!(
+            store_identity_with(&real.join("b.redb"), Some("sqlite")),
+            real.join("b.redb")
+        );
+    }
+
+    #[test]
     fn each_engine_persists_across_reopen_through_open_store() {
         for kind in both() {
             let dir = TempDir::new().unwrap();
@@ -678,5 +813,52 @@ mod tests {
         let report = other.import_manifest(&manifest, "/elsewhere").unwrap();
         assert_eq!(report.project, project);
         assert!(other.imported_hash(&project).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_redb_ignores_the_environment_and_the_path_extension_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.redb");
+        let store = open_redb(&path).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(path.exists());
+        assert!(!dir.path().join("s.fls").exists());
+    }
+
+    #[test]
+    fn store_exists_checks_the_chosen_engines_physical_file() {
+        let dir = TempDir::new().unwrap();
+        let logical = dir.path().join("s.redb");
+        // Nothing yet, under either engine.
+        assert!(!store_exists_with(&logical, None));
+        assert!(!store_exists_with(&logical, Some("ferro")));
+        // A redb file exists for redb, but not for a ferro selection.
+        drop(open_redb(&logical).unwrap());
+        assert!(store_exists_with(&logical, None));
+        assert!(store_exists_with(&logical, Some("redb")));
+        assert!(!store_exists_with(&logical, Some("ferro")));
+        // open_store refuses the lone .redb under a ferro selection; callers
+        // surface that message.
+        let ferro = StoreOptions {
+            backend: Some(BackendKind::Ferro),
+            ..StoreOptions::default()
+        };
+        assert!(open_store_with(&logical, &ferro).is_err());
+        // A ferro store of its own: the logical `.redb` name maps to the
+        // sibling .fls, and an explicit .fls path needs no environment.
+        let fresh = dir.path().join("f.redb");
+        assert!(!store_exists_with(&fresh, Some("ferro")));
+        drop(open_store_with(&fresh, &ferro).unwrap());
+        let physical = dir.path().join("f.fls");
+        assert!(physical.exists());
+        assert!(store_exists_with(&fresh, Some("ferro")));
+        assert!(!store_exists_with(&fresh, None));
+        assert!(store_exists_with(&physical, None));
+        // A bad environment value falls back to the path itself.
+        assert!(store_exists_with(&logical, Some("bogus")));
+        assert!(!store_exists_with(
+            &dir.path().join("none.redb"),
+            Some("bogus")
+        ));
     }
 }
