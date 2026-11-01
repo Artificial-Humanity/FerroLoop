@@ -14,6 +14,10 @@ use crate::artifacts::write_file_atomic;
 
 pub(crate) const MIN_POLL_INTERVAL_SECS: u64 = 2;
 pub(crate) const MAX_POLL_INTERVAL_SECS: u64 = 300;
+/// How long `FerroDeck` chat attachments are kept when no setting says otherwise.
+pub(crate) const DEFAULT_ATTACHMENT_RETENTION_DAYS: u64 = 7;
+/// The longest attachment retention a patch may set.
+pub(crate) const MAX_ATTACHMENT_RETENTION_DAYS: u64 = 365;
 
 /// Serialises every settings read-modify-write.
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
@@ -58,6 +62,11 @@ pub(crate) struct Settings {
     pub subsystems: Subsystems,
     pub notifications: Notifications,
     pub hub_connection: HubConnection,
+    /// Days the hub keeps uploaded chat attachments (`0..=365`, default 7). The hub deletes an
+    /// attachment older than this after an upload and on its periodic sweep. `0` turns automatic
+    /// deletion off. Expiry does not check whether a message still refers to the file, so an
+    /// expired attachment breaks its image link in old chat transcripts.
+    pub attachment_retention_days: u64,
 }
 
 impl Default for Settings {
@@ -80,6 +89,7 @@ impl Default for Settings {
                 auto_reconnect_ws: true,
                 poll_interval_secs: 10,
             },
+            attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
         }
     }
 }
@@ -94,6 +104,8 @@ pub(crate) struct SettingsPatch {
     pub subsystems: Option<SubsystemsPatch>,
     pub notifications: Option<NotificationsPatch>,
     pub hub_connection: Option<HubConnectionPatch>,
+    /// See [`Settings::attachment_retention_days`]. A value above 365 is refused.
+    pub attachment_retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -124,6 +136,10 @@ fn poll_interval_in_range(secs: u64) -> bool {
     (MIN_POLL_INTERVAL_SECS..=MAX_POLL_INTERVAL_SECS).contains(&secs)
 }
 
+fn retention_in_range(days: u64) -> bool {
+    days <= MAX_ATTACHMENT_RETENTION_DAYS
+}
+
 fn normalize_timezone(raw: &str) -> Option<String> {
     let tz = raw.trim();
     if tz.is_empty() || tz.len() > 64 {
@@ -148,8 +164,8 @@ fn normalize_timezone(raw: &str) -> Option<String> {
 }
 
 impl Settings {
-    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval or timezone
-    /// is invalid.
+    /// Apply `patch` on top of `self`. Fails, changing nothing, when the poll interval, timezone
+    /// or attachment retention is invalid.
     pub(crate) fn merged(&self, patch: SettingsPatch) -> Result<Self, String> {
         let mut next = self.clone();
         if let Some(theme) = patch.theme_preference {
@@ -188,6 +204,15 @@ impl Settings {
                 }
                 next.hub_connection.poll_interval_secs = secs;
             }
+        }
+        if let Some(days) = patch.attachment_retention_days {
+            if !retention_in_range(days) {
+                return Err(format!(
+                    "attachment_retention_days must be between 0 and \
+                     {MAX_ATTACHMENT_RETENTION_DAYS}"
+                ));
+            }
+            next.attachment_retention_days = days;
         }
         Ok(next)
     }
@@ -268,6 +293,13 @@ impl Settings {
         {
             s.hub_connection.poll_interval_secs = secs;
         }
+        if let Some(days) = root
+            .get("attachment_retention_days")
+            .and_then(Value::as_u64)
+            .filter(|days| retention_in_range(*days))
+        {
+            s.attachment_retention_days = days;
+        }
         s
     }
 }
@@ -279,6 +311,9 @@ fn set<T>(slot: &mut T, value: Option<T>) {
 }
 
 /// The saved settings, or the defaults for whatever is missing or unreadable. Never fails.
+///
+/// For display and merging only: never decide a deletion from it (see
+/// [`load_attachment_retention_strict`]).
 pub(crate) fn load(home: &Path) -> Settings {
     let Ok(bytes) = std::fs::read(settings_path(home)) else {
         return Settings::default();
@@ -286,6 +321,43 @@ pub(crate) fn load(home: &Path) -> Settings {
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(doc) => Settings::from_stored(&doc),
         Err(_) => Settings::default(),
+    }
+}
+
+/// The saved `attachment_retention_days`, read strictly, for deciding deletions.
+///
+/// Unlike [`load`], it never falls back to the default on damage, because a fallback toward
+/// deletion could sweep files the Owner meant to keep (`0` = never delete).
+///
+/// - No settings file, or a file without the field: `Ok(7)`, the default.
+/// - A file that cannot be read or parsed, a root that is not an object, or a field that is not
+///   an integer in `0..=365`: `Err` with the reason. The caller must not delete on `Err`.
+pub(crate) fn load_attachment_retention_strict(home: &Path) -> Result<u64, String> {
+    let path = settings_path(home);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_ATTACHMENT_RETENTION_DAYS);
+        }
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))?;
+    let Some(root) = doc.as_object() else {
+        return Err(format!("{} is not a JSON object", path.display()));
+    };
+    match root.get("attachment_retention_days") {
+        None => Ok(DEFAULT_ATTACHMENT_RETENTION_DAYS),
+        Some(v) => v
+            .as_u64()
+            .filter(|d| retention_in_range(*d))
+            .ok_or_else(|| {
+                format!(
+                    "attachment_retention_days in {} is {v}, not an integer between 0 and \
+                 {MAX_ATTACHMENT_RETENTION_DAYS}",
+                    path.display()
+                )
+            }),
     }
 }
 
@@ -301,13 +373,25 @@ pub(crate) enum UpdateError {
     Invalid(String),
     /// The merged settings could not be written.
     Io(io::Error),
+    /// The stored file is unreadable or holds an invalid `attachment_retention_days`, and the
+    /// patch does not set it. Writing would silently reset retention to the default and turn
+    /// automatic deletion back on. Carries the reason; nothing was written.
+    Damaged(String),
 }
 
 /// Merge `patch` into the saved settings and persist the result, under one lock.
+///
+/// Refuses with [`UpdateError::Damaged`] when the stored file is damaged (see
+/// [`load_attachment_retention_strict`]) and the patch does not set `attachment_retention_days`:
+/// the lenient [`load`] would otherwise rewrite the file with retention `7`. A patch that sets
+/// it explicitly repairs the file; the other fields still come from the lenient load.
 pub(crate) fn update(home: &Path, patch: SettingsPatch) -> Result<Settings, UpdateError> {
     let _guard = SETTINGS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if patch.attachment_retention_days.is_none() {
+        load_attachment_retention_strict(home).map_err(UpdateError::Damaged)?;
+    }
     let next = load(home).merged(patch).map_err(UpdateError::Invalid)?;
     save(home, &next).map_err(UpdateError::Io)?;
     Ok(next)
@@ -338,8 +422,131 @@ mod tests {
                     "sound_enabled": false,
                 },
                 "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+                "attachment_retention_days": 7,
             })
         );
+    }
+
+    #[test]
+    fn attachment_retention_defaults_to_seven_when_the_file_lacks_it() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file written before the field existed.
+        let doc = json!({
+            "theme_preference": "light",
+            "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.attachment_retention_days, 7);
+        assert_eq!(loaded.theme_preference, Theme::Light);
+        // Stored values outside the contract fall back to the default too.
+        for (stored, want) in [
+            (json!(0), 0),
+            (json!(30), 30),
+            (json!(365), 365),
+            (json!(366), 7),
+            (json!(-1), 7),
+            (json!("30"), 7),
+            (json!(2.5), 7),
+        ] {
+            let doc = json!({ "attachment_retention_days": stored });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            assert_eq!(load(tmp.path()).attachment_retention_days, want, "{stored}");
+        }
+    }
+
+    #[test]
+    fn strict_retention_defaults_only_when_the_file_or_field_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        // No file at all.
+        assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(7));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file without the field (written before it existed).
+        std::fs::write(&path, json!({ "theme_preference": "light" }).to_string()).unwrap();
+        assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(7));
+        for ok in [0, 30, 365] {
+            std::fs::write(
+                &path,
+                json!({ "attachment_retention_days": ok }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(ok));
+        }
+    }
+
+    #[test]
+    fn strict_retention_refuses_a_damaged_file_or_an_invalid_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cases: [&[u8]; 9] = [
+            b"{ not json",
+            b"",
+            b"[0]",
+            br#"{"attachment_retention_days":1000}"#,
+            br#"{"attachment_retention_days":366}"#,
+            br#"{"attachment_retention_days":-1}"#,
+            br#"{"attachment_retention_days":"0"}"#,
+            br#"{"attachment_retention_days":2.5}"#,
+            br#"{"attachment_retention_days":null}"#,
+        ];
+        for bytes in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let got = load_attachment_retention_strict(tmp.path());
+            assert!(got.is_err(), "{}: {got:?}", String::from_utf8_lossy(bytes));
+            // The lenient loader still shows a value for the UI.
+            let _ = load(tmp.path());
+        }
+        // A settings path that cannot be read (a directory) is refused, not defaulted.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = load_attachment_retention_strict(tmp.path()).unwrap_err();
+        assert!(err.contains("could not read"), "{err}");
+    }
+
+    #[test]
+    fn attachment_retention_patch_sets_accepts_zero_and_refuses_above_365() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let out = update(
+            tmp.path(),
+            patch(json!({ "attachment_retention_days": 30 })),
+        )
+        .unwrap();
+        assert_eq!(out.attachment_retention_days, 30);
+        assert_eq!(load(tmp.path()).attachment_retention_days, 30);
+
+        let res = update(
+            tmp.path(),
+            patch(json!({ "attachment_retention_days": 366 })),
+        );
+        let Err(UpdateError::Invalid(msg)) = res else {
+            panic!("366 must be refused");
+        };
+        assert!(msg.contains("attachment_retention_days"), "{msg}");
+        assert_eq!(load(tmp.path()).attachment_retention_days, 30);
+
+        for ok in [0, 365] {
+            let out = update(
+                tmp.path(),
+                patch(json!({ "attachment_retention_days": ok })),
+            )
+            .unwrap();
+            assert_eq!(out.attachment_retention_days, ok);
+            assert_eq!(load(tmp.path()).attachment_retention_days, ok);
+        }
+        for bad in [json!(-1), json!("7"), json!(1.5)] {
+            assert!(
+                serde_json::from_value::<SettingsPatch>(
+                    json!({ "attachment_retention_days": bad })
+                )
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -542,5 +749,42 @@ mod tests {
         let loaded = load(tmp.path());
         assert_eq!(loaded.theme_preference, Theme::Dark);
         assert!(loaded.notifications.sound_enabled);
+    }
+
+    #[test]
+    fn update_refuses_a_damaged_file_unless_the_patch_repairs_retention() {
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let tz = || patch(json!({ "timezone": "Europe/Paris" }));
+        for stored in [
+            &b"{ not json"[..],
+            b"[7]",
+            br#"{"attachment_retention_days":1000}"#,
+            br#"{"attachment_retention_days":"0"}"#,
+            br#"{"attachment_retention_days":null}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = settings_path(tmp.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, stored).unwrap();
+            let Err(UpdateError::Damaged(why)) = update(tmp.path(), tz()) else {
+                panic!("{stored:?} was not refused");
+            };
+            assert!(!why.is_empty());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                stored,
+                "file must not change"
+            );
+
+            let fixed =
+                update(tmp.path(), patch(json!({ "attachment_retention_days": 0 }))).unwrap();
+            assert_eq!(fixed.attachment_retention_days, 0);
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(0));
+            assert!(update(tmp.path(), tz()).is_ok());
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(0));
+        }
+        let tmp = TempDir::new().unwrap();
+        let out = update(tmp.path(), tz()).unwrap();
+        assert_eq!(out.attachment_retention_days, 7);
     }
 }

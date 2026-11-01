@@ -267,7 +267,9 @@ fn cmd_serve(
     fl_store::private::warn_always();
     let hub_cfg_sec = env.cfg.hub.as_ref();
     let listen = resolve_listen_addr(env, listen_flag);
-    let store_path = resolve_hub_store_path(env);
+    // Absolute once, here: the store, and the `attachments/` dir beside it that uploads, serving
+    // and expiry share, never depend on a relative `--db` / `FL_DB`.
+    let store_path = absolute_path(env.cwd, resolve_hub_store_path(env));
     let repo_root = env.cwd.to_path_buf();
 
     let ui_dir = ui_dir_flag

@@ -90,6 +90,10 @@ impl HubServer {
     pub async fn serve(mut self) -> io::Result<()> {
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
+        let mut attachment_sweep_tick =
+            tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
+        attachment_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 accept_res = self.listener.accept() => {
@@ -110,6 +114,13 @@ impl HubServer {
                             drain_ready_session_queues(&state);
                         }).await;
                     }
+                }
+                _ = attachment_sweep_tick.tick() => {
+                    // Not awaited: a sweep never holds up the accept loop.
+                    let state = self.state.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        crate::attachments::run_attachment_sweep(&state);
+                    }));
                 }
                 changed = self.shutdown_rx.changed() => {
                     if changed.is_err() || *self.shutdown_rx.borrow() {

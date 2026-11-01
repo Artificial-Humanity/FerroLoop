@@ -521,6 +521,9 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             handle_get_artifact_office_preview(state, req)
         }
         ("POST", "/api/v1/artifacts/prune") => handle_post_artifacts_prune(state, &authority, req),
+        ("POST", "/api/v1/attachments/prune") => {
+            crate::attachments::handle_post_attachments_prune(state, &authority, req)
+        }
         ("GET", "/api/v1/records") => records::handle_get_records(state, req),
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
@@ -2656,12 +2659,7 @@ fn handle_get_architecture(state: &HubState, req: &HttpRequest) -> HttpResponse 
 }
 
 fn attachments_dir(state: &HubState) -> PathBuf {
-    state
-        .config
-        .store_path
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join("attachments")
+    crate::attachments::attachments_dir(state)
 }
 
 const MAX_ARTIFACT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
@@ -3797,6 +3795,15 @@ fn handle_put_settings(
         Err(settings::UpdateError::Invalid(msg)) => {
             HttpResponse::json(400, json!({ "error": msg }))
         }
+        Err(settings::UpdateError::Damaged(why)) => HttpResponse::json(
+            409,
+            json!({
+                "error": format!(
+                    "the stored settings file is damaged ({why}); include \
+                     attachment_retention_days explicitly to repair it"
+                )
+            }),
+        ),
         Err(settings::UpdateError::Io(e)) => HttpResponse::json(
             500,
             json!({ "error": format!("could not save settings: {e}") }),
@@ -4565,6 +4572,9 @@ fn handle_post_session_prompt(
                 url: format!("/api/v1/attachments/{saved_name}"),
             });
         }
+        // Expire old attachments in the background; the files just saved are younger than any
+        // retention window, so the sweep never takes them.
+        let _ = crate::attachments::spawn_attachment_sweep(state);
     }
 
     let prompt_text = if payload.prompt.trim().is_empty() {

@@ -188,6 +188,8 @@ export interface PruneAttachmentsResponse {
   deleted_count: number;
   deleted_bytes: number;
   kept_count: number;
+  older_than_days?: number | null;
+  retention_disabled?: boolean;
 }
 
 export interface HubSettings {
@@ -209,6 +211,8 @@ export interface HubSettings {
     auto_reconnect_ws: boolean;
     poll_interval_secs: number;
   };
+  /** Days the hub keeps chat attachments (0..=365, default 7; 0 = never auto-delete). */
+  attachment_retention_days?: number;
 }
 
 export type HubSettingsPatch = Partial<HubSettings>;
