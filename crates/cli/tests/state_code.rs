@@ -150,13 +150,17 @@ fn state_install_registers_ferrostate_in_project_files() {
     );
 }
 
+/// `fl state code-search`; `engine` names the store engine for this child
+/// process only (`FL_STORE_BACKEND`), never the test process's environment.
 fn code_search(
     cfg: &tempfile::TempDir,
     db: &Path,
     root: &Path,
     query: &str,
+    engine: &str,
 ) -> assert_cmd::assert::Assert {
     fl(cfg, db, root)
+        .env("FL_STORE_BACKEND", engine)
         .args([
             "state",
             "code-search",
@@ -179,9 +183,10 @@ fn code_search_on_ferro_adds_mode_and_finds_a_typo_that_redb_misses() {
     let root = tempfile::tempdir().unwrap();
     write_widget(root.path());
 
-    // redb: today's JSON, no `mode`, no `note`, no sidecar.
+    // redb (named explicitly: the default engine is ferro): the plain JSON,
+    // no `mode`, no `note`, no sidecar.
     let redb_db = cfg.path().join("t.redb");
-    let plain = code_search(&cfg, &redb_db, root.path(), "widget alpa");
+    let plain = code_search(&cfg, &redb_db, root.path(), "widget alpa", "redb");
     let plain_json = stdout_json(&plain);
     assert!(plain_json.get("mode").is_none() && plain_json.get("note").is_none());
     assert_eq!(
@@ -193,7 +198,7 @@ fn code_search_on_ferro_adds_mode_and_finds_a_typo_that_redb_misses() {
 
     // ferro (an explicit `.fls` path): the vector leg finds it and says so.
     let db = cfg.path().join("t.fls");
-    let found = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa"));
+    let found = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa", "ferro"));
     assert_eq!(found["mode"], "knowledge", "{found}");
     assert!(found.get("note").is_none(), "{found}");
     assert_eq!(found["symbols"][0]["name"], "widget_alpha", "{found}");
@@ -213,7 +218,7 @@ fn code_search_on_ferro_adds_mode_and_finds_a_typo_that_redb_misses() {
 
     // A corrupt sidecar: the exact answer, a generic note, the cause on stderr only.
     std::fs::write(&sidecar, vec![0xA5u8; 4096]).unwrap();
-    let broken = code_search(&cfg, &db, root.path(), "widget_alpha");
+    let broken = code_search(&cfg, &db, root.path(), "widget_alpha", "ferro");
     let broken_json = stdout_json(&broken);
     assert!(broken_json.get("mode").is_none(), "{broken_json}");
     assert_eq!(
@@ -230,7 +235,7 @@ fn code_search_on_ferro_adds_mode_and_finds_a_typo_that_redb_misses() {
 
     // Delete it: the next search rebuilds it.
     std::fs::remove_file(&sidecar).unwrap();
-    let again = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa"));
+    let again = stdout_json(&code_search(&cfg, &db, root.path(), "widget alpa", "ferro"));
     assert_eq!(again["mode"], "knowledge", "{again}");
     assert_eq!(again["symbols"][0]["name"], "widget_alpha", "{again}");
     assert!(sidecar.is_file());
