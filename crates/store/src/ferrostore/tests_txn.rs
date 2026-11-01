@@ -443,7 +443,7 @@ fn assert_batch_matches_singles(items: &[(String, Vec<f32>, Option<Value>)]) {
         vector::canonical_entry(&b.vectors),
         "the canonical entry"
     );
-    vector::validate_graph("v", b).unwrap();
+    vector::validate_graph_full("v", b).unwrap();
     for probe in 0..5 {
         let query = values(1000 + probe, 8);
         assert_eq!(

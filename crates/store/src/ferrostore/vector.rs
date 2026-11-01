@@ -9,7 +9,7 @@ use fl_core::StoreError;
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 const MAX_VECTOR_BYTES: u32 = 8 * 1024 * 1024;
@@ -422,7 +422,24 @@ pub(super) fn check_stored(
             bytes.len()
         )));
     }
-    dequantize(storage, bytes)?;
+    // The finiteness `dequantize` checks, without building the values.
+    let finite = match storage {
+        VectorStorage::F32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|chunk| f32::from_le_bytes(*chunk).is_finite()),
+        // Exponent 31 is infinity or NaN; every other f16 is finite.
+        VectorStorage::F16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|chunk| u16::from_le_bytes(*chunk) & 0x7c00 != 0x7c00),
+        VectorStorage::I8 => true,
+    };
+    if !finite {
+        return Err(backend("stored vector component is not finite"));
+    }
     Ok(())
 }
 
@@ -1278,7 +1295,108 @@ fn normalize(hits: &[(String, f64)]) -> BTreeMap<String, f64> {
     out
 }
 
+/// The graph checks `FerroStore::open` runs on every vector collection a snapshot decodes:
+/// the collection parameters; a canonical, live entry point; and for every vector its id, its
+/// stored bytes, its level, one neighbor list per layer, and on every layer at most
+/// `max_links` neighbors with no self link, no repeat, each neighbor live, present on that
+/// layer, and linking back. These keep a corrupt but CRC-valid snapshot (a writer bug) from
+/// loading a graph that a search or a later delete repair would walk off.
+///
+/// It does not check that each neighbor list is ordered by (distance, id): that is
+/// [`validate_graph_full`]. Open skips it because a search's results do not depend on it:
+/// every hit is a live vector with an exactly computed score, and the final result set of
+/// `search_layer` is the same whatever order the lists are in (the order only steers which
+/// near nodes an approximate search visits first). Delete-repair determinism does depend on
+/// it: `remove_node` hands the deleted node's list, in stored order, to `repair_layer`, which
+/// visits it in that order and changes the graph at each step. So the order is enforced at
+/// write time (`link_layer` and `sort_layer` write it), and the snapshot encoder checks it
+/// in full before every snapshot write (`encode_snapshot_v3` calls [`validate_graph_full`]).
+/// A misordered but CRC-valid snapshot (only a writer bug can make one) is therefore
+/// accepted on open, and the next checkpoint fails with the full check's error. The CRC
+/// protects the bytes after the write. Checking the order on open cost one dequantize and
+/// one distance per link, most of the open time of a large collection.
+///
+/// The checks run on integer indices into the collection: one id lookup per link, and a
+/// reciprocity check that scans the neighbor's list of indices, with no allocation per link.
 pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), StoreError> {
+    checked_graph(name, col).map(|_| ())
+}
+
+/// [`validate_graph`], then the canonical order of every neighbor list: by graph distance
+/// from the vector, then by id ([`cmp_distance_then_id`], the order `sort_layer` writes). The
+/// snapshot encoder runs this before every snapshot it writes, and tests run it; it costs one
+/// distance per link, so open runs [`validate_graph`] only.
+///
+/// Cost: the check dequantizes the whole collection into one `Vec<f32>` of `n * dim * 4`
+/// bytes, so a checkpoint's peak memory is that much above the stored state: 1x the stored
+/// bytes for f32, 2x for f16, 4x for i8.
+pub(super) fn validate_graph_full(name: &str, col: &VectorCollection) -> Result<(), StoreError> {
+    let Some(graph) = checked_graph(name, col)? else {
+        return Ok(());
+    };
+    graph.check_order(col)
+}
+
+/// A collection's links as indices into its vectors, in id order.
+struct GraphIndex<'a> {
+    ids: Vec<&'a str>,
+    records: Vec<&'a VectorRecord>,
+    /// Every neighbor list, concatenated: vector `i`'s list on `layer` is
+    /// `links[spans[first[i] + layer]]`.
+    links: Vec<u32>,
+    spans: Vec<std::ops::Range<usize>>,
+    first: Vec<usize>,
+}
+
+impl GraphIndex<'_> {
+    fn list(&self, node: usize, layer: usize) -> &[u32] {
+        &self.links[self.spans[self.first[node] + layer].clone()]
+    }
+
+    /// The order check of [`validate_graph_full`]. It dequantizes every vector into one
+    /// `Vec<f32>` (`n * dim * 4` bytes) that lives for the whole check: on every checkpoint
+    /// that is extra peak memory of 1x the stored vector bytes for f32, 2x for f16, 4x for i8.
+    fn check_order(&self, col: &VectorCollection) -> Result<(), StoreError> {
+        let dim = usize::try_from(col.dim).map_err(|_| corrupt("vector dim does not fit"))?;
+        let mut values = Vec::with_capacity(self.records.len().saturating_mul(dim));
+        for record in &self.records {
+            values.extend(dequantize(col.storage, &record.bytes).map_err(corrupt)?);
+        }
+        let point = |node: u32| {
+            let at = node as usize * dim;
+            &values[at..at + dim]
+        };
+        for (node, record) in self.records.iter().enumerate() {
+            let origin = point(node as u32);
+            for layer in 0..record.neighbors.len() {
+                let mut previous: Option<(f64, &str)> = None;
+                for &other in self.list(node, layer) {
+                    let dist = graph_distance(col.metric, origin, point(other));
+                    let other_id = self.ids[other as usize];
+                    if let Some((prev_dist, prev_id)) = previous
+                        && cmp_distance_then_id(prev_dist, prev_id, dist, other_id)
+                            != Ordering::Less
+                    {
+                        return Err(corrupt(format!(
+                            "vector `{}` neighbors on layer {layer} are not ordered by distance: \
+                             the collection's neighbor order is not canonical and must be \
+                             rebuilt (re-sort needed)",
+                            self.ids[node]
+                        )));
+                    }
+                    previous = Some((dist, other_id));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The checks of [`validate_graph`]; the index they built, `None` for an empty collection.
+fn checked_graph<'a>(
+    name: &str,
+    col: &'a VectorCollection,
+) -> Result<Option<GraphIndex<'a>>, StoreError> {
     check_create(
         name,
         col.dim,
@@ -1292,7 +1410,7 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
         if col.entry.is_some() {
             return Err(corrupt("empty vector collection has an entry point"));
         }
-        return Ok(());
+        return Ok(None);
     }
     let Some(entry) = &col.entry else {
         return Err(corrupt("vector collection is missing an entry point"));
@@ -1303,7 +1421,28 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
     if col.entry.as_deref() != canonical_entry(&col.vectors).as_deref() {
         return Err(corrupt("vector entry point is not canonical"));
     }
-    for (id, record) in &col.vectors {
+    let count = col.vectors.len();
+    if u32::try_from(count).is_err() {
+        return Err(corrupt("too many vectors in one collection"));
+    }
+    let index: HashMap<&str, u32> = col
+        .vectors
+        .keys()
+        .enumerate()
+        .map(|(at, id)| (id.as_str(), at as u32))
+        .collect();
+    let levels: Vec<u8> = col.vectors.values().map(|rec| rec.level).collect();
+    let mut graph = GraphIndex {
+        ids: Vec::with_capacity(count),
+        records: Vec::with_capacity(count),
+        links: Vec::new(),
+        spans: Vec::with_capacity(count),
+        first: Vec::with_capacity(count),
+    };
+    // `seen[j] == list` when vector `j` is already in the list being checked: a repeat check
+    // without a set per list.
+    let mut seen = vec![usize::MAX; count];
+    for (node, (id, record)) in col.vectors.iter().enumerate() {
         check_vector_id(id).map_err(corrupt)?;
         check_stored(col.storage, col.dim, &record.bytes).map_err(corrupt)?;
         if record.level != vector_level(id, col.m) || record.level > MAX_LEVEL {
@@ -1314,61 +1453,54 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
                 "vector `{id}` layer count does not match its level"
             )));
         }
-        let origin = dequantize(col.storage, &record.bytes).map_err(corrupt)?;
+        graph.ids.push(id);
+        graph.records.push(record);
+        graph.first.push(graph.spans.len());
         for (layer, nids) in record.neighbors.iter().enumerate() {
             if nids.len() > max_links(col.m, layer) {
                 return Err(corrupt(format!(
                     "vector `{id}` has too many neighbors on layer {layer}"
                 )));
             }
-            let mut seen = BTreeSet::new();
+            let list = graph.spans.len();
+            let start = graph.links.len();
             for nid in nids {
-                if nid == id {
-                    return Err(corrupt(format!("vector `{id}` links to itself")));
-                }
-                if !seen.insert(nid.as_str()) {
-                    return Err(corrupt(format!("vector `{id}` repeats neighbor `{nid}`")));
-                }
-                let Some(other) = col.vectors.get(nid) else {
+                // A self link is to a live id, so the lookup finds it first.
+                let Some(&other) = index.get(nid.as_str()) else {
                     return Err(corrupt(format!("vector neighbor `{nid}` is not live")));
                 };
-                if usize::from(other.level) < layer {
+                let at = other as usize;
+                if at == node {
+                    return Err(corrupt(format!("vector `{id}` links to itself")));
+                }
+                if seen[at] == list {
+                    return Err(corrupt(format!("vector `{id}` repeats neighbor `{nid}`")));
+                }
+                seen[at] = list;
+                if usize::from(levels[at]) < layer {
                     return Err(corrupt(format!(
                         "vector neighbor `{nid}` does not exist on layer {layer}"
                     )));
                 }
-                let reciprocal = other
-                    .neighbors
-                    .get(layer)
-                    .is_some_and(|slot| slot.iter().any(|other_id| other_id == id));
-                if !reciprocal {
+                graph.links.push(other);
+            }
+            graph.spans.push(start..graph.links.len());
+        }
+    }
+    for node in 0..count {
+        for layer in 0..graph.records[node].neighbors.len() {
+            for &other in graph.list(node, layer) {
+                // `other` exists on `layer`: checked above.
+                if !graph.list(other as usize, layer).contains(&(node as u32)) {
                     return Err(corrupt(format!(
-                        "vector link `{id}` -> `{nid}` is not bidirectional"
+                        "vector link `{}` -> `{}` is not bidirectional",
+                        graph.ids[node], graph.ids[other as usize]
                     )));
                 }
-            }
-            if nids.len() < 2 {
-                continue;
-            }
-            let mut previous: Option<(f64, &str)> = None;
-            for nid in nids {
-                let Some(other) = col.vectors.get(nid) else {
-                    return Err(corrupt(format!("vector neighbor `{nid}` is not live")));
-                };
-                let neighbor = dequantize(col.storage, &other.bytes).map_err(corrupt)?;
-                let dist = graph_distance(col.metric, &origin, &neighbor);
-                if let Some((prev_dist, prev_id)) = previous
-                    && cmp_distance_then_id(prev_dist, prev_id, dist, nid) != Ordering::Less
-                {
-                    return Err(corrupt(format!(
-                        "vector `{id}` neighbors on layer {layer} are not ordered by distance"
-                    )));
-                }
-                previous = Some((dist, nid.as_str()));
             }
         }
     }
-    Ok(())
+    Ok(Some(graph))
 }
 
 fn bytes_json(bytes: &[u8]) -> Value {
@@ -1474,7 +1606,8 @@ pub(super) fn parse_vectors(value: &Value) -> Result<Vectors, StoreError> {
             .ok_or_else(|| backend("vector collection is missing name"))?
             .to_string();
         let col = parse_collection(item)?;
-        validate_graph(&name, &col)?;
+        // A remote's state, with no CRC over it: the full check, order included.
+        validate_graph_full(&name, &col)?;
         if collections.insert(name.clone(), Arc::new(col)).is_some() {
             return Err(backend(format!("duplicate vector collection `{name}`")));
         }
@@ -1760,6 +1893,195 @@ mod tests {
         col
     }
 
+    /// A graph the ops built: 60 vectors at `m = 2`, so nodes reach layer 1 and above.
+    fn built() -> VectorCollection {
+        let mut col = VectorCollection::empty(3, VectorStorage::F32, VectorMetric::L2, 2, 8, 8);
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        for n in 0..60 {
+            let values: Vec<f32> = (0..3)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x % 1000) as f32 / 100.0
+                })
+                .collect();
+            let bytes = quantize(VectorStorage::F32, &values).unwrap();
+            col.upsert(format!("n{n:02}"), bytes, None).unwrap();
+        }
+        validate_graph_full("v", &col).unwrap();
+        col
+    }
+
+    /// Both checks refuse `col` as corrupt, naming `what`.
+    fn refused(col: &VectorCollection, what: &str) {
+        for check in [validate_graph, validate_graph_full] {
+            let err = check("v", col).unwrap_err();
+            assert!(err.to_string().contains("corrupt"), "{what}: {err}");
+            assert!(err.to_string().contains(what), "{what}: {err}");
+        }
+    }
+
+    /// A node of at least `level` with room for one more link on `layer`, and a node on
+    /// `layer` that it does not link to.
+    fn with_room(col: &VectorCollection, level: u8, layer: usize) -> (String, String) {
+        for (id, rec) in &col.vectors {
+            if rec.level < level || rec.neighbors[layer].len() >= max_links(col.m, layer) {
+                continue;
+            }
+            let stranger = col.vectors.iter().find(|(other, other_rec)| {
+                *other != id
+                    && usize::from(other_rec.level) >= layer
+                    && !rec.neighbors[layer].contains(other)
+            });
+            if let Some((other, _)) = stranger {
+                return (id.clone(), other.clone());
+            }
+        }
+        panic!("no node with room on layer {layer}");
+    }
+
+    fn list<'a>(col: &'a mut VectorCollection, id: &str, layer: usize) -> &'a mut Vec<String> {
+        &mut col.vectors.get_mut(id).unwrap().neighbors[layer]
+    }
+
+    /// Each structural fault on its own, in a graph that is otherwise sound: open's check
+    /// (`validate_graph`) refuses every one, and so does the full check.
+    #[test]
+    fn the_open_check_refuses_every_structural_fault() {
+        let good = built();
+        validate_graph("v", &good).unwrap();
+        let (id, stranger) = with_room(&good, 0, 0);
+
+        let mut col = good.clone();
+        list(&mut col, &id, 0).push(id.clone());
+        refused(&col, "links to itself");
+
+        let mut col = good.clone();
+        let first = col.vectors[&id].neighbors[0][0].clone();
+        list(&mut col, &id, 0).push(first);
+        refused(&col, "repeats neighbor");
+
+        let mut col = good.clone();
+        list(&mut col, &id, 0).push("ghost".into());
+        refused(&col, "is not live");
+
+        let mut col = good.clone();
+        list(&mut col, &id, 0).push(stranger.clone());
+        refused(&col, "is not bidirectional");
+
+        let mut col = good.clone();
+        *list(&mut col, &id, 0) = (0..=max_links(2, 0)).map(|n| format!("g{n}")).collect();
+        refused(&col, "too many neighbors");
+
+        // The same on an upper layer, where the limit is `m`, not `2 * m`: a list one over it
+        // is still under layer 0's limit, so a check that used that limit would accept it.
+        assert!(max_links(2, 1) < max_links(2, 0));
+        let (upper, _) = with_room(&good, 1, 1);
+        assert!(good.vectors[&upper].level >= 1);
+        let mut col = good.clone();
+        *list(&mut col, &upper, 1) = (0..=max_links(2, 1)).map(|n| format!("g{n}")).collect();
+        assert!(col.vectors[&upper].neighbors[1].len() <= max_links(2, 0));
+        refused(&col, "too many neighbors on layer 1");
+
+        // A layer-1 node linking to a node that stops at layer 0.
+        let (upper, _) = with_room(&good, 1, 1);
+        let ground = good
+            .vectors
+            .iter()
+            .find(|(_, rec)| rec.level == 0)
+            .map(|(other, _)| other.clone())
+            .unwrap();
+        let mut col = good.clone();
+        list(&mut col, &upper, 1).push(ground.clone());
+        refused(&col, "does not exist on layer 1");
+
+        // `ground` one level up stays below the entry, so the entry is still canonical.
+        let entry_level = good.vectors[good.entry.as_ref().unwrap()].level;
+        assert!(entry_level >= 2, "the entry is at level {entry_level}");
+        let mut col = good.clone();
+        let rec = col.vectors.get_mut(&ground).unwrap();
+        rec.level += 1;
+        rec.neighbors.push(Vec::new());
+        refused(&col, "level does not match");
+
+        let mut col = good.clone();
+        col.vectors
+            .get_mut(&ground)
+            .unwrap()
+            .neighbors
+            .push(Vec::new());
+        refused(&col, "layer count does not match");
+
+        let mut col = good.clone();
+        col.vectors.get_mut(&ground).unwrap().bytes = [f32::NAN; 3]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        refused(&col, "not finite");
+
+        let mut col = good.clone();
+        col.entry = None;
+        refused(&col, "missing an entry point");
+
+        let mut col = good.clone();
+        col.entry = Some("ghost".into());
+        refused(&col, "entry point is not live");
+    }
+
+    /// A list out of order passes open's check, and the full check and the snapshot encoder
+    /// refuse it with a message that says the order is not canonical and a re-sort is needed.
+    #[test]
+    fn a_misordered_list_fails_the_full_check_and_the_encoder_with_a_re_sort_message() {
+        let good = built();
+        let id = good
+            .vectors
+            .iter()
+            .find(|(_, rec)| rec.neighbors[0].len() >= 2)
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let mut col = good.clone();
+        list(&mut col, &id, 0).reverse();
+        validate_graph("v", &col).unwrap();
+        let vectors: super::super::state::Vectors =
+            BTreeMap::from([("v".to_string(), std::sync::Arc::new(col.clone()))]);
+        let encoded = super::super::layout::encode_snapshot_v3(
+            1,
+            &Default::default(),
+            &Default::default(),
+            &vectors,
+        );
+        for err in [
+            validate_graph_full("v", &col).unwrap_err(),
+            encoded.unwrap_err(),
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("corrupt"), "{text}");
+            assert!(text.contains(&format!("vector `{id}`")), "{text}");
+            assert!(text.contains("not ordered by distance"), "{text}");
+            assert!(text.contains("not canonical"), "{text}");
+            assert!(text.contains("re-sort needed"), "{text}");
+        }
+    }
+
+    /// The f16 finiteness check reads the bits: exponent 31 (infinity, NaN) is refused, the
+    /// largest finite value and a subnormal are not.
+    #[test]
+    fn the_stored_f16_check_refuses_exactly_the_non_finite_bit_patterns() {
+        for (bits, finite) in [
+            (0x7bff_u16, true),
+            (0x0001, true),
+            (0x8000, true),
+            (0x7c00, false),
+            (0xfc00, false),
+            (0x7e00, false),
+        ] {
+            let result = check_stored(VectorStorage::F16, 1, &bits.to_le_bytes());
+            assert_eq!(result.is_ok(), finite, "{bits:#06x}");
+            assert_eq!(f16_to_f32(bits).is_finite(), finite, "{bits:#06x}");
+        }
+    }
+
     fn links(col: &VectorCollection, id: &str) -> Vec<String> {
         let mut out = col.vectors[id].neighbors[0].clone();
         out.sort();
@@ -1805,7 +2127,7 @@ mod tests {
                     "seed {seed}, step {step}"
                 );
             }
-            validate_graph("v", &col).unwrap();
+            validate_graph_full("v", &col).unwrap();
         }
         // The two paths the incremental rule must get right were both taken.
         assert!(entry_deletes > 0, "no delete of the entry");
