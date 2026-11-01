@@ -39,7 +39,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 
 use crate::HubState;
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
@@ -1268,7 +1268,7 @@ enum LoginResult {
 /// against: a different one means the password was changed meanwhile.
 fn mint_under_lock(
     state: &HubState,
-    store: Option<&RedbStore>,
+    store: Option<&AnyStore>,
     file: &OperatorsFile,
     id: &str,
     password_hash: Option<&str>,
