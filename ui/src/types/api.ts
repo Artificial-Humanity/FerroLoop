@@ -312,13 +312,18 @@ export interface RecastAgentRequest {
 
 export interface RecastAgentResponse {
   agent?: AgentRecord;
+  /** The retired Lead's full record. Present only when this call retired a Lead. */
   retired_lead?: AgentRecord;
-  before?: AgentRecord;
-  after?: AgentRecord;
+  /** The retired Lead's display name, or null. */
   retires_lead?: string | null;
+  /** The areas this call created. */
   creates_areas?: string[];
-  open_prs_tier_changes?: unknown[];
-  invalidated_review_markers?: unknown[];
+  /** The endpoint never returns this. SettingsModal reads it only as a fallback after `agent`. */
+  after?: AgentRecord;
+  /** 409 body: the Lead that blocks the recast until `replace_lead` is true. */
+  current_lead?: { display_name: string; id: string };
+  /** 409 body: the areas that do not exist until `create_area` is true. */
+  missing_areas?: string[];
 }
 
 export interface AreaRecord {

@@ -8,9 +8,14 @@
 //! - The agent must exist (404) and be `active` (409 "reactivate it first"). The store's
 //!   `register_agent` always writes `active`, so recasting a retired agent would reactivate it.
 //! - `display_name`, `email` and `id` stay the same. `extra_areas`, when omitted, stay the same.
-//! - A missing area is a 404 unless `create_area` is `true`.
+//! - A missing area is a 409 with `missing_areas` unless `create_area` is `true`.
 //! - To make the agent the Lead of a project that has another active Lead, the body must set
-//!   `replace_lead: true` (else 409). That Lead is then retired, and the response names it.
+//!   `replace_lead: true` (else 409 with `current_lead`). That Lead is then retired, and the
+//!   response names it. When both conflicts apply, one 409 carries both `current_lead` and
+//!   `missing_areas`, and nothing is written.
+//! - A 200 carries `agent`, `retires_lead` (the retired Lead's display name or `null`),
+//!   `creates_areas` (the areas this call created) and, when a Lead was retired, the full
+//!   `retired_lead` record. The `agents:recast` event carries the same fields.
 //!
 //! The checks and the write use one store guard. The guard holds the hub's `store_lock`, so no
 //! other hub request can write between the checks and the write. A separate process (the `fl`
@@ -142,48 +147,50 @@ pub(crate) fn handle_post_agent_recast(
             Err(e) => return store_error(&e),
         }
     }
-    if !missing.is_empty() && !body.create_area {
-        return HttpResponse::json(
-            404,
-            json!({
-                "error": format!(
-                    "no such area: {}; pass create_area: true to create it",
-                    missing.join(", ")
-                ),
-                "missing_areas": missing,
-            }),
-        );
-    }
+    let areas_unconfirmed = !missing.is_empty() && !body.create_area;
 
     // Lead: `register_agent` with `replace: true` retires the sitting Lead without asking, so
     // the caller must confirm with `replace_lead`.
+    let mut sitting_lead = None;
     if body.role == AgentRole::Lead && !body.replace_lead {
         let agents = match store.list_agents(None, false) {
             Ok(agents) => agents,
             Err(e) => return store_error(&e),
         };
-        if let Some(lead) = agents.iter().find(|a| {
+        sitting_lead = agents.into_iter().find(|a| {
             a.status == AgentStatus::Active
                 && a.project == project
                 && a.role == AgentRole::Lead
                 && a.name_key != existing.name_key
-        }) {
-            return HttpResponse::json(
-                409,
-                json!({
-                    "error": format!(
-                        "project `{project}` already has an active Lead: {} ({}); \
-                         pass replace_lead: true to retire it",
-                        lead.display_name,
-                        lead.id.as_str()
-                    ),
-                    "current_lead": {
-                        "display_name": lead.display_name,
-                        "id": lead.id,
-                    },
-                }),
+        });
+    }
+
+    // One 409 lists every unconfirmed conflict, so a single confirm resolves them all. Nothing
+    // is written.
+    if areas_unconfirmed || sitting_lead.is_some() {
+        let mut messages = Vec::new();
+        let mut payload = serde_json::Map::new();
+        if let Some(lead) = &sitting_lead {
+            messages.push(format!(
+                "project `{project}` already has an active Lead: {} ({}); \
+                 pass replace_lead=true to confirm",
+                lead.display_name,
+                lead.id.as_str()
+            ));
+            payload.insert(
+                "current_lead".into(),
+                json!({ "display_name": lead.display_name, "id": lead.id }),
             );
         }
+        if areas_unconfirmed {
+            messages.push(format!(
+                "no such area: {}; pass create_area=true to confirm",
+                missing.join(", ")
+            ));
+            payload.insert("missing_areas".into(), json!(missing));
+        }
+        payload.insert("error".into(), json!(messages.join("; ")));
+        return HttpResponse::json(409, Value::Object(payload));
     }
 
     let at = stamp::now();
@@ -223,7 +230,17 @@ pub(crate) fn handle_post_agent_recast(
         "from": placement(&existing),
         "to": placement(&updated),
     });
-    let mut response = json!({ "agent": updated });
+    // `retires_lead` and `creates_areas` are the names the UI reads; `retired_lead` is the full
+    // record. `missing` is non-empty here only when `create_area` was `true`.
+    let retires_lead = retired_lead.as_ref().map(|lead| lead.display_name.clone());
+    let creates_areas = missing;
+    let mut response = json!({
+        "agent": updated,
+        "retires_lead": retires_lead,
+        "creates_areas": creates_areas,
+    });
+    event["retires_lead"] = json!(retires_lead);
+    event["creates_areas"] = json!(creates_areas);
     if let Some(lead) = retired_lead {
         event["retired_lead"] = json!(lead);
         response["retired_lead"] = json!(lead);
@@ -348,6 +365,10 @@ mod tests {
             json!({ "project": "sonora", "role": "lead", "extra_areas": ["notes"] })
         );
         assert!(data.get("retired_lead").is_none());
+        assert_eq!(data["retires_lead"], Value::Null);
+        assert_eq!(data["creates_areas"], json!([]));
+        assert_eq!(body["retires_lead"], Value::Null);
+        assert_eq!(body["creates_areas"], json!([]));
     }
 
     #[test]
@@ -388,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_area_is_404_without_create_area_and_created_with_it() {
+    fn a_missing_area_is_409_without_create_area_and_created_with_it() {
         let tmp = TempDir::new().unwrap();
         let state = test_state(&tmp);
         let before = register(&state, "Ada", "ferroloop", AgentRole::Assistant);
@@ -398,9 +419,18 @@ mod tests {
             "ada",
             &json!({ "project": "prosodia", "role": "assistant", "extra_areas": ["lexicon"] }),
         );
-        assert_eq!(status, 404, "{body}");
+        assert_eq!(status, 409, "{body}");
         assert_eq!(body["missing_areas"], json!(["prosodia", "lexicon"]));
-        assert!(body["error"].as_str().unwrap().contains("prosodia"));
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("prosodia") && error.contains("lexicon"),
+            "{error}"
+        );
+        assert!(
+            error.contains("pass create_area=true to confirm"),
+            "{error}"
+        );
+        assert!(body.get("current_lead").is_none());
         assert!(area(&state, "prosodia").is_none());
         assert!(area(&state, "lexicon").is_none());
         assert_eq!(agent(&state, "ada").unwrap(), before);
@@ -414,6 +444,8 @@ mod tests {
             }),
         );
         assert_eq!(status, 200, "{body}");
+        assert_eq!(body["creates_areas"], json!(["prosodia", "lexicon"]));
+        assert_eq!(body["retires_lead"], Value::Null);
         assert!(area(&state, "prosodia").is_some());
         assert!(area(&state, "lexicon").is_some());
         let after = agent(&state, "ada").unwrap();
@@ -439,6 +471,11 @@ mod tests {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("Ferris"), "{error}");
         assert!(error.contains(ferris.id.as_str()), "{error}");
+        assert!(
+            error.contains("pass replace_lead=true to confirm"),
+            "{error}"
+        );
+        assert!(body.get("missing_areas").is_none());
         assert_eq!(body["current_lead"]["display_name"], "Ferris");
         assert_eq!(body["current_lead"]["id"], json!(ferris.id));
         assert_eq!(agent(&state, "ferris").unwrap(), ferris);
@@ -455,6 +492,8 @@ mod tests {
         assert_eq!(old.status, AgentStatus::Retired);
         assert_eq!(body["retired_lead"]["name_key"], "ferris");
         assert_eq!(body["retired_lead"]["status"], "retired");
+        assert_eq!(body["retires_lead"], "Ferris");
+        assert_eq!(body["creates_areas"], json!([]));
         let new = agent(&state, "felix").unwrap();
         assert_eq!(new.role, AgentRole::Lead);
         assert_eq!(new.id, felix.id);
@@ -462,8 +501,63 @@ mod tests {
         let sent = recast_frames(&mut frames);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].data["retired_lead"]["name_key"], "ferris");
+        assert_eq!(sent[0].data["retires_lead"], "Ferris");
+        assert_eq!(sent[0].data["creates_areas"], json!([]));
         assert_eq!(sent[0].data["from"]["role"], "assistant");
         assert_eq!(sent[0].data["to"]["role"], "lead");
+    }
+
+    #[test]
+    fn a_lead_conflict_and_missing_areas_are_one_409_and_one_confirm_resolves_both() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ferris = register(&state, "Ferris", "ferroloop", AgentRole::Lead);
+        let ada = register(&state, "Ada", "sonora", AgentRole::Assistant);
+        let felix = register(&state, "Felix", "ferroloop", AgentRole::Assistant);
+        let mut frames = state.subscribe();
+
+        // Both conflicts: Ferris leads ferroloop, and `lexicon` does not exist.
+        let both = json!({
+            "project": "ferroloop", "role": "lead", "extra_areas": ["lexicon"],
+            "replace_lead": false, "create_area": false,
+        });
+        let (status, body) = owner_recast(&state, "felix", &both);
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["current_lead"]["display_name"], "Ferris");
+        assert_eq!(body["current_lead"]["id"], json!(ferris.id));
+        assert_eq!(body["missing_areas"], json!(["lexicon"]));
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("Ferris"), "{error}");
+        assert!(error.contains("lexicon"), "{error}");
+        assert!(error.contains("replace_lead=true"), "{error}");
+        assert!(error.contains("create_area=true"), "{error}");
+        assert_eq!(agent(&state, "ferris").unwrap(), ferris);
+        assert_eq!(agent(&state, "felix").unwrap(), felix);
+        assert_eq!(agent(&state, "ada").unwrap(), ada);
+        assert!(area(&state, "lexicon").is_none());
+        assert!(recast_frames(&mut frames).is_empty());
+
+        let (status, body) = owner_recast(
+            &state,
+            "felix",
+            &json!({
+                "project": "ferroloop", "role": "lead", "extra_areas": ["lexicon"],
+                "replace_lead": true, "create_area": true,
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["retires_lead"], "Ferris");
+        assert_eq!(body["creates_areas"], json!(["lexicon"]));
+        assert_eq!(body["retired_lead"]["name_key"], "ferris");
+        assert!(area(&state, "lexicon").is_some());
+        assert_eq!(
+            agent(&state, "ferris").unwrap().status,
+            AgentStatus::Retired
+        );
+        let sent = recast_frames(&mut frames);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].data["retires_lead"], "Ferris");
+        assert_eq!(sent[0].data["creates_areas"], json!(["lexicon"]));
     }
 
     #[test]
