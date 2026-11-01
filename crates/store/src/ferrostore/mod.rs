@@ -1598,13 +1598,11 @@ impl FerroStore {
             let queue = slot.adapter.is_some() && slot.mode.is_some();
             let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
             if queue {
-                // `prepare_sync_batches` refused any reserved op, so no
-                // prepared batch is left empty here.
-                slot.pending.extend(
-                    prepared
-                        .iter()
-                        .filter_map(|b| outbound_batch(b.seq, &b.ops)),
-                );
+                // The batches as they came in, not as applied: a reserved op
+                // this store dropped is still the next store's to judge, and a
+                // batch whose every op was dropped must not go out empty.
+                debug_assert_eq!(prepared.len(), batches.len());
+                slot.pending.extend(batches);
             }
             (seq, flush)
         };
@@ -1623,16 +1621,17 @@ impl FerroStore {
         if committed.ops.is_empty() {
             return None;
         }
-        let outbound = outbound_batch(committed.seq, &committed.ops);
+        let batch = SyncBatch {
+            seq: committed.seq,
+            ops: committed.ops.iter().map(SyncOp::from_op).collect(),
+        };
         let mut slot = lock_mutex(&self.sync);
-        // A commit of reserved ops only has nothing to send: it counts as
-        // synced, the same as a silent commit.
-        let Some(batch) = outbound.filter(|_| !silent) else {
-            if slot.is_idle() && committed.seq > slot.synced_seq {
-                slot.synced_seq = committed.seq;
+        if silent {
+            if slot.is_idle() && batch.seq > slot.synced_seq {
+                slot.synced_seq = batch.seq;
             }
             return None;
-        };
+        }
         let adapter = slot.adapter.clone()?;
         match slot.mode {
             Some(SyncMode::WriteThrough) => {
@@ -1818,20 +1817,20 @@ fn prepare_sync_batches(
                 batch.seq
             )));
         }
-        if let Some(collection) = batch.ops.iter().find_map(reserved_collection) {
-            return Err(backend(format!(
-                "sync batch {} writes reserved collection `{collection}`: \
-                 a `{}` collection is written only by the store itself",
-                batch.seq,
-                doc::RESERVED_PREFIX
-            )));
+        let mut version = doc::schema_version_in(|collection, id| {
+            scratch
+                .docs
+                .get(&(collection.to_string(), id.to_string()))
+                .cloned()
+        })?;
+        let mut ops = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            if let Some(op) = admit_inbound(op, &mut version)? {
+                ops.push(op.clone().into_op());
+            }
         }
-        let ops = batch
-            .ops
-            .iter()
-            .cloned()
-            .map(SyncOp::into_op)
-            .collect::<Vec<_>>();
+        // Every op may have been dropped: the sequence still advances, as an
+        // empty frame, so the next batch is still the next commit.
         scratch = stage_ops(scratch, &ops)?;
         expect = next;
         prepared.push(PreparedBatch {
@@ -1842,28 +1841,49 @@ fn prepare_sync_batches(
     Ok((scratch, prepared))
 }
 
-/// The reserved collection a document op writes, if any.
-fn reserved_collection(op: &SyncOp) -> Option<&str> {
-    match op {
-        SyncOp::PutDoc { collection, .. } | SyncOp::DeleteDoc { collection, .. }
-            if doc::is_reserved(collection) =>
-        {
-            Some(collection)
-        }
-        _ => None,
+/// Whether an inbound sync op is applied. `version` is the schema version the
+/// batch has reached so far, and is raised when `op` raises it.
+///
+/// An op on an ordinary collection is applied as it is. An op on a reserved
+/// collection is the peer's own bookkeeping and is never applied as it is:
+/// `("__meta", "schema_version")` put to a version on the ladder above
+/// `version` raises it; a version newer than this build is
+/// [`StoreError::FormatVersion`], the same refusal `open` gives, so the batch
+/// is refused whole; any other reserved op (an older, equal or off-ladder
+/// version, another `__meta` id, a delete, another reserved collection) is
+/// dropped.
+fn admit_inbound<'a>(
+    op: &'a SyncOp,
+    version: &mut Option<u64>,
+) -> Result<Option<&'a SyncOp>, StoreError> {
+    let (collection, raise) = match op {
+        SyncOp::PutDoc {
+            collection,
+            id,
+            doc,
+        } => (
+            collection,
+            (collection == doc::SCHEMA_COLLECTION && id == doc::SCHEMA_KEY)
+                .then(|| doc.as_u64())
+                .flatten(),
+        ),
+        SyncOp::DeleteDoc { collection, .. } => (collection, None),
+        _ => return Ok(Some(op)),
+    };
+    if !doc::is_reserved(collection) {
+        return Ok(Some(op));
     }
-}
-
-/// The batch a commit sends to a sync adapter: its ops, less any that write a
-/// reserved collection (the store's own bookkeeping, such as the `__meta`
-/// schema version, stays local). `None` when no op is left.
-fn outbound_batch(seq: u64, ops: &[Op]) -> Option<SyncBatch> {
-    let ops: Vec<SyncOp> = ops
-        .iter()
-        .map(SyncOp::from_op)
-        .filter(|op| reserved_collection(op).is_none())
-        .collect();
-    (!ops.is_empty()).then_some(SyncBatch { seq, ops })
+    let Some(to) = raise else {
+        return Ok(None);
+    };
+    if crate::FORMAT_LADDER.iter().all(|known| to > *known) {
+        crate::check_format(Some(to))?;
+    }
+    if crate::check_format(Some(to)).is_err() || version.is_some_and(|now| to <= now) {
+        return Ok(None);
+    }
+    *version = Some(to);
+    Ok(Some(op))
 }
 
 fn publish_sync_batches(

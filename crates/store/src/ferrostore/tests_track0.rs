@@ -587,8 +587,8 @@ fn ensure_superblock_says_when_it_initialized_the_file() {
 // ---- reserved collections ---------------------------------------------------
 
 mod reserved {
-    use super::super::{FerroStore, SyncAdapter, SyncBatch, SyncMode, SyncOp};
-    use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
+    use super::super::{DocState, FerroStore, Inner, Op, SyncAdapter, SyncBatch, SyncMode, SyncOp};
+    use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE, FORMAT_WITH_WORKFLOW};
     use fl_core::StoreError;
     use fl_core::routing::RoutingMap;
     use fl_core::store::Catalog;
@@ -692,8 +692,50 @@ mod reserved {
         drop(server);
     }
 
+    /// An in-memory store at seq 0 whose schema version is `version` (`None`:
+    /// no version document, a store from before schema versioning).
+    fn at_schema(version: Option<u64>) -> FerroStore {
+        let mut state = DocState::default();
+        if let Some(version) = version {
+            state.docs.insert(
+                ("__meta".to_string(), "schema_version".to_string()),
+                json!(version),
+            );
+        }
+        FerroStore::assemble(Inner::Memory(Mutex::new(state)), "mem://".to_string())
+    }
+
+    fn put(collection: &str, id: &str, doc: Value) -> SyncOp {
+        SyncOp::PutDoc {
+            collection: collection.into(),
+            id: id.into(),
+            doc,
+        }
+    }
+
+    fn schema_put(doc: Value) -> SyncOp {
+        put("__meta", "schema_version", doc)
+    }
+
+    /// `ops` as batches 1, 2, … for `store` to pull.
+    fn pulled(recorder: &Recorder, ops: Vec<Vec<SyncOp>>) {
+        *recorder.pull.lock().unwrap() = ops
+            .into_iter()
+            .zip(1..)
+            .map(|(ops, seq)| SyncBatch { seq, ops })
+            .collect();
+    }
+
+    fn has(store: &FerroStore, collection: &str, id: &str) -> bool {
+        store
+            .read_state()
+            .unwrap()
+            .docs
+            .contains_key(&(collection.to_string(), id.to_string()))
+    }
+
     #[test]
-    fn a_raise_stays_local_and_out_of_the_sync_batch() {
+    fn a_raise_is_sent_with_the_commit_that_made_it() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, recorder) = attached(migrated(tmp.path()), SyncMode::WriteThrough);
         let project = store.add_project("/p").unwrap();
@@ -701,62 +743,207 @@ mod reserved {
         assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_ROUTING));
         let commits = recorder.commits.lock().unwrap().clone();
         assert_eq!(commits.len(), 2, "{commits:?}");
-        let collections: Vec<&str> = commits
-            .iter()
-            .flat_map(|batch| &batch.ops)
-            .filter_map(|op| match op {
-                SyncOp::PutDoc { collection, .. } | SyncOp::DeleteDoc { collection, .. } => {
-                    Some(collection.as_str())
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(collections.contains(&"routing"), "{collections:?}");
+        let last = commits.last().unwrap();
         assert!(
-            !collections.iter().any(|c| c.starts_with("__")),
-            "{collections:?}"
+            last.ops.contains(&schema_put(json!(FORMAT_WITH_ROUTING))),
+            "{last:?}"
         );
         assert!(!store.has_pending_sync());
         assert_eq!(store.synced_seq(), store.read_state().unwrap().last_seq);
     }
 
     #[test]
-    fn an_inbound_batch_that_writes_a_reserved_collection_is_refused_whole() {
-        for reserved in [
-            SyncOp::PutDoc {
-                collection: "__meta".into(),
-                id: "schema_version".into(),
-                doc: json!(FORMAT_VERSION),
-            },
-            SyncOp::DeleteDoc {
-                collection: "__meta".into(),
-                id: "schema_version".into(),
-            },
-        ] {
-            let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
-            *recorder.pull.lock().unwrap() = vec![SyncBatch {
-                seq: 1,
-                ops: vec![
-                    SyncOp::PutDoc {
-                        collection: "docs".into(),
-                        id: "a".into(),
-                        doc: json!(1),
-                    },
-                    reserved.clone(),
+    fn a_reserved_only_commit_is_sent_and_a_replica_pulls_past_it() {
+        let (source, recorder) = attached(at_schema(Some(FORMAT_VERSION)), SyncMode::WriteThrough);
+        source.put_doc("docs", "a", &json!(1)).unwrap();
+        // The socket's `commit_ops` path: a commit of a reserved op only.
+        let raise = Op::Put {
+            collection: "__meta".into(),
+            id: "schema_version".into(),
+            doc: json!(FORMAT_WITH_ROUTING),
+        };
+        assert!(
+            source
+                .commit_if_seq(1, std::slice::from_ref(&raise))
+                .unwrap()
+        );
+        source.put_doc("docs", "b", &json!(2)).unwrap();
+        let sent = recorder.commits.lock().unwrap().clone();
+        assert_eq!(
+            sent.iter().map(|b| b.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "every commit is sent, so the sequence has no gap"
+        );
+        assert_eq!(sent[1].ops, vec![SyncOp::from_op(&raise)]);
+        assert_eq!(source.synced_seq(), 3);
+
+        let (replica, inbound) = attached(at_schema(Some(FORMAT_VERSION)), SyncMode::WriteBehind);
+        *inbound.pull.lock().unwrap() = sent;
+        assert_eq!(replica.sync_pull().unwrap(), 3);
+        assert_eq!(replica.read_state().unwrap().last_seq, 3);
+        assert_eq!(
+            replica.format_version().unwrap(),
+            source.format_version().unwrap()
+        );
+        assert!(has(&replica, "docs", "a") && has(&replica, "docs", "b"));
+    }
+
+    #[test]
+    fn a_migration_into_an_attached_store_does_not_wedge_its_replicas() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteThrough);
+        let redb = crate::RedbStore::open(&tmp.path().join("src.redb")).unwrap();
+        crate::migrate_redb_to_ferrostore(&redb, &source).unwrap();
+        source.put_doc("docs", "a", &json!(1)).unwrap();
+        let sent = recorder.commits.lock().unwrap().clone();
+        assert_eq!(sent.iter().map(|b| b.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(sent[0].ops, vec![schema_put(json!(FORMAT_VERSION))]);
+
+        let (replica, inbound) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
+        *inbound.pull.lock().unwrap() = sent;
+        assert_eq!(replica.sync_pull().unwrap(), 2);
+        // An older version never lowers the replica's.
+        assert_eq!(
+            replica.format_version().unwrap(),
+            Some(FORMAT_WITH_WORKFLOW)
+        );
+        assert!(has(&replica, "docs", "a"));
+    }
+
+    #[test]
+    fn an_inbound_older_schema_version_is_dropped() {
+        let (store, recorder) = attached(at_schema(Some(FORMAT_WITH_STATE)), SyncMode::WriteBehind);
+        pulled(
+            &recorder,
+            vec![
+                vec![schema_put(json!(FORMAT_VERSION))],
+                vec![schema_put(json!(FORMAT_WITH_STATE))],
+                vec![
+                    put("docs", "a", json!(1)),
+                    schema_put(json!(FORMAT_WITH_ROUTING)),
                 ],
-            }];
-            assert_reserved(store.sync_pull().unwrap_err());
-            assert_reserved(store.sync_prewarm(&["docs"]).unwrap_err());
-            assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
-            let state = store.read_state().unwrap();
-            assert_eq!(state.last_seq, 0, "nothing applied");
+            ],
+        );
+        assert_eq!(store.sync_pull().unwrap(), 3);
+        assert_eq!(store.read_state().unwrap().last_seq, 3);
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_STATE));
+        assert!(has(&store, "docs", "a"), "the batch's other op applies");
+    }
+
+    #[test]
+    fn an_inbound_schema_version_off_the_ladder_is_dropped() {
+        // No version document, so any version on the ladder would raise it.
+        let (store, recorder) = attached(at_schema(None), SyncMode::WriteBehind);
+        pulled(
+            &recorder,
+            vec![
+                vec![schema_put(json!(FORMAT_VERSION - 1))],
+                vec![schema_put(json!(0))],
+                vec![schema_put(json!(FORMAT_WITH_ROUTING.to_string()))],
+                vec![schema_put(json!(4.5))],
+                vec![schema_put(json!(-1))],
+                vec![schema_put(Value::Null)],
+            ],
+        );
+        assert_eq!(store.sync_pull().unwrap(), 6);
+        assert_eq!(store.read_state().unwrap().last_seq, 6);
+        assert_eq!(store.format_version().unwrap(), None);
+        assert!(!has(&store, "__meta", "schema_version"));
+    }
+
+    #[test]
+    fn an_inbound_schema_newer_than_this_build_is_refused() {
+        let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
+        let newer = FORMAT_WITH_WORKFLOW + 1;
+        pulled(
+            &recorder,
+            vec![
+                vec![put("docs", "a", json!(1))],
+                vec![put("docs", "b", json!(2)), schema_put(json!(newer))],
+            ],
+        );
+        for err in [
+            store.sync_pull().unwrap_err(),
+            store.sync_prewarm(&["docs"]).unwrap_err(),
+        ] {
             assert!(
-                !state
-                    .docs
-                    .contains_key(&("docs".to_string(), "a".to_string())),
-                "the batch's other op is not applied either"
+                matches!(
+                    err,
+                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_WORKFLOW }
+                        if v == newer
+                ),
+                "{err:?}"
             );
         }
+        assert_eq!(store.read_state().unwrap().last_seq, 0, "nothing applied");
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+        assert!(!has(&store, "docs", "a") && !has(&store, "docs", "b"));
+    }
+
+    #[test]
+    fn other_inbound_reserved_ops_are_dropped_and_the_sequence_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("replica.fls");
+        let ops = vec![
+            vec![put("__meta", "other", json!(1))],
+            vec![SyncOp::DeleteDoc {
+                collection: "__meta".into(),
+                id: "schema_version".into(),
+            }],
+            vec![put("__other", "x", json!(1))],
+            vec![
+                SyncOp::DeleteDoc {
+                    collection: "__other".into(),
+                    id: "x".into(),
+                },
+                put("docs", "a", json!(1)),
+            ],
+        ];
+        {
+            let (store, recorder) =
+                attached(FerroStore::open(&path).unwrap(), SyncMode::WriteBehind);
+            pulled(&recorder, ops.clone());
+            assert_eq!(store.sync_pull().unwrap(), 4);
+        }
+        // Reopened: the dropped batches are empty frames, so replay agrees.
+        for store in [FerroStore::open(&path).unwrap(), {
+            let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
+            pulled(&recorder, ops);
+            store.sync_pull().unwrap();
+            store
+        }] {
+            let state = store.read_state().unwrap();
+            assert_eq!(state.last_seq, 4);
+            assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+            let reserved: Vec<_> = state
+                .docs
+                .keys()
+                .filter(|(collection, _)| collection.starts_with("__"))
+                .collect();
+            assert_eq!(
+                reserved,
+                vec![&("__meta".to_string(), "schema_version".to_string())]
+            );
+            assert!(has(&store, "docs", "a"));
+        }
+    }
+
+    #[test]
+    fn a_loud_apply_relays_the_batches_as_they_came_in() {
+        let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteThrough);
+        let batches = vec![
+            SyncBatch {
+                seq: 1,
+                ops: vec![schema_put(json!(FORMAT_VERSION))],
+            },
+            SyncBatch {
+                seq: 2,
+                ops: vec![put("docs", "a", json!(1))],
+            },
+        ];
+        assert_eq!(store.apply_sync_batches(batches.clone(), false).unwrap(), 2);
+        assert_eq!(*recorder.commits.lock().unwrap(), batches);
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
     }
 
     #[test]
