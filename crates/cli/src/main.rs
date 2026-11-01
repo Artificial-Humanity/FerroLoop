@@ -370,15 +370,16 @@ fn choose_store(
         return Ok(bound.to_path_buf());
     }
     if !confined {
+        // Deduplicated by the store's identity (its physical file), so
+        // `a.redb` and `a.fls` under FerroStore are one candidate.
         let mut candidates = vec![bound.to_path_buf()];
-        if let Some(ws_store) = state_store {
-            let ws_buf = ws_store.to_path_buf();
-            if !candidates.contains(&ws_buf) {
-                candidates.push(ws_buf);
-            }
+        if let Some(ws_store) = state_store
+            && !candidates.iter().any(|c| same_store(c, ws_store))
+        {
+            candidates.push(ws_store.to_path_buf());
         }
         for e in entries {
-            if !candidates.contains(&e.store) {
+            if !candidates.iter().any(|c| same_store(c, &e.store)) {
                 candidates.push(e.store.clone());
             }
         }
@@ -507,14 +508,11 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
     Ok(chosen.expect("iris is non-empty"))
 }
 
-/// Whether two store paths name the same store: the same path, or, when
-/// both exist, the same file once symlinks are resolved.
+/// Whether two store paths name the same store: the same path, or the same
+/// physical file of the selected engine once symlinks are resolved (a
+/// configured `x.redb` and `x.fls` are one store under FerroStore).
 fn same_store(a: &Path, b: &Path) -> bool {
-    a == b
-        || matches!(
-            (a.canonicalize(), b.canonicalize()),
-            (Ok(x), Ok(y)) if x == y
-        )
+    a == b || fl_store::store_identity(a) == fl_store::store_identity(b)
 }
 
 /// How a config entry's tracker reads in a refusal.

@@ -174,6 +174,42 @@ fn store_exists_with(path: &Path, env: Option<&str>) -> bool {
     }
 }
 
+/// The identity of the store named `path` under the process environment: the
+/// physical file of the selected engine, with symlinks resolved. Two paths
+/// name the same store exactly when their identities are equal, so a
+/// configured `x.redb` and an explicit `x.fls` agree under FerroStore, and a
+/// symlinked alias agrees with its target. A file that does not exist yet has
+/// its directory resolved instead. An unusable engine selection falls back to
+/// the path itself, as [`store_exists`] does.
+pub fn store_identity(path: &Path) -> PathBuf {
+    store_identity_with(path, std::env::var(BACKEND_ENV).ok().as_deref())
+}
+
+fn store_identity_with(path: &Path, env: Option<&str>) -> PathBuf {
+    let physical = match choose_backend(path, env) {
+        Ok(kind) => physical_path(path, kind),
+        Err(_) => path.to_path_buf(),
+    };
+    if let Ok(resolved) = physical.canonicalize() {
+        return resolved;
+    }
+    // Absent file: resolve the directory it would be created in.
+    match (physical.parent(), physical.file_name()) {
+        (Some(dir), Some(name)) => {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            match dir.canonicalize() {
+                Ok(resolved) => resolved.join(name),
+                Err(_) => physical,
+            }
+        }
+        _ => physical,
+    }
+}
+
 enum Backend {
     Ferro(Box<FerroStore>),
     Redb(RedbStore),
@@ -560,6 +596,75 @@ mod tests {
         assert_eq!(
             physical_path(Path::new("/x/fl.fls"), BackendKind::Ferro),
             Path::new("/x/fl.fls")
+        );
+    }
+
+    #[test]
+    fn store_identity_is_the_logical_path_on_redb() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let redb = root.join("a.redb");
+        // Absent: the directory is resolved, the name kept.
+        assert_eq!(store_identity_with(&redb, None), redb);
+        assert_eq!(store_identity_with(&redb, Some("redb")), redb);
+        // A sibling .fls is a different store under redb.
+        assert_ne!(
+            store_identity_with(&redb, None),
+            store_identity_with(&root.join("a.fls"), None)
+        );
+        std::fs::write(&redb, b"x").unwrap();
+        assert_eq!(store_identity_with(&redb, None), redb);
+    }
+
+    #[test]
+    fn store_identity_is_the_physical_file_on_ferro() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let redb = root.join("a.redb");
+        let fls = root.join("a.fls");
+        // Both absent: the raw physical path.
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+        assert_eq!(store_identity_with(&fls, None), fls);
+        assert_eq!(
+            store_identity_with(&redb, Some("ferro")),
+            store_identity_with(&fls, None)
+        );
+        // A stale .redb beside it does not change the answer.
+        std::fs::write(&redb, b"stale").unwrap();
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+        std::fs::write(&fls, b"x").unwrap();
+        assert_eq!(store_identity_with(&redb, Some("ferro")), fls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_identity_sees_through_symlinks() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias_dir = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias_dir).unwrap();
+        // An absent file in an aliased directory.
+        assert_eq!(
+            store_identity_with(&alias_dir.join("a.redb"), Some("ferro")),
+            store_identity_with(&real.join("a.fls"), None)
+        );
+        // An existing file reached through a file symlink.
+        std::fs::write(real.join("a.fls"), b"x").unwrap();
+        std::os::unix::fs::symlink(real.join("a.fls"), root.join("link.fls")).unwrap();
+        assert_eq!(
+            store_identity_with(&root.join("link.fls"), None),
+            real.join("a.fls")
+        );
+        assert_eq!(
+            store_identity_with(&alias_dir.join("a.redb"), Some("ferro")),
+            store_identity_with(&root.join("link.fls"), None)
+        );
+        // An unusable engine selection falls back to the path itself.
+        assert_eq!(
+            store_identity_with(&real.join("b.redb"), Some("sqlite")),
+            real.join("b.redb")
         );
     }
 

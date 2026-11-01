@@ -9,7 +9,7 @@
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_store::{BACKEND_ENV, BackendKind, choose_backend, physical_path};
+use fl_store::{BACKEND_ENV, BackendKind, StoreOptions, choose_backend, physical_path};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -55,8 +55,16 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
     let (format_version, format_note): (Value, Option<String>) = match (kind, exists) {
         (BackendKind::Ferro, _) => (json!("n/a"), Some("not available on ferro yet".into())),
         (BackendKind::Redb, false) => (Value::Null, None),
+        // A 0-byte file is not a redb database yet; opening it would
+        // initialise it, so report it without opening.
+        (BackendKind::Redb, true) if size == Some(0) => (Value::Null, Some("empty file".into())),
         (BackendKind::Redb, true) => {
-            match fl_store::open_store(path).and_then(|s| s.format_version()) {
+            // No retries: a store another process holds is reported, not waited on.
+            let options = StoreOptions {
+                retries: 0,
+                ..StoreOptions::default()
+            };
+            match fl_store::open_store_with(path, &options).and_then(|s| s.format_version()) {
                 Ok(Some(v)) => (json!(v), None),
                 Ok(None) => (Value::Null, Some("the file records none".into())),
                 Err(e) => (Value::Null, Some(format!("could not read it: {e}"))),
