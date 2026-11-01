@@ -230,6 +230,10 @@ struct Sim {
     /// reading thread, with the disk unlocked: another handle's I/O can land
     /// between two reads of one refresh.
     after_read: Option<(FailWhen, AfterRead)>,
+    /// The next sync this matches runs the action first, on the syncing
+    /// thread, with the disk unlocked: a lock-free reader can read what the
+    /// writes before the sync left in the page cache.
+    before_sync: Option<(FailWhen, AfterRead)>,
 }
 
 type FailWhen = Box<dyn FnMut(&IoOp) -> bool + Send>;
@@ -371,6 +375,16 @@ impl SimFs {
         then: impl FnOnce() + Send + 'static,
     ) {
         self.lock().after_read = Some((Box::new(when), Box::new(then)));
+    }
+
+    /// Before the next sync `when` matches, run `then` on the syncing thread,
+    /// with the disk unlocked (see `Sim::before_sync`).
+    pub(super) fn before_next_sync(
+        &self,
+        when: impl FnMut(&IoOp) -> bool + Send + 'static,
+        then: impl FnOnce() + Send + 'static,
+    ) {
+        self.lock().before_sync = Some((Box::new(when), Box::new(then)));
     }
 
     /// What a cut now would leave if every pending operation were lost: the
@@ -660,6 +674,18 @@ impl SimFile {
     }
 
     fn sync(&self, op: IoOp) -> io::Result<()> {
+        let before = {
+            let mut sim = self.fs.lock();
+            let fire = sim.before_sync.as_mut().is_some_and(|(when, _)| when(&op));
+            if fire {
+                sim.before_sync.take().map(|(_, then)| then)
+            } else {
+                None
+            }
+        };
+        if let Some(then) = before {
+            then();
+        }
         let mut sim = self.fs.lock();
         sim.step(op)?;
         let inode = &mut sim.inodes[self.ino];

@@ -490,13 +490,15 @@ impl FerroStore {
         pending: &mut Pending,
         lead: &mut Leadership<'_>,
     ) -> Result<Running, StoreError> {
-        if let Some(new_sb) = publish_frames(
+        let published = publish_frames(
             file,
             &disk.poison,
             running.index,
             &running.base.sb,
             &pending.frames,
-        )? {
+        )
+        .inspect_err(|_| disk.settle_failed_publish(&running.base))?;
+        if let Some(new_sb) = published {
             let change = running
                 .take_change()
                 .ok_or_else(|| backend("a publish with frames has no change"))?;

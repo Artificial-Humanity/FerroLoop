@@ -222,7 +222,10 @@ pub(super) const AUTO_CHECKPOINT_BYTES: u64 = 4 << 20;
 /// epoch. So every later write and checkpoint on the handle is refused until
 /// the store is reopened. Reads go on, from the cache only: it holds the last
 /// state whose syncs all returned, and the file's page cache is no longer
-/// trusted.
+/// trusted. A lock-free read that loaded the slots between the slot write
+/// and the failed sync may return that unacknowledged state for its own
+/// call, as any read that finished before the failure did; it is not kept
+/// ([`Disk::settle_failed_publish`]), so no read after the poison serves it.
 struct Poison {
     set: AtomicBool,
     path: String,
@@ -375,8 +378,44 @@ impl Disk {
             _ => load_full(file, file_id, sb)?,
         };
         let fresh = Arc::new(fresh);
-        install_newer(&mut lock_mutex(&self.cache), Arc::clone(&fresh));
+        let mut slot = lock_mutex(&self.cache);
+        // A failed publish sets the poison, then takes this mutex
+        // ([`Self::settle_failed_publish`]): either that runs first, and this
+        // read sees the poison, or this install runs first, and that takes it
+        // back out. So a poisoned handle keeps no state it read around the
+        // failed sync: its slots may name an epoch whose sync never returned.
+        // This one call still returns the cache, not what it read.
+        if self.poison.is_set()
+            && let Some(held) = slot.as_ref()
+        {
+            return Ok(Arc::clone(held));
+        }
+        install_newer(&mut slot, Arc::clone(&fresh));
         Ok(fresh)
+    }
+
+    /// After a publish or a checkpoint through `write` failed: once the
+    /// failure poisoned the handle, hold the cache at `acknowledged`, the
+    /// state the writer published from, whose syncs all returned. A lock-free
+    /// reader that loaded the slots between the slot write and its failed
+    /// sync may have installed the newer epoch: it is taken back out here, so
+    /// every later read of the poisoned handle serves `acknowledged` (see
+    /// [`Poison`]). The caller still holds the `flock`, so no other handle
+    /// published past `acknowledged` meanwhile. A failure that did not
+    /// poison leaves the cache as it is.
+    fn settle_failed_publish(&self, acknowledged: &DiskCache) {
+        if !self.poison.is_set() {
+            return;
+        }
+        // The poison was set before this lock: a reader's install that takes
+        // the mutex after it sees the poison ([`Self::advance`]).
+        let mut slot = lock_mutex(&self.cache);
+        let newer = slot.as_ref().is_none_or(|held| {
+            held.file_id == acknowledged.file_id && held.sb.epoch > acknowledged.sb.epoch
+        });
+        if newer {
+            *slot = Some(Arc::new(acknowledged.clone()));
+        }
     }
 
     /// Install the state a publish through `write` just made as `new_sb`:
@@ -1299,6 +1338,15 @@ impl FerroStore {
 
     /// Append one message. The returned sequence starts at 1 per topic and is
     /// not reused after that message document is deleted.
+    ///
+    /// [`StoreError::Undelivered`] means the message is durable and its batch
+    /// was not sent to the `WriteThrough` adapter: this handle's subscribers
+    /// ([`Self::subscribe_mq`]) still receive it. The error carries the store
+    /// sequence, not the message sequence. On a remote handle, when the
+    /// server returns `Undelivered`, the message is durable on the server and
+    /// its subscribers receive it, but this handle registers no batch with its
+    /// own adapter: the commit's ops are not known here without the message
+    /// sequence, which the error does not carry.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
         Ok(self.publish_mq_detail(topic, key, payload)?.0)
     }
@@ -1334,15 +1382,20 @@ impl FerroStore {
         let topic_owned = topic.to_string();
         let key_owned = key.to_string();
         let payload = payload.clone();
+        // The record the body staged, for subscribers when the commit is
+        // durable but its batch was not delivered.
+        let mut staged: Option<MqRecord> = None;
+        let staged_slot = &mut staged;
         // One `with_write`: the message and the high-water share a WAL frame.
         // A crash must not persist either document alone.
-        let (record, store_seq) = self.with_write_outcome(move |txn| {
+        let outcome = self.with_write_outcome(move |txn| {
             let seq = next_mq_seq(txn, &topic_owned)?;
             let record = MqRecord {
                 seq,
                 key: key_owned.clone(),
                 payload: payload.clone(),
             };
+            *staged_slot = Some(record.clone());
             txn.put(
                 mq_message_collection(&topic_owned),
                 seq.to_string(),
@@ -1358,7 +1411,20 @@ impl FerroStore {
                 serde_json::json!({ "seq": seq }),
             );
             Ok(record)
-        })?;
+        });
+        let (record, store_seq) = match outcome {
+            Ok(done) => done,
+            // Durable, not yet sent to the adapter: the slot sync is done, so
+            // subscribers get the message all the same (spec §4.3). Every
+            // other error committed nothing, and no subscriber hears of it.
+            Err(err @ StoreError::Undelivered { .. }) => {
+                if let Some(record) = staged.take() {
+                    self.notify(topic, &record);
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let store_seq = store_seq.ok_or_else(|| backend("publish_mq did not commit"))?;
         self.notify(topic, &record);
         Ok((record.seq, store_seq))
@@ -1420,6 +1486,7 @@ impl FerroStore {
         mode: SyncMode,
         adapter: Arc<dyn SyncAdapter>,
     ) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
         let mut slot = lock_mutex(&self.sync);
         if !slot.is_idle() {
             return Err(backend(
@@ -1438,6 +1505,7 @@ impl FerroStore {
         mode: SyncMode,
         adapter: Arc<dyn SyncAdapter>,
     ) -> Result<Self, StoreError> {
+        self.refuse_reentry()?;
         self.attach_sync_adapter(mode, adapter)?;
         Ok(self)
     }
@@ -1445,6 +1513,7 @@ impl FerroStore {
     /// Drop the adapter. A pending batch is an error and the adapter stays.
     /// `synced_seq` is kept.
     pub fn detach_sync_adapter(&self) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
         let mut slot = lock_mutex(&self.sync);
         if !slot.is_idle() {
             return Err(backend(
@@ -1479,7 +1548,12 @@ impl FerroStore {
     /// Waits while another thread's notify is in flight, then sends only the
     /// front batch. The thread that owns that notify returns `synced_seq` and
     /// does not send. A later batch stays pending until this loop reaches it.
+    ///
+    /// Refused from inside a transaction body on this handle
+    /// ([`Self::refuse_reentry`]); a call from inside `on_commit`, which runs
+    /// outside every body, is not.
     pub fn sync_flush(&self) -> Result<u64, StoreError> {
+        self.refuse_reentry()?;
         let adapter = {
             let slot = lock_mutex(&self.sync);
             slot.adapter
@@ -2014,7 +2088,12 @@ impl FerroStore {
             Inner::Disk(disk) => {
                 let due = {
                     let file = lock_mutex(&disk.write);
-                    disk.poison.check()?;
+                    // Reads go on on a poisoned handle (see [`Poison`]): the
+                    // adapter's document is returned, and not stored. Every
+                    // sync is made under the write mutex, so this is exact.
+                    if disk.poison.is_set() {
+                        return Ok(Some(fetched));
+                    }
                     let _locked = FlockGuard::acquire(&**file)?;
                     let (index, base) = disk.refresh(&**file, disk.write_id)?;
                     let state = &base.state;
@@ -2032,18 +2111,17 @@ impl FerroStore {
                     };
                     let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                    let due =
-                        match publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])? {
-                            Some(new_sb) => {
-                                let done = disk.install_commit(
-                                    base,
-                                    new_sb,
-                                    Change::Overlay(overlay, seq),
-                                );
-                                checkpoint_due(disk, &done)
-                            }
-                            None => false,
-                        };
+                    let published =
+                        publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])
+                            .inspect_err(|_| disk.settle_failed_publish(&base))?;
+                    let due = match published {
+                        Some(new_sb) => {
+                            let done =
+                                disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                            checkpoint_due(disk, &done)
+                        }
+                        None => false,
+                    };
                     if sync.is_idle() && seq > sync.synced_seq {
                         sync.synced_seq = seq;
                     }
@@ -2250,22 +2328,33 @@ impl FerroStore {
         if committed.ops.is_empty() {
             return Registered::Nothing;
         }
+        {
+            let mut slot = lock_mutex(&self.sync);
+            if silent {
+                if slot.is_idle() && committed.seq > slot.synced_seq {
+                    slot.synced_seq = committed.seq;
+                }
+                return Registered::Nothing;
+            }
+            if slot.adapter.is_none() || slot.mode.is_none() {
+                return Registered::Nothing;
+            }
+        }
+        // Only a batch that is queued or sent is built: it clones every op,
+        // vector and column bytes included, and a group's leader builds its
+        // members' under the gate, the write mutex and the `flock`. It is
+        // built with the sync mutex released; the slot as the second lock
+        // finds it decides where the batch goes.
         let batch = SyncBatch {
             seq: committed.seq,
             ops: committed.ops.iter().map(SyncOp::from_op).collect(),
         };
         let mut slot = lock_mutex(&self.sync);
-        if silent {
-            if slot.is_idle() && batch.seq > slot.synced_seq {
-                slot.synced_seq = batch.seq;
-            }
-            return Registered::Nothing;
-        }
-        let Some(adapter) = slot.adapter.clone() else {
+        let (Some(adapter), Some(mode)) = (slot.adapter.clone(), slot.mode) else {
             return Registered::Nothing;
         };
-        match slot.mode {
-            Some(SyncMode::WriteThrough) => {
+        match mode {
+            SyncMode::WriteThrough => {
                 if !slot.is_idle() {
                     let seq = batch.seq;
                     slot.pending.push(batch);
@@ -2276,11 +2365,10 @@ impl FerroStore {
                     Registered::Owned(adapter, batch)
                 }
             }
-            Some(SyncMode::WriteBehind | SyncMode::LocalCache | SyncMode::CloudPreCache) => {
+            SyncMode::WriteBehind | SyncMode::LocalCache | SyncMode::CloudPreCache => {
                 slot.pending.push(batch);
                 Registered::Nothing
             }
-            None => Registered::Nothing,
         }
     }
 
@@ -2844,6 +2932,20 @@ fn checkpoint_locked(
     base: &DiskCache,
 ) -> Result<(), StoreError> {
     disk.poison.check()?;
+    let new_sb = write_checkpoint(disk, file, index, base)
+        .inspect_err(|_| disk.settle_failed_publish(base))?;
+    disk.install_checkpoint(base, new_sb);
+    disk.checkpoint_failed_at.store(0, Ordering::Release);
+    Ok(())
+}
+
+/// [`checkpoint_locked`]'s writes and syncs: the superblock it published.
+fn write_checkpoint(
+    disk: &Disk,
+    file: &dyn ContainerIo,
+    index: usize,
+    base: &DiskCache,
+) -> Result<Superblock, StoreError> {
     let (sb, state) = (base.sb, &*base.state);
     let blob = if !state.vectors.is_empty() {
         encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
@@ -2872,9 +2974,7 @@ fn checkpoint_locked(
     };
     write_slot(file, index ^ 1, &new_sb)?;
     disk.poison.sync_data(file)?;
-    disk.install_checkpoint(base, new_sb);
-    disk.checkpoint_failed_at.store(0, Ordering::Release);
-    Ok(())
+    Ok(new_sb)
 }
 
 fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<u64, StoreError> {

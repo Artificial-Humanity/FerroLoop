@@ -744,3 +744,112 @@ fn a_checkpoint_whose_snapshot_sync_fails_poisons_the_handle() {
 fn a_checkpoint_whose_slot_sync_fails_poisons_the_handle() {
     failed_checkpoint(2);
 }
+
+/// A lock-free read that loads the slots after a publish's slot write and
+/// before that slot's sync fails reads the unacknowledged epoch for its own
+/// call, but the handle keeps none of it: once poisoned, every read serves
+/// the last state whose syncs all returned.
+#[test]
+fn a_read_between_the_slot_write_and_its_failed_sync_is_not_kept_once_poisoned() {
+    let fs = SimFs::default();
+    let store = Arc::new(open(&fs));
+    store.put_doc("f", "before", &json!(0)).unwrap();
+    let base = store.read_state().unwrap().last_seq;
+    let mid = Arc::new(Mutex::new(None));
+    {
+        let (reader, sim, mid) = (Arc::clone(&store), fs.clone(), Arc::clone(&mid));
+        let mut seen = 0;
+        fs.before_next_sync(
+            move |op| {
+                if matches!(op, IoOp::SyncData { .. }) {
+                    seen += 1;
+                }
+                // The publish's second sync: the one after its slot write.
+                seen == 2
+            },
+            move || {
+                let read = std::thread::spawn(move || {
+                    reader
+                        .read_state()
+                        .map(|state| (state.last_seq, state.docs.get("f", "new").cloned()))
+                        .map_err(|err| err.to_string())
+                })
+                .join()
+                .unwrap();
+                *lock_mutex(&mid) = Some(read);
+                sim.fail_next(|op| matches!(op, IoOp::SyncData { .. }));
+            },
+        );
+    }
+    let err = store.put_doc("f", "new", &json!(1)).unwrap_err();
+    assert!(err.to_string().contains("simulated I/O error"), "{err}");
+    let read = lock_mutex(&mid)
+        .take()
+        .expect("the read between did not run");
+    assert_eq!(
+        read,
+        Ok((base + 1, Some(json!(1)))),
+        "the read between did not load the slot the publish wrote"
+    );
+    assert_eq!(
+        store.read_state().unwrap().last_seq,
+        base,
+        "a poisoned handle served an epoch whose sync never returned"
+    );
+    assert_eq!(store.get_doc("f", "new").unwrap(), None);
+    assert_poisoned(&fs, &store);
+}
+
+/// A `LocalCache` adapter that holds every document it is asked for.
+struct Peer;
+
+impl SyncAdapter for Peer {
+    fn name(&self) -> &str {
+        "peer"
+    }
+
+    fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn fetch_document(&self, _: &str, id: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        Ok(Some(json!({ "peer": id })))
+    }
+}
+
+/// Reads go on on a poisoned handle: a cache miss in `LocalCache` returns the
+/// adapter's document, and stores nothing.
+#[test]
+fn a_poisoned_handle_returns_a_fetched_document_without_storing_it() {
+    let fs = SimFs::default();
+    let store = open(&fs);
+    store.put_doc("f", "before", &json!(0)).unwrap();
+    fs.fail_next(|op| matches!(op, IoOp::SyncData { .. }));
+    let err = store.put_doc("f", "lost", &json!(1)).unwrap_err();
+    assert!(err.to_string().contains("simulated I/O error"), "{err}");
+    store
+        .attach_sync_adapter(SyncMode::LocalCache, Arc::new(Peer))
+        .unwrap();
+    let mark = fs.trace().len();
+    for _ in 0..2 {
+        assert_eq!(
+            store.get_doc("f", "miss").unwrap(),
+            Some(json!({ "peer": "miss" }))
+        );
+    }
+    assert!(
+        !fs.trace()[mark..]
+            .iter()
+            .any(|op| matches!(op, IoOp::Write { .. } | IoOp::SyncData { .. })),
+        "a poisoned handle stored the fetched document"
+    );
+    assert_eq!(store.get_doc("f", "before").unwrap(), Some(json!(0)));
+    assert!(!store.has_pending_sync());
+    store.detach_sync_adapter().unwrap();
+    assert_eq!(
+        store.get_doc("f", "miss").unwrap(),
+        None,
+        "the fill was kept"
+    );
+    assert_poisoned(&fs, &store);
+}

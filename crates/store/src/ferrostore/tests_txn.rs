@@ -822,3 +822,51 @@ fn a_servers_undelivered_still_reaches_the_clients_own_adapter() {
         "the client's own batches were sent"
     );
 }
+
+/// A `WriteThrough` publish whose batch the adapter refuses is durable:
+/// `publish_mq` returns `Undelivered` and the topic's subscribers still get
+/// the message, on every publish of the outage. A served store's own
+/// subscribers get a remote client's publish the same way.
+#[test]
+fn an_undelivered_publish_still_reaches_the_subscribers() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("s.sock");
+    let server =
+        FerroStoreServer::bind_unix(&sock, FerroStore::open(dir.path().join("s.fls")).unwrap())
+            .unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    let local = [
+        ("memory", FerroStore::in_memory()),
+        ("disk", FerroStore::open(dir.path().join("d.fls")).unwrap()),
+    ];
+    let cases = local
+        .iter()
+        .map(|(mode, store)| (*mode, store, store))
+        .chain([("served", &client, server.store())]);
+    for (mode, publisher, owner) in cases {
+        let flaky = Arc::new(Flaky::default());
+        owner
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::clone(&flaky) as _)
+            .unwrap();
+        let rx = owner.subscribe_mq("t");
+        flaky.fail.store(true, Ordering::SeqCst);
+        for n in 1..=2u64 {
+            let base = last_seq(owner);
+            let err = publisher.publish_mq("t", "k", &json!(n)).unwrap_err();
+            assert!(
+                matches!(err, StoreError::Undelivered { seq, .. } if seq == base + 1),
+                "{mode}: publish {n}: {err:?}"
+            );
+            let got = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{mode}: publish {n} reached no subscriber"));
+            assert_eq!((got.seq, got.payload), (n, json!(n)), "{mode}");
+        }
+        // Each publish reached the subscriber once.
+        assert!(rx.try_recv().is_err(), "{mode}");
+        flaky.fail.store(false, Ordering::SeqCst);
+        owner.sync_flush().unwrap();
+        assert_eq!(flaky.sent.lock().unwrap().len(), 2, "{mode}");
+        owner.detach_sync_adapter().unwrap();
+    }
+}

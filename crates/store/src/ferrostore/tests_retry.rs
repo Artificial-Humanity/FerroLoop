@@ -209,7 +209,7 @@ const NOT_REMOTE: &[(&str, &str, &str)] = &[
     ),
     (
         "mod.rs",
-        "let (record, store_seq) = self.with_write_outcome(move |txn| {",
+        "let outcome = self.with_write_outcome(move |txn| {",
         "`publish_mq`: a remote handle sends one `publish_mq` RPC, which the server runs once",
     ),
 ];

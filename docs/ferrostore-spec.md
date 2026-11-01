@@ -178,7 +178,7 @@ Each call is one JSON object:
 {"id": 1, "method": "put_doc", "params": {}}
 ```
 
-`id` is an integer chosen by the client. Success is `{"id": 1, "ok": true, "result": ...}`. Failure is `{"id": 1, "ok": false, "error": "..."}`, and the client returns `StoreError::Backend` of that message. The one exception is a write that committed on the server but whose server-side `WriteThrough` delivery failed (`StoreError::Undelivered`). Its failure also carries `"kind": "undelivered"`, `"seq": <u64>` (the commit's sequence) and `"cause": "..."` (the cause's message; for a `Backend` cause, its detail alone), and the client returns `StoreError::Undelivered { seq, cause: Backend(cause) }`. The write is durable on the server, so the client does not retry it.
+`id` is an integer chosen by the client. Success is `{"id": 1, "ok": true, "result": ...}`. Failure is `{"id": 1, "ok": false, "error": "..."}`, and the client returns `StoreError::Backend` of that message. The one exception is a write that committed on the server but whose server-side `WriteThrough` delivery failed (`StoreError::Undelivered`). Its failure also carries `"kind": "undelivered"`, `"seq": <u64>` (the commit's sequence) and `"cause": "..."` (the cause's full message, as its `Display` reads). A `Backend` cause also carries `"cause_backend": "..."`, its detail alone. The client returns `StoreError::Undelivered { seq, cause }`: `cause` is `Backend(cause_backend)` when `cause_backend` is present, and otherwise `StoreError::Relayed(cause)`, which displays the server's words unchanged. So the client's message is the server's, word for word, whatever kind the cause was. The write is durable on the server, so the client does not retry it.
 
 | Method | Params | Result |
 | --- | --- | --- |
@@ -293,7 +293,9 @@ Acks are documents in collection `mq_ack:{topic}:{group}`, id the decimal sequen
 
 `poll_mq_group` returns the oldest unacked messages for that topic and group, up to `limit`, and does not ack them. A second poll without an ack returns the same messages. `limit == 0` returns an empty vector. Another group has its own ack set.
 
-Subscribers are in-process only: a `Mutex<Vec<Sender<MqRecord>>>` map. `publish_mq` sends a clone after the durable commit and after the file lock is released. A disconnected subscriber is dropped. `subscribe_mq` does not replay history; it receives only later publishes on this handle.
+Subscribers are in-process only: a `Mutex<Vec<Sender<MqRecord>>>` map. `publish_mq` sends a clone after the durable commit and after the file lock is released. A publish that returns `StoreError::Undelivered` (durable, its batch not sent to the `WriteThrough` adapter) still sends it, so live push goes on through an adapter outage, server-side subscribers included. A publish that returns any other error committed nothing and sends nothing. A disconnected subscriber is dropped. `subscribe_mq` does not replay history; it receives only later publishes on this handle.
+
+On a remote handle, a `publish_mq` that the server answers with `Undelivered` is durable on the server, and the server's subscribers get the message. The client registers no batch with its own adapter for it, because the error carries the store sequence and not the message sequence the batch's ops need, and the caller gets no message sequence either.
 
 ## Phases
 

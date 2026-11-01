@@ -2,7 +2,10 @@
 //! refused with an error, and nothing hangs. A call from another thread is
 //! never refused.
 
-use super::{FerroStore, FerroStoreServer, VectorMetric, VectorStorage, lock_mutex};
+use super::{
+    FerroStore, FerroStoreServer, SyncAdapter, SyncBatch, SyncMode, VectorMetric, VectorStorage,
+    lock_mutex,
+};
 use fl_core::StoreError;
 use fl_core::store::Catalog;
 use serde_json::json;
@@ -44,6 +47,19 @@ fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static)
 
 type Nested = fn(&FerroStore) -> Result<(), StoreError>;
 
+/// An adapter a nested call tries to attach.
+struct Quiet;
+
+impl SyncAdapter for Quiet {
+    fn name(&self) -> &str {
+        "quiet"
+    }
+
+    fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
 /// Calls a body might make on its own store: reads and writes, the public
 /// API and the traits.
 const NESTED: &[(&str, Nested)] = &[
@@ -70,6 +86,11 @@ const NESTED: &[(&str, Nested)] = &[
     ("add_project", |s| s.add_project("/nested").map(drop)),
     ("transaction", |s| s.transaction(|_| Ok(()))),
     ("checkpoint", |s| s.checkpoint()),
+    ("sync_flush", |s| s.sync_flush().map(drop)),
+    ("attach_sync_adapter", |s| {
+        s.attach_sync_adapter(SyncMode::WriteBehind, Arc::new(Quiet))
+    }),
+    ("detach_sync_adapter", |s| s.detach_sync_adapter()),
 ];
 
 #[test]
@@ -102,6 +123,11 @@ fn every_call_from_inside_a_body_is_refused_and_the_outer_transaction_goes_on() 
         assert_eq!(store.get_doc("c", "nested").unwrap(), None, "{mode}");
         assert!(store.list_projects().unwrap().is_empty(), "{mode}");
         assert!(!store.has_vector_collection("v").unwrap(), "{mode}");
+        assert_eq!(
+            store.sync_mode(),
+            None,
+            "{mode}: a nested attach took effect"
+        );
         // The handle works normally once the body is done.
         store.put_doc("c", "after", &json!(2)).unwrap();
         assert_eq!(

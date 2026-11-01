@@ -35,7 +35,7 @@ pub use any::{
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
     EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit,
-    RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp, VectorHit, VectorMetric,
+    RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp, Transaction, VectorHit, VectorMetric,
     VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
 };
 pub use knowledge::{
