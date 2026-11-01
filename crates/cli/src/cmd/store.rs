@@ -235,13 +235,24 @@ fn scratch_dir() -> Result<tempfile::TempDir> {
         .context("could not make a private directory in the system temp directory")
 }
 
+/// The line printed when a clean migration could not make the kept redb read-only.
+fn still_writable_notice(fls: &Path, redb: &Path) -> String {
+    format!(
+        "clean: {} is the store; {} is kept but is still writable (its mode could not be \
+         set to 0400): make it read-only with chmod 0400, or a write to it is lost",
+        fls.display(),
+        redb.display()
+    )
+}
+
 /// Refuse, in words, when `free` bytes cannot hold `copies` files of `size`
 /// bytes plus 10% each.
 fn ensure_room(dir: &Path, free: u64, size: u64, copies: u64) -> Result<()> {
     let need = copies.saturating_mul(size.saturating_add(size / 10));
     if free < need {
         bail!(
-            "not enough free space in {} for the private copy: {free} bytes free, {need} needed              ({copies} file(s) of {size} bytes, plus 10%); point $TMPDIR at a bigger filesystem",
+            "not enough free space in {} for the private copy: {free} bytes free, {need} needed \
+             ({copies} file(s) of {size} bytes, plus 10%); point $TMPDIR at a bigger filesystem",
             dir.display()
         );
     }
@@ -358,11 +369,7 @@ fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
                 redb.display()
             );
         } else {
-            println!(
-                "clean: {} is the store; {} is kept but is still writable (its mode could not be                  set to 0400): make it read-only with chmod 0400, or a write to it is lost",
-                fls.display(),
-                redb.display()
-            );
+            println!("{}", still_writable_notice(&fls, &redb));
         }
         return Ok(0);
     }
@@ -517,11 +524,33 @@ mod tests {
         assert!(err.contains("not enough free space in /scratch"), "{err}");
         assert!(err.contains("1100 needed"), "{err}");
         assert!(err.contains("$TMPDIR"), "{err}");
+        assert!(!err.contains("  "), "a run of spaces in the message: {err}");
+        assert!(
+            err.contains("1100 needed (1 file(s) of 1000 bytes, plus 10%)"),
+            "{err}"
+        );
         let err = ensure_room(dir, 2199, 1000, 2).unwrap_err().to_string();
         assert!(err.contains("2200 needed"), "{err}");
         // An empty file needs nothing; sizes near u64::MAX do not wrap.
         assert!(ensure_room(dir, 0, 0, 2).is_ok());
         assert!(ensure_room(dir, u64::MAX - 1, u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn the_still_writable_notice_has_no_runs_of_spaces() {
+        let text = still_writable_notice(Path::new("/d/s.fls"), Path::new("/d/s.redb"));
+        assert!(
+            !text.contains("  "),
+            "a run of spaces in the message: {text}"
+        );
+        assert!(
+            text.contains("(its mode could not be set to 0400): make it read-only"),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("clean: /d/s.fls is the store; /d/s.redb is kept"),
+            "{text}"
+        );
     }
 
     #[test]
