@@ -1,0 +1,14 @@
+$ fl store status --json
+exit: 0
+--- stdout
+{
+  "dead_bytes": null,
+  "engine": "ferro",
+  "exists": false,
+  "format_version": "n/a",
+  "live_bytes": null,
+  "logical_path": "<DIR>/stores/fl.redb",
+  "physical_path": "<DIR>/stores/fl.fls",
+  "size_bytes": null
+}
+--- stderr

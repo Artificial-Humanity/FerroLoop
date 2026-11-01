@@ -1,0 +1,5 @@
+$ FL_STORE_BACKEND=sqlite fl store status
+exit: 2
+--- stdout
+--- stderr
+error: backend failure: unknown store backend `sqlite` in FL_STORE_BACKEND: expected `redb` or `ferro`
