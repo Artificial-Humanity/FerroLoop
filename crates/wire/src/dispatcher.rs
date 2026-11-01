@@ -1663,14 +1663,14 @@ mod tests {
             .send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "synthetic-sender".into(),
                 sender_host: None,
-                to: WireAddress::AgentName("sonya".into()),
+                to: WireAddress::AgentName("synthetic-recipient-a".into()),
                 kind: MessageKind::Mail,
                 urgency: MessageUrgency::Urgent,
                 durable: false,
                 subject: "ping".into(),
-                body: "hello sonya".into(),
+                body: "hello synthetic".into(),
                 reply_to: None,
                 thread_id: None,
                 deadline_at: None,
@@ -1680,7 +1680,7 @@ mod tests {
 
         let mut routes = RouteTable::default();
         routes.upsert(
-            "sonya",
+            "synthetic-recipient-a",
             VendorRoute::Claude {
                 pid: 0,
                 session_id: "s1".into(),
@@ -1707,12 +1707,12 @@ mod tests {
         assert_eq!(auth["token"], "tok-xyz");
         let user: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(user["type"], "user");
-        assert_eq!(user["from"], "jarvis");
+        assert_eq!(user["from"], "synthetic-sender");
         assert!(
             user["message"]["content"]
                 .as_str()
                 .unwrap()
-                .contains("hello sonya")
+                .contains("hello synthetic")
         );
     }
 
@@ -1726,9 +1726,9 @@ mod tests {
             .send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "synthetic-sender".into(),
                 sender_host: None,
-                to: WireAddress::AgentName("kayla".into()),
+                to: WireAddress::AgentName("synthetic-recipient-b".into()),
                 kind: MessageKind::Mail,
                 urgency: MessageUrgency::Normal,
                 durable: false,
@@ -1743,7 +1743,7 @@ mod tests {
 
         let mut routes = RouteTable::default();
         routes.upsert(
-            "kayla",
+            "synthetic-recipient-b",
             VendorRoute::Webhook {
                 socket_path: dead_sock,
             },
@@ -1806,7 +1806,7 @@ mod tests {
             .send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "synthetic-sender".into(),
                 sender_host: None,
                 to: WireAddress::AgentName("mira".into()),
                 kind: MessageKind::Mail,
@@ -2608,6 +2608,10 @@ mod tests {
         let _ls_env = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
         let _csrf_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         let _bin_env = EnvGuard::remove("FL_WIRE_AGY_BIN");
+        // The transcripts to truncate are found under `$HOME/.gemini`: point HOME at a temp
+        // directory so the test never creates or writes anything in the real home.
+        let home_tmp = TempDir::new().unwrap();
+        let _home_env = EnvGuard::set("HOME", home_tmp.path());
 
         let missing = VendorRoute::Agy {
             conversation_id: "conv-missing".into(),
@@ -2702,6 +2706,11 @@ mod tests {
         });
 
         let home = std::env::var("HOME").expect("HOME");
+        assert_eq!(
+            Path::new(&home),
+            home_tmp.path(),
+            "the test must not use the real home"
+        );
         let conversation_id = format!(
             "fl-wire-revert-{}-{}",
             std::process::id(),
@@ -2848,6 +2857,7 @@ mod tests {
         assert!(failed.contains("500"), "{failed}");
         assert!(failed.contains("database locked"), "{failed}");
         assert_eq!(fs::read_to_string(&transcript).unwrap(), before);
+        drop(_home_env);
         drop(_bin_env);
         drop(_csrf_env);
         drop(_ls_env);
@@ -3286,9 +3296,9 @@ mod tests {
             let res = store.send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "synthetic-sender".into(),
                 sender_host: None,
-                to: WireAddress::AgentName("kayla".into()),
+                to: WireAddress::AgentName("synthetic-recipient-b".into()),
                 kind: MessageKind::Mail,
                 urgency: MessageUrgency::Normal,
                 durable: false,

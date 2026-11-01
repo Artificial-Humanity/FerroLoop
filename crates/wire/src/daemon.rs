@@ -1121,9 +1121,9 @@ mod tests {
         SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
+            sender_name: "synthetic-sender".into(),
             sender_host: Some("node-a".into()),
-            to: WireAddress::AgentName("kayla".into()),
+            to: WireAddress::AgentName("synthetic-recipient".into()),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
             durable: true,
@@ -1162,7 +1162,9 @@ mod tests {
                 peers: vec![],
                 psk: b"top-secret-psk".to_vec(),
             },
-            routes: Mutex::new(RouteTable::load(None)),
+            // The table of this rig's own `routes_path`: `load(None)` would read the machine's
+            // real route table (and panics under test, see `refuse_default_route_path`).
+            routes: Mutex::new(RouteTable::load(Some(&tmp.path().join("routes-b.json")))),
             dispatch_gate: Mutex::new(()),
             peers: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -1191,6 +1193,28 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_rig_daemon_registers_and_saves_routes_only_in_its_own_temp_dir() {
+        let rig = rig();
+        let path = rig._tmp.path().join("routes-b.json");
+        assert!(rig.inner.routes.lock().unwrap().entries.is_empty());
+        assert!(!path.exists());
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "synthetic-route-owner".into(),
+            route: VendorRoute::Webhook {
+                socket_path: rig._tmp.path().join("hook.sock"),
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        // The registration reached the rig's own file, and `RouteTable::load(None)` / `save(None)`
+        // (the real machine table) would have panicked above: they refuse under test.
+        assert!(
+            RouteTable::load(Some(&path))
+                .get("synthetic-route-owner")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1401,9 +1425,9 @@ mod tests {
             .send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "synthetic-sender".into(),
                 sender_host: Some("node-a".into()),
-                to: WireAddress::AgentName("kayla".into()),
+                to: WireAddress::AgentName("synthetic-recipient".into()),
                 kind: MessageKind::Mail,
                 urgency: MessageUrgency::Normal,
                 durable: true,
@@ -1464,7 +1488,7 @@ mod tests {
         let mut client_b = LocalClient::connect(&sock_b, Duration::from_secs(1)).unwrap();
         client_b
             .request(&LocalRequest::RegisterRoute {
-                persona: "kayla".into(),
+                persona: "synthetic-recipient".into(),
                 route: VendorRoute::Webhook {
                     socket_path: webhook_sock,
                 },
@@ -1501,9 +1525,9 @@ mod tests {
                 args: SendWireArgs {
                     id: None,
                     sender_id: None,
-                    sender_name: "jarvis".into(),
+                    sender_name: "synthetic-sender".into(),
                     sender_host: None,
-                    to: WireAddress::AgentName("kayla".into()),
+                    to: WireAddress::AgentName("synthetic-recipient".into()),
                     kind: MessageKind::Ask,
                     urgency: MessageUrgency::Urgent,
                     durable: false,
@@ -1526,7 +1550,7 @@ mod tests {
         // Subscribe on daemon A for replies correlated to ask_msg.id
         let mut sub_a = LocalClient::connect(&sock_a, Duration::from_secs(1)).unwrap();
         sub_a
-            .subscribe(Some("jarvis".into()), Some(ask_msg.id.clone()))
+            .subscribe(Some("synthetic-sender".into()), Some(ask_msg.id.clone()))
             .unwrap();
 
         // Wait until ask_msg is present on daemon B, then send Reply on daemon B
@@ -1542,9 +1566,9 @@ mod tests {
                 args: SendWireArgs {
                     id: None,
                     sender_id: None,
-                    sender_name: "kayla".into(),
+                    sender_name: "synthetic-recipient".into(),
                     sender_host: None,
-                    to: WireAddress::AgentName("jarvis".into()),
+                    to: WireAddress::AgentName("synthetic-sender".into()),
                     kind: MessageKind::Reply,
                     urgency: MessageUrgency::Normal,
                     durable: false,
@@ -1589,7 +1613,7 @@ mod tests {
         SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
+            sender_name: "synthetic-sender".into(),
             sender_host: None,
             to: WireAddress::AgentName(to.into()),
             kind: MessageKind::Mail,
@@ -1646,7 +1670,7 @@ mod tests {
 
         // Any send runs a dispatch, whose discovery prunes the derived route.
         request(LocalRequest::Send {
-            args: mail("kayla", "prune"),
+            args: mail("synthetic-recipient", "prune"),
         });
         assert!(
             status_personas().is_empty(),
@@ -1688,7 +1712,7 @@ mod tests {
 
         let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         reg.request(&LocalRequest::RegisterRoute {
-            persona: "kayla".into(),
+            persona: "synthetic-recipient".into(),
             route: VendorRoute::Codex {
                 thread_id: "t1".into(),
                 cwd: None,
@@ -1700,7 +1724,7 @@ mod tests {
         let sender = std::thread::spawn(move || {
             let mut c = LocalClient::connect(&send_sock, Duration::from_secs(10)).unwrap();
             c.request(&LocalRequest::Send {
-                args: mail("kayla", "slow one"),
+                args: mail("synthetic-recipient", "slow one"),
             })
             .map(|_| ())
         });
@@ -1857,7 +1881,9 @@ mod tests {
     fn a_peer_with_the_wrong_psk_is_refused_and_receives_no_messages() {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
-        store.send_wire(mail("kayla", "secret subject")).unwrap();
+        store
+            .send_wire(mail("synthetic-recipient", "secret subject"))
+            .unwrap();
         let mut cfg = test_config(tmp.path(), "guarded");
         cfg.listen_addr = Some("127.0.0.1:0".into());
         let daemon = spawn_daemon(store, cfg).unwrap();
@@ -1936,14 +1962,15 @@ mod tests {
         let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
 
         let mut sub = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
-        sub.subscribe(Some("KAYLA".into()), None).unwrap();
+        sub.subscribe(Some("SYNTHETIC-RECIPIENT".into()), None)
+            .unwrap();
         let mut other = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         other.subscribe(Some("someone-else".into()), None).unwrap();
 
         let mut sender = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         sender
             .request(&LocalRequest::Send {
-                args: mail("kayla", "for kayla"),
+                args: mail("synthetic-recipient", "for kayla"),
             })
             .unwrap();
         let ev = sub.wait_for_event(Duration::from_secs(3)).unwrap();

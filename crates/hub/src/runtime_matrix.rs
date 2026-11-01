@@ -710,7 +710,7 @@ fn vault_metadata(home_override: Option<&Path>) -> Result<Vec<VaultSecretMetadat
         .map_err(|e| e.to_string())
 }
 
-fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
+pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
     // Snapshot under the store guard, then drop it before any filesystem or network probing.
     let snapshot = match state.open_store() {
         Ok(store) => snapshot_discovery_store(&store),
@@ -731,8 +731,16 @@ fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
         state.config.home_override.as_deref(),
     );
     let vault = vault_metadata(state.config.home_override.as_deref());
+    // A hub with a `home_override` is sandboxed (its tests): it looks for the vendor CLIs only
+    // under that home's `.local/bin`, never on the host's PATH, so a probe cannot run (and
+    // write the state of) the real `claude`, `codex`, `grok`, `agy` or `muse` of whoever runs it.
+    let path_env = if state.config.home_override.is_some() {
+        String::new()
+    } else {
+        std::env::var("PATH").unwrap_or_default()
+    };
     Ok(ProbeInputs {
-        path_env: std::env::var("PATH").unwrap_or_default(),
+        path_env,
         home,
         sessions,
         vault,
