@@ -245,6 +245,38 @@ export const PinIcon: React.FC<PinIconProps> = ({
   </svg>
 );
 
+export const ProjectSettingsIcon: React.FC<{ size?: number }> = ({
+  size = 17,
+}) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+    data-testid="project-settings-icon"
+    style={{ display: "inline-block", verticalAlign: "middle", flexShrink: 0 }}
+  >
+    {/* Distinct hexagonal project-level nut shell + inner precision cog ring */}
+    <polygon
+      points="12 2 20.66 7 20.66 17 12 22 3.34 17 3.34 7"
+      fill="currentColor"
+      fillOpacity="0.14"
+    />
+    <circle cx="12" cy="12" r="3.5" />
+    <line x1="12" y1="6.5" x2="12" y2="8.5" />
+    <line x1="12" y1="15.5" x2="12" y2="17.5" />
+    <line x1="7.2" y1="9.2" x2="8.9" y2="10.2" />
+    <line x1="15.1" y1="13.8" x2="16.8" y2="14.8" />
+    <line x1="16.8" y1="9.2" x2="15.1" y2="10.2" />
+    <line x1="8.9" y1="13.8" x2="7.2" y2="14.8" />
+  </svg>
+);
+
 export function usePinnedState(): {
   pinnedProjects: Set<string>;
   pinnedAgents: Set<string>;
@@ -702,8 +734,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 style={{ marginBottom: "14px" }}
               >
                 <div
+                  data-testid={`project-header-row-${projectLower}`}
                   style={{
-                    padding: "4px 8px",
+                    padding: "4px 10px",
+                    border: "1px solid transparent",
                     fontSize: "11px",
                     fontWeight: 700,
                     textTransform: "uppercase",
@@ -765,7 +799,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     </span>
                   </button>
 
-                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
                     {projectUnread > 0 && (
                       <span
                         data-testid={`project-unread-badge-${projectLower}`}
@@ -790,14 +824,19 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       style={{
                         border: "none",
                         background: "transparent",
-                        padding: "2px 4px",
-                        fontSize: "16px",
+                        width: "24px",
+                        height: "24px",
+                        padding: 0,
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
                         lineHeight: 1,
-                        color: "var(--text-muted)",
+                        color: "var(--accent-primary)",
                         cursor: "pointer",
+                        flexShrink: 0,
                       }}
                     >
-                      ⚙
+                      <ProjectSettingsIcon size={17} />
                     </button>
                   </div>
                 </div>
@@ -907,11 +946,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                 style={{
                                   border: "none",
                                   background: "transparent",
-                                  padding: "2px 4px",
-                                  fontSize: "16px",
+                                  width: "24px",
+                                  height: "24px",
+                                  padding: 0,
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  fontSize: "14px",
                                   lineHeight: 1,
                                   color: "var(--text-muted)",
                                   cursor: "pointer",
+                                  flexShrink: 0,
                                 }}
                               >
                                 ⚙

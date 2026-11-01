@@ -350,15 +350,34 @@ describe("RosterSidebar", () => {
     expect(sonoraToggle).toHaveTextContent("Sonora");
     expect(sonoraToggle.textContent?.replace(/[▸▾]/g, "").trim()).toBe("Sonora");
 
-    // Borderless ⚙ cog buttons on project and agent rows
+    // Borderless settings buttons on project and agent rows aligned on a 24x24 right rail,
+    // with a distinct 17px hexagonal SVG in var(--accent-primary) at the project level vs. 14px ⚙ at the agent level
+    const projHeader = screen.getByTestId("project-header-row-ferroloop");
+    const agentRow = screen.getByTestId("agent-row-ferris");
+    expect(projHeader.style.padding).toBe("4px 10px");
+    expect(agentRow.style.padding).toBe("8px 10px");
+
     const projCog = screen.getByTestId("project-settings-btn-ferroloop");
     const agentCog = screen.getByTestId("agent-settings-btn-ferris");
-    expect(projCog).toHaveClass("fd-gear-btn");
+    expect(projCog).toHaveClass("fd-gear-btn", "fd-roster-project-gear-btn");
     expect(projCog).not.toHaveClass("fd-btn");
     expect(projCog.style.background).toBe("transparent");
-    expect(agentCog).toHaveClass("fd-gear-btn");
+    expect(projCog.style.width).toBe("24px");
+    expect(projCog.style.height).toBe("24px");
+    expect(projCog.style.color).toBe("var(--accent-primary)");
+    const projSvg = projCog.querySelector('[data-testid="project-settings-icon"]');
+    expect(projSvg).not.toBeNull();
+    expect(projSvg?.getAttribute("width")).toBe("17");
+    expect(projSvg?.querySelector("polygon")).not.toBeNull();
+
+    expect(agentCog).toHaveClass("fd-gear-btn", "fd-roster-gear-btn");
     expect(agentCog).not.toHaveClass("fd-btn");
     expect(agentCog.style.background).toBe("transparent");
+    expect(agentCog.style.width).toBe("24px");
+    expect(agentCog.style.height).toBe("24px");
+    expect(agentCog.style.fontSize).toBe("14px");
+    expect(agentCog.style.color).toBe("var(--text-muted)");
+    expect(agentCog).toHaveTextContent("⚙");
 
     // Agent unread badges: jarvis -> "4" (normal), ferris -> "2" (normal), felix -> "1?" (question)
     expect(screen.getByTestId("unread-badge-jarvis")).toHaveTextContent("4");
