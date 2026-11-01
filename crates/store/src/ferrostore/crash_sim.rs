@@ -60,6 +60,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// The sector size a write can tear at.
 pub(super) const SECTOR: u64 = 512;
 
+/// The device number every simulated file reports: the inode number alone
+/// tells two simulated files apart.
+pub(super) const SIM_DEV: u64 = 0x51_4D;
+
 /// One recorded operation. A new kind of I/O op gets a variant here, a case
 /// in its `ContainerIo`/`ContainerFs` body, and a fate in [`SimFs::pending`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +74,7 @@ pub(super) enum IoOp {
     Read { ino: usize, offset: u64, len: u64 },
     Write { ino: usize, offset: u64, len: u64 },
     Len { ino: usize },
+    FileId { ino: usize },
     SetLen { ino: usize, len: u64 },
     SyncData { ino: usize },
     SyncAll { ino: usize },
@@ -88,6 +93,7 @@ impl fmt::Display for IoOp {
             IoOp::Read { ino, offset, len } => write!(f, "read ino{ino} @{offset}+{len}"),
             IoOp::Write { ino, offset, len } => write!(f, "write ino{ino} @{offset}+{len}"),
             IoOp::Len { ino } => write!(f, "len ino{ino}"),
+            IoOp::FileId { ino } => write!(f, "file_id ino{ino}"),
             IoOp::SetLen { ino, len } => write!(f, "set_len ino{ino} {len}"),
             IoOp::SyncData { ino } => write!(f, "sync_data ino{ino}"),
             IoOp::SyncAll { ino } => write!(f, "sync_all ino{ino}"),
@@ -618,6 +624,12 @@ impl ContainerIo for SimFile {
         let mut sim = self.fs.lock();
         sim.step(IoOp::Len { ino: self.ino })?;
         Ok(sim.inodes[self.ino].live.len() as u64)
+    }
+
+    fn file_id(&self) -> io::Result<(u64, u64)> {
+        // An `fstat`: recorded and refused after a cut, and never pending.
+        self.fs.lock().step(IoOp::FileId { ino: self.ino })?;
+        Ok((SIM_DEV, self.ino as u64))
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {

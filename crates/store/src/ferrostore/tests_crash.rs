@@ -137,6 +137,10 @@ impl Logical {
 struct Ctx<'a> {
     /// Set on the reference run: each acknowledged op records the live image.
     record: Option<&'a SimFs>,
+    /// The disk and path the workload runs on, for a step that opens a
+    /// second handle (another process, as far as the store can tell).
+    fs: &'a dyn ContainerFs,
+    path: &'a Path,
     images: Mutex<Vec<Image>>,
     labels: Mutex<Vec<String>>,
     started: AtomicUsize,
@@ -145,9 +149,11 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(record: Option<&'a SimFs>) -> Self {
+    fn new(record: Option<&'a SimFs>, fs: &'a dyn ContainerFs, path: &'a Path) -> Self {
         Self {
             record,
+            fs,
+            path,
             images: Mutex::new(Vec::new()),
             labels: Mutex::new(Vec::new()),
             started: AtomicUsize::new(0),
@@ -181,6 +187,11 @@ impl<'a> Ctx<'a> {
                 Err(err)
             }
         }
+    }
+
+    /// A second, independent handle on the workload's store.
+    fn open_other(&self) -> Result<FerroStore, StoreError> {
+        FerroStore::open_with(self.fs, self.path)
     }
 
     fn started(&self) -> usize {
@@ -237,6 +248,19 @@ const WORKLOAD: &[Step] = &[
     Step {
         name: "7 commits after the checkpoint",
         run: tail,
+    },
+];
+
+/// Spec §4.1: a handle that refreshes after another handle's commits (a
+/// WAL tail) and after its checkpoint (a full load), on reads and writes.
+const TWO_HANDLE_WORKLOAD: &[Step] = &[
+    Step {
+        name: "1 puts and deletes",
+        run: puts_and_deletes,
+    },
+    Step {
+        name: "2 a second handle",
+        run: second_handle,
     },
 ];
 
@@ -360,6 +384,51 @@ fn three_writers(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
     })
 }
 
+/// `Err` unless `store` reads `want` at `collection/id`: a read that missed
+/// another handle's commit fails the reference run.
+fn expect_doc(
+    store: &FerroStore,
+    collection: &str,
+    id: &str,
+    want: Value,
+) -> Result<(), StoreError> {
+    match store.get_doc(collection, id)? {
+        Some(got) if got == want => Ok(()),
+        got => Err(backend(format!(
+            "{collection}/{id} reads {got:?}, not {want}"
+        ))),
+    }
+}
+
+fn second_handle(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    let other = ctx.op("open a second handle", || ctx.open_other())?;
+    ctx.op("second handle puts", || {
+        other.put_doc("other", "x", &json!(1))
+    })?;
+    ctx.op("first handle reads the tail", || {
+        expect_doc(store, "other", "x", json!(1))
+    })?;
+    ctx.op("first handle writes on the tail", || {
+        store.with_write(|txn| {
+            let x = txn.get("other", "x").ok_or_else(|| backend("x missing"))?;
+            txn.put("other", "y", json!({"after": x}));
+            Ok(())
+        })
+    })?;
+    ctx.op("second handle writes on the tail", || {
+        expect_doc(&other, "other", "y", json!({"after": 1}))?;
+        other.put_doc("other", "z", &json!(3))
+    })?;
+    ctx.op("second handle checkpoints", || other.checkpoint())?;
+    ctx.op("first handle writes after the checkpoint", || {
+        expect_doc(store, "other", "z", json!(3))?;
+        store.put_doc("other", "w", &json!(4))
+    })?;
+    ctx.op("second handle reads the first's commit", || {
+        expect_doc(&other, "other", "w", json!(4))
+    })
+}
+
 fn tail(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
     ctx.op("put writers/w0 again", || {
         store.put_doc("writers", "w0", &json!({"writer": "again"}))
@@ -457,7 +526,7 @@ fn decode(image: &Image) -> Logical {
 
 fn reference(scenario: &Scenario) -> Reference {
     let fs = SimFs::new(&scenario.initial, None);
-    let ctx = Ctx::new(Some(&fs));
+    let ctx = Ctx::new(Some(&fs), &fs, Path::new(STORE));
     run_workload(scenario, &fs, Path::new(STORE), &ctx).expect("the uncut workload succeeds");
     let images = lock(&ctx.images).clone();
     assert_eq!(images.len(), ctx.acked());
@@ -649,7 +718,7 @@ fn run_scenario(scenario: &Scenario) -> Report {
     let mut report = Report::default();
     for cut in 0..=total {
         let fs = SimFs::new(&scenario.initial, Some(cut));
-        let ctx = Ctx::new(None);
+        let ctx = Ctx::new(None, &fs, &path);
         let result = run_workload(scenario, &fs, &path, &ctx);
         let trace = fs.trace();
         assert_eq!(
@@ -823,6 +892,19 @@ fn every_cut_of_a_v1_file_upgrade_recovers_to_an_acknowledged_prefix() {
     assert_clean(&scenario, &report, start.elapsed());
 }
 
+#[test]
+fn every_cut_of_a_two_handle_workload_recovers_to_an_acknowledged_prefix() {
+    let start = Instant::now();
+    let scenario = Scenario {
+        name: "two handles",
+        initial: Image::default(),
+        steps: TWO_HANDLE_WORKLOAD,
+    };
+    let report = run_scenario(&scenario);
+    assert_floors(&report, 60);
+    assert_clean(&scenario, &report, start.elapsed());
+}
+
 /// The scripted workload also runs on a real file through [`RealFs`], so the
 /// harness never drifts from what production does.
 #[test]
@@ -834,7 +916,7 @@ fn the_workload_runs_on_a_real_file() {
         initial: Image::default(),
         steps: WORKLOAD,
     };
-    let ctx = Ctx::new(None);
+    let ctx = Ctx::new(None, &RealFs, &path);
     run_workload(&scenario, &RealFs, &path, &ctx).unwrap();
     let store = FerroStore::open(&path).unwrap();
     let real = Logical::read(&store).unwrap();

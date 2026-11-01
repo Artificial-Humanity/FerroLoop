@@ -14,7 +14,7 @@
 use fl_core::StoreError;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -36,6 +36,9 @@ pub(super) trait ContainerIo: Send + Sync {
     fn len(&self) -> io::Result<u64>;
     /// `ftruncate`.
     fn set_len(&self, len: u64) -> io::Result<()>;
+    /// `(dev, ino)` of the open file (`fstat`): which file this description
+    /// reads, so a cache filled through it is not trusted for another file.
+    fn file_id(&self) -> io::Result<(u64, u64)>;
     /// The descriptor `flock` takes, or `None` for a file with no descriptor
     /// (the simulated disk, which does not model locks).
     fn lock_fd(&self) -> Option<RawFd>;
@@ -64,6 +67,11 @@ impl ContainerIo for File {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         File::set_len(self, len)
+    }
+
+    fn file_id(&self) -> io::Result<(u64, u64)> {
+        let meta = self.metadata()?;
+        Ok((meta.dev(), meta.ino()))
     }
 
     fn lock_fd(&self) -> Option<RawFd> {

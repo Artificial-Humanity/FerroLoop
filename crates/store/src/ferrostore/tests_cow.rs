@@ -499,6 +499,51 @@ fn a_failed_commit_leaves_the_live_state_the_same_arc() {
     );
 }
 
+/// A body that sees a staged op fail and carries on regardless returns `Ok`:
+/// only the transaction's own `failed` guard keeps it from committing what it
+/// staged before the failure.
+#[test]
+fn a_body_that_ignores_a_failed_stage_cannot_commit() {
+    use super::Op;
+    for (store, _dir) in stores() {
+        cow_fixture(&store);
+        let bad_ops = [
+            // A duplicate create: `v1` exists.
+            Op::CreateVectorCollection {
+                name: "v1".to_string(),
+                dim: 2,
+                storage: VectorStorage::F32,
+                metric: VectorMetric::L2,
+                m: 4,
+                ef_construction: 8,
+                ef_search: 8,
+            },
+            // An append to a column table that does not exist.
+            Op::AppendColumnGroup {
+                name: "missing".to_string(),
+                bytes: super::columnar::encode_row_group(&columns(), &[row(1, "x")]).unwrap(),
+            },
+        ];
+        for bad in bad_ops {
+            let before = store.read_state().unwrap();
+            let err = store
+                .with_write(|txn| {
+                    txn.put("a", "staged-first", json!(1));
+                    let _ = txn.stage(bad.clone());
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("staged op failed"), "{err}");
+            let after = store.read_state().unwrap();
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "a body that ignored a failed stage replaced the state"
+            );
+            assert_eq!(store.get_doc("a", "staged-first").unwrap(), None);
+        }
+    }
+}
+
 #[test]
 fn a_served_store_copies_only_what_a_client_write_touches() {
     let dir = tempfile::tempdir().unwrap();

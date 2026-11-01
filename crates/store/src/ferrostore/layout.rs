@@ -764,9 +764,21 @@ fn read_metadata(cur: &mut Cur<'_>) -> Result<Option<Value>, StoreError> {
     }
 }
 
+/// Decoded WAL frames: `(seq, ops)` in file order.
+pub(super) type WalFrames = Vec<(u64, Vec<Op>)>;
+
 /// Decode committed WAL bytes. A torn tail is dropped; a bad CRC with a
 /// following complete frame is corruption.
-pub(super) fn decode_wal(buf: &[u8]) -> Result<Vec<(u64, Vec<Op>)>, StoreError> {
+#[cfg(test)]
+pub(super) fn decode_wal(buf: &[u8]) -> Result<WalFrames, StoreError> {
+    Ok(decode_wal_prefix(buf)?.0)
+}
+
+/// [`decode_wal`], and how many bytes of `buf` its frames cover: the end of
+/// the last whole frame. Bytes past it are the torn tail that was dropped.
+/// Decoding from a frame boundary decodes the same frames as decoding the
+/// whole buffer, so a tail can be decoded on its own (spec §4.1).
+pub(super) fn decode_wal_prefix(buf: &[u8]) -> Result<(WalFrames, u64), StoreError> {
     let mut offset = 0usize;
     let mut frames = Vec::new();
     while offset < buf.len() {
@@ -801,7 +813,8 @@ pub(super) fn decode_wal(buf: &[u8]) -> Result<Vec<(u64, Vec<Op>)>, StoreError> 
         frames.push(decode_payload(payload)?);
         offset = payload_end;
     }
-    Ok(frames)
+    let consumed = u64::try_from(offset).map_err(|_| corrupt("wal length exceeds u64"))?;
+    Ok((frames, consumed))
 }
 
 fn frame_fits(buf: &[u8], offset: usize) -> bool {

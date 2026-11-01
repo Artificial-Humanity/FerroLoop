@@ -24,6 +24,8 @@ mod crash_sim;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_cache;
+#[cfg(test)]
 mod tests_cow;
 #[cfg(test)]
 mod tests_crash;
@@ -38,7 +40,7 @@ use fl_core::ids::{GateId, ProjectId};
 pub use layout::Op;
 use layout::{
     HEADER_BYTES, KNOWN_INCOMPAT, SLOT_LEN, SlotRead, Superblock, backend, corrupt,
-    decode_snapshot, decode_wal, encode_frame, encode_snapshot, encode_snapshot_v2,
+    decode_snapshot, decode_wal_prefix, encode_frame, encode_snapshot, encode_snapshot_v2,
     encode_snapshot_v3, encode_superblock, parse_superblock,
 };
 use serde_json::{Value, json};
@@ -156,8 +158,186 @@ enum SeqCommit {
 /// crash harness holds simulated files (`container_io`, `crash_sim`).
 struct Disk {
     write: Mutex<Box<dyn ContainerIo>>,
+    /// `(dev, ino)` of `write`, taken once at open.
+    write_id: (u64, u64),
     /// Separate `O_RDONLY` description. Reads never flock it.
     read: Box<dyn ContainerIo>,
+    /// `(dev, ino)` of `read`, taken once at open.
+    read_id: (u64, u64),
+    /// The last state this handle loaded or committed (spec §4.1). The mutex
+    /// is held only to clone, take or swap the `Arc`, never across file I/O.
+    cache: Mutex<Option<Arc<DiskCache>>>,
+}
+
+/// One loaded state and the superblock it is the state of. Never changed in
+/// place once shared: a refresh or a commit makes the next one.
+#[derive(Clone)]
+struct DiskCache {
+    /// `(dev, ino)` of the description `state` was read or written through.
+    file_id: (u64, u64),
+    sb: Superblock,
+    state: Arc<DocState>,
+    /// WAL bytes, from `sb.wal_offset`, folded into `state`: always the end
+    /// of a whole frame. Equal to `sb.wal_length` unless that WAL ends torn.
+    wal_applied: u64,
+}
+
+impl Disk {
+    /// The current state through `file` (spec §4.1), and the index of the
+    /// slot it was published in. Reads the two slots, then:
+    ///
+    /// - the same file and the same superblock as the cache: the cached
+    ///   state, with no other I/O;
+    /// - the same snapshot extent and WAL offset with a longer WAL: only the
+    ///   new WAL bytes are read and applied, copy-on-write, to the cached
+    ///   state;
+    /// - anything else: a full load of the snapshot and the WAL.
+    ///
+    /// Every byte read lies inside the extents of the one superblock just
+    /// read, so a reader needs no lock: a torn slot read falls back to the
+    /// other, older slot, and gives an older, consistent state. The result
+    /// is never newer than that superblock.
+    fn refresh(
+        &self,
+        file: &dyn ContainerIo,
+        file_id: (u64, u64),
+    ) -> Result<(usize, Arc<DiskCache>), StoreError> {
+        // Spec §5 hook: once compaction can swap the inode under the path,
+        // this also compares `stat(path)` with `file_id` and reopens on a
+        // difference, before the cache is trusted.
+        let cached = lock_mutex(&self.cache).clone();
+        let (index, sb) = latest_superblock(file)?;
+        let fresh = match cached {
+            Some(cached) if cached.file_id == file_id && cached.sb == sb => {
+                return Ok((index, cached));
+            }
+            Some(cached) if cached.file_id == file_id && tail_follows(&cached, &sb) => {
+                // Any doubt about the tail is settled by the full load, which
+                // reports the same error a tail would have, or none.
+                match replay_tail(file, &cached, sb) {
+                    Ok(Some(next)) => next,
+                    Ok(None) | Err(_) => load_full(file, file_id, sb)?,
+                }
+            }
+            _ => load_full(file, file_id, sb)?,
+        };
+        let fresh = Arc::new(fresh);
+        install_newer(&mut lock_mutex(&self.cache), Arc::clone(&fresh));
+        Ok((index, fresh))
+    }
+
+    /// Install the state a commit through `write` just published as
+    /// `new_sb`: `base` (what the commit refreshed to) with `overlay` applied
+    /// at `seq`. Nothing is read back. Called with the write mutex and the
+    /// flock still held, so the next writer in this process starts from it.
+    ///
+    /// When the cache still holds `base`, the entry is taken out under the
+    /// cache mutex and changed in place: with no reader holding its state,
+    /// that is O(ops) (spec §4.2). Readers wait on the mutex for that apply,
+    /// never for I/O, and never see an empty cache.
+    fn install_commit(&self, base: Arc<DiskCache>, new_sb: Superblock, overlay: Overlay, seq: u64) {
+        // The base WAL ended torn (published bytes no full frame covers): the
+        // new frame follows those bytes, so leave the next refresh to load
+        // the file and report it.
+        if base.wal_applied != base.sb.wal_length {
+            return;
+        }
+        let mut slot = lock_mutex(&self.cache);
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
+            *slot = None;
+        }
+        let mut entry = Arc::try_unwrap(base).unwrap_or_else(|shared| (*shared).clone());
+        publish_overlay(&mut entry.state, overlay, seq);
+        entry.file_id = self.write_id;
+        entry.sb = new_sb;
+        entry.wal_applied = new_sb.wal_length;
+        install_newer(&mut slot, Arc::new(entry));
+    }
+
+    /// Install a checkpoint's result: the same state, a new superblock.
+    fn install_checkpoint(&self, base: &DiskCache, new_sb: Superblock) {
+        let entry = DiskCache {
+            file_id: self.write_id,
+            sb: new_sb,
+            state: Arc::clone(&base.state),
+            wal_applied: 0,
+        };
+        install_newer(&mut lock_mutex(&self.cache), Arc::new(entry));
+    }
+}
+
+/// Put `fresh` in the cache unless the cache already holds a state of this
+/// file at the same or a later epoch: a slow refresh never replaces a newer
+/// install. A state of another file always replaces it (spec §5 makes the
+/// newer file the only one a refresh reads).
+fn install_newer(slot: &mut Option<Arc<DiskCache>>, fresh: Arc<DiskCache>) {
+    let replace = match slot.as_ref() {
+        None => true,
+        Some(held) => held.file_id != fresh.file_id || fresh.sb.epoch > held.sb.epoch,
+    };
+    if replace {
+        *slot = Some(fresh);
+    }
+}
+
+/// `sb` is `cached.sb` with only frames appended: the same snapshot, the same
+/// WAL start, a longer WAL, a later epoch, and the cache applied all of its
+/// WAL. A checkpoint (a new snapshot extent), a shorter WAL or anything else
+/// is not a tail.
+fn tail_follows(cached: &DiskCache, sb: &Superblock) -> bool {
+    let held = &cached.sb;
+    cached.wal_applied == held.wal_length
+        && sb.epoch > held.epoch
+        && sb.snapshot_offset == held.snapshot_offset
+        && sb.snapshot_length == held.snapshot_length
+        && sb.snapshot_seq == held.snapshot_seq
+        && sb.wal_offset == held.wal_offset
+        && sb.wal_length > held.wal_length
+}
+
+/// Read `[wal_offset + wal_applied, wal_offset + wal_length)` of `sb`, decode
+/// those frames and apply them, copy-on-write, to the cached state. `None`
+/// when a frame is not the next sequence number: the full load decides.
+fn replay_tail(
+    file: &dyn ContainerIo,
+    cached: &DiskCache,
+    sb: Superblock,
+) -> Result<Option<DiskCache>, StoreError> {
+    let start = sb
+        .wal_offset
+        .checked_add(cached.wal_applied)
+        .ok_or_else(|| corrupt("wal offset overflow"))?;
+    let bytes = read_range(file, start, sb.wal_length - cached.wal_applied)?;
+    let (frames, consumed) = decode_wal_prefix(&bytes)?;
+    let mut state = Arc::clone(&cached.state);
+    for (seq, ops) in frames {
+        if state.last_seq.checked_add(1) != Some(seq) {
+            return Ok(None);
+        }
+        let (overlay, next) = stage_ops(&state, &ops)?;
+        publish_overlay(&mut state, overlay, next);
+    }
+    Ok(Some(DiskCache {
+        file_id: cached.file_id,
+        sb,
+        state,
+        wal_applied: cached.wal_applied + consumed,
+    }))
+}
+
+/// Decode the snapshot and the whole WAL that `sb` names.
+fn load_full(
+    file: &dyn ContainerIo,
+    file_id: (u64, u64),
+    sb: Superblock,
+) -> Result<DiskCache, StoreError> {
+    let (state, wal_applied) = load_state(file, &sb)?;
+    Ok(DiskCache {
+        file_id,
+        sb,
+        state: Arc::new(state),
+        wal_applied,
+    })
 }
 
 /// One transaction: an overlay of pending changes on a shared base state,
@@ -340,7 +520,12 @@ impl FerroStore {
             .open_rw(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
         let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, path))?;
-        let (_, _, state) = read_consistent(&*write).map_err(|err| name_store(err, path))?;
+        let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, path))?;
+        let write_id = write
+            .file_id()
+            .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
+        let seed = load_full(&*write, write_id, sb).map_err(|err| name_store(err, path))?;
+        let state = &seed.state;
         // Also when an earlier open created the file and stopped before its
         // first superblock: the entry is only durable once the directory is.
         if created || initialized {
@@ -355,10 +540,16 @@ impl FerroStore {
         let read = fs
             .open_ro(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
+        let read_id = read
+            .file_id()
+            .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
         Ok(Self::assemble(
             Inner::Disk(Disk {
                 write: Mutex::new(write),
+                write_id,
                 read,
+                read_id,
+                cache: Mutex::new(Some(Arc::new(seed))),
             }),
             path.display().to_string(),
         ))
@@ -1126,12 +1317,15 @@ impl FerroStore {
         body(&txn)
     }
 
-    /// The current state. Memory shares the live `Arc`: a later commit
-    /// replaces it and leaves this one as it was.
+    /// The current state. Memory shares the live `Arc`, and Disk the cached
+    /// one, refreshed without a lock (spec §4.1): a later commit replaces it
+    /// and leaves this one as it was.
     fn read_state(&self) -> Result<Arc<DocState>, StoreError> {
         match &self.inner {
             Inner::Memory(state) => Ok(Arc::clone(&lock_mutex(state))),
-            Inner::Disk(disk) => Ok(Arc::new(read_consistent(&*disk.read)?.2)),
+            Inner::Disk(disk) => Ok(Arc::clone(
+                &disk.refresh(&*disk.read, disk.read_id)?.1.state,
+            )),
             Inner::Remote(remote) => Ok(Arc::new(remote.read_state()?)),
         }
     }
@@ -1218,8 +1412,8 @@ impl FerroStore {
     /// Run `body` in a transaction: an overlay on the current state.
     ///
     /// Memory holds the document mutex for the whole call. Disk takes `LOCK_EX`,
-    /// re-reads a consistent snapshot, then builds the transaction over that
-    /// state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
+    /// refreshes its cached state (spec §4.1: the slots, then only WAL frames
+    /// another handle added), then builds the transaction over that state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
     /// and publishes one superblock. `Err` or an empty op list writes nothing.
     /// A remote handle compare-and-swaps those ops and runs `body` again when
     /// `last_seq` changed. The body may run more than once only on a remote handle.
@@ -1464,7 +1658,8 @@ impl FerroStore {
             Inner::Disk(disk) => {
                 let file = lock_mutex(&disk.write);
                 let _locked = FlockGuard::acquire(file.lock_fd())?;
-                let (index, sb, state) = read_consistent(&**file)?;
+                let (index, base) = disk.refresh(&**file, disk.write_id)?;
+                let state = &base.state;
                 let mut sync = lock_mutex(&self.sync);
                 if !sync.is_idle() {
                     return Ok(state.docs.get(&key.0, &key.1).cloned());
@@ -1477,9 +1672,10 @@ impl FerroStore {
                     id: key.1.clone(),
                     doc: fetched.clone(),
                 };
-                let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
+                let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                append_frame(&**file, index, &sb, &frame)?;
+                let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
+                disk.install_commit(base, new_sb, overlay, seq);
                 if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
                 }
@@ -1548,8 +1744,8 @@ impl FerroStore {
                     let committed = {
                         let file = lock_mutex(&disk.write);
                         let _locked = FlockGuard::acquire(file.lock_fd())?;
-                        let (index, sb, state) = read_consistent(&**file)?;
-                        if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
+                        let (index, base) = disk.refresh(&**file, disk.write_id)?;
+                        if let Some(existing) = base.state.docs.get(&key.0, &key.1).cloned() {
                             return Ok(IfAbsent {
                                 wrote: false,
                                 doc: existing,
@@ -1561,9 +1757,10 @@ impl FerroStore {
                             id: key.1,
                             doc: doc.clone(),
                         };
-                        let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
+                        let (overlay, seq) = stage_ops(&base.state, std::slice::from_ref(&op))?;
                         let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                        append_frame(&**file, index, &sb, &frame)?;
+                        let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
+                        disk.install_commit(base, new_sb, overlay, seq);
                         (seq, op)
                     };
                     (
@@ -1955,13 +2152,15 @@ fn publish_sync_batches(
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
             let _locked = FlockGuard::acquire(file.lock_fd())?;
-            let (index, sb, state) = read_consistent(&**file)?;
-            let (_, seq, prepared) = prepare_sync_batches(&state, batches)?;
+            let (index, base) = disk.refresh(&**file, disk.write_id)?;
+            let (overlay, seq, prepared) = prepare_sync_batches(&base.state, batches)?;
             let mut frames = Vec::with_capacity(prepared.len());
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            publish_frames(&**file, index, &sb, &frames)?;
+            if let Some(new_sb) = publish_frames(&**file, index, &base.sb, &frames)? {
+                disk.install_commit(base, new_sb, overlay, seq);
+            }
             Ok((seq, prepared))
         }
     }
@@ -2033,16 +2232,17 @@ fn file_uri_path(rest: &str) -> String {
 fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<SeqCommit, StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, sb, state) = read_consistent(&**file)?;
-    if state.last_seq != expected_seq {
+    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+    if base.state.last_seq != expected_seq {
         return Ok(SeqCommit::Lost);
     }
     if ops.is_empty() {
         return Ok(SeqCommit::Same);
     }
-    let (_, seq) = stage_ops(&state, ops)?;
+    let (overlay, seq) = stage_ops(&base.state, ops)?;
     let frame = encode_frame(seq, ops)?;
-    append_frame(&**file, index, &sb, &frame)?;
+    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
+    disk.install_commit(base, new_sb, overlay, seq);
     Ok(SeqCommit::Wrote(Committed {
         seq,
         ops: ops.to_vec(),
@@ -2055,13 +2255,13 @@ fn with_write_disk<T>(
 ) -> Result<(T, Option<Committed>), StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, sb, state) = read_consistent(&**file)?;
-    let seq_base = state.last_seq;
-    let mut txn = Txn::new(Arc::new(state));
+    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+    let seq_base = base.state.last_seq;
+    let mut txn = Txn::new(Arc::clone(&base.state));
     let result = body(&mut txn)?;
-    // The overlay was checked op by op as it was staged. It is dropped here:
-    // the next read decodes the file again.
-    let (ops, _) = txn.finish()?;
+    // The overlay was checked op by op as it was staged: once the frame is
+    // published it is applied to the cached state, and nothing is re-read.
+    let (ops, overlay) = txn.finish()?;
     if ops.is_empty() {
         return Ok((result, None));
     }
@@ -2069,7 +2269,8 @@ fn with_write_disk<T>(
         .checked_add(1)
         .ok_or_else(|| backend("transaction sequence overflow"))?;
     let frame = encode_frame(seq, &ops)?;
-    append_frame(&**file, index, &sb, &frame)?;
+    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
+    disk.install_commit(base, new_sb, overlay, seq);
     Ok((result, Some(Committed { seq, ops })))
 }
 
@@ -2079,24 +2280,26 @@ fn commit_disk<T>(
 ) -> Result<(T, Committed), StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, sb, state) = read_consistent(&**file)?;
-    let (op, extra) = build(&state)?;
-    let (_, seq) = stage_ops(&state, std::slice::from_ref(&op))?;
+    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+    let (op, extra) = build(&base.state)?;
+    let (overlay, seq) = stage_ops(&base.state, std::slice::from_ref(&op))?;
     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-    append_frame(&**file, index, &sb, &frame)?;
+    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
+    disk.install_commit(base, new_sb, overlay, seq);
     Ok((extra, Committed { seq, ops: vec![op] }))
 }
 
-/// Write every frame at the current WAL end, then publish one superblock.
+/// Write every frame at the current WAL end, then publish one superblock,
+/// which is returned. No frames: nothing is written and `None`.
 /// A failure before `write_slot` leaves the previous superblock current.
 fn publish_frames(
     file: &dyn ContainerIo,
     index: usize,
     sb: &Superblock,
     frames: &[Vec<u8>],
-) -> Result<(), StoreError> {
+) -> Result<Option<Superblock>, StoreError> {
     if frames.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut bytes = Vec::new();
     for frame in frames {
@@ -2130,13 +2333,14 @@ fn publish_frames(
     };
     write_slot(file, index ^ 1, &new_sb)?;
     file.sync_all().map_err(io_err)?;
-    Ok(())
+    Ok(Some(new_sb))
 }
 
 fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, sb, state) = read_consistent(&**file)?;
+    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+    let (sb, state) = (base.sb, &*base.state);
     let blob = if !state.vectors.is_empty() {
         encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
     } else if state.tables.is_empty() {
@@ -2163,6 +2367,7 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     };
     write_slot(&**file, index ^ 1, &new_sb)?;
     file.sync_all().map_err(io_err)?;
+    disk.install_checkpoint(&base, new_sb);
     Ok(())
 }
 
@@ -2302,7 +2507,7 @@ fn name_store(err: StoreError, path: &Path) -> StoreError {
 // an `init_empty` cut short: every header byte present is zero, and the bytes
 // after the header are none, or a prefix (up to all) of the snapshot
 // `init_empty` writes. Any other file is not rewritten: it could hold real
-// data, and `read_consistent` reports it. `true` when this call ran
+// data, and the load in `open` reports it. `true` when this call ran
 // `init_empty`.
 fn ensure_superblock(file: &dyn ContainerIo) -> Result<bool, StoreError> {
     if parsed_superblock(file)?.is_some() {
@@ -2343,8 +2548,17 @@ fn ensure_superblock(file: &dyn ContainerIo) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// The live slot and the state it names, decoded in full. The engine goes
+/// through [`Disk::refresh`]; tests use this to read a file afresh.
+#[cfg(test)]
 fn read_consistent(file: &dyn ContainerIo) -> Result<(usize, Superblock, DocState), StoreError> {
     let (index, sb) = latest_superblock(file)?;
+    Ok((index, sb, load_state(file, &sb)?.0))
+}
+
+/// The state `sb` names: its snapshot, then its whole WAL replayed. Also the
+/// WAL bytes the replayed frames cover (see [`DiskCache::wal_applied`]).
+fn load_state(file: &dyn ContainerIo, sb: &Superblock) -> Result<(DocState, u64), StoreError> {
     let mut state = if sb.snapshot_length == 0 {
         DocState::at_seq(sb.snapshot_seq)
     } else {
@@ -2361,9 +2575,9 @@ fn read_consistent(file: &dyn ContainerIo) -> Result<(usize, Superblock, DocStat
         }
     };
     let wal = read_range(file, sb.wal_offset, sb.wal_length)?;
-    let frames = decode_wal(&wal)?;
+    let (frames, consumed) = decode_wal_prefix(&wal)?;
     apply_frames(&mut state, sb.snapshot_seq, &frames)?;
-    Ok((index, sb, state))
+    Ok((state, consumed))
 }
 
 fn parsed_superblock(file: &dyn ContainerIo) -> Result<Option<(usize, Superblock)>, StoreError> {
