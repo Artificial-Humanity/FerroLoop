@@ -1431,36 +1431,60 @@ describe("Resizable chat composer (Record 57)", () => {
 
     const bar = screen.getByTestId("since-last-prompt-bar");
     expect(bar).toBeInTheDocument();
-    expect(screen.getByTestId("since-last-prompt-text")).toHaveTextContent(
+    expect(bar).not.toHaveTextContent(/Your last message/i);
+    expect(bar).not.toHaveTextContent(/Jump to prompt/i);
+    const promptTextEl = screen.getByTestId("since-last-prompt-text");
+    expect(promptTextEl).toHaveTextContent(
       "Update SettingsModal.tsx with the 3-tab layout and run UI tests.",
     );
 
     const counts = screen.getByTestId("since-last-prompt-counts");
-    expect(counts).toHaveTextContent("1 reply");
-    expect(counts).toHaveTextContent("2 tool calls");
+    const repliesBtn = screen.getByTestId("since-last-prompt-replies-btn");
+    const toolsBtn = screen.getByTestId("since-last-prompt-tools-btn");
+    const wireBtn = screen.getByTestId("since-last-prompt-wire-btn");
+    expect(repliesBtn).toHaveTextContent("1 reply");
+    expect(toolsBtn).toHaveTextContent("2 tool calls");
+    expect(toolsBtn).not.toHaveTextContent(/run_command/i);
     expect(counts).toHaveTextContent("1 file touched");
-    expect(counts).toHaveTextContent("1 wire");
+    expect(wireBtn).toHaveTextContent("1 wire");
 
     // Collapsed by default
     const toggle = screen.getByTestId("since-last-prompt-toggle");
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("since-last-prompt-details")).toBeNull();
 
-    // Expand details
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    const details = screen.getByTestId("since-last-prompt-details");
-    expect(details).toBeInTheDocument();
+    // Clicking "1 reply" opens details filtered ONLY to replies
+    fireEvent.click(repliesBtn);
+    expect(screen.getByTestId("since-last-prompt-details")).toBeInTheDocument();
+    expect(screen.getByTestId("since-last-prompt-step-reply-11")).toBeInTheDocument();
+    expect(screen.queryByTestId("since-last-prompt-step-tool-11-1")).toBeNull();
+    expect(screen.queryByTestId("since-last-prompt-step-wire-12")).toBeNull();
+
+    // Clicking "1 reply" again collapses details
+    fireEvent.click(repliesBtn);
+    expect(screen.queryByTestId("since-last-prompt-details")).toBeNull();
+
+    // Clicking "2 tool calls" opens details filtered ONLY to tool/file steps
+    fireEvent.click(toolsBtn);
+    expect(screen.getByTestId("since-last-prompt-details")).toBeInTheDocument();
+    expect(screen.getByTestId("since-last-prompt-step-file-11-0")).toBeInTheDocument();
+    expect(screen.getByTestId("since-last-prompt-step-tool-11-1")).toBeInTheDocument();
+    expect(screen.queryByTestId("since-last-prompt-step-reply-11")).toBeNull();
     expect(
       screen.getByTestId("since-last-prompt-file-SettingsModal.tsx"),
     ).toBeInTheDocument();
 
-    // Clicking "↑ Jump to prompt" scrolls turn-card-10 into view
+    // Clicking "1 wire" switches details filter ONLY to wire items
+    fireEvent.click(wireBtn);
+    expect(screen.getByTestId("since-last-prompt-step-wire-12")).toBeInTheDocument();
+    expect(screen.queryByTestId("since-last-prompt-step-tool-11-1")).toBeNull();
+
+    // Clicking the amber prompt text (since-last-prompt-text / since-last-prompt-jump-btn) scrolls turn-card-10 into view
     const promptCard = screen.getByTestId("turn-card-10");
     const scrollIntoViewMock = vi.fn();
     promptCard.scrollIntoView = scrollIntoViewMock;
 
-    fireEvent.click(screen.getByTestId("since-last-prompt-jump-btn"));
+    fireEvent.click(screen.getByTestId("since-last-prompt-text"));
     expect(scrollIntoViewMock).toHaveBeenCalledWith({
       behavior: "smooth",
       block: "center",

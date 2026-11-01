@@ -477,6 +477,9 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
     expect(screen.getByTestId("settings-project-summary-name")).toHaveTextContent("FerroLoop");
     expect(screen.getByTestId("settings-project-summary-lead")).toHaveTextContent("Lead: Ferris");
+    expect(screen.getByTestId("session-cwd-badge")).toHaveTextContent(
+      "~/Projects/Artificial-Humanity/FerroLoop",
+    );
     expect(screen.getByTestId("project-pin-toggle-btn")).toHaveTextContent("📌 Pin Project");
     expect(screen.getByTestId("bulk-action-prepare-btn")).toBeInTheDocument();
     expect(screen.getByTestId("bulk-action-teardown-btn")).toBeInTheDocument();

@@ -78,14 +78,12 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(agentNav).getByRole("tab", { name: /^Wire Mail$/i })).toBeInTheDocument();
     expect(within(agentNav).queryByTestId("header-agent-settings-btn")).toBeNull();
 
-    // Tier 2: Project Context
+    // Tier 2: Project Context (session-cwd-badge moved into Project Settings summary card)
     const projectNav = within(tabBar).getByTestId("tier-project-nav");
     expect(within(projectNav).getByTestId("active-project-badge")).toHaveTextContent(
       "FerroLoop",
     );
-    expect(within(projectNav).getByTestId("session-cwd-badge")).toHaveTextContent(
-      "/tmp/felix-three-tier-navigation",
-    );
+    expect(within(projectNav).queryByTestId("session-cwd-badge")).toBeNull();
     expect(within(projectNav).getByRole("tab", { name: /^Artifacts$/i })).toBeInTheDocument();
     expect(within(projectNav).getByRole("tab", { name: /^Git & PRs$/i })).toBeInTheDocument();
     expect(

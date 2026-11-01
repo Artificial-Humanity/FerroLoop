@@ -1148,6 +1148,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <span className="fd-badge fd-mono" data-testid="settings-project-summary-lead">
                       Lead: {projectSummaryLead}
                     </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="session-cwd-badge"
+                      title={`~/Projects/Artificial-Humanity/${selectedProjectFilter}`}
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      ~/Projects/Artificial-Humanity/{selectedProjectFilter}
+                    </span>
                     <span className="fd-badge fd-mono">
                       {filteredAgents.length} {filteredAgents.length === 1 ? "agent" : "agents"}
                     </span>

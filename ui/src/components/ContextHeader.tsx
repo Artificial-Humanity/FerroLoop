@@ -132,10 +132,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
     return "Scope: System · AI-Lab-0";
   }, [activeTier, selectedAgent]);
 
-  const resolvedCwd =
-    activeSession?.cwd ||
-    (selectedAgent?.project ? `~/Projects/Artificial-Humanity/${selectedAgent.project}` : "~/workspace");
-
   const authorityText = React.useMemo(() => {
     if (!authority) return "Unauthenticated";
     if (authority.tier === "owner") {
@@ -296,21 +292,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             title={selectedAgent?.project ? `Project: ${selectedAgent.project}` : "Workspace"}
           >
             {selectedAgent?.project ?? "Workspace"}
-          </span>
-
-          <span
-            className="fd-badge fd-mono"
-            title={resolvedCwd}
-            data-testid="session-cwd-badge"
-            style={{
-              color: "var(--text-muted)",
-              maxWidth: "220px",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {resolvedCwd}
           </span>
 
           <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
