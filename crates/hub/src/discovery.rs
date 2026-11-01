@@ -470,7 +470,7 @@ const AGY_TRAJECTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
 const AGY_STEPS_TAIL_MARGIN: u64 = 10;
 /// Newest bytes of an Antigravity transcript scanned for the last `step_index`.
 const AGY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
-const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
+const AGY_CACHE_TTL: Duration = Duration::from_secs(5);
 /// A failed or empty lookup is cached briefly so a dead server costs one attempt, not one per poll.
 const AGY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 const AGY_CACHE_MAX_ENTRIES: usize = 256;
@@ -967,28 +967,184 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Latest `message.model` (or top-level `model`) in Claude transcript JSONL. Claude Code's
-/// `<synthetic>` placeholder is not a model name and is skipped.
-fn latest_claude_transcript_model(jsonl: &str) -> Option<String> {
-    jsonl.lines().rev().find_map(|line| {
-        let val: Value = serde_json::from_str(line.trim()).ok()?;
-        plain_bounded_str(val.pointer("/message/model"), MODEL_ID_MAX_CHARS)
-            .or_else(|| plain_bounded_str(val.get("model"), MODEL_ID_MAX_CHARS))
-            .filter(|model| !model.starts_with('<'))
-    })
+/// Canonical Claude model id for a `/model` display name (`Opus 5.5`), a `settings.json`
+/// shorthand (`opus`) or a dated id (`claude-sonnet-5-5-20261001`), compared case-insensitively.
+/// A bare family name means that family's current model. Any other id passes through unchanged.
+fn normalize_claude_model(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for id in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-haiku-4-5",
+    ] {
+        if lower == id
+            || lower
+                .strip_prefix(id)
+                .is_some_and(|rest| rest.starts_with('-'))
+        {
+            return id.to_string();
+        }
+    }
+    let mut words = lower.split_whitespace();
+    let (Some(family), version) = (words.next(), words.next()) else {
+        return trimmed.to_string();
+    };
+    let current = match family {
+        "opus" | "sonnet" => "5-5",
+        "haiku" => "4-5",
+        _ => return trimmed.to_string(),
+    };
+    let version = match version {
+        None => current.to_string(),
+        Some(v) => match v.split_once('.') {
+            Some((major, minor))
+                if !major.is_empty()
+                    && !minor.is_empty()
+                    && major
+                        .bytes()
+                        .chain(minor.bytes())
+                        .all(|b| b.is_ascii_digit()) =>
+            {
+                format!("{major}-{minor}")
+            }
+            _ => return trimmed.to_string(),
+        },
+    };
+    format!("claude-{family}-{version}")
 }
 
+/// The model and effort a `/model` command left in a transcript line:
+/// ``<local-command-stdout>Set model to `Opus 5.5` ... with `high` effort</local-command-stdout>``.
+/// Only a genuine user turn whose whole text is that local-command output counts, so a prompt
+/// that merely quotes the sentence, or an API-request blob that embeds one, is not a model change.
+fn claude_model_command(val: &Value) -> Option<(String, Option<String>)> {
+    if val.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let content = val.pointer("/message/content")?;
+    let text = match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                (b.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| b.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => return None,
+    };
+    let inner = text
+        .trim()
+        .strip_prefix("<local-command-stdout>")?
+        .strip_suffix("</local-command-stdout>")?;
+    let rest = inner.trim().strip_prefix("Set model to `")?;
+    let (name, after) = rest.split_once('`')?;
+    let name = plain_bounded_str(Some(&Value::String(name.to_string())), MODEL_ID_MAX_CHARS)?;
+    let effort = after
+        .split_once("with `")
+        .and_then(|(_, tail)| tail.split_once("` effort"))
+        .and_then(|(level, _)| {
+            plain_bounded_str(
+                Some(&Value::String(level.to_string())),
+                CODEX_EFFORT_MAX_CHARS,
+            )
+        });
+    Some((normalize_claude_model(&name), effort))
+}
+
+/// The newest model signal in Claude transcript JSONL: a `/model` command's `Set model to`
+/// output or an assistant turn's `message.model` (or top-level `model`), whichever is last in the
+/// file. The effort is the newest `/model` command's, when that command names the same model.
+/// Claude Code's `<synthetic>` placeholder is not a model name and is skipped.
+fn latest_claude_transcript_signal(jsonl: &str) -> Option<(String, Option<String>)> {
+    let mut winner: Option<String> = None;
+    for line in jsonl.lines().rev() {
+        let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some((model, effort)) = claude_model_command(&val) {
+            return match &winner {
+                // An assistant turn after the command names the model in use now.
+                Some(w) if *w != model => Some((w.clone(), None)),
+                _ => Some((model, effort)),
+            };
+        }
+        if winner.is_none()
+            && let Some(model) =
+                plain_bounded_str(val.pointer("/message/model"), MODEL_ID_MAX_CHARS)
+                    .or_else(|| plain_bounded_str(val.get("model"), MODEL_ID_MAX_CHARS))
+                    .filter(|model| !model.starts_with('<'))
+        {
+            winner = Some(normalize_claude_model(&model));
+        }
+    }
+    winner.map(|model| (model, None))
+}
+
+/// Latest model named in Claude transcript JSONL (see [`latest_claude_transcript_signal`]).
+#[cfg(test)]
+fn latest_claude_transcript_model(jsonl: &str) -> Option<String> {
+    latest_claude_transcript_signal(jsonl).map(|(model, _)| model)
+}
+
+/// `~/.claude/settings.json` `model` (normalized) and its effort: `effortLevel`, else
+/// `modelSettings.<model>.effortLevel`.
+fn claude_settings_model(settings: &Value) -> (Option<String>, Option<String>) {
+    let raw = plain_bounded_str(settings.get("model"), MODEL_ID_MAX_CHARS);
+    let model = raw.as_deref().map(normalize_claude_model);
+    let effort =
+        plain_bounded_str(settings.get("effortLevel"), CODEX_EFFORT_MAX_CHARS).or_else(|| {
+            [raw.as_deref(), model.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|key| {
+                    plain_bounded_str(
+                        settings.pointer(&format!("/modelSettings/{key}/effortLevel")),
+                        CODEX_EFFORT_MAX_CHARS,
+                    )
+                })
+        });
+    (model, effort)
+}
+
+fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// A Claude session's model and effort. The transcript names the session's own model (a turn's
+/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` wins
+/// when it was written after the transcript: a model changed in the Claude app or in that file
+/// shows at once, before any new transcript line exists. Without a transcript signal,
+/// `settings.json` supplies the model.
 fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
-    let from_transcript = transcript_path
-        .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
-        .and_then(|tail| latest_claude_transcript_model(&tail));
-    let model = from_transcript.or_else(|| {
-        let settings = read_json_file(&home?.join(".claude").join("settings.json"))?;
-        plain_bounded_str(settings.get("model"), MODEL_ID_MAX_CHARS)
-    });
+    let transcript = transcript_path.map(Path::new);
+    let from_transcript = transcript
+        .and_then(|p| read_file_tail(p, CLAUDE_TRANSCRIPT_TAIL_BYTES))
+        .and_then(|tail| latest_claude_transcript_signal(&tail));
+    let settings_path = home.map(|h| h.join(".claude").join("settings.json"));
+    let (settings_model, settings_effort) = settings_path
+        .as_deref()
+        .and_then(read_json_file)
+        .map_or((None, None), |v| claude_settings_model(&v));
+    let settings_newer = match (
+        settings_path.as_deref().and_then(file_mtime),
+        transcript.and_then(file_mtime),
+    ) {
+        (Some(settings), Some(transcript)) => settings > transcript,
+        _ => false,
+    };
+    let (model, thinking_level) = match from_transcript {
+        Some(_) if settings_newer && settings_model.is_some() => (settings_model, settings_effort),
+        Some((model, effort)) => (Some(model), effort.or(settings_effort)),
+        None => (settings_model, settings_effort),
+    };
     SessionModelInfo {
         model,
-        thinking_level: None,
+        thinking_level,
         available_models: owned_strings(&CLAUDE_MODELS),
     }
 }
@@ -4867,7 +5023,7 @@ mod tests {
         fs::write(claude.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
         assert_eq!(
             claude_model_info(None, Some(tmp.path())).model.as_deref(),
-            Some("sonnet")
+            Some("claude-sonnet-5-5")
         );
     }
 
@@ -4886,12 +5042,16 @@ mod tests {
             "not json at all",
         ]
         .join("\n");
-        fs::write(project.join(format!("{session_id}.jsonl")), transcript).unwrap();
+        let transcript_file = project.join(format!("{session_id}.jsonl"));
+        fs::write(&transcript_file, transcript).unwrap();
         fs::write(
             home.join(".claude").join("settings.json"),
             r#"{"model":"sonnet"}"#,
         )
         .unwrap();
+        // The transcript is the newer file, so its own model wins over settings.json.
+        set_mtime_secs(&home.join(".claude").join("settings.json"), 1_000);
+        set_mtime_secs(&transcript_file, 2_000);
         write_routes(
             home,
             &[(
@@ -4911,7 +5071,7 @@ mod tests {
 
         // No transcript entry names a model: settings.json supplies it.
         let info = claude_model_info(None, Some(home));
-        assert_eq!(info.model.as_deref(), Some("sonnet"));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
         assert_eq!(info.available_models, strings(&CLAUDE_MODELS));
 
         // Malformed or missing settings never fail the lookup.
@@ -4923,6 +5083,215 @@ mod tests {
             claude_model_info(Some("/definitely/missing.jsonl"), None).available_models,
             strings(&CLAUDE_MODELS)
         );
+    }
+
+    /// Set a file's modification time to `secs` after the Unix epoch.
+    fn set_mtime_secs(path: &Path, secs: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn assistant_line(model: &str) -> String {
+        serde_json::json!({"type":"assistant","message":{"role":"assistant","model":model}})
+            .to_string()
+    }
+
+    fn model_command_line(content: Value) -> String {
+        serde_json::json!({"type":"user","message":{"role":"user","content":content}}).to_string()
+    }
+
+    const OPUS_HIGH: &str = "<local-command-stdout>Set model to `Opus 5.5` and saved as your \
+        default for new sessions with `high` effort</local-command-stdout>";
+
+    #[test]
+    fn claude_model_command_output_overrides_an_earlier_assistant_turn() {
+        // String content and an array of text blocks both carry the command output.
+        for content in [
+            Value::String(OPUS_HIGH.to_string()),
+            serde_json::json!([{"type":"text","text": OPUS_HIGH}]),
+        ] {
+            let transcript = [
+                assistant_line("claude-sonnet-5-5"),
+                model_command_line(content),
+            ]
+            .join("\n");
+            assert_eq!(
+                latest_claude_transcript_signal(&transcript),
+                Some(("claude-opus-5-5".to_string(), Some("high".to_string())))
+            );
+        }
+        // Without the effort suffix there is no effort.
+        let plain = model_command_line(Value::String(
+            "<local-command-stdout>Set model to `Sonnet 5.5` and saved as your default for new \
+             sessions</local-command-stdout>"
+                .to_string(),
+        ));
+        assert_eq!(
+            latest_claude_transcript_signal(&[assistant_line("claude-opus-5-5"), plain].join("\n")),
+            Some(("claude-sonnet-5-5".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn claude_assistant_turn_after_a_model_command_wins_and_keeps_only_a_matching_effort() {
+        let command = model_command_line(Value::String(OPUS_HIGH.to_string()));
+        // A later turn on another model (the command was session-only and did not apply yet).
+        let later_other = [command.clone(), assistant_line("claude-sonnet-5-5")].join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&later_other),
+            Some(("claude-sonnet-5-5".to_string(), None))
+        );
+        // A later turn on the commanded model, named by its dated id, keeps the effort.
+        let later_same = [command, assistant_line("claude-opus-5-5-20261001")].join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&later_same),
+            Some(("claude-opus-5-5".to_string(), Some("high".to_string())))
+        );
+    }
+
+    #[test]
+    fn claude_model_command_text_that_is_not_a_command_turn_is_ignored() {
+        let quoted = model_command_line(Value::String(format!("please explain: {OPUS_HIGH}")));
+        let blob = serde_json::json!({
+            "type":"api-request-blob",
+            "message":{"role":"user","content":OPUS_HIGH},
+        })
+        .to_string();
+        let assistant_quote = serde_json::json!({
+            "type":"assistant",
+            "message":{"role":"assistant","content":OPUS_HIGH},
+        })
+        .to_string();
+        let transcript = [
+            assistant_line("claude-sonnet-5-5"),
+            quoted,
+            blob,
+            assistant_quote,
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_signal(&transcript),
+            Some(("claude-sonnet-5-5".to_string(), None))
+        );
+        // An unquoted or oversized name is not a model either.
+        let bad = model_command_line(Value::String(format!(
+            "<local-command-stdout>Set model to `{}`</local-command-stdout>",
+            "m".repeat(MODEL_ID_MAX_CHARS + 1)
+        )));
+        assert_eq!(latest_claude_transcript_signal(&bad), None);
+    }
+
+    #[test]
+    fn claude_model_names_and_shorthands_normalize_to_canonical_ids() {
+        for (raw, want) in [
+            ("opus", "claude-opus-5-5"),
+            ("Opus 5.5", "claude-opus-5-5"),
+            ("OPUS", "claude-opus-5-5"),
+            ("claude-opus-5-5", "claude-opus-5-5"),
+            ("claude-opus-5-5-20261001", "claude-opus-5-5"),
+            ("sonnet", "claude-sonnet-5-5"),
+            ("Sonnet 5.5", "claude-sonnet-5-5"),
+            ("claude-sonnet-5-5-20261001", "claude-sonnet-5-5"),
+            ("haiku", "claude-haiku-4-5"),
+            ("Haiku 4.5", "claude-haiku-4-5"),
+            ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+            // A different real model is not folded into the current one.
+            ("Haiku 5.5", "claude-haiku-5-5"),
+            ("claude-haiku-5-5", "claude-haiku-5-5"),
+            ("Opus 4.1", "claude-opus-4-1"),
+            ("claude-opus-4-1", "claude-opus-4-1"),
+            // Anything else passes through unchanged.
+            ("some-other-model", "some-other-model"),
+            ("opus-custom", "opus-custom"),
+            ("Opus banana", "Opus banana"),
+        ] {
+            assert_eq!(normalize_claude_model(raw), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn claude_settings_json_wins_only_when_newer_than_the_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let transcript = home.join("t.jsonl");
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        let tp = transcript.to_str().unwrap();
+
+        // settings.json older than the transcript: the session's own model.
+        fs::write(&settings, r#"{"model":"opus","effortLevel":"low"}"#).unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        // The effort has no transcript source here, so settings supplies it.
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+
+        // settings.json written afterwards (the Claude app or an edit): it wins at once.
+        set_mtime_secs(&settings, 3_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+
+        // A newer settings.json with no usable model does not erase the transcript's.
+        fs::write(&settings, r#"{"effortLevel":"low"}"#).unwrap();
+        set_mtime_secs(&settings, 4_000);
+        assert_eq!(
+            claude_model_info(Some(tp), Some(home)).model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
+    fn claude_effort_comes_from_the_model_command_then_settings() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let transcript = home.join("t.jsonl");
+        fs::write(
+            &transcript,
+            [
+                assistant_line("claude-sonnet-5-5"),
+                model_command_line(Value::String(OPUS_HIGH.to_string())),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(&settings, r#"{"model":"sonnet","effortLevel":"low"}"#).unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let tp = transcript.to_str().unwrap();
+        // The newer `/model` output beats both the older assistant turn and settings.json.
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+
+        // Per-model effort in settings.json, by shorthand or canonical id.
+        for key in ["opus", "claude-opus-5-5"] {
+            fs::write(
+                &settings,
+                format!(
+                    r#"{{"model":"opus","modelSettings":{{"{key}":{{"effortLevel":"medium"}}}}}}"#
+                ),
+            )
+            .unwrap();
+            let info = claude_model_info(None, Some(home));
+            assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"), "{key}");
+            assert_eq!(info.thinking_level.as_deref(), Some("medium"), "{key}");
+        }
+        // An over-long or control-character effort is dropped.
+        fs::write(&settings, r#"{"model":"opus","effortLevel":"bad\u0007"}"#).unwrap();
+        assert_eq!(claude_model_info(None, Some(home)).thinking_level, None);
+    }
+
+    #[test]
+    fn antigravity_model_cache_refreshes_within_five_seconds() {
+        assert_eq!(AGY_CACHE_TTL, Duration::from_secs(5));
     }
 
     #[test]
