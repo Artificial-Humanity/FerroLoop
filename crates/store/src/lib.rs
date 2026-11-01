@@ -548,6 +548,27 @@ fn frozen_by_migration(path: &Path, err: &redb::DatabaseError) -> Option<String>
     ))
 }
 
+/// A shared lock on a redb file, held while this value lives. It reads the file
+/// and writes nothing: the file may be 0400, and its bytes and mtime stay as
+/// they are (opening a [`RedbStore`] rewrites internal pages). It is refused
+/// while any process holds the file open for write, as a [`RedbStore`] open
+/// does, so [`is_redb_busy`] recognises that refusal. A caller that copies the
+/// file holds this across the copy and gets a copy no writer is changing.
+pub struct RedbSharedLock {
+    _db: redb::ReadOnlyDatabase,
+}
+
+impl RedbSharedLock {
+    pub fn acquire(path: &Path) -> Result<Self, StoreError> {
+        redb::ReadOnlyDatabase::open(path)
+            .map(|db| Self { _db: db })
+            .map_err(|e| StoreError::Unreachable {
+                store: path.display().to_string(),
+                cause: e.to_string(),
+            })
+    }
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_retries(path, 200)

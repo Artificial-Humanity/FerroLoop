@@ -1069,6 +1069,30 @@ mod tests {
         assert_eq!(mode(&redb), 0o600, "the redb stays writable");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_lock_reads_a_read_only_redb_without_touching_it_and_sees_a_holder() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let holder = RedbStore::open(&redb).unwrap();
+        let err = crate::RedbSharedLock::acquire(&redb)
+            .err()
+            .expect("a writer holds it");
+        assert!(is_redb_busy(&err), "{err}");
+        drop(holder);
+
+        std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let bytes = std::fs::read(&redb).unwrap();
+        let mtime = std::fs::metadata(&redb).unwrap().modified().unwrap();
+        let lock = crate::RedbSharedLock::acquire(&redb).unwrap();
+        // Shared: a second reader is fine.
+        drop(crate::RedbSharedLock::acquire(&redb).unwrap());
+        drop(lock);
+        assert_eq!(std::fs::read(&redb).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&redb).unwrap().modified().unwrap(), mtime);
+    }
+
     #[test]
     fn the_busy_error_is_classified_by_cause() {
         let busy = |cause: &str| StoreError::Unreachable {

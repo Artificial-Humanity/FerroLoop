@@ -1,4 +1,5 @@
-//! `fl store status` and `fl store checkpoint`, black box, on both engines.
+//! `fl store status`, `checkpoint`, `migrate` and `verify`, black box, on both
+//! engines.
 //!
 //! Every run gets private HOME, XDG and `$FL_DB` so nothing reads the
 //! developer's own stores, and none of these commands may create a store.
@@ -466,4 +467,394 @@ fn ferro_treats_a_redb_and_an_fls_alias_of_one_store_as_one_candidate() {
         .args(["gate", "show", &iri])
         .assert()
         .success();
+}
+
+// ---- fl store migrate / verify, and auto-migration ----
+
+/// A git repo to register, so `project add` accepts it.
+fn git_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "t@example.com"],
+        &["config", "user.name", "t"],
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    repo
+}
+
+/// A redb store with a project and a gate in it, made with the CLI.
+fn populate_redb(env: &Env, repo: &Path) {
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "add", repo.to_str().unwrap()])
+        .assert()
+        .success();
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn json_of(out: &std::process::Output) -> Value {
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+#[test]
+fn migrate_dry_run_then_migrate_then_verify_then_refuse_a_second_migration() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let before = snapshot(&[env.stores.path()]);
+
+    // Dry run: reports a clean migration, writes no real file, and its private
+    // copy is gone afterwards.
+    let out = env
+        .fl()
+        .env("TMPDIR", scratch.path())
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["clean"], true);
+    assert_eq!(v["fls"], Value::Null);
+    assert_eq!(v["redb_kept_read_only"], false);
+    let projects = v["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "projects")
+        .expect("a projects row");
+    assert_eq!(projects["redb_rows"], 1);
+    assert_eq!(projects["ferro_rows"], 1);
+    assert_eq!(
+        before,
+        snapshot(&[env.stores.path()]),
+        "the dry run wrote a real file"
+    );
+    assert!(
+        std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "the private copy was not deleted"
+    );
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+
+    // The real migration.
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate"])
+        .assert()
+        .success()
+        .stdout(contains("projects"))
+        .stdout(contains("clean:"))
+        .stdout(contains("read-only (0400)"));
+    assert_eq!(
+        env.files(),
+        vec!["fl.fls".to_string(), "fl.redb".to_string()]
+    );
+    assert_eq!(mode(&env.physical_ferro()), 0o600);
+    assert_eq!(mode(&env.logical()), 0o400);
+
+    // The pair verifies, and verify leaves the read-only redb as it is.
+    let pair = snapshot(&[env.stores.path()]);
+    let out = env
+        .fl()
+        .env("TMPDIR", scratch.path())
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["clean"], true);
+    assert_eq!(v["mismatches"].as_array().unwrap().len(), 0);
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify"])
+        .assert()
+        .success()
+        .stdout(contains("every table and view matches"));
+    assert!(std::fs::read_dir(scratch.path()).unwrap().next().is_none());
+    // Opening the FerroStore may fold its log, so only the redb is compared.
+    let after = snapshot(&[env.stores.path()]);
+    let redb = |t: &[Entry]| t.iter().find(|e| e.0 == env.logical()).cloned();
+    assert_eq!(redb(&pair), redb(&after), "verify touched the redb");
+    assert_eq!(mode(&env.logical()), 0o400);
+
+    // A second migration is refused and changes nothing.
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+    assert_eq!(redb(&pair), redb(&snapshot(&[env.stores.path()])));
+}
+
+#[test]
+fn verify_exits_1_and_names_the_table_when_the_pair_differs() {
+    use fl_core::Catalog;
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate"])
+        .assert()
+        .success();
+    {
+        let ferro = fl_store::open_store_with(
+            &env.logical(),
+            &StoreOptions {
+                backend: Some(BackendKind::Ferro),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        ferro.add_project("/only/in/ferro").unwrap();
+    }
+    let out = env
+        .fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_of(&out);
+    assert_eq!(v["clean"], false);
+    assert!(
+        v["mismatches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "projects"),
+        "{v}"
+    );
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify"])
+        .assert()
+        .code(1)
+        .stdout(contains("MISMATCH"))
+        .stderr(contains("mismatches:"));
+}
+
+#[test]
+fn migrate_and_verify_refuse_what_they_cannot_do_and_create_nothing() {
+    let env = Env::new();
+    for args in [
+        &["store", "migrate"][..],
+        &["store", "migrate", "--dry-run"],
+        &["store", "verify"],
+    ] {
+        // No store at all.
+        env.fl()
+            .arg("--db")
+            .arg(env.logical())
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("no redb store at"));
+        assert!(env.files().is_empty(), "{args:?}: {:?}", env.files());
+        // An explicit .fls path names no redb.
+        env.fl()
+            .arg("--db")
+            .arg(env.physical_ferro())
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("names a .fls file"));
+        assert!(env.files().is_empty(), "{args:?}: {:?}", env.files());
+    }
+
+    // verify needs both files.
+    open_with(&env.logical(), BackendKind::Redb);
+    let before = snapshot(&[env.stores.path()]);
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify"])
+        .assert()
+        .failure()
+        .stderr(contains("no FerroStore at"));
+    assert_eq!(before, snapshot(&[env.stores.path()]));
+    std::fs::remove_file(env.logical()).unwrap();
+    open_with(&env.logical(), BackendKind::Ferro);
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "verify"])
+        .assert()
+        .failure()
+        .stderr(contains("no redb store at"));
+}
+
+#[test]
+fn migrate_and_verify_refuse_a_redb_another_process_holds() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    // The test process is "another process" to the CLI: redb's file lock is
+    // exclusive across processes.
+    let holder = fl_store::open_redb(&env.logical()).unwrap();
+    let before = snapshot(&[env.stores.path()]);
+    for args in [
+        &["store", "migrate"][..],
+        &["store", "migrate", "--dry-run"],
+    ] {
+        env.fl()
+            .arg("--db")
+            .arg(env.logical())
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(contains("held by another process"));
+    }
+    assert_eq!(before, snapshot(&[env.stores.path()]));
+    drop(holder);
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn an_ordinary_ferro_command_migrates_a_redb_only_home() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains(repo.path().to_str().unwrap()));
+    assert_eq!(
+        env.files(),
+        vec!["fl.fls".to_string(), "fl.redb".to_string()]
+    );
+    assert_eq!(mode(&env.physical_ferro()), 0o600);
+    assert_eq!(mode(&env.logical()), 0o400);
+
+    // Later ferro commands read the .fls; nothing migrates again.
+    let fls = std::fs::metadata(env.physical_ferro()).unwrap();
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["gate", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("g"));
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fls),
+        std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(env.physical_ferro()).unwrap())
+    );
+
+    // The redb engine now meets a read-only file. Unless the tests run as
+    // root (which ignores the mode), it cannot open it for write and says so,
+    // rather than reading a store that has moved on.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(env.logical())
+        .is_err()
+    {
+        env.fl()
+            .arg("--db")
+            .arg(env.logical())
+            .args(["project", "list"])
+            .assert()
+            .failure();
+        assert_eq!(mode(&env.logical()), 0o400);
+    }
+}
+
+#[test]
+fn an_ordinary_ferro_command_beside_a_held_redb_stays_on_redb_and_warns() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    let holder = fl_store::open_redb(&env.logical()).unwrap();
+    // The CLI cannot migrate and cannot open the redb either while the holder
+    // has it: it fails after its wait, and creates no .fls.
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("stays on redb"))
+        .stderr(contains("still holds the redb"));
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+    drop(holder);
+    // Free again: the same command migrates.
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "list"])
+        .assert()
+        .success();
+    assert_eq!(
+        env.files(),
+        vec!["fl.fls".to_string(), "fl.redb".to_string()]
+    );
 }
