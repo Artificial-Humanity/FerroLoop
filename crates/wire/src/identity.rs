@@ -69,6 +69,12 @@ pub struct RouteEntry {
     pub updated_at: At,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// [`RouteTable::discover_routes`] calls made on this thread.
+    pub(crate) static DISCOVERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteTable {
     pub entries: BTreeMap<String, RouteEntry>,
@@ -457,6 +463,14 @@ impl RouteTable {
 
     /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
     pub fn discover_routes(&mut self, home_override: Option<&Path>, at: At) {
+        #[cfg(test)]
+        {
+            DISCOVERIES.with(|n| n.set(n.get() + 1));
+            // A unit test never scans the real home.
+            if home_override.is_none() {
+                return;
+            }
+        }
         if home_override.is_none()
             && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
         {

@@ -12,7 +12,9 @@ use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
 
-use crate::identity::{RouteTable, VendorRoute, resolve_agy_exe, resolve_claude_key_path};
+use crate::identity::{
+    RouteTable, VendorRoute, normalize_persona, resolve_agy_exe, resolve_claude_key_path,
+};
 
 /// `clear` sends the vendor reset command only. `reforge` sends that command
 /// and then the canonical hydration prompt.
@@ -1782,16 +1784,27 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     msg: &WireMessage,
     now: At,
 ) -> Vec<DeliveryReceipt> {
-    routes.discover_routes(home_override, now.clone());
     let Ok(receipts) = store.list_wire_receipts(&msg.id) else {
         return Vec::new();
     };
+    let deliverable = |rcpt: &DeliveryReceipt| {
+        !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+            && rcpt.attempts < MAX_DELIVER
+    };
+    // Discovery scans every vendor's session files: run it only when a receipt still to deliver
+    // has no route under its normalized persona key (a name that cannot be a key never gets
+    // one). A route that is present but stale is rediscovered below, when its push fails.
+    let missing_route = receipts.iter().any(|rcpt| {
+        deliverable(rcpt)
+            && normalize_persona(&rcpt.recipient_name).is_some()
+            && routes.get(&rcpt.recipient_name).is_none()
+    });
+    if home_override.is_some() || missing_route {
+        routes.discover_routes(home_override, now.clone());
+    }
     let mut updated = Vec::new();
     for rcpt in receipts {
-        if matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired) {
-            continue;
-        }
-        if rcpt.attempts >= MAX_DELIVER {
+        if !deliverable(&rcpt) {
             continue;
         }
         let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
@@ -1799,8 +1812,8 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         };
         let mut pushed = dispatch_to_route(&entry.route, msg);
         if pushed.is_err() {
-            // The session may have restarted since the scan above (a new pid, socket or pane).
-            // Rescan for this persona, and push once more only when its route changed.
+            // The session may have restarted since this route was learned (a new pid, socket or
+            // pane). Rescan for this persona, and push once more only when its route changed.
             if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
                 && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
             {
@@ -3940,5 +3953,216 @@ mod tests {
             });
             assert!(res.is_err(), "{subject:?} was accepted");
         }
+    }
+
+    fn discoveries() -> u64 {
+        crate::identity::DISCOVERIES.with(std::cell::Cell::get)
+    }
+
+    fn mail_to(store: &MemStore, to: &str) -> WireMessage {
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "synthetic-sender".into(),
+                sender_host: None,
+                to: WireAddress::AgentName(to.into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "discovery".into(),
+                body: "body".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap()
+            .0
+    }
+
+    /// A webhook socket that collects one pushed line.
+    fn webhook(dir: &Path, name: &str) -> (PathBuf, std::thread::JoinHandle<String>) {
+        let sock = dir.join(name);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .read_line(&mut line)
+                .unwrap();
+            line
+        });
+        (sock, handle)
+    }
+
+    #[test]
+    fn a_send_to_a_routed_recipient_runs_no_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let msg = mail_to(&store, "synthetic-recipient-c");
+        // A receipt naming the same persona in another case: the table's key is normalized.
+        let loud = DeliveryReceipt {
+            recipient_id: fl_core::iri::Iri::parse("urn:x:loud").unwrap(),
+            recipient_name: "Synthetic-Recipient-C".into(),
+            ..store.list_wire_receipts(&msg.id).unwrap()[0].clone()
+        };
+        store.import_wire_batch(&[], &[loud]).unwrap();
+        let (sock, pushed) = webhook(tmp.path(), "hook.sock");
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "synthetic-recipient-c",
+            VendorRoute::Webhook { socket_path: sock },
+            At::from_unix_millis(5),
+        );
+        let before = discoveries();
+        let updated =
+            dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(20));
+        assert_eq!(
+            discoveries(),
+            before,
+            "discovery ran with every route present"
+        );
+        assert_eq!(updated.len(), 2, "{updated:?}");
+        assert!(updated.iter().all(|r| r.status == DeliveryStatus::Acked));
+        assert!(pushed.join().unwrap().contains("discovery"));
+    }
+
+    #[test]
+    fn only_a_deliverable_receipt_without_a_route_runs_discovery() {
+        let store = MemStore::default();
+        let mut routes = RouteTable::default();
+        // No route, still pending: discovery runs (here a unit test's home is never scanned).
+        let pending = mail_to(&store, "synthetic-recipient-d");
+        let before = discoveries();
+        let _ = dispatch_message_for_store(
+            &store,
+            &mut routes,
+            None,
+            &pending,
+            At::from_unix_millis(20),
+        );
+        assert_eq!(discoveries(), before + 1);
+        // Acked, expired, or out of attempts: nothing to deliver, so nothing to discover.
+        for (status, attempts) in [
+            (DeliveryStatus::Acked, 0),
+            (DeliveryStatus::Expired, 0),
+            (DeliveryStatus::Pending, MAX_DELIVER),
+        ] {
+            let msg = mail_to(&store, "synthetic-recipient-e");
+            let rcpt = DeliveryReceipt {
+                status,
+                attempts,
+                updated_at: At::from_unix_millis(30),
+                acked_at: (status == DeliveryStatus::Acked).then(|| At::from_unix_millis(30)),
+                ..store.list_wire_receipts(&msg.id).unwrap()[0].clone()
+            };
+            store.import_wire_batch(&[], &[rcpt]).unwrap();
+            let before = discoveries();
+            let _ = dispatch_message_for_store(
+                &store,
+                &mut routes,
+                None,
+                &msg,
+                At::from_unix_millis(40),
+            );
+            assert_eq!(discoveries(), before, "{status:?} with {attempts} attempts");
+        }
+        // A name no route could ever be keyed by: discovery cannot find one.
+        let msg = mail_to(&store, "synthetic-recipient-f");
+        let odd = DeliveryReceipt {
+            recipient_id: fl_core::iri::Iri::parse("urn:x:odd").unwrap(),
+            recipient_name: "urn:x:odd".into(),
+            ..store.list_wire_receipts(&msg.id).unwrap()[0].clone()
+        };
+        let base = store.list_wire_receipts(&msg.id).unwrap()[0].clone();
+        let done = DeliveryReceipt {
+            status: DeliveryStatus::Acked,
+            acked_at: Some(At::from_unix_millis(30)),
+            updated_at: At::from_unix_millis(30),
+            ..base
+        };
+        store.import_wire_batch(&[], &[odd, done]).unwrap();
+        let before = discoveries();
+        let _ =
+            dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(50));
+        assert_eq!(discoveries(), before, "an unroutable name");
+    }
+
+    #[test]
+    fn a_send_to_an_unrouted_recipient_discovers_its_session_and_delivers() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let pid = std::process::id();
+        let sock_path = home.join("claude.sock");
+        fs::write(
+            sessions.join(format!("{pid}.json")),
+            serde_json::json!({
+                "name": "Synthetic-Recipient-G",
+                "nameSource": "user",
+                "sessionId": "sess-g",
+                "messagingSocketPath": sock_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            sessions.join(format!("{pid}.test.key")),
+            "{\"peerToken\":\"tok-g\"}",
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::io::BufReader::new(stream)
+                .lines()
+                .take(2)
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        });
+        let store = MemStore::default();
+        let msg = mail_to(&store, "synthetic-recipient-g");
+        let mut routes = RouteTable::default();
+        let before = discoveries();
+        let updated = dispatch_message_for_store(
+            &store,
+            &mut routes,
+            Some(home),
+            &msg,
+            At::from_unix_millis(20),
+        );
+        assert_eq!(discoveries(), before + 1);
+        assert!(routes.get("synthetic-recipient-g").is_some());
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert_eq!(updated[0].status, DeliveryStatus::Acked);
+        let lines = handle.join().unwrap();
+        assert!(lines[1].contains("discovery"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_stale_route_is_rediscovered_after_its_push_fails_and_its_receipt_stays_pending() {
+        let tmp = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let msg = mail_to(&store, "synthetic-recipient-h");
+        // The table still holds a route to a session that is gone.
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "synthetic-recipient-h",
+            VendorRoute::Webhook {
+                socket_path: tmp.path().join("gone.sock"),
+            },
+            At::from_unix_millis(5),
+        );
+        let before = discoveries();
+        let updated =
+            dispatch_message_for_store(&store, &mut routes, None, &msg, At::from_unix_millis(20));
+        // No discovery up front (the route is present); one after the failed push, through
+        // `refresh_persona`.
+        assert_eq!(discoveries(), before + 1);
+        assert_eq!(updated.len(), 1, "{updated:?}");
+        assert_eq!(updated[0].status, DeliveryStatus::Pending);
+        assert_eq!(updated[0].attempts, 1);
     }
 }
