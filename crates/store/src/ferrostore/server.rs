@@ -6,7 +6,7 @@
 //! first request is read, and every request needs a scope (spec §6.2,
 //! [`auth`](super::auth)).
 
-use super::auth::{self, Credential, MethodRule, Peer, Scope, ServerAuth};
+use super::auth::{self, Credential, MethodRule, Peer, Principal, Scope, ServerAuth};
 use super::columnar;
 use super::layout::{Op, backend};
 use super::retry;
@@ -24,11 +24,11 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::ws;
 
@@ -53,6 +53,18 @@ struct ServerState {
     auth: ServerAuth,
     /// The uid a Unix peer must have: this process's effective uid.
     own_uid: u32,
+    /// The connections still authenticating, and the instant each must be
+    /// done by (spec §6.2). The accept loop shuts down one past its
+    /// deadline, and refuses a connection while this holds
+    /// [`auth::MAX_HANDSHAKES`].
+    handshakes: Mutex<HashMap<u64, Instant>>,
+    /// [`auth::HANDSHAKE_DEADLINE`] in milliseconds; a test lowers it.
+    handshake_deadline_ms: AtomicU64,
+    /// [`auth::MAX_HANDSHAKES`]; a test lowers it.
+    max_handshakes: AtomicUsize,
+    /// Connections closed at accept because too many were authenticating.
+    #[cfg(test)]
+    handshakes_refused: AtomicU64,
     /// The uid every Unix peer is taken to have, in place of its own.
     #[cfg(test)]
     peer_uid: Mutex<Option<u32>>,
@@ -233,6 +245,13 @@ fn new_state(store: FerroStore, auth: ServerAuth) -> Arc<ServerState> {
         dedup: Dedup::default(),
         auth,
         own_uid: auth::own_uid(),
+        handshakes: Mutex::new(HashMap::new()),
+        handshake_deadline_ms: AtomicU64::new(
+            u64::try_from(auth::HANDSHAKE_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+        ),
+        max_handshakes: AtomicUsize::new(auth::MAX_HANDSHAKES),
+        #[cfg(test)]
+        handshakes_refused: AtomicU64::new(0),
         #[cfg(test)]
         peer_uid: Mutex::new(None),
         #[cfg(test)]
@@ -281,6 +300,28 @@ impl FerroStoreServer {
     /// Writes refused because the exactly-once table was full.
     pub(super) fn dedup_refusals(&self) -> u64 {
         self.state.dedup_refused.load(Ordering::SeqCst)
+    }
+
+    /// Lower the time a connection has to authenticate, for connections
+    /// accepted from now on.
+    pub(super) fn set_handshake_deadline(&self, deadline: Duration) {
+        let ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        self.state.handshake_deadline_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Change how many connections may authenticate at once.
+    pub(super) fn set_max_handshakes(&self, max: usize) {
+        self.state.max_handshakes.store(max, Ordering::SeqCst);
+    }
+
+    /// Connections accepted and still authenticating.
+    pub(super) fn handshakes_in_flight(&self) -> usize {
+        lock_mutex(&self.state.handshakes).len()
+    }
+
+    /// Connections closed at accept because too many were authenticating.
+    pub(super) fn handshakes_refused(&self) -> u64 {
+        self.state.handshakes_refused.load(Ordering::SeqCst)
     }
 }
 
@@ -435,10 +476,15 @@ struct Accepted {
     peer: Peer,
 }
 
+/// Accept connections and start one thread for each. Between accepts it
+/// joins finished threads and shuts down every connection still
+/// authenticating past its deadline ([`reap_handshakes`]): this loop wakes
+/// at least every [`ACCEPT_PAUSE`], so no thread per connection is needed.
 fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
     let mut handlers = Vec::new();
     loop {
         reap(&mut handlers);
+        reap_handshakes(&state);
         if state.shutdown.load(Ordering::SeqCst) {
             break;
         }
@@ -449,6 +495,14 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                     break;
                 }
                 let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
+                if !begin_handshake(&state, id) {
+                    // Too many connections authenticating: closed before
+                    // anything is read or any thread started for it.
+                    #[cfg(test)]
+                    state.handshakes_refused.fetch_add(1, Ordering::SeqCst);
+                    accepted.watch.shutdown_both();
+                    continue;
+                }
                 lock_mutex(&state.conns).insert(id, accepted.watch);
                 let conn_state = Arc::clone(&state);
                 let read = accepted.read;
@@ -460,6 +514,7 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                 {
                     Ok(handle) => handlers.push(handle),
                     Err(_) => {
+                        lock_mutex(&state.handshakes).remove(&id);
                         lock_mutex(&state.conns).remove(&id);
                     }
                 }
@@ -473,6 +528,66 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
     shutdown_conns(&state);
     for handle in handlers {
         let _ = handle.join();
+    }
+}
+
+/// Register connection `id` as authenticating, due by the deadline from
+/// now. `false`: [`auth::MAX_HANDSHAKES`] are authenticating already.
+fn begin_handshake(state: &ServerState, id: u64) -> bool {
+    let deadline = Duration::from_millis(state.handshake_deadline_ms.load(Ordering::SeqCst));
+    let mut pending = lock_mutex(&state.handshakes);
+    if pending.len() >= state.max_handshakes.load(Ordering::SeqCst) {
+        return false;
+    }
+    pending.insert(id, Instant::now() + deadline);
+    true
+}
+
+/// Shut down every connection still authenticating past its deadline,
+/// through the transport's own [`JsonIo::shutdown_both`]. Its entry is
+/// removed first, under the lock that [`end_handshake`] takes: a
+/// connection whose handshake passed after this point finds it gone and
+/// is refused, so none is cut off once it is served.
+fn reap_handshakes(state: &ServerState) {
+    let now = Instant::now();
+    let expired: Vec<u64> = {
+        let mut pending = lock_mutex(&state.handshakes);
+        let expired: Vec<u64> = pending
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            pending.remove(id);
+        }
+        expired
+    };
+    if expired.is_empty() {
+        return;
+    }
+    let conns = lock_mutex(&state.conns);
+    for id in expired {
+        if let Some(conn) = conns.get(&id) {
+            conn.shutdown_both();
+        }
+    }
+}
+
+/// End connection `id`'s handshake. `false`: the deadline passed first and
+/// [`reap_handshakes`] has shut it down.
+fn end_handshake(state: &ServerState, id: u64) -> bool {
+    lock_mutex(&state.handshakes).remove(&id).is_some()
+}
+
+/// Ends a connection's handshake however [`authenticate`] returns.
+struct HandshakeSlot<'a> {
+    state: &'a ServerState,
+    id: u64,
+}
+
+impl Drop for HandshakeSlot<'_> {
+    fn drop(&mut self) {
+        end_handshake(self.state, self.id);
     }
 }
 
@@ -569,7 +684,7 @@ fn serve_connection(
         state: Arc::clone(&state),
         id: conn_id,
     };
-    let Some(scope) = authenticate(&mut *read, &write, peer, &state) else {
+    let Some((scope, principal)) = authenticate(&mut *read, &write, peer, &state, conn_id) else {
         return;
     };
     let alive = Arc::new(AtomicBool::new(true));
@@ -579,7 +694,7 @@ fn serve_connection(
         if state.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let incoming = match read.read_value() {
+        let incoming = match read.read_value(ws::MAX_PAYLOAD) {
             Ok(incoming) => incoming,
             Err(_) => break,
         };
@@ -622,7 +737,7 @@ fn serve_connection(
                             .map(|()| Value::Null),
                         )
                     }
-                    Ok(rule) => exactly_once(&state, conn_id, rule, &params),
+                    Ok(rule) => exactly_once(&state, conn_id, &principal, rule, &params),
                 };
                 // An error response leaves the connection up.
                 if send_reply(&write, id, reply).is_err() {
@@ -638,13 +753,16 @@ fn serve_connection(
 }
 
 /// Authenticate the connection before anything is read from it as a
-/// request (spec §6.2). `None`: it was refused and is shut down.
+/// request (spec §6.2): its scope and principal. `None`: it was refused,
+/// or its handshake deadline passed, and it is shut down.
 fn authenticate(
     read: &mut dyn JsonIo,
     write: &Mutex<Box<dyn JsonIo>>,
     peer: Peer,
     state: &ServerState,
-) -> Option<Scope> {
+    conn_id: u64,
+) -> Option<(Scope, Principal)> {
+    let slot = HandshakeSlot { state, id: conn_id };
     #[cfg(test)]
     let peer = match (peer, *lock_mutex(&state.peer_uid)) {
         (Peer::Unix(_), Some(uid)) => Peer::Unix(Some(uid)),
@@ -671,7 +789,7 @@ fn authenticate(
         Peer::Unix(_) => Credential::None,
         Peer::Tcp => credential,
     };
-    let scope = auth::serve_handshake(
+    let authed = auth::serve_handshake(
         read,
         &mut **write,
         &peer,
@@ -679,11 +797,12 @@ fn authenticate(
         &state.auth,
         state.own_uid,
     )?;
-    if read.set_read_timeout(None).is_err() {
+    // Past the deadline the reaper has shut the connection down already.
+    if !end_handshake(state, slot.id) || read.set_read_timeout(None).is_err() {
         write.shutdown_both();
         return None;
     }
-    Some(scope)
+    Some(authed)
 }
 
 fn subscribe_topic(
@@ -743,22 +862,30 @@ fn forward_mq(
 }
 
 /// Run one authorized request. A write ([`MethodRule::writes`]) that
-/// carries `req` runs once: a repeat of its id gets the first reply and
-/// applies nothing (spec §6.1). Any other method ignores `req`, so no read's
-/// answer is kept.
-fn exactly_once(state: &ServerState, conn: u64, rule: &MethodRule, params: &Value) -> Value {
+/// carries `req` runs once: a repeat of its id by the same principal, for
+/// the same method, gets the first reply and applies nothing (spec §6.1);
+/// for another method it is refused. Ids are per principal: another
+/// principal's id never answers this one. Any other method ignores `req`,
+/// so no read's answer is kept.
+fn exactly_once(
+    state: &ServerState,
+    conn: u64,
+    principal: &Principal,
+    rule: &MethodRule,
+    params: &Value,
+) -> Value {
     let method = rule.name;
     if !rule.writes {
-        return reply_body(dispatch(state, conn, method, params));
+        return reply_body(dispatch(state, conn, principal, method, params));
     }
     let req = match session::request_id(params) {
         Ok(req) => req,
         Err(err) => return reply_body(Err(err)),
     };
     let Some(req) = req else {
-        return reply_body(dispatch(state, conn, method, params));
+        return reply_body(dispatch(state, conn, principal, method, params));
     };
-    match state.dedup.claim(req) {
+    match state.dedup.claim(principal, method, req) {
         Err(full) => {
             #[cfg(test)]
             state.dedup_refused.fetch_add(1, Ordering::SeqCst);
@@ -766,7 +893,7 @@ fn exactly_once(state: &ServerState, conn: u64, rule: &MethodRule, params: &Valu
         }
         Ok(Claim::Replay(reply)) => reply,
         Ok(Claim::Run(running)) => {
-            let reply = reply_body(dispatch(state, conn, method, params));
+            let reply = reply_body(dispatch(state, conn, principal, method, params));
             running.finish(&reply);
             reply
         }
@@ -776,6 +903,7 @@ fn exactly_once(state: &ServerState, conn: u64, rule: &MethodRule, params: &Valu
 fn dispatch(
     state: &ServerState,
     conn: u64,
+    principal: &Principal,
     method: &str,
     params: &Value,
 ) -> Result<Value, StoreError> {
@@ -786,7 +914,7 @@ fn dispatch(
         "open_session" => {
             let pinned = store.read_state()?;
             let base_seq = pinned.last_seq;
-            let session = state.sessions.open(conn, pinned)?;
+            let session = state.sessions.open(conn, principal, pinned)?;
             Ok(json!({"session": session, "base_seq": base_seq}))
         }
         "close_session" => {
@@ -805,7 +933,7 @@ fn dispatch(
                     // whose id the client would never learn.
                     let pinned = store.read_state()?;
                     let answer = session::answer(&pinned, &key)?;
-                    let id = state.sessions.open(conn, Arc::clone(&pinned))?;
+                    let id = state.sessions.open(conn, principal, Arc::clone(&pinned))?;
                     Ok(txn_read_reply(&pinned, answer, Some(id)))
                 }
             }
@@ -1379,7 +1507,11 @@ pub(super) trait JsonIo: Send {
     /// Bound each read of the stream (`None`: wait forever).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError>;
 
-    fn read_value(&mut self) -> Result<Incoming, StoreError>;
+    /// The next frame. One that declares more than `max_len` bytes is
+    /// refused before anything is allocated for it: before authentication
+    /// the caller passes [`auth::PRE_AUTH_FRAME_BYTES`], after it
+    /// [`ws::MAX_PAYLOAD`] (16 MiB).
+    fn read_value(&mut self, max_len: usize) -> Result<Incoming, StoreError>;
 
     fn write_value(&mut self, value: &Value) -> Result<(), StoreError>;
 
@@ -1426,8 +1558,8 @@ impl UnixIo {
 }
 
 impl JsonIo for UnixIo {
-    fn read_value(&mut self) -> Result<Incoming, StoreError> {
-        let (value, len) = read_frame(&mut self.stream)?;
+    fn read_value(&mut self, max_len: usize) -> Result<Incoming, StoreError> {
+        let (value, len) = read_frame(&mut self.stream, max_len)?;
         self.counter.add(len);
         Ok(Incoming::Value(value))
     }
@@ -1484,8 +1616,8 @@ impl JsonIo for WsIo {
         self.stream.set_read_timeout(timeout).map_err(backend)
     }
 
-    fn read_value(&mut self) -> Result<Incoming, StoreError> {
-        match ws::read_event(&mut self.stream, self.client)? {
+    fn read_value(&mut self, max_len: usize) -> Result<Incoming, StoreError> {
+        match ws::read_event(&mut self.stream, self.client, max_len)? {
             ws::WsEvent::Data(payload) => {
                 if payload.is_empty() {
                     return Err(backend("frame length is outside 1..=16MiB"));
@@ -1530,13 +1662,21 @@ pub(super) fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usiz
     Ok(bytes.len() + 4)
 }
 
-/// Read one frame, and the bytes it took, length prefix included.
-pub(super) fn read_frame(stream: &mut UnixStream) -> Result<(Value, usize), StoreError> {
+/// Read one frame, and the bytes it took, length prefix included. A frame
+/// that declares more than `max_len` bytes (at most 16 MiB) is refused
+/// before anything is allocated for it.
+pub(super) fn read_frame(
+    stream: &mut UnixStream,
+    max_len: usize,
+) -> Result<(Value, usize), StoreError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(backend)?;
     let len = u32::from_be_bytes(len_buf);
     if len == 0 || len > MAX_FRAME_BYTES {
         return Err(backend("frame length is outside 1..=16MiB"));
+    }
+    if len as usize > max_len {
+        return Err(ws::too_long(max_len));
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).map_err(backend)?;
@@ -1908,8 +2048,16 @@ pub(super) fn client_from_unix(
 }
 
 /// A client of the `ws://` endpoint `rest`, authenticating with `cred`.
-pub(super) fn connect_ws(rest: &str, cred: &auth::ClientCred) -> Result<RemoteClient, StoreError> {
-    let stream = ws::connect(rest, cred.bearer())?;
+/// A credential goes to an address that is not loopback only when
+/// `allow_plaintext` ([`auth::ClientCred::check_plaintext`]).
+pub(super) fn connect_ws(
+    rest: &str,
+    cred: &auth::ClientCred,
+    allow_plaintext: bool,
+) -> Result<RemoteClient, StoreError> {
+    let stream = ws::connect(rest, cred.bearer(), |peer| {
+        cred.check_plaintext(peer, allow_plaintext)
+    })?;
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
@@ -1955,7 +2103,7 @@ fn finish_client(
 
 fn reader_loop(mut stream: Box<dyn JsonIo>, shared: Arc<RemoteShared>) {
     loop {
-        match stream.read_value() {
+        match stream.read_value(ws::MAX_PAYLOAD) {
             Ok(Incoming::Value(frame)) => {
                 if frame.get("id").is_none()
                     && frame.get("method").and_then(Value::as_str) == Some("mq")
@@ -2026,7 +2174,7 @@ mod empty_frame {
         let mut io = WsIo::server(server, false);
 
         ws::write_frame(&mut client, true, 0x1, &[]).unwrap();
-        let msg = match io.read_value() {
+        let msg = match io.read_value(ws::MAX_PAYLOAD) {
             Err(err) => err.to_string(),
             Ok(Incoming::Ping(_)) => panic!("empty data frame was a ping"),
             Ok(Incoming::Value(_)) => panic!("empty data frame was accepted"),
@@ -2037,7 +2185,7 @@ mod empty_frame {
 
         ws::write_frame(&mut client, true, 0xA, &[]).unwrap();
         ws::write_frame(&mut client, true, 0x9, &[]).unwrap();
-        match io.read_value().unwrap() {
+        match io.read_value(ws::MAX_PAYLOAD).unwrap() {
             Incoming::Ping(payload) => assert!(payload.is_empty()),
             Incoming::Value(_) => panic!("empty ping was parsed as json"),
             Incoming::Close => panic!("empty ping was a close"),

@@ -100,10 +100,32 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
 /// The bytes of the secret file at `path` (a PSK, a token file), at most `max` of them. Refused,
 /// with the `chmod` that fixes it, when the file is not a regular file or its group or others have
 /// any permission bit: a secret others can read is no secret, and one they can write is not ours.
-/// The mode is read from the opened file, so the bytes read are the file that was checked. A
-/// symlink is followed, as a configuration path often is one.
+/// The mode is read from the opened file, so the bytes read are the file that was checked.
+///
+/// The open does not block and does not follow a symlink (`O_NONBLOCK | O_NOFOLLOW`): a FIFO or a
+/// device is opened without waiting for a writer and refused as not a regular file, and a path
+/// whose last component is a symlink is refused, so a secret path names the file itself. On a
+/// regular file `O_NONBLOCK` changes nothing.
 pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
+    #[cfg(unix)]
+    let file = {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|err| {
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "it is a symbolic link; name the file it points to",
+                    )
+                } else {
+                    err
+                }
+            })?
+    };
+    #[cfg(not(unix))]
     let file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
@@ -458,6 +480,49 @@ pub fn warn_if_loose(store: &Path) {
         }
         #[cfg(not(test))]
         write_line(&mut std::io::stderr(), &text);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod secret_file_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// `read_secret_file` of `path` on its own thread: its answer, or a
+    /// panic when it gives none within 5 s (an open that blocked).
+    fn read_within(path: PathBuf) -> io::Result<Vec<u8>> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_secret_file(&path, 1024));
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("read_secret_file blocked on the path")
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("psk");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = read_within(fifo).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_symlinked_secret_is_refused_and_the_file_itself_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("psk");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = read_within(link).unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(read_within(file).unwrap(), b"secret");
     }
 }
 

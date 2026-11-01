@@ -2,11 +2,13 @@
 //! and commits with `commit_txn`, validated by value; `req` makes a write
 //! exactly-once.
 
+use super::auth::Principal;
 use super::retry::{Cas, hook};
 use super::server::{self, RemoteClient};
 use super::session::{
-    Claim, DEDUP_ENTRIES, DEDUP_FULL, DEDUP_MIN_AGE, DEDUP_TTL, Dedup, SESSION_EXPIRED,
-    SESSIONS_PER_CONN, SESSIONS_PER_SERVER,
+    self, Claim, DEDUP_ENTRIES, DEDUP_FULL, DEDUP_MIN_AGE, DEDUP_PER_PRINCIPAL, DEDUP_QUOTA,
+    DEDUP_TTL, Dedup, SESSION_EXPIRED, SESSIONS_PER_CONN, SESSIONS_PER_PRINCIPAL,
+    SESSIONS_PER_SERVER,
 };
 use super::{FerroStore, FerroStoreServer, Inner, VectorMetric, VectorStorage};
 use fl_core::StoreError;
@@ -378,17 +380,24 @@ fn a_connection_holds_at_most_64_sessions_and_closing_it_drops_them() {
 
 #[test]
 fn a_server_holds_at_most_1024_sessions() {
-    let served = serve(FerroStore::in_memory());
-    let conns: Vec<RemoteClient> = (0..SESSIONS_PER_SERVER / SESSIONS_PER_CONN)
-        .map(|_| served.raw())
+    // One credential holds a quarter of them, so four fill the server.
+    let principals = SESSIONS_PER_SERVER / SESSIONS_PER_PRINCIPAL;
+    let (server, tokens, _dir) = super::tests_auth::token_principals(principals + 1);
+    let addr = server.local_addr();
+    let conns: Vec<RemoteClient> = tokens[..principals]
+        .iter()
+        .flat_map(|token| {
+            (0..SESSIONS_PER_PRINCIPAL / SESSIONS_PER_CONN)
+                .map(move |_| super::tests_auth::token_raw(addr, token))
+        })
         .collect();
     for raw in &conns {
         for _ in 0..SESSIONS_PER_CONN {
             open(raw).unwrap();
         }
     }
-    assert_eq!(served.server.open_sessions(), SESSIONS_PER_SERVER);
-    let late = served.raw();
+    assert_eq!(server.open_sessions(), SESSIONS_PER_SERVER);
+    let late = super::tests_auth::token_raw(addr, &tokens[principals]);
     let err = open(&late).unwrap_err();
     assert!(
         err.to_string()
@@ -396,7 +405,7 @@ fn a_server_holds_at_most_1024_sessions() {
         "{err}"
     );
     // The sessions already open are kept.
-    assert_eq!(served.server.open_sessions(), SESSIONS_PER_SERVER);
+    assert_eq!(server.open_sessions(), SESSIONS_PER_SERVER);
 }
 
 #[test]
@@ -523,7 +532,8 @@ fn a_repeated_request_id_is_applied_once_and_answered_the_same() {
 
     let put = json!({"collection": "d", "id": "y", "doc": 2, "req": format!("{:032x}", 2u128)});
     let first = raw.call("put_doc", put.clone()).unwrap();
-    // From another connection too: the table is the server's.
+    // From another connection of the same credential too: the table is the
+    // server's, keyed by principal.
     let again = served.raw().call("put_doc", put).unwrap();
     assert_eq!(again, first);
     assert_eq!(store.last_seq().unwrap(), base + 2, "put_doc applied twice");
@@ -571,22 +581,48 @@ fn a_remote_write_sends_a_fresh_request_id_per_attempt() {
     assert_eq!(served.server.store().last_seq().unwrap(), 3);
 }
 
-/// Claim `req` at `at` on `dedup`, which must run it.
-fn run_at(dedup: &Dedup, req: u128, at: Instant) -> super::session::Running<'_> {
-    match dedup.claim_at(req, || at) {
+/// The principal of filler id `req`: four of them share the table, so
+/// together they can fill it (each holds at most a quarter).
+fn who(req: u128) -> Principal {
+    Principal::from(format!("filler:{}", req % 4))
+}
+
+/// A fifth principal, holding nothing.
+fn newcomer() -> Principal {
+    Principal::from("newcomer")
+}
+
+/// Claim `principal`'s `req` at `at` on `dedup`, which must run it.
+fn run_as<'a>(
+    dedup: &'a Dedup,
+    principal: &Principal,
+    req: u128,
+    at: Instant,
+) -> session::Running<'a> {
+    match dedup.claim_at(principal, "put_doc", req, || at) {
         Ok(Claim::Run(running)) => running,
         Ok(Claim::Replay(reply)) => panic!("request {req} replayed {reply}"),
         Err(err) => panic!("request {req} refused: {err}"),
     }
 }
 
-/// `dedup` holds `req`'s reply at `at`.
+/// Claim filler `req` at `at` on `dedup`, which must run it.
+fn run_at(dedup: &Dedup, req: u128, at: Instant) -> session::Running<'_> {
+    run_as(dedup, &who(req), req, at)
+}
+
+/// `dedup` holds filler `req`'s reply at `at`.
 fn replays(dedup: &Dedup, req: u128, at: Instant) -> Option<Value> {
-    match dedup.claim_at(req, || at) {
+    match dedup.claim_at(&who(req), "put_doc", req, || at) {
         Ok(Claim::Replay(reply)) => Some(reply),
         Ok(Claim::Run(_)) => None,
         Err(err) => panic!("request {req} refused: {err}"),
     }
+}
+
+/// The reply `dedup` keeps for filler `req`.
+fn reply_of(dedup: &Dedup, req: u128) -> Option<Value> {
+    dedup.reply_of(&who(req), req)
 }
 
 #[test]
@@ -600,15 +636,15 @@ fn a_running_request_id_survives_eviction_pressure() {
     // Full, and every id is old enough to forget by count: the oldest
     // answered one goes, not the running one.
     let later = base + DEDUP_MIN_AGE + Duration::from_secs(1);
-    run_at(&dedup, u128::MAX, later).finish(&json!("new"));
-    assert_eq!(dedup.reply_of(1), None, "the oldest answered id stays");
+    run_as(&dedup, &newcomer(), u128::MAX, later).finish(&json!("new"));
+    assert_eq!(reply_of(&dedup, 1), None, "the oldest answered id stays");
     // Past the TTL every answered id goes; the running one is kept.
     let late = base + DEDUP_TTL + Duration::from_secs(1);
-    run_at(&dedup, u128::MAX - 1, late).finish(&json!("newer"));
-    assert_eq!(dedup.reply_of(2), None, "an id past the TTL stays");
+    run_as(&dedup, &newcomer(), u128::MAX - 1, late).finish(&json!("newer"));
+    assert_eq!(reply_of(&dedup, 2), None, "an id past the TTL stays");
     first.finish(&json!("first"));
     assert_eq!(
-        dedup.reply_of(0),
+        reply_of(&dedup, 0),
         Some(json!("first")),
         "the running id was forgotten: a resend of its write would apply it again"
     );
@@ -622,7 +658,7 @@ fn an_answered_request_id_younger_than_two_call_timeouts_is_kept_when_full() {
         run_at(&dedup, req, base).finish(&json!(req));
     }
     let young = base + DEDUP_MIN_AGE;
-    let err = match dedup.claim_at(u128::MAX, || young) {
+    let err = match dedup.claim_at(&newcomer(), "put_doc", u128::MAX, || young) {
         Err(err) => err,
         Ok(_) => panic!("a full table took a new request id"),
     };
@@ -634,9 +670,9 @@ fn an_answered_request_id_younger_than_two_call_timeouts_is_kept_when_full() {
     );
     // Older than that, the oldest goes by count and the new id runs.
     let old = young + Duration::from_secs(1);
-    run_at(&dedup, u128::MAX, old).finish(&json!("new"));
-    assert_eq!(dedup.reply_of(0), None);
-    assert_eq!(dedup.reply_of(1), Some(json!(1)));
+    run_as(&dedup, &newcomer(), u128::MAX, old).finish(&json!("new"));
+    assert_eq!(reply_of(&dedup, 0), None);
+    assert_eq!(reply_of(&dedup, 1), Some(json!(1)));
 }
 
 #[test]
@@ -647,14 +683,71 @@ fn a_table_full_of_running_request_ids_refuses_a_new_write() {
         .map(|req| run_at(&dedup, req, base))
         .collect();
     let late = base + DEDUP_TTL + Duration::from_secs(1);
-    let err = match dedup.claim_at(u128::MAX, || late) {
+    let err = match dedup.claim_at(&newcomer(), "put_doc", u128::MAX, || late) {
         Err(err) => err,
         Ok(_) => panic!("a running id was dropped for a new one"),
     };
     assert!(err.to_string().contains(DEDUP_FULL), "{err}");
     // Released (each dropped unanswered), the ids make room again.
     drop(running);
-    run_at(&dedup, u128::MAX, late).finish(&json!("new"));
+    run_as(&dedup, &newcomer(), u128::MAX, late).finish(&json!("new"));
+}
+
+#[test]
+fn one_credential_holds_at_most_a_quarter_of_the_dedup_table() {
+    assert_eq!(DEDUP_PER_PRINCIPAL, DEDUP_ENTRIES / 4);
+    let dedup = Dedup::default();
+    let hog = Principal::from("hog");
+    let base = Instant::now();
+    let running: Vec<_> = (0..DEDUP_PER_PRINCIPAL as u128)
+        .map(|req| run_as(&dedup, &hog, req, base))
+        .collect();
+    // At its quota, with the table three quarters empty.
+    let err = match dedup.claim_at(&hog, "put_doc", u128::MAX, || base) {
+        Err(err) => err,
+        Ok(_) => panic!("a credential took more than its quota"),
+    };
+    assert!(err.to_string().contains(DEDUP_QUOTA), "{err}");
+    assert!(session::is_dedup_full(&err), "a quota refusal ran nothing");
+    // Another credential is not refused.
+    run_as(&dedup, &newcomer(), 1, base).finish(&json!("other"));
+    // Answered ids younger than two call timeouts are still kept.
+    for (req, claim) in running.into_iter().enumerate() {
+        claim.finish(&json!(req));
+    }
+    let young = base + DEDUP_MIN_AGE;
+    let err = match dedup.claim_at(&hog, "put_doc", u128::MAX, || young) {
+        Err(err) => err,
+        Ok(_) => panic!("a young answered id was forgotten for the quota"),
+    };
+    assert!(err.to_string().contains(DEDUP_QUOTA), "{err}");
+    // Older, the credential's own oldest goes, and nobody else's.
+    let old = young + Duration::from_secs(1);
+    run_as(&dedup, &hog, u128::MAX, old).finish(&json!("new"));
+    assert_eq!(dedup.reply_of(&hog, 0), None);
+    assert_eq!(dedup.reply_of(&hog, 1), Some(json!(1)));
+    assert_eq!(dedup.reply_of(&newcomer(), 1), Some(json!("other")));
+}
+
+#[test]
+fn a_request_id_is_kept_per_credential_and_per_method() {
+    let dedup = Dedup::default();
+    let (a, b) = (Principal::from("a"), Principal::from("b"));
+    let now = Instant::now();
+    run_as(&dedup, &a, 7, now).finish(&json!("a's reply"));
+    // B's equal id is B's own: it runs.
+    run_as(&dedup, &b, 7, now).finish(&json!("b's reply"));
+    match dedup.claim_at(&a, "put_doc", 7, || now) {
+        Ok(Claim::Replay(reply)) => assert_eq!(reply, json!("a's reply")),
+        _ => panic!("a's replay was not answered with a's reply"),
+    }
+    match dedup.claim_at(&a, "publish_mq", 7, || now) {
+        Err(err) => assert!(
+            err.to_string().contains(session::DEDUP_OTHER_METHOD),
+            "{err}"
+        ),
+        Ok(_) => panic!("an id was replayed or run for another method"),
+    }
 }
 
 /// Fill `served`'s exactly-once table with running ids, run `write` while
@@ -663,10 +756,11 @@ fn while_the_dedup_table_is_full(served: &Served, write: impl FnOnce() + Send) {
     let dedup = served.server.dedup();
     let refused = served.server.dedup_refusals();
     thread::scope(|scope| {
-        // Claim fresh ids until the table refuses one: it is full.
+        // Claim fresh ids until the table refuses one: it is full. Four
+        // other credentials fill it, a quarter each.
         let mut held = Vec::new();
         for req in 1..=DEDUP_ENTRIES as u128 + 1 {
-            match dedup.claim(req) {
+            match dedup.claim(&who(req), "put_doc", req) {
                 Ok(Claim::Run(running)) => held.push(running),
                 Ok(Claim::Replay(_)) => panic!("a fresh id replayed"),
                 Err(err) => {

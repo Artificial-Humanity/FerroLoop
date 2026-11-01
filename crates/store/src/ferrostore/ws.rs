@@ -8,10 +8,14 @@ use super::layout::backend;
 use fl_core::StoreError;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub(super) const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// The largest upgrade request or response, headers included.
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+/// The end of an HTTP header block.
+const HEADER_END: &[u8; 4] = b"\r\n\r\n";
 
 const OP_TEXT: u8 = 0x1;
 const OP_BINARY: u8 = 0x2;
@@ -33,8 +37,13 @@ struct RawFrame {
 
 /// Connect to `rest` (`host:port[/path]`) and upgrade. `bearer` is sent as
 /// `Authorization: Bearer <token>`; the caller has checked that it is
-/// visible ASCII, so it cannot end the header.
-pub(super) fn connect(rest: &str, bearer: Option<&str>) -> Result<TcpStream, StoreError> {
+/// visible ASCII, so it cannot end the header. `admit` is given the address
+/// actually connected to before anything is written, and may refuse it.
+pub(super) fn connect(
+    rest: &str,
+    bearer: Option<&str>,
+    admit: impl FnOnce(SocketAddr) -> Result<(), StoreError>,
+) -> Result<TcpStream, StoreError> {
     let (host_port, path) = split_target(rest)?;
     if bearer.is_some_and(|token| token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
     {
@@ -42,6 +51,10 @@ pub(super) fn connect(rest: &str, bearer: Option<&str>) -> Result<TcpStream, Sto
     }
     let mut stream = TcpStream::connect(host_port)
         .map_err(|err| backend(format!("connect {host_port}: {err}")))?;
+    let peer = stream
+        .peer_addr()
+        .map_err(|err| backend(format!("peer address of {host_port}: {err}")))?;
+    admit(peer)?;
     stream
         .set_nodelay(true)
         .map_err(|err| backend(format!("set nodelay: {err}")))?;
@@ -124,9 +137,15 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<Vec<String>, StoreError> 
     Ok(authorization)
 }
 
-pub(super) fn read_event(stream: &mut TcpStream, client: bool) -> Result<WsEvent, StoreError> {
+/// The next data frame, ping or close. A frame that declares a payload
+/// longer than `max_len` is refused before anything is allocated for it.
+pub(super) fn read_event(
+    stream: &mut TcpStream,
+    client: bool,
+    max_len: usize,
+) -> Result<WsEvent, StoreError> {
     loop {
-        let frame = read_raw(stream, client)?;
+        let frame = read_raw(stream, client, max_len)?;
         match frame.opcode {
             OP_TEXT | OP_BINARY => return Ok(WsEvent::Data(frame.payload)),
             OP_PING => return Ok(WsEvent::Ping(frame.payload)),
@@ -178,7 +197,19 @@ pub(super) fn write_frame(
     Ok(())
 }
 
-fn read_raw(stream: &mut TcpStream, client: bool) -> Result<RawFrame, StoreError> {
+/// The error of a frame longer than `max_len` (at most [`MAX_PAYLOAD`]).
+pub(super) fn too_long(max_len: usize) -> StoreError {
+    if max_len >= MAX_PAYLOAD {
+        backend("frame length is outside 1..=16MiB")
+    } else {
+        backend(format!(
+            "frame length is over {max_len} bytes, the limit before authentication"
+        ))
+    }
+}
+
+fn read_raw(stream: &mut TcpStream, client: bool, max_len: usize) -> Result<RawFrame, StoreError> {
+    let max_len = max_len.min(MAX_PAYLOAD);
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).map_err(backend)?;
     if hdr[0] & 0x70 != 0 {
@@ -204,8 +235,8 @@ fn read_raw(stream: &mut TcpStream, client: bool) -> Result<RawFrame, StoreError
         stream.read_exact(&mut ext).map_err(backend)?;
         len = u64::from_be_bytes(ext);
     }
-    if len > MAX_PAYLOAD as u64 {
-        return Err(backend("frame length is outside 1..=16MiB"));
+    if len > max_len as u64 {
+        return Err(too_long(max_len));
     }
     let control = opcode >= OP_CLOSE;
     if control && (!fin || len > 125) {
@@ -276,22 +307,37 @@ fn header_has_token(value: &str, token: &str) -> bool {
         .any(|part| part.trim().eq_ignore_ascii_case(token))
 }
 
+/// The upgrade's header block, up to [`MAX_HEADER_BYTES`], and not one
+/// byte past its end: the frames that follow stay in the stream. Each read
+/// asks for as many bytes as cannot reach past the end (up to 4), not one
+/// at a time. The server bounds the whole handshake in time
+/// ([`super::auth::HANDSHAKE_DEADLINE`]), so a peer that trickles is cut off.
 fn read_headers(stream: &mut TcpStream) -> Result<String, StoreError> {
     let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    while buf.len() < 16 * 1024 {
+    let mut chunk = [0u8; HEADER_END.len()];
+    while buf.len() < MAX_HEADER_BYTES {
+        let want = safe_read_len(&buf).min(MAX_HEADER_BYTES - buf.len());
         let n = stream
-            .read(&mut byte)
+            .read(&mut chunk[..want])
             .map_err(|err| backend(format!("read handshake: {err}")))?;
         if n == 0 {
             return Err(backend("websocket handshake ended before the headers"));
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.ends_with(HEADER_END) {
             return String::from_utf8(buf).map_err(|_| backend("websocket handshake is not utf-8"));
         }
     }
     Err(backend("websocket handshake headers are too large"))
+}
+
+/// The most bytes that can follow `buf` without reaching past the first
+/// [`HEADER_END`]: 4 less the longest end of `buf` that begins it.
+fn safe_read_len(buf: &[u8]) -> usize {
+    (1..HEADER_END.len())
+        .rev()
+        .find(|&k| buf.ends_with(&HEADER_END[..k]))
+        .map_or(HEADER_END.len(), |k| HEADER_END.len() - k)
 }
 
 fn check_accept(text: &str, sec_key: &str) -> Result<(), StoreError> {
@@ -476,30 +522,32 @@ mod tests {
             stream.set_nodelay(true).unwrap();
             accept(&mut stream).unwrap();
             for expected in [4usize, 200, 70_000] {
-                let WsEvent::Data(payload) = read_event(&mut stream, false).unwrap() else {
+                let WsEvent::Data(payload) = read_event(&mut stream, false, MAX_PAYLOAD).unwrap()
+                else {
                     panic!("expected a data frame");
                 };
                 assert_eq!(payload.len(), expected);
                 assert!(payload.iter().all(|byte| *byte == b'z'));
                 write_frame(&mut stream, false, OP_TEXT, &payload).unwrap();
             }
-            let WsEvent::Ping(payload) = read_event(&mut stream, false).unwrap() else {
+            let WsEvent::Ping(payload) = read_event(&mut stream, false, MAX_PAYLOAD).unwrap()
+            else {
                 panic!("expected a ping");
             };
             assert_eq!(payload, b"xyz");
             write_frame(&mut stream, false, OP_PONG, &payload).unwrap();
         });
-        let mut client = connect(&format!("{addr}/store"), None).unwrap();
+        let mut client = connect(&format!("{addr}/store"), None, |_| Ok(())).unwrap();
         for size in [4usize, 200, 70_000] {
             let payload = vec![b'z'; size];
             write_frame(&mut client, true, OP_BINARY, &payload).unwrap();
-            let WsEvent::Data(got) = read_event(&mut client, true).unwrap() else {
+            let WsEvent::Data(got) = read_event(&mut client, true, MAX_PAYLOAD).unwrap() else {
                 panic!("expected echoed data");
             };
             assert_eq!(got, payload);
         }
         write_frame(&mut client, true, OP_PING, b"xyz").unwrap();
-        let pong = read_raw(&mut client, true).unwrap();
+        let pong = read_raw(&mut client, true, MAX_PAYLOAD).unwrap();
         assert_eq!(pong.opcode, OP_PONG);
         assert_eq!(pong.payload, b"xyz");
         drop(client);
@@ -513,15 +561,75 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             accept(&mut stream).unwrap();
-            let err = read_event(&mut stream, false).unwrap_err();
+            let err = read_event(&mut stream, false, MAX_PAYLOAD).unwrap_err();
             assert!(err.to_string().contains("16MiB"), "{err}");
         });
-        let mut client = connect(&format!("{addr}"), None).unwrap();
+        let mut client = connect(&format!("{addr}"), None, |_| Ok(())).unwrap();
         let mut hdr = vec![0x82, 0x80 | 127];
         hdr.extend_from_slice(&u64::try_from(MAX_PAYLOAD + 1).unwrap().to_be_bytes());
         hdr.extend_from_slice(&[1, 2, 3, 4]);
         client.write_all(&hdr).unwrap();
         drop(client);
         server.join().unwrap();
+    }
+
+    /// A frame that declares more than the reader's limit is refused from
+    /// its header: the reader does not wait for, or allocate, the payload.
+    #[test]
+    fn a_frame_over_the_callers_limit_is_refused_from_its_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        // 1 MiB declared, mask sent, no payload: a reader that allocated and
+        // waited would block here until its timeout.
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut hdr = vec![0x82, 0x80 | 127];
+        hdr.extend_from_slice(&(1u64 << 20).to_be_bytes());
+        hdr.extend_from_slice(&[1, 2, 3, 4]);
+        client.write_all(&hdr).unwrap();
+        let started = std::time::Instant::now();
+        let err = read_event(&mut server, false, 4096).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("over 4096 bytes, the limit before authentication"),
+            "{err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // At the limit is fine (on a new connection: the refused frame's
+        // mask is still in this one).
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let payload = vec![b'x'; 4096];
+        write_frame(&mut client, true, OP_BINARY, &payload).unwrap();
+        let WsEvent::Data(got) = read_event(&mut server, false, 4096).unwrap() else {
+            panic!("expected data");
+        };
+        assert_eq!(got.len(), 4096);
+    }
+
+    #[test]
+    fn a_header_read_never_reaches_past_the_end_of_the_headers() {
+        assert_eq!(safe_read_len(b""), 4);
+        assert_eq!(safe_read_len(b"GET /"), 4);
+        assert_eq!(safe_read_len(b"x\r"), 3);
+        assert_eq!(safe_read_len(b"x\r\n"), 2);
+        assert_eq!(safe_read_len(b"x\r\n\r"), 1);
+        assert_eq!(safe_read_len(b"x\r\r"), 3);
+        // The bytes after the headers are left for the frame reader.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nAFTER")
+            .unwrap();
+        let headers = read_headers(&mut server).unwrap();
+        assert!(headers.ends_with("Host: x\r\n\r\n"), "{headers:?}");
+        let mut rest = [0u8; 5];
+        server.read_exact(&mut rest).unwrap();
+        assert_eq!(&rest, b"AFTER");
     }
 }

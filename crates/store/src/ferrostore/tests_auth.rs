@@ -5,7 +5,7 @@
 //! bind configures one. TCP (`ws://`): the mutual PSK challenge-response, or
 //! a bearer token in the upgrade's `Authorization` header.
 
-use super::auth::{self, Psk, Scope};
+use super::auth::{self, ClientCred, Psk, Scope};
 use super::server::{self, read_frame, write_frame};
 use super::ws;
 use super::{ConnectOptions, FerroStore, FerroStoreServer, Inner, ServerAuth};
@@ -13,7 +13,8 @@ use fl_core::StoreError;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::net::{SocketAddr, TcpStream};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -69,7 +70,7 @@ struct RawWs {
 
 impl RawWs {
     fn connect(addr: SocketAddr, bearer: Option<&str>) -> Self {
-        let stream = ws::connect(&addr.to_string(), bearer).unwrap();
+        let stream = ws::connect(&addr.to_string(), bearer, |_| Ok(())).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -83,7 +84,7 @@ impl RawWs {
 
     /// The next JSON frame; `None` once the server closed.
     fn recv(&mut self) -> Option<Value> {
-        match ws::read_event(&mut self.stream, true) {
+        match ws::read_event(&mut self.stream, true, ws::MAX_PAYLOAD) {
             Ok(ws::WsEvent::Data(payload)) => Some(serde_json::from_slice(&payload).unwrap()),
             Ok(ws::WsEvent::Ping(_)) => self.recv(),
             Ok(ws::WsEvent::Close) | Err(_) => None,
@@ -100,7 +101,12 @@ impl RawWs {
 
     /// Send a PSK hello; the server's answer, `None` when it closed.
     fn hello(&mut self, nc: &[u8; 32], proof: &[u8]) -> Option<Value> {
-        self.send(&json!({"auth": "psk", "nc": hex(nc), "proof": hex(proof)}));
+        self.hello_value(&json!({"auth": "psk", "nc": hex(nc), "proof": hex(proof)}))
+    }
+
+    /// Send `hello` as the answer to the challenge; the server's answer.
+    fn hello_value(&mut self, hello: &Value) -> Option<Value> {
+        self.send(hello);
         self.recv()
     }
 
@@ -149,6 +155,42 @@ fn three_tokens(dir: &Path) -> PathBuf {
 
 fn token_client(addr: SocketAddr, token: &str) -> Result<FerroStore, StoreError> {
     FerroStore::connect_with(&format!("ws://{addr}"), &ConnectOptions::token(token))
+}
+
+/// A served in-memory store over TCP that accepts `n` write-scope tokens,
+/// each its own principal; the tokens.
+pub(super) fn token_principals(n: usize) -> (FerroStoreServer, Vec<String>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens: Vec<String> = (0..n).map(|i| format!("principal-token-{i:04}")).collect();
+    let lines: String = tokens
+        .iter()
+        .map(|token| format!("{} write\n", sha256_hex(token)))
+        .collect();
+    let path = token_file(dir.path(), &lines);
+    let server = serve_tcp(
+        FerroStore::in_memory(),
+        ServerAuth::new().with_token_file(&path).unwrap(),
+    );
+    (server, tokens, dir)
+}
+
+/// A raw client of `addr` under `token`, for calls the trait methods do not
+/// make.
+pub(super) fn token_raw(addr: SocketAddr, token: &str) -> server::RemoteClient {
+    server::connect_ws(
+        &addr.to_string(),
+        &ClientCred::Bearer(token.to_string()),
+        false,
+    )
+    .unwrap()
+}
+
+/// A 0600 PSK file in `dir` holding `text`.
+fn psk_file(dir: &Path, text: &str) -> PathBuf {
+    let path = dir.join("psk");
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
 }
 
 fn needs(err: &StoreError, method: &str, scope: &str) {
@@ -208,12 +250,15 @@ fn a_unix_peer_of_the_same_uid_is_served_and_another_uid_is_refused_unread() {
         &json!({"id": 1, "method": "put_doc", "params": {"collection": "docs", "id": "b", "doc": 2}}),
     )
     .unwrap();
-    let (frame, _) = read_frame(&mut raw).unwrap();
+    let (frame, _) = read_frame(&mut raw, ws::MAX_PAYLOAD).unwrap();
     assert_eq!(
         frame,
         json!({"auth": "failed", "error": "authentication failed"})
     );
-    assert!(read_frame(&mut raw).is_err(), "closed after the refusal");
+    assert!(
+        read_frame(&mut raw, ws::MAX_PAYLOAD).is_err(),
+        "closed after the refusal"
+    );
     assert_eq!(server.dispatched(), before, "nothing ran");
     assert_eq!(server.store().get_doc("docs", "b").unwrap(), None);
     assert!(
@@ -336,10 +381,10 @@ fn fake_server(
             &json!({"auth": "challenge", "v": 1, "ns": hex(&ns)}),
         )
         .unwrap();
-        let (hello, _) = read_frame(&mut stream).unwrap();
+        let (hello, _) = read_frame(&mut stream, ws::MAX_PAYLOAD).unwrap();
         write_frame(&mut stream, &answer(&hello, &ns)).unwrap();
         // Anything the client sends after a refusal would be read here.
-        let _ = read_frame(&mut stream);
+        let _ = read_frame(&mut stream, ws::MAX_PAYLOAD);
     });
     (format!("unix://{}", sock.display()), handle, dir)
 }
@@ -511,7 +556,7 @@ fn a_secret_file_others_can_read_is_refused() {
     ServerAuth::new().with_token_file(&tokens).unwrap();
 
     let psk = dir.path().join("psk");
-    std::fs::write(&psk, [TEST_PSK, b"\n"].concat()).unwrap();
+    std::fs::write(&psk, format!("{}\n", hex(TEST_PSK))).unwrap();
     std::fs::set_permissions(&psk, std::fs::Permissions::from_mode(0o644)).unwrap();
     let err = ServerAuth::new()
         .with_psk_file(TEST_SERVER_ID, &psk)
@@ -562,15 +607,13 @@ fn a_token_file_with_a_bad_line_is_refused_by_line_number() {
 }
 
 #[test]
-fn the_uri_names_secret_files_and_never_a_secret() {
+fn the_uri_names_only_a_ferrostore_variable_never_a_file_or_a_secret() {
     let dir = tempfile::tempdir().unwrap();
     let tokens = three_tokens(dir.path());
     let token = dir.path().join("my-token");
     std::fs::write(&token, format!("{WRITE_TOKEN}\n")).unwrap();
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let psk = dir.path().join("psk");
-    std::fs::write(&psk, TEST_PSK).unwrap();
-    std::fs::set_permissions(&psk, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let psk = psk_file(dir.path(), &format!("{}\n", hex(TEST_PSK)));
 
     let by_token = serve_tcp(
         FerroStore::in_memory(),
@@ -578,59 +621,78 @@ fn the_uri_names_secret_files_and_never_a_secret() {
     );
     let by_psk = serve_tcp(FerroStore::in_memory(), psk_auth());
 
-    let client = FerroStore::connect_uri(&format!(
-        "ws://{}/store?token_file={}",
-        by_token.local_addr(),
-        token.display()
-    ))
+    // Files are named in the options.
+    let client = FerroStore::connect_with(
+        &format!("ws://{}/store", by_token.local_addr()),
+        &ConnectOptions::token_file(&token),
+    )
     .unwrap();
     client.put_doc("docs", "a", &json!(1)).unwrap();
-    let client = FerroStore::connect_uri(&format!(
-        "ws://{}?psk_file={}&server_id={TEST_SERVER_ID}",
-        by_psk.local_addr(),
-        psk.display()
-    ))
+    let client = FerroStore::connect_with(
+        &format!("ws://{}", by_psk.local_addr()),
+        &ConnectOptions::psk_file(TEST_SERVER_ID, &psk),
+    )
     .unwrap();
     client.put_doc("docs", "a", &json!(1)).unwrap();
 
+    // A `FERROSTORE_` variable is accepted, and read at connect.
+    let unset = "FERROSTORE_TEST_UNSET_6B_FIX";
     for query in [
-        format!("token={WRITE_TOKEN}"),
-        "psk=0123456789abcdef0123456789abcdef&server_id=x".to_string(),
+        format!("token_env={unset}"),
+        format!("psk_env={unset}&server_id={TEST_SERVER_ID}"),
     ] {
-        let err = FerroStore::connect_uri(&format!("ws://{}?{query}", by_psk.local_addr()))
+        let err = FerroStore::connect_uri(&format!("ws://{}?{query}", by_token.local_addr()))
             .err()
             .unwrap();
-        let message = err.to_string();
-        assert!(message.contains("never"), "{message}");
         assert!(
-            !message.contains(WRITE_TOKEN),
-            "the error repeats the secret"
+            err.to_string()
+                .contains(&format!("variable `{unset}` is not set")),
+            "{query}: {err}"
         );
     }
+    let (_, options) = auth::split_uri_query(&format!("h:1?token_env={unset}")).unwrap();
+    assert!(format!("{options:?}").contains(unset), "{options:?}");
+
+    // No file, no other variable, no secret.
     for (query, needle) in [
-        (format!("psk_file={}", psk.display()), "server_id"),
+        (format!("token_file={}", token.display()), "names no file"),
+        (
+            format!("psk_file={}&server_id={TEST_SERVER_ID}", psk.display()),
+            "names no file",
+        ),
+        ("token_env=HOME".to_string(), "FERROSTORE_"),
+        (
+            "psk_env=AWS_SECRET_ACCESS_KEY&server_id=x".to_string(),
+            "FERROSTORE_",
+        ),
+        ("token_env=FERROSTORE_".to_string(), "FERROSTORE_"),
+        ("token_env=FERROSTORE_A-B".to_string(), "FERROSTORE_"),
+        (format!("token={WRITE_TOKEN}"), "never"),
+        (
+            "psk=0123456789abcdef0123456789abcdef&server_id=x".to_string(),
+            "never",
+        ),
+        (format!("psk_env={unset}"), "server_id"),
+        (format!("token_env={unset}&server_id=x"), "server_id"),
         ("colour=blue".to_string(), "colour"),
         (
-            format!(
-                "token_file={}&psk_file={}&server_id=x",
-                token.display(),
-                psk.display()
-            ),
+            format!("token_env={unset}&psk_env={unset}&server_id=x"),
             "one",
         ),
     ] {
         let err = FerroStore::connect_uri(&format!("ws://{}?{query}", by_psk.local_addr()))
             .err()
             .unwrap();
-        assert!(err.to_string().contains(needle), "{query}: {err}");
+        let message = err.to_string();
+        assert!(message.contains(needle), "{query}: {message}");
+        assert!(
+            !message.contains(WRITE_TOKEN),
+            "the error repeats the secret"
+        );
     }
     // Options and a URI that both name a credential are refused.
     let err = FerroStore::connect_with(
-        &format!(
-            "ws://{}?token_file={}",
-            by_token.local_addr(),
-            token.display()
-        ),
+        &format!("ws://{}?token_env={unset}", by_token.local_addr()),
         &psk_options(),
     )
     .err()
@@ -656,6 +718,144 @@ fn the_uri_names_secret_files_and_never_a_secret() {
     assert!(err.to_string().contains("token"), "{err}");
     assert!(!format!("{:?}", ConnectOptions::token(WRITE_TOKEN)).contains(WRITE_TOKEN));
     assert!(!format!("{:?}", psk_options()).contains("0123456789abcdef"));
+}
+
+// ---- plaintext ------------------------------------------------------------------
+
+#[test]
+fn a_credential_goes_over_plain_ws_only_to_loopback_unless_allowed() {
+    let remote_v4: SocketAddr = "10.1.2.3:7000".parse().unwrap();
+    let remote_v6: SocketAddr = "[2001:db8::1]:7000".parse().unwrap();
+    let bearer = ClientCred::Bearer("t".into());
+    let psk = ClientCred::Psk(Psk::new(TEST_SERVER_ID, TEST_PSK).unwrap());
+    for cred in [&bearer, &psk] {
+        for peer in [remote_v4, remote_v6] {
+            let err = cred.check_plaintext(peer, false).unwrap_err();
+            assert!(err.to_string().contains("plain ws://"), "{err}");
+            assert!(err.to_string().contains("allow_plaintext"), "{err}");
+            cred.check_plaintext(peer, true).unwrap();
+        }
+        for peer in [
+            "127.0.0.1:1",
+            "127.9.9.9:1",
+            "[::1]:1",
+            "[::ffff:127.0.0.1]:1",
+        ] {
+            cred.check_plaintext(peer.parse().unwrap(), false).unwrap();
+        }
+    }
+    ClientCred::None.check_plaintext(remote_v4, false).unwrap();
+
+    // Wired in: with every address taken as remote, a token is never
+    // written to the socket.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sink = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut got = Vec::new();
+        let _ = stream.read_to_end(&mut got);
+        got
+    });
+    auth::LOOPBACK_IS_REMOTE.with(|flag| flag.set(true));
+    let err = token_client(addr, WRITE_TOKEN).err().unwrap();
+    assert!(
+        err.to_string().contains("refused to send a bearer token"),
+        "{err}"
+    );
+    assert!(sink.join().unwrap().is_empty(), "bytes went to the peer");
+
+    // A PSK handshake is refused the same way, and allowed by the options
+    // (never by a URI).
+    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    let url = format!("ws://{}", server.local_addr());
+    let err = FerroStore::connect_with(&url, &psk_options())
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string().contains("refused to send a PSK handshake"),
+        "{err}"
+    );
+    let client = FerroStore::connect_with(&url, &psk_options().allow_plaintext(true)).unwrap();
+    client.put_doc("docs", "a", &json!(1)).unwrap();
+    // No credential: nothing to protect, the server decides.
+    let err = FerroStore::connect_uri(&url).err().unwrap();
+    assert!(err.to_string().contains("requires authentication"), "{err}");
+    auth::LOOPBACK_IS_REMOTE.with(|flag| flag.set(false));
+    FerroStore::connect_with(&url, &psk_options()).unwrap();
+}
+
+// ---- the PSK file -----------------------------------------------------------------
+
+#[test]
+fn a_psk_file_holds_64_or_more_hex_digits_decoded_to_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = hex(TEST_PSK);
+    for bad in [
+        // The 32 bytes themselves: hex digits, but 32 of them, not 64.
+        String::from_utf8(TEST_PSK.to_vec()).unwrap(),
+        good[..62].to_string(),
+        good[..63].to_string(),
+        format!("{}g", &good[..63]),
+        format!("{} {}", &good[..32], &good[32..]),
+        format!("{good}\n\n"),
+        String::new(),
+    ] {
+        let path = psk_file(dir.path(), &bad);
+        for err in [
+            ServerAuth::new()
+                .with_psk_file(TEST_SERVER_ID, &path)
+                .unwrap_err(),
+            ConnectOptions::psk_file(TEST_SERVER_ID, &path)
+                .resolve()
+                .err()
+                .unwrap(),
+        ] {
+            let message = err.to_string();
+            assert!(
+                message.contains("64 or more hex digits"),
+                "{bad:?}: {message}"
+            );
+            assert!(
+                message.contains("head -c 32 /dev/urandom | xxd -p -c 64"),
+                "{message}"
+            );
+            assert!(bad.len() < 8 || !message.contains(&bad[..8]), "{message}");
+        }
+    }
+    // Hex of either case, one trailing newline, 32 bytes or more: the
+    // decoded key interoperates with the raw key in the options.
+    for text in [
+        format!("{good}\n"),
+        format!("{}\r\n", good.to_uppercase()),
+        good.clone(),
+    ] {
+        let path = psk_file(dir.path(), &text);
+        let server = serve_tcp(
+            FerroStore::in_memory(),
+            ServerAuth::new()
+                .with_psk_file(TEST_SERVER_ID, &path)
+                .unwrap(),
+        );
+        let url = format!("ws://{}", server.local_addr());
+        FerroStore::connect_with(&url, &psk_options()).unwrap();
+        FerroStore::connect_with(&url, &ConnectOptions::psk_file(TEST_SERVER_ID, &path)).unwrap();
+    }
+    let long = psk_file(dir.path(), &hex(&[7u8; 64]));
+    ServerAuth::new()
+        .with_psk_file(TEST_SERVER_ID, &long)
+        .unwrap();
+    // Raw bytes in the options and in `with_psk` stay the key itself.
+    assert!(
+        ServerAuth::new()
+            .with_psk(TEST_SERVER_ID, &[1u8; 31])
+            .is_err()
+    );
+    ServerAuth::new()
+        .with_psk(TEST_SERVER_ID, &[1u8; 32])
+        .unwrap();
 }
 
 // ---- the single table of scopes -----------------------------------------------
@@ -802,4 +1002,298 @@ fn bind_tcp_without_authentication_is_an_error() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("authentication"), "{err}");
+}
+
+// ---- unauthenticated peers are bounded ---------------------------------------------
+
+/// Wait until `server` has `n` connections authenticating.
+fn wait_handshakes(server: &FerroStoreServer, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server.handshakes_in_flight() != n {
+        assert!(
+            Instant::now() < deadline,
+            "{} connections authenticating, not {n}",
+            server.handshakes_in_flight()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `true` once `stream` reads end-of-stream (or a reset) within `within`.
+fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let started = Instant::now();
+    let mut buf = [0u8; 256];
+    while started.elapsed() < within {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// A peer that sends one byte at a time, each well inside the per-read
+/// timeout, is cut off at the total handshake deadline.
+#[test]
+fn a_trickling_handshake_is_cut_off_at_the_total_deadline() {
+    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    let deadline = Duration::from_millis(600);
+    server.set_handshake_deadline(deadline);
+    let addr = server.local_addr();
+
+    let mut trickle = TcpStream::connect(addr).unwrap();
+    trickle
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let started = Instant::now();
+    trickle.write_all(b"GET / HTTP/1.1\r\nX-Slow: ").unwrap();
+    let mut closed = None;
+    while started.elapsed() < Duration::from_secs(5) {
+        // One byte per 50 ms: 16 KiB of headers would take 13 minutes.
+        if trickle.write_all(b"a").is_err() {
+            closed = Some(started.elapsed());
+            break;
+        }
+        let mut buf = [0u8; 64];
+        match trickle.read(&mut buf) {
+            Ok(0) => {
+                closed = Some(started.elapsed());
+                break;
+            }
+            Ok(_) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(30));
+            }
+            Err(_) => {
+                closed = Some(started.elapsed());
+                break;
+            }
+        }
+    }
+    let closed = closed.expect("the trickling peer was never cut off");
+    assert!(
+        closed >= deadline,
+        "cut off after {closed:?}, before the deadline"
+    );
+    assert!(
+        closed < deadline + Duration::from_secs(2),
+        "cut off after {closed:?}"
+    );
+    wait_handshakes(&server, 0);
+
+    // A client that authenticates at once is unaffected, and is not cut off
+    // once served.
+    let client = ws_client(addr);
+    thread::sleep(deadline + Duration::from_millis(200));
+    client.put_doc("docs", "a", &json!(1)).unwrap();
+    assert_eq!(client.get_doc("docs", "a").unwrap(), Some(json!(1)));
+    assert_eq!(auth::HANDSHAKE_DEADLINE, Duration::from_secs(10));
+}
+
+/// A pre-auth hello that declares 1 MiB is refused from its length: the
+/// server answers at once, without waiting for (or allocating) the payload.
+#[test]
+fn an_oversized_hello_is_refused_from_its_declared_length() {
+    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    let mut raw = RawWs::connect(server.local_addr(), None);
+    raw.challenge();
+    let mut header = vec![0x81, 0x80 | 127];
+    header.extend_from_slice(&(1u64 << 20).to_be_bytes());
+    header.extend_from_slice(&[9, 9, 9, 9]);
+    let started = Instant::now();
+    raw.stream.write_all(&header).unwrap();
+    let answer = raw.recv();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the server waited {:?} for the payload",
+        started.elapsed()
+    );
+    raw.refused(answer);
+
+    // The same over a Unix socket with a PSK: the length prefix is checked.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("s.sock");
+    let _unix =
+        FerroStoreServer::bind_unix_with(&sock, FerroStore::in_memory(), psk_auth()).unwrap();
+    let mut stream = UnixStream::connect(&sock).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (challenge, _) = read_frame(&mut stream, ws::MAX_PAYLOAD).unwrap();
+    assert_eq!(challenge["auth"], "challenge");
+    let started = Instant::now();
+    stream.write_all(&(1u32 << 20).to_be_bytes()).unwrap();
+    let (answer, _) = read_frame(&mut stream, ws::MAX_PAYLOAD).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        answer,
+        json!({"auth": "failed", "error": "authentication failed"})
+    );
+    // A hello at the limit is read whole (and refused as malformed).
+    let mut raw = RawWs::connect(server.local_addr(), None);
+    raw.challenge();
+    let padding = "x".repeat(auth::PRE_AUTH_FRAME_BYTES - 40);
+    let answer = raw.hello_value(&json!({"auth": "psk", "pad": padding}));
+    raw.refused(answer);
+}
+
+/// At most [`auth::MAX_HANDSHAKES`] connections authenticate at once; one
+/// more is closed at accept, and served connections are not counted.
+#[test]
+fn the_129th_concurrent_unauthenticated_connection_is_refused() {
+    assert_eq!(auth::MAX_HANDSHAKES, 128);
+    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    let addr = server.local_addr();
+    let served = ws_client(addr);
+    served.put_doc("docs", "a", &json!(1)).unwrap();
+
+    let silent: Vec<TcpStream> = (0..auth::MAX_HANDSHAKES)
+        .map(|_| TcpStream::connect(addr).unwrap())
+        .collect();
+    wait_handshakes(&server, auth::MAX_HANDSHAKES);
+    let refused = server.handshakes_refused();
+    let started = Instant::now();
+    let mut extra = TcpStream::connect(addr).unwrap();
+    assert!(
+        closed_within(&mut extra, Duration::from_secs(2)),
+        "the extra connection was held open"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(server.handshakes_refused(), refused + 1);
+    assert_eq!(server.handshakes_in_flight(), auth::MAX_HANDSHAKES);
+
+    // The served client keeps working while the slots are full.
+    served.put_doc("docs", "b", &json!(2)).unwrap();
+    assert_eq!(served.get_doc("docs", "a").unwrap(), Some(json!(1)));
+
+    // Freed, the slots take new clients again.
+    drop(silent);
+    wait_handshakes(&server, 0);
+    let late = ws_client(addr);
+    assert_eq!(late.get_doc("docs", "b").unwrap(), Some(json!(2)));
+
+    // The same cap on a Unix socket, lowered: the extra peer gets no
+    // challenge, only the close.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("s.sock");
+    let unix =
+        FerroStoreServer::bind_unix_with(&sock, FerroStore::in_memory(), psk_auth()).unwrap();
+    unix.set_max_handshakes(2);
+    let held: Vec<UnixStream> = (0..2)
+        .map(|_| UnixStream::connect(&sock).unwrap())
+        .collect();
+    wait_handshakes(&unix, 2);
+    let mut extra = UnixStream::connect(&sock).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        extra.read(&mut buf).unwrap(),
+        0,
+        "the extra peer was served"
+    );
+    assert_eq!(unix.handshakes_refused(), 1);
+    drop(held);
+    wait_handshakes(&unix, 0);
+    FerroStore::connect_with(&format!("unix://{}", sock.display()), &psk_options()).unwrap();
+}
+
+// ---- per-principal quotas and request ids ----------------------------------------
+
+#[test]
+fn one_credential_holds_at_most_a_quarter_of_the_sessions() {
+    use super::session::{SESSION_QUOTA, SESSIONS_PER_CONN, SESSIONS_PER_PRINCIPAL};
+    assert_eq!(SESSIONS_PER_PRINCIPAL, 256);
+    let (server, tokens, _dir) = token_principals(2);
+    let addr = server.local_addr();
+    let hog: Vec<server::RemoteClient> = (0..SESSIONS_PER_PRINCIPAL / SESSIONS_PER_CONN + 1)
+        .map(|_| token_raw(addr, &tokens[0]))
+        .collect();
+    let open = |client: &server::RemoteClient| client.call("open_session", json!({}));
+    for client in &hog[..hog.len() - 1] {
+        for _ in 0..SESSIONS_PER_CONN {
+            open(client).unwrap();
+        }
+    }
+    assert_eq!(server.open_sessions(), SESSIONS_PER_PRINCIPAL);
+    // A fresh connection of the same credential is at the quota.
+    let err = open(hog.last().unwrap()).unwrap_err();
+    assert!(err.to_string().contains(SESSION_QUOTA), "{err}");
+    // So is a read that would open one.
+    let err = hog
+        .last()
+        .unwrap()
+        .call("txn_read", json!({"read": {"p": "inventory"}}))
+        .unwrap_err();
+    assert!(err.to_string().contains(SESSION_QUOTA), "{err}");
+    // Another credential is not.
+    let other = token_raw(addr, &tokens[1]);
+    open(&other).unwrap();
+    assert_eq!(server.open_sessions(), SESSIONS_PER_PRINCIPAL + 1);
+}
+
+/// A request id is the principal's own: another principal's equal id runs
+/// as a fresh request and never gets the first principal's reply; the same
+/// principal's id for another method is refused and runs nothing.
+#[test]
+fn a_request_id_is_per_credential_and_names_one_method() {
+    use super::session::DEDUP_OTHER_METHOD;
+    let (server, tokens, _dir) = token_principals(2);
+    let addr = server.local_addr();
+    let a = token_raw(addr, &tokens[0]);
+    let b = token_raw(addr, &tokens[1]);
+    let store = server.store();
+    let req = format!("{:032x}", 0xfeed_u128);
+
+    let first = a
+        .call(
+            "publish_mq",
+            json!({"topic": "t", "key": "a", "payload": "from a", "req": req}),
+        )
+        .unwrap();
+    let seq = store.last_seq().unwrap();
+    // B's colliding id is B's own key space: it runs, and gets its reply.
+    let theirs = b
+        .call(
+            "publish_mq",
+            json!({"topic": "t", "key": "b", "payload": "from b", "req": req}),
+        )
+        .unwrap();
+    assert_ne!(theirs, first, "B was answered with A's reply");
+    assert_eq!(store.last_seq().unwrap(), seq + 1, "B's write did not run");
+    let records = store.poll_mq_group("t", "g", 10).unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    // A's own replay still answers A's first reply and runs nothing.
+    let again = a
+        .call(
+            "publish_mq",
+            json!({"topic": "t", "key": "a", "payload": "from a", "req": req}),
+        )
+        .unwrap();
+    assert_eq!(again, first);
+    assert_eq!(store.last_seq().unwrap(), seq + 1);
+    // The same id for another method is refused, and runs nothing.
+    let before = server.dispatched();
+    let err = a
+        .call(
+            "put_doc",
+            json!({"collection": "d", "id": "x", "doc": 1, "req": req}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains(DEDUP_OTHER_METHOD), "{err}");
+    assert_eq!(server.dispatched(), before, "the other method ran");
+    assert_eq!(store.get_doc("d", "x").unwrap(), None);
+    assert_eq!(store.last_seq().unwrap(), seq + 1);
 }

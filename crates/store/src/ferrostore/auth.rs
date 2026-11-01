@@ -28,7 +28,9 @@ use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long a refused connection waits before its failure frame and close,
@@ -36,6 +38,18 @@ use std::time::Duration;
 pub(super) const AUTH_FAIL_DELAY: Duration = Duration::from_millis(200);
 /// The longest either side waits for one frame of the handshake.
 pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest a connection may take to authenticate, from its accept to
+/// its `ok`, however its bytes trickle in: the server shuts down one still
+/// authenticating past it (spec §6.2).
+pub(super) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// The most connections a server lets authenticate at once. One accepted
+/// past it is closed at once, before anything is read from it; connections
+/// that have authenticated are not counted.
+pub(super) const MAX_HANDSHAKES: usize = 128;
+/// The largest frame either side reads before the connection has
+/// authenticated: every handshake frame is far smaller. The length a frame
+/// declares is checked against it before anything is allocated.
+pub(super) const PRE_AUTH_FRAME_BYTES: usize = 4096;
 /// The message of every refused authentication, on the client.
 pub(super) const AUTH_FAILED: &str = "FerroStore authentication failed";
 /// The `error` of the failure frame: it names no check.
@@ -50,6 +64,12 @@ const AUTH_VERSION: u64 = 1;
 const NONCE_LEN: usize = 32;
 /// The shortest PSK accepted, in bytes.
 pub(super) const MIN_PSK_LEN: usize = 32;
+/// The fewest hex digits a PSK file or variable holds: [`MIN_PSK_LEN`] bytes.
+const MIN_PSK_HEX: usize = 2 * MIN_PSK_LEN;
+/// How an operator makes a PSK file.
+const MAKE_PSK: &str = "head -c 32 /dev/urandom | xxd -p -c 64 > psk && chmod 600 psk";
+/// The prefix of every environment variable a `ws://` URI may name.
+pub(super) const URI_ENV_PREFIX: &str = "FERROSTORE_";
 /// The longest `server_id`, in bytes: its length is one byte of the MAC input.
 const MAX_SERVER_ID: usize = 255;
 /// The largest secret file read (PSK or token file).
@@ -58,6 +78,12 @@ const MAX_SECRET_FILE: u64 = 1024 * 1024;
 type Nonce = [u8; NONCE_LEN];
 
 // ---- scopes ---------------------------------------------------------------------
+
+/// Who a connection authenticated as: `token:<sha256 hex>` for a bearer
+/// token, `psk` for the PSK over TCP, `unix:<uid>` for a Unix peer. Quotas
+/// (sessions, exactly-once ids) are per principal, and so is the key space
+/// of request ids (spec §6.1).
+pub(super) type Principal = Arc<str>;
 
 /// What a connection may do. `Admin` covers `Write`, which covers `Read`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -348,9 +374,9 @@ impl TokenTable {
         Ok(Self { entries })
     }
 
-    /// The scope of `token`. Its SHA-256 is compared with every entry in
-    /// constant time, and every entry is compared.
-    fn lookup(&self, token: &str) -> Option<Scope> {
+    /// The scope of `token`, and its principal. Its SHA-256 is compared
+    /// with every entry in constant time, and every entry is compared.
+    fn lookup(&self, token: &str) -> Option<(Scope, Principal)> {
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let mut found = None;
         for (hash, scope) in &self.entries {
@@ -358,7 +384,7 @@ impl TokenTable {
                 found = Some(*scope);
             }
         }
-        found
+        found.map(|scope| (scope, Principal::from(format!("token:{}", hex(&digest)))))
     }
 }
 
@@ -423,22 +449,28 @@ impl ServerAuth {
         Self::default()
     }
 
-    /// Prove the server as `server_id` with the PSK `psk` (at least 32 bytes).
+    /// Prove the server as `server_id` with the PSK `psk`: the key's own
+    /// bytes, at least 32 of them (not its hex; a file holds hex, see
+    /// [`Self::with_psk_file`]).
     pub fn with_psk(mut self, server_id: &str, psk: &[u8]) -> Result<Self, StoreError> {
         self.psk = Some(Psk::new(server_id, psk)?);
         Ok(self)
     }
 
-    /// [`Self::with_psk`] with the PSK the file at `path` holds (one trailing
-    /// newline dropped). The file must be a regular file of mode 0600 or
-    /// stricter: one that group or others can read or write is refused.
+    /// [`Self::with_psk`] with the PSK the file at `path` holds: 64 or more
+    /// hex digits (32 or more random bytes), one trailing newline dropped,
+    /// decoded to the key's bytes. Anything else is refused with the command
+    /// that makes one (`head -c 32 /dev/urandom | xxd -p -c 64`). The file
+    /// must be a regular file of mode 0600 or stricter: one that group or
+    /// others can read or write is refused.
     pub fn with_psk_file(
         self,
         server_id: &str,
         path: impl AsRef<Path>,
     ) -> Result<Self, StoreError> {
-        let secret = read_secret(path.as_ref(), "PSK")?;
-        self.with_psk(server_id, &secret)
+        let text = read_secret(path.as_ref(), "PSK")?;
+        let key = decode_psk(&text, &format!("the PSK file {}", shown(path.as_ref())))?;
+        self.with_psk(server_id, &key)
     }
 
     /// Accept the bearer tokens of the token file at `path` (see the served
@@ -468,19 +500,56 @@ impl ServerAuth {
 /// A secret file's bytes, refused when others can reach it. One trailing
 /// `\n` (or `\r\n`) is dropped.
 fn read_secret(path: &Path, what: &str) -> Result<Vec<u8>, StoreError> {
-    let mut bytes = crate::private::read_secret_file(path, MAX_SECRET_FILE).map_err(|err| {
-        backend(format!(
-            "read the {what} file {}: {err}",
-            crate::private::shown_path(path)
-        ))
-    })?;
+    let mut bytes = crate::private::read_secret_file(path, MAX_SECRET_FILE)
+        .map_err(|err| backend(format!("read the {what} file {}: {err}", shown(path))))?;
+    strip_newline(&mut bytes);
+    Ok(bytes)
+}
+
+fn shown(path: &Path) -> String {
+    crate::private::shown_path(path)
+}
+
+/// Drop one trailing `\n` or `\r\n`.
+fn strip_newline(bytes: &mut Vec<u8>) {
     if bytes.ends_with(b"\n") {
         bytes.pop();
         if bytes.ends_with(b"\r") {
             bytes.pop();
         }
     }
-    Ok(bytes)
+}
+
+/// The key a PSK file or variable holds: [`MIN_PSK_HEX`] or more hex digits
+/// (either case), an even number, nothing else (its one trailing newline is
+/// already dropped). `source` names where it came from; the error repeats
+/// nothing of the text.
+pub(super) fn decode_psk(text: &[u8], source: &str) -> Result<Vec<u8>, StoreError> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let refused = || {
+        backend(format!(
+            "{source} is not a FerroStore PSK: it holds {MIN_PSK_HEX} or more hex digits \
+             (32 or more random bytes) and nothing else; make one with `{MAKE_PSK}`"
+        ))
+    };
+    if text.len() < MIN_PSK_HEX || !text.len().is_multiple_of(2) {
+        return Err(refused());
+    }
+    let mut key = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_chunks::<2>().0 {
+        let (Some(high), Some(low)) = (digit(pair[0]), digit(pair[1])) else {
+            return Err(refused());
+        };
+        key.push((high << 4) | low);
+    }
+    Ok(key)
 }
 
 // ---- the server's side of the handshake ----------------------------------------------
@@ -599,10 +668,10 @@ pub(super) fn peer_uid(_: &std::os::unix::net::UnixStream) -> std::io::Result<u3
     ))
 }
 
-/// Authenticate one connection before any request is read: `Some(scope)`
-/// once it passed (the server has sent `ok`), `None` once it was refused
-/// (the server has waited [`AUTH_FAIL_DELAY`], sent the failure frame and
-/// shut the connection down).
+/// Authenticate one connection before any request is read: `Some` with
+/// its scope and principal once it passed (the server has sent `ok`),
+/// `None` once it was refused (the server has waited [`AUTH_FAIL_DELAY`],
+/// sent the failure frame and shut the connection down).
 pub(super) fn serve_handshake(
     read: &mut dyn JsonIo,
     write: &mut dyn JsonIo,
@@ -610,14 +679,16 @@ pub(super) fn serve_handshake(
     credential: Credential,
     auth: &ServerAuth,
     own: u32,
-) -> Option<Scope> {
+) -> Option<(Scope, Principal)> {
     let outcome = match peer {
         Peer::Unix(uid) => {
             if peer_allowed(*uid, own) {
+                let principal = Principal::from(format!("unix:{own}"));
                 match &auth.psk {
                     None => send_ok(write, Scope::Admin, None),
                     Some(psk) => psk_exchange(read, write, Some(psk)),
                 }
+                .map(|scope| (scope, principal))
             } else {
                 warn_peer(*uid, own);
                 Err(())
@@ -626,16 +697,19 @@ pub(super) fn serve_handshake(
         Peer::Tcp => match credential {
             Credential::Bearer(token) => {
                 match auth.tokens.as_ref().and_then(|table| table.lookup(&token)) {
-                    Some(scope) => send_ok(write, scope, None),
+                    Some((scope, principal)) => {
+                        send_ok(write, scope, None).map(|scope| (scope, principal))
+                    }
                     None => Err(()),
                 }
             }
             Credential::Invalid => Err(()),
-            Credential::None => psk_exchange(read, write, auth.psk.as_ref()),
+            Credential::None => psk_exchange(read, write, auth.psk.as_ref())
+                .map(|scope| (scope, Principal::from("psk"))),
         },
     };
     match outcome {
-        Ok(scope) => Some(scope),
+        Ok(authed) => Some(authed),
         Err(()) => {
             refuse(write, true);
             None
@@ -674,7 +748,7 @@ fn psk_exchange(
     write
         .write_value(&json!({"auth": "challenge", "v": AUTH_VERSION, "ns": hex(&ns)}))
         .map_err(|_| ())?;
-    let hello = match read.read_value() {
+    let hello = match read.read_value(PRE_AUTH_FRAME_BYTES) {
         Ok(Incoming::Value(hello)) => hello,
         _ => return Err(()),
     };
@@ -753,9 +827,11 @@ impl Secret {
             Secret::File(path) => read_secret(path, what),
             Secret::Env(name) => {
                 use std::os::unix::ffi::OsStringExt;
-                std::env::var_os(name)
+                let mut bytes = std::env::var_os(name)
                     .map(OsStringExt::into_vec)
-                    .ok_or_else(|| backend(format!("the {what} variable `{name}` is not set")))
+                    .ok_or_else(|| backend(format!("the {what} variable `{name}` is not set")))?;
+                strip_newline(&mut bytes);
+                Ok(bytes)
             }
             Secret::Value(bytes) => Ok(bytes.clone()),
         }
@@ -782,9 +858,18 @@ enum ClientAuth {
 /// PSK under the `server_id` it expects. A bearer token is for `ws://`, sent
 /// in the upgrade's `Authorization` header. A secret is read from a file
 /// (mode 0600 or stricter) or an environment variable at connect time.
+///
+/// A PSK file or variable holds 64 or more hex digits, decoded to the key;
+/// [`Self::psk`] takes the key's own bytes (32 or more).
+///
+/// Over plain `ws://` to an address that is not loopback, the client sends
+/// no bearer token and runs no PSK handshake unless
+/// [`Self::allow_plaintext`] is set: a token travels in clear there, and a
+/// PSK handshake can be relayed. `wss://` is the remote path (spec §6.3).
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOptions {
     auth: ClientAuth,
+    allow_plaintext: bool,
 }
 
 impl ConnectOptions {
@@ -833,7 +918,24 @@ impl ConnectOptions {
     }
 
     fn with(auth: ClientAuth) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            allow_plaintext: false,
+        }
+    }
+
+    /// Let a credential go over plain `ws://` to an address that is not
+    /// loopback (default: refused). Only these options can allow it, never
+    /// a URI.
+    #[must_use]
+    pub fn allow_plaintext(mut self, allow: bool) -> Self {
+        self.allow_plaintext = allow;
+        self
+    }
+
+    /// `true` when [`Self::allow_plaintext`] is set.
+    pub(super) fn plaintext_allowed(&self) -> bool {
+        self.allow_plaintext
     }
 
     /// `true` when these options name a credential.
@@ -846,7 +948,15 @@ impl ConnectOptions {
         match &self.auth {
             ClientAuth::None => Ok(ClientCred::None),
             ClientAuth::Psk { server_id, secret } => {
-                Ok(ClientCred::Psk(Psk::new(server_id, &secret.read("PSK")?)?))
+                let bytes = secret.read("PSK")?;
+                let key = match secret {
+                    Secret::Value(_) => bytes,
+                    Secret::File(path) => {
+                        decode_psk(&bytes, &format!("the PSK file {}", shown(path)))?
+                    }
+                    Secret::Env(name) => decode_psk(&bytes, &format!("the PSK variable `{name}`"))?,
+                };
+                Ok(ClientCred::Psk(Psk::new(server_id, &key)?))
             }
             ClientAuth::Bearer(secret) => {
                 let bytes = secret.read("token")?;
@@ -883,10 +993,60 @@ impl ClientCred {
             _ => None,
         }
     }
+
+    /// `Err` when this credential would go over plain `ws://` to `peer`, an
+    /// address that is not loopback, and `allowed` (the options'
+    /// [`ConnectOptions::allow_plaintext`]) is not set. Checked after the
+    /// TCP connect and before the upgrade is written.
+    pub(super) fn check_plaintext(
+        &self,
+        peer: SocketAddr,
+        allowed: bool,
+    ) -> Result<(), StoreError> {
+        let what = match self {
+            ClientCred::None => return Ok(()),
+            ClientCred::Bearer(_) => "a bearer token",
+            ClientCred::Psk(_) => "a PSK handshake",
+        };
+        if allowed || is_loopback(peer.ip()) {
+            return Ok(());
+        }
+        Err(backend(format!(
+            "refused to send {what} over plain ws:// to {peer}, which is not a loopback \
+             address: use wss:// (spec §6.3), or set ConnectOptions::allow_plaintext(true)"
+        )))
+    }
+}
+
+/// `true` for a loopback address, an IPv4-mapped one included.
+pub(super) fn is_loopback(ip: IpAddr) -> bool {
+    #[cfg(test)]
+    if LOOPBACK_IS_REMOTE.with(std::cell::Cell::get) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test on its thread: every address is taken to be remote, so
+    /// the plaintext rule can be tested against a loopback server.
+    pub(super) static LOOPBACK_IS_REMOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The auth parameters a `ws://` URI's query may name. No other parameter
 /// is accepted, and no secret: a parameter that would carry one is refused.
+///
+/// A URI may come from a less trusted place than the code that connects, so
+/// it names a credential only by an environment variable whose name starts
+/// with [`URI_ENV_PREFIX`] (`token_env=FERROSTORE_TOKEN`), never a file and
+/// never another variable: a URI cannot make the client send an arbitrary
+/// secret to the URI's host. A file is named in [`ConnectOptions`].
 ///
 /// `rest` is the URI after `ws://`. Returns it without the query, and the
 /// options the query named (none when it had no query). Values are not
@@ -895,29 +1055,33 @@ pub(super) fn split_uri_query(rest: &str) -> Result<(String, ConnectOptions), St
     let Some((base, query)) = rest.split_once('?') else {
         return Ok((rest.to_string(), ConnectOptions::new()));
     };
-    let mut psk_file = None;
     let mut psk_env = None;
     let mut server_id = None;
-    let mut token_file = None;
     let mut token_env = None;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let slot = match key {
-            "psk_file" => &mut psk_file,
             "psk_env" => &mut psk_env,
             "server_id" => &mut server_id,
-            "token_file" => &mut token_file,
             "token_env" => &mut token_env,
+            "psk_file" | "token_file" => {
+                return Err(backend(format!(
+                    "a FerroStore URI names no file: `{key}` is refused; name the file in \
+                     ConnectOptions, or a `{URI_ENV_PREFIX}*` variable with `psk_env` or \
+                     `token_env`"
+                )));
+            }
             "psk" | "token" | "secret" | "password" | "key" => {
                 return Err(backend(format!(
-                    "a secret never goes in a FerroStore URI: name its file or variable with \
-                     `psk_file`, `psk_env`, `token_file` or `token_env` instead of `{key}`"
+                    "a secret never goes in a FerroStore URI: name its `{URI_ENV_PREFIX}*` \
+                     variable with `psk_env` or `token_env`, or pass it in ConnectOptions, \
+                     instead of `{key}`"
                 )));
             }
             other => {
                 return Err(backend(format!(
-                    "unknown FerroStore URI parameter `{other}`: the query takes `psk_file`, \
-                     `psk_env`, `server_id`, `token_file` and `token_env`"
+                    "unknown FerroStore URI parameter `{other}`: the query takes `psk_env`, \
+                     `server_id` and `token_env`"
                 )));
             }
         };
@@ -926,36 +1090,40 @@ pub(super) fn split_uri_query(rest: &str) -> Result<(String, ConnectOptions), St
                 "the FerroStore URI parameter `{key}` is empty or given twice"
             )));
         }
+        if key != "server_id" && !uri_env_name(value) {
+            return Err(backend(format!(
+                "the FerroStore URI parameter `{key}` names a variable that does not start \
+                 with `{URI_ENV_PREFIX}`: a URI may name only those (letters, digits, `_`)"
+            )));
+        }
         *slot = Some(value.to_string());
     }
-    let named = [&psk_file, &psk_env, &token_file, &token_env]
-        .iter()
-        .filter(|slot| slot.is_some())
-        .count();
-    if named > 1 {
+    if psk_env.is_some() && token_env.is_some() {
         return Err(backend(
-            "a FerroStore URI names one credential: one of `psk_file`, `psk_env`, `token_file`, \
-             `token_env`",
+            "a FerroStore URI names one credential: `psk_env` or `token_env`",
         ));
     }
-    let options = match (psk_file, psk_env, token_file, token_env) {
-        (Some(path), None, None, None) => ConnectOptions::psk_file(
-            server_id.ok_or_else(missing_server_id)?,
-            PathBuf::from(path),
-        ),
-        (None, Some(var), None, None) => {
-            ConnectOptions::psk_env(server_id.ok_or_else(missing_server_id)?, var)
-        }
-        (None, None, Some(path), None) => ConnectOptions::token_file(PathBuf::from(path)),
-        (None, None, None, Some(var)) => ConnectOptions::token_env(var),
+    let options = match (psk_env, token_env) {
+        (Some(var), None) => ConnectOptions::psk_env(server_id.ok_or_else(missing_server_id)?, var),
+        (None, Some(var)) if server_id.is_none() => ConnectOptions::token_env(var),
         _ if server_id.is_some() => {
             return Err(backend(
-                "the FerroStore URI parameter `server_id` goes with `psk_file` or `psk_env`",
+                "the FerroStore URI parameter `server_id` goes with `psk_env`",
             ));
         }
         _ => ConnectOptions::new(),
     };
     Ok((base.to_string(), options))
+}
+
+/// `FERROSTORE_` and one or more ASCII letters, digits or `_`.
+fn uri_env_name(name: &str) -> bool {
+    name.strip_prefix(URI_ENV_PREFIX).is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 fn missing_server_id() -> StoreError {
@@ -1042,7 +1210,7 @@ fn ok_scope(frame: &Value) -> Result<Scope, StoreError> {
 }
 
 fn recv_auth(read: &mut dyn JsonIo) -> Result<Value, StoreError> {
-    match read.read_value() {
+    match read.read_value(PRE_AUTH_FRAME_BYTES) {
         Ok(Incoming::Value(frame)) => Ok(frame),
         Ok(Incoming::Ping(_)) | Ok(Incoming::Close) | Err(_) => Err(backend(
             "the FerroStore connection closed during authentication",
@@ -1112,10 +1280,15 @@ mod tests {
         };
         let table =
             TokenTable::parse(&format!("{}{}", line("r", "read"), line("w", "write"))).unwrap();
-        assert_eq!(table.lookup("r"), Some(Scope::Read));
-        assert_eq!(table.lookup("w"), Some(Scope::Write));
-        assert_eq!(table.lookup("x"), None);
-        assert_eq!(table.lookup(""), None);
+        let scope = |token: &str| table.lookup(token).map(|(scope, _)| scope);
+        assert_eq!(scope("r"), Some(Scope::Read));
+        assert_eq!(scope("w"), Some(Scope::Write));
+        assert_eq!(scope("x"), None);
+        assert_eq!(scope(""), None);
+        // The principal is the token's hash, never the token.
+        let (_, principal) = table.lookup("r").unwrap();
+        assert_eq!(&*principal, format!("token:{}", hex(&Sha256::digest(b"r"))));
+        assert_ne!(principal, table.lookup("w").unwrap().1);
         assert!(equal_32(&[5u8; 32], &[5u8; 32]));
         let mut other = [5u8; 32];
         other[31] = 6;
