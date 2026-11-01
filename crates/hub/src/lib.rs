@@ -7296,7 +7296,13 @@ default_target = "wire:felicity"
     const ATTACH_PRUNE_URL: &str = "/api/v1/attachments/prune";
     const DAY_SECS: u64 = 24 * 60 * 60;
 
+    /// An upload-shaped (`<epoch_ms>-<n>-<name>`) file in the attachments dir, `age_days` old.
     fn seed_aged_attachment(tmp: &TempDir, name: &str, bytes: &[u8], age_days: u64) -> PathBuf {
+        seed_aged_file(tmp, &format!("1700000000000-0-{name}"), bytes, age_days)
+    }
+
+    /// A file named exactly `name` in the attachments dir, `age_days` old.
+    fn seed_aged_file(tmp: &TempDir, name: &str, bytes: &[u8], age_days: u64) -> PathBuf {
         let dir = tmp.path().join("attachments");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
@@ -7557,6 +7563,175 @@ default_target = "wire:felicity"
         assert!(!old.exists());
         let handle = attachments::spawn_attachment_sweep(&state).expect("sweep thread");
         assert_eq!(handle.join().unwrap().deleted_count, 0);
+    }
+
+    fn write_settings_file(tmp: &TempDir, bytes: &[u8]) {
+        let path = settings::settings_path(tmp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_missing_settings_file_or_field_sweeps_with_the_seven_day_default() {
+        // No settings file at all.
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 10);
+        let young = seed_aged_attachment(&tmp, "young.png", b"young", 5);
+        let report = attachments::run_attachment_sweep(&state).expect("sweep ran");
+        assert_eq!((report.deleted_count, report.kept_count), (1, 1));
+        assert!(!old.exists() && young.exists());
+
+        // A settings file written before the field existed.
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        write_settings_file(&tmp, br#"{"theme_preference":"light"}"#);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 10);
+        let young = seed_aged_attachment(&tmp, "young.png", b"young", 5);
+        let report = attachments::run_attachment_sweep(&state).expect("sweep ran");
+        assert_eq!((report.deleted_count, report.kept_count), (1, 1));
+        assert!(!old.exists() && young.exists());
+        let resp = prune_attachments(&state, OWNER, b"");
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["older_than_days"], 7);
+    }
+
+    #[test]
+    fn an_unreadable_retention_setting_never_deletes_by_default() {
+        for (label, stored) in [
+            ("unparseable file", &b"{ not json"[..]),
+            ("not an object", b"[7]"),
+            ("out of range", br#"{"attachment_retention_days":1000}"#),
+            ("wrong type", br#"{"attachment_retention_days":"0"}"#),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            write_settings_file(&tmp, stored);
+            let old = seed_aged_attachment(&tmp, "old.png", b"old", 30);
+
+            // No automatic sweep: not on the timer path, not after an upload.
+            assert!(
+                attachments::run_attachment_sweep(&state).is_none(),
+                "{label}"
+            );
+            assert!(
+                attachments::spawn_attachment_sweep(&state).is_none(),
+                "{label}"
+            );
+            upload_attachment(&state, "new.png");
+            assert!(
+                !state
+                    .attachment_sweep_running
+                    .load(std::sync::atomic::Ordering::Acquire),
+                "{label}: no sweep was started"
+            );
+            assert!(old.exists(), "{label}");
+
+            // A manual prune that relies on the setting is refused and deletes nothing.
+            for body in [&b""[..], b"{}"] {
+                let resp = prune_attachments(&state, OWNER, body);
+                assert_eq!(resp.status, 409, "{label}: {}", error_text(&resp));
+                assert!(
+                    error_text(&resp).starts_with("retention setting could not be read: "),
+                    "{label}: {}",
+                    error_text(&resp)
+                );
+            }
+            assert!(old.exists(), "{label}");
+
+            // An explicit age still works.
+            let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":7}"#);
+            assert_eq!(resp.status, 200, "{label}: {}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap()["report"]["deleted_count"], 1);
+            assert!(!old.exists(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_stored_zero_never_sweeps() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        write_settings_file(&tmp, br#"{"attachment_retention_days":0}"#);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 300);
+        assert!(attachments::run_attachment_sweep(&state).is_none());
+        assert!(attachments::spawn_attachment_sweep(&state).is_none());
+        upload_attachment(&state, "new.png");
+        let resp = prune_attachments(&state, OWNER, b"");
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["retention_disabled"], true);
+        assert!(old.exists());
+    }
+
+    #[test]
+    fn non_upload_files_in_the_attachments_dir_survive_sweeps_and_purges() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let notes = seed_aged_file(&tmp, "notes.md", b"notes", 400);
+        let readme = seed_aged_file(&tmp, "README", b"readme", 400);
+        let upload = seed_aged_attachment(&tmp, "old.png", b"old", 400);
+
+        let report = attachments::run_attachment_sweep(&state).expect("sweep ran");
+        assert_eq!((report.deleted_count, report.kept_count), (1, 2));
+        assert!(!upload.exists());
+
+        let resp = prune_attachments(&state, OWNER, br#"{"older_than_days":0}"#);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(
+            resp.json_value().unwrap()["report"],
+            json!({ "deleted_count": 0, "deleted_bytes": 0, "kept_count": 2 })
+        );
+        assert_eq!(fs::read(&notes).unwrap(), b"notes");
+        assert_eq!(fs::read(&readme).unwrap(), b"readme");
+    }
+
+    #[test]
+    fn a_manual_prune_returns_409_while_another_sweep_holds_the_guard() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = seed_aged_attachment(&tmp, "old.png", b"old", 30);
+        let owner = auth::HubAuthority::Owner {
+            login: "lmcfarlin".into(),
+        };
+        let req = HttpRequest::new("POST", ATTACH_PRUNE_URL)
+            .with_body(br#"{"older_than_days":0}"#.to_vec());
+
+        let guard = attachments::SweepGuard::try_acquire(&state.attachment_sweep_running)
+            .expect("free flag");
+        let resp = attachments::prune_attachments_waiting(&state, &owner, &req, Duration::ZERO);
+        assert_eq!(resp.status, 409, "{}", error_text(&resp));
+        assert_eq!(
+            error_text(&resp),
+            "an attachment sweep is already running; try again"
+        );
+        assert!(old.exists(), "a refused prune deletes nothing");
+
+        drop(guard);
+        let resp = attachments::prune_attachments_waiting(&state, &owner, &req, Duration::ZERO);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert!(!old.exists());
+    }
+
+    #[test]
+    fn a_relative_store_path_gives_an_absolute_attachments_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        state.config.store_path = PathBuf::from("fl.redb");
+        let dir = attachments::attachments_dir(&state);
+        assert!(dir.is_absolute(), "{}", dir.display());
+        assert_eq!(dir, std::env::current_dir().unwrap().join("attachments"));
+
+        state.config.store_path = PathBuf::from("sub/dir/fl.redb");
+        assert_eq!(
+            attachments::attachments_dir(&state),
+            std::env::current_dir().unwrap().join("sub/dir/attachments")
+        );
+
+        // An absolute store path is unchanged.
+        state.config.store_path = tmp.path().join("store.redb");
+        assert_eq!(
+            attachments::attachments_dir(&state),
+            tmp.path().join("attachments")
+        );
     }
 
     // --- Records 52 and 53: cloud adapter settings -------------------------------------------

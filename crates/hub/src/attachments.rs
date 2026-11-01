@@ -7,8 +7,18 @@
 //! any age, or delete them all. Expiry does not check whether a chat message still refers to a
 //! file: a deleted attachment breaks its image link in old chat transcripts.
 //!
-//! Only regular files directly inside the directory are candidates. Symlinks, directories and
-//! anything else are never touched, and nothing outside the directory is ever deleted.
+//! Only regular files directly inside the directory whose names have the upload shape
+//! `<epoch_ms>-<n>-<name>` are candidates. Any other file (a `README`, `notes.md`), symlinks,
+//! directories and anything else are never touched, and nothing outside the directory is ever
+//! deleted. The directory is `attachments/` beside the store file, made absolute, so uploads,
+//! serving and sweeps all use one directory whatever the process's working directory.
+//!
+//! If the attachments directory itself is a symlink, the sweep follows it (as upload and serving
+//! do) and expires the upload-shaped files in the directory it points to.
+//!
+//! The saved retention is read strictly: a damaged settings file, an invalid stored value or an
+//! unknown home directory skips the automatic sweep and refuses a manual prune that relies on the
+//! setting, instead of falling back to the 7-day default.
 
 use std::fs;
 use std::io;
@@ -38,14 +48,33 @@ pub(crate) struct PrunedAttachmentsReport {
     pub kept_count: u64,
 }
 
-/// The hub's attachments directory: `attachments/` beside the store file.
+/// The hub's attachments directory: `attachments/` beside the store file, as an absolute path.
+///
+/// A relative store path is resolved against the process's working directory, the same base
+/// the store itself is opened against (`fl hub serve` passes an absolute path already).
 pub(crate) fn attachments_dir(state: &HubState) -> PathBuf {
-    state
-        .config
-        .store_path
+    let store = &state.config.store_path;
+    let store = std::path::absolute(store).unwrap_or_else(|_| store.clone());
+    store
         .parent()
         .unwrap_or_else(|| Path::new("/tmp"))
         .join("attachments")
+}
+
+/// Whether `name` has the shape the hub gives an upload: `<epoch_ms>-<n>-<name>`, both numbers
+/// plain decimal integers and the name non-empty. Only such files may be expired.
+fn is_upload_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let mut parts = name.splitn(3, '-');
+    let (Some(ms), Some(idx), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let integer = |s: &str| {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u64>().is_ok()
+    };
+    integer(ms) && integer(idx) && !rest.is_empty()
 }
 
 /// Delete the expired attachments in `dir`.
@@ -54,7 +83,9 @@ pub(crate) fn attachments_dir(state: &HubState) -> PathBuf {
 /// - `Some(Duration::ZERO)`: delete every eligible file.
 /// - `Some(age)`: delete the eligible files older than `age`.
 ///
-/// Eligible means a regular file directly inside `dir` (no recursion, symlinks never followed).
+/// Eligible means a regular file directly inside `dir` (no recursion, symlinks never followed)
+/// whose name has the upload shape (see [`is_upload_name`]); other regular files are counted as
+/// kept, even for `Some(Duration::ZERO)`. `dir` itself is followed if it is a symlink.
 /// A file's age comes from its mtime; when the mtime is unavailable or in the future, from the
 /// `<epoch_ms>-` prefix of its name; when neither is usable, the file is kept. A file that cannot
 /// be deleted is counted as kept and the sweep goes on. A missing `dir` gives an empty report.
@@ -79,6 +110,11 @@ pub(crate) fn prune_expired_attachments(
             continue;
         };
         if !meta.file_type().is_file() {
+            continue;
+        }
+        if !is_upload_name(&entry.file_name()) {
+            // Not a file the hub uploaded: never deleted.
+            report.kept_count += 1;
             continue;
         }
         let expired = match max_age {
@@ -151,11 +187,28 @@ impl Drop for SweepGuard {
     }
 }
 
-/// The saved retention in days (the default when the home directory is unknown).
-fn retention_days(state: &HubState) -> u64 {
-    hub_home_dir(state).map_or(settings::DEFAULT_ATTACHMENT_RETENTION_DAYS, |home| {
-        settings::load(&home).attachment_retention_days
-    })
+/// The saved retention in days, read strictly (see
+/// [`settings::load_attachment_retention_strict`]). `Err` (with the reason) when the home
+/// directory is unknown or the setting cannot be read: never delete on `Err`.
+fn retention_days(state: &HubState) -> Result<u64, String> {
+    let home = hub_home_dir(state)
+        .ok_or_else(|| "the home directory is unknown (HOME is not set)".to_string())?;
+    settings::load_attachment_retention_strict(&home)
+}
+
+/// The retention an automatic sweep should use: `None` when retention is `0` or the setting
+/// cannot be read (then it says why, once for this sweep).
+fn automatic_sweep_retention(state: &HubState) -> Option<u64> {
+    match retention_days(state) {
+        Ok(0) => None,
+        Ok(days) => Some(days),
+        Err(reason) => {
+            eprintln!(
+                "fl-hub: attachment sweep skipped: retention setting could not be read: {reason}"
+            );
+            None
+        }
+    }
 }
 
 fn sweep_with_guard(
@@ -186,26 +239,20 @@ fn sweep_with_guard(
     }
 }
 
-/// Run an automatic sweep on this thread with the saved retention. `None` when retention is `0`
-/// or another sweep is running.
+/// Run an automatic sweep on this thread with the saved retention. `None` when retention is `0`,
+/// the setting cannot be read, or another sweep is running.
 pub(crate) fn run_attachment_sweep(state: &HubState) -> Option<PrunedAttachmentsReport> {
-    let retention = retention_days(state);
-    if retention == 0 {
-        return None;
-    }
+    let retention = automatic_sweep_retention(state)?;
     let guard = SweepGuard::try_acquire(&state.attachment_sweep_running)?;
     Some(sweep_with_guard(state, retention, guard))
 }
 
 /// Start an automatic sweep on a new thread and return at once. `None` (no thread) when
-/// retention is `0` or another sweep is running.
+/// retention is `0`, the setting cannot be read, or another sweep is running.
 pub(crate) fn spawn_attachment_sweep(
     state: &HubState,
 ) -> Option<std::thread::JoinHandle<PrunedAttachmentsReport>> {
-    let retention = retention_days(state);
-    if retention == 0 {
-        return None;
-    }
+    let retention = automatic_sweep_retention(state)?;
     let guard = SweepGuard::try_acquire(&state.attachment_sweep_running)?;
     let state = state.clone();
     std::thread::Builder::new()
@@ -222,13 +269,27 @@ const MANUAL_PRUNE_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Body (optional): `{ "older_than_days": u64 }`, at most 365; unknown fields are refused.
 /// Omitted, the saved `attachment_retention_days` applies, and when that is `0` nothing is
-/// deleted. `0` deletes every attachment. Deleted attachments break their image links in old
-/// chat transcripts. Returns `{ "report", "older_than_days", "retention_disabled" }` and
-/// broadcasts `attachments.pruned` on the `attachments` channel.
+/// deleted; when the setting cannot be read (damaged file, invalid value, unknown home) the
+/// prune is refused with `409` and deletes nothing. `0` deletes every upload-shaped attachment,
+/// however young: that includes one an in-flight upload has just written and one a queued
+/// (`send_now: false`) prompt still refers to by path. Deleted attachments break their image
+/// links in old chat transcripts. Waits up to 5 s for a running sweep, then `409`. Returns
+/// `{ "report", "older_than_days", "retention_disabled" }` and broadcasts `attachments.pruned`
+/// on the `attachments` channel.
 pub(crate) fn handle_post_attachments_prune(
     state: &HubState,
     authority: &HubAuthority,
     req: &HttpRequest,
+) -> HttpResponse {
+    prune_attachments_waiting(state, authority, req, MANUAL_PRUNE_WAIT)
+}
+
+/// [`handle_post_attachments_prune`], waiting at most `wait` for a running sweep.
+pub(crate) fn prune_attachments_waiting(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+    wait: Duration,
 ) -> HttpResponse {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -283,13 +344,21 @@ pub(crate) fn handle_post_attachments_prune(
     let (older_than_days, max_age) = match body.older_than_days {
         Some(n) => (Some(n), Some(days(n))),
         None => match retention_days(state) {
-            0 => (None, None),
-            n => (Some(n), Some(days(n))),
+            Ok(0) => (None, None),
+            Ok(n) => (Some(n), Some(days(n))),
+            Err(reason) => {
+                return HttpResponse::json(
+                    409,
+                    json!({
+                        "error": format!("retention setting could not be read: {reason}")
+                    }),
+                );
+            }
         },
     };
 
     // One sweep at a time: wait a little for an automatic one to finish.
-    let deadline = std::time::Instant::now() + MANUAL_PRUNE_WAIT;
+    let deadline = std::time::Instant::now() + wait;
     let guard = loop {
         if let Some(guard) = SweepGuard::try_acquire(&state.attachment_sweep_running) {
             break guard;
@@ -344,6 +413,11 @@ mod tests {
             .unwrap();
     }
 
+    /// An upload-shaped name, as `POST /api/v1/sessions/:id/prompt` saves it.
+    fn up(name: &str) -> String {
+        format!("1700000000000-0-{name}")
+    }
+
     fn epoch_ms(t: SystemTime) -> u128 {
         t.duration_since(UNIX_EPOCH).unwrap().as_millis()
     }
@@ -351,9 +425,9 @@ mod tests {
     #[test]
     fn deletes_old_files_and_keeps_young_ones_with_exact_counts() {
         let tmp = TempDir::new().unwrap();
-        let old = write_aged(tmp.path(), "old.png", b"12345", 10 * DAY);
-        let old2 = write_aged(tmp.path(), "old2.png", b"abc", 8 * DAY);
-        let young = write_aged(tmp.path(), "young.png", b"xy", DAY);
+        let old = write_aged(tmp.path(), &up("old.png"), b"12345", 10 * DAY);
+        let old2 = write_aged(tmp.path(), &up("old2.png"), b"abc", 8 * DAY);
+        let young = write_aged(tmp.path(), &up("young.png"), b"xy", DAY);
         let report = prune_expired_attachments(tmp.path(), Some(7 * DAY)).unwrap();
         assert_eq!(
             report,
@@ -371,9 +445,9 @@ mod tests {
     #[test]
     fn zero_deletes_every_regular_file_and_none_deletes_nothing() {
         let tmp = TempDir::new().unwrap();
-        write_aged(tmp.path(), "a.png", b"1", 10 * DAY);
-        write_aged(tmp.path(), "b.png", b"22", Duration::ZERO);
-        write_aged(tmp.path(), "c.png", b"333", DAY);
+        write_aged(tmp.path(), &up("a.png"), b"1", 10 * DAY);
+        write_aged(tmp.path(), &up("b.png"), b"22", Duration::ZERO);
+        write_aged(tmp.path(), &up("c.png"), b"333", DAY);
 
         let report = prune_expired_attachments(tmp.path(), None).unwrap();
         assert_eq!(
@@ -406,14 +480,14 @@ mod tests {
         let outside = tmp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
         let outside_target = write_aged(&outside, "secret.txt", b"keep me", 30 * DAY);
-        let inside_target = write_aged(&dir, "target.png", b"inside", 30 * DAY);
+        let inside_target = write_aged(&dir, &up("target.png"), b"inside", 30 * DAY);
         let link_in = dir.join("link-to-inside.png");
         let link_out = dir.join("link-to-outside.png");
         std::os::unix::fs::symlink(&inside_target, &link_in).unwrap();
         std::os::unix::fs::symlink(&outside_target, &link_out).unwrap();
         let sub = dir.join("sub");
         fs::create_dir_all(&sub).unwrap();
-        let nested = write_aged(&sub, "nested.png", b"nested", 30 * DAY);
+        let nested = write_aged(&sub, &up("nested.png"), b"nested", 30 * DAY);
         set_mtime(&sub, SystemTime::now() - 30 * DAY);
 
         let report = prune_expired_attachments(&dir, Some(Duration::ZERO)).unwrap();
@@ -499,6 +573,63 @@ mod tests {
         assert_eq!(name_epoch_ms(OsStr::new("-0-a.png")), None);
         assert_eq!(name_epoch_ms(OsStr::new("12a-0-a.png")), None);
         assert_eq!(name_epoch_ms(OsStr::new("a.png")), None);
+    }
+
+    #[test]
+    fn only_upload_shaped_names_are_eligible() {
+        use std::ffi::OsStr;
+        for ok in ["1730000000000-0-a.png", "1-2-x", "0-0-a-b-c", "1-0-.hidden"] {
+            assert!(is_upload_name(OsStr::new(ok)), "{ok}");
+        }
+        for bad in [
+            "README",
+            "notes.md",
+            "screenshot-1.png",
+            "1234567",
+            "1-0-",
+            "1-0",
+            "-0-a.png",
+            "1--a.png",
+            "1-x-a.png",
+            "12a-0-a.png",
+            "+1-0-a.png",
+            "99999999999999999999999-0-a.png",
+        ] {
+            assert!(!is_upload_name(OsStr::new(bad)), "{bad}");
+        }
+    }
+
+    #[test]
+    fn non_upload_files_are_never_deleted_not_even_by_a_purge() {
+        let tmp = TempDir::new().unwrap();
+        let notes = write_aged(tmp.path(), "notes.md", b"my notes", 400 * DAY);
+        let readme = write_aged(tmp.path(), "README", b"readme", 400 * DAY);
+        let dated = write_aged(tmp.path(), "2024-report.pdf", b"pdf", 400 * DAY);
+        let upload = write_aged(tmp.path(), &up("shot.png"), b"png", 400 * DAY);
+
+        let report = prune_expired_attachments(tmp.path(), Some(7 * DAY)).unwrap();
+        assert_eq!(
+            report,
+            PrunedAttachmentsReport {
+                deleted_count: 1,
+                deleted_bytes: 3,
+                kept_count: 3,
+            }
+        );
+        assert!(!upload.exists());
+
+        let report = prune_expired_attachments(tmp.path(), Some(Duration::ZERO)).unwrap();
+        assert_eq!(
+            report,
+            PrunedAttachmentsReport {
+                deleted_count: 0,
+                deleted_bytes: 0,
+                kept_count: 3,
+            }
+        );
+        assert_eq!(fs::read(&notes).unwrap(), b"my notes");
+        assert_eq!(fs::read(&readme).unwrap(), b"readme");
+        assert_eq!(fs::read(&dated).unwrap(), b"pdf");
     }
 
     #[test]

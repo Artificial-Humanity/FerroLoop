@@ -311,6 +311,9 @@ fn set<T>(slot: &mut T, value: Option<T>) {
 }
 
 /// The saved settings, or the defaults for whatever is missing or unreadable. Never fails.
+///
+/// For display and merging only: never decide a deletion from it (see
+/// [`load_attachment_retention_strict`]).
 pub(crate) fn load(home: &Path) -> Settings {
     let Ok(bytes) = std::fs::read(settings_path(home)) else {
         return Settings::default();
@@ -318,6 +321,43 @@ pub(crate) fn load(home: &Path) -> Settings {
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(doc) => Settings::from_stored(&doc),
         Err(_) => Settings::default(),
+    }
+}
+
+/// The saved `attachment_retention_days`, read strictly, for deciding deletions.
+///
+/// Unlike [`load`], it never falls back to the default on damage, because a fallback toward
+/// deletion could sweep files the Owner meant to keep (`0` = never delete).
+///
+/// - No settings file, or a file without the field: `Ok(7)`, the default.
+/// - A file that cannot be read or parsed, a root that is not an object, or a field that is not
+///   an integer in `0..=365`: `Err` with the reason. The caller must not delete on `Err`.
+pub(crate) fn load_attachment_retention_strict(home: &Path) -> Result<u64, String> {
+    let path = settings_path(home);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_ATTACHMENT_RETENTION_DAYS);
+        }
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let doc: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))?;
+    let Some(root) = doc.as_object() else {
+        return Err(format!("{} is not a JSON object", path.display()));
+    };
+    match root.get("attachment_retention_days") {
+        None => Ok(DEFAULT_ATTACHMENT_RETENTION_DAYS),
+        Some(v) => v
+            .as_u64()
+            .filter(|d| retention_in_range(*d))
+            .ok_or_else(|| {
+                format!(
+                    "attachment_retention_days in {} is {v}, not an integer between 0 and \
+                 {MAX_ATTACHMENT_RETENTION_DAYS}",
+                    path.display()
+                )
+            }),
     }
 }
 
@@ -403,6 +443,56 @@ mod tests {
             std::fs::write(&path, doc.to_string()).unwrap();
             assert_eq!(load(tmp.path()).attachment_retention_days, want, "{stored}");
         }
+    }
+
+    #[test]
+    fn strict_retention_defaults_only_when_the_file_or_field_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        // No file at all.
+        assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(7));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file without the field (written before it existed).
+        std::fs::write(&path, json!({ "theme_preference": "light" }).to_string()).unwrap();
+        assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(7));
+        for ok in [0, 30, 365] {
+            std::fs::write(
+                &path,
+                json!({ "attachment_retention_days": ok }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(ok));
+        }
+    }
+
+    #[test]
+    fn strict_retention_refuses_a_damaged_file_or_an_invalid_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let cases: [&[u8]; 9] = [
+            b"{ not json",
+            b"",
+            b"[0]",
+            br#"{"attachment_retention_days":1000}"#,
+            br#"{"attachment_retention_days":366}"#,
+            br#"{"attachment_retention_days":-1}"#,
+            br#"{"attachment_retention_days":"0"}"#,
+            br#"{"attachment_retention_days":2.5}"#,
+            br#"{"attachment_retention_days":null}"#,
+        ];
+        for bytes in cases {
+            std::fs::write(&path, bytes).unwrap();
+            let got = load_attachment_retention_strict(tmp.path());
+            assert!(got.is_err(), "{}: {got:?}", String::from_utf8_lossy(bytes));
+            // The lenient loader still shows a value for the UI.
+            let _ = load(tmp.path());
+        }
+        // A settings path that cannot be read (a directory) is refused, not defaulted.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let err = load_attachment_retention_strict(tmp.path()).unwrap_err();
+        assert!(err.contains("could not read"), "{err}");
     }
 
     #[test]
