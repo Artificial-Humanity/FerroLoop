@@ -1970,7 +1970,7 @@ mod tests {
         let mut sender = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         sender
             .request(&LocalRequest::Send {
-                args: mail("synthetic-recipient", "for kayla"),
+                args: mail("synthetic-recipient", "for synthetic-recipient"),
             })
             .unwrap();
         let ev = sub.wait_for_event(Duration::from_secs(3)).unwrap();

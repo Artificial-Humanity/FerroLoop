@@ -43,18 +43,20 @@ ledger are options you turn on per project.
 ## The Ferro Suite
 
 FerroLoop is developed as one workspace of crates plus a web app. Six parts have their own
-repository. Those repositories are extractions: each currently mirrors code that still lives
-in this one, and this repository is where the code is built and tested.
+repository, and this repository is still where their code is built and tested. Five of them
+carry their own copy of the code in the last column; FerroState is a facade crate over this
+repository's `fl-core` and `fl-store`. Every one but FerroGate takes `fl-core` from this
+repository as a git dependency.
 
 | Part | What it is | Where it lives here |
 | --- | --- | --- |
 | [FerroDeck](https://github.com/Artificial-Humanity/FerroDeck) | The command-center web app (React PWA) for supervising coding agents, and the hub daemon that serves it. | `ui/`, `crates/hub` |
 | [FerroStore](https://github.com/Artificial-Humanity/FerroStore) | The embedded store: the redb-backed local store and the single-file `.fls` store (documents, queue, tables, vectors). | `crates/store` |
-| [FerroState](https://github.com/Artificial-Humanity/FerroState) | Durable agent memory: scoped memories, handoffs, runtime state, recall and the structural code index. | `crates/core` (state modules), `fl state` |
-| [FerroWire](https://github.com/Artificial-Humanity/FerroWire) | Agent-to-agent messaging: mailboxes, receipts, the local daemon, peer relay and push to vendor CLIs. | `crates/wire` |
+| [FerroState](https://github.com/Artificial-Humanity/FerroState) | Durable agent memory. The `fl-state` crate re-exports the state model and code index from `fl-core` and the redb backend from `fl-store`, and adds ranked recall and sensitivity redaction. | `crates/core` (state modules), `crates/store`, `fl state` in `crates/cli`, redaction in `crates/hub` |
+| [FerroWire](https://github.com/Artificial-Humanity/FerroWire) | Agent-to-agent messaging transport: the local daemon, peer relay, route table and push to vendor CLIs. Its message model and mailbox traits come from `fl-core`. | `crates/wire` |
 | [FerroTrack](https://github.com/Artificial-Humanity/FerroTrack) | Two-tier tracking: GitHub Issues as a tier, the `fl/ledger` branch, and the pull-request client. | `crates/github` |
 | [FerroGate](https://github.com/Artificial-Humanity/FerroGate) | The zero-knowledge secrets vault, credential proxy and API-to-MCP gateway. | `crates/gate` |
-| FerroWatch | Reserved name for observability and monitoring. A roadmap item: no repository and no code yet. | — |
+| FerroWatch | Reserved name for observability and monitoring: no repository and no code yet. See [Roadmap](#roadmap). | — |
 
 The six repositories are mounted as optional git submodules under `submodules/`. The build does
 not use them. See [Submodules](docs/getting-started.md#submodules).
@@ -63,14 +65,18 @@ not use them. See [Submodules](docs/getting-started.md#submodules).
 
 ## Installation
 
-Today the only route is building from source.
+The goal is to install, uninstall, or install component by component. Today the only route is
+building from source.
 
 * Rust 1.98+ (edition 2024) and Cargo
 * git: `fl project add` refuses a directory that is not a git working tree with at least one
   commit
 * Optional: an execution CLI (`claude`, `codex`, `agy`, `muse` or `grok`), for `fl attempt` and
   `fl flow`
-* Optional: Node.js and npm, to build the FerroDeck bundle in `ui/`
+* Optional: Node.js and npm, to build the FerroDeck bundle in `ui/` (the `Dockerfile` builds it
+  with Node.js 22)
+* Optional: a GitHub repository and a token or GitHub App, for the tracker, ledger and
+  `fl github pr`
 
 ```console
 git clone --recurse-submodules https://github.com/Artificial-Humanity/FerroLoop.git
@@ -103,6 +109,16 @@ output and a refusal. A store `fl` creates is private to your Unix user: file mo
 directory `0700`. `FL_QUIET_STORE_PERMS=1` silences the warning about an existing store that
 others can reach. Which store `fl` opens, and the permission details, are in
 [Where the store lives](docs/getting-started.md#where-the-store-lives).
+
+---
+
+## Roadmap
+
+* Native desktop and mobile packaging for FerroDeck (Tauri 2), next to the PWA that
+  `fl hub serve` serves.
+* Multi-hub federation across tailnets for `fl wire` and `fl hub`.
+* A cherry-pick installer: install `fl` and optional components without building from source.
+* FerroWatch: observability and monitoring.
 
 ---
 

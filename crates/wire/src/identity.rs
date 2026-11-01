@@ -250,8 +250,11 @@ fn note_agy_proc_env(
 /// the default path and, unless host discovery is disabled, `~/.cache/agent-bus/routes.json`
 /// (what live agent sessions registered), and `RouteTable::save(None)` overwrites the default
 /// path. A test that reaches either would pass or fail depending on which agents run on the
-/// machine, and could dispatch to a real session. Under `cfg(test)` a `None` path therefore
-/// panics, so a test must hand the table a path in its own temp directory.
+/// machine, and could dispatch to a real session. When fl-wire's own unit tests are built
+/// (`cfg(test)` on this crate) a `None` path therefore panics, so those tests must hand the
+/// table a path in their own temp directory. The guard does not cover other crates' tests:
+/// fl-hub and fl-cli tests compile fl-wire without `cfg(test)`, so there a `None` path still
+/// reaches the real route table.
 #[cfg(test)]
 fn refuse_default_route_path(custom_path: Option<&Path>, operation: &str) {
     assert!(

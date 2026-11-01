@@ -11,9 +11,8 @@ use fl_core::arch::{
     check_architecture_conformance, export_likec4_dsl, validate_architecture_model,
 };
 use fl_core::state::validate_slug;
-use fl_hub::discovery::scan_workspace_for_arch;
+use fl_hub::discovery::{arch_scan_walk, scan_workspace_for_arch};
 use serde_json::json;
-use walkdir::WalkDir;
 
 use crate::cmd::agent::write_atomic_non_symlink;
 
@@ -149,20 +148,6 @@ fn slugify_identifier(raw: &str, fallback: &str) -> String {
     validate_slug(&slug).unwrap_or_else(|_| fallback.to_string())
 }
 
-fn should_skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | "target" | "node_modules" | "dist" | ".fl" | ".superpowers" | ".cargo"
-    )
-}
-
-/// The repository's top-level `submodules/` directory mounts standalone repositories (see
-/// `docs/getting-started.md`). Their crates are not workspace packages of this repository, so
-/// the scan must not read their manifests or sources, populated or not.
-fn is_submodule_mount(entry: &walkdir::DirEntry) -> bool {
-    entry.depth() == 1 && entry.file_name() == "submodules"
-}
-
 fn infer_architecture_model(cwd: &Path) -> Result<ArchitectureModel, (i32, String)> {
     let raw_dir_name = cwd
         .file_name()
@@ -177,19 +162,7 @@ fn infer_architecture_model(cwd: &Path) -> Result<ArchitectureModel, (i32, Strin
     };
 
     let mut manifest_paths = BTreeSet::new();
-    for entry in WalkDir::new(cwd)
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !e.file_type().is_dir()
-                || (e
-                    .file_name()
-                    .to_str()
-                    .is_none_or(|name| !should_skip_dir(name))
-                    && !is_submodule_mount(e))
-        })
-        .flatten()
-    {
+    for entry in arch_scan_walk(cwd) {
         let p = entry.path();
         if p.is_file() && p.file_name().and_then(|s| s.to_str()) == Some("Cargo.toml") {
             manifest_paths.insert(p.to_path_buf());
@@ -461,4 +434,50 @@ fn cmd_likec4(
         print!("{dsl}");
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component_packages(model: &ArchitectureModel) -> BTreeSet<&str> {
+        model
+            .components
+            .iter()
+            .filter_map(|c| c.package.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn init_inference_honours_the_root_manifest_workspace_exclude() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        write(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"pkg-a\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "submodules/Standalone/Cargo.toml",
+            "[package]\nname = \"pkg-standalone\"\nversion = \"0.1.0\"\n",
+        );
+
+        write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"submodules\"]\n",
+        );
+        let model = infer_architecture_model(root).unwrap();
+        assert_eq!(component_packages(&model), BTreeSet::from(["pkg-a"]));
+
+        write("Cargo.toml", "[workspace]\nmembers = [\"crates/a\"]\n");
+        let model = infer_architecture_model(root).unwrap();
+        assert_eq!(
+            component_packages(&model),
+            BTreeSet::from(["pkg-a", "pkg-standalone"])
+        );
+    }
 }
