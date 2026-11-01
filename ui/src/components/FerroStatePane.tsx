@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import type {
   CodeSearchKind,
   CodeSymbolHit,
@@ -138,6 +139,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
   apiClient,
 }) => {
   const isOwner = authority?.tier === "owner";
+  const activeTimeZone = useActiveTimeZone();
 
   const [subView, setSubView] = useState<"explorer" | "code">("explorer");
   const [internalEntries, setInternalEntries] = useState<StateEntry[]>([]);
@@ -631,7 +633,10 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
 
         <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", fontSize: "12px", color: "var(--text-muted)" }}>
           <span>
-            Updated: <span className="fd-mono">{entry.updated_at}</span>
+            Updated:{" "}
+            <span className="fd-mono" title={entry.updated_at}>
+              {formatTimestamp(entry.updated_at, activeTimeZone)}
+            </span>
           </span>
           <span>
             By: <span className="fd-mono">{entry.by}</span>

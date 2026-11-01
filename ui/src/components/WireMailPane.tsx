@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentRecord,
@@ -75,6 +76,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   const [internalMessages, setInternalMessages] = useState<WireInboxItem[]>([]);
   const [internalLoading, setInternalLoading] = useState(false);
   const [internalError, setInternalError] = useState<string | null>(null);
+  const activeTimeZone = useActiveTimeZone();
 
   const [scope, setScope] = useState<RecipientScope>("selected");
   const [unreadOnly, setUnreadOnly] = useState<boolean>(false);
@@ -424,6 +426,11 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                       <span
                         data-testid={`mail-status-${msg.id}`}
                         className="fd-badge"
+                        title={
+                          item.receipt?.acked_at
+                            ? `Acked at ${formatTimestamp(item.receipt.acked_at, activeTimeZone)}`
+                            : undefined
+                        }
                         style={
                           isAcked
                             ? {
@@ -444,10 +451,12 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
 
                     <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                       <time
+                        dateTime={msg.created_at}
+                        title={msg.created_at}
                         className="fd-mono"
                         style={{ fontSize: "11px", color: "var(--text-dim)" }}
                       >
-                        {msg.created_at}
+                        {formatTimestamp(msg.created_at, activeTimeZone)}
                       </time>
 
                       {!isAcked && (

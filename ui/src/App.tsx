@@ -17,12 +17,19 @@ import { PairingModal } from "./components/PairingModal";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
-import { SettingsModal } from "./components/SettingsModal";
+import {
+  SettingsModal,
+  executeScopedBulkSessionAction,
+} from "./components/SettingsModal";
 import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
 import { WireMailPane } from "./components/WireMailPane";
+import {
+  setActiveTimeZone,
+  useActiveTimeZone,
+} from "./lib/datetime";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
@@ -275,6 +282,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
   const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
   const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
@@ -287,7 +295,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [secondaryTab, setSecondaryTab] = useState<Exclude<CockpitTab, "chat">>("git");
   const [splitView, setSplitView] = useState<boolean>(false);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
+  const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+  useActiveTimeZone();
   const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
   const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
 
@@ -305,6 +315,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     });
     setSplitView(true);
     setSecondaryTab("artifacts");
+    setActiveTab("artifacts");
   }, []);
 
   useEffect(() => {
@@ -431,11 +442,20 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const [loading, setLoading] = useState<boolean>(false);
 
-  // Update secondaryTab whenever user selects a non-chat tab
+  // ChatPane always stays on the primary canvas; secondary tabs open/toggle the right split panel.
   const handleSelectTab = (tab: CockpitTab) => {
-    setActiveTab(tab);
-    if (tab !== "chat") {
+    if (tab === "chat") {
+      setSplitView(false);
+      setActiveTab("chat");
+      return;
+    }
+    if (splitView && secondaryTab === tab) {
+      setSplitView(false);
+      setActiveTab("chat");
+    } else {
       setSecondaryTab(tab);
+      setActiveTab(tab);
+      setSplitView(true);
     }
   };
 
@@ -621,6 +641,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         archRes,
         statsRes,
         nodesRes,
+        settingsRes,
       ] = await Promise.all([
         apiClient.getAgents().catch(() => null),
         apiClient.getAgentsLiveness().catch(() => null),
@@ -633,7 +654,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         apiClient.getArchitecture().catch(() => null),
         apiClient.getStats().catch(() => null),
         apiClient.fetchNodes().catch(() => null),
+        apiClient.getSettings().catch(() => null),
       ]);
+
+      if (settingsRes?.timezone) {
+        setActiveTimeZone(settingsRes.timezone);
+      }
 
       if (nodesRes) {
         setNodes(nodesRes);
@@ -1238,8 +1264,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return res;
   };
 
-  const handleBulkSessionAction = async (action: BulkSessionAction) => {
-    const res = await apiClient.bulkSessionAction(action);
+  const handleBulkSessionAction = async (
+    action: BulkSessionAction,
+    selectedAgentKeys?: string[],
+  ) => {
+    const res = await executeScopedBulkSessionAction(
+      apiClient,
+      action,
+      selectedAgentKeys,
+    );
     await Promise.all([
       refreshWireAndRoster(),
       refreshSessionsAndTranscript(),
@@ -1430,8 +1463,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           }
           setAgentSettingsOpen(true);
         }}
+        onOpenProjectSettings={(project) => {
+          setSettingsInitialProject(project);
+          setSettingsModalOpen(true);
+        }}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
+        isCollapsedDesktop={desktopSidebarCollapsed}
         onClose={() => setMobileRosterOpen(false)}
       />
 
@@ -1456,10 +1494,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           splitView={splitView}
           onToggleSplitView={() => {
             setSplitView((prev) => {
-              if (prev) {
-                setActiveTab("chat");
-              }
-              return !prev;
+              const next = !prev;
+              setActiveTab(next ? secondaryTab : "chat");
+              return next;
             });
           }}
           themeMode={themeMode}
@@ -1468,7 +1505,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           wsConnected={wsConnected}
           onlineNodesCount={onlineNodesCount}
           onOpenNodesModal={() => setNodesModalOpen(true)}
-          onOpenSettingsModal={() => setSettingsModalOpen(true)}
+          onOpenSettingsModal={() => {
+            setSettingsInitialProject(null);
+            setSettingsModalOpen(true);
+          }}
           onOpenHelpModal={(tab) => {
             setHelpTopic(tab ?? activeTab);
             setHelpDrawerOpen(true);
@@ -1482,7 +1522,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
-          onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
+          onOpenMobileRoster={() => {
+            setMobileRosterOpen((prev) => !prev);
+            setDesktopSidebarCollapsed((prev) => !prev);
+          }}
           mobileSidebarOpen={mobileRosterOpen}
         />
 
@@ -1490,52 +1533,43 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           className={`fd-workspace${splitView ? " is-split" : ""}`}
           data-testid="cockpit-workspace"
         >
-          {splitView ? (
-            <>
-              <ChatPane
-                agentName={selectedAgent?.name_key ?? null}
-                agentDisplayName={selectedAgent?.display_name ?? null}
-                agentRole={selectedAgent?.role ?? null}
-                agentProject={selectedAgent?.project ?? null}
-                adapter={activeSession?.adapter ?? null}
-                model={activeSession?.model ?? null}
-                thinkingLevel={activeSession?.thinking_level ?? null}
-                availableModels={activeSession?.available_models ?? null}
-                sessionId={activeSession?.id ?? null}
-                turns={transcriptTurns}
-                contextUsage={sessionContextUsage}
-                quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
-                isBusy={isSessionBusy}
-                queue={sessionQueue}
-                loading={loading}
-                wsConnected={wsConnected}
-                agentSettingsOpen={agentSettingsOpen}
-                onOpenAgentSettings={() => setAgentSettingsOpen(true)}
-                onCloseAgentSettings={() => setAgentSettingsOpen(false)}
-                onToggleArtifacts={() => {
-                  setSplitView((prev) => !prev || secondaryTab !== "artifacts");
-                  setSecondaryTab("artifacts");
-                }}
-                onRefresh={() => void refreshSessionsAndTranscript()}
-                onSendPrompt={handleSendPrompt}
-                onSendQueuedNow={handleSendQueuedNow}
-                onCancelQueued={handleCancelQueued}
-                onUpdateQueued={handleUpdateQueued}
-                onDecommissionSession={handleDecommissionSession}
-                onInterruptSession={handleInterruptSession}
-                onSetSessionModel={handleSetSessionModel}
-                onOpenArtifact={handleOpenArtifact}
-                onOpenHelpTopic={(topic) => {
-                  setHelpTopic(topic);
-                  setHelpDrawerOpen(true);
-                }}
-                apiClient={apiClient}
-              />
-              {renderSecondaryPane(rightSplitTab)}
-            </>
-          ) : (
-            renderSecondaryPane(activeTab)
-          )}
+          <ChatPane
+            agentName={selectedAgent?.name_key ?? null}
+            agentDisplayName={selectedAgent?.display_name ?? null}
+            agentRole={selectedAgent?.role ?? null}
+            agentProject={selectedAgent?.project ?? null}
+            adapter={activeSession?.adapter ?? null}
+            model={activeSession?.model ?? null}
+            thinkingLevel={activeSession?.thinking_level ?? null}
+            availableModels={activeSession?.available_models ?? null}
+            sessionId={activeSession?.id ?? null}
+            turns={transcriptTurns}
+            contextUsage={sessionContextUsage}
+            quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
+            isBusy={isSessionBusy}
+            queue={sessionQueue}
+            loading={loading}
+            wsConnected={wsConnected}
+            agentSettingsOpen={agentSettingsOpen}
+            onOpenAgentSettings={() => setAgentSettingsOpen(true)}
+            onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+            onToggleArtifacts={() => handleSelectTab("artifacts")}
+            onRefresh={() => void refreshSessionsAndTranscript()}
+            onSendPrompt={handleSendPrompt}
+            onSendQueuedNow={handleSendQueuedNow}
+            onCancelQueued={handleCancelQueued}
+            onUpdateQueued={handleUpdateQueued}
+            onDecommissionSession={handleDecommissionSession}
+            onInterruptSession={handleInterruptSession}
+            onSetSessionModel={handleSetSessionModel}
+            onOpenArtifact={handleOpenArtifact}
+            onOpenHelpTopic={(topic) => {
+              setHelpTopic(topic);
+              setHelpDrawerOpen(true);
+            }}
+            apiClient={apiClient}
+          />
+          {splitView && renderSecondaryPane(rightSplitTab)}
         </main>
 
         {/* Mobile Bottom Navigation Bar */}
@@ -1604,7 +1638,30 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
       <SettingsModal
         isOpen={settingsModalOpen}
-        onClose={() => setSettingsModalOpen(false)}
+        onClose={() => {
+          setSettingsModalOpen(false);
+          setSettingsInitialProject(null);
+        }}
+        initialProject={settingsInitialProject}
+        agents={agents}
+        authority={authority}
+        wsConnected={wsConnected}
+        onlineNodesCount={onlineNodesCount}
+        activeCockpitTab={activeTab}
+        onSelectCockpitTab={handleSelectTab}
+        onOpenNodesModal={() => setNodesModalOpen(true)}
+        onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
+        onOpenPairingModal={() => setPairingOpen(true)}
+        onLogout={handleLogout}
+        onAgentsUpdated={() => void refreshWireAndRoster()}
+        onDecommissionAgent={async (targetId, mode) => {
+          const res = await apiClient.decommissionSession(targetId, mode);
+          await Promise.all([
+            refreshWireAndRoster(),
+            refreshSessionsAndTranscript(),
+          ]);
+          return res;
+        }}
         onBulkSessionAction={handleBulkSessionAction}
         onSettingsUpdated={(updated) => {
           if (
@@ -1613,6 +1670,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           ) {
             persistThemeMode(updated.theme_preference);
             setThemeMode(updated.theme_preference);
+          }
+          if (updated.timezone) {
+            setActiveTimeZone(updated.timezone);
           }
         }}
         apiClient={apiClient}

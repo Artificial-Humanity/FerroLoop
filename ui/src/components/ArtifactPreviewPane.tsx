@@ -18,6 +18,7 @@ import {
   RichMarkdown,
 } from "./RichMarkdown";
 import { extractTurnAttachments } from "./TurnCard";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
 
 export interface ArtifactPreviewPaneProps {
@@ -731,9 +732,9 @@ export function shortSha(sha: string): string {
   return sha.slice(0, 8);
 }
 
-export function formatVersionTime(ms: number): string {
+export function formatVersionTime(ms: number, timeZone?: string): string {
   if (!Number.isFinite(ms) || ms <= 0) return "unknown time";
-  return new Date(ms).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+  return formatTimestamp(ms, timeZone);
 }
 
 const DIFF_COLORS = {
@@ -958,6 +959,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     }
     return allDiscoveredPaths.filter((p) => isUserFacingArtifactPath(p));
   }, [allDiscoveredPaths, artifactFilter]);
+  const activeTimeZone = useActiveTimeZone();
 
   // Auto-select the most recent discovered artifact if none is selected yet
   useEffect(() => {
@@ -1719,7 +1721,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                         {formatByteSize(v.size_bytes)}
                       </span>
                       <span className="fd-mono" style={{ color: "var(--text-dim)" }}>
-                        {formatVersionTime(v.recorded_at_ms)}
+                        {formatVersionTime(v.recorded_at_ms, activeTimeZone)}
                       </span>
                       <button
                         type="button"

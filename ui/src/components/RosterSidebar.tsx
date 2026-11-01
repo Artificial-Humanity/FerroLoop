@@ -7,6 +7,8 @@ import {
   type DiscoveredSessionSummary,
 } from "../types/api";
 
+export const COLLAPSED_PROJECTS_STORAGE_KEY = "fd_collapsed_projects";
+
 export interface RosterSidebarProps {
   agents: AgentRecord[];
   routes: DiscoveredSessionSummary[];
@@ -15,8 +17,10 @@ export interface RosterSidebarProps {
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
+  onOpenProjectSettings?: (project: string) => void;
   onOpenSpinUpModal?: () => void;
   isOpen?: boolean;
+  isCollapsedDesktop?: boolean;
   onClose?: () => void;
 }
 
@@ -68,11 +72,52 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   selectedAgentName,
   onSelectAgent,
   onOpenAgentSettings,
+  onOpenProjectSettings,
   onOpenSpinUpModal,
   isOpen = false,
+  isCollapsedDesktop = false,
   onClose,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
+  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => {
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        const raw = window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            return new Set(parsed.map((p) => String(p).toLowerCase()));
+          }
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return new Set();
+  });
+
+  const toggleProjectGroup = (project: string) => {
+    const key = project.toLowerCase();
+    setCollapsedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      try {
+        if (typeof window !== "undefined" && window.localStorage) {
+          window.localStorage.setItem(
+            COLLAPSED_PROJECTS_STORAGE_KEY,
+            JSON.stringify(Array.from(next)),
+          );
+        }
+      } catch {
+        // Ignore storage errors
+      }
+      return next;
+    });
+  };
 
   const enrichedAgents = useMemo<EnrichedAgent[]>(() => {
     const baseAgents = agents.length > 0 ? agents : DEFAULT_WORKSPACE_AGENTS;
@@ -180,10 +225,11 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         />
       )}
       <aside
-        className={`fd-sidebar${isOpen ? " is-open" : ""}`}
+        className={`fd-sidebar${isOpen ? " is-open" : ""}${isCollapsedDesktop ? " is-desktop-collapsed" : ""}`}
         aria-label="Agent Roster"
         data-testid="roster-sidebar"
         data-mobile-open={isOpen ? "true" : "false"}
+        data-desktop-collapsed={isCollapsedDesktop ? "true" : "false"}
       >
       <div
         style={{
@@ -223,20 +269,34 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <span className="fd-badge" title="Registered Workspace Agents">
-              {enrichedAgents.length} agents
-            </span>
-            {onOpenSpinUpModal && (
-              <button
-                type="button"
-                className="fd-btn fd-btn-primary"
-                data-testid="spin-up-agent-btn"
-                onClick={onOpenSpinUpModal}
-                style={{ padding: "3px 8px", fontSize: "11px" }}
-              >
-                + Spin Up
-              </button>
-            )}
+            <div
+              style={{
+                position: "absolute",
+                width: "1px",
+                height: "1px",
+                padding: 0,
+                margin: "-1px",
+                overflow: "hidden",
+                clip: "rect(0, 0, 0, 0)",
+                whiteSpace: "nowrap",
+                border: 0,
+              }}
+            >
+              <span className="fd-badge" title="Registered Workspace Agents">
+                {enrichedAgents.length} agents
+              </span>
+              {onOpenSpinUpModal && (
+                <button
+                  type="button"
+                  className="fd-btn fd-btn-primary"
+                  data-testid="spin-up-agent-btn"
+                  onClick={onOpenSpinUpModal}
+                  style={{ padding: "3px 8px", fontSize: "11px" }}
+                >
+                  + Spin Up
+                </button>
+              )}
+            </div>
             {onClose && (
               <button
                 type="button"
@@ -274,155 +334,241 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             No matching agents found.
           </div>
         ) : (
-          groupedByProject.map(([project, items]) => (
-            <div key={project} style={{ marginBottom: "14px" }}>
-              <div
-                style={{
-                  padding: "4px 8px",
-                  fontSize: "11px",
-                  fontWeight: 700,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.05em",
-                  color: "var(--text-muted)",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                }}
-              >
-                <span>{project}</span>
-                <span style={{ fontSize: "10px", color: "var(--text-dim)" }}>{items.length}</span>
-              </div>
+          groupedByProject.map(([project, items]) => {
+            const projectLower = project.toLowerCase();
+            const isGroupCollapsed = collapsedProjects.has(projectLower);
+            const projectUnread = items.reduce((sum, a) => sum + a.unreadCount, 0);
 
-              <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                {items.map(({ record, livenessState, adapter, unreadCount }) => {
-                  const key = record.name_key.toLowerCase();
-                  const isSelected = key === selectedKey;
-                  const dotClass =
-                    livenessState === "alive"
-                      ? "fd-dot fd-dot-alive"
-                      : livenessState === "stale"
-                        ? "fd-dot fd-dot-stale"
-                        : "fd-dot fd-dot-dead";
-
-                  return (
-                    <div
-                      key={record.id || record.name_key}
-                      role="button"
-                      tabIndex={0}
-                      data-testid={`agent-row-${key}`}
-                      onClick={() => {
-                        onSelectAgent(record.name_key);
-                        onClose?.();
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          onSelectAgent(record.name_key);
-                          onClose?.();
-                        }
-                      }}
+            return (
+              <div key={project} style={{ marginBottom: "14px" }}>
+                <div
+                  style={{
+                    padding: "4px 8px",
+                    fontSize: "11px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.05em",
+                    color: "var(--text-muted)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
+                >
+                  <button
+                    type="button"
+                    data-testid={`project-group-toggle-${projectLower}`}
+                    aria-expanded={!isGroupCollapsed}
+                    onClick={() => toggleProjectGroup(project)}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      color: "inherit",
+                      fontSize: "inherit",
+                      fontWeight: "inherit",
+                      textTransform: "inherit",
+                      letterSpacing: "inherit",
+                      cursor: "pointer",
+                      textAlign: "left",
+                      flex: 1,
+                      minWidth: 0,
+                    }}
+                  >
+                    <span style={{ fontSize: "10px", width: "10px", display: "inline-block" }}>
+                      {isGroupCollapsed ? "▸" : "▾"}
+                    </span>
+                    <span
                       style={{
-                        width: "100%",
-                        textAlign: "left",
-                        padding: "8px 10px",
-                        borderRadius: "var(--radius-md)",
-                        border: isSelected
-                          ? "1px solid var(--border-accent)"
-                          : "1px solid transparent",
-                        backgroundColor: isSelected ? "var(--accent-subtle)" : "transparent",
-                        color: "var(--text-primary)",
-                        cursor: "pointer",
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: "5px",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
                       }}
                     >
-                      <div
+                      {project}
+                    </span>
+                  </button>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                    {projectUnread > 0 && (
+                      <span
+                        data-testid={`project-unread-badge-${projectLower}`}
+                        className="fd-badge"
+                        title={`${projectUnread} unread wire message${projectUnread === 1 ? "" : "s"} in ${project}`}
                         style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: "6px",
+                          backgroundColor: "var(--accent-primary)",
+                          color: "#0A0D12",
+                          borderColor: "var(--accent-primary)",
+                          fontWeight: 700,
+                          fontSize: "10px",
+                          padding: "1px 5px",
                         }}
                       >
-                        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                          <span
-                            data-testid={`liveness-dot-${key}`}
-                            className={dotClass}
-                            title={`Liveness: ${livenessState}`}
-                          />
-                          <span style={{ fontWeight: 600, fontSize: "13px" }}>
-                            {record.display_name}
-                          </span>
-                        </div>
+                        {projectUnread}
+                      </span>
+                    )}
+                    <span style={{ fontSize: "10px", color: "var(--text-dim)" }}>
+                      {items.length}
+                    </span>
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid={`project-settings-btn-${projectLower}`}
+                      title={`Project settings for ${project}`}
+                      aria-label={`Project settings for ${project}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onOpenProjectSettings?.(project);
+                      }}
+                      style={{
+                        padding: "1px 5px",
+                        fontSize: "11px",
+                        minHeight: "20px",
+                        lineHeight: 1,
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      ⚙
+                    </button>
+                  </div>
+                </div>
 
-                        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                          {unreadCount > 0 && (
-                            <span
-                              data-testid={`unread-badge-${key}`}
-                              className="fd-badge"
-                              style={{
-                                backgroundColor: "var(--accent-primary)",
-                                color: "#0A0D12",
-                                borderColor: "var(--accent-primary)",
-                                fontWeight: 700,
-                              }}
-                            >
-                              {unreadCount}
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            className="fd-btn"
-                            data-testid={`agent-settings-btn-${key}`}
-                            title={`Settings for ${record.display_name}`}
-                            aria-label={`Settings for ${record.display_name}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
+                {!isGroupCollapsed && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
+                    {items.map(({ record, livenessState, adapter, unreadCount }) => {
+                      const key = record.name_key.toLowerCase();
+                      const isSelected = key === selectedKey;
+                      const dotClass =
+                        livenessState === "alive"
+                          ? "fd-dot fd-dot-alive"
+                          : livenessState === "stale"
+                            ? "fd-dot fd-dot-stale"
+                            : "fd-dot fd-dot-dead";
+
+                      return (
+                        <div
+                          key={record.id || record.name_key}
+                          role="button"
+                          tabIndex={0}
+                          data-testid={`agent-row-${key}`}
+                          onClick={() => {
+                            onSelectAgent(record.name_key);
+                            onClose?.();
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
                               onSelectAgent(record.name_key);
-                              onOpenAgentSettings?.(record.name_key);
                               onClose?.();
-                            }}
+                            }
+                          }}
+                          style={{
+                            width: "100%",
+                            textAlign: "left",
+                            padding: "8px 10px",
+                            borderRadius: "var(--radius-md)",
+                            border: isSelected
+                              ? "1px solid var(--border-accent)"
+                              : "1px solid transparent",
+                            backgroundColor: isSelected ? "var(--accent-subtle)" : "transparent",
+                            color: "var(--text-primary)",
+                            cursor: "pointer",
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: "5px",
+                          }}
+                        >
+                          <div
                             style={{
-                              padding: "1px 5px",
-                              fontSize: "11px",
-                              minHeight: "20px",
-                              lineHeight: 1,
-                              color: "var(--text-muted)",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: "6px",
                             }}
                           >
-                            ⚙
-                          </button>
-                        </div>
-                      </div>
+                            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                              <span
+                                data-testid={`liveness-dot-${key}`}
+                                className={dotClass}
+                                title={`Liveness: ${livenessState}`}
+                              />
+                              <span style={{ fontWeight: 600, fontSize: "13px" }}>
+                                {record.display_name}
+                              </span>
+                            </div>
 
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          paddingLeft: "16px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span className="fd-badge" data-testid={`role-badge-${key}`}>
-                          {formatRoleLabel(record.role)}
-                        </span>
-                        {adapter && (
-                          <span
-                            data-testid={`adapter-pill-${key}`}
-                            className={getAdapterBadgeClass(adapter)}
+                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              {unreadCount > 0 && (
+                                <span
+                                  data-testid={`unread-badge-${key}`}
+                                  className="fd-badge"
+                                  style={{
+                                    backgroundColor: "var(--accent-primary)",
+                                    color: "#0A0D12",
+                                    borderColor: "var(--accent-primary)",
+                                    fontWeight: 700,
+                                  }}
+                                >
+                                  {unreadCount}
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                className="fd-btn"
+                                data-testid={`agent-settings-btn-${key}`}
+                                title={`Settings for ${record.display_name}`}
+                                aria-label={`Settings for ${record.display_name}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onSelectAgent(record.name_key);
+                                  onOpenAgentSettings?.(record.name_key);
+                                  onClose?.();
+                                }}
+                                style={{
+                                  padding: "1px 5px",
+                                  fontSize: "11px",
+                                  minHeight: "20px",
+                                  lineHeight: 1,
+                                  color: "var(--text-muted)",
+                                }}
+                              >
+                                ⚙
+                              </button>
+                            </div>
+                          </div>
+
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                              paddingLeft: "16px",
+                              flexWrap: "wrap",
+                            }}
                           >
-                            {adapter}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+                            <span className="fd-badge" data-testid={`role-badge-${key}`}>
+                              {formatRoleLabel(record.role)}
+                            </span>
+                            {adapter && (
+                              <span
+                                data-testid={`adapter-pill-${key}`}
+                                className={getAdapterBadgeClass(adapter)}
+                              >
+                                {adapter}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
       </aside>

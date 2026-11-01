@@ -1,11 +1,14 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { ContextHeader } from "../components/ContextHeader";
 import { PairingModal } from "../components/PairingModal";
-import { RosterSidebar } from "../components/RosterSidebar";
+import {
+  COLLAPSED_PROJECTS_STORAGE_KEY,
+  RosterSidebar,
+} from "../components/RosterSidebar";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
@@ -14,6 +17,10 @@ import {
 } from "../types/api";
 
 describe("RosterSidebar", () => {
+  beforeEach(() => {
+    window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+  });
+
   const sampleRoutes: DiscoveredSessionSummary[] = [
     {
       id: "urn:uuid:01965500-0000-7000-8000-000000000001",
@@ -150,6 +157,58 @@ describe("RosterSidebar", () => {
     fireEvent.change(searchInput, { target: { value: "Website" } });
     expect(screen.getByText("Wesley")).toBeInTheDocument();
     expect(screen.queryByText("Kayla")).toBeNull();
+  });
+
+  it("supports collapsible project groups persisted in localStorage, project unread badge sum, and project settings cog", () => {
+    const onOpenProjectSettings = vi.fn();
+    const customAgents: AgentRecord[] = [
+      ...DEFAULT_WORKSPACE_AGENTS,
+      {
+        id: "urn:fl:agent:felix",
+        name_key: "felix",
+        display_name: "Felix",
+        project: "FerroLoop",
+        role: "ui-developer",
+        status: "active",
+      },
+    ];
+
+    render(
+      <RosterSidebar
+        agents={customAgents}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{ ferris: 2, felix: 4, jarvis: 1 }}
+        selectedAgentName="ferris"
+        onSelectAgent={() => {}}
+        onOpenProjectSettings={onOpenProjectSettings}
+      />,
+    );
+
+    // Project unread badge sums ferris (2) + felix (4) = 6
+    const ferroUnreadBadge = screen.getByTestId("project-unread-badge-ferroloop");
+    expect(ferroUnreadBadge).toHaveTextContent("6");
+    expect(screen.getByTestId("project-unread-badge-ai-lab-amd")).toHaveTextContent("1");
+
+    // Clicking project settings cog calls onOpenProjectSettings without collapsing group
+    const ferroCogBtn = screen.getByTestId("project-settings-btn-ferroloop");
+    fireEvent.click(ferroCogBtn);
+    expect(onOpenProjectSettings).toHaveBeenCalledWith("FerroLoop");
+    expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
+
+    // Clicking project group toggle collapses FerroLoop agents while keeping unread badge visible
+    const ferroToggle = screen.getByTestId("project-group-toggle-ferroloop");
+    expect(ferroToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(ferroToggle);
+    expect(ferroToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("agent-row-ferris")).toBeNull();
+    expect(screen.getByTestId("project-unread-badge-ferroloop")).toHaveTextContent("6");
+
+    // Persisted in localStorage
+    expect(
+      JSON.parse(window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY) ?? "[]"),
+    ).toContain("ferroloop");
+    window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
   });
 });
 
