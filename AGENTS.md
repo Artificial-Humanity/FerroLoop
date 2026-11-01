@@ -15,13 +15,21 @@ at `notes/` (a gitignored symlink to `Notes/FerroLoop`) and deliberately not pub
   by component (cherry-pick). That goal does not imply how many binaries or other parts FerroLoop
   has. FerroLoop is self-hosted: no cloud accounts, no mandatory external databases, and nothing
   depends on a vendor-hosted service.
-* **Orchestration & Protocols:** One execution adapter exists, for the Claude Code CLI
-  (`fl attempt`). `fl mcp` keeps a project's catalog of MCP servers and writes it into the MCP
-  config files of Claude Code, Codex and Antigravity; `fl mcp` only writes their configuration and
-  starts neither the CLIs nor the MCP servers. Planned, not built: more execution adapters, and agent-to-agent messaging.
-* **Storage & Telemetry:** An embedded redb store holds a project's gates, transitions, gate runs
-  and attempts (each with its outcome and duration), and its records and findings unless the
-  project keeps those in GitHub Issues. Planned, not built: token and cost telemetry (attempts record zero tokens and zero cost today).
+* **Orchestration & Protocols:** Five execution adapters run attempts (`fl attempt`): `claude`,
+  `codex`, `antigravity`, `muse` and `grok`. `fl mcp` keeps a project's catalog of MCP servers and
+  writes it into the MCP config files of those same five CLIs; it only writes their configuration
+  and starts neither the CLIs nor the MCP servers. FerroWire carries agent-to-agent messaging,
+  receipts, vendor push and peer relay (`fl wire`). FerroGate holds the zero-knowledge secrets
+  vault, the credential proxy and the declarative MCP gateway (`fl vault`). FerroDeck is the
+  command-center web app that the hub daemon serves (`fl hub`).
+* **Storage & Telemetry:** FerroStore (`fl-store`) is the embedded store. Its default engine is
+  the `.fls` file (the `ferro` backend); a lone `.redb` is migrated to it on first open, verified
+  table by table and view by view, and kept read-only. `FL_STORE_BACKEND=redb` selects redb.
+  The standalone `ferrostore` binary and `fl store` share one command module (`fl_store::cli`).
+  The store holds a project's gates, transitions, gate runs and attempts (each with its outcome,
+  duration, tokens and cost), and its records and findings unless the project keeps those in
+  GitHub Issues. FerroState searches memories and the code index with exact BM25, plus an HNSW
+  vector leg on the ferro engine.
 * **Capability truth lives in code, not prose:** Enums, adapter registries, and protocol
   schemas generate capability lists wherever possible. Avoid duplicating hard-coded provider or
   feature lists in documentation that easily rots.
