@@ -26,7 +26,12 @@ use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
 use crate::peer::{PeerFrame, handshake_peer};
 use crate::ws::{WsError, WsStream};
 
-pub const DEFAULT_LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+/// How long a [`LocalClient`] waits for `fl wire daemon` to read a request or answer it: the
+/// socket's read and write timeout. A daemon's store is a remote FerroStore, so a reply can take
+/// many store round trips. It does not bound the connect: a missing socket, or one nothing
+/// listens on, still fails at once. Only a daemon that accepts and then is slow or hung makes a
+/// caller wait this long. [`LocalClient::wait_for_event`] sets its own read timeout.
+pub const DEFAULT_LOCAL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest request line the daemon reads from a local client: a send carries at most a 256 KiB
 /// body, which JSON escaping can at most roughly six-fold, plus the other fields.
@@ -1989,5 +1994,50 @@ mod tests {
                 .is_none(),
             "a subscriber for another recipient saw the message"
         );
+    }
+
+    #[test]
+    fn a_request_to_a_slow_daemon_succeeds_with_the_default_timeout() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("slow.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("Status") || line.contains("status"), "{line}");
+            // A daemon whose store is remote takes this long, or longer.
+            std::thread::sleep(Duration::from_millis(200));
+            let mut writer = stream;
+            let mut reply = serde_json::to_string(&LocalResponse::RouteRegistered).unwrap();
+            reply.push('\n');
+            writer.write_all(reply.as_bytes()).unwrap();
+        });
+        let mut client = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT).unwrap();
+        let resp = client.request(&LocalRequest::Status);
+        fake.join().unwrap();
+        assert!(
+            matches!(resp, Ok(LocalResponse::RouteRegistered)),
+            "{resp:?}"
+        );
+    }
+
+    #[test]
+    fn a_connect_to_a_missing_or_refused_socket_fails_at_once() {
+        let dir = TempDir::new().unwrap();
+        // A socket file that nothing listens on any more refuses the connect.
+        let stale = dir.path().join("stale.sock");
+        drop(UnixListener::bind(&stale).unwrap());
+        for sock in [dir.path().join("none.sock"), stale] {
+            let started = Instant::now();
+            let err = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT);
+            assert!(err.is_err(), "{}", sock.display());
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                started.elapsed()
+            );
+        }
     }
 }

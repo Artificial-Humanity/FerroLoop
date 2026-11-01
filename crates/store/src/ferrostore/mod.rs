@@ -61,6 +61,8 @@ mod tests_track0;
 mod tests_txn;
 #[cfg(test)]
 mod tests_verify;
+#[cfg(test)]
+mod tests_wire;
 
 use container_io::{ContainerFs, ContainerIo, RealFs};
 use fl_core::StoreError;
