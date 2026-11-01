@@ -332,7 +332,7 @@ impl AnyStore {
     /// The format version the store file records.
     pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
         match &self.backend {
-            Backend::Ferro(_) => Err(not_on_ferro("format_version")),
+            Backend::Ferro(s) => s.format_version(),
             Backend::Redb(s) => s.format_version(),
         }
     }
@@ -346,7 +346,9 @@ impl AnyStore {
         repository_node_id: Option<&str>,
     ) -> Result<Manifest, ManifestError> {
         match &self.backend {
-            Backend::Ferro(_) => Err(not_on_ferro("export_manifest").into()),
+            Backend::Ferro(s) => {
+                s.export_manifest(project, commit, exported_at_unix, repository_node_id)
+            }
             Backend::Redb(s) => {
                 s.export_manifest(project, commit, exported_at_unix, repository_node_id)
             }
@@ -356,16 +358,10 @@ impl AnyStore {
     /// Write the manifest's project, gates and transitions, atomically.
     pub fn import_manifest(&self, m: &Manifest, root: &str) -> Result<ImportReport, ManifestError> {
         match &self.backend {
-            Backend::Ferro(_) => Err(not_on_ferro("import_manifest").into()),
+            Backend::Ferro(s) => s.import_manifest(m, root),
             Backend::Redb(s) => s.import_manifest(m, root),
         }
     }
-}
-
-fn not_on_ferro(what: &str) -> StoreError {
-    backend(format!(
-        "{what} is not available on a FerroStore yet; use {BACKEND_ENV}=redb for this command"
-    ))
 }
 
 /// Implement each store trait on [`AnyStore`] by calling the engine's own
@@ -794,13 +790,26 @@ mod tests {
     }
 
     #[test]
-    fn what_ferrostore_cannot_do_yet_is_refused_by_name() {
-        let (store, _g) = on(BackendKind::Ferro);
-        let err = store.format_version().unwrap_err();
-        assert!(err.to_string().contains("format_version"), "{err}");
-        let project = store.add_project("/repo").unwrap();
-        let err = store.export_manifest(&project, "c", 0, None).unwrap_err();
-        assert!(err.to_string().contains("export_manifest"), "{err}");
+    fn manifests_and_versions_are_served_on_both_engines() {
+        for kind in both() {
+            let (store, _g) = on(kind);
+            assert!(store.format_version().unwrap().is_some(), "{kind:?}");
+            let project = store.add_project("/repo").unwrap();
+            let manifest = store.export_manifest(&project, "c0ffee", 1, None).unwrap();
+            for target in both() {
+                let (other, _g2) = on(target);
+                let report = other.import_manifest(&manifest, "/elsewhere").unwrap();
+                assert_eq!(report.project, project, "{kind:?} -> {target:?}");
+                assert!(
+                    other.imported_hash(&project).unwrap().is_some(),
+                    "{kind:?} -> {target:?}"
+                );
+                assert!(
+                    other.format_version().unwrap() >= Some(crate::FORMAT_WITH_IMPORTS),
+                    "{kind:?} -> {target:?}"
+                );
+            }
+        }
     }
 
     #[test]

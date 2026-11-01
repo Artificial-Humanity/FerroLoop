@@ -5,6 +5,7 @@ mod columnar;
 mod compat;
 mod doc;
 mod layout;
+mod manifest_ops;
 mod migrate;
 mod server;
 mod state;
@@ -14,18 +15,23 @@ mod traits_state;
 mod traits_wire;
 mod traits_workflow;
 mod vector;
+mod verify;
 mod ws;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_track0;
+#[cfg(test)]
+mod tests_verify;
 
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 pub use layout::Op;
 use layout::{
-    HEADER_BYTES, SLOT_LEN, Superblock, backend, corrupt, decode_snapshot, decode_wal,
-    encode_frame, encode_snapshot, encode_snapshot_v2, encode_snapshot_v3, encode_superblock,
-    parse_superblock,
+    HEADER_BYTES, KNOWN_INCOMPAT, SLOT_LEN, SlotRead, Superblock, backend, corrupt,
+    decode_snapshot, decode_wal, encode_frame, encode_snapshot, encode_snapshot_v2,
+    encode_snapshot_v3, encode_superblock, parse_superblock,
 };
 use serde_json::{Value, json};
 use state::{
@@ -52,6 +58,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
+pub use verify::{
+    PER_ITEM_SAMPLE, ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore,
+};
 
 const LOCK_EX: i32 = 2;
 const LOCK_UN: i32 = 8;
@@ -212,26 +221,52 @@ impl FerroStore {
         }
     }
 
-    /// Empty in-memory store. `checkpoint` succeeds and writes nothing.
+    /// Empty in-memory store at the newest schema version. `checkpoint`
+    /// succeeds and writes nothing.
     pub fn in_memory() -> Self {
-        Self::assemble(
-            Inner::Memory(Mutex::new(DocState::default())),
-            "mem://".to_string(),
-        )
+        let state = DocState {
+            docs: new_store_docs(),
+            ..DocState::default()
+        };
+        Self::assemble(Inner::Memory(Mutex::new(state)), "mem://".to_string())
     }
 
     /// Open or create a `.fls` file. A second open of the same path succeeds.
+    ///
+    /// A new file is created mode 0600 from its first byte, in a parent made
+    /// 0700 when the parent is missing too, and starts at the newest schema
+    /// version; its directory is synced once the first superblock is down. An
+    /// existing file keeps its mode and is only reported when it is loose
+    /// (`private::warn_if_loose`). A container a newer fl wrote is
+    /// [`StoreError::ContainerFormat`]; a schema version off the ladder is
+    /// [`StoreError::FormatVersion`]. A file from before schema versioning
+    /// (no version document) opens, and [`Self::format_version`] reads `None`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        let created = create_store_file(path)?;
+        // Not `create(true)`: a file this open makes must come from
+        // `create_private_file`, so it is never made with the umask's mode.
         let write = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        ensure_superblock(&write)?;
-        read_consistent(&write)?;
+        let initialized = ensure_superblock(&write).map_err(|err| name_store(err, path))?;
+        let (_, _, state) = read_consistent(&write).map_err(|err| name_store(err, path))?;
+        // Also when an earlier open created the file and stopped before its
+        // first superblock: the entry is only durable once the directory is.
+        if created || initialized {
+            sync_dir(&parent_dir(path))?;
+        }
+        if let Some(found) = doc::schema_version_in(|collection, id| {
+            state
+                .docs
+                .get(&(collection.to_string(), id.to_string()))
+                .cloned()
+        })? {
+            crate::check_format(Some(found))?;
+        }
+        crate::private::warn_if_loose(path);
         // `OpenOptions::read` without write is `O_RDONLY`.
         let read = OpenOptions::new()
             .read(true)
@@ -293,6 +328,14 @@ impl FerroStore {
         Err(backend(format!("unknown FerroStore URI scheme in `{uri}`")))
     }
 
+    /// The schema version the store records, `None` for a store with no
+    /// version document (a FerroStore written before schema versioning), the
+    /// same meaning as [`crate::RedbStore::format_version`]. The value is on
+    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`.
+    pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
+        self.with_read(doc::schema_version)
+    }
+
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         match &self.inner {
             Inner::Remote(remote) => remote.call_unit("checkpoint", json!({})),
@@ -301,11 +344,27 @@ impl FerroStore {
         }
     }
 
+    /// Put one document. A reserved collection (a name starting `__`, such as
+    /// the schema version's `__meta`) is refused: only the store's own
+    /// transactions write it.
     pub fn put_doc(&self, collection: &str, id: &str, doc: &Value) -> Result<(), StoreError> {
         self.put_doc_inner(collection, id, doc, false)
     }
 
     fn put_doc_inner(
+        &self,
+        collection: &str,
+        id: &str,
+        doc: &Value,
+        silent: bool,
+    ) -> Result<(), StoreError> {
+        doc::refuse_reserved(collection, "put_doc")?;
+        self.put_doc_unchecked(collection, id, doc, silent)
+    }
+
+    /// `put_doc` without the reserved-collection check: for tests that must
+    /// plant a store's own bookkeeping.
+    fn put_doc_unchecked(
         &self,
         collection: &str,
         id: &str,
@@ -353,7 +412,15 @@ impl FerroStore {
         self.fill_doc_miss(collection, id)
     }
 
+    /// Delete one document. A reserved collection is refused, as in
+    /// [`Self::put_doc`].
     pub fn delete_doc(&self, collection: &str, id: &str) -> Result<(), StoreError> {
+        doc::refuse_reserved(collection, "delete_doc")?;
+        self.delete_doc_unchecked(collection, id)
+    }
+
+    /// `delete_doc` without the reserved-collection check, for tests.
+    fn delete_doc_unchecked(&self, collection: &str, id: &str) -> Result<(), StoreError> {
         let collection = collection.to_string();
         let id = id.to_string();
         self.commit(move |_| Ok((Op::Delete { collection, id }, ())), false)
@@ -1261,6 +1328,10 @@ impl FerroStore {
     }
 
     fn fill_doc_miss(&self, collection: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        // The store's own bookkeeping is local: never filled from a peer.
+        if doc::is_reserved(collection) {
+            return Ok(None);
+        }
         let adapter = {
             let slot = lock_mutex(&self.sync);
             match slot.mode {
@@ -1375,6 +1446,7 @@ impl FerroStore {
         doc: &Value,
         silent: bool,
     ) -> Result<IfAbsent, StoreError> {
+        doc::refuse_reserved(collection, "put_doc")?;
         let key = (collection.to_string(), id.to_string());
         match &self.inner {
             Inner::Remote(_) => Err(backend(
@@ -1526,12 +1598,11 @@ impl FerroStore {
             let queue = slot.adapter.is_some() && slot.mode.is_some();
             let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
             if queue {
-                for batch in prepared {
-                    slot.pending.push(SyncBatch {
-                        seq: batch.seq,
-                        ops: batch.ops.iter().map(SyncOp::from_op).collect(),
-                    });
-                }
+                // The batches as they came in, not as applied: a reserved op
+                // this store dropped is still the next store's to judge, and a
+                // batch whose every op was dropped must not go out empty.
+                debug_assert_eq!(prepared.len(), batches.len());
+                slot.pending.extend(batches);
             }
             (seq, flush)
         };
@@ -1746,12 +1817,20 @@ fn prepare_sync_batches(
                 batch.seq
             )));
         }
-        let ops = batch
-            .ops
-            .iter()
-            .cloned()
-            .map(SyncOp::into_op)
-            .collect::<Vec<_>>();
+        let mut version = doc::schema_version_in(|collection, id| {
+            scratch
+                .docs
+                .get(&(collection.to_string(), id.to_string()))
+                .cloned()
+        })?;
+        let mut ops = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            if let Some(op) = admit_inbound(op, &mut version)? {
+                ops.push(op.clone().into_op());
+            }
+        }
+        // Every op may have been dropped: the sequence still advances, as an
+        // empty frame, so the next batch is still the next commit.
         scratch = stage_ops(scratch, &ops)?;
         expect = next;
         prepared.push(PreparedBatch {
@@ -1760,6 +1839,51 @@ fn prepare_sync_batches(
         });
     }
     Ok((scratch, prepared))
+}
+
+/// Whether an inbound sync op is applied. `version` is the schema version the
+/// batch has reached so far, and is raised when `op` raises it.
+///
+/// An op on an ordinary collection is applied as it is. An op on a reserved
+/// collection is the peer's own bookkeeping and is never applied as it is:
+/// `("__meta", "schema_version")` put to a version on the ladder above
+/// `version` raises it; a version newer than this build is
+/// [`StoreError::FormatVersion`], the same refusal `open` gives, so the batch
+/// is refused whole; any other reserved op (an older, equal or off-ladder
+/// version, another `__meta` id, a delete, another reserved collection) is
+/// dropped.
+fn admit_inbound<'a>(
+    op: &'a SyncOp,
+    version: &mut Option<u64>,
+) -> Result<Option<&'a SyncOp>, StoreError> {
+    let (collection, raise) = match op {
+        SyncOp::PutDoc {
+            collection,
+            id,
+            doc,
+        } => (
+            collection,
+            (collection == doc::SCHEMA_COLLECTION && id == doc::SCHEMA_KEY)
+                .then(|| doc.as_u64())
+                .flatten(),
+        ),
+        SyncOp::DeleteDoc { collection, .. } => (collection, None),
+        _ => return Ok(Some(op)),
+    };
+    if !doc::is_reserved(collection) {
+        return Ok(Some(op));
+    }
+    let Some(to) = raise else {
+        return Ok(None);
+    };
+    if crate::FORMAT_LADDER.iter().all(|known| to > *known) {
+        crate::check_format(Some(to))?;
+    }
+    if crate::check_format(Some(to)).is_err() || version.is_some_and(|now| to <= now) {
+        return Ok(None);
+    }
+    *version = Some(to);
+    Ok(Some(op))
 }
 
 fn publish_sync_batches(
@@ -2037,13 +2161,32 @@ fn append_frame(
     Ok(new_sb)
 }
 
+/// The documents a new store starts with: its schema version, the newest on
+/// the ladder. They sit in the snapshot at sequence 0, so a new store still
+/// has `last_seq` 0 and no WAL frame.
+fn new_store_docs() -> BTreeMap<(String, String), Value> {
+    let mut docs = BTreeMap::new();
+    docs.insert(
+        (
+            doc::SCHEMA_COLLECTION.to_string(),
+            doc::SCHEMA_KEY.to_string(),
+        ),
+        json!(crate::FORMAT_WITH_WORKFLOW),
+    );
+    docs
+}
+
 fn init_empty(file: &File) -> Result<(), StoreError> {
+    let blob = encode_snapshot(0, &new_store_docs())?;
+    let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     file.set_len(HEADER_BYTES).map_err(io_err)?;
+    file.write_all_at(&blob, HEADER_BYTES).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
     let sb = Superblock {
         epoch: 1,
         snapshot_offset: HEADER_BYTES,
-        snapshot_length: 0,
-        wal_offset: HEADER_BYTES,
+        snapshot_length: blob_len,
+        wal_offset: HEADER_BYTES + blob_len,
         wal_length: 0,
         snapshot_seq: 0,
     };
@@ -2052,31 +2195,104 @@ fn init_empty(file: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
-// No valid slot yet. Publish slot 0 only for an empty file, or when every byte
-// already in a file no longer than the header is zero. A non-zero short file
-// is not rewritten, and neither is a longer file.
-fn ensure_superblock(file: &File) -> Result<(), StoreError> {
+/// Make the store file 0600 when it is missing, and its parent 0700 when that
+/// is missing too. `true` when this call created the file. An error from the
+/// file create is left to the open that follows, which reports it in its own
+/// words (the same rule as `RedbStore::open`).
+fn create_store_file(path: &Path) -> Result<bool, StoreError> {
+    let parent = parent_dir(path);
+    if !parent.exists() {
+        crate::private::create_private_dir_all(&parent)
+            .map_err(|err| backend(format!("create directory {}: {err}", parent.display())))?;
+        sync_dir(&parent_dir(&parent))?;
+    }
+    Ok(crate::private::create_private_file(path).unwrap_or(false))
+}
+
+/// The directory that holds `path`: its parent, or `.` for a bare name.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// `fsync` a directory so an entry made in it is durable. A file system that
+/// cannot sync a directory (`EINVAL`) has nothing more to give.
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    let handle =
+        File::open(dir).map_err(|err| backend(format!("open {}: {err}", dir.display())))?;
+    match handle.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(backend(format!("sync {}: {err}", dir.display()))),
+    }
+}
+
+/// Name `path` in a container-format error that was raised without one.
+fn name_store(err: StoreError, path: &Path) -> StoreError {
+    match err {
+        StoreError::ContainerFormat {
+            store,
+            found,
+            engine,
+            unknown_incompat,
+            newest,
+        } if store.is_empty() => StoreError::ContainerFormat {
+            store: path.display().to_string(),
+            found,
+            engine,
+            unknown_incompat,
+            newest,
+        },
+        other => other,
+    }
+}
+
+// No valid slot yet. Publish slot 0 only for a file that can hold nothing but
+// an `init_empty` cut short: every header byte present is zero, and the bytes
+// after the header are none, or a prefix (up to all) of the snapshot
+// `init_empty` writes. Any other file is not rewritten: it could hold real
+// data, and `read_consistent` reports it. `true` when this call ran
+// `init_empty`.
+fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
     if parsed_superblock(file)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     if parsed_superblock(file)?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let len = file.metadata().map_err(io_err)?.len();
-    if len > HEADER_BYTES {
-        return Ok(());
-    }
     if len == 0 {
-        return init_empty(file);
+        init_empty(file)?;
+        return Ok(true);
     }
-    let n = usize::try_from(len).map_err(|_| backend("short file length exceeds usize"))?;
+    let header_len = len.min(HEADER_BYTES);
+    let n = usize::try_from(header_len).map_err(|_| backend("header length exceeds usize"))?;
     let mut buf = vec![0u8; n];
     file.read_exact_at(&mut buf, 0).map_err(io_err)?;
     if buf.iter().any(|byte| *byte != 0) {
-        return Ok(());
+        return Ok(false);
     }
-    init_empty(file)
+    if len > HEADER_BYTES {
+        let blob = encode_snapshot(0, &new_store_docs())?;
+        let tail_len = len - HEADER_BYTES;
+        let Ok(tail) = usize::try_from(tail_len) else {
+            return Ok(false);
+        };
+        if tail > blob.len() {
+            return Ok(false);
+        }
+        let mut held = vec![0u8; tail];
+        file.read_exact_at(&mut held, HEADER_BYTES)
+            .map_err(io_err)?;
+        if held != blob[..tail] {
+            return Ok(false);
+        }
+    }
+    init_empty(file)?;
+    Ok(true)
 }
 
 fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreError> {
@@ -2112,13 +2328,29 @@ fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreEr
         }
         let mut buf = [0u8; SLOT_LEN];
         file.read_exact_at(&mut buf, offset).map_err(io_err)?;
-        if let Some(sb) = parse_superblock(&buf) {
-            match &best {
+        match parse_superblock(&buf) {
+            SlotRead::Valid(sb) => match &best {
                 Some((_, current)) if sb.epoch < current.epoch => {}
                 Some((_, current)) if sb.epoch == current.epoch => {
                     return Err(corrupt("two valid superblocks share an epoch"));
                 }
                 _ => best = Some((index, sb)),
+            },
+            SlotRead::Invalid => {}
+            // Either slot from a newer build stops the read: falling back to
+            // the other slot would read, and then overwrite, a stale state.
+            SlotRead::Newer {
+                version,
+                engine,
+                incompat,
+            } => {
+                return Err(StoreError::ContainerFormat {
+                    store: String::new(),
+                    found: version,
+                    engine,
+                    unknown_incompat: incompat & !KNOWN_INCOMPAT,
+                    newest: layout::FORMAT_VERSION,
+                });
             }
         }
     }

@@ -84,6 +84,21 @@ pub enum StoreError {
         oldest: u64,
         newest: u64,
     },
+    /// ⚠ A FerroStore file whose container a newer fl wrote: a superblock names
+    /// a container version, an engine or an incompatible feature bit this build
+    /// does not know. The file is not damaged, and this build neither reads nor
+    /// writes it. `store` is the file's path, or empty when the caller had none.
+    #[error(
+        "{}",
+        container_format_message(store, *found, *engine, *unknown_incompat, *newest)
+    )]
+    ContainerFormat {
+        store: String,
+        found: u32,
+        engine: u32,
+        unknown_incompat: u64,
+        newest: u32,
+    },
     /// ⚠ A stored record could not be read back into its type. This is what a
     /// wire-format change looks like from the other side, so the message names
     /// that cause and the remedy — a refusal that only reports serde's
@@ -334,6 +349,34 @@ fn format_version_message(found: Option<u64>, oldest: u64, newest: u64) -> Strin
             }
         ),
     }
+}
+
+/// `ContainerFormat`'s message. Like a newer schema, a newer container is not
+/// damage: the remedy is a newer fl.
+fn container_format_message(
+    store: &str,
+    found: u32,
+    engine: u32,
+    unknown_incompat: u64,
+    newest: u32,
+) -> String {
+    let file = if store.is_empty() {
+        "this FerroStore file".to_string()
+    } else {
+        format!("the FerroStore file {store}")
+    };
+    let mut what = format!("container format {found}");
+    if engine != 0 {
+        what.push_str(&format!(", engine {engine}"));
+    }
+    if unknown_incompat != 0 {
+        what.push_str(&format!(", feature bits {unknown_incompat:#x}"));
+    }
+    format!(
+        "{file} uses {what}, which a newer fl wrote; this version of fl reads container formats \
+         1 to {newest} with engine 0 and no feature bits. Upgrade fl to open it: nothing is \
+         wrong with the store."
+    )
 }
 
 impl StoreError {

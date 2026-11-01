@@ -14,27 +14,27 @@ A `.fls` file begins with two 4096-byte superblocks.
 | `4096..8192` | Superblock slot 1 |
 | `8192..` | Snapshot and WAL bytes |
 
-Creating a missing file writes slot 0 and leaves slot 1 as zeros, then `fsync`s:
+Creating a missing file makes it mode `0600` from its first byte, and makes its parent directory mode `0700` when that is missing too. An existing file or directory keeps its mode; a store file that other users can read gets a warning (`private::warn_if_loose`), never a `chmod`. The create writes a snapshot at `8192` that holds one document, the schema version (below), at sequence `0`, `fsync`s, writes slot 0 and leaves slot 1 as zeros, `fsync`s, then `fsync`s the parent directory:
 
 | Field | Initial value |
 | --- | --- |
 | `epoch` | `1` |
 | `snapshot_offset` | `8192` |
-| `snapshot_length` | `0` |
-| `wal_offset` | `8192` |
+| `snapshot_length` | the length of that snapshot |
+| `wal_offset` | `8192 + snapshot_length` |
 | `wal_length` | `0` |
 | `snapshot_seq` | `0` |
 
-The create path holds the same short exclusive `flock` as a commit, only while it publishes that first superblock.
+The create path holds the same short exclusive `flock` as a commit, only while it publishes that first superblock. A file with no valid slot is created again only when it can hold nothing but a create cut short: every header byte is zero, and the bytes after the header are none or a prefix (up to all) of that first snapshot. Any other such file is never rewritten, and `open` fails. An open that creates the first superblock this way also `fsync`s the parent directory.
 
 ### Superblock
 
-Each slot is 4096 bytes.
+Each slot is 4096 bytes. Every slot this build writes is container format `2`.
 
 | Offset | Type | Contents |
 | --- | --- | --- |
 | `0..8` | bytes | Magic `FERRSTR1` |
-| `8..12` | `u32` | Format version `1` |
+| `8..12` | `u32` | Container format version: `2` (format `1` is still read) |
 | `12..20` | `u64` | `epoch`, monotonic, starting at `1` |
 | `20..24` | `u32` | CRC-32 of this 4096-byte block with bytes `20..24` set to zero |
 | `24..32` | `u64` | `snapshot_offset` (absolute) |
@@ -42,11 +42,17 @@ Each slot is 4096 bytes.
 | `40..48` | `u64` | `wal_offset` (absolute) |
 | `48..56` | `u64` | `wal_length` |
 | `56..64` | `u64` | `snapshot_seq` |
-| `64..4096` | bytes | Zeros |
+| `64..68` | `u32` | `engine`: `0` is snapshot plus WAL. Format `2` only |
+| `68..76` | `u64` | `incompat` feature bits. None are defined. Format `2` only |
+| `76..4096` | bytes | Zeros (`64..4096` in format `1`) |
 
 `snapshot_seq` is the highest committed transaction sequence included in the snapshot, or `0` when no snapshot holds a commit.
 
-A slot is valid only when magic, version, padding, and CRC all match. Any other bytes are ignored. The current superblock is the valid slot with the highest `epoch`. A torn write fails the CRC, so the other slot stays current. Equal epochs on two valid slots are corruption.
+A slot is valid only when magic, a known version, padding, and CRC all match, and its engine is `0` with no unknown `incompat` bit. A CRC-valid slot with a newer version, another engine, or an unknown `incompat` bit was written by a newer build: `open` fails with `StoreError::ContainerFormat`, which names the version found, and reads neither slot. Every later format keeps the magic at `0..8`, the version at `8..12` and the CRC at `20..24`, so a newer slot is told from a torn one. Any other bytes are ignored. The current superblock is the valid slot with the highest `epoch`. A torn write fails the CRC, so the other slot stays current. Equal epochs on two valid slots are corruption. A format-1 file is upgraded at its next slot write; both slots stay CRC-valid throughout.
+
+### Schema version
+
+The document `("__meta", "schema_version")` holds the schema version, on the same ladder as `RedbStore` (`FORMAT_VERSION` to `FORMAT_WITH_WORKFLOW` in `crates/store/src/lib.rs`), so `format_version()` means the same on both. A new store starts at the newest constant. A write that needs a newer schema raises it in the same transaction, and a raise never lowers it. `open` refuses a version off the ladder with `StoreError::FormatVersion`. A store from before `__meta` reads its version from `("meta", "format_version")`, or has none: it opens, and `format_version()` is `None`. No trait method lists `__meta`. A collection whose name starts with `__` is reserved: only the store's own transactions write it. `put_doc` and `delete_doc`, local or over the socket, refuse it, and a cache miss on it is never fetched. Sync carries its ops like any other: an outbound batch holds every op of its commit, so sync sequences have no gaps. An inbound batch never applies a reserved op as it is. A put of `("__meta", "schema_version")` to a version on the ladder above the store's own raises it. A put of a version newer than this build refuses the whole batch with `StoreError::FormatVersion`, as `open` does. Every other reserved op (an older, equal or off-ladder version, another `__meta` id, a delete, another `__` collection) is dropped. The batch's sequence advances even when every op in it is dropped.
 
 Every committed WAL append and every `checkpoint` publishes a new generation: write the inactive slot (the slot that does not hold the highest valid epoch) with `epoch + 1`, then `fsync`. The live slot is never rewritten in place.
 
@@ -215,6 +221,8 @@ A columnar cell is `{"t":"null"}`, `{"t":"i64","v":1}`, `{"t":"f64","v":1.5}`, `
 
 `default_socket_path_for_store(path)` appends `.sock` to the file name. `dir/store.fls` is `dir/store.fls.sock`. A path with no file name (`/` or `..`) is that path joined with `ferrostore.sock`.
 
+`FerroStoreServer::bind_unix(path, store)` makes the socket mode `0600` before it listens: `socket`, `bind`, `chmod 0600`, then `listen`, so no peer can connect while the mode is wider. A missing parent directory is created mode `0700`; an existing one keeps its mode. A socket already at `path` is removed only after a `connect` to it is refused. One that accepts belongs to a live server and the bind fails. A `path` that is not a socket is never removed.
+
 `FerroStore::auto(path)` connects to that socket. When the connect is accepted, the handle is a client of that server, and that connection is the client: it does not connect again. A refused connect — nothing listening, or the socket file missing — opens `path` in embedded mode and is not an error. An error from `open` is still returned.
 
 ## Documents
@@ -295,16 +303,18 @@ HNSW parameters live on the collection. There is no hidden default `M`. The leve
 
 `search_knowledge` uses that fusion and those two collections. Each hit is the id, the fused score, the vector metadata when the id is in the vector collection (`None` when it is absent or when the id is BM25-only), and the document when the id is in the document collection (`None` otherwise). The caller stores a knowledge entry with `put_doc` and its embedding with `upsert_vector` under the same id. FerroStore does not call an embedding model, and this phase does not change the redb state format.
 
-A checkpoint with any vector collection writes snapshot version 3. A document-only store stays version 1 and byte-identical. Columnar tables with no vector collections stay version 2. `migrate_redb_to_ferrostore` refuses a non-empty document map, column-table map, or vector map.
+A checkpoint with any vector collection writes snapshot version 3. A document-only store stays version 1 and byte-identical. Columnar tables with no vector collections stay version 2. `migrate_redb_to_ferrostore` refuses a non-empty document map (the new store's own `__meta` document aside), column-table map, or vector map. It writes redb's `meta.format_version` to `("__meta", "schema_version")`.
+
+`fl_store::migrate::verify_redb_vs_ferrostore(src, dst)` returns a `ParityReport`: one `TableParity` per redb table the migration copies, plus `__meta`, `redb:<name>` for a redb table outside the copy list, and `ferrostore:unlisted` for FerroStore data outside it; and one per list-style trait view, run on both stores. Each side is a row count and a SHA-256 over its rows sorted by key, each row `len(key) ‖ key ‖ len(value) ‖ canonical-JSON(value)` (lengths `u64` little-endian, canonical JSON with sorted object keys and no whitespace). A raw `&str` is hashed as the JSON string the migration stores. A view's items are keyed by their own canonical JSON, so a view compares content, not order. It is `Ok` when the stores differ and `Err` only when one cannot be read. `fl_store::migrate::migrate_verified(redb_path, fls_path)` migrates into a new `<name>.migrating-<pid>-<n>-<nonce>` (mode `0600`, `O_EXCL`, so a taken name is an error and never reused), verifies, and on a report that is not clean deletes that file and returns the report with no `fls_path` made. Otherwise it `fsync`s the file, moves it to `fls_path` (`link` then `unlink`, so an `fls_path` that appeared meanwhile is never replaced), `fsync`s the directory, and makes the `.redb` mode `0400`. It links only the file it created and verified (device and inode checked before and after the link) and removes only a temp file it created. Once the link is made the result is `Ok`: a failure to remove the temp file, sync the directory or `chmod` the `.redb` is a warning on stderr. It refuses an existing `fls_path`.
 
 ## Sync adapter
 
 A process may attach one `SyncAdapter` in a `SyncMode`: `WriteThrough`, `WriteBehind`, `LocalCache`, or `CloudPreCache`. The mode, the adapter, the pending batches, and `synced_seq` are process memory. They are not written to the `.fls` file. A reopened store has no adapter and `synced_seq` of 0.
 
-After a commit that advances the store sequence, the store builds a `SyncBatch` of that sequence and its ops. An empty op list does not. The adapter is not called while the memory document mutex or the disk `flock` is held. `WriteThrough` calls `on_commit` after the commit is published, and only one of those calls is in flight. A newer commit cannot call `on_commit` while an older notify is in flight or still queued. If the pending buffer is non-empty, or a `WriteThrough` `on_commit` is already in flight, the batch is appended and `on_commit` is not called. Success sets `synced_seq` to that sequence when it is greater. Failure leaves the commit applied, puts that batch at the front of the pending buffer, ahead of any batch appended during the call, does not advance `synced_seq`, and returns the error. `WriteBehind`, `LocalCache`, and `CloudPreCache` append the batch and do not call `on_commit`. A silent commit does not call `on_commit` and is not queued. It may set `synced_seq` to that sequence only when the pending buffer is empty and the sequence is greater. With no adapter, commits are unchanged.
+After a commit that advances the store sequence, the store builds a `SyncBatch` of that sequence and all its ops. An empty op list does not. The adapter is not called while the memory document mutex or the disk `flock` is held. `WriteThrough` calls `on_commit` after the commit is published, and only one of those calls is in flight. A newer commit cannot call `on_commit` while an older notify is in flight or still queued. If the pending buffer is non-empty, or a `WriteThrough` `on_commit` is already in flight, the batch is appended and `on_commit` is not called. Success sets `synced_seq` to that sequence when it is greater. Failure leaves the commit applied, puts that batch at the front of the pending buffer, ahead of any batch appended during the call, does not advance `synced_seq`, and returns the error. `WriteBehind`, `LocalCache`, and `CloudPreCache` append the batch and do not call `on_commit`. A silent commit does not call `on_commit` and is not queued. It may set `synced_seq` to that sequence only when the pending buffer is empty and the sequence is greater. With no adapter, commits are unchanged.
 
 `sync_flush` waits while a notify is in flight, then sends only the oldest pending batch. It repeats in order until the buffer is empty, in every mode. It does not send a batch that is not the front, and it does not send while another `on_commit` is in flight. The first error leaves that batch and the later ones pending. Success of a batch removes it when it is still the front and sets `synced_seq` to that sequence when it is greater. A failed `WriteThrough` batch stays ahead of later commits until that flush. A loud multi-batch apply calls `sync_flush` only in `WriteThrough`; the other modes keep the batches pending, and `sync_flush` from inside the in-flight `on_commit` returns without sending.
 
 `get_doc` in `LocalCache` or `CloudPreCache`, and only when the pending buffer is empty, treats a missing document as a cache miss and calls `fetch_document`. `Ok(None)` stays a miss. `Ok(Some(doc))` is stored only when that id is still absent and the pending buffer is still empty. The check and the write hold the document lock and then the sync mutex, and no other commit registers until that check finishes, so a document inserted after the miss is not overwritten. If the id is already present, that stored document is returned and nothing is written. If the pending buffer filled during the fetch, the fetched value is dropped: an id that is now present is returned, and an id that is still absent stays missing. A silent put does not call `on_commit` and is not queued. When the pending buffer is empty, it sets `synced_seq` to the new sequence. A stored JSON null is a hit, not a miss. A missing remote document is a JSON null result. Other modes do not fetch. A fetch error is returned. A remote fill rechecks the client pending buffer, then sends `put_doc` with `silent` and `if_absent`. The server writes only when the id is absent. Silent means the server adapter is not notified. The client sets `synced_seq` from that store sequence only when its own pending buffer is still empty. If the server wrote nothing, the client returns the server's current document and does not advance `synced_seq`.
 
-`sync_pull` calls `pull_since` with the store sequence. `sync_prewarm` calls `prewarm`. Both require an adapter and an empty pending buffer. Every batch is dry-run first. The store publishes them only when every batch applies: the first sequence is the current sequence plus one, each later sequence is strictly one greater, and an empty op list is not a commit. On disk, a multi-batch apply publishes one superblock whose `wal_length` covers every frame. Anything that fails before that publish leaves the previous superblock current. A bad op or a bad sequence writes nothing and leaves `synced_seq` unchanged. An empty result writes nothing and returns the current `synced_seq`. After a successful apply, `synced_seq` is the last applied sequence, and `on_commit` is not called. A remote client sends the batches in one `apply_sync_batches` with `silent` set, so the adapter on the store that owns the file is not notified. The mode, the adapter, the pending batches, and `synced_seq` stay process memory. They are not written to the `.fls` file.
+`sync_pull` calls `pull_since` with the store sequence. `sync_prewarm` calls `prewarm`. Both require an adapter and an empty pending buffer. Every batch is dry-run first. The store publishes them only when every batch applies: the first sequence is the current sequence plus one, each later sequence is strictly one greater, and an empty op list is not a commit. Reserved ops are applied or dropped as `__meta` describes above; a batch whose ops were all dropped still advances the sequence, as an empty WAL frame. A loud apply queues the batches as they came in, not as applied. On disk, a multi-batch apply publishes one superblock whose `wal_length` covers every frame. Anything that fails before that publish leaves the previous superblock current. A bad op or a bad sequence writes nothing and leaves `synced_seq` unchanged. An empty result writes nothing and returns the current `synced_seq`. After a successful apply, `synced_seq` is the last applied sequence, and `on_commit` is not called. A remote client sends the batches in one `apply_sync_batches` with `silent` set, so the adapter on the store that owns the file is not notified. The mode, the adapter, the pending batches, and `synced_seq` stay process memory. They are not written to the `.fls` file.

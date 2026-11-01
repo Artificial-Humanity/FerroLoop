@@ -15,7 +15,17 @@ pub(super) const SLOT_LEN: usize = 4096;
 pub(super) const HEADER_BYTES: u64 = 8192;
 const SUPER_MAGIC: &[u8; 8] = b"FERRSTR1";
 const SNAP_MAGIC: &[u8; 8] = b"FERRSNAP";
-const FORMAT_VERSION: u32 = 1;
+/// Container format 1: bytes 64.. of a slot are zero. Still read.
+pub(super) const FORMAT_V1: u32 = 1;
+/// Container format 2: `engine: u32` at 64..68 and `incompat: u64` at 68..76;
+/// bytes 76.. are zero. Every slot this build writes is format 2.
+pub(super) const FORMAT_V2: u32 = 2;
+/// The newest container format this build reads and the one it writes.
+pub(super) const FORMAT_VERSION: u32 = FORMAT_V2;
+/// `engine` 0: a copy-on-write snapshot plus a WAL, held in memory.
+pub(super) const ENGINE_SNAPSHOT_WAL: u32 = 0;
+/// The `incompat` feature bits this build understands. None are defined yet.
+pub(super) const KNOWN_INCOMPAT: u64 = 0;
 const SNAPSHOT_VERSION_DOCS: u32 = 1;
 const SNAPSHOT_VERSION_COLUMNAR: u32 = 2;
 const SNAPSHOT_VERSION_VECTOR: u32 = 3;
@@ -61,10 +71,26 @@ pub(super) struct Superblock {
     pub(super) snapshot_seq: u64,
 }
 
+/// A format-2 slot with `engine` 0 and no `incompat` bits.
 pub(super) fn encode_superblock(sb: &Superblock) -> [u8; SLOT_LEN] {
+    encode_superblock_as(sb, FORMAT_VERSION, ENGINE_SNAPSHOT_WAL, 0)
+}
+
+/// A slot with the given header fields. Format 1 has no engine or feature
+/// field, so `engine` and `incompat` are ignored for it.
+pub(super) fn encode_superblock_as(
+    sb: &Superblock,
+    version: u32,
+    engine: u32,
+    incompat: u64,
+) -> [u8; SLOT_LEN] {
     let mut buf = [0u8; SLOT_LEN];
     buf[0..8].copy_from_slice(SUPER_MAGIC);
-    buf[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    buf[8..12].copy_from_slice(&version.to_le_bytes());
+    if version != FORMAT_V1 {
+        buf[64..68].copy_from_slice(&engine.to_le_bytes());
+        buf[68..76].copy_from_slice(&incompat.to_le_bytes());
+    }
     buf[12..20].copy_from_slice(&sb.epoch.to_le_bytes());
     buf[24..32].copy_from_slice(&sb.snapshot_offset.to_le_bytes());
     buf[32..40].copy_from_slice(&sb.snapshot_length.to_le_bytes());
@@ -76,45 +102,124 @@ pub(super) fn encode_superblock(sb: &Superblock) -> [u8; SLOT_LEN] {
     buf
 }
 
-pub(super) fn parse_superblock(buf: &[u8]) -> Option<Superblock> {
+/// What one 4 KiB slot holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SlotRead {
+    /// A format this build reads, with a valid CRC and sane extents.
+    Valid(Superblock),
+    /// Not a superblock: no magic, a torn or stale CRC, or bad fields.
+    Invalid,
+    /// A CRC-valid slot that a newer build wrote: a container version above
+    /// [`FORMAT_VERSION`], an engine other than [`ENGINE_SNAPSHOT_WAL`], or
+    /// an `incompat` bit outside [`KNOWN_INCOMPAT`]. The store must not be
+    /// read or written by this build.
+    Newer {
+        version: u32,
+        engine: u32,
+        incompat: u64,
+    },
+}
+
+#[cfg(test)]
+impl SlotRead {
+    pub(super) fn valid(self) -> Option<Superblock> {
+        match self {
+            SlotRead::Valid(sb) => Some(sb),
+            SlotRead::Invalid | SlotRead::Newer { .. } => None,
+        }
+    }
+}
+
+/// Classify one slot.
+///
+/// Forward-compatibility contract for every later format: the magic stays at
+/// 0..8, the version at 8..12, and the CRC-32 at 20..24, computed over the
+/// whole slot with those four bytes zeroed. That is what lets this build tell
+/// a slot a newer build wrote from a torn one: a newer slot is reported only
+/// when its CRC is valid.
+pub(super) fn parse_superblock(buf: &[u8]) -> SlotRead {
     if buf.len() != SLOT_LEN || buf.get(..8) != Some(SUPER_MAGIC.as_slice()) {
-        return None;
+        return SlotRead::Invalid;
     }
-    let version = u32_at(buf, 8)?;
-    if version != FORMAT_VERSION {
-        return None;
-    }
-    let stored = u32_at(buf, 20)?;
+    let (Some(version), Some(stored)) = (u32_at(buf, 8), u32_at(buf, 20)) else {
+        return SlotRead::Invalid;
+    };
     let mut zeroed = [0u8; SLOT_LEN];
     zeroed.copy_from_slice(buf);
     zeroed[20..24].fill(0);
     if crc32(&zeroed) != stored {
-        return None;
+        return SlotRead::Invalid;
     }
-    if buf[64..].iter().any(|byte| *byte != 0) {
-        return None;
+    let (engine, incompat, reserved_from) = match version {
+        FORMAT_V1 => (ENGINE_SNAPSHOT_WAL, 0, 64),
+        FORMAT_V2 => {
+            let (Some(engine), Some(incompat)) = (u32_at(buf, 64), u64_at(buf, 68)) else {
+                return SlotRead::Invalid;
+            };
+            (engine, incompat, 76)
+        }
+        0 => return SlotRead::Invalid,
+        // A later format may lay out bytes 24.. differently, so its engine
+        // and feature fields are not read.
+        newer => {
+            return SlotRead::Newer {
+                version: newer,
+                engine: ENGINE_SNAPSHOT_WAL,
+                incompat: 0,
+            };
+        }
+    };
+    if engine != ENGINE_SNAPSHOT_WAL || incompat & !KNOWN_INCOMPAT != 0 {
+        return SlotRead::Newer {
+            version,
+            engine,
+            incompat,
+        };
     }
-    let epoch = u64_at(buf, 12)?;
-    let snapshot_offset = u64_at(buf, 24)?;
-    let snapshot_length = u64_at(buf, 32)?;
-    let wal_offset = u64_at(buf, 40)?;
-    let wal_length = u64_at(buf, 48)?;
+    if buf[reserved_from..].iter().any(|byte| *byte != 0) {
+        return SlotRead::Invalid;
+    }
+    let fields = (
+        u64_at(buf, 12),
+        u64_at(buf, 24),
+        u64_at(buf, 32),
+        u64_at(buf, 40),
+        u64_at(buf, 48),
+        u64_at(buf, 56),
+    );
+    let (
+        Some(epoch),
+        Some(snapshot_offset),
+        Some(snapshot_length),
+        Some(wal_offset),
+        Some(wal_length),
+        Some(snapshot_seq),
+    ) = fields
+    else {
+        return SlotRead::Invalid;
+    };
     if epoch == 0
         || snapshot_offset < HEADER_BYTES
         || wal_offset < HEADER_BYTES
         || snapshot_offset.checked_add(snapshot_length).is_none()
         || wal_offset.checked_add(wal_length).is_none()
     {
-        return None;
+        return SlotRead::Invalid;
     }
-    Some(Superblock {
+    SlotRead::Valid(Superblock {
         epoch,
         snapshot_offset,
         snapshot_length,
         wal_offset,
         wal_length,
-        snapshot_seq: u64_at(buf, 56)?,
+        snapshot_seq,
     })
+}
+
+/// The container version recorded in a slot, CRC or not. For inspection.
+#[cfg(test)]
+pub(super) fn slot_version(buf: &[u8]) -> Option<u32> {
+    u32_at(buf, 8)
 }
 
 #[derive(Debug, Clone)]

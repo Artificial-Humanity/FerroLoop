@@ -17,9 +17,13 @@ pub mod any;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod manifest;
+pub mod migrate;
 pub mod private;
 pub mod state;
 pub mod workflow;
+
+#[cfg(test)]
+mod manifest_conformance;
 
 pub use any::{
     AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, StoreOptions, choose_backend, open_redb,
@@ -127,6 +131,31 @@ pub const FORMAT_WITH_WIRE: u64 = 7;
 /// an older fl refuses the store with `FormatVersion` rather than ignoring its
 /// workflow tables. This build opens 2 to 8.
 pub const FORMAT_WITH_WORKFLOW: u64 = 8;
+
+/// Every schema version this build opens, oldest first. Both `RedbStore` and
+/// `FerroStore` use this one ladder, so `format_version()` means the same on
+/// both; a new schema step adds a constant here and an upgrade for both.
+pub(crate) const FORMAT_LADDER: [u64; 7] = [
+    FORMAT_VERSION,
+    FORMAT_WITH_IMPORTS,
+    FORMAT_WITH_LEDGER_ROOT,
+    FORMAT_WITH_ROUTING,
+    FORMAT_WITH_STATE,
+    FORMAT_WITH_WIRE,
+    FORMAT_WITH_WORKFLOW,
+];
+
+/// `FormatVersion` unless `found` is on [`FORMAT_LADDER`].
+pub(crate) fn check_format(found: Option<u64>) -> Result<(), StoreError> {
+    match found {
+        Some(v) if FORMAT_LADDER.contains(&v) => Ok(()),
+        _ => Err(StoreError::FormatVersion {
+            found,
+            oldest: FORMAT_VERSION,
+            newest: FORMAT_WITH_WORKFLOW,
+        }),
+    }
+}
 
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
@@ -524,21 +553,7 @@ impl RedbStore {
         match found {
             // No META table at all: a brand-new file.
             None => Self::create_tables(&db)?,
-            Some(Some(v))
-                if v == FORMAT_VERSION
-                    || v == FORMAT_WITH_IMPORTS
-                    || v == FORMAT_WITH_LEDGER_ROOT
-                    || v == FORMAT_WITH_ROUTING
-                    || v == FORMAT_WITH_STATE
-                    || v == FORMAT_WITH_WIRE
-                    || v == FORMAT_WITH_WORKFLOW => {}
-            Some(v) => {
-                return Err(StoreError::FormatVersion {
-                    found: v,
-                    oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_WORKFLOW,
-                });
-            }
+            Some(v) => check_format(v)?,
         }
         // Only a report, and only after the open worked: a store others can reach is the owner's
         // to fix, and a stat error here is no reason to fail the open.
@@ -2737,11 +2752,10 @@ mod tests {
         );
     }
 
-    use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
 
-    /// A well-formed ledger root (ruling 20).
-    const ROOT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+    // The export/import contract runs against both stores in
+    // `manifest_conformance`; what stays here is redb's own file format.
 
     /// An authoring store with one project: gates `fmt` and `lint`, and a
     /// transition over both. Returns the store's guard too.
@@ -2764,264 +2778,6 @@ mod tests {
         })
         .unwrap();
         (s, dir, p, g1, g2)
-    }
-
-    fn stamp(s: &RedbStore, g: &GateId, commit: &str) {
-        let mut def = s.get_gate(g).unwrap().unwrap();
-        def.last_pass_commit = Some(commit.into());
-        s.update_gate(&def).unwrap();
-    }
-
-    #[test]
-    fn an_import_writes_every_item_under_its_own_iri_and_marks_the_project() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let (b, _gb) = fresh();
-        let report = b.import_manifest(&m, "/elsewhere").unwrap();
-        assert_eq!((report.gates_added, report.transitions), (2, 1));
-        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/elsewhere");
-        assert_eq!(b.get_gate(&g1).unwrap(), a.get_gate(&g1).unwrap());
-        assert!(b.owns(g2.iri()).unwrap());
-        assert!(b.get_transition(&p, "ship").unwrap().is_some());
-        assert_eq!(b.imported_hash(&p).unwrap(), Some(m.content_sha256.clone()));
-        assert!(b.handle_of(Kind::Gate, g1.iri()).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_store_that_never_imported_reads_as_nothing_imported() {
-        let (s, _g) = fresh();
-        let p = s.add_project("/p").unwrap();
-        assert_eq!(s.imported_hash(&p).unwrap(), None);
-    }
-
-    #[test]
-    fn the_authoring_store_refuses_to_import_its_own_project() {
-        let (a, _g, p, _, _) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let err = a.import_manifest(&m, "/author").unwrap_err();
-        assert!(matches!(err, ManifestError::AuthoringStore(_)), "{err}");
-    }
-
-    #[test]
-    fn an_importing_store_refuses_to_export() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        let err = b.export_manifest(&p, "c1", 8, None).unwrap_err();
-        assert!(matches!(err, ManifestError::NotAuthoring(_)), "{err}");
-    }
-
-    #[test]
-    fn an_imported_gate_can_earn_a_pass_mark_but_cannot_be_edited() {
-        let (a, _ga, p, g1, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        stamp(&b, &g1, "c1");
-        assert_eq!(
-            b.get_gate(&g1)
-                .unwrap()
-                .unwrap()
-                .last_pass_commit
-                .as_deref(),
-            Some("c1")
-        );
-
-        let mut edited = b.get_gate(&g1).unwrap().unwrap();
-        edited.name = "renamed".into();
-        let err = b.update_gate(&edited).unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-
-        let err = b
-            .add_gate(&p, "new", kind(), selector(), 1, "c1", "o")
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-
-        let err = b
-            .add_transition(Transition {
-                project: p.clone(),
-                name: "other".into(),
-                from: State::Todo,
-                to: State::Doing,
-                regret: Regret::Low,
-                gates: vec![],
-            })
-            .unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
-    }
-
-    #[test]
-    fn a_reimport_keeps_the_mark_of_an_unchanged_gate_and_drops_a_changed_ones() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        stamp(&b, &g1, "c1");
-        stamp(&b, &g2, "c1");
-
-        let mut changed = a.get_gate(&g2).unwrap().unwrap();
-        changed.authored_at_commit = "c2".into();
-        a.update_gate(&changed).unwrap();
-        let g3 = a
-            .add_gate(&p, "new", kind(), selector(), 1, "c2", "o")
-            .unwrap();
-
-        let report = b
-            .import_manifest(&a.export_manifest(&p, "c2", 8, None).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(
-            (
-                report.gates_added,
-                report.gates_changed,
-                report.gates_unchanged
-            ),
-            (1, 1, 1)
-        );
-        assert_eq!(
-            b.get_gate(&g1)
-                .unwrap()
-                .unwrap()
-                .last_pass_commit
-                .as_deref(),
-            Some("c1")
-        );
-        assert_eq!(b.get_gate(&g2).unwrap().unwrap().last_pass_commit, None);
-        assert_eq!(b.get_gate(&g2).unwrap().unwrap().authored_at_commit, "c2");
-        assert!(b.handle_of(Kind::Gate, g3.iri()).unwrap().is_some());
-    }
-
-    #[test]
-    fn an_import_refuses_a_manifest_it_did_not_verify() {
-        let (a, _ga, p, _, _) = authoring();
-        let mut m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        m.body.gates[0].name = "edited".into();
-        let (b, _gb) = fresh();
-        let err = b.import_manifest(&m, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::HandEdited { .. }), "{err}");
-        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
-    }
-
-    #[test]
-    fn a_fresh_import_onto_a_root_another_project_uses_is_refused() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let local = b.add_project("/x").unwrap();
-        let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap_err();
-        assert!(
-            matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
-        let report = b.import_manifest(&m, "/two").unwrap();
-        assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
-        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/two");
-    }
-
-    #[test]
-    fn a_reimport_mirrors_the_manifests_transitions() {
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
-        b.import_manifest(&first, "/x").unwrap();
-        let mut body = first.body.clone();
-        body.transitions.clear();
-        let without = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-        let report = b.import_manifest(&without, "/x").unwrap();
-        assert!(b.list_transitions(&p).unwrap().is_empty());
-        assert_eq!(report.transitions_removed, vec!["ship".to_string()]);
-    }
-
-    // Routing spec §1.2: the importing machine routes as the authoring one.
-    #[test]
-    fn an_export_carries_the_map_and_an_import_writes_it_raising_the_store_to_5() {
-        use fl_core::routing::{Routes, RoutingMap};
-        let (a, _ga, p, _, _) = authoring();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-        assert_eq!(m.body.format_version, 3);
-        assert_eq!(m.body.routing, Some(RoutingMap::starting()));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.redb");
-        {
-            let b = RedbStore::open(&path).unwrap();
-            let report = b.import_manifest(&m, "/x").unwrap();
-            assert_eq!(report.areas, Some(5));
-            assert_eq!(b.routes(&p).unwrap(), Some(RoutingMap::starting()));
-            assert!(b.holds_routing().unwrap());
-        }
-        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
-    }
-
-    // Routing spec §1.2: an older checked-out manifest must not un-route one
-    // machine.
-    #[test]
-    fn an_import_that_would_drop_the_routing_map_is_refused() {
-        use fl_core::routing::{Routes, RoutingMap};
-        let (a, _ga, p, _, _) = authoring();
-        let unrouted = a.export_manifest(&p, "c1", 7, None).unwrap();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let routed = a.export_manifest(&p, "c2", 8, None).unwrap();
-        let (b, _gb) = fresh();
-        b.import_manifest(&routed, "/x").unwrap();
-        let err = b.import_manifest(&unrouted, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::WouldDropRouting(_)), "{err}");
-        assert!(
-            err.to_string().contains("would un-route the project"),
-            "{err}"
-        );
-        assert_eq!(
-            b.routes(&p).unwrap(),
-            Some(RoutingMap::starting()),
-            "nothing written"
-        );
-        // A map that changed is imported: areas come and go (decision 15).
-        a.set_routes(&p, &RoutingMap::starting().without("design"))
-            .unwrap();
-        b.import_manifest(&a.export_manifest(&p, "c3", 9, None).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(b.routes(&p).unwrap().unwrap().declared().len(), 4);
-    }
-
-    // Routing spec decision 20: an import keeps a routed store to one
-    // project, both ways round.
-    #[test]
-    fn an_import_never_puts_a_routed_project_beside_another() {
-        use fl_core::routing::RoutingMap;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_routes(&p, &RoutingMap::starting()).unwrap();
-        let routed = a.export_manifest(&p, "c1", 7, None).unwrap();
-        let (b, _gb) = fresh();
-        b.add_project("/elsewhere").unwrap();
-        let err = b.import_manifest(&routed, "/x").unwrap_err().to_string();
-        assert!(err.contains("needs a store of its own"), "{err}");
-        assert!(!b.holds_routing().unwrap(), "nothing written");
-        let (c, _gc) = fresh();
-        c.import_manifest(&routed, "/x").unwrap();
-        let (o, _go, op, _, _) = authoring();
-        let unrouted = o.export_manifest(&op, "c1", 7, None).unwrap();
-        let err = c.import_manifest(&unrouted, "/y").unwrap_err().to_string();
-        assert!(err.contains("needs a store of its own"), "{err}");
-        assert_eq!(c.list_projects().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn imported_hash_of_a_project_this_store_never_held_is_not_owned() {
-        let (s, _g) = fresh();
-        let err = s.imported_hash(&ProjectId(seq_iri(42))).unwrap_err();
-        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
     }
 
     #[test]
@@ -3047,66 +2803,6 @@ mod tests {
         drop(db);
         let b = RedbStore::open(&path).unwrap();
         assert!(b.imported_hash(&p).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
-        let (a, _ga, p, g1, g2) = authoring();
-        let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
-        b.import_manifest(&first, "/x").unwrap();
-
-        let mut body = first.body.clone();
-        body.gates.retain(|g| g.id != g2);
-        for t in &mut body.transitions {
-            t.gates.retain(|g| *g != g2);
-        }
-        let shrunk = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-        let err = b.import_manifest(&shrunk, "/x").unwrap_err();
-        assert!(
-            matches!(err, ManifestError::WouldRemoveGate { ref id, ref name } if *id == g2 && name == "lint"),
-            "{err}"
-        );
-        assert_eq!(b.imported_hash(&p).unwrap(), Some(first.content_sha256));
-        assert!(b.get_gate(&g1).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_gate_held_locally_under_another_project_is_refused_and_writes_nothing() {
-        let (a, _ga, p, _g1, _g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
-
-        // `b` authors its own project locally and holds a gate under it —
-        // the manifest below is rewritten to claim that same gate id for a
-        // project `b` has never held.
-        let (b, _gb) = fresh();
-        let q = b.add_project("/local").unwrap();
-        let local_gate = b
-            .add_gate(&q, "local", kind(), selector(), 1, "c0", "o")
-            .unwrap();
-
-        let old_id = m.body.gates[0].id.clone();
-        let mut body = m.body.clone();
-        body.gates[0].id = local_gate.clone();
-        for t in &mut body.transitions {
-            for gid in &mut t.gates {
-                if *gid == old_id {
-                    *gid = local_gate.clone();
-                }
-            }
-        }
-        let swapped = Manifest {
-            content_sha256: content_sha256(&body).unwrap(),
-            body,
-        };
-
-        let err = b.import_manifest(&swapped, "/x").unwrap_err();
-        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
-        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
-        assert_eq!(b.get_gate(&local_gate).unwrap().unwrap().project, q);
     }
 
     #[test]
@@ -3230,92 +2926,6 @@ mod tests {
         assert_eq!(s.ledger_root("R_2").unwrap(), None);
     }
 
-    #[test]
-    fn an_import_never_lowers_the_format_of_a_store_that_records_a_ledger_root() {
-        use fl_core::store::Bindings;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.redb");
-        let (a, _ga, p, _, _) = authoring();
-        {
-            let b = RedbStore::open(&path).unwrap();
-            b.set_ledger_root("R_9", "abc").unwrap();
-            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-                .unwrap();
-        }
-        let db = redb::Database::open(&path).unwrap();
-        let tx = db.begin_read().unwrap();
-        let meta = tx.open_table(META).unwrap();
-        assert_eq!(
-            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
-            Some(FORMAT_WITH_LEDGER_ROOT)
-        );
-    }
-
-    #[test]
-    fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
-        assert_eq!(m.body.format_version, 2);
-        assert_eq!(
-            m.body.ledger_root,
-            Some(LedgerRoot {
-                repository_node_id: "R_1".into(),
-                commit: ROOT_A.into(),
-            })
-        );
-        for other in [None, Some("R_2")] {
-            let m = a.export_manifest(&p, "c1", 7, other).unwrap();
-            assert_eq!(
-                (m.body.format_version, m.body.ledger_root),
-                (1, None),
-                "{other:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_import_records_the_manifests_ledger_root() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
-            .unwrap();
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some(ROOT_A));
-        // ⚠ An import that records a root makes the
-        // store one an older fl refuses, not one it opens and exports
-        // without the root.
-        let tx = b.db.begin_read().unwrap();
-        let meta = tx.open_table(META).unwrap();
-        assert_eq!(
-            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
-            Some(FORMAT_WITH_LEDGER_ROOT)
-        );
-    }
-
-    #[test]
-    fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
-        use fl_core::store::Bindings;
-        let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", ROOT_A).unwrap();
-        let (b, _gb) = fresh();
-        b.set_ledger_root("R_1", "other").unwrap();
-        let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                ManifestError::Store(StoreError::LedgerRootChanged { .. })
-            ),
-            "{err}"
-        );
-        assert!(!b.owns(p.iri()).unwrap(), "nothing was written");
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("other"));
-    }
-
     // Routing spec §1.2, §1.4: the map is kept, raising the store to 5 in
     // the same write; a store holds routing once its project has a map.
     #[test]
@@ -3388,23 +2998,6 @@ mod tests {
             assert_eq!(s.routes(&p).unwrap(), None);
         }
         assert_eq!(format_at(&path), Some(FORMAT_VERSION));
-    }
-
-    // The map is authored where the project is (routing spec §1.2): an
-    // importing store's copy comes from the manifest only.
-    #[test]
-    fn an_imported_projects_routing_map_cannot_be_changed_here() {
-        use fl_core::routing::RoutingMap;
-        let (a, _ga, p, _, _) = authoring();
-        let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
-            .unwrap();
-        let err = b.set_routes(&p, &RoutingMap::starting()).unwrap_err();
-        assert!(matches!(err, StoreError::Imported { .. }), "{err:?}");
-        assert!(
-            err.to_string().contains("change the routing map of"),
-            "{err}"
-        );
     }
 
     #[test]

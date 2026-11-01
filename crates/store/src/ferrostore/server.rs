@@ -68,13 +68,23 @@ pub struct FerroStoreServer {
 impl FerroStoreServer {
     /// Bind a Unix socket and serve `store`.
     ///
-    /// Moves `store` in and does not open its path again. If `path` exists and
-    /// is a socket, it is unlinked first. If it exists and is not a socket,
-    /// this returns [`StoreError::Backend`].
+    /// Moves `store` in and does not open its path again. The socket is mode
+    /// 0600 before it listens; a missing parent directory is created 0700.
+    /// If `path` is a socket that refuses a connection, it is stale and is
+    /// unlinked first; one that accepts is another live server, and this
+    /// returns [`StoreError::Backend`]. So does a `path` that is not a socket.
     pub fn bind_unix(path: impl AsRef<Path>, store: FerroStore) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        if !parent.exists() {
+            crate::private::create_private_dir_all(parent)
+                .map_err(|err| backend(format!("create directory {}: {err}", parent.display())))?;
+        }
         prepare_bind_path(path)?;
-        let listener = UnixListener::bind(path)
+        let listener = bind_private_unix(path)
             .map_err(|err| backend(format!("bind {}: {err}", path.display())))?;
         if let Err(err) = listener.set_nonblocking(true) {
             drop(listener);
@@ -184,10 +194,25 @@ impl Drop for FerroStoreServer {
     }
 }
 
+/// Clear the way for a bind. A socket is removed only after a `connect` to it
+/// was refused: nothing listens there. A socket that accepts belongs to a
+/// live server and is left alone.
 fn prepare_bind_path(path: &Path) -> Result<(), StoreError> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(path)
-            .map_err(|err| backend(format!("unlink {}: {err}", path.display()))),
+        Ok(meta) if meta.file_type().is_socket() => match UnixStream::connect(path) {
+            Ok(_) => Err(backend(format!(
+                "a FerroStore server is already listening on {}",
+                path.display()
+            ))),
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)
+                .map_err(|err| backend(format!("unlink {}: {err}", path.display()))),
+            // It went away between the stat and the connect.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(backend(format!(
+                "connect {} to see whether it is stale: {err}; it was not removed",
+                path.display()
+            ))),
+        },
         Ok(_) => Err(backend(format!(
             "{} exists and is not a socket",
             path.display()
@@ -195,6 +220,75 @@ fn prepare_bind_path(path: &Path) -> Result<(), StoreError> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(backend(format!("stat {}: {err}", path.display()))),
     }
+}
+
+/// `socket`, `bind`, `chmod 0600`, then `listen`: no peer can connect before
+/// the mode is owner-only. A failure after the bind removes the node it made.
+fn bind_private_unix(path: &Path) -> io::Result<UnixListener> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is plain old data; all-zero is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the socket path is empty, holds a NUL, or is too long for a Unix socket",
+        ));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let len = libc::socklen_t::try_from(
+        std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1,
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket address too long"))?;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: plain syscall; the result is checked before use.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a new descriptor this function alone owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // SAFETY: `fd` is open; FD_CLOEXEC only marks it close-on-exec.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: `addr` is a valid `sockaddr_un` and `len` covers the path and its NUL.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let listened = fs::set_permissions(path, fs::Permissions::from_mode(0o600)).and_then(|()| {
+        // SAFETY: `fd` is a bound stream socket.
+        if unsafe { libc::listen(fd.as_raw_fd(), 128) } != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(err) = listened {
+        let _ = fs::remove_file(path);
+        return Err(err);
+    }
+    Ok(UnixListener::from(fd))
 }
 
 fn unlink_bound(path: &Path, inode: u64) {
