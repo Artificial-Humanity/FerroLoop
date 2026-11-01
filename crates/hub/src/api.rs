@@ -59,7 +59,7 @@ use fl_gate::{
     evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
     handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use fl_wire::dispatcher::{
     MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
     dispatch_to_route,
@@ -727,7 +727,7 @@ fn stored_node_slug(node_id: &str) -> Option<String> {
 }
 
 fn revoked_node_bearer_matches(
-    store: &RedbStore,
+    store: &AnyStore,
     node_id: &str,
     bearer: &str,
 ) -> Result<bool, String> {
@@ -825,7 +825,7 @@ fn authorize_node_caller<'a>(
     }
 }
 
-fn ensure_primary_hub(state: &HubState, store: &RedbStore, now_ms: u64) -> Result<(), String> {
+fn ensure_primary_hub(state: &HubState, store: &AnyStore, now_ms: u64) -> Result<(), String> {
     let hostname = local_hostname();
     let (node_id, display_name) = match find_hub_node(store)? {
         Some(hub) => (hub.node_id, hub.display_name),
@@ -1478,7 +1478,7 @@ fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpRespon
     HttpResponse::json(200, json!({ "liveness": items }))
 }
 
-fn handle_get_prs(store: &RedbStore) -> HttpResponse {
+fn handle_get_prs(store: &AnyStore) -> HttpResponse {
     let mut prs = Vec::new();
     if let Ok(entries) = store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
     {
@@ -1493,7 +1493,7 @@ fn handle_get_prs(store: &RedbStore) -> HttpResponse {
     HttpResponse::json(200, json!({ "prs": prs }))
 }
 
-fn handle_get_wire_messages(store: &RedbStore, req: &HttpRequest) -> HttpResponse {
+fn handle_get_wire_messages(store: &AnyStore, req: &HttpRequest) -> HttpResponse {
     let unread_only = req
         .query
         .get("unread")
@@ -1690,7 +1690,7 @@ fn handle_post_wire_send(
     HttpResponse::json(200, event_data)
 }
 
-fn resolve_message_id(store: &RedbStore, raw: &str) -> Result<MessageId, String> {
+fn resolve_message_id(store: &AnyStore, raw: &str) -> Result<MessageId, String> {
     let trimmed = raw.trim();
     if trimmed.starts_with("urn:uuid:") {
         let iri = Iri::parse(trimmed).map_err(|e| e.to_string())?;
@@ -1708,7 +1708,7 @@ fn resolve_message_id(store: &RedbStore, raw: &str) -> Result<MessageId, String>
 
 fn handle_post_wire_ack(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -1753,7 +1753,7 @@ fn handle_post_wire_ack(
 }
 
 fn resolve_workflow_def_in_store(
-    store: &RedbStore,
+    store: &AnyStore,
     raw: &str,
 ) -> Result<fl_core::workflow::WorkflowDef, String> {
     let trimmed = raw.trim();
@@ -1780,7 +1780,7 @@ fn resolve_workflow_def_in_store(
         .ok_or_else(|| format!("no workflow definition matching `{trimmed}`"))
 }
 
-fn resolve_workflow_run_id(store: &RedbStore, raw: &str) -> Result<WorkflowRunId, String> {
+fn resolve_workflow_run_id(store: &AnyStore, raw: &str) -> Result<WorkflowRunId, String> {
     let trimmed = raw.trim();
     if trimmed.starts_with("urn:uuid:") {
         let iri = Iri::parse(trimmed).map_err(|e| e.to_string())?;
@@ -1798,7 +1798,7 @@ fn resolve_workflow_run_id(store: &RedbStore, raw: &str) -> Result<WorkflowRunId
 
 fn handle_post_workflow_run_start(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -1868,11 +1868,7 @@ fn redact_sensitive_entry(mut entry: StateEntry) -> StateEntry {
     entry
 }
 
-fn handle_get_state(
-    store: &RedbStore,
-    authority: &HubAuthority,
-    req: &HttpRequest,
-) -> HttpResponse {
+fn handle_get_state(store: &AnyStore, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
     let scope = match req.query.get("scope") {
         Some(s) if !s.trim().is_empty() => match StateScope::from_wire(s.trim()) {
             Ok(sc) => Some(sc),
@@ -1958,7 +1954,7 @@ fn search_state_for_hub(
 }
 
 fn handle_get_state_search(
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -2103,7 +2099,7 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
 }
 
 fn handle_post_state(
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -2440,7 +2436,7 @@ fn handle_post_state_import_workspace(
     )
 }
 
-fn handle_get_stats(store: &RedbStore, _req: &HttpRequest) -> HttpResponse {
+fn handle_get_stats(store: &AnyStore, _req: &HttpRequest) -> HttpResponse {
     let projects = match store.list_projects() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
@@ -2681,6 +2677,8 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
                 || seg == "vault.key"
                 || seg == "gate-audit.jsonl"
                 || seg.ends_with(".redb")
+                // Denied whatever the selected engine: a `.fls` is a store file.
+                || seg.ends_with(".fls")
             {
                 return true;
             }
@@ -5407,7 +5405,7 @@ fn read_command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<S
 }
 
 fn handle_post_pr_review(
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     number: u64,
     req: &HttpRequest,
@@ -5529,7 +5527,7 @@ fn handle_post_pr_review(
 }
 
 fn handle_post_pr_merge(
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     reviewer_apps: &ReviewerApps,
     number: u64,
@@ -5622,7 +5620,7 @@ fn handle_post_pr_merge(
 
 fn handle_post_workflow_step(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     run_id: &WorkflowRunId,
     req: &HttpRequest,
@@ -5676,7 +5674,7 @@ fn handle_post_workflow_step(
 
 fn handle_post_workflow_handoff(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     run_id: &WorkflowRunId,
     req: &HttpRequest,
@@ -5744,7 +5742,7 @@ fn handle_post_workflow_handoff(
 
 fn handle_post_workflow_sign_off(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     run_id: &WorkflowRunId,
     approve: bool,
@@ -5930,7 +5928,7 @@ fn handle_post_workflow_sign_off(
 
 fn handle_post_workflow_abort(
     state: &HubState,
-    store: &RedbStore,
+    store: &AnyStore,
     authority: &HubAuthority,
     run_id: &WorkflowRunId,
     req: &HttpRequest,
@@ -6229,6 +6227,13 @@ mod tests {
     use super::*;
     use fl_core::at::At;
     use fl_core::ids::{RevisionId, StateId, seq_iri};
+
+    #[test]
+    fn store_files_are_forbidden_artifact_paths_whatever_the_engine() {
+        assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.fls")));
+        assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.redb")));
+        assert!(!is_forbidden_artifact_path(Path::new("/w/data/notes.md")));
+    }
 
     fn memory_entry(n: u64, slug: &str, body: &str, sensitive: bool) -> StateEntry {
         StateEntry {

@@ -10,6 +10,7 @@ pub mod code_index;
 #[doc(hidden)]
 pub mod conformance;
 pub mod decision;
+pub mod embed;
 pub mod escalate;
 pub mod escalation;
 pub mod fault;
@@ -51,6 +52,10 @@ pub use code_index::{
     record_token_gain_query, scan_code_index, search_code_index,
 };
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
+pub use embed::{
+    EmbedConfig, EmbedError, Embedder, HashingEmbedder, MAX_EMBED_BYTES, cosine, decode_weights,
+    encode_weights,
+};
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;

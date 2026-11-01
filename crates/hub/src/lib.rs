@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use fl_core::pr_policy::{DEFAULT_OWNER_LOGIN, ReviewerApps};
 use fl_core::store::StoreError;
 use fl_exec::stamp;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -155,7 +155,7 @@ impl Default for HubServerConfig {
     }
 }
 
-/// Shared Hub server state holding configuration, [`AuthManager`], on-demand `RedbStore`
+/// Shared Hub server state holding configuration, [`AuthManager`], on-demand `AnyStore`
 /// access (so CLI commands like `fl hub pair` can concurrently access the `.redb` file),
 /// and the live [`HubWsFrame`] broadcast channel.
 #[derive(Debug, Clone)]
@@ -177,7 +177,7 @@ pub struct HubState {
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
 /// the wait for another process (the CLI) that holds the `.redb` file.
 const PROJECT_OPEN_BUDGET: Duration = Duration::from_secs(2);
-/// Pause between tries on a file another process holds; the same as [`RedbStore::open`]'s.
+/// Pause between tries on a file another process holds; the same as the store's own (`fl_store::StoreOptions::retries`).
 const PROJECT_OPEN_RETRY: Duration = Duration::from_millis(15);
 
 /// An in-process lock for one store file that a waiter can give up on: redb opens a file
@@ -198,17 +198,17 @@ pub enum ProjectOpenError {
     Store(StoreError),
 }
 
-/// A per-project [`RedbStore`] together with that file's [`PathLock`]. Holding it blocks other
+/// A per-project [`AnyStore`] together with that file's [`PathLock`]. Holding it blocks other
 /// requests for the same file and nothing else.
 pub struct ProjectStoreGuard {
-    store: Option<RedbStore>,
+    store: Option<AnyStore>,
     lock: Arc<PathLock>,
 }
 
 impl Deref for ProjectStoreGuard {
-    type Target = RedbStore;
+    type Target = AnyStore;
 
-    fn deref(&self) -> &RedbStore {
+    fn deref(&self) -> &AnyStore {
         self.store
             .as_ref()
             .expect("store present while guard is alive")
@@ -224,8 +224,8 @@ impl Drop for ProjectStoreGuard {
     }
 }
 
-/// Whether `err` is redb saying another holder has the file, the case [`RedbStore::open`]
-/// retries.
+/// Whether `err` is redb saying another holder has the file, the case the store open
+/// retries. (FerroStore is multi-process safe and never reports it.)
 fn is_file_busy(err: &StoreError) -> bool {
     let StoreError::Unreachable { cause, .. } = err else {
         return false;
@@ -233,17 +233,17 @@ fn is_file_busy(err: &StoreError) -> bool {
     cause.contains("Database already open") || cause.contains("Cannot acquire lock")
 }
 
-/// RAII guard holding a [`RedbStore`] together with the `store_lock` mutex for
+/// RAII guard holding a [`AnyStore`] together with the `store_lock` mutex for
 /// the store's whole lifetime, so concurrent in-process opens are serialized.
 pub struct HubStoreGuard<'a> {
-    store: Option<RedbStore>,
+    store: Option<AnyStore>,
     _guard: Option<std::sync::MutexGuard<'a, ()>>,
 }
 
 impl Deref for HubStoreGuard<'_> {
-    type Target = RedbStore;
+    type Target = AnyStore;
 
-    fn deref(&self) -> &RedbStore {
+    fn deref(&self) -> &AnyStore {
         self.store
             .as_ref()
             .expect("store present while guard is alive")
@@ -456,7 +456,7 @@ impl HubState {
         Some((updated, snapshot))
     }
 
-    pub fn is_session_busy(&self, store: &RedbStore, session_id: &str) -> bool {
+    pub fn is_session_busy(&self, store: &AnyStore, session_id: &str) -> bool {
         let turns = read_session_transcript_with_home(
             session_id,
             store,
@@ -504,7 +504,7 @@ impl HubState {
         self.is_session_busy_from_turns(session_id, &turns)
     }
 
-    pub fn mark_session_in_flight(&self, store: &RedbStore, session_key: &str) {
+    pub fn mark_session_in_flight(&self, store: &AnyStore, session_key: &str) {
         let turns = read_session_transcript_with_home(
             session_key,
             store,
@@ -543,7 +543,7 @@ impl HubState {
         self.mark_session_in_flight_from_turns(session_key, &turns);
     }
 
-    /// Open the workspace `RedbStore` for the duration of a single operation, retrying
+    /// Open the workspace `AnyStore` for the duration of a single operation, retrying
     /// briefly if an external CLI process holds a transient lock on the `.redb` file.
     /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
     /// lifetime, serializing concurrent in-process opens.
@@ -562,7 +562,7 @@ impl HubState {
         }
         let mut last_err = None;
         for attempt in 0..200 {
-            match RedbStore::open(path) {
+            match fl_store::open_store(path) {
                 Ok(store) => {
                     return Ok(HubStoreGuard {
                         store: Some(store),
@@ -612,7 +612,13 @@ impl HubState {
             .saturating_duration_since(Instant::now())
             .as_millis()
             / PROJECT_OPEN_RETRY.as_millis()) as u32;
-        match RedbStore::open_with_retries(path, retries) {
+        match fl_store::open_store_with(
+            path,
+            &fl_store::StoreOptions {
+                retries,
+                ..fl_store::StoreOptions::default()
+            },
+        ) {
             Ok(store) => {
                 guard.store = Some(store);
                 Ok(guard)
@@ -2278,7 +2284,7 @@ mod tests {
         assert_eq!(
             max_concurrent.load(Ordering::SeqCst),
             1,
-            "HubStoreGuard must serialize RedbStore holders"
+            "HubStoreGuard must serialize AnyStore holders"
         );
     }
 
