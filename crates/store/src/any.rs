@@ -322,7 +322,14 @@ impl MigrationLock {
         use std::os::unix::fs::OpenOptionsExt;
         let path = Self::path_for(physical);
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).mode(0o600);
+        // O_NOFOLLOW: a symlink at the lock path (live or dangling) is refused
+        // with ELOOP, a hard error, instead of being followed by O_CREAT to lock
+        // or create whatever it points at.
+        options
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
         if create {
             options.create(true).truncate(false);
         }
@@ -531,9 +538,10 @@ fn redb_engine(
 /// A held redb is not remembered (the holder may stop), only its warning.
 ///
 /// Limit: the lock orders ferro-engine processes. A process on the redb
-/// engine (`FL_STORE_BACKEND=redb`) does not take it; one that opens the redb
-/// in the instants after the migration released its handle and before it made
-/// the file read-only can still write a redb the `.fls` does not hold.
+/// engine (`FL_STORE_BACKEND=redb`) does not take it, but it takes the redb's
+/// own file lock: the migration holds that across the chmod to 0400, so such a
+/// process cannot write the redb between the copy and the chmod. The migration
+/// lock additionally orders ferro-engine processes before the redb is opened.
 fn open_ferro(
     path: &Path,
     physical: &Path,
@@ -581,6 +589,11 @@ fn open_ferro(
             return redb_engine_unlocked(path, physical, options.retries);
         }
     };
+    // Another thread of this process may have run the migration, and recorded
+    // that it did not verify, while this one waited for the lock.
+    if memory().unclean.contains(&key) {
+        return stay(Some(lock));
+    }
     let busy = |lock: MigrationLock| {
         if first_time("busy", &key) {
             sink(&format!(
@@ -609,6 +622,8 @@ fn open_ferro(
             return fls_if_present(physical, err);
         }
     }
+    #[cfg(test)]
+    tests::note_migration_attempt(&key);
     match crate::migrate::migrate_verified(path, physical) {
         Ok(report) if report.is_clean() => {
             drop(lock);
@@ -630,11 +645,13 @@ fn open_ferro(
                 None => "the migration did not verify".to_string(),
             };
             memory().unclean.insert(key.clone());
-            sink(&format!(
-                "warning: {} stays on redb: {why}; no {} was created",
-                path.display(),
-                physical.display()
-            ));
+            if first_time("unclean", &key) {
+                sink(&format!(
+                    "warning: {} stays on redb: {why}; no {} was created",
+                    path.display(),
+                    physical.display()
+                ));
+            }
             stay(Some(lock))
         }
         Err(err) if is_redb_busy(&err) => busy(lock),
@@ -1516,6 +1533,59 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// Migration attempts per store key, counted where `migrate_verified` is
+    /// about to run (see `open_ferro`).
+    fn attempts() -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, usize>> {
+        static ATTEMPTS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+            OnceLock::new();
+        ATTEMPTS
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn note_migration_attempt(key: &Path) {
+        *attempts().entry(key.to_path_buf()).or_default() += 1;
+    }
+
+    #[test]
+    fn two_threads_racing_on_an_unclean_store_migrate_once_and_warn_once() {
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src);
+        }
+        add_unknown_table(&redb);
+        let key = memory_key(&redb);
+
+        // Hold the lock so that both threads get past the early check of the
+        // process memory and queue on the lock; then let them go.
+        let holder = MigrationLock::acquire(&fls, true).unwrap().unwrap();
+        let said = Lines::default();
+        let opened: Vec<BackendKind> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let store =
+                            open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &said.sink())
+                                .unwrap();
+                        store.kind()
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holder);
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(opened, vec![BackendKind::Redb, BackendKind::Redb]);
+        assert_eq!(attempts().get(&key).copied(), Some(1), "one migration");
+        assert_eq!(said.all().len(), 1, "{:?}", said.all());
+        assert_eq!(said.count_containing("did not verify"), 1);
+        assert!(!fls.exists());
+    }
+
     #[test]
     fn a_migration_that_does_not_verify_stays_on_redb_warns_once_and_is_not_repeated() {
         let dir = TempDir::new().unwrap();
@@ -1928,6 +1998,7 @@ mod tests {
             Error::from_raw_os_error(37), // ENOLCK
             Error::from_raw_os_error(5),  // EIO
             Error::from_raw_os_error(21), // EISDIR
+            Error::from_raw_os_error(40), // ELOOP: a symlink at the lock path
             Error::from(ErrorKind::TimedOut),
             Error::from(ErrorKind::WouldBlock),
             Error::from(ErrorKind::Interrupted),
@@ -1935,6 +2006,64 @@ mod tests {
             Error::other("unexpected"),
         ] {
             assert!(!lock_error_is_benign(&err), "{err:?}");
+        }
+    }
+
+    /// A symlink at the lock path, live or dangling, is never followed: the
+    /// open is refused (ELOOP), the target is neither locked, written, nor
+    /// created, and the redb is neither opened nor migrated.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_lock_path_is_a_hard_error_and_is_never_followed() {
+        const ELOOP: i32 = 40;
+        for live in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let redb = dir.path().join("s.redb");
+            let fls = dir.path().join("s.fls");
+            let target = dir.path().join("lock-target");
+            {
+                let src = RedbStore::open(&redb).unwrap();
+                populate(&src);
+            }
+            if live {
+                std::fs::write(&target, b"untouched").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, MigrationLock::path_for(&fls)).unwrap();
+            let before = std::fs::read(&redb).unwrap();
+
+            // The probe (no create) and the creating open both fail hard; the
+            // probe's NotFound => Ok(None) must not swallow a dangling symlink.
+            for create in [false, true] {
+                let err = MigrationLock::acquire(&fls, create)
+                    .err()
+                    .unwrap_or_else(|| panic!("live={live} create={create}: lock taken"));
+                assert_eq!(err.raw_os_error(), Some(ELOOP), "{err:?}");
+                assert!(!lock_error_is_benign(&err), "{err:?}");
+            }
+
+            for unmigrated in [Unmigrated::Migrate, Unmigrated::UseRedb] {
+                let said = Lines::default();
+                let err = open_store_sink(&redb, &ferro_opts(unmigrated), &said.sink())
+                    .err()
+                    .unwrap_or_else(|| panic!("live={live} {unmigrated:?}: opened"));
+                let text = err.to_string();
+                assert!(text.contains("could not take the migration lock"), "{text}");
+                assert!(said.all().is_empty(), "{:?}", said.all());
+            }
+            assert!(!fls.exists(), "nothing was migrated");
+            assert_eq!(std::fs::read(&redb).unwrap(), before, "redb untouched");
+            assert_eq!(mode(&redb), 0o600);
+            if live {
+                assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+            } else {
+                assert!(!target.exists(), "the dangling target was not created");
+            }
+            assert!(
+                std::fs::symlink_metadata(MigrationLock::path_for(&fls))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
     }
 
