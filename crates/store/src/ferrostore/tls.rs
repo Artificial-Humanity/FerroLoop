@@ -6,9 +6,10 @@
 //!   provider; TLS 1.2 requires the extended master secret (RFC 7627), so
 //!   its exporter is unique to the connection.
 //! * **Client.** [`Verify`] picks how the server's certificate is checked:
-//!   the system roots (`webpki-roots`, as FerroWire), only the CA in one
-//!   file, or a pinned SHA-256 of the server's SubjectPublicKeyInfo
-//!   ([`PinnedSpki`]).
+//!   the bundled Mozilla root certificates (`webpki-roots`, as FerroWire),
+//!   compiled into the binary and not the OS trust store; only the CA in
+//!   one file (an enterprise or private CA); or a pinned SHA-256 of the
+//!   server's SubjectPublicKeyInfo ([`PinnedSpki`]).
 //! * **Transport.** [`Wire`] is a plain `TcpStream` or one half of a TLS
 //!   stream ([`TlsStream`]). A `rustls` stream cannot be cloned, so the
 //!   halves share one connection state behind a mutex, and each half keeps
@@ -33,8 +34,9 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
+use zeroize::Zeroize;
 
 /// The exporter label of the PSK channel binding (RFC 5705 / RFC 8446
 /// §7.5), with no context: the binding is 32 bytes of
@@ -53,6 +55,9 @@ const MAX_CERT_FILE: u64 = 1024 * 1024;
 const WRITE_CHUNK: usize = 16 * 1024;
 /// The most ciphertext one socket read takes.
 const READ_CHUNK: usize = 16 * 1024;
+/// The longest a best-effort send (a fatal alert the reader queued, or a
+/// `close_notify` at shutdown) may wait for the socket.
+const BEST_EFFORT_SEND: Duration = Duration::from_millis(100);
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
@@ -60,6 +65,15 @@ fn provider() -> Arc<CryptoProvider> {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The guard of `mutex` when no one holds it; `None` when someone does.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
 }
 
 fn shown(path: &Path) -> String {
@@ -86,32 +100,42 @@ impl ServerTls {
     /// file: a regular file of mode 0600 or stricter, owned by this uid or
     /// root (`crate::private::read_secret_file`). No error repeats any of
     /// its bytes.
+    ///
+    /// **Key bytes in memory.** The PEM text read from the file is zeroed
+    /// (`zeroize`) as soon as it is decoded. The decoded DER goes to
+    /// `rustls`, whose `ring` key provider zeroes it after it loads the key.
+    /// Not every copy is zeroed: the PEM decoder of `rustls-pki-types`
+    /// frees its own base64 buffer without zeroing it, and the loaded
+    /// signing key (`ring`'s key pair) holds the key in memory for the
+    /// server's lifetime. Anyone who can read this process's memory can read
+    /// the key. It is never logged, and no error or `Debug` output holds it.
     pub(super) fn from_pem_files(cert: &Path, key: &Path) -> Result<Self, StoreError> {
         let chain = read_certs(cert, "certificate")?;
+        // Built before the key is read, so no error after it drops the key
+        // without zeroing it.
+        let builder = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(VERSIONS)
+            .map_err(|err| backend(format!("TLS versions: {err}")))?
+            .with_no_client_auth();
         let mut key_bytes = crate::private::read_secret_file(key, MAX_CERT_FILE)
             .map_err(|err| backend(format!("read the TLS key file {}: {err}", shown(key))))?;
         let parsed = PrivateKeyDer::from_pem_slice(&key_bytes);
-        // The PEM text of the key goes now; `PrivateKeyDer` zeroes its own copy.
-        key_bytes.fill(0);
-        std::hint::black_box(&key_bytes);
+        key_bytes.zeroize();
         let key_der = parsed.map_err(|_| {
             backend(format!(
                 "the TLS key file {} holds no PEM private key (PKCS#8, PKCS#1 or SEC1)",
                 shown(key)
             ))
         })?;
-        let mut config = ServerConfig::builder_with_provider(provider())
-            .with_protocol_versions(VERSIONS)
-            .map_err(|err| backend(format!("TLS versions: {err}")))?
-            .with_no_client_auth()
-            .with_single_cert(chain, key_der)
-            .map_err(|err| {
-                backend(format!(
-                    "the TLS certificate {} and key {} do not make a server identity: {err}",
-                    shown(cert),
-                    shown(key)
-                ))
-            })?;
+        // `with_single_cert` takes the DER by value and the `ring` provider
+        // zeroes it, on success and on failure.
+        let mut config = builder.with_single_cert(chain, key_der).map_err(|err| {
+            backend(format!(
+                "the TLS certificate {} and key {} do not make a server identity: {err}",
+                shown(cert),
+                shown(key)
+            ))
+        })?;
         config.require_ems = true;
         Ok(Self {
             config: Arc::new(config),
@@ -156,10 +180,13 @@ fn read_public(path: &Path, what: &str) -> Result<Vec<u8>, StoreError> {
 /// How a `wss://` client checks the server's certificate.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Verify {
-    /// A chain to one of the system roots (`webpki-roots`), valid now, for
-    /// the URI's host.
+    /// A chain to one of the bundled Mozilla root certificates
+    /// (`webpki-roots`), valid now, for the URI's host. The roots are
+    /// compiled into the binary; the OS trust store is not read, so a
+    /// server whose certificate comes from an enterprise or private CA needs
+    /// [`Verify::CaFile`] (`ConnectOptions::ca_file`).
     #[default]
-    SystemRoots,
+    BundledRoots,
     /// A chain to a CA in this PEM file alone, valid now, for the URI's host.
     CaFile(PathBuf),
     /// A leaf whose SubjectPublicKeyInfo has this SHA-256, and a handshake
@@ -174,7 +201,9 @@ pub(super) fn client_config(verify: &Verify) -> Result<Arc<ClientConfig>, StoreE
         .with_protocol_versions(VERSIONS)
         .map_err(|err| backend(format!("TLS versions: {err}")))?;
     let mut config = match verify {
-        Verify::SystemRoots => {
+        Verify::BundledRoots => {
+            // The Mozilla roots compiled in by `webpki-roots`, not the OS
+            // trust store.
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             builder.with_root_certificates(roots).with_no_client_auth()
@@ -342,13 +371,22 @@ struct TlsState {
 ///   [`WRITE_CHUNK`] bytes and drain every queued record into a buffer,
 ///   releases `conn`, and writes the buffer to the socket holding `send`
 ///   alone (`send` keeps two writers' records in sealing order);
-/// * the reader never writes to the socket after the handshake: a record
+/// * the reader does not write to the socket after the handshake: a record
 ///   that reading queues (a TLS 1.3 key update reply) stays in the
-///   connection and goes out, in order, with the next write.
+///   connection and goes out, in order, with the next write. The one
+///   exception is a fatal error: the alert that names it is sent once,
+///   best-effort ([`TlsStream::send_best_effort`]);
+/// * a shutdown sends `close_notify` the same best-effort way, then shuts
+///   the socket down.
 ///
-/// Every lock is held for in-memory work only, except `send`, which only
-/// writers take; the reader never waits for it. So a blocked socket write
-/// never stops the reader, and a blocked socket read never stops a writer.
+/// A best-effort send never waits for a lock: it takes `send`, then
+/// `conn`, with `try_lock`, and sends nothing when either is held (a
+/// writer is blocked on the socket, or the handshake runs). It writes with
+/// a [`BEST_EFFORT_SEND`] socket write timeout, so it never blocks for
+/// longer. Every other lock is held for in-memory work only, except `send`,
+/// which only writers take; the reader never waits for it. So a blocked
+/// socket write never stops the reader, and a blocked socket read never
+/// stops a writer.
 ///
 /// The handshake runs on the reading half before the other halves are used
 /// (the server's connection thread in `prepare`, the client before its
@@ -454,8 +492,53 @@ impl TlsStream {
         self.sock.set_read_timeout(timeout)
     }
 
+    /// Send `close_notify` (best-effort, see [`Self::send_best_effort`]),
+    /// then shut the socket down both ways. A peer that reads it sees the
+    /// end of the stream as a clean close, not a truncation.
     fn shutdown_both(&self) {
+        self.send_best_effort(true);
         let _ = self.sock.shutdown(Shutdown::Both);
+    }
+
+    /// Send the records the connection holds queued (a fatal alert), after
+    /// queuing `close_notify` when `close` is set (`rustls` sends nothing
+    /// after a fatal alert, and one `close_notify` at most). Best-effort and
+    /// bounded: nothing is sent when a writer holds `send` or the handshake
+    /// holds `conn` (`try_lock`; their own sends go first), or during the
+    /// handshake, and the socket write waits at most [`BEST_EFFORT_SEND`].
+    /// Whatever fails is dropped: the connection is ending.
+    fn send_best_effort(&self, close: bool) {
+        let Some(_send) = try_lock(&self.state.send) else {
+            return;
+        };
+        let mut sealed = Vec::new();
+        {
+            let Some(mut conn) = try_lock(&self.state.conn) else {
+                return;
+            };
+            if conn.is_handshaking() {
+                return;
+            }
+            if close {
+                conn.send_close_notify();
+            }
+            while conn.wants_write() {
+                if conn.write_tls(&mut sealed).is_err() {
+                    break;
+                }
+            }
+        }
+        if sealed.is_empty() {
+            return;
+        }
+        // `SO_SNDTIMEO` is the socket's, shared by every clone; no writer
+        // is in a socket write while `send` is held here, and the previous
+        // value is put back.
+        let previous = self.sock.write_timeout().ok().flatten();
+        if self.sock.set_write_timeout(Some(BEST_EFFORT_SEND)).is_ok() {
+            let _ = (&self.sock).write_all(&sealed);
+            let _ = self.sock.set_write_timeout(previous);
+        }
     }
 }
 
@@ -508,8 +591,13 @@ impl Read for TlsStream {
                         self.eof = true;
                         continue;
                     }
-                    conn.process_new_packets()
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    if let Err(err) = conn.process_new_packets() {
+                        // The alert that names the error goes to the peer,
+                        // best-effort, before the error is returned.
+                        drop(conn);
+                        self.send_best_effort(false);
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+                    }
                 }
             }
             // No plaintext and no ciphertext to feed: wait for the socket,

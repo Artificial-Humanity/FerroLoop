@@ -17,6 +17,7 @@ ring.workspace = true
 libc.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -7,6 +7,7 @@
 //! [`auth`](super::auth)).
 
 use super::auth::{self, Credential, MethodRule, Peer, Principal, Scope, ServerAuth};
+use super::bind;
 use super::columnar;
 use super::layout::{Op, backend};
 use super::retry;
@@ -232,11 +233,29 @@ impl FerroStoreServer {
         if addrs.is_empty() {
             return Err(backend("bind tcp: the address resolves to nothing"));
         }
-        for addr in &addrs {
-            auth.check_bind(*addr)?;
+        let mut checked = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let device = auth.check_bind(addr)?;
+            checked.push((addr, device));
         }
-        let listener = TcpListener::bind(addrs.as_slice())
-            .map_err(|err| backend(format!("bind tcp: {err}")))?;
+        // As `TcpListener::bind` does: the first address that binds. A
+        // plaintext bind on a named interface's address is pinned to that
+        // interface (`SO_BINDTODEVICE`), or not made at all.
+        let mut bound = None;
+        let mut last_err = None;
+        for (addr, device) in &checked {
+            match bind::listen(*addr, device.as_deref()) {
+                Ok(listener) => {
+                    bound = Some((listener, device.clone()));
+                    break;
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        let Some((listener, device)) = bound else {
+            let err = last_err.map_or_else(|| "no address".to_string(), |err| err.to_string());
+            return Err(backend(format!("bind tcp: {err}")));
+        };
         if let Err(err) = listener.set_nonblocking(true) {
             return Err(backend(format!("set socket nonblocking: {err}")));
         }
@@ -244,8 +263,14 @@ impl FerroStoreServer {
             .local_addr()
             .map_err(|err| backend(format!("tcp local address: {err}")))?;
         // The address bound is one of those checked; checked again, so no
-        // resolution can widen it.
-        auth.check_bind(local)?;
+        // resolution can widen it, and it must name the interface it was
+        // pinned to.
+        if auth.check_bind(local)? != device {
+            return Err(backend(format!(
+                "bind tcp: {local} is pinned to an interface other than the one \
+                 allow_plaintext_on names for it"
+            )));
+        }
         let tls = auth.tls().cloned();
         let state = new_state(store, auth);
         let accept_state = Arc::clone(&state);
@@ -809,6 +834,9 @@ fn serve_connection(
     for handle in forwarders {
         let _ = handle.join();
     }
+    // Over TLS this sends close_notify first (best-effort, bounded), so the
+    // peer reads a clean end, not a truncation.
+    lock_mutex(&write).shutdown_both();
 }
 
 /// Authenticate the connection before anything is read from it as a

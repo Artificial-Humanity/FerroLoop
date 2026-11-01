@@ -608,14 +608,20 @@ impl ServerAuth {
     }
 
     /// `Ok` when `addr` may be bound: anything with TLS; without it, see
-    /// [`bind::check_plaintext_bind`].
-    pub(super) fn check_bind(&self, addr: std::net::SocketAddr) -> Result<(), StoreError> {
+    /// [`bind::check_plaintext_bind`]. `Some(name)`: a plaintext bind on an
+    /// address of the named interface `name`, which the listener must be
+    /// pinned to (`SO_BINDTODEVICE`, [`bind::listen`]).
+    pub(super) fn check_bind(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Result<Option<String>, StoreError> {
         if self.tls.is_some() {
-            return Ok(());
+            return Ok(None);
         }
-        let ip = addr.ip();
-        // Loopback and unspecified need no interface list.
-        if bind::ip_is_loopback(ip) || ip.is_unspecified() || self.allow_plaintext_on.is_empty() {
+        // The unspecified address, or nothing named, needs no interface
+        // list. A loopback address does when an interface is named: `lo`
+        // named pins the listener to `lo`.
+        if addr.ip().is_unspecified() || self.allow_plaintext_on.is_empty() {
             return bind::check_plaintext_bind(addr, &self.allow_plaintext_on, &[]);
         }
         let interfaces = bind::interfaces()
@@ -1012,9 +1018,10 @@ enum ClientAuth {
 /// client knows the server only by TLS, so use a token over `wss://` (or
 /// to loopback, or an allowed plaintext interface on a network you trust).
 ///
-/// A `wss://` client checks the server's certificate against the system
-/// roots by default; [`Self::ca_file`] trusts the CA in one PEM file
-/// instead, and [`Self::pin_spki_sha256`] trusts one server key. A URI never
+/// A `wss://` client checks the server's certificate against the bundled
+/// Mozilla root certificates (`webpki-roots`) by default: they are compiled
+/// into the binary, and the OS trust store is not read. [`Self::ca_file`]
+/// trusts the CA in one PEM file instead (an enterprise or private CA), and [`Self::pin_spki_sha256`] trusts one server key. A URI never
 /// sets these.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOptions {
@@ -1077,7 +1084,9 @@ impl ConnectOptions {
     }
 
     /// Over `wss://`, trust only the CA certificates in the PEM file at
-    /// `path` (not the system roots). The server's chain must reach one of
+    /// `path` (not the bundled Mozilla roots). Use it for a server whose
+    /// certificate comes from an enterprise or private CA: the OS trust
+    /// store is never read. The server's chain must reach one of
     /// them, be valid now, and name the URI's host.
     #[must_use]
     pub fn ca_file(mut self, path: impl Into<PathBuf>) -> Self {
@@ -1102,11 +1111,11 @@ impl ConnectOptions {
         self.ca_file.is_some() || self.pin.is_some()
     }
 
-    /// How a `wss://` connection checks the server: one of the system roots,
+    /// How a `wss://` connection checks the server: the bundled Mozilla roots,
     /// the CA file, or the pin; both named is an error.
     pub(super) fn verify(&self) -> Result<Verify, StoreError> {
         match (&self.ca_file, &self.pin) {
-            (None, None) => Ok(Verify::SystemRoots),
+            (None, None) => Ok(Verify::BundledRoots),
             (Some(path), None) => Ok(Verify::CaFile(path.clone())),
             (None, Some(pin)) => Ok(Verify::Pin(tls::parse_pin(pin)?)),
             (Some(_), Some(_)) => Err(backend(

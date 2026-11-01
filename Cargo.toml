@@ -39,4 +39,5 @@ indexmap = { version = "2.14", features = ["serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1.15"
 webpki-roots = "1.0"
+zeroize = "1.9"
 

@@ -311,12 +311,16 @@ The first field is the SHA-256 of the token's bytes in lowercase hex, the second
 
 `ServerAuth::with_tls_files(cert_chain, key)` makes `bind_tcp` serve `wss://`. `cert_chain` is a PEM file of one or more `CERTIFICATE` blocks, leaf first; `key` is a PEM private key (PKCS#8, PKCS#1 or SEC1) and is a secret file under the rules of Secret files (`0600` or stricter, owned by this uid or root, no FIFO); a key file others can read is refused with the `chmod 600` that fixes it, and no error repeats its bytes. A key that is not the certificate's is refused at load. The server speaks TLS 1.3 and TLS 1.2, `ring` provider, no client certificates; TLS 1.2 requires the extended master secret (RFC 7627), on the client too, so its exporter is the connection's own. The TLS handshake runs on the connection's own thread, within the 10 s handshake deadline of Unauthenticated connections (a peer that never sends its ClientHello, trickles it, or stops halfway is shut down at the deadline), and the 4 KiB pre-authentication frame limit applies inside TLS. TLS and `allow_plaintext_on` are refused on a Unix bind.
 
+The key file's PEM text is zeroed as soon as it is decoded, and `rustls` (`ring` provider) zeroes the decoded DER once it loads the key. Not every copy is zeroed: the PEM decoder frees its own base64 buffer without zeroing it, and the loaded signing key stays in memory for the server's lifetime, so anyone who can read the process's memory can read the key. The key is never logged and is in no error or `Debug` output.
+
+A connection that ends sends `close_notify` before its socket is shut down, and a fatal TLS error found while reading (a record that does not decrypt) sends its alert first. Both are best-effort: they are skipped when a writer is blocked on the socket or the handshake holds the connection, and they wait at most 100 ms for the socket, so a shutdown never blocks on them.
+
 A `wss://` client checks the server's certificate in one of three ways, named in `ConnectOptions` and never in a URI:
 
 | Option | The client accepts |
 | --- | --- |
-| none (the default) | A chain to one of the system roots (`webpki-roots`), valid now, for the URI's host |
-| `ca_file(path)` | A chain to a CA in that PEM file alone (not the system roots), valid now, for the URI's host |
+| none (the default) | A chain to one of the bundled Mozilla root certificates (`webpki-roots`), compiled into the binary (not the OS trust store), valid now, for the URI's host. A server whose certificate comes from an enterprise or private CA needs `ca_file` |
+| `ca_file(path)` | A chain to a CA in that PEM file alone (not the bundled roots), valid now, for the URI's host: an enterprise or private CA |
 | `pin_spki_sha256(hex)` | A leaf whose SubjectPublicKeyInfo DER has that SHA-256 (64 hex digits, either case, `:` between bytes allowed; `openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| sha256sum`). No CA, name or date is checked: the pinned key is the server's identity, so a self-signed certificate, or one renewed over the same key, works. The TLS handshake must still be signed by that key: the certificate the signature is checked against is matched to the pin again first |
 
 The host of the URI is the name verified and the SNI sent (an IP address is matched against the certificate's IP addresses). Naming both `ca_file` and `pin_spki_sha256`, a pin that is not 64 hex digits, or either option with a URI that is not `wss://`, is refused.
@@ -326,6 +330,8 @@ The host of the URI is the name verified and the SNI sent (an IP address is matc
 * a loopback address is always allowed;
 * `0.0.0.0` and `::` (and `::ffff:0.0.0.0`) are always refused: they listen on every interface, the ones that are not loopback included;
 * any other address is allowed only when `ServerAuth::allow_plaintext_on(["tailscale0"])` names an interface and the address is one of that interface's own addresses (`getifaddrs`; an IPv4-mapped address is compared as IPv4, and an IPv6 link-local address must also have that interface's scope id). Naming `lo` covers nothing beyond loopback.
+
+A plaintext bind on an address of a named interface (`lo` named and `127.0.0.1` included) also pins the listening socket to that interface with `SO_BINDTODEVICE`, set before the bind. Linux delivers a packet to a local address whatever interface it arrived on (the weak host model), so without it a listener on a `tailscale0` address also answers a peer on `eth0` that routes that address to the host. The option needs no privilege since Linux 5.7; when setting it fails, the bind is refused with an error that names `SO_BINDTODEVICE` and the interface, and is never made without it. Off Linux there is no `SO_BINDTODEVICE`: the address rule applies but the listener is not pinned, so use TLS there.
 
 Every address the bind's argument resolves to is checked before anything is bound, and the bound address once more. The refusal names the address and says to configure TLS or `allow_plaintext_on`. Authentication is required on every TCP bind, an allowed plaintext interface included.
 

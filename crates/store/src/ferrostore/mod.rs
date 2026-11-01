@@ -1493,10 +1493,12 @@ impl FerroStore {
 
     /// `mem://`, `file://`, `unix://`, `ws://` and `wss://`.
     ///
-    /// A `wss://` client checks the server's certificate against the system
-    /// roots (see [`ConnectOptions::ca_file`] and
+    /// A `wss://` client checks the server's certificate against the bundled
+    /// Mozilla root certificates (`webpki-roots`, compiled into the binary;
+    /// not the OS trust store). See [`ConnectOptions::ca_file`] (an
+    /// enterprise or private CA) and
     /// [`ConnectOptions::pin_spki_sha256`] for the other ways, which only
-    /// options set, never a URI).
+    /// options set, never a URI.
     ///
     /// A `ws://` or `wss://` URI may name its credential in its query (spec §6.2), only
     /// by a `FERROSTORE_*` environment variable:

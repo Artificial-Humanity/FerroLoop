@@ -205,6 +205,72 @@ fn a_split_tls_stream_reads_and_writes_at_once_both_ways() {
     });
 }
 
+/// A connected TLS pair over loopback: the server's halves, the client's
+/// halves, and a raw clone of the client's socket.
+fn tls_pair() -> ((TlsStream, TlsStream), (TlsStream, TlsStream), TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tls = server_tls();
+    let server = thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        let (mut read, write) = TlsStream::server(tcp, &tls).unwrap();
+        read.handshake().unwrap();
+        (read, write)
+    });
+    let tcp = TcpStream::connect(addr).unwrap();
+    let raw = tcp.try_clone().unwrap();
+    let config = tls::client_config(&Verify::CaFile(test_ca())).unwrap();
+    let name = tls::server_name(&addr.to_string()).unwrap();
+    let client = TlsStream::client(tcp, config, name).unwrap();
+    (server.join().unwrap(), client, raw)
+}
+
+/// A shutdown sends close_notify first: the peer reads a clean end of the
+/// stream (`Ok(0)`), not a truncation (`UnexpectedEof`).
+#[test]
+fn a_tls_shutdown_sends_close_notify_and_the_peer_reads_a_clean_end() {
+    within(30, || {
+        let ((mut server_read, _server_write), (_client_read, client_write), _raw) = tls_pair();
+        let mut client_write = Wire::Tls(client_write);
+        client_write.write_all(b"last").unwrap();
+        client_write.shutdown_both();
+        let mut got = [0u8; 4];
+        server_read.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"last");
+        let mut more = [0u8; 16];
+        match server_read.read(&mut more) {
+            Ok(0) => {}
+            other => panic!("expected a clean close (Ok(0)), got {other:?}"),
+        }
+    });
+}
+
+/// A record the reader cannot open is an error, and the fatal alert that
+/// names it reaches the peer before the connection goes (best-effort, from
+/// the reading half), so the peer reads the reason, not a bare end.
+#[test]
+fn a_fatal_tls_read_error_sends_its_alert_to_the_peer() {
+    within(30, || {
+        let ((mut server_read, server_write), (mut client_read, _client_write), mut raw) =
+            tls_pair();
+        // An application-data record of 32 bytes that no key sealed.
+        let mut forged = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+        forged.extend_from_slice(&[0x41; 32]);
+        raw.write_all(&forged).unwrap();
+        let err = server_read.read(&mut [0u8; 16]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        // The server's halves stay open: what the client reads is the alert.
+        // (`SO_RCVTIMEO` is the socket's: the raw clone sets it.)
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let err = client_read.read(&mut [0u8; 16]).unwrap_err();
+        assert!(
+            err.to_string().contains("received fatal alert"),
+            "expected the server's alert, got {err:?}"
+        );
+        drop((server_read, server_write));
+    });
+}
+
 // ---- verification -----------------------------------------------------------------------
 
 #[test]
@@ -218,8 +284,8 @@ fn a_wss_client_trusts_its_ca_file_alone() {
     FerroStore::connect_with(&by_name, &psk_options().ca_file(test_ca())).unwrap();
     let before = server.dispatched();
 
-    // An unrelated CA, and the system roots (the default), do not know the
-    // test CA: refused in the TLS handshake, before any credential.
+    // An unrelated CA, and the bundled Mozilla roots (the default), do not
+    // know the test CA: refused in the TLS handshake, before any credential.
     for options in [
         psk_options().ca_file(fixture("other-ca.pem")),
         psk_options(),
@@ -862,6 +928,30 @@ fn a_routable_address() -> Option<(String, IpAddr)> {
     })
 }
 
+/// The interface `SO_BINDTODEVICE` names on this process's listening socket
+/// bound to `addr` (found in `/proc/self/fd`), `None` when it names none.
+#[cfg(target_os = "linux")]
+fn listener_device(addr: SocketAddr) -> Option<String> {
+    use std::os::fd::{AsFd, BorrowedFd};
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let Ok(raw) = entry.unwrap().file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        // SAFETY: the descriptor is only duplicated here; a descriptor
+        // another thread closes meanwhile makes the dup fail, nothing more.
+        let Ok(owned) = unsafe { BorrowedFd::borrow_raw(raw) }.try_clone_to_owned() else {
+            continue;
+        };
+        let stream = TcpStream::from(owned);
+        // A listener has this local address and no peer (an accepted
+        // connection has the same local address and a peer).
+        if stream.local_addr().ok() == Some(addr) && stream.peer_addr().is_err() {
+            return bind::bound_device(stream.as_fd()).unwrap();
+        }
+    }
+    panic!("no listening socket of this process is bound to {addr}")
+}
+
 #[test]
 fn plain_ws_binds_loopback_or_a_named_interface_and_never_every_interface() {
     // Every interface: refused without TLS, whatever is named.
@@ -875,7 +965,23 @@ fn plain_ws_binds_loopback_or_a_named_interface_and_never_every_interface() {
     // Loopback: allowed, by address or by a name that resolves to it.
     bind("127.0.0.1:0", psk_auth()).unwrap();
     bind("localhost:0", psk_auth()).unwrap();
-    bind("127.0.0.1:0", psk_auth().allow_plaintext_on(["lo"])).unwrap();
+    // `lo` named: allowed, and the listener is pinned to `lo`
+    // (SO_BINDTODEVICE); it still serves.
+    let pinned = bind("127.0.0.1:0", psk_auth().allow_plaintext_on(["lo"])).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(listener_device(pinned.local_addr()).as_deref(), Some("lo"));
+    let client =
+        FerroStore::connect_with(&format!("ws://{}", pinned.local_addr()), &psk_options()).unwrap();
+    client.put_doc("docs", "a", &json!(1)).unwrap();
+    // Nothing named, or TLS: not pinned.
+    #[cfg(target_os = "linux")]
+    for auth in [
+        psk_auth(),
+        with_test_tls(psk_auth()).allow_plaintext_on(["lo"]),
+    ] {
+        let served = bind("127.0.0.1:0", auth).unwrap();
+        assert_eq!(listener_device(served.local_addr()), None);
+    }
     // Authentication is still required.
     let err = error_of(bind(
         "127.0.0.1:0",
@@ -895,9 +1001,31 @@ fn plain_ws_binds_loopback_or_a_named_interface_and_never_every_interface() {
         ));
         assert!(err.contains("bind_tcp"), "{err}");
     }
+    // With TLS every address is allowed, the unspecified one included: the
+    // rule, checked without listening on every interface (the matcher test
+    // in bind.rs covers the plaintext rule for other interfaces).
+    let tls = with_test_tls(psk_auth());
+    for addr in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
+        assert_eq!(
+            tls.check_bind(addr.parse().unwrap()).unwrap(),
+            None,
+            "{addr}"
+        );
+    }
+}
 
+/// Live binds on a non-loopback address of this host and on `0.0.0.0`:
+/// they listen where other hosts can reach them, so they run only with
+/// `FERROSTORE_TEST_LAN_BIND=1`.
+#[test]
+fn plain_ws_binds_a_named_lan_interface_when_asked() {
+    if std::env::var("FERROSTORE_TEST_LAN_BIND").as_deref() != Ok("1") {
+        eprintln!("skipped: set FERROSTORE_TEST_LAN_BIND=1 to bind a LAN address");
+        return;
+    }
     // An address of another interface: refused, refused when only `lo` is
-    // named, and allowed when its own interface is; with TLS, allowed.
+    // named, and allowed (pinned to it) when its own interface is; with
+    // TLS, allowed.
     match a_routable_address() {
         Some((name, ip)) => {
             let addr = SocketAddr::new(ip, 0).to_string();
@@ -907,6 +1035,8 @@ fn plain_ws_binds_loopback_or_a_named_interface_and_never_every_interface() {
             assert!(err.contains("allow_plaintext_on"), "{addr}: {err}");
             let served = bind(&addr, psk_auth().allow_plaintext_on([name.clone()])).unwrap();
             assert_eq!(served.local_addr().ip(), ip);
+            #[cfg(target_os = "linux")]
+            assert_eq!(listener_device(served.local_addr()), Some(name.clone()));
             // Its client is served (an allowed plaintext interface still
             // authenticates; the client side needs allow_plaintext too).
             let client = FerroStore::connect_with(
@@ -922,11 +1052,8 @@ fn plain_ws_binds_loopback_or_a_named_interface_and_never_every_interface() {
             assert!(err.contains("requires authentication"), "{err}");
             bind(&addr, with_test_tls(psk_auth())).unwrap();
         }
-        None => eprintln!(
-            "this host has no routable address: the matcher test in bind.rs covers the rule"
-        ),
+        None => eprintln!("this host has no routable address"),
     }
-    // With TLS every address is allowed, the unspecified one included.
     let any = bind("0.0.0.0:0", with_test_tls(psk_auth())).unwrap();
     let port = any.local_addr().port();
     let client = FerroStore::connect_with(
