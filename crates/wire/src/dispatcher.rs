@@ -3991,19 +3991,35 @@ mod tests {
             .0
     }
 
-    /// A webhook socket that collects one pushed line.
-    fn webhook(dir: &Path, name: &str) -> (PathBuf, std::thread::JoinHandle<String>) {
+    /// A webhook socket for a dispatch. The caller keeps the listener open until the dispatch
+    /// returns, so every push connects, then reads them with [`pushed_lines`]. A helper thread
+    /// that accepted one push and then closed the listener refused any later push, and that
+    /// refusal ran the stale-route repair and its discovery.
+    fn webhook(dir: &Path, name: &str) -> (PathBuf, UnixListener) {
         let sock = dir.join(name);
         let listener = UnixListener::bind(&sock).unwrap();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            std::io::BufReader::new(stream)
-                .read_line(&mut line)
-                .unwrap();
-            line
-        });
-        (sock, handle)
+        (sock, listener)
+    }
+
+    /// The line of each push queued on `listener`. A push connects, writes and closes before
+    /// `dispatch_to_route` returns, so after the dispatch every push is waiting in the backlog.
+    fn pushed_lines(listener: &UnixListener) -> Vec<String> {
+        listener.set_nonblocking(true).unwrap();
+        let mut lines = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    lines.push(line);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return lines,
+                Err(e) => panic!("accept a push: {e}"),
+            }
+        }
     }
 
     #[test]
@@ -4018,7 +4034,7 @@ mod tests {
             ..store.list_wire_receipts(&msg.id).unwrap()[0].clone()
         };
         store.import_wire_batch(&[], &[loud]).unwrap();
-        let (sock, pushed) = webhook(tmp.path(), "hook.sock");
+        let (sock, listener) = webhook(tmp.path(), "hook.sock");
         let mut routes = RouteTable::default();
         routes.upsert(
             "synthetic-recipient-c",
@@ -4037,7 +4053,10 @@ mod tests {
         );
         assert_eq!(updated.len(), 2, "{updated:?}");
         assert!(updated.iter().all(|r| r.status == DeliveryStatus::Acked));
-        assert!(pushed.join().unwrap().contains("discovery"));
+        // One push per deliverable receipt, each to the one route.
+        let lines = pushed_lines(&listener);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| l.contains("discovery")), "{lines:?}");
     }
 
     #[test]
@@ -4205,7 +4224,7 @@ mod tests {
             ),
         ] {
             let msg = mail_to(&store, "synthetic-recipient-i");
-            let (sock, pushed) = webhook(tmp.path(), &format!("{}.sock", case.replace(' ', "-")));
+            let (sock, listener) = webhook(tmp.path(), &format!("{}.sock", case.replace(' ', "-")));
             let mut routes = RouteTable::default();
             routes.upsert(
                 "synthetic-recipient-i",
@@ -4228,7 +4247,9 @@ mod tests {
             );
             assert_eq!(updated.len(), 1, "{case}: {updated:?}");
             assert_eq!(updated[0].status, DeliveryStatus::Acked, "{case}");
-            assert!(pushed.join().unwrap().contains("discovery"), "{case}");
+            let lines = pushed_lines(&listener);
+            assert_eq!(lines.len(), 1, "{case}: {lines:?}");
+            assert!(lines[0].contains("discovery"), "{case}");
         }
     }
 }
