@@ -1607,9 +1607,9 @@ fn read_claude_key(
     Ok((kpath, key_json))
 }
 
-/// The live tmux pane id (`%<n>`) a Claude route's session runs in (see [`claude_live_pane`]), or `None` for any
-/// other vendor, a stopped process, an unreadable key file, or a pane that is not alive.
-/// An interrupt of a session the hub does not host uses it as the pane to send `Escape` to.
+/// The pane from [`claude_live_pane`], or `None` for any other vendor, a stopped process, or a
+/// pane that is not alive/found. The interrupt of a session the hub does not host uses it as the
+/// pane to send `Escape` to.
 pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     let VendorRoute::Claude {
         pid,

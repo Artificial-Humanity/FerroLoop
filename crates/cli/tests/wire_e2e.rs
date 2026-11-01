@@ -780,4 +780,21 @@ fn agent_msg_register_replace_keeps_an_existing_lab_manager_and_never_raises_any
     // Only an existing lab manager is preserved: asking for lead raises nobody, and the name
     // is irrelevant.
     assert_eq!(find(&r, "worker")["role"], "lead");
+
+    // A retired lab manager holds no role: unregister, then a lead --replace comes back as lead.
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .args(["unregister", "manager"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    register("Manager", "lab", "lead", None, true);
+    let r = roster();
+    let manager = find(&r, "manager");
+    assert_eq!(manager["role"], "lead", "{manager}");
+    assert_eq!(manager["extra_areas"], serde_json::json!([]), "{manager}");
 }

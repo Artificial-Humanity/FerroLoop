@@ -399,8 +399,14 @@ fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
 ///   `register --role lead --replace` must not drop the lab manager's authority);
 /// - when no extra areas were given (`extras_given == false`), the existing record's are kept.
 ///
-/// With no existing record, or without `replace`, the request is used as given. The name is
-/// never consulted: only a role the store already granted is preserved.
+/// With no existing record, or without `replace`, the request is used as given. Only an
+/// `Active` existing record counts: a retired record holds no role, so it is treated like no
+/// record (`unregister X` then `register X --role lead --replace` comes back as `lead`). The name
+/// is never consulted: only a role the store already granted is preserved.
+///
+/// The existing record is read in a separate read transaction from the `register_agent` write,
+/// so a role changed in between can be written back. It can only restore a role that name held a
+/// moment earlier, never raise anyone.
 pub fn preserve_on_replace(
     existing: Option<&AgentRecord>,
     replace: bool,
@@ -408,7 +414,7 @@ pub fn preserve_on_replace(
     requested_extras: Vec<String>,
     extras_given: bool,
 ) -> (AgentRole, Vec<String>) {
-    let Some(existing) = existing.filter(|_| replace) else {
+    let Some(existing) = existing.filter(|e| replace && e.status == AgentStatus::Active) else {
         return (requested_role, requested_extras);
     };
     let role = if existing.role == AgentRole::LabManager && requested_role == AgentRole::Lead {
@@ -906,6 +912,26 @@ mod tests {
                 AgentRole::Lead
             );
         }
+        // A retired record holds no role: a Lead request comes back as Lead with the requested
+        // extras.
+        let retired = AgentRecord {
+            status: AgentStatus::Retired,
+            ..record(AgentRole::LabManager, &["agents", "notes"])
+        };
+        assert_eq!(
+            preserve_on_replace(
+                Some(&retired),
+                true,
+                AgentRole::Lead,
+                vec!["x".into()],
+                true
+            ),
+            (AgentRole::Lead, vec!["x".to_string()])
+        );
+        assert_eq!(
+            preserve_on_replace(Some(&retired), true, AgentRole::Lead, vec![], false),
+            (AgentRole::Lead, vec![])
+        );
         // Without --replace nothing is preserved.
         assert_eq!(
             preserve_on_replace(Some(&lm), false, AgentRole::Lead, vec![], false),
