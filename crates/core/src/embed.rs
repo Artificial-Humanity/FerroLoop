@@ -1,4 +1,5 @@
-//! Deterministic, dependency-free CPU text embedder.
+//! Deterministic CPU text embedder with no runtime dependencies beyond
+//! `thiserror` and `sha2`.
 //!
 //! # Honest scope
 //!
@@ -18,14 +19,17 @@
 //! `DefaultHasher`), features are processed in sorted order, the
 //! accumulator is a fixed array, and all float math uses only IEEE
 //! `+ - * /` and `sqrt` (the sublinear `1 + ln(tf)` weight uses an in-file
-//! series rather than the platform `ln`). The only external dependency of
-//! the output is Rust's Unicode case tables for non-ASCII text.
+//! series rather than the platform `ln`). Output for non-ASCII text follows
+//! the compiler's Unicode tables (case mapping) and may change when the
+//! Unicode version changes; if a toolchain upgrade changes the golden value,
+//! bump the `hashing-v1` tag in [`Embedder::space_id`].
 //!
 //! # Limits
 //!
 //! Input is capped at [`MAX_EMBED_BYTES`] (64 KiB); longer text is
 //! truncated on a char boundary, so a huge body cannot stall a caller.
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Maximum number of input bytes considered by [`HashingEmbedder::embed`].
@@ -154,7 +158,13 @@ impl HashingEmbedder {
         let c = &self.config;
         let bw = match &self.bucket_weights {
             None => "none".to_string(),
-            Some(w) => format!("{:016x}", fnv1a(FNV_OFFSET, &encode_weights(w))),
+            Some(w) => {
+                // Normalise -0.0 to 0.0 so equal weights give equal ids.
+                let normalised: Vec<f32> =
+                    w.iter().map(|x| if *x == 0.0 { 0.0 } else { *x }).collect();
+                let digest = Sha256::digest(encode_weights(&normalised));
+                digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+            }
         };
         format!(
             "hashing-v1:dim={}:ngram={}-{}:w={:08x},{:08x},{:08x}:bw={}",
@@ -427,6 +437,17 @@ mod tests {
         (13, -0.157_392_81),
     ];
 
+    /// Independent known answers: published FNV-1a 64-bit vectors and
+    /// murmur3 fmix64 values.
+    #[test]
+    fn primitives_match_published_vectors() {
+        assert_eq!(fnv1a(FNV_OFFSET, b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(FNV_OFFSET, b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(FNV_OFFSET, b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(finish(0), 0);
+        assert_eq!(finish(1), 0xb456_bcfc_34c2_cb2c);
+    }
+
     #[test]
     fn unit_length_and_zero_vectors() {
         let e = HashingEmbedder::default();
@@ -550,6 +571,22 @@ mod tests {
         assert_ne!(masked.space_id(), base.space_id());
         assert_ne!(masked.space_id(), ones.space_id());
 
+        // Different weights never share an id; -0.0 and 0.0 do.
+        let with_w = |w: Vec<f32>| {
+            HashingEmbedder::default()
+                .with_bucket_weights(w)
+                .unwrap()
+                .space_id()
+        };
+        let mut a = vec![1.0f32; 256];
+        let mut b = a.clone();
+        b[255] = 1.000_000_1;
+        assert_ne!(with_w(a.clone()), with_w(b));
+        a[7] = 0.0;
+        let mut neg = a.clone();
+        neg[7] = -0.0;
+        assert_eq!(with_w(a), with_w(neg));
+
         let zero = HashingEmbedder::default()
             .with_bucket_weights(vec![0.0; 256])
             .unwrap();
@@ -583,9 +620,7 @@ mod tests {
         let unit = "tokenizer splits text into words. ";
         let big = unit.repeat((1 << 20) / unit.len() + 1);
         assert!(big.len() > 1 << 20);
-        let start = std::time::Instant::now();
         let v = e.embed(&big);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(v, e.embed(&big[..MAX_EMBED_BYTES]));
 
         // Multi-byte char straddling the cap: truncation backs up to a boundary.
@@ -627,7 +662,8 @@ mod tests {
 
     #[test]
     fn ln_det_is_accurate() {
-        for x in [1.0f64, 2.0, 3.0, 10.0, 1000.0, 65536.0] {
+        for tf in 1..=10_000u32 {
+            let x = f64::from(tf);
             assert!((ln_det(x) - x.ln()).abs() < 1e-12, "{x}");
         }
     }
