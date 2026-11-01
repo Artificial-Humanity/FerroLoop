@@ -22,8 +22,8 @@ pub mod state;
 pub mod workflow;
 
 pub use any::{
-    AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, StoreOptions, choose_backend, open_store,
-    open_store_with, physical_path,
+    AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, StoreOptions, choose_backend, open_redb,
+    open_store, open_store_with, physical_path, store_exists,
 };
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,

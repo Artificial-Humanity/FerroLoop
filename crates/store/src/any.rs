@@ -144,6 +144,36 @@ pub fn open_store_with(path: &Path, options: &StoreOptions) -> Result<AnyStore, 
     })
 }
 
+/// Open the redb store at `path` whatever the environment says. For tests and
+/// for tools that must read a `.redb` file regardless of `FL_STORE_BACKEND`.
+pub fn open_redb(path: &Path) -> Result<AnyStore, StoreError> {
+    open_store_with(
+        path,
+        &StoreOptions {
+            backend: Some(BackendKind::Redb),
+            ..StoreOptions::default()
+        },
+    )
+}
+
+/// Whether the store named by the logical `path` exists under the engine that
+/// [`choose_backend`] selects for it (the process environment's
+/// [`BACKEND_ENV`] included): the physical file of that engine, nothing else.
+/// An unusable environment value counts as "check the path itself".
+///
+/// A lone `.redb` beside a ferro selection reports `false` here; callers that
+/// go on to [`open_store`] it get its refusal, which tells the user to migrate.
+pub fn store_exists(path: &Path) -> bool {
+    store_exists_with(path, std::env::var(BACKEND_ENV).ok().as_deref())
+}
+
+fn store_exists_with(path: &Path, env: Option<&str>) -> bool {
+    match choose_backend(path, env) {
+        Ok(kind) => physical_path(path, kind).exists(),
+        Err(_) => path.exists(),
+    }
+}
+
 enum Backend {
     Ferro(Box<FerroStore>),
     Redb(RedbStore),
@@ -678,5 +708,52 @@ mod tests {
         let report = other.import_manifest(&manifest, "/elsewhere").unwrap();
         assert_eq!(report.project, project);
         assert!(other.imported_hash(&project).unwrap().is_some());
+    }
+
+    #[test]
+    fn open_redb_ignores_the_environment_and_the_path_extension_rules() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.redb");
+        let store = open_redb(&path).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(path.exists());
+        assert!(!dir.path().join("s.fls").exists());
+    }
+
+    #[test]
+    fn store_exists_checks_the_chosen_engines_physical_file() {
+        let dir = TempDir::new().unwrap();
+        let logical = dir.path().join("s.redb");
+        // Nothing yet, under either engine.
+        assert!(!store_exists_with(&logical, None));
+        assert!(!store_exists_with(&logical, Some("ferro")));
+        // A redb file exists for redb, but not for a ferro selection.
+        drop(open_redb(&logical).unwrap());
+        assert!(store_exists_with(&logical, None));
+        assert!(store_exists_with(&logical, Some("redb")));
+        assert!(!store_exists_with(&logical, Some("ferro")));
+        // open_store refuses the lone .redb under a ferro selection; callers
+        // surface that message.
+        let ferro = StoreOptions {
+            backend: Some(BackendKind::Ferro),
+            ..StoreOptions::default()
+        };
+        assert!(open_store_with(&logical, &ferro).is_err());
+        // A ferro store of its own: the logical `.redb` name maps to the
+        // sibling .fls, and an explicit .fls path needs no environment.
+        let fresh = dir.path().join("f.redb");
+        assert!(!store_exists_with(&fresh, Some("ferro")));
+        drop(open_store_with(&fresh, &ferro).unwrap());
+        let physical = dir.path().join("f.fls");
+        assert!(physical.exists());
+        assert!(store_exists_with(&fresh, Some("ferro")));
+        assert!(!store_exists_with(&fresh, None));
+        assert!(store_exists_with(&physical, None));
+        // A bad environment value falls back to the path itself.
+        assert!(store_exists_with(&logical, Some("bogus")));
+        assert!(!store_exists_with(
+            &dir.path().join("none.redb"),
+            Some("bogus")
+        ));
     }
 }
