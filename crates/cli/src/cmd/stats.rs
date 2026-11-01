@@ -8,7 +8,7 @@ use fl_core::split::{Coverage, SplitLedger};
 use fl_core::store::{Catalog, Ledger};
 use fl_core::telemetry::{RegretChallenge, RegretMetric, audit_transition_regret};
 use fl_core::{Iri, Kind};
-use fl_store::AnyStore;
+use fl_store::{AnyStore, AttemptTotals, GateRunTotals, TotalsSource};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,6 +29,12 @@ pub struct Cmd {
     pub project: Ref,
     #[arg(long)]
     pub json: bool,
+    /// Totals only: attempts, wall clock, tokens, cost and gate-run counts. On a FerroStore
+    /// store with no GitHub ledger involved this does not hand attempt rows to the caller and
+    /// skips the per-attempt and breakdown work. The engine still scans the table, so the gain
+    /// is CPU and memory in `fl`, not I/O.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 impl Cmd {
@@ -72,6 +78,23 @@ struct StatsJson {
     regret_audit: Vec<RegretChallenge>,
 }
 
+/// One gate's runs, read as rows: from the merged ledger when there is one, else the local store.
+fn gate_run_rows(
+    store: &AnyStore,
+    source: &Source<'_>,
+    coverage: &Coverage,
+    gate_id: &GateId,
+) -> Result<Vec<GateRun>> {
+    Ok(match (source, coverage) {
+        (Source::Split(split), Coverage::Complete) => match split.gate_runs(gate_id) {
+            Ok(r) => r,
+            Err(e) if e.is_transient() => Ledger::gate_runs(store, gate_id)?,
+            Err(e) => return Err(e.into()),
+        },
+        _ => Ledger::gate_runs(store, gate_id)?,
+    })
+}
+
 pub fn run(store: &AnyStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
     let project = ProjectId(refs::resolve(
         store,
@@ -79,6 +102,9 @@ pub fn run(store: &AnyStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
         Kind::Project,
         &cmd.project,
     )?);
+    if cmd.summary {
+        return run_summary(store, &project, &cmd, &source);
+    }
     let (attempts, coverage) = match &source {
         Source::Local => (store.attempts(&project)?, Coverage::Complete),
         Source::LocalOnly(reason) => (
@@ -105,15 +131,7 @@ pub fn run(store: &AnyStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
             }
         }
         for gate_id in gate_ids {
-            let runs = match (&source, &coverage) {
-                (Source::Split(split), Coverage::Complete) => match split.gate_runs(&gate_id) {
-                    Ok(r) => r,
-                    Err(e) if e.is_transient() => Ledger::gate_runs(store, &gate_id)?,
-                    Err(e) => return Err(e.into()),
-                },
-                _ => Ledger::gate_runs(store, &gate_id)?,
-            };
-            gate_runs.extend(runs);
+            gate_runs.extend(gate_run_rows(store, &source, &coverage, &gate_id)?);
         }
     }
 
@@ -124,6 +142,138 @@ pub fn run(store: &AnyStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
         for line in report_with_audit(&attempts, &coverage, &transitions, &gate_runs) {
             println!("{line}");
         }
+    }
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SummaryGateRuns {
+    pass: u64,
+    fail: u64,
+    error: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SummaryJson {
+    attempts: u64,
+    coverage: String,
+    wall_clock_ms: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    cost_usd_micros: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate_runs: Option<SummaryGateRuns>,
+    source: &'static str,
+}
+
+/// Totals over attempts already in memory (a GitHub ledger is involved).
+fn totals_of_rows(attempts: &[Attempt]) -> AttemptTotals {
+    let mut t = AttemptTotals::default();
+    for a in attempts {
+        t.count = t.count.saturating_add(1);
+        t.cost_usd_micros = t.cost_usd_micros.saturating_add(a.cost_usd_micros);
+        t.tokens_in = t.tokens_in.saturating_add(a.tokens_in);
+        t.tokens_out = t.tokens_out.saturating_add(a.tokens_out);
+        t.duration_ms = t.duration_ms.saturating_add(a.duration_ms);
+    }
+    t
+}
+
+/// `fl stats --summary`: totals only.
+///
+/// ⚠ The columnar rollup reads the local store's own tables and cannot see GitHub entries, so
+/// it answers only for [`Source::Local`]. With a GitHub ledger involved the totals come from
+/// the same rows `fl stats` reads, and `source` says `rows`.
+///
+/// On the ferro engine this calls `gate_run_totals` once per gate and each call scans the table,
+/// so the cost is gates x runs, the same shape as the row path.
+fn run_summary(
+    store: &AnyStore,
+    project: &ProjectId,
+    cmd: &Cmd,
+    source: &Source<'_>,
+) -> Result<i32> {
+    let (attempts, coverage, mut origin) = match source {
+        Source::Local => {
+            let (t, o) = fl_store::attempt_totals(store, Some(project))?;
+            (t, Coverage::Complete, o)
+        }
+        Source::LocalOnly(reason) => (
+            totals_of_rows(&store.attempts(project)?),
+            Coverage::LocalOnly {
+                reason: reason.clone(),
+            },
+            TotalsSource::Rows,
+        ),
+        // ⚠ Same fallback as the full report: GitHub unreadable means local only.
+        Source::Split(split) => {
+            let (rows, coverage) = split.attempts_for_stats(project)?;
+            (totals_of_rows(&rows), coverage, TotalsSource::Rows)
+        }
+    };
+    let gates = Catalog::list_gates(store, project)?;
+    let mut runs = GateRunTotals::default();
+    for gate in &gates {
+        let (t, o) = match source {
+            Source::Local => fl_store::gate_run_totals(store, Some(&gate.id))?,
+            _ => {
+                let mut t = GateRunTotals::default();
+                for run in gate_run_rows(store, source, &coverage, &gate.id)? {
+                    match run.verdict {
+                        fl_core::verdict::Verdict::Pass { .. } => t.pass = t.pass.saturating_add(1),
+                        fl_core::verdict::Verdict::Fail { .. } => t.fail = t.fail.saturating_add(1),
+                        fl_core::verdict::Verdict::Error { .. } => {
+                            t.error = t.error.saturating_add(1)
+                        }
+                    }
+                }
+                (t, TotalsSource::Rows)
+            }
+        };
+        runs.pass = runs.pass.saturating_add(t.pass);
+        runs.fail = runs.fail.saturating_add(t.fail);
+        runs.error = runs.error.saturating_add(t.error);
+        if o == TotalsSource::Rows {
+            origin = TotalsSource::Rows;
+        }
+    }
+    let gate_runs = (!gates.is_empty()).then_some(SummaryGateRuns {
+        pass: runs.pass,
+        fail: runs.fail,
+        error: runs.error,
+    });
+    if cmd.json {
+        let coverage_str = match &coverage {
+            Coverage::Complete => "complete".to_string(),
+            Coverage::LocalOnly { reason } => format!("local_only ({reason})"),
+        };
+        let out = SummaryJson {
+            attempts: attempts.count,
+            coverage: coverage_str,
+            wall_clock_ms: attempts.duration_ms,
+            tokens_in: attempts.tokens_in,
+            tokens_out: attempts.tokens_out,
+            cost_usd_micros: attempts.cost_usd_micros,
+            gate_runs,
+            source: origin.as_str(),
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("attempts: {}", attempts.count);
+        if let Coverage::LocalOnly { reason } = &coverage {
+            println!("note: this covers the local store only, because {reason}");
+        }
+        println!("wall clock: {}ms", attempts.duration_ms);
+        println!("tokens in: {}", attempts.tokens_in);
+        println!("tokens out: {}", attempts.tokens_out);
+        println!("cost: {} micro-USD", attempts.cost_usd_micros);
+        if let Some(g) = &gate_runs {
+            println!(
+                "gate runs: {} pass, {} fail, {} error",
+                g.pass, g.fail, g.error
+            );
+        }
+        println!("source: {}", origin.as_str());
     }
     Ok(0)
 }

@@ -2441,7 +2441,47 @@ fn handle_post_state_import_workspace(
     )
 }
 
-fn handle_get_stats(store: &AnyStore, _req: &HttpRequest) -> HttpResponse {
+/// `GET /api/v1/stats?summary=1`: totals across every project; on the ferro engine no row is
+/// handed to the hub, though the engine still scans the tables. `source` is `columnar` only when every figure came from the engine's columnar scan.
+fn handle_get_stats_summary(store: &AnyStore) -> HttpResponse {
+    let totals = fl_store::attempt_totals(store, None)
+        .and_then(|(a, sa)| fl_store::gate_run_totals(store, None).map(|(g, sg)| (a, sa, g, sg)));
+    let (attempts, attempts_source, runs, runs_source) = match totals {
+        Ok(t) => t,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    let source = if attempts_source == fl_store::TotalsSource::Columnar
+        && runs_source == fl_store::TotalsSource::Columnar
+    {
+        fl_store::TotalsSource::Columnar
+    } else {
+        fl_store::TotalsSource::Rows
+    };
+    HttpResponse::json(
+        200,
+        json!({
+            "attempts": attempts.count,
+            "wall_clock_ms": attempts.duration_ms,
+            "tokens_in": attempts.tokens_in,
+            "tokens_out": attempts.tokens_out,
+            "cost_usd_micros": attempts.cost_usd_micros,
+            "gate_runs": {
+                "pass": runs.pass,
+                "fail": runs.fail,
+                "error": runs.error,
+            },
+            "source": source.as_str(),
+        }),
+    )
+}
+
+/// `GET /api/v1/stats`: the full report. Only the literal `summary=1` selects the totals-only
+/// response of [`handle_get_stats_summary`]; any other value, `summary=0` included, gives this
+/// default response.
+fn handle_get_stats(store: &AnyStore, req: &HttpRequest) -> HttpResponse {
+    if matches!(req.query.get("summary").map(String::as_str), Some("1")) {
+        return handle_get_stats_summary(store);
+    }
     let projects = match store.list_projects() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
