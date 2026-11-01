@@ -59,6 +59,17 @@ impl Env {
     }
 }
 
+/// What a store directory holds after an automatic migration: the pair, and
+/// the empty migration lock file that is left in place (documented in
+/// `fl_store::MigrationLock`).
+fn with_lock() -> Vec<String> {
+    vec![
+        "fl.fls".to_string(),
+        "fl.fls.migrate.lock".to_string(),
+        "fl.redb".to_string(),
+    ]
+}
+
 fn open_with(path: &Path, backend: BackendKind) {
     drop(
         fl_store::open_store_with(
@@ -335,10 +346,7 @@ fn ferro_migrates_a_stray_redb_on_first_use_and_keeps_it_read_only() {
         .success()
         .stdout(contains("/work/app"));
 
-    assert_eq!(
-        env.files(),
-        vec!["fl.fls".to_string(), "fl.redb".to_string()]
-    );
+    assert_eq!(env.files(), with_lock());
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&env.physical_ferro()), 0o600);
     assert_eq!(mode(&env.logical()), 0o400);
@@ -586,10 +594,7 @@ fn migrate_dry_run_then_migrate_then_verify_then_refuse_a_second_migration() {
         .stdout(contains("projects"))
         .stdout(contains("clean:"))
         .stdout(contains("read-only (0400)"));
-    assert_eq!(
-        env.files(),
-        vec!["fl.fls".to_string(), "fl.redb".to_string()]
-    );
+    assert_eq!(env.files(), with_lock());
     assert_eq!(mode(&env.physical_ferro()), 0o600);
     assert_eq!(mode(&env.logical()), 0o400);
 
@@ -789,10 +794,7 @@ fn an_ordinary_ferro_command_migrates_a_redb_only_home() {
         .assert()
         .success()
         .stdout(contains(repo.path().to_str().unwrap()));
-    assert_eq!(
-        env.files(),
-        vec!["fl.fls".to_string(), "fl.redb".to_string()]
-    );
+    assert_eq!(env.files(), with_lock());
     assert_eq!(mode(&env.physical_ferro()), 0o600);
     assert_eq!(mode(&env.logical()), 0o400);
 
@@ -825,6 +827,11 @@ fn an_ordinary_ferro_command_migrates_a_redb_only_home() {
             .assert()
             .failure();
         assert_eq!(mode(&env.logical()), 0o400);
+    } else {
+        eprintln!(
+            "SKIPPED the redb-engine-refuses-a-0400-file assertion: this process can write a \
+             0400 file (running as root), so the refusal cannot be observed"
+        );
     }
 }
 
@@ -844,7 +851,11 @@ fn an_ordinary_ferro_command_beside_a_held_redb_stays_on_redb_and_warns() {
         .failure()
         .stderr(contains("stays on redb"))
         .stderr(contains("still holds the redb"));
-    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+    // (The empty migration lock file was made by the attempt.)
+    assert_eq!(
+        env.files(),
+        vec!["fl.fls.migrate.lock".to_string(), "fl.redb".to_string()]
+    );
     drop(holder);
     // Free again: the same command migrates.
     env.ferro()
@@ -853,8 +864,137 @@ fn an_ordinary_ferro_command_beside_a_held_redb_stays_on_redb_and_warns() {
         .args(["project", "list"])
         .assert()
         .success();
+    assert_eq!(env.files(), with_lock());
+}
+
+// ---- scans do not migrate -------------------------------------------------
+
+/// Every file in `dir` with its bytes, mtime and mode: equal before and after
+/// means untouched.
+fn dir_state(dir: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime, u32)> {
+    let mut out: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            let meta = std::fs::metadata(&path).unwrap();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(&path).unwrap(),
+                meta.modified().unwrap(),
+                mode(&path),
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test]
+fn a_read_only_lookup_does_not_migrate_another_configured_redb_store() {
+    let env = Env::new();
+    let repo = git_repo();
+    let other_repo = git_repo();
+    let other_stores = tempfile::tempdir().unwrap();
+    let other = other_stores.path().join("other.redb");
+    {
+        let store = fl_store::open_redb(&other).unwrap();
+        fl_core::Catalog::add_project(&store, "/work/other").unwrap();
+    }
+    // The bound store is a ferro store of its own; the other project's store
+    // is a lone redb that is configured but not the one in use.
+    populate_redb_ferro(&env, repo.path());
+    let dir = env.home.path().join("config").join("fl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\n\n[[project]]\nroot = \"{}\"\nstore = \"{}\"\n",
+            repo.path().display(),
+            env.logical().display(),
+            other_repo.path().display(),
+            other.display(),
+        ),
+    )
+    .unwrap();
+    let shown = env
+        .ferro()
+        .current_dir(repo.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let iri = json_of(&shown)["id"].as_str().unwrap().to_string();
+
+    let before = dir_state(other_stores.path());
+    assert_eq!(before.len(), 1, "{before:?}");
+    // The lookup visits every configured store that exists, to find the owner.
+    env.ferro()
+        .current_dir(repo.path())
+        .args(["gate", "show", &iri])
+        .assert()
+        .success()
+        .stdout(contains(iri.as_str()));
     assert_eq!(
-        env.files(),
-        vec!["fl.fls".to_string(), "fl.redb".to_string()]
+        dir_state(other_stores.path()),
+        before,
+        "the lookup changed the other store (bytes, mtime or mode), or made a file beside it"
     );
+    assert_eq!(mode(&other), 0o600, "not made read-only");
+    assert!(!other_stores.path().join("other.fls").exists());
+
+    // The store that is USED does migrate: a command that works on `other`.
+    env.ferro()
+        .current_dir(other_repo.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains("/work/other"))
+        .stderr(contains("migrated "))
+        .stderr(contains("kept read-only"));
+    assert!(other_stores.path().join("other.fls").exists());
+    assert_eq!(mode(&other), 0o400);
+}
+
+/// A ferro store at the test's logical path holding a project and a gate.
+fn populate_redb_ferro(env: &Env, repo: &Path) {
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "add", repo.to_str().unwrap()])
+        .assert()
+        .success();
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn migrate_json_reports_the_real_mode_of_the_kept_redb() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    let out = env
+        .fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "migrate", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["redb_kept_read_only"], true, "{v}");
+    assert_eq!(mode(&env.logical()), 0o400);
 }

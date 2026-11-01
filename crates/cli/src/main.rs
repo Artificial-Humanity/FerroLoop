@@ -433,7 +433,7 @@ fn held_elsewhere(
         && !same_store(ws_store, bound)
         && fl_store::store_exists(ws_store)
     {
-        let s = fl_store::open_store(ws_store)
+        let s = fl_store::open_store_for_scan(ws_store)
             .with_context(|| format!("could not open the store at {}", ws_store.display()))?;
         for id in iris {
             if s.owns(id)? {
@@ -445,7 +445,7 @@ fn held_elsewhere(
         if same_store(&e.store, bound) || !fl_store::store_exists(&e.store) {
             continue;
         }
-        let s = fl_store::open_store(&e.store)
+        let s = fl_store::open_store_for_scan(&e.store)
             .with_context(|| format!("could not open the store at {}", e.store.display()))?;
         for id in iris {
             if s.owns(id)? {
@@ -473,7 +473,7 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
         for c in candidates {
             // ⚠ A store that cannot be opened is an ERROR here, not a
             // "doesn't have it": skipping it would search less than it says.
-            let s = fl_store::open_store(c)
+            let s = fl_store::open_store_for_scan(c)
                 .with_context(|| format!("could not open the store at {}", c.display()))?;
             if s.owns(id)? {
                 owners.push(c.clone());

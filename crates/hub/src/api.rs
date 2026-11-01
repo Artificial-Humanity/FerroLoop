@@ -2684,6 +2684,8 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
                 || seg.ends_with(".redb")
                 // Denied whatever the selected engine: a `.fls` is a store file.
                 || seg.ends_with(".fls")
+                // The empty lock file an automatic migration leaves beside a store.
+                || seg.ends_with(".migrate.lock")
             {
                 return true;
             }
@@ -6237,6 +6239,9 @@ mod tests {
     fn store_files_are_forbidden_artifact_paths_whatever_the_engine() {
         assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.fls")));
         assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.redb")));
+        assert!(is_forbidden_artifact_path(Path::new(
+            "/w/data/foo.fls.migrate.lock"
+        )));
         assert!(!is_forbidden_artifact_path(Path::new("/w/data/notes.md")));
     }
 

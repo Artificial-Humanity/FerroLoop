@@ -9,13 +9,24 @@
 //! `verify` work on a private copy of the `.redb` and never write the real
 //! files (opening a redb file rewrites its internal pages, so they do not
 //! open the real one).
+//!
+//! Cost of the private copy: it is made in the system temp directory
+//! (`$TMPDIR`, else `/tmp`, which is often RAM-backed), and it is made while
+//! this process holds a shared lock on the `.redb`, which stops any writer
+//! (a hub or daemon on redb) until the copy is done. `verify` makes one copy
+//! of the redb; `migrate --dry-run` makes the copy and then a `.fls` of the
+//! same size. Each command first checks that the filesystem has room (the
+//! size of each file plus 10%) and refuses, naming `$TMPDIR`, when it does not.
+//! A real `migrate` copies nothing: it writes the new `.fls` beside the
+//! `.redb` and takes the same lock as an automatic migration, so a ferro
+//! process that opens the store meanwhile waits for it.
 
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use fl_store::migrate::{ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore};
 use fl_store::{
     BACKEND_ENV, BackendKind, FerroStore, RedbSharedLock, RedbStore, StoreOptions, choose_backend,
-    is_redb_busy, physical_path,
+    is_redb_busy, migrate_locked, physical_path,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -34,8 +45,11 @@ pub enum Cmd {
     /// Copy the bound `.redb` store into a new `.fls`, verified; the `.redb` is
     /// kept, read-only (0400). Exit 1 when the copy does not verify.
     Migrate {
-        /// Migrate a private copy in the system temp directory, report, and
-        /// delete it. The real files are not written.
+        /// Migrate a private copy, report, and delete it; the real files are
+        /// not written. The copy is made in the system temp directory ($TMPDIR,
+        /// else /tmp, often RAM-backed) and needs room for two files the size
+        /// of the .redb (the command checks, and refuses when short); the
+        /// .redb is locked against writers while it is copied.
         #[arg(long)]
         dry_run: bool,
         /// Print one JSON object instead of text.
@@ -43,7 +57,10 @@ pub enum Cmd {
         json: bool,
     },
     /// Compare an existing `.redb` and `.fls` pair, table by table and view by
-    /// view. Exit 1 when they differ.
+    /// view. Exit 1 when they differ. Works on a private copy of the .redb in
+    /// the system temp directory ($TMPDIR, else /tmp, often RAM-backed; the
+    /// command checks for room and refuses when short); the .redb is locked
+    /// against writers while it is copied.
     Verify {
         /// Print one JSON object instead of text.
         #[arg(long)]
@@ -218,12 +235,34 @@ fn scratch_dir() -> Result<tempfile::TempDir> {
         .context("could not make a private directory in the system temp directory")
 }
 
+/// Refuse, in words, when `free` bytes cannot hold `copies` files of `size`
+/// bytes plus 10% each.
+fn ensure_room(dir: &Path, free: u64, size: u64, copies: u64) -> Result<()> {
+    let need = copies.saturating_mul(size.saturating_add(size / 10));
+    if free < need {
+        bail!(
+            "not enough free space in {} for the private copy: {free} bytes free, {need} needed              ({copies} file(s) of {size} bytes, plus 10%); point $TMPDIR at a bigger filesystem",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// A writable copy of `redb` as `<dir>/<name>`, made while this process holds
-/// a shared lock on the original, so no writer changes it mid-copy. The
-/// original is only read.
-fn copy_redb(redb: &Path, dir: &Path) -> Result<PathBuf> {
+/// a shared lock on the original, so no writer changes it mid-copy (a hub or
+/// daemon on redb waits for the copy). The original is only read. `copies` is
+/// how many files of that size the command will keep in `dir` in all; the
+/// filesystem must have room for them, plus 10%, or nothing is copied.
+fn copy_redb(redb: &Path, dir: &Path, copies: u64) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let _lock = lock_redb(redb)?;
+    let size = std::fs::metadata(redb)
+        .with_context(|| format!("could not read {}", redb.display()))?
+        .len();
+    // A filesystem that cannot report its free space is not a reason to refuse.
+    if let Ok(free) = fl_store::private::available_bytes(dir) {
+        ensure_room(dir, free, size, copies)?;
+    }
     let name = redb
         .file_name()
         .with_context(|| format!("{} has no file name", redb.display()))?;
@@ -232,6 +271,13 @@ fn copy_redb(redb: &Path, dir: &Path) -> Result<PathBuf> {
         .with_context(|| format!("could not copy {} to {}", redb.display(), copy.display()))?;
     std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
     Ok(copy)
+}
+
+/// Whether nobody may write `path` by its mode bits (what `stat` says; root
+/// ignores the bits, which is why the mode is read, not assumed).
+fn mode_is_read_only(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o222 == 0)
 }
 
 fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
@@ -248,7 +294,7 @@ fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
     let started = Instant::now();
     let (report, scratch) = if dry_run {
         let dir = scratch_dir()?;
-        let copy = copy_redb(&redb, dir.path())?;
+        let copy = copy_redb(&redb, dir.path(), 2)?;
         let copy_fls = physical_path(&copy, BackendKind::Ferro);
         let report = migrate_verified(&copy, &copy_fls)
             .with_context(|| format!("dry run on a copy of {}", redb.display()))?;
@@ -264,7 +310,7 @@ fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
         {
             bail!("{} {BUSY}", redb.display());
         }
-        let report = migrate_verified(&redb, &fls).map_err(|e| {
+        let report = migrate_locked(&redb, &fls).map_err(|e| {
             if is_redb_busy(&e) {
                 anyhow::anyhow!("{} {BUSY}", redb.display())
             } else {
@@ -280,7 +326,8 @@ fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
     }
 
     let clean = report.is_clean();
-    let kept_read_only = !dry_run && clean;
+    // The file's real mode: a chmod that failed leaves it writable.
+    let kept_read_only = !dry_run && clean && mode_is_read_only(&redb);
     if json_out {
         let mut out = report_json(&report, Some(elapsed));
         out["command"] = json!("migrate");
@@ -304,9 +351,15 @@ fn migrate(path: &Path, dry_run: bool, json_out: bool) -> Result<i32> {
     if clean {
         if dry_run {
             println!("clean: a real `fl store migrate` would succeed; the copy was deleted");
-        } else {
+        } else if kept_read_only {
             println!(
                 "clean: {} is the store; {} is kept, read-only (0400)",
+                fls.display(),
+                redb.display()
+            );
+        } else {
+            println!(
+                "clean: {} is the store; {} is kept but is still writable (its mode could not be                  set to 0400): make it read-only with chmod 0400, or a write to it is lost",
                 fls.display(),
                 redb.display()
             );
@@ -341,7 +394,7 @@ fn verify(path: &Path, json_out: bool) -> Result<i32> {
     // The redb is compared as a private copy: opening it for the comparison
     // would rewrite the real file, which a migration left read-only.
     let scratch = scratch_dir()?;
-    let copy = copy_redb(&redb, scratch.path())?;
+    let copy = copy_redb(&redb, scratch.path(), 1)?;
     let report = {
         let src = RedbStore::open_with_retries(&copy, 0)
             .with_context(|| format!("could not open a copy of {}", redb.display()))?;
@@ -446,5 +499,61 @@ fn print_mismatches(report: &ParityReport) {
             p.ferro_rows,
             &hex(&p.ferro_hash)[..12],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn ensure_room_needs_the_size_plus_ten_percent_per_copy() {
+        let dir = Path::new("/scratch");
+        // 1000 bytes + 10% = 1100 per copy.
+        assert!(ensure_room(dir, 1100, 1000, 1).is_ok());
+        assert!(ensure_room(dir, 2200, 1000, 2).is_ok());
+        let err = ensure_room(dir, 1099, 1000, 1).unwrap_err().to_string();
+        assert!(err.contains("not enough free space in /scratch"), "{err}");
+        assert!(err.contains("1100 needed"), "{err}");
+        assert!(err.contains("$TMPDIR"), "{err}");
+        let err = ensure_room(dir, 2199, 1000, 2).unwrap_err().to_string();
+        assert!(err.contains("2200 needed"), "{err}");
+        // An empty file needs nothing; sizes near u64::MAX do not wrap.
+        assert!(ensure_room(dir, 0, 0, 2).is_ok());
+        assert!(ensure_room(dir, u64::MAX - 1, u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn copy_redb_checks_the_scratch_space_before_it_copies() {
+        let src = tempfile::tempdir().unwrap();
+        let redb = src.path().join("s.redb");
+        drop(RedbStore::open(&redb).unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        // Room enough on a test machine for one copy: it is made, writable.
+        let copy = copy_redb(&redb, scratch.path(), 1).unwrap();
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // More copies than any filesystem has room for: refused, nothing copied.
+        let other = tempfile::tempdir().unwrap();
+        let err = copy_redb(&redb, other.path(), u64::MAX / 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not enough free space"), "{err}");
+        assert_eq!(std::fs::read_dir(other.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_kept_redb_is_read_only_by_its_real_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.redb");
+        std::fs::write(&file, b"x").unwrap();
+        for (mode, read_only) in [(0o600, false), (0o644, false), (0o400, true), (0o444, true)] {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(mode_is_read_only(&file), read_only, "{mode:o}");
+        }
+        assert!(!mode_is_read_only(&dir.path().join("missing")));
     }
 }

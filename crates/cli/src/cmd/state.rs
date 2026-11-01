@@ -857,24 +857,31 @@ impl<'a> StateEnv<'a> {
             return Ok(primary);
         }
         let ws_path = self.cfg.workspace_state_store(self.default_store);
-        if !crate::same_store(&ws_path, &primary_path) && fl_store::store_exists(&ws_path) {
-            let other = fl_store::open_store(&ws_path).map_err(|e| e.to_string())?;
-            if other.owns(&iri).map_err(|e| e.to_string())? {
-                return Ok(other);
-            }
+        if !crate::same_store(&ws_path, &primary_path)
+            && fl_store::store_exists(&ws_path)
+            && scan_owns(&ws_path, &iri)?
+        {
+            return fl_store::open_store(&ws_path).map_err(|e| e.to_string());
         }
         for entry in &self.cfg.projects {
             let path = &entry.store;
             if crate::same_store(path, &primary_path) || !fl_store::store_exists(path) {
                 continue;
             }
-            let other = fl_store::open_store(path).map_err(|e| e.to_string())?;
-            if other.owns(&iri).map_err(|e| e.to_string())? {
-                return Ok(other);
+            if scan_owns(path, &iri)? {
+                return fl_store::open_store(path).map_err(|e| e.to_string());
             }
         }
         Ok(primary)
     }
+}
+
+/// Whether the store at `path` holds `iri`, asked without migrating it: a lookup
+/// that only searches must not migrate every configured store. (The store a
+/// command goes on to use is opened with `open_store`.)
+pub(crate) fn scan_owns(path: &Path, iri: &Iri) -> Result<bool, String> {
+    let scan = fl_store::open_store_for_scan(path).map_err(|e| e.to_string())?;
+    scan.owns(iri).map_err(|e| e.to_string())
 }
 
 pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
@@ -1582,6 +1589,24 @@ mod tests {
     /// Two paths that name one store open once: the primary store is held (a redb file opens
     /// once per process), so a second open of an alias of it would fail after the retries.
     /// Symlinks stand in for the `.redb`/`.fls` alias, which needs the process environment.
+    #[test]
+    fn scan_owns_answers_for_a_store_and_fails_on_one_it_cannot_open() {
+        use fl_core::Catalog;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.redb");
+        let project = {
+            let store = fl_store::open_redb(&path).unwrap();
+            store.add_project("/repo").unwrap()
+        };
+        assert!(scan_owns(&path, project.iri()).unwrap());
+        let stranger = Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000001").unwrap();
+        assert!(!scan_owns(&path, &stranger).unwrap());
+        // A directory is not a store: an error, never "not mine".
+        let not_a_store = dir.path().join("d.redb");
+        std::fs::create_dir(&not_a_store).unwrap();
+        assert!(scan_owns(&not_a_store, &stranger).is_err());
+    }
+
     #[test]
     fn open_for_id_or_key_does_not_reopen_the_primary_through_an_alias() {
         let dir = tempfile::tempdir().unwrap();
