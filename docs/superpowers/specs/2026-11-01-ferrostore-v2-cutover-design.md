@@ -230,6 +230,10 @@ vectors: BTreeMap<String, Arc<VectorCollection>>
 
 No new dependency. The `im`/`imbl` persistent maps are MPL-2.0. Per-collection `Arc` gets the bound we need without them.
 
+**Known limit (vectors).** An HNSW upsert or delete can fail partway, so a vector op stages a copy of the touched `VectorCollection`. A vector write therefore costs O(that collection) even when no reader holds the state. It is never O(DB). Docs and column tables do meet the O(ops) bound.
+
+The fix is a follow-up: split the upsert into a search phase that only reads and an apply phase that cannot fail. The apply phase then runs in place under `make_mut`.
+
 ### 4.3 Durability and group commit
 
 **Sync.** Frame bytes are synced with `fdatasync`, which still flushes the file size. The slot write is also followed by `fdatasync`. `sync_all` stays only where the inode's metadata must also be durable: create, set_len and rename.
