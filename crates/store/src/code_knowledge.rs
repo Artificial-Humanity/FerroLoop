@@ -229,7 +229,9 @@ pub(crate) struct CodeSyncStats {
 }
 
 /// The sidecar file of the primary store `store`: `<primary>.code.fls`. `None`
-/// for a store with no file of its own (in memory, or served over a socket).
+/// for a store with no file of its own (in memory, or a `unix://` or `ws://`
+/// client). A primary reached through the server at its own file's socket
+/// has a file, and its sidecar is opened embedded beside it.
 pub fn sidecar_path(store: &AnyStore) -> Option<PathBuf> {
     // The path the store was opened with, never its label: the label is
     // `Path::display`, which is lossy for a name that is not UTF-8.

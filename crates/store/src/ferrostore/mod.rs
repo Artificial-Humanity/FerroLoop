@@ -1477,13 +1477,18 @@ impl FerroStore {
     ///
     /// The successful `UnixStream` is the client. It is not dropped in favor of a second connect.
     /// A refused connect (nothing listening, or no socket file) is the embedded fallback, not an error.
-    /// `open` errors are still returned.
+    /// So is a socket path too long for `sun_path`: no server can bind it.
+    /// A failed handshake is an error that names the socket. `open` errors are still returned.
     pub fn auto(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let sock = default_socket_path_for_store(path);
+        if !socket_path_fits(&sock) {
+            return Self::open(path);
+        }
         match UnixStream::connect(&sock) {
             Ok(stream) => {
-                let remote = server::client_from_unix(stream, &auth::ClientCred::None)?;
+                let remote = server::client_from_unix(stream, &auth::ClientCred::None)
+                    .map_err(|err| naming_socket(&sock, err))?;
                 Ok(Self::assemble(
                     Inner::Remote(remote),
                     sock.display().to_string(),
@@ -3560,6 +3565,33 @@ pub fn default_socket_path_for_store(path: impl AsRef<Path>) -> PathBuf {
             path.with_file_name(sock_name)
         }
         None => path.join("ferrostore.sock"),
+    }
+}
+
+/// The bytes `sun_path` holds, the NUL included: 108 on Linux.
+const SUN_PATH_LEN: usize =
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+
+/// Whether `path` fits a Unix socket address (`sun_path`, with its NUL).
+/// A path that does not can never be bound, so no server listens there.
+pub(crate) fn socket_path_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len() < SUN_PATH_LEN
+}
+
+/// `err`, from a client handshake at `sock`, with `connect {sock}: ` before
+/// its message. The variant is kept; one with no message is returned as is.
+fn naming_socket(sock: &Path, err: StoreError) -> StoreError {
+    let at = |text: String| format!("connect {}: {text}", sock.display());
+    match err {
+        StoreError::Backend(text) => StoreError::Backend(at(text)),
+        StoreError::Relayed(text) => StoreError::Relayed(at(text)),
+        StoreError::Decode(text) => StoreError::Decode(at(text)),
+        StoreError::Unreachable { store, cause } => StoreError::Unreachable {
+            store,
+            cause: at(cause),
+        },
+        other => other,
     }
 }
 

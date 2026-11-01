@@ -459,7 +459,7 @@ fn bind_private_unix(path: &Path) -> io::Result<UnixListener> {
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: `sockaddr_un` is plain old data; all-zero is a valid value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= addr.sun_path.len() {
+    if bytes.is_empty() || bytes.contains(&0) || !super::socket_path_fits(path) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the socket path is empty, holds a NUL, or is too long for a Unix socket",

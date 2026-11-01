@@ -2014,6 +2014,44 @@ fn auto_uses_the_listening_socket_and_otherwise_the_file() {
     assert_eq!(opened.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
 }
 
+/// A socket path that cannot fit `sun_path` can have no server: `auto` opens the file.
+#[test]
+fn auto_opens_the_file_when_the_socket_path_is_too_long_for_a_unix_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("d".repeat(120));
+    std::fs::create_dir(&deep).unwrap();
+    let path = deep.join("store.fls");
+    let sock = default_socket_path_for_store(&path);
+    assert!(sock.as_os_str().len() >= 108, "{}", sock.display());
+
+    {
+        let store = FerroStore::auto(&path).unwrap();
+        assert!(!store.is_remote());
+        store.put_doc("docs", "long", &json!({"n": 1})).unwrap();
+    }
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "long").unwrap().unwrap()["n"], 1);
+}
+
+/// A handshake that fails (the server wants a PSK) names the socket.
+#[test]
+fn auto_names_the_socket_when_the_handshake_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.fls");
+    let sock = default_socket_path_for_store(&path);
+    let _server =
+        FerroStoreServer::bind_unix_with(&sock, FerroStore::in_memory(), psk_auth()).unwrap();
+    let err = FerroStore::auto(&path).err().unwrap();
+    assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("connect {}: ", sock.display())),
+        "{text}"
+    );
+    assert!(text.contains("requires authentication"), "{text}");
+    assert!(!path.exists());
+}
+
 fn exercise_store_traits(store: &FerroStore, tag: &str) {
     use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
     use fl_core::at::At;

@@ -14,6 +14,13 @@ impl FerroStore {
         &self.label
     }
 
+    /// Whether this handle is a client of a FerroStore server (`unix://`,
+    /// `ws://`, `wss://`, or [`Self::auto`] that found a listening socket),
+    /// not the file or memory itself.
+    pub fn is_remote(&self) -> bool {
+        matches!(self.inner, super::Inner::Remote(_))
+    }
+
     /// Whether this store holds `id`. An I/O failure is an error, never `false`.
     pub fn owns(&self, id: &Iri) -> Result<bool, StoreError> {
         self.with_read(|txn| doc::owns(txn, &self.label, id))
