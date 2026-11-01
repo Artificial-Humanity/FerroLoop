@@ -18,6 +18,22 @@ libc.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 zeroize.workspace = true
+clap = { workspace = true, optional = true }
+
+[features]
+# The `ferrostore` binary and the shared clap arguments in `fl_store::cli::args`.
+# On by default; a library consumer that needs neither can turn it off.
+default = ["cli"]
+cli = ["dep:clap"]
+
+[[bin]]
+name = "ferrostore"
+path = "src/bin/ferrostore.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "ferrostore_bin"
+required-features = ["cli"]
 
 [dev-dependencies]
 tempfile.workspace = true
