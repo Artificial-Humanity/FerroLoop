@@ -431,6 +431,8 @@ The wire bytes, the configuration and the bind rules are in `docs/ferrostore-spe
 
 **What the binary decides for itself.** The store comes from `--store` (and the `inspect` argument). The engine of `status`, `checkpoint` and `compact` comes from `--engine`. `ferrostore` never reads `FL_STORE_BACKEND`. The private copies of `migrate --dry-run` and `verify` are made in a `0700` directory beside the store, on its own filesystem, not in a RAM-backed `/tmp`.
 
+**Creating a store.** `ferrostore put` and `ferrostore serve` create a missing `.fls` (mode 0600) only with `--create`, and only in a directory that exists. Every other `ferrostore` command, and `put` and `serve` without `--create`, refuse a missing store. `fl store put` and `fl store serve` create the bound store's `.fls` without a flag, with its missing parent directories (mode 0700), unless `FL_STORE_BACKEND=redb` puts the bound store on redb, which they refuse. Neither program creates a `.fls` beside a lone `.redb`: that is refused, and `migrate` is the way on. `serve` checks its auth files and its TCP bind policy before it opens the store, so a `serve` refused for either creates nothing.
+
 **Safety.** `inspect` reads the file through an `O_RDONLY` descriptor and takes no lock, so it never writes, migrates or repairs. `bench` works on fresh stores in a private directory. It runs on an existing store only with `--path` and `--i-know-it-writes`, and then only on FerroStore, in a collection of its own that it empties afterwards. `serve` blocks SIGINT and SIGTERM before it starts a thread, waits for one with `sigwait`, then drops the server, which removes its socket. No command prints a secret.
 
 The flags, the output and the exit codes are in `docs/ferrostore-spec.md` (Command line).

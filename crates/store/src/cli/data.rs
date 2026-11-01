@@ -336,20 +336,34 @@ impl GetReport {
 
 // ---- put ----
 
+/// The most bytes `put -` reads from stdin: 64 MiB. More is refused.
+pub const MAX_STDIN_DOC: u64 = 64 * 1024 * 1024;
+
 /// The document a `put` argument gives: the JSON text itself, or `-` for
-/// the JSON on `stdin`.
+/// the JSON on `stdin` (at most [`MAX_STDIN_DOC`] bytes; more is refused).
 pub fn read_doc(arg: &str, stdin: impl Read) -> Result<Value> {
-    let text = if arg == "-" {
-        let mut text = String::new();
-        let mut stdin = stdin;
-        stdin
-            .read_to_string(&mut text)
-            .map_err(|e| Error::context("could not read the document from stdin", e))?;
-        text
-    } else {
-        arg.to_string()
-    };
-    serde_json::from_str(&text).map_err(|e| Error::context("the document is not JSON", e))
+    read_doc_capped(arg, stdin, MAX_STDIN_DOC)
+}
+
+fn read_doc_capped(arg: &str, stdin: impl Read, cap: u64) -> Result<Value> {
+    if arg != "-" {
+        return serde_json::from_str(arg)
+            .map_err(|e| Error::context("the document is not JSON", e));
+    }
+    // Bytes, not a string: a cut in the middle of a character is still
+    // refused for its size, not reported as bad UTF-8.
+    let mut bytes = Vec::new();
+    stdin
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::context("could not read the document from stdin", e))?;
+    if bytes.len() as u64 > cap {
+        refuse!(
+            "the document on stdin is over the {} MiB limit of `put -`",
+            cap / (1024 * 1024)
+        );
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::context("the document is not JSON", e))
 }
 
 /// What `put` wrote. JSON: `{"collection", "id", "put": true}`.
@@ -615,6 +629,29 @@ mod tests {
         assert_eq!(read_doc(r#"{"a":1}"#, std::io::empty()).unwrap()["a"], 1);
         assert_eq!(read_doc("-", &b"[2]"[..]).unwrap()[0], 2);
         assert!(read_doc("not json", std::io::empty()).is_err());
+    }
+
+    #[test]
+    fn stdin_is_read_up_to_the_cap_and_refused_past_it() {
+        let cap = 2 * 1024 * 1024;
+        // Exactly the cap: read whole.
+        let mut at_cap = vec![b' '; usize::try_from(cap).unwrap()];
+        at_cap[0] = b'7';
+        assert_eq!(read_doc_capped("-", &at_cap[..], cap).unwrap(), 7);
+        // One byte more: refused for its size, the limit named.
+        let over = vec![b' '; usize::try_from(cap + 1).unwrap()];
+        let err = read_doc_capped("-", &over[..], cap)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over the 2 MiB limit"), "{err}");
+        // A cut in the middle of a character is still a size refusal.
+        let mut split = vec![b' '; usize::try_from(cap).unwrap()];
+        split.extend_from_slice("é".as_bytes());
+        let err = read_doc_capped("-", &split[..], cap)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MiB limit"), "{err}");
+        assert_eq!(MAX_STDIN_DOC, 64 * 1024 * 1024);
     }
 
     #[test]

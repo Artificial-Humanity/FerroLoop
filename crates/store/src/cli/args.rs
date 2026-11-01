@@ -85,7 +85,8 @@ pub struct PutArgs {
     pub collection: String,
     /// The document id.
     pub id: String,
-    /// The document as JSON, or `-` to read it from stdin.
+    /// The document as JSON, or `-` to read it from stdin (64 MiB at most;
+    /// more is refused).
     #[arg(value_name = "JSON|-")]
     pub json: String,
     #[command(flatten)]

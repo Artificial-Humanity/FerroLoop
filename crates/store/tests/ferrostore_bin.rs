@@ -983,8 +983,16 @@ fn put_and_serve_never_create_a_fls_beside_a_lone_redb() {
     redb_store(&sb.redb());
     let fls = sb.fls();
     let socket = sb.dir("home").join("s.sock");
-    // However the store is named: `fl.fls` and `fl.redb` are the same pair.
-    for store in [s(&fls), s(&sb.redb())] {
+    // Symlinks to the `.redb`, outside `stores/`: one with the extension and
+    // one without. Each names a `.fls` beside itself, which must not appear.
+    let link = sb.dir("home").join("link.redb");
+    let bare_link = sb.dir("home").join("alias");
+    std::os::unix::fs::symlink(sb.redb(), &link).unwrap();
+    std::os::unix::fs::symlink(sb.redb(), &bare_link).unwrap();
+    let no_ext = sb.dir("stores").join("fl");
+    // However the store is named: `fl.fls`, `fl.redb` and `fl` are the same
+    // pair, and a symlink to the `.redb` is that redb store.
+    for store in [s(&fls), s(&sb.redb()), s(&no_ext), s(&link), s(&bare_link)] {
         for args in [
             vec!["put", "--create", "--store", store, "docs", "a", "1"],
             vec!["put", "--store", store, "docs", "a", "1"],
@@ -1007,8 +1015,112 @@ fn put_and_serve_never_create_a_fls_beside_a_lone_redb() {
             );
             assert_eq!(sb.stores(), ["fl.redb"], "{args:?}");
             assert!(!socket.exists());
+            assert!(!sb.dir("home").join("link.fls").exists(), "{args:?}");
+            assert!(!sb.dir("home").join("alias.fls").exists(), "{args:?}");
         }
     }
+}
+
+#[test]
+fn serve_refuses_plaintext_on_a_non_loopback_address_and_creates_nothing() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    let psk = psk_file(&sb);
+    let serve = |create: bool| {
+        let mut args = vec!["serve"];
+        if create {
+            args.push("--create");
+        }
+        args.extend([
+            "--store",
+            s(&fls),
+            "--tcp",
+            "0.0.0.0:0",
+            "--psk-file",
+            s(&psk),
+            "--server-id",
+            "lab",
+        ]);
+        sb.run(&args)
+    };
+    // --create on a missing store: refused before the store is created, so
+    // nothing at all is made in its directory (no `.fls`, no lock file).
+    let out = serve(true);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("refused 0.0.0.0:0 without TLS"), "{err}");
+    assert!(sb.stores().is_empty(), "{:?}", sb.stores());
+    // An existing store: refused the same, and left as it was.
+    ferro_store(&fls);
+    let before = sb.stores();
+    let out = serve(false);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("without TLS"));
+    assert_eq!(sb.stores(), before);
+}
+
+#[test]
+fn serve_refuses_a_psk_file_others_can_read() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    let psk = psk_file(&sb);
+    std::fs::set_permissions(&psk, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for tcp in [None, Some("127.0.0.1:0")] {
+        let mut args = vec![
+            "serve",
+            "--create",
+            "--store",
+            s(&fls),
+            "--psk-file",
+            s(&psk),
+            "--server-id",
+            "lab",
+        ];
+        if let Some(addr) = tcp {
+            args.extend(["--tcp", addr]);
+        }
+        let out = sb.run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("mode 644") && err.contains("chmod 600"),
+            "{args:?}: {err}"
+        );
+        assert!(!err.contains(&"5a".repeat(32)), "the PSK was printed");
+        // Refused before the store is created.
+        assert!(sb.stores().is_empty(), "{args:?}: {:?}", sb.stores());
+    }
+}
+
+#[test]
+fn put_from_stdin_refuses_a_document_over_64_mib() {
+    let sb = Sandbox::new();
+    let fls = sb.fls();
+    let cap = 64 * 1024 * 1024;
+    // A JSON string one byte over the cap, generated here.
+    let mut doc = Vec::with_capacity(cap + 1);
+    doc.push(b'"');
+    doc.resize(cap, b'a');
+    doc.push(b'"');
+    assert_eq!(doc.len(), cap + 1);
+    let mut child = sb
+        .cmd(&["put", "--create", "--store", s(&fls), "docs", "big", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // The reader stops at the cap and exits; a broken pipe is expected.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&doc);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("over the 64 MiB limit of `put -`"), "{err}");
+    assert!(!fls.exists(), "the refused put created the store");
 }
 
 #[test]

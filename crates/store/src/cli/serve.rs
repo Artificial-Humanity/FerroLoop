@@ -148,7 +148,14 @@ pub fn serve(
     check(options)?;
     // Before the store or the server starts a thread.
     let signals = Signals::block()?;
+    // Everything that can refuse before the store is opened, which can
+    // create it: the PSK, token and TLS files are read and checked here, and
+    // a TCP address is resolved and checked against the bind policy, so a
+    // refused serve leaves no new `.fls` behind. (`bind_tcp` checks again.)
     let auth = server_auth(options)?;
+    if let Some(addr) = &options.tcp {
+        FerroStoreServer::check_tcp_bind(addr.as_str(), &auth)?;
+    }
     let store = open_local(path, create, "serve", w)?;
     let physical = physical_path(path, BackendKind::Ferro);
     let mut methods = Vec::new();

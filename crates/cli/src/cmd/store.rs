@@ -14,7 +14,7 @@
 
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs};
+use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs, emit};
 use fl_store::cli::{self as store_cli, Create, Scratch, Target, Wording};
 use fl_store::{BACKEND_ENV, BackendKind, choose_backend};
 use std::path::Path;
@@ -226,12 +226,6 @@ pub fn run(path: &Path, cmd: Cmd) -> Result<i32> {
 fn printed((out, code): (store_cli::Output, i32)) -> Result<i32> {
     emit(&out);
     Ok(code)
-}
-
-/// A command's text: its stdout, then its stderr.
-fn emit(out: &store_cli::Output) {
-    print!("{}", out.stdout);
-    eprint!("{}", out.stderr);
 }
 
 /// A private (0700) directory in the system temp directory, removed by
