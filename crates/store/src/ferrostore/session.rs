@@ -389,6 +389,13 @@ pub(super) fn is_session_expired(err: &StoreError) -> bool {
     matches!(err, StoreError::Backend(detail) if detail.contains(SESSION_EXPIRED))
 }
 
+/// `true` for the refusal [`DEDUP_FULL`] starts, also as the client
+/// rebuilds it from the server's message: the write ran nothing, so the
+/// client may send it again.
+pub(super) fn is_dedup_full(err: &StoreError) -> bool {
+    matches!(err, StoreError::Backend(detail) if detail.contains(DEDUP_FULL))
+}
+
 fn expired(detail: impl std::fmt::Display) -> StoreError {
     backend(format!("{SESSION_EXPIRED}: {detail}"))
 }

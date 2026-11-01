@@ -370,6 +370,15 @@ So making those primitives remote covers every trait method, and also public `tr
 
 A failed authentication closes the connection after a fixed delay. It says nothing about which check failed.
 
+**Decisions.** The wire bytes, the token file format and the full scope table are in `docs/ferrostore-spec.md` (Served mode, Authentication).
+- **Unix.** The uid check always runs. A PSK on a Unix bind (`bind_unix_with`) is required in addition to it, never optional: a configured PSK that some connections may skip would be a silent downgrade. A token file is refused on a Unix bind. A peer-uid or PSK connection holds `admin`.
+- **`server_id`** is an operator-chosen name (1 to 255 bytes), not an address. It is set with the PSK on the server and on each client as the server it expects. In the MAC input it is preceded by its one-byte length; the labels and nonces have fixed lengths.
+- **Who proves first.** The client proves first and the server answers only a valid client proof, so the server never signs anything for a peer that has not proved the PSK. The server also refuses `nc = ns`.
+- **TCP without a bearer header** always gets the challenge, also on a server with no PSK (which then refuses every answer), so the first frame does not tell a client which methods the server has.
+- **Scopes.** One table (`METHODS` in `auth.rs`). Creating a column table or a vector collection is `write`, since the same op can be staged in `commit_txn`. `apply_sync_batches` is `admin`: it applies batches at their own sequence numbers (replication). There is no migrate RPC; the one migration-only effect, lowering the schema version, is admitted only into an empty store (§6.1).
+- **The failure delay** is 200 ms, then the failure frame, then the close. There is no rate limit; that is a known gap.
+- **Over plain `ws://`** the PSK proves both ends but does not bind the session that follows: an on-path attacker can relay a handshake and then use the connection, and a bearer token travels in clear. §6.3 adds `wss://` with the same handshake inside TLS.
+
 ### 6.3 TLS and bind policy
 
 `wss://` uses `rustls` with a certificate and key from config.

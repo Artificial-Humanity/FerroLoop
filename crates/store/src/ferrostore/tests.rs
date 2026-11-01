@@ -1,4 +1,5 @@
 use super::layout::{self, Op, Superblock};
+use super::tests_auth::psk_auth;
 use super::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnType, ColumnValue, FerroStore,
     FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit, VectorMetric, VectorStorage,
@@ -634,6 +635,11 @@ fn ferromq_redelivers_until_ack_and_subscribers_see_the_next_publish() {
     assert_eq!(store.publish_mq("orders", "k4", &json!(4)).unwrap(), 4);
 }
 
+/// A `ws://` client under the test PSK of [`psk_auth`].
+fn connect_psk(uri: &str) -> Result<FerroStore, StoreError> {
+    FerroStore::connect_with(uri, &super::tests_auth::psk_options())
+}
+
 fn must_not_unreachable<T>(result: Result<T, StoreError>) -> Result<T, String> {
     match result {
         Ok(value) => Ok(value),
@@ -850,7 +856,8 @@ fn websocket_serves_concurrent_clients_without_opening_the_file() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("store.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     assert_ne!(server.local_addr().port(), 0);
     let uri = format!("ws://{}", server.local_addr());
 
@@ -858,7 +865,7 @@ fn websocket_serves_concurrent_clients_without_opening_the_file() {
     for i in 0..4 {
         let uri = uri.clone();
         handles.push(thread::spawn(move || {
-            let client = must_not_unreachable(FerroStore::connect_uri(&uri))?;
+            let client = must_not_unreachable(connect_psk(&uri))?;
             let id = format!("id-{i}");
             must_not_unreachable(client.put_doc(
                 "docs",
@@ -903,23 +910,24 @@ fn websocket_mq_subscribe_does_not_replay_and_ack_matches_local() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("store.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let uri = format!("ws://{}", server.local_addr());
 
-    let publisher = FerroStore::connect_uri(&uri).unwrap();
+    let publisher = connect_psk(&uri).unwrap();
     let early = publisher
         .publish_mq("orders", "before", &json!({"n": 0}))
         .unwrap();
     assert_eq!(early, 1);
 
-    let client_a = FerroStore::connect_uri(&uri).unwrap();
+    let client_a = connect_psk(&uri).unwrap();
     let rx = client_a.subscribe_mq("orders");
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "subscribe does not replay history"
     );
 
-    let client_b = FerroStore::connect_uri(&format!("{uri}/store")).unwrap();
+    let client_b = connect_psk(&format!("{uri}/store")).unwrap();
     let seq = client_b
         .publish_mq("orders", "k", &json!({"n": 1}))
         .unwrap();
@@ -979,8 +987,9 @@ fn websocket_get_doc_returns_stored_null() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("null.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}/store", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}/store", server.local_addr())).unwrap();
     client.put_doc("docs", "empty", &json!(null)).unwrap();
     let stored = client.get_doc("docs", "empty");
     assert!(
@@ -1003,8 +1012,9 @@ fn websocket_get_doc_returns_stored_null() {
 
 #[test]
 fn websocket_subscribe_disconnects_when_the_server_drops() {
-    let server = FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory(), psk_auth()).unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     let rx = client.subscribe_mq("orders");
     drop(server);
     assert_eq!(
@@ -2285,9 +2295,10 @@ fn store_traits_run_over_unix_ws_and_auto() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("traits.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_store_traits(&client, "ws");
     drop(client);
     drop(server);
@@ -2318,10 +2329,11 @@ fn remote_with_write_commits_both_ops_in_one_frame() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("cas.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
     let uri = format!("ws://127.0.0.1:{port}");
-    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    assert_concurrent_increments(|| connect_psk(&uri).unwrap(), &file);
     drop(server);
 
     let dir = tempfile::tempdir().unwrap();
@@ -2585,9 +2597,10 @@ fn served_column_scan_works_over_unix_and_ws_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("cols.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_served_columns(&client);
     drop(client);
     drop(server);
@@ -2733,8 +2746,9 @@ fn attempt_and_gate_rollups_match_hand_sums_locally_and_over_unix() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("roll.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     assert_rollups(&client);
     drop(client);
     drop(server);
@@ -2873,8 +2887,9 @@ fn non_finite_floats_round_trip_locally_and_over_unix_and_ws() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("floats.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
-    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
+    let client = connect_psk(&format!("ws://{}", server.local_addr())).unwrap();
     assert_non_finite_round_trip(&client);
     drop(client);
     drop(server);
@@ -3908,9 +3923,10 @@ fn vector_rpc_works_over_unix_and_ws() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("vecs.fls");
     let server =
-        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap(), psk_auth())
+            .unwrap();
     let port = server.local_addr().port();
-    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    let client = connect_psk(&format!("ws://127.0.0.1:{port}")).unwrap();
     exercise_vector_rpc(&client, &file);
     let knowledge: Vec<KnowledgeHit> = client
         .search_knowledge(

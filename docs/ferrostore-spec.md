@@ -191,11 +191,13 @@ Phase 1 implements two of the four native models.
 | `file://rel/x.fls` | `open` of relative `rel/x.fls` |
 | `unix:///tmp/x.sock`, `unix://localhost/tmp/x.sock` | Client of absolute `/tmp/x.sock`. Served |
 | `unix://rel/x.sock` | Client of relative `rel/x.sock`. Served |
-| `ws://127.0.0.1:9`, `ws://127.0.0.1:9/store` | Client of that WebSocket endpoint. Served |
+| `ws://127.0.0.1:9`, `ws://127.0.0.1:9/store` | Client of that WebSocket endpoint. Served. The query may name the credential (see Authentication) |
 | `wss://...` | `StoreError::Backend`. The message names `wss` and does not say the scheme is unknown |
 | Anything else, including `""` and `http://` | `StoreError::Backend` whose message contains `unknown` and does not describe the scheme as deferred |
 
 `file://` and `unix://` paths are not percent-decoded. Only the host `localhost` is stripped; any other non-empty host is part of a relative path. A failed `unix://` or `ws://` connect is `StoreError::Backend`. It is not an unknown scheme.
+
+`FerroStore::connect_with(uri, &ConnectOptions)` is `connect_uri` with a credential (see Authentication). `connect_uri(uri)` is `connect_with(uri, &ConnectOptions::new())`: no credential, which a `unix://` server that checks the peer uid alone accepts.
 
 ## Served mode
 
@@ -205,7 +207,7 @@ A Unix frame is a 4-byte big-endian length followed by that many bytes of UTF-8 
 
 A WebSocket message is one JSON object in one RFC 6455 frame. Client frames are masked. Server frames are not. The payload has no length prefix. The JSON payload is `1..=16MiB`. `wss://` is recognized and refused with a message that does not say the scheme is unknown.
 
-Each call is one JSON object:
+Every connection authenticates before the server reads its first request (see Authentication). After that, each call is one JSON object:
 
 ```json
 {"id": 1, "method": "put_doc", "params": {}}
@@ -251,7 +253,54 @@ Each call is one JSON object:
 {"method": "mq", "params": {"topic": "orders", "record": {"seq": 1, "key": "k", "payload": {}}}}
 ```
 
-Every write method (`commit_txn`, `put_doc`, `delete_doc`, `publish_mq`, `ack_mq`, `create_column_table`, `append_column_rows`, `create_vector_collection`, `upsert_vector`, `delete_vector`, `apply_sync_batches`) takes an optional `req`: 32 hex digits, a client-chosen id for one logical attempt of the write. The server keeps the reply to each `req` it ran, at most 10 000 of them for at most 10 minutes. A write whose `req` it holds is answered with that first reply, error or not, from any connection, and runs nothing; one whose `req` is still running waits for it. A running `req` is never forgotten, nor one answered less than 20 s (two call timeouts) after it arrived; when the table holds 10 000 of those, a write with a new `req` is refused with `dedup table full, retry` and runs nothing. So a resend after a lost reply cannot apply a write twice. A write without `req` is not remembered, and every other method ignores `req`. The client sends `req` with every write it makes (`commit_txn`, `publish_mq`, `apply_sync_batches`, and a cache fill's `put_doc`), a new one for every attempt (a lost `commit_txn` retries under a new one), and the same one again only when it resends an attempt whose reply did not come: it does so once, after the 10 s call timeout.
+Every write method (`commit_txn`, `put_doc`, `delete_doc`, `publish_mq`, `ack_mq`, `create_column_table`, `append_column_rows`, `create_vector_collection`, `upsert_vector`, `delete_vector`, `apply_sync_batches`) takes an optional `req`: 32 hex digits, a client-chosen id for one logical attempt of the write. The server keeps the reply to each `req` it ran, at most 10 000 of them for at most 10 minutes. A write whose `req` it holds is answered with that first reply, error or not, from any connection, and runs nothing; one whose `req` is still running waits for it. A running `req` is never forgotten, nor one answered less than 20 s (two call timeouts) after it arrived; when the table holds 10 000 of those, a write with a new `req` is refused with `dedup table full, retry` and runs nothing. So a resend after a lost reply cannot apply a write twice. A write without `req` is not remembered, and every other method ignores `req`. The client sends `req` with every write it makes (`commit_txn`, `publish_mq`, `apply_sync_batches`, and a cache fill's `put_doc`), a new one for every attempt (a lost `commit_txn` retries under a new one), and the same one again only when it resends an attempt whose reply did not come: it does so once, after the 10 s call timeout. A `dedup table full, retry` refusal ran nothing, so the client takes it as a lost attempt: it sends the same `req` again after the wait of a lost commit (see Remote transactions), within 8 sends in all, and then returns the refusal.
+
+### Authentication
+
+A connection authenticates before the server reads anything from it as a request. Until then the server answers no method, `open_session` and `txn_read` included. The first frames of a connection are the handshake below, in the transport's framing (a length-prefixed JSON frame on a Unix socket, one WebSocket message on `ws://`).
+
+**Unix socket.** The server reads the peer's uid with `SO_PEERCRED` (`getpeereid` on the BSDs and macOS) when it accepts. A uid other than the server's effective uid, or one the kernel does not report, is refused before anything is read, and the server prints `warning: FerroStore refused a Unix connection from uid <uid>: the server runs as uid <own>` to stderr. The socket is mode `0600` as well (see Auto). `bind_unix(path, store)` checks the uid alone. `bind_unix_with(path, store, auth)` given a `ServerAuth` with a PSK also runs the PSK challenge-response after the uid check; a configured PSK is always required, never optional. A token file is refused on a Unix bind. A Unix connection that passes holds the `admin` scope.
+
+**TCP (`ws://`).** `bind_tcp(addr, store, auth)` needs a `ServerAuth` with a PSK, a token file, or both; without one it fails before it binds. A connection is decided by its upgrade request:
+
+* With one `Authorization: Bearer <token>` header (scheme case-insensitive; the token is visible ASCII), the server hashes the token with SHA-256 and compares the hash with every token-file entry in constant time. A match holds the entry's scope. Anything else in `Authorization`, two such headers, or no match is refused.
+* Without `Authorization`, the server runs the PSK challenge-response. A connection that passes holds the `admin` scope. A server without a PSK still sends the challenge and refuses every answer.
+
+**PSK challenge-response.** Each side proves the PSK to the other.
+
+1. Server: `{"auth": "challenge", "v": 1, "ns": <hex>}`. `ns` is 32 bytes from the system random source, fresh for every connection.
+2. Client: `{"auth": "psk", "nc": <hex>, "proof": <hex>}`, `nc` 32 fresh random bytes, `proof = HMAC-SHA256(psk, "fl-store/1/client" ‖ L ‖ server_id ‖ ns ‖ nc)`.
+3. The server checks the proof with `ring::hmac::verify` (constant time). It refuses a hello with any other key, a value that is not exactly 64 lowercase hex digits, or `nc` equal to `ns`.
+4. Server: `{"auth": "ok", "scope": "admin", "proof": <hex>}`, `proof = HMAC-SHA256(psk, "fl-store/1/server" ‖ L ‖ server_id ‖ nc ‖ ns)`.
+5. The client checks that proof the same way. A missing or wrong proof, or an `ok` without a challenge, is refused by the client with an error that says the server did not prove the PSK for that `server_id`, and no request is sent.
+
+Every `<hex>` is 64 lowercase hex digits (32 bytes). Both labels are 17 ASCII bytes and differ, so a proof made in one direction is never valid in the other. `L` is one byte, the length of `server_id`; the nonces are 32 bytes each, so the input has one reading. `server_id` is the name the server proves itself under: an operator-chosen name, 1 to 255 bytes of UTF-8 without control characters, configured with the PSK on the server (`ServerAuth::with_psk_file(server_id, path)`) and on every client as the server it expects (`ConnectOptions::psk_file(server_id, path)`). It is not an address. A client whose `server_id` differs from the server's fails the server's check, so a proof one server sees cannot be used at another that shares the PSK. A PSK is at least 32 bytes.
+
+**Bearer and Unix accept.** With a valid token, or a Unix peer whose uid passed and no PSK, the server's first frame is `{"auth": "ok", "scope": <scope>}`. A client configured with a PSK refuses that frame, since it proves nothing.
+
+**Failure.** Whatever check failed (a wrong PSK or `server_id`, an unknown token, a malformed upgrade or hello, a request sent instead of a hello, another uid, a 10 s silence), the server waits 200 ms, sends `{"auth": "failed", "error": "authentication failed"}` (not after a malformed upgrade, which has no frames yet) and closes. The client's error is `FerroStore authentication failed` in every case. The server limits neither the rate of attempts nor the connections it holds; a rate limit is a known gap.
+
+**Secret files.** A PSK file holds the PSK's bytes; one trailing `\n` or `\r\n` is dropped. A client token file holds the token on its first line. The server's token file has one token per line:
+
+```text
+# sha256-of-token scope label...
+3f0a…(64 lowercase hex digits) read ci-dashboard
+9b1c…(64 lowercase hex digits) write ingest bot
+```
+
+The first field is the SHA-256 of the token's bytes in lowercase hex, the second is `read`, `write` or `admin`, and the rest of the line is a label for people. Blank lines and lines that start with `#` are skipped. A bad field, a repeated hash or a file with no token is refused at load with the line number, and the error repeats nothing of the line. The server holds the hashes, never a token. Every secret file (a PSK file on either side, a token file on either side) must be a regular file without group or other permission bits (`0600` or stricter); one that has them is refused with the `chmod 600` that fixes it. The token file is read once, at `ServerAuth::with_token_file`. To make an entry: `token=$(head -c 32 /dev/urandom | xxd -p -c 64)`, then `printf %s "$token" | sha256sum`.
+
+**Client credentials.** `ConnectOptions::psk_file(server_id, path)`, `psk_env(server_id, var)` or `psk(server_id, bytes)`; `ConnectOptions::token_file(path)`, `token_env(var)` or `token(text)`. A bearer token is for `ws://` alone. A `ws://` URI given to `connect_uri` may name the credential in its query instead: `psk_file=<path>` or `psk_env=<var>` with `server_id=<name>`, or `token_file=<path>` or `token_env=<var>`. Values are not percent-decoded. A query that names a secret itself (`psk=`, `token=`, `secret=`, `password=`, `key=`) is refused, as is any other parameter, an empty or repeated one, two credentials, or a URI credential passed to `connect_with` with options that name one too.
+
+**Scopes.** `admin` covers `write`, which covers `read`. A method the connection's scope does not cover is an error reply that names the method, the scope it needs and the scope the connection has. It runs nothing (it takes no exactly-once slot); the connection stays open. A method the table does not name is `no such method`.
+
+| Scope | Methods |
+| --- | --- |
+| `read` | `open_session`, `close_session`, `txn_read`, `get_doc`, `query_by_field`, `search_bm25`, `poll_mq_group`, `subscribe_mq`, `scan_column_table`, `attempt_rollup`, `gate_run_rollup`, `has_vector_collection`, `get_vector`, `search_vectors`, `search_hybrid`, `search_knowledge` |
+| `write` | `commit_txn` (even with empty `ops`: it takes the write lock, and its answer says whether the reads still match), `put_doc`, `delete_doc`, `publish_mq`, `ack_mq`, `create_column_table`, `append_column_rows`, `create_vector_collection`, `upsert_vector`, `delete_vector` |
+| `admin` | `checkpoint`, `compact`, `apply_sync_batches` |
+
+Creating a column table or a vector collection is `write`: the same op staged in a `commit_txn` is. A `commit_txn` may raise the schema version, as an ordinary write body does on first use of a feature; it lowers or deletes it only in a store that holds nothing outside `__meta` (see Remote transactions), so `write` cannot move the version of a store with data. `apply_sync_batches` is `admin`: it applies another replica's batches at their own sequence numbers, which is replication, not a client write. The one table is `METHODS` in `crates/store/src/ferrostore/auth.rs`; a test checks it names every method the server dispatches, once.
 
 ### Remote transactions
 

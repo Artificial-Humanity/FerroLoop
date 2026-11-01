@@ -39,9 +39,10 @@ pub use code_knowledge::{
 };
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
-    EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit,
-    RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp, Transaction, VectorHit, VectorMetric,
-    VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
+    ConnectOptions, EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup,
+    KnowledgeHit, RecordEnvelope, ServerAuth, SyncAdapter, SyncBatch, SyncMode, SyncOp,
+    Transaction, VectorHit, VectorMetric, VectorStorage, ZoneMap, default_socket_path_for_store,
+    migrate_redb_to_ferrostore,
 };
 pub use knowledge::{
     DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,

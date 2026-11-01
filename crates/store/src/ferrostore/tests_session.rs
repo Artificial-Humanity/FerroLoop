@@ -657,6 +657,61 @@ fn a_table_full_of_running_request_ids_refuses_a_new_write() {
     run_at(&dedup, u128::MAX, late).finish(&json!("new"));
 }
 
+/// Fill `served`'s exactly-once table with running ids, run `write` while
+/// they are held, and free them after a moment: `write` must wait it out.
+fn while_the_dedup_table_is_full(served: &Served, write: impl FnOnce() + Send) {
+    let dedup = served.server.dedup();
+    let refused = served.server.dedup_refusals();
+    thread::scope(|scope| {
+        // Claim fresh ids until the table refuses one: it is full.
+        let mut held = Vec::new();
+        for req in 1..=DEDUP_ENTRIES as u128 + 1 {
+            match dedup.claim(req) {
+                Ok(Claim::Run(running)) => held.push(running),
+                Ok(Claim::Replay(_)) => panic!("a fresh id replayed"),
+                Err(err) => {
+                    assert!(err.to_string().contains(DEDUP_FULL), "{err}");
+                    break;
+                }
+            }
+        }
+        assert!(held.len() > DEDUP_ENTRIES / 2, "the table was full already");
+        scope.spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(held);
+        });
+        write();
+    });
+    assert!(
+        served.server.dedup_refusals() > refused,
+        "the table was never full for the write"
+    );
+}
+
+#[test]
+fn a_full_dedup_table_is_a_lost_attempt_retried_until_it_has_room() {
+    let served = serve(FerroStore::in_memory());
+    let client = served.client();
+    // `commit_txn`, in a transaction that also read.
+    while_the_dedup_table_is_full(&served, || {
+        client
+            .transaction(|txn| {
+                let seen = txn.get_doc("docs", "a");
+                txn.put_doc("docs", "a", &json!({ "seen": seen }))
+            })
+            .unwrap();
+    });
+    assert_eq!(
+        client.get_doc("docs", "a").unwrap(),
+        Some(json!({ "seen": null }))
+    );
+    // `publish_mq`, a write RPC of its own.
+    while_the_dedup_table_is_full(&served, || {
+        assert_eq!(client.publish_mq("t", "k", &json!({})).unwrap(), 1);
+    });
+    assert_eq!(client.poll_mq_group("t", "g", 10).unwrap().len(), 1);
+}
+
 // ---- commit validation of ops ---------------------------------------------------------
 
 #[test]

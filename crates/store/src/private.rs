@@ -97,6 +97,51 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// The bytes of the secret file at `path` (a PSK, a token file), at most `max` of them. Refused,
+/// with the `chmod` that fixes it, when the file is not a regular file or its group or others have
+/// any permission bit: a secret others can read is no secret, and one they can write is not ours.
+/// The mode is read from the opened file, so the bytes read are the file that was checked. A
+/// symlink is followed, as a configuration path often is one.
+pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "it is mode {mode:03o}, so other users can reach it; refused: {}",
+                    fix_clause("chmod 600", path, "")
+                ),
+            ));
+        }
+    }
+    if meta.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it is larger than {max} bytes"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it is larger than {max} bytes"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Paths already warned about in this process.
 static WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 

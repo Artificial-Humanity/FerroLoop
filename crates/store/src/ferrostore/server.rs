@@ -2,10 +2,14 @@
 //!
 //! The server process is the only opener of the `.fls` file. Unix clients
 //! speak length-prefixed JSON. WebSocket clients speak one JSON value per
-//! frame. Neither takes `flock`.
+//! frame. Neither takes `flock`. Every connection authenticates before its
+//! first request is read, and every request needs a scope (spec §6.2,
+//! [`auth`](super::auth)).
 
+use super::auth::{self, Credential, MethodRule, Peer, Scope, ServerAuth};
 use super::columnar;
 use super::layout::{Op, backend};
+use super::retry;
 use super::session::{self, Claim, Dedup, ReadKey, Sessions};
 use super::vector;
 use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
@@ -45,6 +49,19 @@ struct ServerState {
     sessions: Sessions,
     /// Recent request ids and their replies (spec §6.1).
     dedup: Dedup,
+    /// How connections authenticate (spec §6.2).
+    auth: ServerAuth,
+    /// The uid a Unix peer must have: this process's effective uid.
+    own_uid: u32,
+    /// The uid every Unix peer is taken to have, in place of its own.
+    #[cfg(test)]
+    peer_uid: Mutex<Option<u32>>,
+    /// Requests that reached `dispatch` or a subscription.
+    #[cfg(test)]
+    dispatched: AtomicU64,
+    /// Writes refused because the exactly-once table was full.
+    #[cfg(test)]
+    dedup_refused: AtomicU64,
 }
 
 struct ConnReg {
@@ -90,7 +107,27 @@ impl FerroStoreServer {
     /// If `path` is a socket that refuses a connection, it is stale and is
     /// unlinked first; one that accepts is another live server, and this
     /// returns [`StoreError::Backend`]. So does a `path` that is not a socket.
+    ///
+    /// A peer is served only when its uid (`SO_PEERCRED`) is this process's
+    /// effective uid; it then holds the `admin` scope (spec §6.2).
     pub fn bind_unix(path: impl AsRef<Path>, store: FerroStore) -> Result<Self, StoreError> {
+        Self::bind_unix_with(path, store, ServerAuth::new())
+    }
+
+    /// [`Self::bind_unix`], under `auth`: when `auth` holds a PSK, a peer
+    /// must also pass the PSK challenge-response, after its uid is checked.
+    /// A token file is refused: bearer tokens are for `ws://`.
+    pub fn bind_unix_with(
+        path: impl AsRef<Path>,
+        store: FerroStore,
+        auth: ServerAuth,
+    ) -> Result<Self, StoreError> {
+        if auth.has_tokens() {
+            return Err(backend(
+                "a token file is for ws:// connections; a Unix socket checks the peer uid \
+                 and, when one is configured, the PSK",
+            ));
+        }
         let path = path.as_ref();
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -116,7 +153,7 @@ impl FerroStoreServer {
                 return Err(backend(format!("stat {}: {err}", path.display())));
             }
         };
-        let state = new_state(store);
+        let state = new_state(store, auth);
         let accept_state = Arc::clone(&state);
         let path_buf = path.to_path_buf();
         let accept = match thread::Builder::new()
@@ -140,7 +177,22 @@ impl FerroStoreServer {
     }
 
     /// Listen on TCP, speak RFC 6455, and serve `store`. `127.0.0.1:0` must bind an ephemeral port.
-    pub fn bind_tcp(addr: impl ToSocketAddrs, store: FerroStore) -> Result<Self, StoreError> {
+    ///
+    /// `auth` must hold a PSK, a token file, or both: a TCP server without
+    /// authentication is refused before it binds. A connection with a valid
+    /// bearer token holds that token's scope; one that passes the PSK
+    /// challenge-response holds `admin` (spec §6.2).
+    pub fn bind_tcp(
+        addr: impl ToSocketAddrs,
+        store: FerroStore,
+        auth: ServerAuth,
+    ) -> Result<Self, StoreError> {
+        if !auth.any_method() {
+            return Err(backend(
+                "bind_tcp needs authentication: configure a PSK, a token file, or both \
+                 (ServerAuth)",
+            ));
+        }
         let listener =
             TcpListener::bind(addr).map_err(|err| backend(format!("bind tcp: {err}")))?;
         if let Err(err) = listener.set_nonblocking(true) {
@@ -149,7 +201,7 @@ impl FerroStoreServer {
         let local = listener
             .local_addr()
             .map_err(|err| backend(format!("tcp local address: {err}")))?;
-        let state = new_state(store);
+        let state = new_state(store, auth);
         let accept_state = Arc::clone(&state);
         let accept = thread::Builder::new()
             .name("fls-accept".to_string())
@@ -171,7 +223,7 @@ impl FerroStoreServer {
     }
 }
 
-fn new_state(store: FerroStore) -> Arc<ServerState> {
+fn new_state(store: FerroStore, auth: ServerAuth) -> Arc<ServerState> {
     Arc::new(ServerState {
         store: Arc::new(store),
         shutdown: AtomicBool::new(false),
@@ -179,6 +231,14 @@ fn new_state(store: FerroStore) -> Arc<ServerState> {
         next_conn: AtomicU64::new(1),
         sessions: Sessions::new(),
         dedup: Dedup::default(),
+        auth,
+        own_uid: auth::own_uid(),
+        #[cfg(test)]
+        peer_uid: Mutex::new(None),
+        #[cfg(test)]
+        dispatched: AtomicU64::new(0),
+        #[cfg(test)]
+        dedup_refused: AtomicU64::new(0),
     })
 }
 
@@ -201,6 +261,26 @@ impl FerroStoreServer {
     /// Lower the time after which a session is gone however often it is read.
     pub(super) fn set_session_lifetime(&self, lifetime: Duration) {
         self.state.sessions.set_lifetime(lifetime);
+    }
+
+    /// Take every later Unix peer to have `uid` (`None`: its own).
+    pub(super) fn set_peer_uid(&self, uid: Option<u32>) {
+        *lock_mutex(&self.state.peer_uid) = uid;
+    }
+
+    /// Requests this server ran (dispatched or subscribed).
+    pub(super) fn dispatched(&self) -> u64 {
+        self.state.dispatched.load(Ordering::SeqCst)
+    }
+
+    /// The exactly-once table.
+    pub(super) fn dedup(&self) -> &Dedup {
+        &self.state.dedup
+    }
+
+    /// Writes refused because the exactly-once table was full.
+    pub(super) fn dedup_refusals(&self) -> u64 {
+        self.state.dedup_refused.load(Ordering::SeqCst)
     }
 }
 
@@ -352,6 +432,7 @@ struct Accepted {
     read: Box<dyn JsonIo>,
     write: Box<dyn JsonIo>,
     watch: Box<dyn JsonIo>,
+    peer: Peer,
 }
 
 fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
@@ -372,9 +453,10 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                 let conn_state = Arc::clone(&state);
                 let read = accepted.read;
                 let write = Arc::new(Mutex::new(accepted.write));
+                let peer = accepted.peer;
                 match thread::Builder::new()
                     .name("fls-conn".to_string())
-                    .spawn(move || serve_connection(read, write, conn_state, id))
+                    .spawn(move || serve_connection(read, write, peer, conn_state, id))
                 {
                     Ok(handle) => handlers.push(handle),
                     Err(_) => {
@@ -419,6 +501,8 @@ fn poll_tcp(listener: &TcpListener) -> AcceptPoll {
 }
 
 fn unix_accepted(stream: UnixStream) -> Result<Accepted, StoreError> {
+    // An error is an unknown peer, which the handshake refuses.
+    let peer = Peer::Unix(auth::peer_uid(&stream).ok());
     let write = stream
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;
@@ -429,6 +513,7 @@ fn unix_accepted(stream: UnixStream) -> Result<Accepted, StoreError> {
         read: Box::new(UnixIo::new(stream, FrameCounter::default())),
         write: Box::new(UnixIo::new(write, FrameCounter::default())),
         watch: Box::new(UnixIo::new(watch, FrameCounter::default())),
+        peer,
     })
 }
 
@@ -451,6 +536,7 @@ fn tcp_accepted(stream: TcpStream) -> Result<Accepted, StoreError> {
         read: Box::new(WsIo::server(stream, true)),
         write: Box::new(WsIo::server(write, false)),
         watch: Box::new(WsIo::server(watch, false)),
+        peer: Peer::Tcp,
     })
 }
 
@@ -475,6 +561,7 @@ fn reap(handlers: &mut Vec<JoinHandle<()>>) {
 fn serve_connection(
     mut read: Box<dyn JsonIo>,
     write: Arc<Mutex<Box<dyn JsonIo>>>,
+    peer: Peer,
     state: Arc<ServerState>,
     conn_id: u64,
 ) {
@@ -482,9 +569,9 @@ fn serve_connection(
         state: Arc::clone(&state),
         id: conn_id,
     };
-    if read.prepare().is_err() {
+    let Some(scope) = authenticate(&mut *read, &write, peer, &state) else {
         return;
-    }
+    };
     let alive = Arc::new(AtomicBool::new(true));
     let mut subscribed = HashSet::new();
     let mut forwarders = Vec::new();
@@ -510,22 +597,34 @@ fn serve_connection(
                 };
                 let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-                let reply = if method == "subscribe_mq" {
-                    reply_body(
-                        subscribe_topic(
-                            &state.store,
-                            &params,
-                            &write,
-                            &alive,
-                            &mut subscribed,
-                            &mut forwarders,
+                // A method the scope does not cover, or an unknown one, is an
+                // error response that ran nothing.
+                let reply = match auth::authorize(scope, method) {
+                    Err(err) => {
+                        #[cfg(test)]
+                        if matches!(method, "read_state" | "commit_ops" | "commit_if_seq") {
+                            LEGACY_CALLS.fetch_add(1, Ordering::SeqCst);
+                        }
+                        reply_body(Err(err))
+                    }
+                    Ok(rule) if rule.name == "subscribe_mq" => {
+                        #[cfg(test)]
+                        state.dispatched.fetch_add(1, Ordering::SeqCst);
+                        reply_body(
+                            subscribe_topic(
+                                &state.store,
+                                &params,
+                                &write,
+                                &alive,
+                                &mut subscribed,
+                                &mut forwarders,
+                            )
+                            .map(|()| Value::Null),
                         )
-                        .map(|()| Value::Null),
-                    )
-                } else {
-                    exactly_once(&state, conn_id, method, &params)
+                    }
+                    Ok(rule) => exactly_once(&state, conn_id, rule, &params),
                 };
-                // An unknown method is an error response. The connection stays up.
+                // An error response leaves the connection up.
                 if send_reply(&write, id, reply).is_err() {
                     break;
                 }
@@ -536,6 +635,55 @@ fn serve_connection(
     for handle in forwarders {
         let _ = handle.join();
     }
+}
+
+/// Authenticate the connection before anything is read from it as a
+/// request (spec §6.2). `None`: it was refused and is shut down.
+fn authenticate(
+    read: &mut dyn JsonIo,
+    write: &Mutex<Box<dyn JsonIo>>,
+    peer: Peer,
+    state: &ServerState,
+) -> Option<Scope> {
+    #[cfg(test)]
+    let peer = match (peer, *lock_mutex(&state.peer_uid)) {
+        (Peer::Unix(_), Some(uid)) => Peer::Unix(Some(uid)),
+        (peer, _) => peer,
+    };
+    let mut write = lock_mutex(write);
+    // A peer that sends nothing is refused, not waited for.
+    if read
+        .set_read_timeout(Some(auth::HANDSHAKE_TIMEOUT))
+        .is_err()
+    {
+        write.shutdown_both();
+        return None;
+    }
+    let credential = match read.prepare() {
+        Ok(values) => auth::credential(&values),
+        Err(_) => {
+            // No frames before the transport's own handshake completes.
+            auth::refuse(&mut **write, false);
+            return None;
+        }
+    };
+    let credential = match peer {
+        Peer::Unix(_) => Credential::None,
+        Peer::Tcp => credential,
+    };
+    let scope = auth::serve_handshake(
+        read,
+        &mut **write,
+        &peer,
+        credential,
+        &state.auth,
+        state.own_uid,
+    )?;
+    if read.set_read_timeout(None).is_err() {
+        write.shutdown_both();
+        return None;
+    }
+    Some(scope)
 }
 
 fn subscribe_topic(
@@ -594,26 +742,13 @@ fn forward_mq(
     }
 }
 
-/// The methods that write: a `req` on one of them makes it exactly-once.
-const WRITE_METHODS: &[&str] = &[
-    "commit_txn",
-    "put_doc",
-    "delete_doc",
-    "publish_mq",
-    "ack_mq",
-    "create_column_table",
-    "append_column_rows",
-    "create_vector_collection",
-    "upsert_vector",
-    "delete_vector",
-    "apply_sync_batches",
-];
-
-/// Run one request. A write that carries `req` runs once: a repeat of its
-/// id gets the first reply and applies nothing (spec §6.1). Any other
-/// method ignores `req`, so no read's answer is kept.
-fn exactly_once(state: &ServerState, conn: u64, method: &str, params: &Value) -> Value {
-    if !WRITE_METHODS.contains(&method) {
+/// Run one authorized request. A write ([`MethodRule::writes`]) that
+/// carries `req` runs once: a repeat of its id gets the first reply and
+/// applies nothing (spec §6.1). Any other method ignores `req`, so no read's
+/// answer is kept.
+fn exactly_once(state: &ServerState, conn: u64, rule: &MethodRule, params: &Value) -> Value {
+    let method = rule.name;
+    if !rule.writes {
         return reply_body(dispatch(state, conn, method, params));
     }
     let req = match session::request_id(params) {
@@ -624,7 +759,11 @@ fn exactly_once(state: &ServerState, conn: u64, method: &str, params: &Value) ->
         return reply_body(dispatch(state, conn, method, params));
     };
     match state.dedup.claim(req) {
-        Err(full) => reply_body(Err(full)),
+        Err(full) => {
+            #[cfg(test)]
+            state.dedup_refused.fetch_add(1, Ordering::SeqCst);
+            reply_body(Err(full))
+        }
         Ok(Claim::Replay(reply)) => reply,
         Ok(Claim::Run(running)) => {
             let reply = reply_body(dispatch(state, conn, method, params));
@@ -640,6 +779,8 @@ fn dispatch(
     method: &str,
     params: &Value,
 ) -> Result<Value, StoreError> {
+    #[cfg(test)]
+    state.dispatched.fetch_add(1, Ordering::SeqCst);
     let store = &*state.store;
     match method {
         "open_session" => {
@@ -890,13 +1031,8 @@ fn dispatch(
             let silent = optional_bool(params, "silent")?;
             Ok(Value::from(store.apply_sync_batches(batches, silent)?))
         }
-        _ => {
-            #[cfg(test)]
-            if matches!(method, "read_state" | "commit_ops" | "commit_if_seq") {
-                LEGACY_CALLS.fetch_add(1, Ordering::SeqCst);
-            }
-            Err(backend(format!("no such method `{method}`")))
-        }
+        // `auth::METHODS` names every method above, and only those.
+        _ => Err(backend(format!("no such method `{method}`"))),
     }
 }
 
@@ -1227,16 +1363,21 @@ fn parse_op(value: &Value) -> Result<Op, StoreError> {
     }
 }
 
-enum Incoming {
+pub(super) enum Incoming {
     Value(Value),
     Ping(Vec<u8>),
     Close,
 }
 
-trait JsonIo: Send {
-    fn prepare(&mut self) -> Result<(), StoreError> {
-        Ok(())
+pub(super) trait JsonIo: Send {
+    /// Finish the transport's own handshake (a `ws://` upgrade). Returns
+    /// the values of the upgrade's `Authorization` headers.
+    fn prepare(&mut self) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
     }
+
+    /// Bound each read of the stream (`None`: wait forever).
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError>;
 
     fn read_value(&mut self) -> Result<Incoming, StoreError>;
 
@@ -1297,6 +1438,10 @@ impl JsonIo for UnixIo {
         Ok(())
     }
 
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError> {
+        self.stream.set_read_timeout(timeout).map_err(backend)
+    }
+
     fn shutdown_both(&self) {
         let _ = self.stream.shutdown(Shutdown::Both);
     }
@@ -1327,12 +1472,16 @@ impl WsIo {
 }
 
 impl JsonIo for WsIo {
-    fn prepare(&mut self) -> Result<(), StoreError> {
+    fn prepare(&mut self) -> Result<Vec<String>, StoreError> {
         if !self.handshake {
-            return Ok(());
+            return Ok(Vec::new());
         }
         self.handshake = false;
         ws::accept(&mut self.stream)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<(), StoreError> {
+        self.stream.set_read_timeout(timeout).map_err(backend)
     }
 
     fn read_value(&mut self) -> Result<Incoming, StoreError> {
@@ -1370,7 +1519,7 @@ impl JsonIo for WsIo {
 }
 
 /// Write one frame; the bytes it took, length prefix included.
-fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usize, StoreError> {
+pub(super) fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usize, StoreError> {
     let bytes = serde_json::to_vec(value).map_err(|err| backend(format!("encode frame: {err}")))?;
     let len = u32::try_from(bytes.len()).map_err(|_| backend("frame length exceeds u32"))?;
     if len == 0 || len > MAX_FRAME_BYTES {
@@ -1382,7 +1531,7 @@ fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usize, StoreErr
 }
 
 /// Read one frame, and the bytes it took, length prefix included.
-fn read_frame(stream: &mut UnixStream) -> Result<(Value, usize), StoreError> {
+pub(super) fn read_frame(stream: &mut UnixStream) -> Result<(Value, usize), StoreError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(backend)?;
     let len = u32::from_be_bytes(len_buf);
@@ -1453,18 +1602,38 @@ impl RemoteShared {
     /// request id. A request that times out is sent once more with the same
     /// id, so the server, which ran it or is running it, replies with the
     /// first result and applies nothing again.
+    ///
+    /// A refusal because the server's table of request ids is full
+    /// ([`session::DEDUP_FULL`]) ran nothing: it is a lost attempt, sent
+    /// again with the same id after the backoff of a lost commit
+    /// ([`retry::Backoff`]), within [`retry::REMOTE_ATTEMPTS`] sends.
     pub(super) fn call_req(&self, method: &str, mut params: Value) -> Result<Value, StoreError> {
         if let Some(object) = params.as_object_mut() {
             object.insert("req".into(), Value::String(session::new_request_id()));
         }
-        for _ in 0..2 {
-            if let Ok(result) = self.call_once(method, &params) {
-                return result;
+        let mut backoff = retry::Backoff::new();
+        let mut timeouts = 0;
+        let mut refusals = 0;
+        loop {
+            match self.call_once(method, &params) {
+                Ok(Err(err))
+                    if session::is_dedup_full(&err) && refusals + 1 < retry::REMOTE_ATTEMPTS =>
+                {
+                    refusals += 1;
+                    backoff.wait(refusals);
+                }
+                Ok(result) => return result,
+                Err(TimedOut) => {
+                    timeouts += 1;
+                    if timeouts == 2 {
+                        return Err(backend(
+                            "timed out waiting for the FerroStore server, twice: the write may \
+                             have committed",
+                        ));
+                    }
+                }
             }
         }
-        Err(backend(
-            "timed out waiting for the FerroStore server, twice: the write may have committed",
-        ))
     }
 
     /// Send `method` and do not wait: its reply is dropped when it comes.
@@ -1700,13 +1869,32 @@ impl Drop for RemoteClient {
     }
 }
 
+/// A client of the Unix socket at `path` with no credential: the server
+/// checks the peer's uid.
+#[cfg(test)]
 pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
-    let stream =
-        UnixStream::connect(path).map_err(|err| backend(format!("connect {path}: {err}")))?;
-    client_from_unix(stream)
+    connect_unix_with(path, &auth::ClientCred::None)
 }
 
-pub(super) fn client_from_unix(stream: UnixStream) -> Result<RemoteClient, StoreError> {
+/// A client of the Unix socket at `path`, authenticating with `cred`.
+pub(super) fn connect_unix_with(
+    path: &str,
+    cred: &auth::ClientCred,
+) -> Result<RemoteClient, StoreError> {
+    if cred.bearer().is_some() {
+        return Err(backend(
+            "a bearer token is for ws://; a Unix socket takes the peer uid and, optionally, a PSK",
+        ));
+    }
+    let stream =
+        UnixStream::connect(path).map_err(|err| backend(format!("connect {path}: {err}")))?;
+    client_from_unix(stream, cred)
+}
+
+pub(super) fn client_from_unix(
+    stream: UnixStream,
+    cred: &auth::ClientCred,
+) -> Result<RemoteClient, StoreError> {
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;
@@ -1715,11 +1903,13 @@ pub(super) fn client_from_unix(stream: UnixStream) -> Result<RemoteClient, Store
         Box::new(UnixIo::new(stream, counter.clone())),
         Box::new(UnixIo::new(writer, counter.clone())),
         counter,
+        cred,
     )
 }
 
-pub(super) fn connect_ws(rest: &str) -> Result<RemoteClient, StoreError> {
-    let stream = ws::connect(rest)?;
+/// A client of the `ws://` endpoint `rest`, authenticating with `cred`.
+pub(super) fn connect_ws(rest: &str, cred: &auth::ClientCred) -> Result<RemoteClient, StoreError> {
+    let stream = ws::connect(rest, cred.bearer())?;
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
@@ -1727,14 +1917,24 @@ pub(super) fn connect_ws(rest: &str) -> Result<RemoteClient, StoreError> {
         Box::new(WsIo::client(stream)),
         Box::new(WsIo::client(writer)),
         FrameCounter::default(),
+        cred,
     )
 }
 
+/// Authenticate (spec §6.2), then start the reader. No request is sent
+/// before the server accepted the connection and, for a PSK, proved itself.
 fn finish_client(
-    read: Box<dyn JsonIo>,
-    write: Box<dyn JsonIo>,
+    mut read: Box<dyn JsonIo>,
+    mut write: Box<dyn JsonIo>,
     counter: FrameCounter,
+    cred: &auth::ClientCred,
 ) -> Result<RemoteClient, StoreError> {
+    read.set_read_timeout(Some(auth::HANDSHAKE_TIMEOUT))?;
+    if let Err(err) = auth::client_handshake(&mut *read, &mut *write, cred) {
+        write.shutdown_both();
+        return Err(err);
+    }
+    read.set_read_timeout(None)?;
     let shared = Arc::new(RemoteShared {
         write: Mutex::new(write),
         pending: Mutex::new(HashMap::new()),

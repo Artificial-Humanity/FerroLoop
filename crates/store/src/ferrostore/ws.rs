@@ -31,8 +31,15 @@ struct RawFrame {
     payload: Vec<u8>,
 }
 
-pub(super) fn connect(rest: &str) -> Result<TcpStream, StoreError> {
+/// Connect to `rest` (`host:port[/path]`) and upgrade. `bearer` is sent as
+/// `Authorization: Bearer <token>`; the caller has checked that it is
+/// visible ASCII, so it cannot end the header.
+pub(super) fn connect(rest: &str, bearer: Option<&str>) -> Result<TcpStream, StoreError> {
     let (host_port, path) = split_target(rest)?;
+    if bearer.is_some_and(|token| token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        return Err(backend("a bearer token is visible ASCII without spaces"));
+    }
     let mut stream = TcpStream::connect(host_port)
         .map_err(|err| backend(format!("connect {host_port}: {err}")))?;
     stream
@@ -41,13 +48,17 @@ pub(super) fn connect(rest: &str) -> Result<TcpStream, StoreError> {
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let sec_key = base64_encode(&key_bytes);
+    let authorization = bearer.map_or_else(String::new, |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host_port}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {sec_key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
+         Sec-WebSocket-Version: 13\r\n\
+         {authorization}\r\n"
     );
     stream
         .write_all(req.as_bytes())
@@ -57,7 +68,9 @@ pub(super) fn connect(rest: &str) -> Result<TcpStream, StoreError> {
     Ok(stream)
 }
 
-pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
+/// Read and answer the client's upgrade. Returns the values of its
+/// `Authorization` headers, for the caller to judge (spec §6.2).
+pub(super) fn accept(stream: &mut TcpStream) -> Result<Vec<String>, StoreError> {
     let text = read_headers(stream)?;
     let mut lines = text.split("\r\n");
     let start = lines.next().unwrap_or("");
@@ -69,6 +82,7 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
     let mut connection = false;
     let mut version = false;
     let mut key = None;
+    let mut authorization = Vec::new();
     for line in lines {
         if line.is_empty() {
             break;
@@ -87,6 +101,8 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
             version = value == "13";
         } else if name.trim().eq_ignore_ascii_case("sec-websocket-key") && !value.is_empty() {
             key = Some(value.to_string());
+        } else if name.trim().eq_ignore_ascii_case("authorization") {
+            authorization.push(value.to_string());
         }
     }
     let Some(key) = key else {
@@ -105,7 +121,7 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<(), StoreError> {
     stream
         .write_all(resp.as_bytes())
         .map_err(|err| backend(format!("write handshake: {err}")))?;
-    Ok(())
+    Ok(authorization)
 }
 
 pub(super) fn read_event(stream: &mut TcpStream, client: bool) -> Result<WsEvent, StoreError> {
@@ -473,7 +489,7 @@ mod tests {
             assert_eq!(payload, b"xyz");
             write_frame(&mut stream, false, OP_PONG, &payload).unwrap();
         });
-        let mut client = connect(&format!("{addr}/store")).unwrap();
+        let mut client = connect(&format!("{addr}/store"), None).unwrap();
         for size in [4usize, 200, 70_000] {
             let payload = vec![b'z'; size];
             write_frame(&mut client, true, OP_BINARY, &payload).unwrap();
@@ -500,7 +516,7 @@ mod tests {
             let err = read_event(&mut stream, false).unwrap_err();
             assert!(err.to_string().contains("16MiB"), "{err}");
         });
-        let mut client = connect(&format!("{addr}")).unwrap();
+        let mut client = connect(&format!("{addr}"), None).unwrap();
         let mut hdr = vec![0x82, 0x80 | 127];
         hdr.extend_from_slice(&u64::try_from(MAX_PAYLOAD + 1).unwrap().to_be_bytes());
         hdr.extend_from_slice(&[1, 2, 3, 4]);
