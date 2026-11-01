@@ -150,7 +150,7 @@ fn populate(redb: &RedbStore) -> Populated {
     )
     .unwrap();
     redb.register_agent(RegisterAgentArgs {
-        display_name: "ferris".into(),
+        display_name: "bob".into(),
         email: None,
         project: "ferroloop".into(),
         role: AgentRole::Lead,
@@ -175,7 +175,7 @@ fn populate(redb: &RedbStore) -> Populated {
                 notes: None,
             }),
             at: At::from_unix_millis(10),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
     }
@@ -192,7 +192,7 @@ fn populate(redb: &RedbStore) -> Populated {
                 title: "Build".into(),
                 prompt: "Run build.".into(),
                 assignee: AssigneeRule::Agent {
-                    name: "felicia".into(),
+                    name: "alice".into(),
                 },
                 reviews_step: None,
                 require_different_vendor: false,
@@ -214,7 +214,7 @@ fn populate(redb: &RedbStore) -> Populated {
             max_tokens: None,
             declared_keys: BTreeMap::new(),
             authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            authored_by: "ferris".into(),
+            authored_by: "bob".into(),
         })
         .unwrap();
     redb.create_workflow_run(
@@ -223,7 +223,7 @@ fn populate(redb: &RedbStore) -> Populated {
             &workflow,
             "CI Run 1",
             At::from_unix_millis(100),
-            "ferris",
+            "bob",
         )
         .unwrap(),
     )
@@ -232,9 +232,9 @@ fn populate(redb: &RedbStore) -> Populated {
         .send_wire(SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
-            sender_host: Some("ai-lab-0".into()),
-            to: WireAddress::AgentName("ferris".into()),
+            sender_name: "carol".into(),
+            sender_host: Some("build-host".into()),
+            to: WireAddress::AgentName("bob".into()),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
             durable: false,
@@ -249,9 +249,9 @@ fn populate(redb: &RedbStore) -> Populated {
     redb.send_wire(SendWireArgs {
         id: None,
         sender_id: None,
-        sender_name: "ferris".into(),
+        sender_name: "bob".into(),
         sender_host: None,
-        to: WireAddress::AgentName("ferris".into()),
+        to: WireAddress::AgentName("bob".into()),
         kind: MessageKind::Reply,
         urgency: MessageUrgency::Normal,
         durable: true,
@@ -272,7 +272,7 @@ fn populate(redb: &RedbStore) -> Populated {
             sensitivity: SensitivityPatch::Inherit,
             payload: handoff("base"),
             at: At::from_unix_millis(20),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
     redb.upsert_state(UpsertStateArgs {
@@ -281,7 +281,7 @@ fn populate(redb: &RedbStore) -> Populated {
         sensitivity: SensitivityPatch::Inherit,
         payload: handoff("local"),
         at: At::from_unix_millis(21),
-        by: "jarvis".into(),
+        by: "carol".into(),
     })
     .unwrap();
     redb.import_state_revisions(
@@ -296,7 +296,7 @@ fn populate(redb: &RedbStore) -> Populated {
             ever_sensitive: false,
             payload: handoff("remote"),
             at: At::from_unix_millis(22),
-            by: "ferris".into(),
+            by: "bob".into(),
         }],
         At::from_unix_millis(23),
     )
@@ -316,7 +316,7 @@ fn populate(redb: &RedbStore) -> Populated {
     // Escalation, last: a mark blocks writes to its item. One record stays
     // marked; another is marked, then tombstoned.
     let mark = Mark {
-        by: "ferris".into(),
+        by: "bob".into(),
         reason: "to GitHub".into(),
         at_ms: 30,
     };

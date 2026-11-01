@@ -1636,16 +1636,16 @@ mod tests {
                 sensitivity: SensitivityPatch::Inherit,
                 payload: handoff("v1"),
                 at: At::from_unix_millis(10),
-                by: "jarvis".into(),
+                by: "carol".into(),
             })
             .unwrap();
         store
             .send_wire(SendWireArgs {
                 id: None,
                 sender_id: None,
-                sender_name: "jarvis".into(),
+                sender_name: "carol".into(),
                 sender_host: None,
-                to: WireAddress::AgentName("ferris".into()),
+                to: WireAddress::AgentName("bob".into()),
                 kind: MessageKind::Mail,
                 urgency: MessageUrgency::Normal,
                 durable: false,
@@ -1674,7 +1674,7 @@ mod tests {
         assert_eq!(entry.slug, "rule");
         let inbox = store
             .list_wire_inbox(&WireFilter {
-                recipient: Some("ferris".into()),
+                recipient: Some("bob".into()),
                 ..WireFilter::default()
             })
             .unwrap();
