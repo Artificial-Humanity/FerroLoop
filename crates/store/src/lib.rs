@@ -20,6 +20,7 @@ pub mod knowledge;
 pub mod manifest;
 pub mod migrate;
 pub mod private;
+pub mod rollup;
 pub mod state;
 pub mod workflow;
 
@@ -40,6 +41,10 @@ pub use ferrostore::{
 pub use knowledge::{
     DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,
     rank_state_entries_read_only, rank_state_entries_with,
+};
+pub use rollup::{
+    AttemptTotals, GateRunTotals, TotalsSource, attempt_totals, attempt_totals_from_rows,
+    gate_run_totals, gate_run_totals_from_rows,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
