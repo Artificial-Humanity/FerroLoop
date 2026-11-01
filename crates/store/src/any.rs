@@ -1888,9 +1888,15 @@ mod tests {
             let threads: Vec<_> = (0..2)
                 .map(|_| {
                     scope.spawn(|| {
-                        let store =
-                            open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &said.sink())
-                                .unwrap();
+                        // Both threads fall back to the same redb file, which
+                        // opens once per process: the retries make the second
+                        // wait for the first to drop its store.
+                        let options = StoreOptions {
+                            backend: Some(BackendKind::Ferro),
+                            unmigrated: Unmigrated::Migrate,
+                            retries: 200,
+                        };
+                        let store = open_store_sink(&redb, &options, &said.sink()).unwrap();
                         store.kind()
                     })
                 })
