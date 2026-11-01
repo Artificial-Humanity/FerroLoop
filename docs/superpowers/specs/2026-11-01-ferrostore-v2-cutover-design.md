@@ -257,7 +257,7 @@ The fix is a follow-up: split the upsert into a search phase that only reads and
 
 ### 4.4 Auto-checkpoint
 
-After a commit, the writer checkpoints inside the same lock when the WAL is longer than `max(snapshot_length, 4 MiB)`. `FerroStore::checkpoint` stays public.
+After a commit, the writer checkpoints when the WAL is longer than `max(snapshot_length, 4 MiB)`. It does so in a lock window of its own, after the commit has released its locks and every writer in its group has its result, so no other commit waits for the checkpoint. `FerroStore::checkpoint` stays public.
 
 ### 4.5 Remote write retry
 

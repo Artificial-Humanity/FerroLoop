@@ -810,34 +810,41 @@ fn send_result(
 }
 
 /// A failure response. `error` is always the error's message. An
-/// [`StoreError::Undelivered`] also carries `kind`, `seq` and `cause`, so
-/// the client rebuilds it: the commit is durable on the server, and a
-/// client that read it as a plain failure would retry it and apply it twice.
-fn error_value(id: u64, err: &StoreError) -> Value {
+/// [`StoreError::Undelivered`] also carries `kind`, `seq` and `cause` (the
+/// cause's own message, as it reads), so the client rebuilds it: the commit
+/// is durable on the server, and a client that read it as a plain failure
+/// would retry it and apply it twice. A [`StoreError::Backend`] cause also
+/// carries its detail as `cause_backend`, so it is rebuilt as that kind.
+pub(super) fn error_value(id: u64, err: &StoreError) -> Value {
     let mut body = json!({"id": id, "ok": false, "error": err.to_string()});
     if let StoreError::Undelivered { seq, cause } = err {
-        let cause = match &**cause {
-            StoreError::Backend(detail) => detail.clone(),
-            other => other.to_string(),
-        };
         body["kind"] = json!("undelivered");
         body["seq"] = json!(seq);
-        body["cause"] = json!(cause);
+        body["cause"] = json!(cause.to_string());
+        if let StoreError::Backend(detail) = &**cause {
+            body["cause_backend"] = json!(detail);
+        }
     }
     body
 }
 
 /// The error a failure response names: [`StoreError::Undelivered`] for a
-/// structured one ([`error_value`]), and otherwise the server's message as
-/// [`StoreError::Backend`].
-fn response_error(frame: &Value) -> StoreError {
+/// structured one ([`error_value`]), whose message is the server's, and
+/// otherwise the server's message as [`StoreError::Backend`]. The cause is
+/// a [`StoreError::Backend`] when the server's was, and otherwise
+/// [`StoreError::Relayed`] with the server's words.
+pub(super) fn response_error(frame: &Value) -> StoreError {
     if frame.get("kind").and_then(Value::as_str) == Some("undelivered")
         && let Some(seq) = frame.get("seq").and_then(Value::as_u64)
         && let Some(cause) = frame.get("cause").and_then(Value::as_str)
     {
+        let cause = match frame.get("cause_backend").and_then(Value::as_str) {
+            Some(detail) => StoreError::Backend(detail.to_string()),
+            None => StoreError::Relayed(cause.to_string()),
+        };
         return StoreError::Undelivered {
             seq,
-            cause: Box::new(StoreError::Backend(cause.to_string())),
+            cause: Box::new(cause),
         };
     }
     backend(

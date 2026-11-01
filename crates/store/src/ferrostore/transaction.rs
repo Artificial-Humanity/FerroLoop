@@ -180,8 +180,11 @@ impl FerroStore {
     /// writes, or commit apart from them. The refusal goes back to `body`,
     /// which decides: returned with `?`, the transaction commits nothing and
     /// returns it; ignored, the transaction commits what `body` staged.
-    /// Another thread's call is not refused. The sync adapter is called
-    /// after the commit, as for any other write.
+    /// Another thread's call is not refused, so **`body` must not wait on
+    /// another thread that calls this same store**: that call waits for the
+    /// lock `body` runs under (`mem://`: any call; `file://`: a write), and
+    /// the two deadlock. The sync adapter is called after the commit, as for
+    /// any other write.
     pub fn transaction<T>(
         &self,
         mut body: impl FnMut(&mut Transaction<'_>) -> Result<T, StoreError>,

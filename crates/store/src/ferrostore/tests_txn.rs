@@ -666,3 +666,127 @@ fn a_remote_client_gets_the_servers_undelivered_with_its_sequence() {
     flaky.fail.store(false, Ordering::SeqCst);
     assert_eq!(server.store().sync_flush().unwrap(), base + 2);
 }
+
+/// What the refusing adapter below returns: not a `Backend` error.
+fn adapter_conflict() -> StoreError {
+    StoreError::Conflict {
+        id: fl_core::iri::Iri::parse("urn:adapter:peer").unwrap(),
+        detail: "the peer holds a newer copy".into(),
+    }
+}
+
+/// A `WriteThrough` adapter that refuses every batch with
+/// [`adapter_conflict`].
+struct Refusing;
+
+impl SyncAdapter for Refusing {
+    fn name(&self) -> &str {
+        "refusing"
+    }
+
+    fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+        Err(adapter_conflict())
+    }
+}
+
+/// The wire form of an `Undelivered` rebuilds the server's error word for
+/// word, whatever kind its cause is; a `Backend` cause stays `Backend`.
+#[test]
+fn an_undelivered_over_the_wire_reads_as_the_servers_error() {
+    let causes = [
+        StoreError::Backend("adapter is down".into()),
+        adapter_conflict(),
+        StoreError::Relayed("already relayed once".into()),
+    ];
+    for cause in causes {
+        let backend = matches!(cause, StoreError::Backend(_));
+        let server_err = StoreError::Undelivered {
+            seq: 7,
+            cause: Box::new(cause),
+        };
+        let client_err = super::server::response_error(&super::server::error_value(1, &server_err));
+        assert_eq!(client_err.to_string(), server_err.to_string());
+        let StoreError::Undelivered { seq, cause } = &client_err else {
+            panic!("{client_err:?}");
+        };
+        assert_eq!(*seq, 7);
+        assert_eq!(
+            matches!(**cause, StoreError::Backend(_)),
+            backend,
+            "{cause:?}"
+        );
+    }
+}
+
+/// One remote write path.
+type Write<'a> = Box<dyn Fn() -> Result<(), StoreError> + 'a>;
+
+/// A served store whose adapter refuses, and a client with its own
+/// `WriteThrough` adapter: every remote write path returns the server's
+/// `Undelivered`, with the server's message, and the client's adapter has
+/// still been sent the batch (the commit is durable).
+#[test]
+fn a_servers_undelivered_still_reaches_the_clients_own_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("s.sock");
+    let server =
+        FerroStoreServer::bind_unix(&sock, FerroStore::open(dir.path().join("s.fls")).unwrap())
+            .unwrap();
+    server
+        .store()
+        .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Refusing) as _)
+        .unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    let own = Arc::new(Flaky::default());
+    client
+        .attach_sync_adapter(SyncMode::WriteThrough, Arc::clone(&own) as _)
+        .unwrap();
+    let base = last_seq(&client);
+
+    let writes: [(&str, Write<'_>); 3] = [
+        (
+            "put_doc",
+            Box::new(|| client.put_doc("docs", "a", &json!(1))),
+        ),
+        (
+            "transaction",
+            Box::new(|| client.transaction(|txn| txn.put_doc("docs", "b", &json!(2)))),
+        ),
+        (
+            "commit_if_seq",
+            Box::new(|| {
+                let expected = last_seq(&client);
+                let op = super::Op::Put {
+                    collection: "docs".into(),
+                    id: "c".into(),
+                    doc: json!(3),
+                };
+                client
+                    .commit_if_seq(expected, &[op])
+                    .map(|wrote| assert!(wrote))
+            }),
+        ),
+    ];
+    for (k, (path, write)) in writes.iter().enumerate() {
+        let seq = base + 1 + k as u64;
+        let err = write().unwrap_err();
+        let server_err = StoreError::Undelivered {
+            seq,
+            cause: Box::new(adapter_conflict()),
+        };
+        assert_eq!(err.to_string(), server_err.to_string(), "{path}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: at, .. } if at == seq),
+            "{path}: {err:?}"
+        );
+        assert!(
+            own.sent.lock().unwrap().contains(&seq),
+            "{path}: the client's adapter never got batch {seq}"
+        );
+    }
+    assert_eq!(last_seq(&client), base + 3, "each write applied once");
+    assert!(
+        !client.has_pending_sync(),
+        "the client's own batches were sent"
+    );
+}

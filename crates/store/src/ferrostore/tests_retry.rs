@@ -10,6 +10,7 @@ use fl_core::StoreError;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -217,21 +218,34 @@ const NOT_REMOTE: &[(&str, &str, &str)] = &[
 /// shrink must be deliberate.
 const WRITE_SITES_FLOOR: usize = 50;
 
-/// Every `(file, line)` that starts a write: a call of `with_write`,
-/// `with_write_outcome` or `commit`, outside comments.
+/// The source files of `ferrostore` that are not scanned for write call
+/// sites, though a line in them matches [`starts_a_write`], and why.
+const NOT_SCANNED: &[(&str, &str)] = &[
+    (
+        "compat.rs",
+        "its one write call is in its own #[cfg(test)] module, on an in-memory store",
+    ),
+    ("tests.rs", "test code, as every tests_*.rs file is"),
+];
+
+/// A line that starts a write: a call of `with_write`, `with_write_outcome`
+/// or `commit`, outside comments.
+fn starts_a_write(line: &str) -> bool {
+    let code = line.trim_start();
+    !code.starts_with("//")
+        && (code.contains(".with_write(")
+            || code.contains(".with_write_outcome(")
+            || code.contains("self.commit("))
+}
+
+/// Every `(file, line)` that starts a write ([`starts_a_write`]).
 fn write_sites() -> BTreeSet<(&'static str, u32)> {
     let mut sites = BTreeSet::new();
     let mut excluded = vec![0; NOT_REMOTE.len()];
     for (file, text) in SOURCES {
         for (index, line) in text.lines().enumerate() {
             let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if !(code.contains(".with_write(")
-                || code.contains(".with_write_outcome(")
-                || code.contains("self.commit("))
-            {
+            if !starts_a_write(code) {
                 continue;
             }
             if let Some(at) = NOT_REMOTE
@@ -251,6 +265,50 @@ fn write_sites() -> BTreeSet<(&'static str, u32)> {
         );
     }
     sites
+}
+
+/// [`SOURCES`] is hand-listed: every source file of `ferrostore` (not a
+/// `tests_*.rs` file) with a line that starts a write is in it, or in
+/// [`NOT_SCANNED`] with its reason. A new file of write call sites cannot
+/// go unscanned.
+#[test]
+fn every_source_file_with_a_write_call_site_is_scanned() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ferrostore");
+    let mut with_writes = BTreeSet::new();
+    let mut files = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        if !name.ends_with(".rs") || name.starts_with("tests_") {
+            continue;
+        }
+        files += 1;
+        let text = std::fs::read_to_string(&path).unwrap();
+        if text.lines().any(starts_a_write) {
+            with_writes.insert(name);
+        }
+    }
+    assert!(
+        files >= 20,
+        "only {files} source files in {}",
+        dir.display()
+    );
+    for (name, why) in NOT_SCANNED {
+        assert!(
+            with_writes.remove(*name),
+            "{name} is excluded ({why}) but has no write call site, or is gone"
+        );
+        assert!(
+            SOURCES.iter().all(|(file, _)| file != name),
+            "{name} is both scanned and excluded"
+        );
+    }
+    let scanned: BTreeSet<String> = SOURCES.iter().map(|(file, _)| file.to_string()).collect();
+    let missing: Vec<&String> = with_writes.difference(&scanned).collect();
+    assert!(
+        missing.is_empty(),
+        "files with write call sites missing from SOURCES: {missing:?}"
+    );
 }
 
 /// `text` with every `urn:uuid:` id that `known` does not hold renamed by

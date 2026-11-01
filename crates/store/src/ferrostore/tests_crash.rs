@@ -478,7 +478,8 @@ fn tail(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
 }
 
 /// Spec §4.4: a commit whose WAL passes `max(snapshot_length, floor)`
-/// checkpoints inside its own lock. The floor is lowered to 0, so the
+/// checkpoints before its call returns, in a lock window of its own after
+/// the commit's (so a cut can land between the two). The floor is lowered to 0, so the
 /// threshold is the snapshot's length, and the commit is sized to pass it.
 /// Then one more commit, on the new snapshot: a cut inside the checkpoint
 /// leaves the first commit acknowledged, and this one refused.

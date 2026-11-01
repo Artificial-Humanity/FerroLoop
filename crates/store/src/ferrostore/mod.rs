@@ -76,7 +76,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -158,6 +158,16 @@ enum Registered {
     Queued(u64),
 }
 
+/// A remote compare-and-swap the server committed
+/// ([`FerroStore::commit_remote`]).
+struct RemoteCommit {
+    seq: u64,
+    /// This handle's own batch for the commit.
+    registered: Registered,
+    /// The server's `Undelivered`: its own adapter refused the batch.
+    server: Option<StoreError>,
+}
+
 /// How a compare-and-swap commit went.
 enum SeqCommit {
     Lost,
@@ -182,6 +192,12 @@ struct Disk {
     group: group::Group,
     /// Set by a failed sync of a publish or a checkpoint.
     poison: Poison,
+    /// The WAL length at which the last auto-checkpoint failed, or 0 when the
+    /// last checkpoint (auto or manual) succeeded or none has failed. An
+    /// auto-checkpoint is tried again only once the WAL has grown past it by
+    /// another threshold ([`checkpoint_due`]). Written only with the write
+    /// mutex held.
+    checkpoint_failed_at: AtomicU64,
     /// [`AUTO_CHECKPOINT_BYTES`], lowered by a test so a small workload
     /// crosses it.
     #[cfg(test)]
@@ -189,7 +205,7 @@ struct Disk {
 }
 
 /// The WAL length a commit's auto-checkpoint (spec §4.4) never fires at or
-/// below: after a commit publishes, still under the `flock`, the writer
+/// below: once a commit has published and released its locks, the writer
 /// checkpoints when the WAL is longer than `max(snapshot_length, this)`. The
 /// snapshot term keeps the work of checkpoints linear in the bytes written:
 /// a checkpoint, which costs O(state), runs only after at least as many
@@ -778,6 +794,7 @@ impl FerroStore {
                 cache: Mutex::new(Some(Arc::new(seed))),
                 group: group::Group::default(),
                 poison: Poison::new(path),
+                checkpoint_failed_at: AtomicU64::new(0),
                 #[cfg(test)]
                 auto_checkpoint_floor: std::sync::atomic::AtomicU64::new(AUTO_CHECKPOINT_BYTES),
             }),
@@ -1616,23 +1633,14 @@ impl FerroStore {
                 if ops.is_empty() {
                     return Ok(remote.read_state()?.last_seq == expected_seq);
                 }
-                let registered = {
+                let committed = {
                     let _gate = lock_mutex(&self.commit_gate);
-                    if !remote.commit_ops(expected_seq, ops, silent)? {
-                        return Ok(false);
+                    match self.commit_remote(remote, expected_seq, ops.to_vec(), silent)? {
+                        Some(committed) => committed,
+                        None => return Ok(false),
                     }
-                    let seq = expected_seq
-                        .checked_add(1)
-                        .ok_or_else(|| backend("transaction sequence overflow"))?;
-                    self.register_committed(
-                        &Committed {
-                            seq,
-                            ops: ops.to_vec(),
-                        },
-                        silent,
-                    )
                 };
-                self.deliver_owned(registered)?;
+                self.deliver_remote(committed)?;
                 Ok(true)
             }
         }
@@ -1769,25 +1777,63 @@ impl FerroStore {
             base: &state,
             ops: &ops,
         });
-        let committed = {
+        let committed = if forced {
+            None
+        } else {
             let _gate = lock_mutex(&self.commit_gate);
-            if forced || !remote.commit_ops(seq_base, &ops, false)? {
-                None
-            } else {
-                let seq = seq_base
-                    .checked_add(1)
-                    .ok_or_else(|| backend("transaction sequence overflow"))?;
-                let committed = Committed { seq, ops };
-                let registered = self.register_committed(&committed, false);
-                Some((result, seq, registered))
-            }
+            self.commit_remote(remote, seq_base, ops, false)?
         };
         match committed {
-            Some((result, seq, registered)) => {
-                self.deliver_owned(registered)?;
+            Some(committed) => {
+                let seq = self.deliver_remote(committed)?;
                 Ok(Some((result, Some(seq))))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Compare-and-swap `ops` on the server at `expected` and, when the
+    /// server committed them, register this handle's own batch for them.
+    /// The caller holds the commit gate. `None`: another writer committed
+    /// first and nothing was written.
+    ///
+    /// The server's [`StoreError::Undelivered`] (its own adapter refused) is
+    /// a commit too: the batch is registered here all the same, and the
+    /// error is returned by [`Self::deliver_remote`] once this handle's own
+    /// adapter has had the batch.
+    fn commit_remote(
+        &self,
+        remote: &server::RemoteClient,
+        expected: u64,
+        ops: Vec<Op>,
+        silent: bool,
+    ) -> Result<Option<RemoteCommit>, StoreError> {
+        let server = match remote.commit_ops(expected, &ops, silent) {
+            Ok(false) => return Ok(None),
+            Ok(true) => None,
+            Err(err @ StoreError::Undelivered { .. }) => Some(err),
+            Err(err) => return Err(err),
+        };
+        let seq = expected
+            .checked_add(1)
+            .ok_or_else(|| backend("transaction sequence overflow"))?;
+        let registered = self.register_committed(&Committed { seq, ops }, silent);
+        Ok(Some(RemoteCommit {
+            seq,
+            registered,
+            server,
+        }))
+    }
+
+    /// Send what [`Self::commit_remote`] registered, once the commit gate is
+    /// released, and return the commit's sequence, or the server's
+    /// `Undelivered` when its adapter refused (this handle's own delivery
+    /// was still tried: the batch is pending here if it failed too).
+    fn deliver_remote(&self, committed: RemoteCommit) -> Result<u64, StoreError> {
+        let delivered = self.deliver_owned(committed.registered);
+        match committed.server {
+            Some(err) => Err(err),
+            None => delivered.map(|()| committed.seq),
         }
     }
 
@@ -1831,27 +1877,14 @@ impl FerroStore {
                         base: &state,
                         ops: std::slice::from_ref(&op),
                     });
-                    let registered = {
+                    let committed = if forced {
+                        None
+                    } else {
                         let _gate = lock_mutex(&self.commit_gate);
-                        if forced
-                            || !remote.commit_ops(expected, std::slice::from_ref(&op), silent)?
-                        {
-                            None
-                        } else {
-                            let seq = expected
-                                .checked_add(1)
-                                .ok_or_else(|| backend("transaction sequence overflow"))?;
-                            Some(self.register_committed(
-                                &Committed {
-                                    seq,
-                                    ops: vec![op.clone()],
-                                },
-                                silent,
-                            ))
-                        }
+                        self.commit_remote(remote, expected, vec![op.clone()], silent)?
                     };
-                    if let Some(registered) = registered {
-                        self.deliver_owned(registered)?;
+                    if let Some(committed) = committed {
+                        self.deliver_remote(committed)?;
                         return Ok(extra);
                     }
                 }
@@ -1979,33 +2012,48 @@ impl FerroStore {
                 Ok(Some(fetched))
             }
             Inner::Disk(disk) => {
-                let file = lock_mutex(&disk.write);
-                disk.poison.check()?;
-                let _locked = FlockGuard::acquire(&**file)?;
-                let (index, base) = disk.refresh(&**file, disk.write_id)?;
-                let state = &base.state;
-                let mut sync = lock_mutex(&self.sync);
-                if !sync.is_idle() {
-                    return Ok(state.docs.get(&key.0, &key.1).cloned());
-                }
-                if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
-                    return Ok(Some(existing));
-                }
-                let op = Op::Put {
-                    collection: key.0.clone(),
-                    id: key.1.clone(),
-                    doc: fetched.clone(),
+                let due = {
+                    let file = lock_mutex(&disk.write);
+                    disk.poison.check()?;
+                    let _locked = FlockGuard::acquire(&**file)?;
+                    let (index, base) = disk.refresh(&**file, disk.write_id)?;
+                    let state = &base.state;
+                    let mut sync = lock_mutex(&self.sync);
+                    if !sync.is_idle() {
+                        return Ok(state.docs.get(&key.0, &key.1).cloned());
+                    }
+                    if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
+                        return Ok(Some(existing));
+                    }
+                    let op = Op::Put {
+                        collection: key.0.clone(),
+                        id: key.1.clone(),
+                        doc: fetched.clone(),
+                    };
+                    let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
+                    let frame = encode_frame(seq, std::slice::from_ref(&op))?;
+                    let due =
+                        match publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])? {
+                            Some(new_sb) => {
+                                let done = disk.install_commit(
+                                    base,
+                                    new_sb,
+                                    Change::Overlay(overlay, seq),
+                                );
+                                checkpoint_due(disk, &done)
+                            }
+                            None => false,
+                        };
+                    if sync.is_idle() && seq > sync.synced_seq {
+                        sync.synced_seq = seq;
+                    }
+                    due
                 };
-                let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
-                let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                if let Some(new_sb) =
-                    publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])?
-                {
-                    let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
-                    auto_checkpoint(disk, &**file, index ^ 1, &done);
-                }
-                if sync.is_idle() && seq > sync.synced_seq {
-                    sync.synced_seq = seq;
+                // Spec §4.4: once the gate, the write mutex, the `flock` and
+                // the sync mutex are released.
+                drop(_gate);
+                if due {
+                    auto_checkpoint(disk);
                 }
                 Ok(Some(fetched))
             }
@@ -2142,36 +2190,46 @@ impl FerroStore {
             };
             return Ok(seq);
         }
-        let (seq, flush) = {
+        let (seq, flush, due) = {
             let _gate = lock_mutex(&self.commit_gate);
             if !lock_mutex(&self.sync).is_idle() {
                 return Err(backend(
                     "cannot apply sync batches while commits are pending",
                 ));
             }
-            let (seq, prepared) = publish_sync_batches(&self.inner, &batches)?;
+            let (seq, prepared, due) = publish_sync_batches(&self.inner, &batches)?;
+            let mut slot = lock_mutex(&self.sync);
             if silent {
-                let mut slot = lock_mutex(&self.sync);
                 if slot.is_idle() && seq > slot.synced_seq {
                     slot.synced_seq = seq;
                 }
-                return Ok(seq);
+                (seq, false, due)
+            } else {
+                let queue = slot.adapter.is_some() && slot.mode.is_some();
+                let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
+                if queue {
+                    // The batches as they came in, not as applied: a reserved
+                    // op this store dropped is still the next store's to
+                    // judge, and a batch whose every op was dropped must not
+                    // go out empty.
+                    debug_assert_eq!(prepared.len(), batches.len());
+                    slot.pending.extend(batches);
+                }
+                (seq, flush, due)
             }
-            let mut slot = lock_mutex(&self.sync);
-            let queue = slot.adapter.is_some() && slot.mode.is_some();
-            let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
-            if queue {
-                // The batches as they came in, not as applied: a reserved op
-                // this store dropped is still the next store's to judge, and a
-                // batch whose every op was dropped must not go out empty.
-                debug_assert_eq!(prepared.len(), batches.len());
-                slot.pending.extend(batches);
-            }
-            (seq, flush)
         };
-        if flush {
-            self.sync_flush().map_err(|cause| undelivered(seq, cause))?;
+        let flushed = if flush {
+            self.sync_flush()
+                .map(|_| ())
+                .map_err(|cause| undelivered(seq, cause))
+        } else {
+            Ok(())
+        };
+        // Spec §4.4: once the gate is released and the batches are sent.
+        if due && let Inner::Disk(disk) = &self.inner {
+            auto_checkpoint(disk);
         }
+        flushed?;
         Ok(seq)
     }
 
@@ -2514,11 +2572,13 @@ fn admit_inbound<'a>(
 /// Disk: alone, not in a group (spec §4.3). The peer fixes every batch's
 /// sequence, and the batches publish as one unit (one `sync_data` for all
 /// their frames, one slot), checked with the sync-idle test under the commit
-/// gate, which keeps them apart from every group.
+/// gate, which keeps them apart from every group. The `bool` is `true` when
+/// the published state is due an auto-checkpoint, which the caller runs once
+/// the gate is released ([`auto_checkpoint`]).
 fn publish_sync_batches(
     inner: &Inner,
     batches: &[SyncBatch],
-) -> Result<(u64, Vec<PreparedBatch>), StoreError> {
+) -> Result<(u64, Vec<PreparedBatch>, bool), StoreError> {
     match inner {
         Inner::Remote(_) => Err(backend(
             "a remote FerroStore does not publish sync batches locally",
@@ -2527,7 +2587,7 @@ fn publish_sync_batches(
             let mut state = lock_mutex(slot);
             let (overlay, seq, prepared) = prepare_sync_batches(&state, batches)?;
             publish_overlay(&mut state, overlay, seq);
-            Ok((seq, prepared))
+            Ok((seq, prepared, false))
         }
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
@@ -2539,11 +2599,14 @@ fn publish_sync_batches(
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            if let Some(new_sb) = publish_frames(&**file, &disk.poison, index, &base.sb, &frames)? {
-                let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
-                auto_checkpoint(disk, &**file, index ^ 1, &done);
-            }
-            Ok((seq, prepared))
+            let due = match publish_frames(&**file, &disk.poison, index, &base.sb, &frames)? {
+                Some(new_sb) => {
+                    let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                    checkpoint_due(disk, &done)
+                }
+                None => false,
+            };
+            Ok((seq, prepared, due))
         }
     }
 }
@@ -2678,37 +2741,102 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     checkpoint_locked(disk, &**file, index, &base)
 }
 
-/// Spec §4.4: after a commit published `base` into slot `index`, with the
-/// write mutex and the `flock` still held, checkpoint when the WAL is longer
-/// than `max(snapshot_length, AUTO_CHECKPOINT_BYTES)`.
+/// Spec §4.4: whether the state `base` is due an auto-checkpoint: its WAL is
+/// longer than `threshold = max(snapshot_length, AUTO_CHECKPOINT_BYTES)`,
+/// and does not end torn (that is left to the next refresh, which reports
+/// it). After a failed auto-checkpoint at WAL length `f`
+/// ([`Disk::checkpoint_failed_at`]) it is due again only once the WAL is
+/// longer than `f + threshold`, so a failure that persists (a full disk, an
+/// encode error) costs one O(state) attempt per threshold of WAL bytes, not
+/// one per commit. A WAL shorter than `f` was checkpointed by another handle
+/// since: the failure no longer holds it back.
+fn checkpoint_due(disk: &Disk, base: &DiskCache) -> bool {
+    let wal = base.sb.wal_length;
+    let threshold = base.sb.snapshot_length.max(disk.auto_checkpoint_floor());
+    if base.wal_applied != wal || wal <= threshold {
+        return false;
+    }
+    let failed_at = disk.checkpoint_failed_at.load(Ordering::Acquire);
+    failed_at == 0 || wal < failed_at || wal - failed_at > threshold
+}
+
+/// Spec §4.4: the auto-checkpoint of a commit whose published state was
+/// [`checkpoint_due`]. Called once the commit has released every lock it
+/// published under (the commit gate, the write mutex, the `flock`) and, in
+/// a group, once every member has its result: the checkpoint delays no
+/// other commit's result, only its own caller's return. It takes a lock
+/// window of its own, as [`checkpoint_disk`] does (the write mutex, then the
+/// `flock`), refreshes, and checkpoints only when the refreshed state is
+/// still due: another handle may have checkpointed meanwhile.
 ///
 /// The commit is already durable and acknowledged, so a failed checkpoint
-/// does not fail it: the error goes to stderr, and the commit's caller gets
-/// its own result. A failed `sync_data` poisons the handle, as any failed
-/// sync does ([`Poison`]); any other failure leaves the file and the cache
-/// as they were, and the next commit past the threshold tries again. A base
-/// whose WAL ends torn is left to the next refresh, which reports it.
-fn auto_checkpoint(disk: &Disk, file: &dyn ContainerIo, index: usize, base: &DiskCache) {
-    if base.wal_applied != base.sb.wal_length
-        || base.sb.wal_length <= base.sb.snapshot_length.max(disk.auto_checkpoint_floor())
-    {
+/// does not fail it: the commit's caller gets its own result. A failed
+/// `sync_data` poisons the handle, as any failed sync does ([`Poison`]); any
+/// other failure leaves the file and the cache as they were, and is tried
+/// again once the WAL has grown by another threshold. Only the first failure
+/// of a run of failures is reported on stderr; a checkpoint that succeeds
+/// ends the run.
+fn auto_checkpoint(disk: &Disk) {
+    let file = lock_mutex(&disk.write);
+    if disk.poison.is_set() {
         return;
     }
-    if let Err(err) = checkpoint_locked(disk, file, index, base) {
-        #[cfg(not(test))]
-        eprintln!(
-            "warning: FerroStore auto-checkpoint of {} failed, and the commit before it is \
-             durable: {err}",
-            disk.poison.path
-        );
-        #[cfg(test)]
-        let _ = err;
+    let mut wal = None;
+    let result = (|| -> Result<(), StoreError> {
+        let _locked = FlockGuard::acquire(&**file)?;
+        let (index, base) = disk.refresh(&**file, disk.write_id)?;
+        if !checkpoint_due(disk, &base) {
+            return Ok(());
+        }
+        wal = Some(base.sb.wal_length);
+        checkpoint_locked(disk, &**file, index, &base)
+    })();
+    let Err(err) = result else {
+        return;
+    };
+    // A refresh that failed before the WAL was read: the length the
+    // commit left is not known here, and the next due commit tries again.
+    let Some(wal) = wal else {
+        return;
+    };
+    let first = disk.checkpoint_failed_at.load(Ordering::Acquire) == 0;
+    disk.checkpoint_failed_at
+        .store(wal.max(1), Ordering::Release);
+    if first {
+        warn_auto_checkpoint(disk, &err);
     }
+}
+
+#[cfg(not(test))]
+fn warn_auto_checkpoint(disk: &Disk, err: &StoreError) {
+    eprintln!(
+        "warning: FerroStore auto-checkpoint of {} failed, and the commit before it is durable \
+         (tried again once the WAL grows by another threshold): {err}",
+        disk.poison.path
+    );
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Auto-checkpoint warnings this thread would have printed.
+    static AUTO_CHECKPOINT_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn warn_auto_checkpoint(_disk: &Disk, _err: &StoreError) {
+    AUTO_CHECKPOINT_WARNINGS.with(|count| count.set(count.get() + 1));
+}
+
+/// The auto-checkpoint warnings this thread would have printed.
+#[cfg(test)]
+pub(super) fn auto_checkpoint_warnings() -> usize {
+    AUTO_CHECKPOINT_WARNINGS.with(std::cell::Cell::get)
 }
 
 /// Write a snapshot of `base` and publish it into the slot after `index`.
 /// The caller holds the write mutex and the `flock`, and `base` is the
-/// state the slot `index` names.
+/// state the slot `index` names. Success clears an auto-checkpoint failure
+/// ([`Disk::checkpoint_failed_at`]).
 fn checkpoint_locked(
     disk: &Disk,
     file: &dyn ContainerIo,
@@ -2745,6 +2873,7 @@ fn checkpoint_locked(
     write_slot(file, index ^ 1, &new_sb)?;
     disk.poison.sync_data(file)?;
     disk.install_checkpoint(base, new_sb);
+    disk.checkpoint_failed_at.store(0, Ordering::Release);
     Ok(())
 }
 

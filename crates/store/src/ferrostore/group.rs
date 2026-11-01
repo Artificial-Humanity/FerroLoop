@@ -19,21 +19,23 @@
 //! starts the next publish, so a frame larger than the cap is published alone.
 //! Only once a publish's slot sync has returned are its members registered
 //! with the sync adapter, under the commit gate and in sequence order. The
-//! leader then wakes every member with its own result (before an
-//! auto-checkpoint, below, or after it has released the `flock`, the write
-//! mutex and the gate): the member then calls `on_commit` on its own thread.
-//! Once the locks are released the next queued writer, if any, leads. In `WriteThrough`
-//! only the first member's batch finds the adapter idle; every later member
-//! drains the queue, oldest first, until its own batch is sent, so each
-//! member returns only once its own batch is delivered.
+//! leader then releases the `flock`, the write mutex and the gate, wakes
+//! every member with its own result, and hands the lead on: the next queued
+//! writer, if any, leads. Each member calls `on_commit` on its own thread.
+//! In `WriteThrough` only the first member's batch finds the adapter idle;
+//! every later member drains the queue, oldest first, until its own batch
+//! is sent, so each member returns only once its own batch is delivered.
 //!
 //! **Auto-checkpoint (spec §4.4).** When the group published and its WAL is
 //! now longer than `max(snapshot_length, AUTO_CHECKPOINT_BYTES)`, the leader
-//! first wakes every other member with its result (each commit is durable),
-//! then checkpoints with the `flock` still held, and only then releases the
-//! locks and hands the lead on. No member waits for the checkpoint but the
-//! leader itself, whose own result it does not change: a failed checkpoint
-//! is reported on stderr, and a failed sync in it poisons the handle.
+//! checkpoints only after all of the above, and after it has delivered its
+//! own batch: it takes the write mutex and the `flock` again, refreshes,
+//! and checkpoints if the refreshed state is still past the threshold
+//! (another handle may have checkpointed meanwhile). So no member waits for
+//! the checkpoint, nor for the leader's `on_commit` behind it; only the
+//! leader's own call returns after the checkpoint, whose failure does not
+//! change its result: a failed sync in it poisons the handle, and any other
+//! failure is reported on stderr and tried again later.
 //!
 //! A sync that fails poisons the handle (`Poison`): the group fails, and
 //! every later write and checkpoint on the handle is refused.
@@ -50,7 +52,7 @@ use super::layout::{Op, backend, encode_frame};
 use super::state::{DocState, Overlay, publish_overlay};
 use super::{
     Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, auto_checkpoint,
-    lock_mutex, publish_frames, wait_mutex,
+    checkpoint_due, lock_mutex, publish_frames, wait_mutex,
 };
 use fl_core::StoreError;
 use std::any::Any;
@@ -175,31 +177,9 @@ struct Leadership<'a> {
     group: &'a Group,
     members: Vec<Arc<Member>>,
     results: Vec<Option<Result<Acked, StoreError>>>,
-    /// Members already given their result ([`Self::acknowledge`]).
-    woken: Vec<bool>,
 }
 
 impl Leadership<'_> {
-    /// Wake every member but `me` that has its result, now: its commit is
-    /// durable. The leader goes on, with the locks, to the auto-checkpoint
-    /// (spec §4.4), which no member waits for.
-    fn acknowledge(&mut self, me: &Arc<Member>) {
-        for ((member, result), woken) in self
-            .members
-            .iter()
-            .zip(&mut self.results)
-            .zip(&mut self.woken)
-        {
-            if Arc::ptr_eq(member, me) || *woken {
-                continue;
-            }
-            if let Some(result) = result.take() {
-                member.set(Slot::Done(result));
-                *woken = true;
-            }
-        }
-    }
-
     /// Every member with no result yet gets `err`.
     fn fail_rest(&mut self, err: &StoreError) {
         for result in &mut self.results {
@@ -212,11 +192,7 @@ impl Leadership<'_> {
 
 impl Drop for Leadership<'_> {
     fn drop(&mut self) {
-        for ((member, result), woken) in self.members.iter().zip(&mut self.results).zip(&self.woken)
-        {
-            if *woken {
-                continue;
-            }
+        for (member, result) in self.members.iter().zip(&mut self.results) {
             let result = result.take().unwrap_or_else(|| {
                 Err(backend(
                     "the group's leader stopped before this commit was published",
@@ -299,7 +275,10 @@ impl FerroStore {
     /// value and the sequence the commit took. A commit is registered with
     /// the sync adapter after its slot sync; its `on_commit` runs on this
     /// thread, after the group's locks are released, and in `WriteThrough`
-    /// this returns only once that batch is sent (`deliver_owned`).
+    /// this returns only once that batch is sent (`deliver_owned`). A leader
+    /// whose group left the WAL past the auto-checkpoint threshold
+    /// checkpoints after that (spec §4.4), so its own call returns after the
+    /// checkpoint.
     pub(super) fn group_write<T>(
         &self,
         disk: &Disk,
@@ -315,6 +294,7 @@ impl FerroStore {
         let mut body = Some(body);
         let mut value: Option<T> = None;
         let mut panicked: Option<Box<dyn Any + Send>> = None;
+        let mut checkpoint = false;
         let result = {
             let mut run = |state: Arc<DocState>| -> Result<Option<Staged>, StoreError> {
                 let Some(body) = body.take() else {
@@ -333,7 +313,7 @@ impl FerroStore {
                 }
             };
             if disk.group.join(&me) {
-                self.lead_group(disk, &me, &mut run);
+                checkpoint |= self.lead_group(disk, &me, &mut run);
             }
             loop {
                 let mut slot = lock_mutex(&me.slot);
@@ -343,7 +323,7 @@ impl FerroStore {
                 match std::mem::replace(&mut *slot, Slot::Empty) {
                     Slot::Lead => {
                         drop(slot);
-                        self.lead_group(disk, &me, &mut run);
+                        checkpoint |= self.lead_group(disk, &me, &mut run);
                     }
                     Slot::Turn(state) => {
                         drop(slot);
@@ -357,30 +337,39 @@ impl FerroStore {
                 }
             }
         };
+        let delivered = result.and_then(|acked| {
+            self.deliver_owned(acked.delivery)?;
+            Ok(acked.seq)
+        });
+        // Spec §4.4: every member has its result and the leader's own batch
+        // is delivered; the checkpoint takes a lock window of its own.
+        if checkpoint {
+            auto_checkpoint(disk);
+        }
         if let Some(payload) = panicked {
             panic::resume_unwind(payload);
         }
-        let acked = result?;
-        self.deliver_owned(acked.delivery)?;
+        let seq = delivered?;
         let value = value.ok_or_else(|| backend("a group member returned no value"))?;
-        Ok((value, acked.seq))
+        Ok((value, seq))
     }
 
     /// Lead one group. `me` is at the front of the queue; `own` runs its
-    /// body.
+    /// body. `true` when the group published a state that is due an
+    /// auto-checkpoint, which the caller runs once it has its own result
+    /// and has delivered its own batch ([`auto_checkpoint`]).
     fn lead_group(
         &self,
         disk: &Disk,
         me: &Arc<Member>,
         own: &mut dyn FnMut(Arc<DocState>) -> Result<Option<Staged>, StoreError>,
-    ) {
+    ) -> bool {
         // Declared first, so dropped last: after the flock, the write mutex
         // and the gate.
         let mut lead = Leadership {
             group: &disk.group,
             members: Vec::new(),
             results: Vec::new(),
-            woken: Vec::new(),
         };
         let _gate = lock_mutex(&self.commit_gate);
         let file = lock_mutex(&disk.write);
@@ -391,7 +380,6 @@ impl FerroStore {
         });
         lead.members = disk.group.take();
         lead.results = lead.members.iter().map(|_| None).collect();
-        lead.woken = vec![false; lead.members.len()];
         debug_assert!(
             lead.members
                 .first()
@@ -399,7 +387,10 @@ impl FerroStore {
             "a leader is the front of its group"
         );
         match locked {
-            Err(err) => lead.fail_rest(&err),
+            Err(err) => {
+                lead.fail_rest(&err);
+                false
+            }
             Ok((_flock, (index, base))) => {
                 let running = Running {
                     index,
@@ -408,16 +399,11 @@ impl FerroStore {
                     first: None,
                     state: None,
                 };
-                // Spec §4.4: each member is acknowledged once its commit is
-                // durable, before the checkpoint, which runs with the flock
-                // still held. A member woken here may go on at once: a read
-                // needs no lock, and a write queues for the next group.
-                if let Some(done) = self.run_group(disk, &**file, &mut lead, me, own, running)
-                    && done.published
-                {
-                    lead.acknowledge(me);
-                    auto_checkpoint(disk, &**file, done.index, &done.base);
-                }
+                // Spec §4.4: only whether the checkpoint is due is decided
+                // here. It runs outside this lock window, so no member's
+                // result waits for it.
+                self.run_group(disk, &**file, &mut lead, me, own, running)
+                    .is_some_and(|done| done.published && checkpoint_due(disk, &done.base))
             }
         }
     }

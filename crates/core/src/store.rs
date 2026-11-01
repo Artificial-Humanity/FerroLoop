@@ -85,6 +85,11 @@ pub enum StoreError {
         #[source]
         cause: Box<StoreError>,
     },
+    /// An error another process raised, carried here as its own message: a
+    /// FerroStore server's [`StoreError::Undelivered`] cause, rebuilt by its
+    /// client. The words are the server's; the kind is not kept.
+    #[error("{0}")]
+    Relayed(String),
     /// ⚠ The store could not be reached at all. This is "didn't look", and it
     /// must never read as an empty store.
     #[error("the store at {store} could not be opened: {cause}")]
