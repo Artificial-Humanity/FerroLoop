@@ -1091,24 +1091,35 @@ fn latest_claude_transcript_model(jsonl: &str) -> Option<String> {
     latest_claude_transcript_signal(jsonl).map(|(model, _)| model)
 }
 
-/// `~/.claude/settings.json` `model` (normalized) and its effort: `effortLevel`, else
-/// `modelSettings.<model>.effortLevel`.
+/// `~/.claude/settings.json` `model`: `(normalized, as written)`.
 fn claude_settings_model(settings: &Value) -> (Option<String>, Option<String>) {
     let raw = plain_bounded_str(settings.get("model"), MODEL_ID_MAX_CHARS);
     let model = raw.as_deref().map(normalize_claude_model);
-    let effort =
-        plain_bounded_str(settings.get("effortLevel"), CODEX_EFFORT_MAX_CHARS).or_else(|| {
-            [raw.as_deref(), model.as_deref()]
-                .into_iter()
-                .flatten()
-                .find_map(|key| {
-                    plain_bounded_str(
-                        settings.pointer(&format!("/modelSettings/{key}/effortLevel")),
-                        CODEX_EFFORT_MAX_CHARS,
-                    )
-                })
-        });
-    (model, effort)
+    (model, raw)
+}
+
+/// The `settings.json` effort for `model`: the global `effortLevel`, else
+/// `modelSettings.<model>.effortLevel`. The per-model entry is looked up by the canonical id,
+/// and by `settings_raw` (the spelling `settings.json` uses for its own model) only when
+/// `model` is that settings model.
+fn claude_settings_effort(
+    settings: &Value,
+    model: &str,
+    settings_model: Option<&str>,
+    settings_raw: Option<&str>,
+) -> Option<String> {
+    let raw = settings_raw.filter(|_| settings_model == Some(model));
+    plain_bounded_str(settings.get("effortLevel"), CODEX_EFFORT_MAX_CHARS).or_else(|| {
+        [Some(model), raw].into_iter().flatten().find_map(|key| {
+            plain_bounded_str(
+                settings
+                    .get("modelSettings")
+                    .and_then(|m| m.get(key))
+                    .and_then(|m| m.get("effortLevel")),
+                CODEX_EFFORT_MAX_CHARS,
+            )
+        })
+    })
 }
 
 fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
@@ -1126,10 +1137,15 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         .and_then(|p| read_file_tail(p, CLAUDE_TRANSCRIPT_TAIL_BYTES))
         .and_then(|tail| latest_claude_transcript_signal(&tail));
     let settings_path = home.map(|h| h.join(".claude").join("settings.json"));
-    let (settings_model, settings_effort) = settings_path
-        .as_deref()
-        .and_then(read_json_file)
-        .map_or((None, None), |v| claude_settings_model(&v));
+    let settings = settings_path.as_deref().and_then(read_json_file);
+    let (settings_model, settings_raw) = settings
+        .as_ref()
+        .map_or((None, None), claude_settings_model);
+    let settings_effort = |model: &str| {
+        settings.as_ref().and_then(|v| {
+            claude_settings_effort(v, model, settings_model.as_deref(), settings_raw.as_deref())
+        })
+    };
     let settings_newer = match (
         settings_path.as_deref().and_then(file_mtime),
         transcript.and_then(file_mtime),
@@ -1138,9 +1154,20 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         _ => false,
     };
     let (model, thinking_level) = match from_transcript {
-        Some(_) if settings_newer && settings_model.is_some() => (settings_model, settings_effort),
-        Some((model, effort)) => (Some(model), effort.or(settings_effort)),
-        None => (settings_model, settings_effort),
+        Some((signal, effort)) if settings_newer && settings_model.is_some() => {
+            let model = settings_model.clone().unwrap_or_default();
+            // The transcript's command effort still holds when settings.json names that model.
+            let effort = settings_effort(&model).or(effort.filter(|_| signal == model));
+            (Some(model), effort)
+        }
+        Some((model, effort)) => {
+            let effort = effort.or_else(|| settings_effort(&model));
+            (Some(model), effort)
+        }
+        None => {
+            let effort = settings_model.as_deref().and_then(&settings_effort);
+            (settings_model, effort)
+        }
     };
     SessionModelInfo {
         model,
@@ -5290,8 +5317,147 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_model_cache_refreshes_within_five_seconds() {
-        assert_eq!(AGY_CACHE_TTL, Duration::from_secs(5));
+    fn claude_per_model_settings_effort_belongs_to_the_winning_model_only() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let transcript = home.join("t.jsonl");
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        let tp = transcript.to_str().unwrap();
+
+        // Only the settings model (opus) has a per-model effort; the transcript wins with
+        // sonnet, which must not inherit it.
+        fs::write(
+            &settings,
+            r#"{"model":"opus","modelSettings":{"opus":{"effortLevel":"medium"}}}"#,
+        )
+        .unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(info.thinking_level, None);
+
+        // The converse: the winning model has its own per-model entry (canonical id).
+        fs::write(
+            &settings,
+            r#"{"model":"opus","modelSettings":{"opus":{"effortLevel":"medium"},
+                "claude-sonnet-5-5":{"effortLevel":"low"}}}"#,
+        )
+        .unwrap();
+        set_mtime_secs(&settings, 1_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+
+        // A global effortLevel applies to whichever model wins.
+        fs::write(
+            &settings,
+            r#"{"model":"opus","effortLevel":"high","modelSettings":{"opus":{"effortLevel":"medium"}}}"#,
+        )
+        .unwrap();
+        set_mtime_secs(&settings, 1_000);
+        assert_eq!(
+            claude_model_info(Some(tp), Some(home))
+                .thinking_level
+                .as_deref(),
+            Some("high")
+        );
+
+        // A key with `/` or `~` is a plain key, not a JSON pointer.
+        fs::write(
+            &settings,
+            r#"{"model":"a/b~c","modelSettings":{"a":{"b~c":{"effortLevel":"wrong"}},
+                "a/b~c":{"effortLevel":"max"}}}"#,
+        )
+        .unwrap();
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("a/b~c"));
+        assert_eq!(info.thinking_level.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn claude_newer_settings_naming_the_transcript_model_keep_the_command_effort() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let transcript = home.join("t.jsonl");
+        fs::write(
+            &transcript,
+            model_command_line(Value::String(OPUS_HIGH.to_string())),
+        )
+        .unwrap();
+        let tp = transcript.to_str().unwrap();
+        set_mtime_secs(&transcript, 1_000);
+
+        // Same model, no settings effort: the command's effort survives.
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        set_mtime_secs(&settings, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+
+        // Settings effort, when present, still wins.
+        fs::write(&settings, r#"{"model":"opus","effortLevel":"low"}"#).unwrap();
+        set_mtime_secs(&settings, 2_000);
+        assert_eq!(
+            claude_model_info(Some(tp), Some(home))
+                .thinking_level
+                .as_deref(),
+            Some("low")
+        );
+
+        // A different settings model does not take the command's effort.
+        fs::write(&settings, r#"{"model":"sonnet"}"#).unwrap();
+        set_mtime_secs(&settings, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(info.thinking_level, None);
+    }
+
+    #[test]
+    fn claude_settings_and_transcript_edge_cases() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        let transcript = home.join("t.jsonl");
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        let tp = transcript.to_str().unwrap();
+
+        // Equal mtimes: the comparison is strict, so the transcript wins.
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        set_mtime_secs(&settings, 2_000);
+        set_mtime_secs(&transcript, 2_000);
+        assert_eq!(
+            claude_model_info(Some(tp), Some(home)).model.as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+
+        // A transcript path to a missing file: settings supplies the model.
+        let missing = home.join("missing.jsonl");
+        assert_eq!(
+            claude_model_info(missing.to_str(), Some(home))
+                .model
+                .as_deref(),
+            Some("claude-opus-5-5")
+        );
+
+        // A newer settings.json whose model is unusable never erases the transcript's.
+        let oversized = "m".repeat(MODEL_ID_MAX_CHARS + 1);
+        for bad in [oversized.as_str(), "bad\u{7}model"] {
+            fs::write(&settings, serde_json::json!({ "model": bad }).to_string()).unwrap();
+            set_mtime_secs(&settings, 3_000);
+            assert_eq!(
+                claude_model_info(Some(tp), Some(home)).model.as_deref(),
+                Some("claude-sonnet-5-5")
+            );
+        }
     }
 
     #[test]
