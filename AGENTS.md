@@ -28,8 +28,9 @@ at `notes/` (a gitignored symlink to `Notes/FerroLoop`) and deliberately not pub
   The standalone `ferrostore` binary and `fl store` share one command module (`fl_store::cli`).
   The store holds a project's gates, transitions, gate runs and attempts (each with its outcome,
   duration, tokens and cost), and its records and findings unless the project keeps those in
-  GitHub Issues. FerroState searches memories and the code index with exact BM25, plus an HNSW
-  vector leg on the ferro engine.
+  GitHub Issues. FerroState searches state entries (memories, handoffs and runtime state) with
+  exact BM25, and the code index by name tiers and line matches; on the ferro engine both fuse in
+  an HNSW vector leg.
 * **Capability truth lives in code, not prose:** Enums, adapter registries, and protocol
   schemas generate capability lists wherever possible. Avoid duplicating hard-coded provider or
   feature lists in documentation that easily rots.
