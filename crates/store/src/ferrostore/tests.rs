@@ -79,6 +79,33 @@ fn seed(path: &Path) {
         .unwrap();
 }
 
+/// The table CRC equals the bit-at-a-time one at every length 0..=64 (each tail length after
+/// whole 8-byte steps) and every offset into the buffer, and on a large buffer.
+#[test]
+fn the_table_crc32_equals_the_bitwise_crc32() {
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    let data: Vec<u8> = (0..1 << 16)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    for start in 0..8 {
+        for len in 0..=64 {
+            let part = &data[start..start + len];
+            assert_eq!(
+                layout::crc32(part),
+                layout::crc32_bitwise(part),
+                "start {start}, len {len}"
+            );
+        }
+    }
+    assert_eq!(layout::crc32(&data), layout::crc32_bitwise(&data));
+    assert_eq!(layout::crc32(&[]), 0);
+}
+
 #[test]
 fn crc32_iso_hdlc_and_superblock_round_trip() {
     assert_eq!(layout::crc32(b"123456789"), 0xCBF4_3926);
@@ -4379,15 +4406,59 @@ fn l2_graph(order: &[&str]) -> super::vector::VectorCollection {
     }
 }
 
+/// The neighbor order is the full check's, not open's: `validate_graph` (what a snapshot
+/// decode runs) accepts a list out of (distance, id) order, `validate_graph_full` refuses it.
 #[test]
-fn validate_graph_rejects_neighbors_that_are_not_distance_then_id_ordered() {
-    let err = super::vector::validate_graph("emb", &l2_graph(&["m", "b", "a"])).unwrap_err();
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert!(err.to_string().contains("corrupt"), "{err}");
-    let err = super::vector::validate_graph("emb", &l2_graph(&["a", "b", "m"])).unwrap_err();
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    assert!(err.to_string().contains("corrupt"), "{err}");
-    super::vector::validate_graph("emb", &l2_graph(&["b", "m", "a"])).unwrap();
+fn the_full_check_rejects_neighbors_that_are_not_distance_then_id_ordered() {
+    for order in [&["m", "b", "a"][..], &["a", "b", "m"]] {
+        let graph = l2_graph(order);
+        super::vector::validate_graph("emb", &graph).unwrap();
+        let err = super::vector::validate_graph_full("emb", &graph).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(err.to_string().contains("corrupt"), "{err}");
+        assert!(err.to_string().contains("not ordered by distance"), "{err}");
+    }
+    super::vector::validate_graph_full("emb", &l2_graph(&["b", "m", "a"])).unwrap();
+}
+
+/// A CRC-valid snapshot whose only fault is a neighbor list out of canonical order decodes
+/// (open does not re-derive the order), the full check names the fault, and the encoder
+/// refuses to write it again.
+#[test]
+fn a_snapshot_decodes_a_misordered_neighbor_list_the_full_check_and_the_encoder_refuse_it() {
+    let vectors: super::state::Vectors = BTreeMap::from([(
+        "emb".to_string(),
+        std::sync::Arc::new(l2_graph(&["b", "m", "a"])),
+    )]);
+    let docs = super::state::Docs::default();
+    let tables = super::state::Tables::new();
+    let mut blob = layout::encode_snapshot_v3(1, &docs, &tables, &vectors).unwrap();
+    // `o`'s layer-0 list: a count of 3, then `b`, `m`, `a`, each length-prefixed.
+    let lp = |id: u8| [1, 0, 0, 0, id];
+    let list = |ids: [u8; 3]| -> Vec<u8> {
+        let mut out = vec![3, 0, 0, 0];
+        for id in ids {
+            out.extend_from_slice(&lp(id));
+        }
+        out
+    };
+    let canonical = list(*b"bma");
+    let at: Vec<usize> = (0..blob.len() - canonical.len())
+        .filter(|at| blob[*at..].starts_with(&canonical))
+        .collect();
+    assert_eq!(at.len(), 1, "one canonical list of three in the snapshot");
+    blob[at[0]..at[0] + canonical.len()].copy_from_slice(&list(*b"mba"));
+    let body = blob.len() - 4;
+    let crc = layout::crc32(&blob[..body]);
+    blob[body..].copy_from_slice(&crc.to_le_bytes());
+
+    let snap = layout::decode_snapshot(&blob).unwrap();
+    let col = &snap.vectors["emb"];
+    assert_eq!(col.vectors["o"].neighbors[0], ["m", "b", "a"]);
+    let err = super::vector::validate_graph_full("emb", col).unwrap_err();
+    assert!(err.to_string().contains("not ordered by distance"), "{err}");
+    let err = layout::encode_snapshot_v3(2, &docs, &tables, &snap.vectors).unwrap_err();
+    assert!(err.to_string().contains("not ordered by distance"), "{err}");
 }
 
 fn put_frame(seq: u64, id: &str) -> Vec<u8> {
