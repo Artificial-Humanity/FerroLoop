@@ -3370,7 +3370,7 @@ mod tests {
                     notes: None,
                 }),
                 at: At::from_unix_millis(10),
-                by: "jarvis".into(),
+                by: "carol".into(),
             })
             .unwrap()
         };
@@ -3404,9 +3404,9 @@ mod tests {
                 .send_wire(SendWireArgs {
                     id: None,
                     sender_id: None,
-                    sender_name: "jarvis".into(),
-                    sender_host: Some("ai-lab-0".into()),
-                    to: WireAddress::AgentName("ferris".into()),
+                    sender_name: "carol".into(),
+                    sender_host: Some("build-host".into()),
+                    to: WireAddress::AgentName("bob".into()),
                     kind: MessageKind::Mail,
                     urgency: MessageUrgency::Normal,
                     durable: false,
@@ -3432,7 +3432,7 @@ mod tests {
         reopened
             .update_wire_receipt(
                 &msg.id,
-                "ferris",
+                "bob",
                 DeliveryStatus::Acked,
                 false,
                 At::from_unix_millis(15),
@@ -3481,7 +3481,7 @@ mod tests {
                         title: "Build".into(),
                         prompt: "Run build.".into(),
                         assignee: AssigneeRule::Agent {
-                            name: "felicia".into(),
+                            name: "alice".into(),
                         },
                         reviews_step: None,
                         require_different_vendor: false,
@@ -3503,7 +3503,7 @@ mod tests {
                     max_tokens: None,
                     declared_keys: BTreeMap::new(),
                     authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-                    authored_by: "ferris".into(),
+                    authored_by: "bob".into(),
                 })
                 .unwrap();
             let run = s
@@ -3513,7 +3513,7 @@ mod tests {
                         &wf,
                         "CI Run 1",
                         At::from_unix_millis(100),
-                        "ferris",
+                        "bob",
                     )
                     .unwrap(),
                 )

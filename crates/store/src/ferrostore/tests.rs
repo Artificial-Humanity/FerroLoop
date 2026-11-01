@@ -1456,7 +1456,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
     redb.upsert_area(area).unwrap();
     let agent = redb
         .register_agent(RegisterAgentArgs {
-            display_name: "ferris".into(),
+            display_name: "bob".into(),
             email: None,
             project: "ferroloop".into(),
             role: AgentRole::Lead,
@@ -1481,7 +1481,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 notes: None,
             }),
             at: At::from_unix_millis(10),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
 
@@ -1497,7 +1497,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 title: "Build".into(),
                 prompt: "Run build.".into(),
                 assignee: AssigneeRule::Agent {
-                    name: "felicia".into(),
+                    name: "alice".into(),
                 },
                 reviews_step: None,
                 require_different_vendor: false,
@@ -1519,7 +1519,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
             max_tokens: None,
             declared_keys: BTreeMap::new(),
             authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            authored_by: "ferris".into(),
+            authored_by: "bob".into(),
         })
         .unwrap();
     let workflow_run = redb
@@ -1529,7 +1529,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
                 &workflow,
                 "CI Run 1",
                 At::from_unix_millis(100),
-                "ferris",
+                "bob",
             )
             .unwrap(),
         )
@@ -1539,9 +1539,9 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         .send_wire(SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
-            sender_host: Some("ai-lab-0".into()),
-            to: WireAddress::AgentName("ferris".into()),
+            sender_name: "carol".into(),
+            sender_host: Some("build-host".into()),
+            to: WireAddress::AgentName("bob".into()),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
             durable: false,
@@ -1641,7 +1641,7 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         redb.get_wire_message(&message.id).unwrap()
     );
     let filter = WireFilter {
-        recipient: Some("ferris".into()),
+        recipient: Some("bob".into()),
         ..WireFilter::default()
     };
     assert_eq!(
@@ -2094,7 +2094,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 notes: None,
             }),
             at: At::from_unix_millis(10),
-            by: "jarvis".into(),
+            by: "carol".into(),
         })
         .unwrap();
     let got_state = store.get_state(&state.id).unwrap().expect("state");
@@ -2114,7 +2114,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 title: "Build".into(),
                 prompt: "Run build.".into(),
                 assignee: AssigneeRule::Agent {
-                    name: "felicia".into(),
+                    name: "alice".into(),
                 },
                 reviews_step: None,
                 require_different_vendor: false,
@@ -2136,7 +2136,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
             max_tokens: None,
             declared_keys: BTreeMap::new(),
             authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
-            authored_by: "ferris".into(),
+            authored_by: "bob".into(),
         })
         .unwrap();
     let got_workflow = store
@@ -2153,7 +2153,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
                 &got_workflow,
                 format!("CI run {tag}"),
                 At::from_unix_millis(20),
-                "ferris",
+                "bob",
             )
             .unwrap(),
         )
@@ -2180,8 +2180,8 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
         .send_wire(SendWireArgs {
             id: None,
             sender_id: None,
-            sender_name: "jarvis".into(),
-            sender_host: Some("ai-lab-0".into()),
+            sender_name: "carol".into(),
+            sender_host: Some("build-host".into()),
             to: WireAddress::AgentName(agent_name),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
