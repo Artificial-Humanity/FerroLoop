@@ -123,6 +123,15 @@ pub fn verify_redb_vs_ferrostore(
 /// 3. `fsync` the file; 4. move it to `fls_path`; 5. `fsync` the directory;
 /// 6. `chmod 0400` the `.redb`, which is kept.
 ///
+/// The `.redb` is held open, and so keeps redb's exclusive lock, from before
+/// the copy until after the `chmod`: no other process can write it once it is
+/// copied, so nothing written to it is missing from the published `.fls`.
+///
+/// First, it removes this target's stale temp files: regular files beside
+/// `fls_path`, not symlinks, whose names have the step 1 form for this
+/// `fls_path`, owned by this user and not modified for 24 hours (a crashed
+/// migration's leftovers). A sweep that fails is a warning on stderr.
+///
 /// Refuses when `fls_path` already exists or `redb_path` does not. The move is
 /// `link` then `unlink`, not `rename`: a `rename` would replace an `fls_path`
 /// another process created after the check, and `link` refuses to. The file
@@ -172,8 +181,102 @@ fn temp_path(fls_path: &Path) -> Result<std::path::PathBuf, StoreError> {
     let addr = std::ptr::addr_of!(marker) as usize as u64;
     let nonce = (nanos ^ addr.rotate_left(32)) & 0xffff_ffff;
     let mut temp_name = name.to_os_string();
-    temp_name.push(format!(".migrating-{}-{n}-{nonce:08x}", std::process::id()));
+    temp_name.push(format!("{TEMP_MARK}{}-{n}-{nonce:08x}", std::process::id()));
     Ok(fls_path.with_file_name(temp_name))
+}
+
+/// What [`temp_path`] puts between the target's file name and its numbers.
+const TEMP_MARK: &str = ".migrating-";
+
+/// A temp file left this long without a write is a crashed migration's.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// `candidate` is a name [`temp_path`] makes for a target named `target`:
+/// `<target>.migrating-<pid>-<n>-<nonce>`, decimal pid and counter, and an
+/// eight-digit lowercase hex nonce.
+fn is_temp_name_for(candidate: &std::ffi::OsStr, target: &std::ffi::OsStr) -> bool {
+    let (Some(candidate), Some(target)) = (candidate.to_str(), target.to_str()) else {
+        return false;
+    };
+    let Some(numbers) = candidate
+        .strip_prefix(target)
+        .and_then(|rest| rest.strip_prefix(TEMP_MARK))
+    else {
+        return false;
+    };
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = numbers.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(pid), Some(n), Some(nonce), None) => {
+            decimal(pid)
+                && decimal(n)
+                && nonce.len() == 8
+                && nonce
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        _ => false,
+    }
+}
+
+/// Remove the stale temp files of a migration into `fls_path` (see
+/// [`migrate_verified`]). Never an error: what cannot be read or removed is a
+/// warning, and the migration goes on.
+fn sweep_stale_temps(fls_path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Some(target) = fls_path.file_name() else {
+        return;
+    };
+    let dir = super::parent_dir(fls_path);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // No directory, no temp files in it; the migration reports it.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            warn(&format!(
+                "warning: stale migration temp files in {} were not swept: {err}",
+                dir.display()
+            ));
+            return;
+        }
+    };
+    // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
+    let uid = unsafe { libc::geteuid() };
+    let now = std::time::SystemTime::now();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                warn(&format!(
+                    "warning: stale migration temp files in {} were not all swept: {err}",
+                    dir.display()
+                ));
+                return;
+            }
+        };
+        if !is_temp_name_for(&entry.file_name(), target) {
+            continue;
+        }
+        let path = entry.path();
+        // `symlink_metadata`: a symlink is itself, never the file it names.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > STALE_TEMP_AGE);
+        if !meta.file_type().is_file() || meta.uid() != uid || !stale {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            warn(&format!(
+                "warning: the stale migration temp file {} was not removed: {err}",
+                path.display()
+            ));
+        }
+    }
 }
 
 /// Remove `temp` only while it is still the file this call created.
@@ -193,6 +296,29 @@ pub(super) fn migrate_verified_with(
     fls_path: &Path,
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
 ) -> Result<ParityReport, StoreError> {
+    migrate_verified_hooked(redb_path, fls_path, after_copy, || {})
+}
+
+/// [`migrate_verified_with`] with `before_chmod` also run after the link and
+/// the directory `fsync`, just before the `chmod`: tests use it to look at the
+/// `.redb` while the migration still holds it.
+#[cfg(test)]
+pub(super) fn migrate_verified_with_before_chmod(
+    redb_path: &Path,
+    fls_path: &Path,
+    after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
+    before_chmod: impl FnOnce(),
+) -> Result<ParityReport, StoreError> {
+    migrate_verified_hooked(redb_path, fls_path, after_copy, before_chmod)
+}
+
+fn migrate_verified_hooked(
+    redb_path: &Path,
+    fls_path: &Path,
+    after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
+    before_chmod: impl FnOnce(),
+) -> Result<ParityReport, StoreError> {
+    sweep_stale_temps(fls_path);
     if std::fs::symlink_metadata(fls_path).is_ok() {
         return Err(backend(format!(
             "{} already exists: a verified migration only creates a new store",
@@ -206,7 +332,7 @@ pub(super) fn migrate_verified_with(
         )));
     }
     let temp = temp_path(fls_path)?;
-    migrate_into(redb_path, fls_path, &temp, after_copy)
+    migrate_into(redb_path, fls_path, &temp, after_copy, before_chmod)
 }
 
 /// [`migrate_verified`] through the temp file `temp`, for a test that must
@@ -217,7 +343,7 @@ pub(super) fn migrate_verified_with_temp(
     fls_path: &Path,
     temp: &Path,
 ) -> Result<ParityReport, StoreError> {
-    migrate_into(redb_path, fls_path, temp, |_| Ok(()))
+    migrate_into(redb_path, fls_path, temp, |_| Ok(()), || {})
 }
 
 /// Steps 1 to 6 of [`migrate_verified`], through `temp`, once the checks on
@@ -227,6 +353,7 @@ fn migrate_into(
     fls_path: &Path,
     temp: &Path,
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
+    before_chmod: impl FnOnce(),
 ) -> Result<ParityReport, StoreError> {
     // `create_new` is `O_EXCL`: a taken name fails here and is not touched.
     let held = {
@@ -249,88 +376,95 @@ fn migrate_into(
         err
     };
 
-    let outcome = (|| {
-        let src = RedbStore::open(redb_path)?;
+    // Invariant: `src` holds redb's exclusive lock on the `.redb` from before
+    // the copy until after the `chmod`, and is dropped only once the steps
+    // below (and any temp cleanup on their error paths) are done, so no other
+    // process can write the `.redb` after it was copied.
+    let src = RedbStore::open(redb_path).map_err(&cleanup)?;
+    let result = (|| {
         let report = {
-            let dst = FerroStore::open(temp)?;
-            super::migrate_redb_to_ferrostore(&src, &dst)?;
-            after_copy(&dst)?;
-            verify_redb_vs_ferrostore(&src, &dst)?
+            let dst = FerroStore::open(temp).map_err(&cleanup)?;
+            let outcome = super::migrate_redb_to_ferrostore(&src, &dst)
+                .and_then(|()| after_copy(&dst))
+                .and_then(|()| verify_redb_vs_ferrostore(&src, &dst));
+            drop(dst);
+            match outcome {
+                Ok(report) if report.is_clean() => report,
+                Ok(report) => {
+                    remove_own_temp(temp, ours)
+                        .map_err(|err| backend(format!("remove {}: {err}", temp.display())))?;
+                    return Ok(report);
+                }
+                Err(err) => return Err(cleanup(err)),
+            }
         };
-        drop(src);
-        Ok(report)
-    })();
-    let report = match outcome {
-        Ok(report) if report.is_clean() => report,
-        Ok(report) => {
-            remove_own_temp(temp, ours)
-                .map_err(|err| backend(format!("remove {}: {err}", temp.display())))?;
-            return Ok(report);
-        }
-        Err(err) => return Err(cleanup(err)),
-    };
 
-    // Publish the inode that was migrated and verified, and no other.
-    let replaced = |when: &str| {
-        backend(format!(
-            "{} is no longer the file this migration verified ({when}): not published",
-            temp.display()
-        ))
-    };
-    if id_at(temp) != Some(ours) {
-        return Err(cleanup(replaced("before the link")));
-    }
-    held.sync_all()
-        .map_err(|err| cleanup(backend(format!("sync {}: {err}", temp.display()))))?;
-    std::fs::hard_link(temp, fls_path).map_err(|err| {
-        cleanup(backend(format!(
-            "move {} to {}: {err}",
-            temp.display(),
-            fls_path.display()
-        )))
-    })?;
-    let linked = id_at(fls_path);
-    if linked != Some(ours) {
-        // The temp name was swapped between the check and the link, so the
-        // link this call made names that other file: take it back. An
-        // `fls_path` that is not the temp's file is not this call's link and
-        // is left alone.
-        if linked.is_some() && linked == id_at(temp) {
-            let _ = std::fs::remove_file(fls_path);
+        // Publish the inode that was migrated and verified, and no other.
+        let replaced = |when: &str| {
+            backend(format!(
+                "{} is no longer the file this migration verified ({when}): not published",
+                temp.display()
+            ))
+        };
+        if id_at(temp) != Some(ours) {
+            return Err(cleanup(replaced("before the link")));
         }
-        return Err(cleanup(replaced("after the link")));
-    }
-    drop(held);
+        held.sync_all()
+            .map_err(|err| cleanup(backend(format!("sync {}: {err}", temp.display()))))?;
+        std::fs::hard_link(temp, fls_path).map_err(|err| {
+            cleanup(backend(format!(
+                "move {} to {}: {err}",
+                temp.display(),
+                fls_path.display()
+            )))
+        })?;
+        let linked = id_at(fls_path);
+        if linked != Some(ours) {
+            // The temp name was swapped between the check and the link, so the
+            // link this call made names that other file: take it back. An
+            // `fls_path` that is not the temp's file is not this call's link and
+            // is left alone.
+            if linked.is_some() && linked == id_at(temp) {
+                let _ = std::fs::remove_file(fls_path);
+            }
+            return Err(cleanup(replaced("after the link")));
+        }
+        drop(held);
 
-    // `fls_path` is the store from here on: what fails now is a warning.
-    if let Err(err) = remove_own_temp(temp, ours) {
-        warn(&format!(
-            "warning: {} is published, but its temp file {} was not removed: {err}",
-            fls_path.display(),
-            temp.display()
-        ));
-    }
-    if let Err(err) = super::sync_dir(&super::parent_dir(fls_path)) {
-        warn(&format!(
-            "warning: {} is published, but its directory was not synced, so a crash \
-             may still lose the new entry: {err}",
-            fls_path.display()
-        ));
-    }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(err) =
-            std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
-        {
+        // `fls_path` is the store from here on: what fails now is a warning.
+        if let Err(err) = remove_own_temp(temp, ours) {
             warn(&format!(
-                "warning: {} is published, but chmod 0400 {} failed, so the redb store \
-                 remains writable: {err}",
+                "warning: {} is published, but its temp file {} was not removed: {err}",
                 fls_path.display(),
-                redb_path.display()
+                temp.display()
             ));
         }
-    }
-    Ok(report)
+        if let Err(err) = super::sync_dir(&super::parent_dir(fls_path)) {
+            warn(&format!(
+                "warning: {} is published, but its directory was not synced, so a crash \
+                 may still lose the new entry: {err}",
+                fls_path.display()
+            ));
+        }
+        before_chmod();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
+            {
+                warn(&format!(
+                    "warning: {} is published, but chmod 0400 {} failed, so the redb store \
+                     remains writable: {err}",
+                    fls_path.display(),
+                    redb_path.display()
+                ));
+            }
+        }
+        Ok(report)
+    })();
+    // The lock is released here, last, on every path.
+    drop(src);
+    result
 }
 
 /// One line on stderr, as the store's other warnings print: a closed stderr is

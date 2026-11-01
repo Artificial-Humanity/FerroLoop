@@ -899,3 +899,178 @@ fn a_temp_file_replaced_before_the_link_is_not_published_or_removed() {
     );
     assert_eq!(mode(&redb_path), 0o600, "the redb stays writable");
 }
+
+/// The cause a no-wait open of `redb_path` fails with, or `None` when it opens.
+fn open_failure(redb_path: &Path) -> Option<String> {
+    match RedbStore::open_with_retries(redb_path, 0) {
+        Ok(_) => None,
+        Err(fl_core::StoreError::Unreachable { cause, .. }) => Some(cause),
+        Err(other) => panic!("not an unreachable store: {other}"),
+    }
+}
+
+/// What redb says when another open file description holds the lock.
+const LOCKED: &str = "Database already open. Cannot acquire lock.";
+
+/// A permission check is meaningless for root, who writes a mode-0400 file.
+fn is_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[test]
+fn the_redb_stays_locked_from_the_copy_until_after_the_chmod() {
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    let mut after_copy = None;
+    let mut before_chmod = None;
+    let report = verify::migrate_verified_with_before_chmod(
+        &redb_path,
+        &fls,
+        |_| {
+            after_copy = Some(open_failure(&redb_path));
+            Ok(())
+        },
+        || {
+            // Linked and synced, not yet frozen: only the lock can refuse this.
+            assert!(fls.is_file(), "the store is published before the chmod");
+            assert_eq!(mode(&redb_path), 0o600, "the chmod has not run yet");
+            before_chmod = Some(open_failure(&redb_path));
+        },
+    )
+    .unwrap();
+    assert!(report.is_clean(), "{:#?}", report.mismatches());
+    assert_eq!(after_copy, Some(Some(LOCKED.to_string())));
+    assert_eq!(before_chmod, Some(Some(LOCKED.to_string())));
+    assert_eq!(mode(&redb_path), 0o400);
+
+    // Once the call returns the lock is gone: what refuses an open now is the
+    // mode, and with the mode put back the file opens at once.
+    if !is_root() {
+        let cause = open_failure(&redb_path).expect("a 0400 redb does not open for writing");
+        assert!(!cause.contains(LOCKED), "{cause}");
+        assert!(cause.contains("Permission denied"), "{cause}");
+    }
+    std::fs::set_permissions(&redb_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(open_failure(&redb_path), None, "the lock was released");
+}
+
+/// Set `path`'s modification time `age` in the past.
+fn age_by(path: &Path, age: std::time::Duration) {
+    let when = std::time::SystemTime::now() - age;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(when))
+        .unwrap();
+    assert!(
+        std::fs::metadata(path).unwrap().modified().unwrap() <= when,
+        "the mtime was set"
+    );
+}
+
+#[test]
+fn a_migration_sweeps_only_this_targets_stale_temp_files() {
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let old = day + std::time::Duration::from_secs(60 * 60);
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    let dir = tmp.path();
+    let write_aged = |name: &str, age: Option<std::time::Duration>| {
+        let path = dir.join(name);
+        std::fs::write(&path, b"left by a crash").unwrap();
+        if let Some(age) = age {
+            age_by(&path, age);
+        }
+        path
+    };
+    let stale = write_aged("fl.fls.migrating-4242-0-0badf00d", Some(old));
+    let fresh = write_aged("fl.fls.migrating-4242-1-0badf00d", None);
+    let unlike = [
+        // Not the pattern: a suffix, a word, a short or upper-case nonce.
+        "fl.fls.migrating-4242-0-0badf00d.bak",
+        "fl.fls.migrating-taken",
+        "fl.fls.migrating-4242-0-badf00d",
+        "fl.fls.migrating-4242-0-0BADF00D",
+        // Another target's temp files.
+        "other.fls.migrating-4242-0-0badf00d",
+        "xfl.fls.migrating-4242-0-0badf00d",
+    ]
+    .map(|name| write_aged(name, Some(old)));
+    // A symlink with a matching name, to an old file of the right form: the
+    // sweep looks at the link itself, which is not a regular file.
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let target = elsewhere.join("fl.fls.migrating-4242-2-0badf00d");
+    std::fs::write(&target, b"not the sweep's").unwrap();
+    age_by(&target, old);
+    let link = dir.join("fl.fls.migrating-4242-2-0badf00d");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    // A directory with a matching name is not a temp file either.
+    let subdir = dir.join("fl.fls.migrating-4242-3-0badf00d");
+    std::fs::create_dir(&subdir).unwrap();
+
+    let report = migrate_verified(&redb_path, &fls).unwrap();
+    assert!(report.is_clean(), "{:#?}", report.mismatches());
+    assert!(!stale.exists(), "the stale temp file is removed");
+    assert!(fresh.exists(), "a temp file written within 24 h is kept");
+    for path in &unlike {
+        assert!(path.exists(), "{} is kept", path.display());
+    }
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink is kept"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"not the sweep's");
+    assert!(subdir.is_dir(), "the directory is kept");
+    assert!(fls.is_file());
+}
+
+#[test]
+fn a_frozen_redb_says_how_to_reach_the_store() {
+    if is_root() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    assert!(migrate_verified(&redb_path, &fls).unwrap().is_clean());
+
+    let err = RedbStore::open_with_retries(&redb_path, 0).err().unwrap();
+    let text = err.to_string();
+    assert!(
+        matches!(err, fl_core::StoreError::Unreachable { .. }),
+        "{text}"
+    );
+    for want in [
+        "Permission denied",
+        "read-only (mode 400)",
+        "FerroStore migration",
+        &format!("{} (it exists)", fls.display()),
+        "Use the FerroStore engine",
+        "FL_STORE_BACKEND=ferro",
+        &format!("chmod 600 '{}'", redb_path.display()),
+    ] {
+        assert!(text.contains(want), "missing {want:?} in: {text}");
+    }
+
+    // The .fls gone (or never made): the text says so.
+    std::fs::remove_file(&fls).unwrap();
+    let text = RedbStore::open_with_retries(&redb_path, 0)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains(&format!("{} (it does not exist)", fls.display())),
+        "{text}"
+    );
+
+    // A refusal for any other reason keeps redb's own text.
+    std::fs::set_permissions(&redb_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let held = RedbStore::open(&redb_path).unwrap();
+    assert_eq!(open_failure(&redb_path), Some(LOCKED.to_string()));
+    drop(held);
+}
