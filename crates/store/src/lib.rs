@@ -14,9 +14,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod any;
-// `RedbStore::db` is a `Db` with its own `begin_read`, so the `redb::ReadableDatabase` import that
-// the migration code in this module needs to call `redb.db.begin_read()` is now unused there.
-#[allow(unused_imports)]
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod knowledge;
