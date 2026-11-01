@@ -26,9 +26,7 @@ use fl_wire::identity::{
 };
 use serde_json::{Value, json};
 
-use crate::cmd::agent::{
-    now_at, render_registry_markdown, resolve_agent, write_atomic_non_symlink,
-};
+use crate::cmd::agent::{now_at, resolve_agent, sync_registry_markdown};
 use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -208,8 +206,12 @@ pub enum AgentMsgCmd {
         body: String,
     },
     Read {
+        /// Accepted for compatibility; unread-only is the default.
         #[arg(long)]
         unread_only: bool,
+        /// Include messages already acknowledged.
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -245,6 +247,24 @@ pub enum AgentMsgCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Run `agent-hydrate` with `args`, so `agent-msg hydrate <Name>` keeps working.
+    Hydrate {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+/// The `agent-hydrate` program: the one on `PATH`, else `~/.local/bin/agent-hydrate`.
+fn hydrate_program() -> PathBuf {
+    let on_path = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join("agent-hydrate").is_file())
+    });
+    if on_path {
+        return PathBuf::from("agent-hydrate");
+    }
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".local/bin/agent-hydrate"))
+        .unwrap_or_else(|| PathBuf::from("agent-hydrate"))
 }
 
 pub fn resolve_socket_path(env: &StateEnv<'_>, explicit: Option<&Path>) -> PathBuf {
@@ -1206,13 +1226,14 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
         ),
         AgentMsgCmd::Read {
             unread_only,
+            all,
             json,
             ack,
         } => run(
             env,
             WireCmd::Read {
                 ack,
-                all: !unread_only,
+                all: all && !unread_only,
                 thread: None,
                 for_agent: from,
                 json,
@@ -1278,18 +1299,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                     if let Some(route) = capture_current_env_route() {
                         record_caller_route(env, &rec.name_key, route);
                     }
-                    // Render `.agents/REGISTRY.md` if present in ancestor workspace directory
-                    for ancestor in env.cwd.ancestors() {
-                        let candidate = ancestor.join(".agents").join("REGISTRY.md");
-                        if candidate.exists()
-                            && let (Ok(areas), Ok(agents)) =
-                                (store.list_areas(), store.list_agents(None, false))
-                        {
-                            let md = render_registry_markdown(&areas, &agents);
-                            let _ = write_atomic_non_symlink(&candidate, md.as_bytes());
-                            break;
-                        }
-                    }
+                    sync_registry_markdown(&store, env.cwd);
                     let all_active = store.list_agents(None, false).unwrap_or_default();
                     let mgr = reports_to(&rec, &all_active);
                     println!(
@@ -1317,8 +1327,16 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            sync_registry_markdown(&store, env.cwd);
             println!("Retired {} ({})", retired.display_name, retired.id);
             Ok(0)
+        }
+        AgentMsgCmd::Hydrate { args } => {
+            let status = std::process::Command::new(hydrate_program())
+                .args(&args)
+                .status()
+                .map_err(|e| (1, format!("failed to run agent-hydrate: {e}")))?;
+            Ok(status.code().unwrap_or(1))
         }
         AgentMsgCmd::Roster { json } => {
             let store = env

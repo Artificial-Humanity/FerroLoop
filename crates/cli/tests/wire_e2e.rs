@@ -578,3 +578,150 @@ fn mcp_server_exposes_and_executes_all_ferrowire_tools() {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[test]
+fn agent_msg_register_and_unregister_update_the_workspace_registry_from_a_subdirectory() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let sub = env.work_dir.join("ProjectA").join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    let registry = env.work_dir.join(".agents/REGISTRY.md");
+
+    for (name, proj, role) in [("Ferris", "ferroloop", "lead"), ("Kayla", "kaggle", "lead")] {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .current_dir(&sub)
+            .args(["register", name, "--project", proj, "--role", role])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let md = std::fs::read_to_string(&registry).unwrap();
+    assert!(
+        md.contains("**Ferris**") && md.contains("**Kayla**"),
+        "{md}"
+    );
+    assert!(
+        !sub.join(".agents").exists(),
+        "no registry may be created in the subdirectory"
+    );
+
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .current_dir(&sub)
+        .args(["unregister", "kayla"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(&registry).unwrap();
+    assert!(md.contains("**Ferris**"), "{md}");
+    assert!(
+        !md.contains("**Kayla**"),
+        "a retired agent must leave the active table: {md}"
+    );
+}
+
+#[test]
+fn agent_msg_read_defaults_to_unread_and_all_includes_acknowledged() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    for (name, proj) in [("Ferris", "ferroloop"), ("Kayla", "kaggle")] {
+        assert!(
+            env.cmd_for(&agent_msg_bin)
+                .args(["register", name, "--project", proj, "--role", "lead"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert!(
+        env.fl()
+            .args([
+                "wire",
+                "send",
+                "kayla",
+                "Unread default",
+                "body",
+                "--from",
+                "ferris"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let read = |args: &[&str]| {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .env("AGENT_PERSONA", "kayla")
+            .arg("read")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(read(&["--ack"]).contains("Unread default"));
+    assert!(
+        !read(&[]).contains("Unread default"),
+        "an acknowledged message is not unread"
+    );
+    assert!(read(&["--all"]).contains("Unread default"));
+    assert!(
+        !read(&["--all", "--unread-only"]).contains("Unread default"),
+        "--unread-only wins over --all"
+    );
+}
+
+#[test]
+fn agent_msg_hydrate_runs_agent_hydrate_and_forwards_its_exit_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let bindir = env.root.join("fake-bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let args_out = env.root.join("hydrate.args");
+    let script = bindir.join("agent-hydrate");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" > \"{}\"\nexit 7\n",
+            args_out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .env("PATH", path)
+        .args(["hydrate", "Kayla", "--replace"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args_out).unwrap().trim(),
+        "Kayla --replace"
+    );
+}

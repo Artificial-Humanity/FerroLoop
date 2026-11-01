@@ -392,6 +392,24 @@ fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
     (code, e.to_string())
 }
 
+/// Re-render the workspace `.agents/REGISTRY.md` from `store`, found by walking up from `start`
+/// through its ancestors, so a command run in any project subdirectory updates the workspace's
+/// file rather than looking for `./.agents/REGISTRY.md`. Returns the file written, or `None`
+/// when no ancestor holds one (nothing is created) or the roster could not be read or written.
+pub fn sync_registry_markdown<S: AgentRegistry>(store: &S, start: &Path) -> Option<PathBuf> {
+    // A relative `start` such as `.` has no ancestors to walk; resolve it first.
+    let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let candidate = start
+        .ancestors()
+        .map(|dir| dir.join(".agents").join("REGISTRY.md"))
+        .find(|path| path.is_file())?;
+    let areas = store.list_areas().ok()?;
+    let agents = store.list_agents(None, true).ok()?;
+    let md = render_registry_markdown(&areas, &agents);
+    write_atomic_non_symlink(&candidate, md.as_bytes()).ok()?;
+    Some(candidate)
+}
+
 pub fn run<S: AgentRegistry + Handles + StateStore>(
     store: &S,
     cmd: AgentCmd,
