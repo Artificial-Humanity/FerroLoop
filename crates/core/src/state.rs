@@ -632,6 +632,24 @@ fn search_snippet(text: &str, summary: &str, matched_terms: &[String]) -> String
         .to_string()
 }
 
+/// Per-entry ranking factor shared by every state ranker: pinned memories
+/// x1.5, memories whose lifecycle is not `Active` x0.25, everything else 1.
+/// [`search_state_entries`] multiplies its BM25 score by it; other rankers
+/// (the store's knowledge search) apply it to their own scores so the same
+/// entry is preferred or demoted the same way on every engine.
+pub fn rank_weight(entry: &StateEntry) -> f64 {
+    let mut weight = 1.0;
+    if let StatePayload::Memory(m) = &entry.payload {
+        if m.pinned {
+            weight *= 1.5;
+        }
+        if m.lifecycle != MemoryLifecycle::Active {
+            weight *= 0.25;
+        }
+    }
+    weight
+}
+
 /// Rank `entries` against `query` with field-weighted BM25 (spec §2):
 /// slug weight 3, summary weight 2, body weight 1; `k1 = 1.2`, `b = 0.75`.
 /// Pinned memories score x1.5, non-active memories x0.25. Only entries
@@ -742,14 +760,7 @@ pub fn search_state_entries(
                 score += idf[term] * f * (K1 + 1.0) / denom;
             }
         }
-        if let StatePayload::Memory(m) = &doc.entry.payload {
-            if m.pinned {
-                score *= 1.5;
-            }
-            if m.lifecycle != MemoryLifecycle::Active {
-                score *= 0.25;
-            }
-        }
+        score *= rank_weight(&doc.entry);
         if !score.is_finite() || score <= 0.0 {
             continue;
         }
@@ -938,6 +949,23 @@ mod tests {
             Err(StateError::InvalidSummary)
         );
         assert_eq!(validate_summary("   "), Err(StateError::InvalidSummary));
+    }
+
+    #[test]
+    fn rank_weight_is_the_pinned_and_lifecycle_factor() {
+        let plain = memory_entry(1, "a", "s", "b", false, MemoryLifecycle::Active, 1);
+        let pinned = memory_entry(2, "a", "s", "b", true, MemoryLifecycle::Active, 1);
+        let retired = memory_entry(3, "a", "s", "b", false, MemoryLifecycle::Superseded, 1);
+        let both = memory_entry(4, "a", "s", "b", true, MemoryLifecycle::Superseded, 1);
+        assert_eq!(rank_weight(&plain), 1.0);
+        assert_eq!(rank_weight(&pinned), 1.5);
+        assert_eq!(rank_weight(&retired), 0.25);
+        assert_eq!(rank_weight(&both), 0.375);
+        assert_eq!(rank_weight(&handoff_entry(5, "h", "s", "n")), 1.0);
+        assert_eq!(
+            rank_weight(&runtime_entry(6, "r", serde_json::json!({"k": 1}))),
+            1.0
+        );
     }
 
     #[test]
