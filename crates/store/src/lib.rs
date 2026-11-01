@@ -16,6 +16,7 @@ use std::path::Path;
 pub mod any;
 pub mod ferrostore;
 pub mod ferrowire;
+pub mod knowledge;
 pub mod manifest;
 pub mod migrate;
 pub mod private;
@@ -34,6 +35,10 @@ pub use ferrostore::{
     EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit,
     RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp, VectorHit, VectorMetric,
     VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
+};
+pub use knowledge::{
+    DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,
+    rank_state_entries_read_only, rank_state_entries_with,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};

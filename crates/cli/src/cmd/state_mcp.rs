@@ -30,10 +30,10 @@ use std::time::Duration;
 
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
-    DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, collect_search_hits,
-    effective_code_limit, effective_search_limit, parse_concern, parse_memory_basis,
-    parse_memory_category, parse_merge_mode, render_state_markdown, resolve_state_in_store,
-    search_and_record, search_result_json,
+    DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, effective_code_limit,
+    effective_search_limit, index_unavailable_line, parse_concern, parse_memory_basis,
+    parse_memory_category, parse_merge_mode, ranked_result_json, render_state_markdown,
+    resolve_state_in_store, search_and_record,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -407,6 +407,8 @@ fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, Str
     .unwrap())
 }
 
+/// BM25-only search shape, for tests that have no store.
+#[cfg(test)]
 fn memory_search_json(
     entries: &[StateEntry],
     query: &str,
@@ -414,8 +416,8 @@ fn memory_search_json(
     concern: Option<StateConcern>,
     limit: usize,
 ) -> String {
-    let (hits, total_hits) = collect_search_hits(entries, query, scope, concern, limit);
-    serde_json::to_string_pretty(&search_result_json(query, &hits, total_hits)).unwrap()
+    let ranked = fl_store::rank_bm25(entries, query, scope, concern, limit);
+    serde_json::to_string_pretty(&ranked_result_json(query, &ranked)).unwrap()
 }
 
 fn open_workflow_store(
@@ -736,13 +738,18 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             let entries: Vec<StateEntry> = store
                 .list_state(parsed_scope.as_ref(), parsed_concern)
                 .map_err(|e| e.to_string())?;
-            Ok(memory_search_json(
+            let ranked = fl_store::rank_state_entries(
+                &store,
                 &entries,
                 &query,
                 parsed_scope.as_ref(),
                 parsed_concern,
                 limit,
-            ))
+            );
+            if let Some(line) = index_unavailable_line(&ranked) {
+                eprintln!("{line}");
+            }
+            Ok(serde_json::to_string_pretty(&ranked_result_json(&query, &ranked)).unwrap())
         }
         "state_set_memory" => {
             let scope =
