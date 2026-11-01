@@ -588,9 +588,28 @@ fn forward_mq(
     }
 }
 
-/// Run one request. A request that carries `req` runs once: a repeat of
-/// its id gets the first reply and applies nothing (spec §6.1).
+/// The methods that write: a `req` on one of them makes it exactly-once.
+const WRITE_METHODS: &[&str] = &[
+    "commit_txn",
+    "put_doc",
+    "delete_doc",
+    "publish_mq",
+    "ack_mq",
+    "create_column_table",
+    "append_column_rows",
+    "create_vector_collection",
+    "upsert_vector",
+    "delete_vector",
+    "apply_sync_batches",
+];
+
+/// Run one request. A write that carries `req` runs once: a repeat of its
+/// id gets the first reply and applies nothing (spec §6.1). Any other
+/// method ignores `req`, so no read's answer is kept.
 fn exactly_once(state: &ServerState, conn: u64, method: &str, params: &Value) -> Value {
+    if !WRITE_METHODS.contains(&method) {
+        return reply_body(dispatch(state, conn, method, params));
+    }
     let req = match session::request_id(params) {
         Ok(req) => req,
         Err(err) => return reply_body(Err(err)),
