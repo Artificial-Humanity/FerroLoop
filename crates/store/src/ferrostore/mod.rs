@@ -16,6 +16,7 @@ mod traits_catalog;
 mod traits_state;
 mod traits_wire;
 mod traits_workflow;
+mod transaction;
 mod vector;
 mod verify;
 mod ws;
@@ -34,6 +35,8 @@ mod tests_crash;
 mod tests_group;
 #[cfg(test)]
 mod tests_track0;
+#[cfg(test)]
+mod tests_txn;
 #[cfg(test)]
 mod tests_verify;
 
@@ -70,6 +73,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
+pub use transaction::Transaction;
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
 pub use verify::{
     PER_ITEM_SAMPLE, ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore,
@@ -870,14 +874,7 @@ impl FerroStore {
 
     /// Create a column table. An existing name is an error and writes nothing.
     pub fn create_column_table(&self, name: &str, columns: &[ColumnDef]) -> Result<(), StoreError> {
-        let name = name.to_string();
-        let columns = columns.to_vec();
-        self.with_write(move |txn| {
-            txn.stage(Op::CreateColumnTable {
-                name: name.clone(),
-                columns: columns.clone(),
-            })
-        })
+        self.with_write(|txn| txn.stage_create_column_table(name, columns))
     }
 
     /// Append one row group. An empty `rows` writes nothing. A bad row writes nothing.
@@ -886,21 +883,7 @@ impl FerroStore {
         name: &str,
         rows: &[Vec<ColumnValue>],
     ) -> Result<(), StoreError> {
-        let name = name.to_string();
-        let rows = rows.to_vec();
-        self.with_write(move |txn| {
-            let Some(columns) = txn.table_columns(&name) else {
-                return Err(backend(format!("no column table `{name}`")));
-            };
-            if rows.is_empty() {
-                return Ok(());
-            }
-            let bytes = columnar::encode_row_group(columns, &rows)?;
-            txn.stage(Op::AppendColumnGroup {
-                name: name.clone(),
-                bytes,
-            })
-        })
+        self.with_write(|txn| txn.stage_append_column_rows(name, rows))
     }
 
     /// Scan `name`. A row group whose zone map excludes any filter is skipped
@@ -972,24 +955,30 @@ impl FerroStore {
         ef_construction: u32,
         ef_search: u32,
     ) -> Result<(), StoreError> {
-        let name = name.to_string();
-        self.with_write(move |txn| {
-            vector::check_create(&name, dim, storage, m, ef_construction, ef_search)?;
-            if txn.vector(&name).is_some() {
-                return Err(backend(format!(
-                    "vector collection `{name}` already exists"
-                )));
-            }
-            txn.stage(Op::CreateVectorCollection {
-                name: name.clone(),
+        self.with_write(|txn| {
+            txn.stage_create_vector_collection(
+                name,
                 dim,
                 storage,
                 metric,
                 m,
                 ef_construction,
                 ef_search,
-            })
+            )
         })
+    }
+
+    /// `true` when vector collection `name` exists. A read: it never creates
+    /// the collection and commits nothing. A document collection of the same
+    /// name does not count.
+    pub fn has_vector_collection(&self, name: &str) -> Result<bool, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote
+                .call("has_vector_collection", json!({"name": name}))?
+                .as_bool()
+                .ok_or_else(|| backend("has_vector_collection result is not a bool"));
+        }
+        self.with_read(|txn| Ok(txn.vector(name).is_some()))
     }
 
     /// Insert or replace one vector. `None` metadata is absent. `Some(Null)` stores JSON null.
@@ -1000,47 +989,38 @@ impl FerroStore {
         values: &[f32],
         metadata: Option<&Value>,
     ) -> Result<(), StoreError> {
-        let collection = collection.to_string();
-        let id = id.to_string();
-        let values = values.to_vec();
-        let metadata = metadata.cloned();
-        self.with_write(move |txn| {
-            let Some(col) = txn.vector(&collection) else {
+        self.with_write(|txn| txn.stage_upsert_vectors(collection, &[(id, values, metadata)]))
+    }
+
+    /// Insert or replace every `(id, values, metadata)` item in one commit:
+    /// one sequence, one WAL frame, and one copy of the collection for the
+    /// whole batch. The result is the same as [`Self::upsert_vector`] for
+    /// each item in order, so an id given twice ends as its last item.
+    ///
+    /// Every item is checked (id, length, finite components) before any is
+    /// applied: one bad item, or a missing collection, writes nothing. `Ok`
+    /// is `Some` of the sequence the batch committed at. An empty `items`
+    /// commits nothing and is `Ok(None)` (a missing collection is still an
+    /// error).
+    pub fn upsert_vectors(
+        &self,
+        collection: &str,
+        items: &[(&str, &[f32], Option<&Value>)],
+    ) -> Result<Option<u64>, StoreError> {
+        if items.is_empty() {
+            if !self.has_vector_collection(collection)? {
                 return Err(backend(format!("no vector collection `{collection}`")));
-            };
-            let dim = col.dim;
-            let storage = col.storage;
-            vector::check_vector_id(&id)?;
-            if u32::try_from(values.len()).ok() != Some(dim) {
-                return Err(backend(format!(
-                    "vector values have length {}, expected {dim}",
-                    values.len()
-                )));
             }
-            let bytes = vector::quantize(storage, &values)?;
-            txn.stage(Op::UpsertVector {
-                collection: collection.clone(),
-                id: id.clone(),
-                bytes,
-                metadata: metadata.clone(),
-            })
-        })
+            return Ok(None);
+        }
+        let ((), seq) =
+            self.with_write_outcome(|txn| txn.stage_upsert_vectors(collection, items))?;
+        Ok(seq)
     }
 
     /// Delete one vector. A missing id still commits. A missing collection writes nothing.
     pub fn delete_vector(&self, collection: &str, id: &str) -> Result<(), StoreError> {
-        let collection = collection.to_string();
-        let id = id.to_string();
-        self.with_write(move |txn| {
-            if txn.vector(&collection).is_none() {
-                return Err(backend(format!("no vector collection `{collection}`")));
-            }
-            vector::check_vector_id(&id)?;
-            txn.stage(Op::DeleteVector {
-                collection: collection.clone(),
-                id: id.clone(),
-            })
-        })
+        self.with_write(|txn| txn.stage_delete_vector(collection, id))
     }
 
     /// Dequantized values and metadata. `Ok(None)` when the id is missing.
@@ -1055,19 +1035,7 @@ impl FerroStore {
                 &remote.call("get_vector", json!({"collection": collection, "id": id}))?,
             );
         }
-        let collection = collection.to_string();
-        let id = id.to_string();
-        self.with_read(move |txn| {
-            let Some(col) = txn.vector(&collection) else {
-                return Err(backend(format!("no vector collection `{collection}`")));
-            };
-            vector::check_vector_id(&id)?;
-            let Some(record) = col.vectors.get(&id) else {
-                return Ok(None);
-            };
-            let values = vector::dequantize(col.storage, &record.bytes)?;
-            Ok(Some((values, record.metadata.clone())))
-        })
+        self.with_read(|txn| txn.read_vector(collection, id))
     }
 
     /// Higher-better scores, at most `limit`. `ef` of `None` uses the collection `ef_search`.
@@ -1993,7 +1961,7 @@ impl FerroStore {
             (seq, flush)
         };
         if flush {
-            self.sync_flush()?;
+            self.sync_flush().map_err(|cause| undelivered(seq, cause))?;
         }
         Ok(seq)
     }
@@ -2086,7 +2054,22 @@ impl FerroStore {
     /// error and leaves the batch at the front of the queue: the commit is
     /// durable and not yet sent. Later pending batches of other commits stay
     /// queued for their own committers or `sync_flush`.
+    ///
+    /// Every error here is [`StoreError::Undelivered`] at the commit's own
+    /// sequence, so a caller tells "durable, not yet sent" from "not
+    /// committed".
     fn deliver_owned(&self, registered: Registered) -> Result<(), StoreError> {
+        let seq = match &registered {
+            Registered::Nothing => return Ok(()),
+            Registered::Queued(seq) => *seq,
+            Registered::Owned(_, batch) => batch.seq,
+        };
+        self.deliver_registered(registered)
+            .map_err(|cause| undelivered(seq, cause))
+    }
+
+    /// [`Self::deliver_owned`] with the adapter's own error.
+    fn deliver_registered(&self, registered: Registered) -> Result<(), StoreError> {
         let (adapter, batch) = match registered {
             Registered::Nothing => return Ok(()),
             Registered::Queued(seq) => return self.drain_through(seq),
@@ -2144,6 +2127,14 @@ impl FerroStore {
         if senders.is_empty() {
             subs.remove(topic);
         }
+    }
+}
+
+/// A commit durable at `seq` whose batch the adapter has not received.
+fn undelivered(seq: u64, cause: StoreError) -> StoreError {
+    StoreError::Undelivered {
+        seq,
+        cause: Box::new(cause),
     }
 }
 

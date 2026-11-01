@@ -710,6 +710,9 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             store.delete_vector(param_str(params, "collection")?, param_str(params, "id")?)?;
             Ok(Value::Null)
         }
+        "has_vector_collection" => Ok(Value::Bool(
+            store.has_vector_collection(param_str(params, "name")?)?,
+        )),
         "get_vector" => {
             match store.get_vector(param_str(params, "collection")?, param_str(params, "id")?)? {
                 Some((values, metadata)) => vector::vector_get_json(&values, &metadata),

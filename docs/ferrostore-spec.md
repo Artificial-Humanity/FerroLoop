@@ -194,6 +194,7 @@ Each call is one JSON object:
 | `create_vector_collection` | `name`, `dim`, `storage`, `metric`, `m`, `ef_construction`, `ef_search` | `null` |
 | `upsert_vector` | `collection`, `id`, `values` (finite JSON numbers), `metadata` optional | `null`. Absent `metadata` stores none. Present `metadata`, including `null`, is stored |
 | `delete_vector` | `collection`, `id` | `null` |
+| `has_vector_collection` | `name` | `true` or `false`. Creates nothing |
 | `get_vector` | `collection`, `id` | `null` when the id is missing. A present value is `{"values": [<numbers>]}` plus `metadata` only when it was stored |
 | `search_vectors` | `collection`, `values`, `limit`, optional `ef` | `[{"id", "score"}]`. `score` is a finite JSON number |
 | `search_hybrid` | `doc_collection`, `vector_collection`, `query`, `values`, `limit`, `fusion` | `[{"id", "score"}]` |
@@ -249,6 +250,28 @@ score = sum over query tokens of
 
 `ln` is the natural logarithm. A document scores only when at least one query token occurs in it. Results are ordered by score descending, then id ascending, and truncated to `limit`. An empty query, a query with no tokens, or `limit == 0` returns an empty vector. Statistics are rebuilt from documents after replay.
 
+## Transactions
+
+```text
+transaction(body: FnMut(&mut Transaction) -> Result<T, StoreError>) -> Result<T, StoreError>
+```
+
+`transaction` runs `body` over one `Transaction` and commits every write it makes as one sequence: one WAL frame on disk, one `SyncBatch`. Either all of them commit or none does. `Err` from `body` is returned and commits nothing. A `Transaction` write method that returns `Err` wrote nothing, and the transaction then cannot commit, even if `body` goes on and returns `Ok`. A body that writes nothing commits nothing.
+
+| `Transaction` method | Same rules as |
+| --- | --- |
+| `get_doc(collection, id) -> Option<Value>` | `get_doc`, without a sync-adapter cache fill |
+| `put_doc(collection, id, doc)`, `delete_doc(collection, id)` | `put_doc`, `delete_doc`. A reserved (`__`) collection is refused |
+| `scan(collection) -> Vec<(String, Value)>` | every document, in id order |
+| `query_by_field(collection, field, value) -> Vec<String>` | `query_by_field` |
+| `create_column_table`, `append_column_rows` | the store methods |
+| `has_vector_collection(name) -> bool` | `has_vector_collection` |
+| `create_vector_collection`, `upsert_vector`, `delete_vector`, `get_vector` | the store methods |
+
+Every read sees the transaction's own earlier writes. Nothing is visible to another reader until the commit.
+
+`transaction` closes read-modify-write races. On `mem://` and `file://` the body runs under the write lock: on disk it joins a group commit under `LOCK_EX`, against the state every other handle committed, so no commit lands between a read in the body and the write that depends on it. On a remote handle the commit is a compare-and-swap of the body's ops (`commit_ops`), and the body runs again when another writer committed first. So the body must be free of side effects, and it must not call the store it runs in (on `mem://` and `file://` that deadlocks). On disk the body runs exactly once.
+
 ## FerroMQ
 
 ```text
@@ -293,9 +316,18 @@ Phase 4 is the vector model. A vector collection is a separate map from document
 
 Distances are computed on dequantized `f32` values and accumulated in `f64`. The query is quantized and dequantized with the collection storage before the distance, so search runs in storage space. A non-finite component, or a length other than `dim`, is `StoreError::Backend` and writes nothing. L2 similarity is `1 / (1 + euclidean)` and the graph distance is the euclidean length. Cosine similarity is `dot / (|a| |b|)`, or `0` when either norm is `0`, and the graph distance is `1 - similarity`. Dot-product similarity is the dot product and the graph distance is `-dot`. Scores are higher-better. Results are ordered by score descending, then id ascending.
 
-An id is non-empty, has no NUL, and is at most 1024 bytes. `/` is allowed. `upsert_vector` replaces the bytes and the metadata. `None` metadata is absent. `Some(null)` stores JSON null. `get_vector` of a missing id is `Ok(None)`. `delete_vector` of a missing id succeeds and still commits a delete. A later upsert of that id works, and search does not return a deleted id. A missing collection is `StoreError::Backend` and writes nothing. `apply_op` checks the collection, the byte length, and that every stored `f32` or `f16` decodes finite. A bad check is an error, and `stage_ops` publishes nothing.
+An id is non-empty, has no NUL, and is at most 1024 bytes. `/` is allowed. `upsert_vector` replaces the bytes and the metadata. `None` metadata is absent. `Some(null)` stores JSON null. `get_vector` of a missing id is `Ok(None)`. `delete_vector` of a missing id succeeds and still commits a delete. A later upsert of that id works, and search does not return a deleted id. A missing collection is `StoreError::Backend` and writes nothing.
 
-HNSW parameters live on the collection. There is no hidden default `M`. The level of an id is deterministic: hash the id with SHA-256, take the first 8 bytes as a little-endian `u64`, replace `0` with `1`, set `u = x / u64::MAX` in `(0, 1]`, and set `level = floor(-ln(u) / ln(M))`, clamped to `0..=16`. Layer 0 allows `2 * M` neighbors. Every upper layer allows `M`. Neighbors are ordered by smaller graph distance, then lower id. The first vector is the entry point and has no links. Later inserts search from the entry point: greedy with ef 1 above the new level, then ef `ef_construction` from `min(new level, entry level)` down to layer 0. Each layer keeps the closest `max_links` neighbors, links both ways, and prunes the other node back to its max links. The entry point is the live node with the highest level, then the lowest id. Upsert unlinks the id and inserts it again. Delete unlinks it and removes it. A neighbor id that is not live is not left behind. Links are bidirectional.
+```text
+upsert_vectors(collection, items: &[(&str, &[f32], Option<&Value>)]) -> Result<Option<u64>, StoreError>
+has_vector_collection(name) -> Result<bool, StoreError>
+```
+
+`upsert_vectors` is one commit for every item: one sequence, one WAL frame, and one copy of the collection. The result is the same as `upsert_vector` for each item in order, graph and entry point included, so an id given twice ends as its last item. Every item is checked (id, length, finite components) before any is applied: one bad item, or a missing collection, writes nothing. `Ok(Some(seq))` is the sequence the batch committed at. An empty `items` commits nothing and is `Ok(None)`; a missing collection is still an error. `has_vector_collection` is a read: it never creates the collection and commits nothing. A document collection of that name does not count.
+
+`apply_op` checks the collection, the byte length, and that every stored `f32` or `f16` decodes finite. A bad check is an error, and `stage_ops` publishes nothing.
+
+HNSW parameters live on the collection. There is no hidden default `M`. The level of an id is deterministic: hash the id with SHA-256, take the first 8 bytes as a little-endian `u64`, replace `0` with `1`, set `u = x / u64::MAX` in `(0, 1]`, and set `level = floor(-ln(u) / ln(M))`, clamped to `0..=16`. Layer 0 allows `2 * M` neighbors. Every upper layer allows `M`. Neighbors are ordered by smaller graph distance, then lower id. The first vector is the entry point and has no links. Later inserts search from the entry point: greedy with ef 1 above the new level, then ef `ef_construction` from `min(new level, entry level)` down to layer 0. Each layer keeps the closest `max_links` neighbors, links both ways, and prunes the other node back to its max links. The entry point is the live node with the highest level, then the lowest id. An insert keeps it in O(1): the new id becomes the entry when its level is higher, or equal with a lower id. Deleting the entry (also when an upsert replaces it) finds the next one by a scan of the collection. Upsert unlinks the id and inserts it again. Delete unlinks it and removes it. A neighbor id that is not live is not left behind. Links are bidirectional.
 
 `search_vectors` is greedy from the entry point down to layer 1 with ef 1, then layer 0 with width `max(ef, limit)`. It returns at most `limit` live nodes. `limit == 0` or `ef == Some(0)` returns an empty vector and is not an error. `ef == None` uses the collection `ef_search`.
 
@@ -311,7 +343,9 @@ A checkpoint with any vector collection writes snapshot version 3. A document-on
 
 A process may attach one `SyncAdapter` in a `SyncMode`: `WriteThrough`, `WriteBehind`, `LocalCache`, or `CloudPreCache`. The mode, the adapter, the pending batches, and `synced_seq` are process memory. They are not written to the `.fls` file. A reopened store has no adapter and `synced_seq` of 0.
 
-After a commit that advances the store sequence, the store builds a `SyncBatch` of that sequence and all its ops. An empty op list does not. The adapter is not called while the memory document mutex or the disk `flock` is held. `WriteThrough` calls `on_commit` after the commit is published, and only one of those calls is in flight. A newer commit cannot call `on_commit` while an older notify is in flight or still queued. If the pending buffer is non-empty, or a `WriteThrough` `on_commit` is already in flight, the batch is appended behind them, and the commit then drains with `sync_flush` (it waits out the notify in flight and sends the pending batches oldest first) until its own batch is sent. A `WriteThrough` commit returns `Ok` only once its own batch is sent. The one exception is a commit made inside the in-flight `on_commit`, on that call's own thread: it stays queued and returns, as `sync_flush` does there. Success sets `synced_seq` to that sequence when it is greater. Failure leaves the commit applied, puts that batch at the front of the pending buffer, ahead of any batch appended during the call, does not advance `synced_seq`, and returns the error. A failed drain returns the adapter's error the same way: the commit is durable and its batch stays pending. `WriteBehind`, `LocalCache`, and `CloudPreCache` append the batch and do not call `on_commit`. A silent commit does not call `on_commit` and is not queued. It may set `synced_seq` to that sequence only when the pending buffer is empty and the sequence is greater. With no adapter, commits are unchanged.
+After a commit that advances the store sequence, the store builds a `SyncBatch` of that sequence and all its ops. An empty op list does not. The adapter is not called while the memory document mutex or the disk `flock` is held. `WriteThrough` calls `on_commit` after the commit is published, and only one of those calls is in flight. A newer commit cannot call `on_commit` while an older notify is in flight or still queued. If the pending buffer is non-empty, or a `WriteThrough` `on_commit` is already in flight, the batch is appended behind them, and the commit then drains with `sync_flush` (it waits out the notify in flight and sends the pending batches oldest first) until its own batch is sent. A `WriteThrough` commit returns `Ok` only once its own batch is sent. The one exception is a commit made inside the in-flight `on_commit`, on that call's own thread: it stays queued and returns, as `sync_flush` does there. Success sets `synced_seq` to that sequence when it is greater. Failure leaves the commit applied, puts that batch at the front of the pending buffer, ahead of any batch appended during the call, does not advance `synced_seq`, and returns `StoreError::Undelivered { seq, cause }`: `seq` is the commit's own sequence, `cause` is the adapter's error, and the message reads `committed at seq N (durable), not yet delivered to the sync adapter: <cause>`. A failed drain (an older queued batch failed) returns `Undelivered` the same way: the commit is durable and its batch stays pending. A write that did not commit never returns `Undelivered`, so a caller tells the two apart; retrying an `Undelivered` write applies it a second time. A loud multi-batch apply whose `WriteThrough` flush fails returns `Undelivered` at the last applied sequence.
+
+An `on_commit` that blocks waiting for a commit made on another thread through the same handle deadlocks under `WriteThrough`: that commit waits for the in-flight `on_commit` to return before its own batch can be sent. An HTTP adapter pointed back at a server that writes to the same handle is one example. `WriteBehind`, `LocalCache`, and `CloudPreCache` append the batch and do not call `on_commit`. A silent commit does not call `on_commit` and is not queued. It may set `synced_seq` to that sequence only when the pending buffer is empty and the sequence is greater. With no adapter, commits are unchanged.
 
 `sync_flush` waits while a notify is in flight, then sends only the oldest pending batch. It repeats in order until the buffer is empty, in every mode. It does not send a batch that is not the front, and it does not send while another `on_commit` is in flight. The first error leaves that batch and the later ones pending. Success of a batch removes it when it is still the front and sets `synced_seq` to that sequence when it is greater. A failed `WriteThrough` batch stays ahead of later commits until a flush sends it: an explicit `sync_flush` or the drain of the next `WriteThrough` commit. A loud multi-batch apply calls `sync_flush` only in `WriteThrough`; the other modes keep the batches pending, and `sync_flush` from inside the in-flight `on_commit` returns without sending.
 

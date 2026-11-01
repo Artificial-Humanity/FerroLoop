@@ -193,6 +193,16 @@ pub enum SyncMode {
 pub trait SyncAdapter: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Receive one committed batch. In `WriteThrough` the commit is durable
+    /// before this runs, and the committer waits for it: an `Err` makes the
+    /// write return [`StoreError::Undelivered`] and leaves the batch pending.
+    ///
+    /// ⚠ An `on_commit` that blocks waiting for a commit made on another
+    /// thread through the same handle deadlocks under `WriteThrough`: that
+    /// commit waits for this call to return before its own batch can be
+    /// sent. For example, an HTTP adapter pointed back at a server that
+    /// writes to the same handle. A commit made on this call's own thread
+    /// does not wait: it stays queued.
     fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError>;
 
     fn pull_since(&self, _after_seq: u64) -> Result<Vec<SyncBatch>, StoreError> {
@@ -1026,7 +1036,7 @@ mod tests {
         let (store, fake) = attach(SyncMode::WriteThrough);
         fake.fail.store(true, Ordering::SeqCst);
         let err = store.put_doc("docs", "a", &json!({"n": 1})).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)));
+        assert!(matches!(err, StoreError::Undelivered { seq: 1, .. }));
         assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
         assert!(fake.commits().is_empty());
         assert_eq!(store.synced_seq(), 0);
@@ -1203,7 +1213,10 @@ mod tests {
         let (store, fake) = attach(SyncMode::WriteThrough);
         fake.fail.store(true, Ordering::SeqCst);
         let err = store.put_doc("docs", "a", &json!({"n": 1})).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: 1, .. }),
+            "{err}"
+        );
         assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
         assert!(fake.commits().is_empty());
         assert_eq!(store.synced_seq(), 0);
@@ -1212,7 +1225,10 @@ mod tests {
         // While the adapter still fails, the next commit is durable and
         // returns the adapter's error: its batch is queued behind the first.
         let err = store.put_doc("docs", "b", &json!({"n": 2})).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: 2, .. }),
+            "{err}"
+        );
         assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
         assert!(fake.commits().is_empty());
 
@@ -1501,7 +1517,10 @@ mod tests {
             cv.notify_all();
         }
         let err = first.join().unwrap().unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert!(
+            matches!(err, StoreError::Undelivered { seq: 1, .. }),
+            "{err}"
+        );
         second.join().unwrap();
         assert_eq!(flushed.join().unwrap().unwrap(), 2);
         assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1, 1, 2]);

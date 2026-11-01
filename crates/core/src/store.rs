@@ -74,6 +74,17 @@ pub enum StoreError {
     Imported { id: Iri, action: &'static str },
     #[error("backend failure: {0}")]
     Backend(String),
+    /// ⚠ The write committed and is durable at `seq`, but the sync adapter
+    /// (`WriteThrough`) has not received it: `cause` is the adapter's error,
+    /// for this commit's batch or for an older one still queued ahead of it.
+    /// The batch stays pending until a flush sends it. This is never "not
+    /// committed": retrying the write would apply it a second time.
+    #[error("committed at seq {seq} (durable), not yet delivered to the sync adapter: {cause}")]
+    Undelivered {
+        seq: u64,
+        #[source]
+        cause: Box<StoreError>,
+    },
     /// ⚠ The store could not be reached at all. This is "didn't look", and it
     /// must never read as an empty store.
     #[error("the store at {store} could not be opened: {cause}")]

@@ -677,18 +677,19 @@ pub(super) fn query_by_field(
 ) -> Vec<String> {
     let mut ids = Vec::new();
     for (id, doc) in state.docs.in_collection(collection) {
-        let Some(object) = doc.as_object() else {
-            continue;
-        };
-        let Some(field_value) = object.get(field) else {
-            continue;
-        };
-        if scalar_key(field_value).as_deref() == Some(value) {
+        if field_matches(doc, field, value) {
             ids.push(id.clone());
         }
     }
     ids.sort();
     ids
+}
+
+/// `doc` is an object whose top-level `field` is a scalar whose key is `value`.
+pub(super) fn field_matches(doc: &Value, field: &str, value: &str) -> bool {
+    doc.as_object()
+        .and_then(|object| object.get(field))
+        .is_some_and(|field_value| scalar_key(field_value).as_deref() == Some(value))
 }
 
 fn scalar_key(value: &Value) -> Option<String> {
