@@ -37,10 +37,17 @@
 //! crash, an error part-way or a concurrent writer therefore leaves a
 //! committed vector listed, never orphaned. As a second line, a sensitive
 //! entry the document does not list is probed once and its vector deleted if
-//! one exists. FerroStore has no compare-and-swap on a document, so two
-//! processes syncing at once can still overwrite each other's document; the
-//! merge on write narrows that window and the placeholder and the probe cover
-//! what it leaves.
+//! one exists. The document is a merge-on-write: every update reads the
+//! freshest document and writes it back inside one [`FerroStore::transaction`],
+//! which runs under the store's write lock, so two processes syncing at once
+//! cannot lose each other's entries. The placeholder and the probe stay as the
+//! defence for a crash between the document write and the vector writes.
+//!
+//! Vectors are written in batches of [`UPSERT_BATCH`] through
+//! [`FerroStore::upsert_vectors`] (one commit and one copy of the collection
+//! per batch), and a sync that wrote at least one batch ends with a
+//! [`FerroStore::checkpoint`], so the next open does not replay the HNSW
+//! inserts from the log.
 //!
 //! The caller decides which entries may be shown: only ids in the `entries`
 //! slice are ever returned, however much the store holds. A failure on the
@@ -94,6 +101,8 @@ const PENDING_REV: u64 = 1 << 53;
 /// Index-document `rev` meaning "this entry is not indexable and was probed:
 /// it has no vector". Also outside the range of [`stamp`].
 const CLEAN_REV: u64 = (1 << 53) + 2;
+/// Most vectors written in one commit.
+pub(crate) const UPSERT_BATCH: usize = 256;
 
 /// Which ranker produced a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +468,19 @@ pub(crate) fn sync_index(
     entries: &[&StateEntry],
     budget: usize,
 ) -> Result<IndexStats, StoreError> {
+    sync_index_batched(ferro, embedder, collection, entries, budget, UPSERT_BATCH)
+}
+
+/// [`sync_index`] with a chosen upsert batch size.
+pub(crate) fn sync_index_batched(
+    ferro: &FerroStore,
+    embedder: &dyn Embedder,
+    collection: &str,
+    entries: &[&StateEntry],
+    budget: usize,
+    batch: usize,
+) -> Result<IndexStats, StoreError> {
+    let batch = batch.max(1);
     let space = stamp(&embedder.space_id());
     let index = IndexDoc::load(ferro, collection, space)?;
     let mut stats = IndexStats::default();
@@ -523,27 +545,38 @@ pub(crate) fn sync_index(
         IndexDoc::update(ferro, collection, space, &changes)?;
     }
 
-    // Write. Stop at the first error but still finalise what succeeded.
+    // Write. Stop at the first error but still finalise what succeeded. The
+    // deletes are one transaction, each upsert batch one commit: a batch is
+    // all or nothing.
     let mut failure: Option<StoreError> = None;
-    for id in deletes {
-        match ferro.delete_vector(collection, id) {
+    if !deletes.is_empty() {
+        match delete_vectors(ferro, collection, &deletes) {
             Ok(()) => {
-                changes.insert(id.to_string(), CLEAN_REV);
-                stats.deleted += 1;
+                for id in &deletes {
+                    changes.insert((*id).to_string(), CLEAN_REV);
+                }
+                stats.deleted += deletes.len();
             }
-            Err(err) => {
-                failure = Some(err);
-                break;
-            }
+            Err(err) => failure = Some(err),
         }
     }
     if failure.is_none() {
-        for (id, rev, values) in &upserts {
-            let meta = json!({ "rev": rev, "space": space });
-            match ferro.upsert_vector(collection, id, values, Some(&meta)) {
-                Ok(()) => {
-                    changes.insert((*id).to_string(), *rev);
-                    stats.written += 1;
+        for chunk in upserts.chunks(batch) {
+            let metas: Vec<Value> = chunk
+                .iter()
+                .map(|(_, rev, _)| json!({ "rev": rev, "space": space }))
+                .collect();
+            let items: Vec<(&str, &[f32], Option<&Value>)> = chunk
+                .iter()
+                .zip(&metas)
+                .map(|((id, _, values), meta)| (*id, values.as_slice(), Some(meta)))
+                .collect();
+            match ferro.upsert_vectors(collection, &items) {
+                Ok(_) => {
+                    for (id, rev, _) in chunk {
+                        changes.insert((*id).to_string(), *rev);
+                    }
+                    stats.written += chunk.len();
                 }
                 Err(err) => {
                     failure = Some(err);
@@ -553,9 +586,39 @@ pub(crate) fn sync_index(
         }
     }
     let finalised = IndexDoc::update(ferro, collection, space, &changes);
+    checkpoint_after_bulk(ferro, stats.written);
     match (failure, finalised) {
         (Some(err), _) | (None, Err(err)) => Err(err),
         (None, Ok(())) => Ok(stats),
+    }
+}
+
+/// Delete `ids` from `collection` in one transaction. A collection that does
+/// not exist holds none of them: that is `Ok`.
+pub(crate) fn delete_vectors(
+    ferro: &FerroStore,
+    collection: &str,
+    ids: &[&str],
+) -> Result<(), StoreError> {
+    ferro.transaction(|txn| {
+        if !txn.has_vector_collection(collection) {
+            return Ok(());
+        }
+        for id in ids {
+            txn.delete_vector(collection, id)?;
+        }
+        Ok(())
+    })
+}
+
+/// Fold the log into a snapshot after a sync that wrote at least one batch.
+/// The engine replays every logged vector insert through HNSW on open, which
+/// costs milliseconds per vector, so an unfolded bulk build makes the next
+/// open slow. A failure is ignored: the log still holds every write, and the
+/// engine folds it on its own once it grows past its limit.
+pub(crate) fn checkpoint_after_bulk(ferro: &FerroStore, written: usize) {
+    if written >= UPSERT_BATCH {
+        let _ = ferro.checkpoint();
     }
 }
 
@@ -568,8 +631,17 @@ struct IndexDoc {
 
 impl IndexDoc {
     fn load(ferro: &FerroStore, collection: &str, space: u64) -> Result<Self, StoreError> {
+        Ok(Self::parse(
+            ferro.get_doc(INDEX_DOC_COLLECTION, collection)?,
+            space,
+        ))
+    }
+
+    /// The document as read; one written for another embedding space, or
+    /// absent, is empty.
+    fn parse(doc: Option<Value>, space: u64) -> Self {
         let mut revs = HashMap::new();
-        if let Some(doc) = ferro.get_doc(INDEX_DOC_COLLECTION, collection)?
+        if let Some(doc) = doc
             && doc.get("space").and_then(Value::as_u64) == Some(space)
             && let Some(map) = doc.get("revs").and_then(Value::as_object)
         {
@@ -579,39 +651,40 @@ impl IndexDoc {
                 }
             }
         }
-        Ok(Self { revs })
+        Self { revs }
     }
 
-    /// Read the freshest document, apply `changes` to it and write it back.
-    /// Ids this call did not touch keep whatever another writer recorded, so a
-    /// writer holding an older snapshot does not erase them. FerroStore has no
-    /// compare-and-swap on a document: a write landing between the read and
-    /// the write here is still lost. The placeholder written ahead of the
-    /// vectors and the probe in [`sync_index`] cover that remainder.
+    /// Read the freshest document, apply `changes` to it and write it back, in
+    /// one transaction: no other writer commits between the read and the
+    /// write, so none of its entries is lost. Ids this call did not touch keep
+    /// whatever another writer recorded.
     fn update(
         ferro: &FerroStore,
         collection: &str,
         space: u64,
         changes: &HashMap<String, u64>,
     ) -> Result<(), StoreError> {
-        let mut fresh = Self::load(ferro, collection, space)?;
-        for (id, rev) in changes {
-            fresh.revs.insert(id.clone(), *rev);
-        }
-        fresh.store(ferro, collection, space)
+        ferro.transaction(|txn| {
+            let mut fresh = Self::parse(txn.get_doc(INDEX_DOC_COLLECTION, collection), space);
+            for (id, rev) in changes {
+                fresh.revs.insert(id.clone(), *rev);
+            }
+            txn.put_doc(INDEX_DOC_COLLECTION, collection, &fresh.to_json(space))
+        })
     }
 
-    fn store(&self, ferro: &FerroStore, collection: &str, space: u64) -> Result<(), StoreError> {
+    fn to_json(&self, space: u64) -> Value {
         let revs: serde_json::Map<String, Value> = self
             .revs
             .iter()
             .map(|(id, rev)| (id.clone(), json!(rev)))
             .collect();
-        ferro.put_doc(
-            INDEX_DOC_COLLECTION,
-            collection,
-            &json!({ "space": space, "revs": revs }),
-        )
+        json!({ "space": space, "revs": revs })
+    }
+
+    #[cfg(test)]
+    fn store(&self, ferro: &FerroStore, collection: &str, space: u64) -> Result<(), StoreError> {
+        ferro.put_doc(INDEX_DOC_COLLECTION, collection, &self.to_json(space))
     }
 }
 
@@ -634,26 +707,22 @@ pub(crate) fn ensure_vector_collection(
     embedder: &dyn Embedder,
     name: &str,
 ) -> Result<(), StoreError> {
-    if missing_as_none(ferro.get_vector(name, "probe"))?.is_some() {
-        return Ok(());
-    }
-    let created = ferro.create_vector_collection(
-        name,
-        embedder.dim() as u32,
-        VectorStorage::F32,
-        VectorMetric::Cosine,
-        16,
-        200,
-        64,
-    );
-    match created {
-        Ok(()) => Ok(()),
-        // Another process may have created it between the probe and now.
-        Err(err) => match missing_as_none(ferro.get_vector(name, "probe")) {
-            Ok(Some(_)) => Ok(()),
-            _ => Err(err),
-        },
-    }
+    // One transaction: the check and the create see no commit between them,
+    // so another process creating the collection first is not an error.
+    ferro.transaction(|txn| {
+        if txn.has_vector_collection(name) {
+            return Ok(());
+        }
+        txn.create_vector_collection(
+            name,
+            embedder.dim() as u32,
+            VectorStorage::F32,
+            VectorMetric::Cosine,
+            16,
+            200,
+            64,
+        )
+    })
 }
 
 pub(crate) fn stamp(text: &str) -> u64 {
@@ -1432,9 +1501,10 @@ mod tests {
         let ferro = store.as_ferro().unwrap();
         let col = vector_collection_name(default_embedder());
 
-        // Entries 1 and 2 commit, the 3rd upsert is refused, the 4th is not tried.
+        // Batches of 2: entries 1 and 2 commit, the 3rd vector is bad so the
+        // batch of 3 and 4 is refused whole.
         let flaky = FlakyEmbedder::new(3);
-        let err = sync_index(ferro, &flaky, &col, &refs(&entries), 100).unwrap_err();
+        let err = sync_index_batched(ferro, &flaky, &col, &refs(&entries), 100, 2).unwrap_err();
         assert!(
             err.to_string().contains("vector values have length"),
             "{err}"
@@ -1528,6 +1598,30 @@ mod tests {
         assert_eq!(doc.revs.get(flipped.id.as_str()), Some(&CLEAN_REV));
         let (_, again) = run(&store, SYNC, &entries, "gpu queue");
         assert_eq!(again, IndexStats::default());
+    }
+
+    #[test]
+    fn two_concurrent_index_doc_merges_both_survive() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let ferro = store.as_ferro().unwrap();
+        let (col, space) = ("state_vec_concurrent", 9);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for who in 0..2u64 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    for round in 0..40u64 {
+                        barrier.wait();
+                        let changes =
+                            HashMap::from([(format!("w{who}-{round}"), who * 1000 + round)]);
+                        IndexDoc::update(ferro, col, space, &changes).unwrap();
+                    }
+                });
+            }
+        });
+        let doc = IndexDoc::load(ferro, col, space).unwrap();
+        assert_eq!(doc.revs.len(), 80, "a concurrent merge lost an update");
     }
 
     #[test]

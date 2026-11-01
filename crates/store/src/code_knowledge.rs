@@ -55,18 +55,29 @@
 //! exist are recorded under a `pending` digest; afterwards the real digest
 //! replaces it, and that final write happens on the error path too. A crash
 //! or an error part-way leaves a committed vector listed, never orphaned, and
-//! the next sync repairs it (a `pending` digest never matches). Writes merge
-//! into the freshest document, so a concurrent writer's files survive;
-//! FerroStore has no compare-and-swap, so a write landing between the read
-//! and the write is still lost, and the placeholder covers what that leaves.
+//! the next sync repairs it (a `pending` digest never matches).
+//!
+//! Every write to the document is a merge into the freshest copy, done inside
+//! one [`FerroStore::transaction`]: the read and the write run under the
+//! store's write lock, so a concurrent writer's files cannot be lost between
+//! them. The placeholder remains for what a transaction cannot cover, a crash
+//! or an error between the document write and the vector writes.
+//!
+//! Vectors are written in batches of [`UPSERT_BATCH`] through
+//! [`FerroStore::upsert_vectors`] (a batch is one commit and one copy of the
+//! collection, and is all or nothing), a changed file's stale vectors are
+//! deleted in one transaction per batch, and a sync that wrote at least one
+//! batch ends with a [`FerroStore::checkpoint`]: the engine replays every
+//! logged vector insert through HNSW on open, so an unfolded bulk build would
+//! make the next open slow.
 //!
 //! [`IndexPolicy::Sync`] writes at most `budget` new vectors per call (a whole
-//! file at a time; a file larger than the budget goes alone) and for at most
-//! three seconds (checked between files), because the engine's upsert costs
-//! time proportional to the vectors already stored. What is left is found
-//! lexically and indexed by later searches. [`IndexPolicy::ReadOnly`]
-//! writes nothing and never creates the sidecar: without one the vector leg
-//! is empty.
+//! file at a time; a file larger than the budget goes alone) and starts no new
+//! file once `SYNC_DEADLINE` has passed, so one search never waits for a whole
+//! cold build (about 11,000 symbols take about 40 seconds). What is left is
+//! found lexically and indexed by the next searches, each of which makes
+//! progress. [`IndexPolicy::ReadOnly`] writes nothing and never creates the
+//! sidecar: without one the vector leg is empty.
 //!
 //! Any failure on the FerroStore path (sidecar open, index, search) falls back
 //! to the exact answer with a fixed [`RankedCode::note`] and the engine's
@@ -74,8 +85,8 @@
 //! sidecar never fails a code search.
 
 use crate::knowledge::{
-    MIN_VECTOR_COSINE, default_embedder, ensure_vector_collection, is_zero, missing_as_none, rrf,
-    stamp,
+    MIN_VECTOR_COSINE, UPSERT_BATCH, checkpoint_after_bulk, default_embedder, delete_vectors,
+    ensure_vector_collection, is_zero, missing_as_none, rrf, stamp,
 };
 use crate::{AnyStore, FerroStore, IndexPolicy, SearchMode};
 use fl_core::{
@@ -88,13 +99,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Vectors one CLI or MCP call may write.
-pub const DEFAULT_CODE_SYNC_BUDGET: usize = 512;
-/// Longest a sync spends writing vectors, checked between files: every upsert
-/// costs time proportional to the vectors already in the sidecar, so a count
-/// budget alone could hold a search for minutes. Files not reached are left
-/// to a later search, like files over the budget.
-const SYNC_DEADLINE: Duration = Duration::from_secs(3);
+/// Vectors one CLI or MCP call may plan (and embed). A cap on the work per
+/// call; the deadline below is what normally ends a call.
+pub const DEFAULT_CODE_SYNC_BUDGET: usize = 4096;
+/// Longest a sync spends writing vectors, checked before each file after the
+/// first. A batched upsert costs about 3.4 ms per vector, so this admits
+/// about 1,500 vectors per call and a cold build of this repository (about
+/// 11,000 symbols) takes a handful of searches, none of which waits for the
+/// whole build. Files not reached are left to a later search, like files over
+/// the budget.
+const SYNC_DEADLINE: Duration = Duration::from_secs(5);
 /// Most matches the lexical leg keeps before fusion.
 const LEXICAL_CAP: usize = 10_000;
 /// Smallest number of nearest vectors asked of the index.
@@ -436,8 +450,17 @@ struct IndexDoc {
 
 impl IndexDoc {
     fn load(ferro: &FerroStore, collection: &str, space: u64) -> Result<Self, StoreError> {
+        Ok(Self::parse(
+            ferro.get_doc(INDEX_DOC_COLLECTION, collection)?,
+            space,
+        ))
+    }
+
+    /// The document as read; one written for another embedding space, or
+    /// absent, is empty.
+    fn parse(doc: Option<Value>, space: u64) -> Self {
         let mut files = BTreeMap::new();
-        if let Some(doc) = ferro.get_doc(INDEX_DOC_COLLECTION, collection)?
+        if let Some(doc) = doc
             && doc.get("space").and_then(Value::as_u64) == Some(space)
             && let Some(map) = doc.get("files").and_then(Value::as_object)
         {
@@ -458,26 +481,11 @@ impl IndexDoc {
                 }
             }
         }
-        Ok(Self { files })
+        Self { files }
     }
 
-    /// Read the freshest document, apply `changes` (`None` removes a path) and
-    /// write it back. Paths this call did not touch keep whatever another
-    /// writer recorded.
-    fn update(
-        ferro: &FerroStore,
-        collection: &str,
-        space: u64,
-        changes: &BTreeMap<String, Option<FileRecord>>,
-    ) -> Result<(), StoreError> {
-        let mut fresh = Self::load(ferro, collection, space)?;
-        for (path, rec) in changes {
-            match rec {
-                Some(rec) => fresh.files.insert(path.clone(), rec.clone()),
-                None => fresh.files.remove(path),
-            };
-        }
-        let files: serde_json::Map<String, Value> = fresh
+    fn to_json(&self, space: u64) -> Value {
+        let files: serde_json::Map<String, Value> = self
             .files
             .iter()
             .map(|(path, rec)| {
@@ -487,11 +495,29 @@ impl IndexDoc {
                 )
             })
             .collect();
-        ferro.put_doc(
-            INDEX_DOC_COLLECTION,
-            collection,
-            &json!({ "space": space, "files": files }),
-        )
+        json!({ "space": space, "files": files })
+    }
+
+    /// Read the freshest document, apply `changes` (`None` removes a path) and
+    /// write it back, in one transaction: no other writer commits between the
+    /// read and the write. Paths this call did not touch keep whatever
+    /// another writer recorded.
+    fn update(
+        ferro: &FerroStore,
+        collection: &str,
+        space: u64,
+        changes: &BTreeMap<String, Option<FileRecord>>,
+    ) -> Result<(), StoreError> {
+        ferro.transaction(|txn| {
+            let mut fresh = Self::parse(txn.get_doc(INDEX_DOC_COLLECTION, collection), space);
+            for (path, rec) in changes {
+                match rec {
+                    Some(rec) => fresh.files.insert(path.clone(), rec.clone()),
+                    None => fresh.files.remove(path),
+                };
+            }
+            txn.put_doc(INDEX_DOC_COLLECTION, collection, &fresh.to_json(space))
+        })
     }
 }
 
@@ -530,6 +556,30 @@ pub(crate) fn sync_files(
     budget: usize,
     deadline: Duration,
 ) -> Result<CodeSyncStats, StoreError> {
+    sync_files_batched(
+        ferro,
+        embedder,
+        collection,
+        index,
+        budget,
+        deadline,
+        UPSERT_BATCH,
+    )
+}
+
+/// [`sync_files`] with a chosen batch size: the vectors of whole files are
+/// grouped until a group holds `batch` of them, and a group is written, then
+/// finalised, together.
+pub(crate) fn sync_files_batched(
+    ferro: &FerroStore,
+    embedder: &dyn Embedder,
+    collection: &str,
+    index: &CodeIndex,
+    budget: usize,
+    deadline: Duration,
+    batch: usize,
+) -> Result<CodeSyncStats, StoreError> {
+    let batch = batch.max(1);
     let started = Instant::now();
     let space = stamp(&embedder.space_id());
     let doc = IndexDoc::load(ferro, collection, space)?;
@@ -629,52 +679,51 @@ pub(crate) fn sync_files(
     }
     changes.clear();
 
-    // Write. Stop at the first error but still finalise what succeeded.
+    // Write. Stop at the first error but still finalise what succeeded. The
+    // files go in groups of about `batch` vectors; a group is written, its
+    // stale vectors deleted, and only then are its files finalised.
     let mut failure: Option<StoreError> = None;
     'files: {
-        for (path, rec) in &gone {
-            for id in &rec.ids {
-                if let Err(err) = missing_as_none(ferro.delete_vector(collection, id)) {
-                    failure = Some(err);
-                    break 'files;
-                }
-                stats.deleted += 1;
+        if !gone.is_empty() {
+            let ids: Vec<&str> = gone
+                .iter()
+                .flat_map(|(_, rec)| rec.ids.iter().map(String::as_str))
+                .collect();
+            if let Err(err) = delete_vectors(ferro, collection, &ids) {
+                failure = Some(err);
+                break 'files;
             }
-            changes.insert((*path).clone(), None);
+            stats.deleted += ids.len();
+            for (path, _) in &gone {
+                changes.insert((*path).clone(), None);
+            }
         }
+        let mut group: Vec<&FileWork> = Vec::new();
+        let mut buffered = 0usize;
         for (done, item) in work.iter().enumerate() {
             if done > 0 && started.elapsed() >= deadline {
                 // Still listed as pending: a later sync takes it up again.
                 stats.pending += work[done..].iter().map(|w| w.vectors.len()).sum::<usize>();
                 break;
             }
-            let rev = stamp(&item.digest);
-            for (id, values) in &item.vectors {
-                let meta = json!({ "path": item.path, "rev": rev });
-                if let Err(err) = ferro.upsert_vector(collection, id, values, Some(&meta)) {
+            buffered += item.vectors.len();
+            group.push(item);
+            if buffered >= batch {
+                if let Err(err) =
+                    write_group(ferro, collection, &group, batch, &mut stats, &mut changes)
+                {
                     failure = Some(err);
                     break 'files;
                 }
-                stats.written += 1;
+                group.clear();
+                buffered = 0;
             }
-            let new_ids = item.new_ids();
-            let current: HashSet<&str> = new_ids.iter().map(String::as_str).collect();
-            for id in item
-                .old_ids
-                .iter()
-                .filter(|id| !current.contains(id.as_str()))
-            {
-                if let Err(err) = missing_as_none(ferro.delete_vector(collection, id)) {
-                    failure = Some(err);
-                    break 'files;
-                }
-                stats.deleted += 1;
-            }
-            let record = (!item.no_symbols).then(|| FileRecord {
-                digest: item.digest.clone(),
-                ids: new_ids,
-            });
-            changes.insert(item.path.clone(), record);
+        }
+        if !group.is_empty()
+            && let Err(err) =
+                write_group(ferro, collection, &group, batch, &mut stats, &mut changes)
+        {
+            failure = Some(err);
         }
     }
     let finalised = if changes.is_empty() {
@@ -682,10 +731,66 @@ pub(crate) fn sync_files(
     } else {
         IndexDoc::update(ferro, collection, space, &changes)
     };
+    checkpoint_after_bulk(ferro, stats.written);
     match (failure, finalised) {
         (Some(err), _) | (None, Err(err)) => Err(err),
         (None, Ok(())) => Ok(stats),
     }
+}
+
+/// Write the vectors of `group` in commits of at most `batch`, delete the ids
+/// its files no longer own in one transaction, and record each file as done in
+/// `changes`. On `Err` nothing is recorded: the group's files stay pending,
+/// and a chunk that did commit is listed by the intent record.
+fn write_group(
+    ferro: &FerroStore,
+    collection: &str,
+    group: &[&FileWork],
+    batch: usize,
+    stats: &mut CodeSyncStats,
+    changes: &mut BTreeMap<String, Option<FileRecord>>,
+) -> Result<(), StoreError> {
+    let mut items: Vec<(&str, &[f32], Value)> = Vec::new();
+    for item in group {
+        let rev = stamp(&item.digest);
+        for (id, values) in &item.vectors {
+            items.push((
+                id.as_str(),
+                values.as_slice(),
+                json!({ "path": item.path, "rev": rev }),
+            ));
+        }
+    }
+    for chunk in items.chunks(batch) {
+        let refs: Vec<(&str, &[f32], Option<&Value>)> = chunk
+            .iter()
+            .map(|(id, values, meta)| (*id, *values, Some(meta)))
+            .collect();
+        ferro.upsert_vectors(collection, &refs)?;
+        stats.written += chunk.len();
+    }
+    let mut stale: Vec<&str> = Vec::new();
+    for item in group {
+        let current: HashSet<&str> = item.vectors.iter().map(|(id, _)| id.as_str()).collect();
+        stale.extend(
+            item.old_ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| !current.contains(id)),
+        );
+    }
+    if !stale.is_empty() {
+        delete_vectors(ferro, collection, &stale)?;
+        stats.deleted += stale.len();
+    }
+    for item in group {
+        let record = (!item.no_symbols).then(|| FileRecord {
+            digest: item.digest.clone(),
+            ids: item.new_ids(),
+        });
+        changes.insert(item.path.clone(), record);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1234,13 +1339,15 @@ pub fn lunch_menu_planner() {}
         let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
         let space = stamp(&default_embedder().space_id());
 
-        // gpu.rs: 2 symbols, store.rs: 5. The 4th upsert (the 2nd of store.rs) fails.
+        // gpu.rs: 2 symbols, store.rs: 5. The 4th vector (the 2nd of store.rs) is bad.
         let flaky = FlakyEmbedder {
             inner: HashingEmbedder::default(),
             calls: std::cell::Cell::new(0),
             fail_at: 4,
         };
-        let err = sync_files(&side, &flaky, &col(), &index, 100, LONG).unwrap_err();
+        // A batch of 2: gpu.rs commits alone, then store.rs's batch of 5 is
+        // refused whole (a batch is all or nothing).
+        let err = sync_files_batched(&side, &flaky, &col(), &index, 100, LONG, 2).unwrap_err();
         assert!(
             err.to_string().contains("vector values have length"),
             "{err}"
@@ -1259,7 +1366,7 @@ pub fn lunch_menu_planner() {}
                 sym.name()
             );
         }
-        assert_eq!(vector_count(&side, &index), 3);
+        assert_eq!(vector_count(&side, &index), 2);
 
         // store.rs changes before the repair: its half-written ids are still
         // cleaned up, from the pending record.
@@ -1296,6 +1403,93 @@ pub fn lunch_menu_planner() {}
         let stats = sync_files(&side, default_embedder(), &col(), &index, 100, LONG).unwrap();
         assert!(stats.written >= 5, "{stats:?}");
         assert_eq!(vector_count(&side, &index), 7);
+    }
+
+    #[test]
+    fn a_batched_sync_indexes_the_same_ids_whatever_the_batch_size() {
+        let (_root, index) = tree();
+        let want: HashSet<String> = index
+            .files()
+            .flat_map(|f| f.symbols().map(|s| id_of_symbol(&s)).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(want.len(), 7);
+        let mut docs = Vec::new();
+        for batch in [1, 2, 3, 5, 7, 256] {
+            let d = TempDir::new().unwrap();
+            let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
+            let stats =
+                sync_files_batched(&side, default_embedder(), &col(), &index, 100, LONG, batch)
+                    .unwrap();
+            assert_eq!((stats.written, stats.pending), (7, 0), "batch {batch}");
+            let got: HashSet<String> = side
+                .search_vectors(&col(), &default_embedder().embed("store"), 100, None)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(got, want, "batch {batch}");
+            let doc = IndexDoc::load(&side, &col(), stamp(&default_embedder().space_id())).unwrap();
+            let listed: HashSet<String> = doc.files.values().flat_map(|f| f.ids.clone()).collect();
+            assert_eq!(listed, want, "batch {batch}");
+            assert!(doc.files.values().all(|f| f.digest != PENDING_DIGEST));
+            docs.push(doc.files);
+        }
+        assert!(docs.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn a_big_sync_is_written_in_batches_and_reopens_from_a_snapshot() {
+        let root = TempDir::new().unwrap();
+        for f in 0..4 {
+            let body: String = (0..120)
+                .map(|n| format!("pub fn symbol_{f}_{n}(value: u32) {{}}\n"))
+                .collect();
+            write(root.path(), &format!("src/f{f}.rs"), &body);
+        }
+        let index = scan_code_index(root.path());
+        let d = TempDir::new().unwrap();
+        let path = d.path().join("s.code.fls");
+        {
+            let side = FerroStore::open(&path).unwrap();
+            let stats = sync_files(&side, default_embedder(), &col(), &index, 1000, LONG).unwrap();
+            assert_eq!(stats.written, 480);
+            assert_eq!(vector_count(&side, &index), 480);
+        }
+        let side = FerroStore::open(&path).unwrap();
+        assert_eq!(vector_count(&side, &index), 480);
+        let quiet = sync_files(&side, default_embedder(), &col(), &index, 1000, LONG).unwrap();
+        assert_eq!(quiet, CodeSyncStats::default());
+    }
+
+    #[test]
+    fn two_concurrent_index_document_merges_both_survive() {
+        let d = TempDir::new().unwrap();
+        let side = FerroStore::open(d.path().join("s.code.fls")).unwrap();
+        let space = stamp(&default_embedder().space_id());
+        let c = col();
+        let rec = |n: usize| FileRecord {
+            digest: format!("d{n}"),
+            ids: vec![format!("id{n}")],
+        };
+        // Many rounds of two writers, each adding its own paths from a stale
+        // view; every path must be in the document at the end.
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for who in 0..2usize {
+                let (side, c, barrier, rec) = (&side, &c, &barrier, &rec);
+                scope.spawn(move || {
+                    for round in 0..40usize {
+                        barrier.wait();
+                        let n = who * 1000 + round;
+                        let mut changes = BTreeMap::new();
+                        changes.insert(format!("src/w{who}_{round}.rs"), Some(rec(n)));
+                        IndexDoc::update(side, c, space, &changes).unwrap();
+                    }
+                });
+            }
+        });
+        let doc = IndexDoc::load(&side, &c, space).unwrap();
+        assert_eq!(doc.files.len(), 80, "a concurrent merge lost an update");
     }
 
     #[test]

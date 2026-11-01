@@ -187,7 +187,9 @@ pub fn format_code_hit(hit: &CodeSymbolHit) -> String {
 /// gain in `store`, returning the ranked result and the updated ledger.
 ///
 /// On FerroStore a `Search` also brings the code vector index up to date
-/// (at most [`DEFAULT_CODE_SYNC_BUDGET`] new vectors per call). If that path
+/// (at most [`DEFAULT_CODE_SYNC_BUDGET`] new vectors per call, and no new file
+/// is started after a few seconds, so a cold build finishes over several
+/// searches). If that path
 /// failed, the exact answer is returned and the reason goes to stderr, one
 /// line, never into the JSON. The ledger is fed from the final outcome.
 ///
