@@ -192,10 +192,10 @@ Phase 1 implements two of the four native models.
 | `unix:///tmp/x.sock`, `unix://localhost/tmp/x.sock` | Client of absolute `/tmp/x.sock`. Served |
 | `unix://rel/x.sock` | Client of relative `rel/x.sock`. Served |
 | `ws://127.0.0.1:9`, `ws://127.0.0.1:9/store` | Client of that WebSocket endpoint. Served. The query may name the credential (see Authentication) |
-| `wss://...` | `StoreError::Backend`. The message names `wss` and does not say the scheme is unknown |
+| `wss://host:9`, `wss://host:9/store` | Client of that WebSocket endpoint over TLS (see TLS). Served. The query takes the same parameters as `ws://`. An error about the URI itself names `wss` |
 | Anything else, including `""` and `http://` | `StoreError::Backend` whose message contains `unknown` and does not describe the scheme as deferred |
 
-`file://` and `unix://` paths are not percent-decoded. Only the host `localhost` is stripped; any other non-empty host is part of a relative path. A failed `unix://` or `ws://` connect is `StoreError::Backend`. It is not an unknown scheme.
+`file://` and `unix://` paths are not percent-decoded. Only the host `localhost` is stripped; any other non-empty host is part of a relative path. A failed `unix://`, `ws://` or `wss://` connect is `StoreError::Backend`. It is not an unknown scheme.
 
 `FerroStore::connect_with(uri, &ConnectOptions)` is `connect_uri` with a credential (see Authentication). `connect_uri(uri)` is `connect_with(uri, &ConnectOptions::new())`: no credential, which a `unix://` server that checks the peer uid alone accepts.
 
@@ -205,7 +205,7 @@ Phase 2 is this served mode. The process that binds a `FerroStoreServer` is the 
 
 A Unix frame is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON. The length is `1..=16MiB` (`16 * 1024 * 1024`). A length of zero or a longer payload is an error.
 
-A WebSocket message is one JSON object in one RFC 6455 frame. Client frames are masked. Server frames are not. The payload has no length prefix. The JSON payload is `1..=16MiB`. `wss://` is recognized and refused with a message that does not say the scheme is unknown.
+A WebSocket message is one JSON object in one RFC 6455 frame. Client frames are masked. Server frames are not. The payload has no length prefix. The JSON payload is `1..=16MiB`. `wss://` is the same WebSocket protocol inside TLS (see TLS).
 
 Every connection authenticates before the server reads its first request (see Authentication). After that, each call is one JSON object:
 
@@ -257,16 +257,16 @@ Every write method (`commit_txn`, `put_doc`, `delete_doc`, `publish_mq`, `ack_mq
 
 ### Authentication
 
-A connection authenticates before the server reads anything from it as a request. Until then the server answers no method, `open_session` and `txn_read` included. The first frames of a connection are the handshake below, in the transport's framing (a length-prefixed JSON frame on a Unix socket, one WebSocket message on `ws://`).
+A connection authenticates before the server reads anything from it as a request. Until then the server answers no method, `open_session` and `txn_read` included. The first frames of a connection are the handshake below, in the transport's framing (a length-prefixed JSON frame on a Unix socket, one WebSocket message on `ws://` and `wss://`).
 
 **Unix socket.** The server reads the peer's uid with `SO_PEERCRED` (`getpeereid` on the BSDs and macOS) when it accepts. A uid other than the server's effective uid, or one the kernel does not report, is refused before anything is read, and the server prints `warning: FerroStore refused a Unix connection from uid <uid>: the server runs as uid <own>` to stderr. The socket is mode `0600` as well (see Auto). `bind_unix(path, store)` checks the uid alone. `bind_unix_with(path, store, auth)` given a `ServerAuth` with a PSK also runs the PSK challenge-response after the uid check; a configured PSK is always required, never optional. A token file is refused on a Unix bind. A Unix connection that passes holds the `admin` scope.
 
-**TCP (`ws://`).** `bind_tcp(addr, store, auth)` needs a `ServerAuth` with a PSK, a token file, or both; without one it fails before it binds. A connection is decided by its upgrade request:
+**TCP (`ws://`, `wss://`).** `bind_tcp(addr, store, auth)` needs a `ServerAuth` with a PSK, a token file, or both; without one it fails before it binds. Which addresses it may bind, and when it serves `wss://`, is in TLS. A connection is decided by its upgrade request:
 
 * With one `Authorization: Bearer <token>` header (scheme case-insensitive; the token is visible ASCII), the server hashes the token with SHA-256 and compares the hash with every token-file entry in constant time. A match holds the entry's scope. Anything else in `Authorization`, two such headers, or no match is refused.
 * Without `Authorization`, the server runs the PSK challenge-response. A connection that passes holds the `admin` scope. A server without a PSK still sends the challenge and refuses every answer.
 
-**PSK challenge-response.** Each side proves the PSK to the other.
+**PSK challenge-response.** Each side proves the PSK to the other. On a Unix socket and over plain `ws://` the handshake is version 1:
 
 1. Server: `{"auth": "challenge", "v": 1, "ns": <hex>}`. `ns` is 32 bytes from the system random source, fresh for every connection.
 2. Client: `{"auth": "psk", "nc": <hex>, "proof": <hex>}`, `nc` 32 fresh random bytes, `proof = HMAC-SHA256(psk, "fl-store/1/client" ‖ L ‖ server_id ‖ ns ‖ nc)`.
@@ -274,7 +274,14 @@ A connection authenticates before the server reads anything from it as a request
 4. Server: `{"auth": "ok", "scope": "admin", "proof": <hex>}`, `proof = HMAC-SHA256(psk, "fl-store/1/server" ‖ L ‖ server_id ‖ nc ‖ ns)`.
 5. The client checks that proof the same way. A missing or wrong proof, or an `ok` without a challenge, is refused by the client with an error that says the server did not prove the PSK for that `server_id`, and no request is sent.
 
-Every `<hex>` is 64 lowercase hex digits (32 bytes). Both labels are 17 ASCII bytes and differ, so a proof made in one direction is never valid in the other. `L` is one byte, the length of `server_id`; the nonces are 32 bytes each, so the input has one reading. `server_id` is the name the server proves itself under: an operator-chosen name, 1 to 255 bytes of UTF-8 without control characters, configured with the PSK on the server (`ServerAuth::with_psk_file(server_id, path)`) and on every client as the server it expects (`ConnectOptions::psk_file(server_id, path)`). It is not an address. A client whose `server_id` differs from the server's fails the server's check, so a proof one server sees cannot be used at another that shares the PSK. A PSK is at least 32 bytes (see Secret files for its encoding in a file).
+Over `wss://` the handshake is version 2, bound to the TLS session. The frames are the same, the challenge says `"v": 2`, and each proof covers the connection's TLS exporter `E`: 32 bytes of `export_keying_material(label = "EXPORTER-fl-store-psk", context = none)` (RFC 8446 §7.5; RFC 5705 for TLS 1.2), which both ends of one TLS session compute alike and no other session shares:
+
+* client `proof = HMAC-SHA256(psk, "fl-store/2/client" ‖ L ‖ server_id ‖ ns ‖ nc ‖ E)`;
+* server `proof = HMAC-SHA256(psk, "fl-store/2/server" ‖ L ‖ server_id ‖ nc ‖ ns ‖ E)`.
+
+Each side takes the version from its own transport, never from the peer: a server over TLS sends version 2 and checks only version-2 proofs, and a client over TLS refuses a version-1 challenge (`the FerroStore server speaks another authentication version`) without answering it. A TLS connection whose exporter cannot be read is refused, never served unbound. So a handshake relayed into another TLS session (an attacker that terminates the client's TLS and opens its own to the server) does not verify: the two sessions have different exporters. For the same reason a PSK does not pass through a proxy that terminates TLS and speaks plain `ws://` to the server; a bearer token does.
+
+Every `<hex>` is 64 lowercase hex digits (32 bytes). All four labels are 17 ASCII bytes and differ, so a proof made in one direction, or in one version, is never valid in the other. `L` is one byte, the length of `server_id`; the nonces are 32 bytes each, so the input has one reading. `server_id` is the name the server proves itself under: an operator-chosen name, 1 to 255 bytes of UTF-8 without control characters, configured with the PSK on the server (`ServerAuth::with_psk_file(server_id, path)`) and on every client as the server it expects (`ConnectOptions::psk_file(server_id, path)`). It is not an address. A client whose `server_id` differs from the server's fails the server's check, so a proof one server sees cannot be used at another that shares the PSK. A PSK is at least 32 bytes (see Secret files for its encoding in a file).
 
 **Bearer and Unix accept.** With a valid token, or a Unix peer whose uid passed and no PSK, the server's first frame is `{"auth": "ok", "scope": <scope>}`. A client configured with a PSK refuses that frame, since it proves nothing.
 
@@ -294,9 +301,33 @@ Every `<hex>` is 64 lowercase hex digits (32 bytes). Both labels are 17 ASCII by
 
 The first field is the SHA-256 of the token's bytes in lowercase hex, the second is `read`, `write` or `admin`, and the rest of the line is a label for people. Blank lines and lines that start with `#` are skipped. A bad field, a repeated hash or a file with no token is refused at load with the line number, and the error repeats nothing of the line. The server holds the hashes, never a token. Every secret file (a PSK file on either side, a token file on either side) must be a regular file without group or other permission bits (`0600` or stricter), owned by the process's effective uid or by root (a root-owned secret mount works); one with those bits is refused with the `chmod 600` that fixes it, and one owned by any other uid is refused with an error that names the path and the owner uid (never the contents). A secret file is opened without blocking (`O_NONBLOCK`), and a symlink is followed: the checks (regular file, no group or other bits, owner) run on the opened descriptor, so they apply to the symlink's target, and a symlinked secret (a Kubernetes secret volume) works. A FIFO or a device, also one a symlink points to, is refused without waiting for a writer. The token file is read once, at `ServerAuth::with_token_file`. To make an entry: `token=$(head -c 32 /dev/urandom | xxd -p -c 64)`, then `printf %s "$token" | sha256sum`.
 
-**Client credentials.** `ConnectOptions::psk_file(server_id, path)`, `psk_env(server_id, var)` or `psk(server_id, bytes)`; `ConnectOptions::token_file(path)`, `token_env(var)` or `token(text)`. A bearer token is for `ws://` alone. A `ws://` URI given to `connect_uri` may name the credential in its query instead, but only by an environment variable whose name is `FERROSTORE_` and one or more letters, digits or `_`: `psk_env=<var>` with `server_id=<name>`, or `token_env=<var>` (`token_env=FERROSTORE_TOKEN`). A URI may come from a less trusted place than the code that connects, so it names no file (`psk_file=` and `token_file=` are refused; a file is named in `ConnectOptions`) and no other variable: it cannot make the client send an arbitrary secret to the URI's host. Values are not percent-decoded. A query that names a secret itself (`psk=`, `token=`, `secret=`, `password=`, `key=`) is refused, as is any other parameter, an empty or repeated one, two credentials, or a URI credential passed to `connect_with` with options that name one too.
+**Client credentials.** `ConnectOptions::psk_file(server_id, path)`, `psk_env(server_id, var)` or `psk(server_id, bytes)`; `ConnectOptions::token_file(path)`, `token_env(var)` or `token(text)`. A bearer token is for `ws://` and `wss://` alone. A `ws://` or `wss://` URI given to `connect_uri` may name the credential in its query instead, but only by an environment variable whose name is `FERROSTORE_` and one or more letters, digits or `_`: `psk_env=<var>` with `server_id=<name>`, or `token_env=<var>` (`token_env=FERROSTORE_TOKEN`). A URI may come from a less trusted place than the code that connects, so it names no file (`psk_file=` and `token_file=` are refused; a file is named in `ConnectOptions`) and no other variable: it cannot make the client send an arbitrary secret to the URI's host. Values are not percent-decoded. A query that names a secret itself (`psk=`, `token=`, `secret=`, `password=`, `key=`) is refused, as is any other parameter, an empty or repeated one, two credentials, or a URI credential passed to `connect_with` with options that name one too.
 
-**Plaintext.** Over plain `ws://`, a client sends no bearer token and runs no PSK handshake to an address that is not loopback (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback; the address checked is the one the TCP connect reached, before the upgrade is written), unless its `ConnectOptions` set `allow_plaintext(true)`; a URI cannot set it. The error says to use `wss://` or that option. A connection without a credential is not refused by the client.
+**Plaintext.** Over plain `ws://`, a client sends no bearer token and runs no PSK handshake to an address that is not loopback (`127.0.0.0/8`, `::1`, or an IPv4-mapped loopback; the address checked is the one the TCP connect reached, before the upgrade is written), unless its `ConnectOptions` set `allow_plaintext(true)`; a URI cannot set it. The error says to use `wss://` or that option. A connection without a credential is not refused by the client. Over `wss://` a credential goes to any address, inside TLS.
+
+**Bearer tokens and server identity.** A bearer token proves the client and nothing about the server: a client knows its server only through TLS. Use a token over `wss://`; over plain `ws://` only to loopback or on an allowed plaintext interface of a network you trust, where anyone on the path can read and replay it.
+
+### TLS
+
+`ServerAuth::with_tls_files(cert_chain, key)` makes `bind_tcp` serve `wss://`. `cert_chain` is a PEM file of one or more `CERTIFICATE` blocks, leaf first; `key` is a PEM private key (PKCS#8, PKCS#1 or SEC1) and is a secret file under the rules of Secret files (`0600` or stricter, owned by this uid or root, no FIFO); a key file others can read is refused with the `chmod 600` that fixes it, and no error repeats its bytes. A key that is not the certificate's is refused at load. The server speaks TLS 1.3 and TLS 1.2, `ring` provider, no client certificates; TLS 1.2 requires the extended master secret (RFC 7627), on the client too, so its exporter is the connection's own. The TLS handshake runs on the connection's own thread, within the 10 s handshake deadline of Unauthenticated connections (a peer that never sends its ClientHello, trickles it, or stops halfway is shut down at the deadline), and the 4 KiB pre-authentication frame limit applies inside TLS. TLS and `allow_plaintext_on` are refused on a Unix bind.
+
+A `wss://` client checks the server's certificate in one of three ways, named in `ConnectOptions` and never in a URI:
+
+| Option | The client accepts |
+| --- | --- |
+| none (the default) | A chain to one of the system roots (`webpki-roots`), valid now, for the URI's host |
+| `ca_file(path)` | A chain to a CA in that PEM file alone (not the system roots), valid now, for the URI's host |
+| `pin_spki_sha256(hex)` | A leaf whose SubjectPublicKeyInfo DER has that SHA-256 (64 hex digits, either case, `:` between bytes allowed; `openssl x509 -in cert.pem -pubkey -noout \| openssl pkey -pubin -outform DER \| sha256sum`). No CA, name or date is checked: the pinned key is the server's identity, so a self-signed certificate, or one renewed over the same key, works. The TLS handshake must still be signed by that key: the certificate the signature is checked against is matched to the pin again first |
+
+The host of the URI is the name verified and the SNI sent (an IP address is matched against the certificate's IP addresses). Naming both `ca_file` and `pin_spki_sha256`, a pin that is not 64 hex digits, or either option with a URI that is not `wss://`, is refused.
+
+**Bind policy.** With TLS, `bind_tcp` may bind any address. Without it (plain `ws://`):
+
+* a loopback address is always allowed;
+* `0.0.0.0` and `::` (and `::ffff:0.0.0.0`) are always refused: they listen on every interface, the ones that are not loopback included;
+* any other address is allowed only when `ServerAuth::allow_plaintext_on(["tailscale0"])` names an interface and the address is one of that interface's own addresses (`getifaddrs`; an IPv4-mapped address is compared as IPv4, and an IPv6 link-local address must also have that interface's scope id). Naming `lo` covers nothing beyond loopback.
+
+Every address the bind's argument resolves to is checked before anything is bound, and the bound address once more. The refusal names the address and says to configure TLS or `allow_plaintext_on`. Authentication is required on every TCP bind, an allowed plaintext interface included.
 
 **Scopes.** `admin` covers `write`, which covers `read`. A method the connection's scope does not cover is an error reply that names the method, the scope it needs and the scope the connection has. It runs nothing (it takes no exactly-once slot); the connection stays open. A method the table does not name is `no such method`.
 
@@ -419,7 +450,7 @@ On a remote handle, a `publish_mq` that the server answers with `Undelivered` is
 
 Phase 1 (Record 14) is this engine: the `.fls` container, `mem://`, `file://`, the document store, and FerroMQ.
 
-Phase 2 (Record 13) is served mode: Unix-socket and WebSocket RPC, and `FerroStore::auto`. `unix://` and `ws://` are served. `wss://` is recognized and refused.
+Phase 2 (Record 13) is served mode: Unix-socket and WebSocket RPC, and `FerroStore::auto`. `unix://`, `ws://` and `wss://` are served.
 
 Phase 3 is the columnar model. One non-empty `append_column_rows` is one row group. An empty append writes nothing and is success. The codec is chosen when the group is written and stored in the row-group blob; a read does not pick a different one.
 

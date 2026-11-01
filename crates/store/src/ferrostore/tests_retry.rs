@@ -420,37 +420,48 @@ pub(super) fn fresh_remote() -> (FerroStore, Served) {
     (client(&served), served)
 }
 
-/// The store contracts over a remote handle.
+/// The store contracts over a remote handle (a Unix socket).
 pub(super) fn run_contracts() {
+    run_contracts_over(fresh_remote);
+}
+
+/// The store contracts over the remote handles `fresh` makes (each with
+/// the guard that keeps its server).
+pub(super) fn run_contracts_over<G>(fresh: impl Fn() -> (FerroStore, G) + Copy) {
     use fl_core::conformance::{Single, SplitOver};
-    let single = || {
-        let (s, g) = fresh_remote();
+    let single = move || {
+        let (s, g) = fresh();
         Single(s, g)
     };
-    let split = || {
-        let (s, g) = fresh_remote();
+    let split = move || {
+        let (s, g) = fresh();
         SplitOver(s, g)
     };
-    fl_core::conformance::catalog(fresh_remote);
+    fl_core::conformance::catalog(fresh);
     fl_core::conformance::tracker(single);
     fl_core::conformance::ledger(single);
     fl_core::conformance::ledger(split);
     fl_core::conformance::split_ledger(split);
     fl_core::conformance::all_roles(single);
-    fl_core::conformance::local_handles(fresh_remote);
-    fl_core::conformance::ledger_cache(fresh_remote);
-    fl_core::conformance::agent_registry(fresh_remote);
-    fl_core::conformance::state_store(fresh_remote);
-    fl_core::conformance::message_store(fresh_remote);
-    fl_core::conformance::workflow_store(fresh_remote);
+    fl_core::conformance::local_handles(fresh);
+    fl_core::conformance::ledger_cache(fresh);
+    fl_core::conformance::agent_registry(fresh);
+    fl_core::conformance::state_store(fresh);
+    fl_core::conformance::message_store(fresh);
+    fl_core::conformance::workflow_store(fresh);
     fl_core::conformance::escalations(single);
-    crate::manifest_conformance::manifest_contract(fresh_remote);
+    crate::manifest_conformance::manifest_contract(fresh);
 }
 
 /// The public writes of `FerroStore` the contracts do not reach.
 pub(super) fn run_public_writes() {
+    run_public_writes_over(fresh_remote);
+}
+
+/// [`run_public_writes`] over the remote handles `fresh` makes.
+pub(super) fn run_public_writes_over<G>(fresh: impl Fn() -> (FerroStore, G)) {
     use super::{ColumnDef, ColumnType, ColumnValue, VectorMetric, VectorStorage};
-    let (store, _guard) = fresh_remote();
+    let (store, _guard) = fresh();
     store.put_doc("docs", "a", &json!({"n": 1})).unwrap();
     store.delete_doc("docs", "a").unwrap();
     store.publish_mq("topic", "k", &json!(1)).unwrap();
@@ -509,8 +520,8 @@ pub(super) fn run_public_writes() {
     let dir = tempfile::tempdir().unwrap();
     let redb = crate::RedbStore::open(&dir.path().join("src.redb")).unwrap();
     fl_core::store::Catalog::add_project(&redb, "/migrated").unwrap();
-    let (fresh, _fresh_guard) = fresh_remote();
-    super::migrate_redb_to_ferrostore(&redb, &fresh).unwrap();
+    let (target, _target_guard) = fresh();
+    super::migrate_redb_to_ferrostore(&redb, &target).unwrap();
 }
 
 #[test]

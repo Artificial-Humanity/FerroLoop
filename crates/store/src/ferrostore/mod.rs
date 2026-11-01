@@ -2,6 +2,7 @@
 //! See `docs/ferrostore-spec.md`.
 
 mod auth;
+mod bind;
 mod columnar;
 mod compact;
 mod compat;
@@ -17,6 +18,7 @@ mod server;
 mod session;
 mod state;
 mod sync;
+mod tls;
 mod traits_catalog;
 mod traits_state;
 mod traits_wire;
@@ -50,6 +52,8 @@ mod tests_reentry;
 mod tests_retry;
 #[cfg(test)]
 mod tests_session;
+#[cfg(test)]
+mod tests_tls;
 #[cfg(test)]
 mod tests_track0;
 #[cfg(test)]
@@ -1487,9 +1491,14 @@ impl FerroStore {
         }
     }
 
-    /// `mem://`, `file://`, `unix://`, and `ws://`. `wss://` is recognized and refused.
+    /// `mem://`, `file://`, `unix://`, `ws://` and `wss://`.
     ///
-    /// A `ws://` URI may name its credential in its query (spec §6.2), only
+    /// A `wss://` client checks the server's certificate against the system
+    /// roots (see [`ConnectOptions::ca_file`] and
+    /// [`ConnectOptions::pin_spki_sha256`] for the other ways, which only
+    /// options set, never a URI).
+    ///
+    /// A `ws://` or `wss://` URI may name its credential in its query (spec §6.2), only
     /// by a `FERROSTORE_*` environment variable:
     /// `?psk_env=FERROSTORE_PSK&server_id=<name>` or
     /// `?token_env=FERROSTORE_TOKEN`. A file, another variable or a secret
@@ -1501,23 +1510,32 @@ impl FerroStore {
     }
 
     /// [`Self::connect_uri`], authenticating with `options` (spec §6.2).
-    /// `options` apply to `unix://` and `ws://` alone, and a `ws://` URI
-    /// that also names a credential in its query is refused. Over plain
-    /// `ws://` a credential goes only to a loopback address, unless
-    /// `options` set [`ConnectOptions::allow_plaintext`]. The handle
-    /// is returned only after the server accepted the connection and, for
-    /// a PSK, proved that it holds the same PSK under the expected
+    /// `options` apply to `unix://` and `ws://` (and `wss://`) alone, and a
+    /// `ws://` or `wss://` URI that also names a credential in its query is
+    /// refused. Over plain `ws://` a credential goes only to a loopback
+    /// address, unless `options` set [`ConnectOptions::allow_plaintext`];
+    /// over `wss://` it goes to any host, inside TLS (spec §6.3). The TLS
+    /// options ([`ConnectOptions::ca_file`],
+    /// [`ConnectOptions::pin_spki_sha256`]) apply to `wss://` alone. The
+    /// handle is returned only after the server accepted the connection
+    /// and, for a PSK, proved that it holds the same PSK under the expected
     /// `server_id`.
     pub fn connect_with(uri: &str, options: &ConnectOptions) -> Result<Self, StoreError> {
         let local_only = || {
             if options.has_auth() {
                 Err(backend(
-                    "authentication options apply to unix:// and ws:// only",
+                    "authentication options apply to unix:// and ws:// (or wss://) only",
                 ))
             } else {
                 Ok(())
             }
         };
+        let tls_options = options.has_tls_options();
+        if tls_options && !uri.starts_with("wss://") {
+            return Err(backend(
+                "the TLS options (ca_file, pin_spki_sha256) apply to wss:// only",
+            ));
+        }
         if uri == "mem://" || uri == "mem:///" {
             local_only()?;
             return Ok(Self::in_memory());
@@ -1531,10 +1549,12 @@ impl FerroStore {
             let remote = server::connect_unix_with(&path, &options.resolve()?)?;
             return Ok(Self::assemble(Inner::Remote(remote), path));
         }
-        if uri.starts_with("wss://") {
-            return Err(backend("wss is not implemented"));
-        }
-        if let Some(rest) = uri.strip_prefix("ws://") {
+        let tcp = match (uri.strip_prefix("wss://"), uri.strip_prefix("ws://")) {
+            (Some(rest), _) => Some((rest, Some(options.verify()?))),
+            (None, Some(rest)) => Some((rest, None)),
+            (None, None) => None,
+        };
+        if let Some((rest, verify)) = tcp {
             let (target, from_uri) = auth::split_uri_query(rest)?;
             let outer_plaintext = options.plaintext_allowed();
             let options = match (options.has_auth(), from_uri.has_auth()) {
@@ -1546,11 +1566,13 @@ impl FerroStore {
                 (false, true) => &from_uri,
                 _ => options,
             };
-            let remote = server::connect_ws(
+            let remote = server::connect_tcp(
                 &target,
                 &options.resolve()?,
                 // Only the caller's options allow plaintext, never a URI.
                 outer_plaintext,
+                // Only the caller's options name the TLS check, never a URI.
+                verify.as_ref(),
             )?;
             return Ok(Self::assemble(Inner::Remote(remote), uri.to_string()));
         }

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::tls::{self, ServerTls, TlsStream, Wire};
 use super::ws;
 
 pub(super) const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
@@ -143,8 +144,14 @@ impl FerroStoreServer {
     ) -> Result<Self, StoreError> {
         if auth.has_tokens() {
             return Err(backend(
-                "a token file is for ws:// connections; a Unix socket checks the peer uid \
+                "a token file is for ws:// and wss:// connections; a Unix socket checks the peer uid \
                  and, when one is configured, the PSK",
+            ));
+        }
+        if auth.has_tcp_transport() {
+            return Err(backend(
+                "TLS and allow_plaintext_on are for bind_tcp; a Unix socket is local, mode \
+                 0600, and checks the peer uid",
             ));
         }
         let path = path.as_ref();
@@ -201,6 +208,12 @@ impl FerroStoreServer {
     /// authentication is refused before it binds. A connection with a valid
     /// bearer token holds that token's scope; one that passes the PSK
     /// challenge-response holds `admin` (spec §6.2).
+    ///
+    /// With TLS ([`ServerAuth::with_tls_files`]) this serves `wss://` on any
+    /// address. Without it, plain `ws://` binds only a loopback address, or
+    /// an address of an interface named in [`ServerAuth::allow_plaintext_on`];
+    /// every other address, `0.0.0.0` and `::` always, is refused before it is
+    /// bound (spec §6.3).
     pub fn bind_tcp(
         addr: impl ToSocketAddrs,
         store: FerroStore,
@@ -212,19 +225,33 @@ impl FerroStoreServer {
                  (ServerAuth)",
             ));
         }
-        let listener =
-            TcpListener::bind(addr).map_err(|err| backend(format!("bind tcp: {err}")))?;
+        let addrs: Vec<SocketAddr> = addr
+            .to_socket_addrs()
+            .map_err(|err| backend(format!("bind tcp: resolve the address: {err}")))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(backend("bind tcp: the address resolves to nothing"));
+        }
+        for addr in &addrs {
+            auth.check_bind(*addr)?;
+        }
+        let listener = TcpListener::bind(addrs.as_slice())
+            .map_err(|err| backend(format!("bind tcp: {err}")))?;
         if let Err(err) = listener.set_nonblocking(true) {
             return Err(backend(format!("set socket nonblocking: {err}")));
         }
         let local = listener
             .local_addr()
             .map_err(|err| backend(format!("tcp local address: {err}")))?;
+        // The address bound is one of those checked; checked again, so no
+        // resolution can widen it.
+        auth.check_bind(local)?;
+        let tls = auth.tls().cloned();
         let state = new_state(store, auth);
         let accept_state = Arc::clone(&state);
         let accept = thread::Builder::new()
             .name("fls-accept".to_string())
-            .spawn(move || accept_loop(move || poll_tcp(&listener), accept_state))
+            .spawn(move || accept_loop(move || poll_tcp(&listener, tls.as_ref()), accept_state))
             .map_err(|err| backend(format!("start accept thread: {err}")))?;
         Ok(Self {
             bound: Bound::Tcp { addr: local },
@@ -621,9 +648,9 @@ fn poll_unix(listener: &UnixListener) -> AcceptPoll {
     }
 }
 
-fn poll_tcp(listener: &TcpListener) -> AcceptPoll {
+fn poll_tcp(listener: &TcpListener, tls: Option<&ServerTls>) -> AcceptPoll {
     match listener.accept() {
-        Ok((stream, _)) => match tcp_accepted(stream) {
+        Ok((stream, _)) => match tcp_accepted(stream, tls) {
             Ok(accepted) => AcceptPoll::Conn(accepted),
             Err(_) => AcceptPoll::Retry,
         },
@@ -650,7 +677,12 @@ fn unix_accepted(stream: UnixStream) -> Result<Accepted, StoreError> {
     })
 }
 
-fn tcp_accepted(stream: TcpStream) -> Result<Accepted, StoreError> {
+/// The halves of an accepted TCP connection. With `tls`, the reading and
+/// writing halves share one TLS state ([`TlsStream`]) whose handshake runs
+/// later, on the connection's thread (in `prepare`), under the handshake
+/// deadline; the watcher is the bare socket, whose `shutdown_both` ends a
+/// TLS handshake as it ends any read.
+fn tcp_accepted(stream: TcpStream, tls: Option<&ServerTls>) -> Result<Accepted, StoreError> {
     stream
         .set_nodelay(true)
         .map_err(|err| backend(format!("set nodelay: {err}")))?;
@@ -659,16 +691,25 @@ fn tcp_accepted(stream: TcpStream) -> Result<Accepted, StoreError> {
     stream
         .set_nonblocking(false)
         .map_err(|err| backend(format!("set socket blocking: {err}")))?;
-    let write = stream
-        .try_clone()
-        .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
     let watch = stream
         .try_clone()
         .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+    let (read, write) = match tls {
+        None => {
+            let write = stream
+                .try_clone()
+                .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+            (Wire::Plain(stream), Wire::Plain(write))
+        }
+        Some(tls) => {
+            let (read, write) = TlsStream::server(stream, tls)?;
+            (Wire::Tls(read), Wire::Tls(write))
+        }
+    };
     Ok(Accepted {
-        read: Box::new(WsIo::server(stream, true)),
+        read: Box::new(WsIo::server(read, true)),
         write: Box::new(WsIo::server(write, false)),
-        watch: Box::new(WsIo::server(watch, false)),
+        watch: Box::new(WsIo::server(Wire::Plain(watch), false)),
         peer: Peer::Tcp,
     })
 }
@@ -1538,6 +1579,13 @@ pub(super) trait JsonIo: Send {
     }
 
     fn shutdown_both(&self);
+
+    /// The TLS channel binding of this connection (spec §6.3): `None` on a
+    /// transport without TLS. An error on a TLS connection whose binding
+    /// cannot be read: the handshake then refuses, never runs unbound.
+    fn channel_binding(&self) -> Result<Option<tls::Binding>, StoreError> {
+        Ok(None)
+    }
 }
 
 /// Frame bytes one client moved, both ways (`cfg(test)` only: a build
@@ -1598,13 +1646,13 @@ impl JsonIo for UnixIo {
 }
 
 struct WsIo {
-    stream: TcpStream,
+    stream: Wire,
     client: bool,
     handshake: bool,
 }
 
 impl WsIo {
-    fn client(stream: TcpStream) -> Self {
+    fn client(stream: Wire) -> Self {
         Self {
             stream,
             client: true,
@@ -1612,7 +1660,7 @@ impl WsIo {
         }
     }
 
-    fn server(stream: TcpStream, handshake: bool) -> Self {
+    fn server(stream: Wire, handshake: bool) -> Self {
         Self {
             stream,
             client: false,
@@ -1627,6 +1675,8 @@ impl JsonIo for WsIo {
             return Ok(Vec::new());
         }
         self.handshake = false;
+        // TLS first (`wss://`), then the upgrade inside it.
+        self.stream.start()?;
         ws::accept(&mut self.stream)
     }
 
@@ -1664,7 +1714,11 @@ impl JsonIo for WsIo {
     }
 
     fn shutdown_both(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        self.stream.shutdown_both();
+    }
+
+    fn channel_binding(&self) -> Result<Option<tls::Binding>, StoreError> {
+        self.stream.channel_binding()
     }
 }
 
@@ -2041,7 +2095,7 @@ pub(super) fn connect_unix_with(
 ) -> Result<RemoteClient, StoreError> {
     if cred.bearer().is_some() {
         return Err(backend(
-            "a bearer token is for ws://; a Unix socket takes the peer uid and, optionally, a PSK",
+            "a bearer token is for ws:// and wss://; a Unix socket takes the peer uid and, optionally, a PSK",
         ));
     }
     let stream =
@@ -2068,23 +2122,77 @@ pub(super) fn client_from_unix(
 /// A client of the `ws://` endpoint `rest`, authenticating with `cred`.
 /// A credential goes to an address that is not loopback only when
 /// `allow_plaintext` ([`auth::ClientCred::check_plaintext`]).
+#[cfg(test)]
 pub(super) fn connect_ws(
     rest: &str,
     cred: &auth::ClientCred,
     allow_plaintext: bool,
 ) -> Result<RemoteClient, StoreError> {
-    let stream = ws::connect(rest, cred.bearer(), |peer| {
+    connect_tcp(rest, cred, allow_plaintext, None)
+}
+
+/// A client of the `ws://` endpoint `rest` (`verify` is `None`) or the
+/// `wss://` endpoint `rest` (the server checked by `verify`),
+/// authenticating with `cred`. Over `wss://` a credential goes to any
+/// host, inside TLS; over `ws://` see [`connect_ws`].
+pub(super) fn connect_tcp(
+    rest: &str,
+    cred: &auth::ClientCred,
+    allow_plaintext: bool,
+    verify: Option<&tls::Verify>,
+) -> Result<RemoteClient, StoreError> {
+    let (read, write) = dial_wire(rest, cred.bearer(), verify, |peer| {
         cred.check_plaintext(peer, allow_plaintext)
     })?;
-    let writer = stream
-        .try_clone()
-        .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
     finish_client(
-        Box::new(WsIo::client(stream)),
-        Box::new(WsIo::client(writer)),
+        Box::new(WsIo::client(read)),
+        Box::new(WsIo::client(write)),
         FrameCounter::default(),
         cred,
     )
+}
+
+/// Connect to `rest` (`host:port[/path]`), run TLS when `verify` names how
+/// to check the server, and upgrade: the reading and the writing half.
+/// Without TLS `admit` may refuse the address reached before anything is
+/// written; with TLS a credential may go anywhere, and it is not asked.
+pub(super) fn dial_wire(
+    rest: &str,
+    bearer: Option<&str>,
+    verify: Option<&tls::Verify>,
+    admit: impl FnOnce(SocketAddr) -> Result<(), StoreError>,
+) -> Result<(Wire, Wire), StoreError> {
+    let scheme = if verify.is_some() { "wss" } else { "ws" };
+    let (host_port, path) = ws::split_target(scheme, rest)?;
+    ws::check_bearer(bearer)?;
+    // Checked before the connect, so no bad name or file costs one.
+    let tls_setup = match verify {
+        Some(verify) => Some((tls::client_config(verify)?, tls::server_name(host_port)?)),
+        None => None,
+    };
+    let (stream, peer) = ws::dial(host_port)?;
+    // The TLS handshake and the upgrade are bounded like any handshake read.
+    stream
+        .set_read_timeout(Some(auth::HANDSHAKE_TIMEOUT))
+        .map_err(|err| backend(format!("set read timeout: {err}")))?;
+    let (mut read, write) = match tls_setup {
+        None => {
+            admit(peer)?;
+            let write = stream
+                .try_clone()
+                .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+            (Wire::Plain(stream), Wire::Plain(write))
+        }
+        Some((config, name)) => {
+            let (read, write) = TlsStream::client(stream, config, name)?;
+            (Wire::Tls(read), Wire::Tls(write))
+        }
+    };
+    if let Err(err) = ws::upgrade(&mut read, host_port, &path, bearer) {
+        read.shutdown_both();
+        return Err(err);
+    }
+    Ok((read, write))
 }
 
 /// Authenticate (spec §6.2), then start the reader. No request is sent
@@ -2189,7 +2297,7 @@ mod empty_frame {
         let addr = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
-        let mut io = WsIo::server(server, false);
+        let mut io = WsIo::server(Wire::Plain(server), false);
 
         ws::write_frame(&mut client, true, 0x1, &[]).unwrap();
         let msg = match io.read_value(ws::MAX_PAYLOAD) {
