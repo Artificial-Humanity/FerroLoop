@@ -39,25 +39,51 @@ struct RawFrame {
 /// `Authorization: Bearer <token>`; the caller has checked that it is
 /// visible ASCII, so it cannot end the header. `admit` is given the address
 /// actually connected to before anything is written, and may refuse it.
+#[cfg(test)]
 pub(super) fn connect(
     rest: &str,
     bearer: Option<&str>,
     admit: impl FnOnce(SocketAddr) -> Result<(), StoreError>,
 ) -> Result<TcpStream, StoreError> {
-    let (host_port, path) = split_target(rest)?;
+    let (host_port, path) = split_target("ws", rest)?;
+    check_bearer(bearer)?;
+    let (mut stream, peer) = dial(host_port)?;
+    admit(peer)?;
+    upgrade(&mut stream, host_port, &path, bearer)?;
+    Ok(stream)
+}
+
+/// `Err` unless `bearer` is absent or visible ASCII without spaces.
+pub(super) fn check_bearer(bearer: Option<&str>) -> Result<(), StoreError> {
     if bearer.is_some_and(|token| token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
     {
         return Err(backend("a bearer token is visible ASCII without spaces"));
     }
-    let mut stream = TcpStream::connect(host_port)
+    Ok(())
+}
+
+/// The TCP connection to `host_port`, with no delay, and the address it
+/// reached.
+pub(super) fn dial(host_port: &str) -> Result<(TcpStream, SocketAddr), StoreError> {
+    let stream = TcpStream::connect(host_port)
         .map_err(|err| backend(format!("connect {host_port}: {err}")))?;
     let peer = stream
         .peer_addr()
         .map_err(|err| backend(format!("peer address of {host_port}: {err}")))?;
-    admit(peer)?;
     stream
         .set_nodelay(true)
         .map_err(|err| backend(format!("set nodelay: {err}")))?;
+    Ok((stream, peer))
+}
+
+/// Send the upgrade request for `path` on `stream` and check the answer.
+pub(super) fn upgrade<S: Read + Write>(
+    stream: &mut S,
+    host_port: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<(), StoreError> {
+    check_bearer(bearer)?;
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let sec_key = base64_encode(&key_bytes);
@@ -76,14 +102,13 @@ pub(super) fn connect(
     stream
         .write_all(req.as_bytes())
         .map_err(|err| backend(format!("write handshake: {err}")))?;
-    let headers = read_headers(&mut stream)?;
-    check_accept(&headers, &sec_key)?;
-    Ok(stream)
+    let headers = read_headers(stream)?;
+    check_accept(&headers, &sec_key)
 }
 
 /// Read and answer the client's upgrade. Returns the values of its
 /// `Authorization` headers, for the caller to judge (spec §6.2).
-pub(super) fn accept(stream: &mut TcpStream) -> Result<Vec<String>, StoreError> {
+pub(super) fn accept<S: Read + Write>(stream: &mut S) -> Result<Vec<String>, StoreError> {
     let text = read_headers(stream)?;
     let mut lines = text.split("\r\n");
     let start = lines.next().unwrap_or("");
@@ -139,8 +164,8 @@ pub(super) fn accept(stream: &mut TcpStream) -> Result<Vec<String>, StoreError> 
 
 /// The next data frame, ping or close. A frame that declares a payload
 /// longer than `max_len` is refused before anything is allocated for it.
-pub(super) fn read_event(
-    stream: &mut TcpStream,
+pub(super) fn read_event<S: Read>(
+    stream: &mut S,
     client: bool,
     max_len: usize,
 ) -> Result<WsEvent, StoreError> {
@@ -158,8 +183,8 @@ pub(super) fn read_event(
     }
 }
 
-pub(super) fn write_frame(
-    stream: &mut TcpStream,
+pub(super) fn write_frame<S: Write>(
+    stream: &mut S,
     client: bool,
     opcode: u8,
     payload: &[u8],
@@ -208,7 +233,7 @@ pub(super) fn too_long(max_len: usize) -> StoreError {
     }
 }
 
-fn read_raw(stream: &mut TcpStream, client: bool, max_len: usize) -> Result<RawFrame, StoreError> {
+fn read_raw<S: Read>(stream: &mut S, client: bool, max_len: usize) -> Result<RawFrame, StoreError> {
     let max_len = max_len.min(MAX_PAYLOAD);
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).map_err(backend)?;
@@ -262,17 +287,24 @@ fn read_raw(stream: &mut TcpStream, client: bool, max_len: usize) -> Result<RawF
     Ok(RawFrame { opcode, payload })
 }
 
-fn split_target(rest: &str) -> Result<(&str, String), StoreError> {
+/// `rest` (`host:port[/path]`) as its `host:port` and its path (`/` when
+/// none). `scheme` (`ws` or `wss`) names the URI in an error.
+pub(super) fn split_target<'a>(
+    scheme: &str,
+    rest: &'a str,
+) -> Result<(&'a str, String), StoreError> {
     if rest.is_empty() {
-        return Err(backend("ws uri is missing a host"));
+        return Err(backend(format!("{scheme} uri is missing a host")));
     }
     let (host_port, path) = match rest.find('/') {
-        Some(0) => return Err(backend("ws uri is missing a host")),
+        Some(0) => return Err(backend(format!("{scheme} uri is missing a host"))),
         Some(index) => (&rest[..index], rest[index..].to_string()),
         None => (rest, "/".to_string()),
     };
     if !host_has_port(host_port) {
-        return Err(backend(format!("ws uri `{host_port}` is missing a port")));
+        return Err(backend(format!(
+            "{scheme} uri `{host_port}` is missing a port"
+        )));
     }
     Ok((host_port, path))
 }
@@ -312,7 +344,7 @@ fn header_has_token(value: &str, token: &str) -> bool {
 /// asks for as many bytes as cannot reach past the end (up to 4), not one
 /// at a time. The server bounds the whole handshake in time
 /// ([`super::auth::HANDSHAKE_DEADLINE`]), so a peer that trickles is cut off.
-fn read_headers(stream: &mut TcpStream) -> Result<String, StoreError> {
+fn read_headers<S: Read>(stream: &mut S) -> Result<String, StoreError> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; HEADER_END.len()];
     while buf.len() < MAX_HEADER_BYTES {
