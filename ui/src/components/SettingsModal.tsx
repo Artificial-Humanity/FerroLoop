@@ -42,6 +42,7 @@ export interface SettingsModalProps {
   ) => Promise<unknown>;
   onBulkSessionAction?: (
     action: BulkSessionAction,
+    selectedAgentKeys?: string[],
   ) => Promise<BulkSessionActionResponse>;
   onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
@@ -72,6 +73,12 @@ const ACTION_LABELS: Record<BulkSessionAction, string> = {
   reforge: "Reforge All",
 };
 
+const ACTION_VERBS: Record<BulkSessionAction, string> = {
+  compact: "Compact",
+  clear: "Clear",
+  reforge: "Reforge",
+};
+
 const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
   compact:
     "Send /compact to every active session across the workspace fleet.",
@@ -80,6 +87,54 @@ const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
   reforge:
     "Clear conversation context and immediately re-prime every active session with its registered identity, project, and role prompt.",
 };
+
+export function getBulkActionLabel(
+  action: BulkSessionAction,
+  selectedCount: number,
+): string {
+  if (selectedCount > 0) {
+    return `${ACTION_VERBS[action]} Selected (${selectedCount})`;
+  }
+  return ACTION_LABELS[action];
+}
+
+export async function executeScopedBulkSessionAction(
+  client: HubApiClient,
+  action: BulkSessionAction,
+  selectedAgentKeys?: string[],
+): Promise<BulkSessionActionResponse> {
+  if (!selectedAgentKeys || selectedAgentKeys.length === 0) {
+    return client.bulkSessionAction(action);
+  }
+  const results = await Promise.all(
+    selectedAgentKeys.map(async (sessionId) => {
+      try {
+        if (action === "compact") {
+          await client.sendSessionPrompt(sessionId, {
+            prompt: "/compact",
+            send_now: true,
+          });
+        } else {
+          await client.clearSession(sessionId, action);
+        }
+        return { session_id: sessionId, ok: true, error: null };
+      } catch (err) {
+        return {
+          session_id: sessionId,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }),
+  );
+  const succeeded = results.filter((r) => r.ok).length;
+  return {
+    action,
+    total: results.length,
+    succeeded,
+    results,
+  };
+}
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
@@ -187,9 +242,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setRecastReplaceLeadArmed({});
     setSelectedAgentKeys(new Set());
     setSelectedProjectFilter(initialProject || "all");
-    if (initialProject) {
-      setActiveTab("agents");
-    }
+    setActiveTab(initialProject ? "agents" : initialTab);
     setTotpEnrollment(null);
     setTotpVerifyCode("");
     setTotpVerified(false);
@@ -611,15 +664,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!armedAction || submitting) return;
     setSubmitting(true);
     setError(null);
+    const selectedKeys =
+      selectedAgentKeys.size > 0 ? Array.from(selectedAgentKeys) : undefined;
     try {
       let res: BulkSessionActionResponse;
       if (onBulkSessionAction) {
-        res = await onBulkSessionAction(armedAction);
-      } else if (apiClient) {
-        res = await apiClient.bulkSessionAction(armedAction);
+        res = selectedKeys
+          ? await onBulkSessionAction(armedAction, selectedKeys)
+          : await onBulkSessionAction(armedAction);
       } else {
-        const client = new HubApiClient();
-        res = await client.bulkSessionAction(armedAction);
+        const client = apiClient ?? new HubApiClient();
+        res = await executeScopedBulkSessionAction(
+          client,
+          armedAction,
+          selectedKeys,
+        );
       }
       setLastResult(res);
       setArmedAction(null);
@@ -1403,8 +1462,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 }}
               >
                 <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
-                  <strong>Confirm {ACTION_LABELS[armedAction]}:</strong>{" "}
-                  {ACTION_DESCRIPTIONS[armedAction]}
+                  <strong>
+                    Confirm{" "}
+                    {getBulkActionLabel(armedAction, selectedAgentKeys.size)}:
+                  </strong>{" "}
+                  {selectedAgentKeys.size > 0
+                    ? `Execute ${armedAction} across the ${selectedAgentKeys.size} selected agent session${selectedAgentKeys.size === 1 ? "" : "s"} (${Array.from(selectedAgentKeys).join(", ")}).`
+                    : ACTION_DESCRIPTIONS[armedAction]}
                 </div>
                 <div
                   style={{
@@ -1436,7 +1500,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {submitting
                       ? "Running..."
-                      : `Confirm ${ACTION_LABELS[armedAction]}`}
+                      : `Confirm ${getBulkActionLabel(armedAction, selectedAgentKeys.size)}`}
                   </button>
                 </div>
               </div>

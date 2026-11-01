@@ -489,7 +489,8 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
       )}
 
-      {toolCalls.length > 0 && (
+      {(toolCalls.length > 0 ||
+        (attachedToolOutputs && attachedToolOutputs.length > 0)) && (
         <div
           data-testid={`turn-tools-${turn.index}`}
           style={{ display: "flex", flexDirection: "column", gap: "4px" }}
@@ -501,97 +502,97 @@ export const TurnCard: React.FC<TurnCardProps> = ({
               index={idx}
             />
           ))}
-        </div>
-      )}
 
-      {attachedToolOutputs && attachedToolOutputs.length > 0 && (
-        <div
-          data-testid={`turn-attached-tool-outputs-${turn.index}`}
-          style={{ display: "flex", flexDirection: "column", gap: "4px" }}
-        >
-          {attachedToolOutputs.map((outTurn) => {
-            const { cleanedContent: outCleaned } = extractTurnAttachments(
-              outTurn.content,
-              { stripAgyWrapper: false },
-            );
-            const outText = outCleaned || outTurn.content || "";
-            const outSummary = summarizeToolOutputContent(outText);
-            const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
-            return (
-              <div
-                key={`attached-tool-output-${outTurn.index}`}
-                data-testid={`turn-content-${outTurn.index}`}
-                style={{
-                  borderRadius: "var(--radius-sm)",
-                  border: "1px solid var(--border-subtle)",
-                  backgroundColor: "rgba(13, 17, 24, 0.65)",
-                  overflow: "hidden",
-                }}
-              >
-                <button
-                  type="button"
-                  data-testid={`turn-tool-output-toggle-${outTurn.index}`}
-                  aria-expanded={outExpanded}
-                  onClick={() =>
-                    setExpandedAttachedToolOutputs((prev) => ({
-                      ...prev,
-                      [outTurn.index]: !prev[outTurn.index],
-                    }))
-                  }
-                  style={{
-                    width: "100%",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    padding: "6px 10px",
-                    background: "transparent",
-                    border: "none",
-                    color: "var(--text-secondary)",
-                    cursor: "pointer",
-                    fontSize: "11px",
-                    textAlign: "left",
-                  }}
-                >
-                  <span
-                    className="fd-mono"
-                    style={{ display: "flex", alignItems: "center", gap: "6px" }}
-                  >
-                    <span
-                      data-testid={`turn-tool-output-arrow-${outTurn.index}`}
-                      style={{ color: "var(--status-warn, #F59E0B)" }}
-                    >
-                      {outExpanded ? "▼" : "▶"}
-                    </span>
-                    <span>{outSummary}</span>
-                  </span>
-                  <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
-                    {outExpanded ? "Hide output" : "Show output"}
-                  </span>
-                </button>
-
-                {outExpanded && (
-                  <pre
-                    className="fd-mono"
+          {attachedToolOutputs && attachedToolOutputs.length > 0 && (
+            <div
+              data-testid={`turn-attached-tool-outputs-${turn.index}`}
+              style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+            >
+              {attachedToolOutputs.map((outTurn) => {
+                const { cleanedContent: outCleaned } = extractTurnAttachments(
+                  outTurn.content,
+                  { stripAgyWrapper: false },
+                );
+                const outText = outCleaned || outTurn.content || "";
+                const outSummary = summarizeToolOutputContent(outText);
+                const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
+                return (
+                  <div
+                    key={`attached-tool-output-${outTurn.index}`}
+                    data-testid={`turn-content-${outTurn.index}`}
                     style={{
-                      margin: 0,
-                      padding: "10px 12px",
-                      borderTop: "1px solid var(--border-subtle)",
-                      fontSize: "11.5px",
-                      lineHeight: 1.45,
-                      color: "var(--text-secondary)",
-                      whiteSpace: "pre-wrap",
-                      wordBreak: "break-word",
-                      maxHeight: "340px",
-                      overflowY: "auto",
+                      borderRadius: "var(--radius-sm)",
+                      border: "1px solid var(--border-subtle)",
+                      backgroundColor: "rgba(13, 17, 24, 0.65)",
+                      overflow: "hidden",
                     }}
                   >
-                    {outText}
-                  </pre>
-                )}
-              </div>
-            );
-          })}
+                    <button
+                      type="button"
+                      data-testid={`turn-tool-output-toggle-${outTurn.index}`}
+                      aria-expanded={outExpanded}
+                      onClick={() =>
+                        setExpandedAttachedToolOutputs((prev) => ({
+                          ...prev,
+                          [outTurn.index]: !prev[outTurn.index],
+                        }))
+                      }
+                      style={{
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        padding: "6px 10px",
+                        background: "transparent",
+                        border: "none",
+                        color: "var(--text-secondary)",
+                        cursor: "pointer",
+                        fontSize: "11px",
+                        textAlign: "left",
+                      }}
+                    >
+                      <span
+                        className="fd-mono"
+                        style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                      >
+                        <span
+                          data-testid={`turn-tool-output-arrow-${outTurn.index}`}
+                          style={{ color: "var(--status-warn, #F59E0B)" }}
+                        >
+                          {outExpanded ? "▼" : "▶"}
+                        </span>
+                        <span>{outSummary}</span>
+                      </span>
+                      <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+                        {outExpanded ? "Hide output" : "Show output"}
+                      </span>
+                    </button>
+
+                    {outExpanded && (
+                      <pre
+                        className="fd-mono"
+                        style={{
+                          margin: 0,
+                          padding: "10px 12px",
+                          borderTop: "1px solid var(--border-subtle)",
+                          fontSize: "11.5px",
+                          lineHeight: 1.45,
+                          color: "var(--text-secondary)",
+                          whiteSpace: "pre-wrap",
+                          wordBreak: "break-word",
+                          maxHeight: "340px",
+                          overflowY: "auto",
+                        }}
+                      >
+                        {outText}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

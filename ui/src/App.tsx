@@ -17,7 +17,10 @@ import { PairingModal } from "./components/PairingModal";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
-import { SettingsModal } from "./components/SettingsModal";
+import {
+  SettingsModal,
+  executeScopedBulkSessionAction,
+} from "./components/SettingsModal";
 import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
@@ -1261,8 +1264,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return res;
   };
 
-  const handleBulkSessionAction = async (action: BulkSessionAction) => {
-    const res = await apiClient.bulkSessionAction(action);
+  const handleBulkSessionAction = async (
+    action: BulkSessionAction,
+    selectedAgentKeys?: string[],
+  ) => {
+    const res = await executeScopedBulkSessionAction(
+      apiClient,
+      action,
+      selectedAgentKeys,
+    );
     await Promise.all([
       refreshWireAndRoster(),
       refreshSessionsAndTranscript(),

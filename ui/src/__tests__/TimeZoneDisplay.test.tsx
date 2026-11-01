@@ -303,6 +303,8 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
         headers: { "Content-Type": "application/json" },
       });
     const recastRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const sessionClearRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const bulkActionRequests: Array<{ url: string; body: Record<string, unknown> }> = [];
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const method = (init?.method ?? "GET").toUpperCase();
@@ -327,6 +329,16 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       }
       if (url.endsWith("/api/v1/cloud/adapters")) {
         return json({ adapters: [] });
+      }
+      if (url.endsWith("/api/v1/sessions/bulk-action") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        bulkActionRequests.push({ url, body });
+        return json({ action: body.action ?? "reforge", total: 2, succeeded: 2, results: [] });
+      }
+      if (url.endsWith("/api/v1/sessions/felix/clear") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        sessionClearRequests.push({ url, body });
+        return json({ status: "ok", mode: body.mode ?? "reforge" });
       }
       if (url.endsWith("/api/v1/agents/felix/recast") && method === "POST") {
         const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
@@ -423,6 +435,18 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact Selected (1)");
     expect(screen.getByTestId("bulk-clear-btn")).toHaveTextContent("Clear Selected (1)");
     expect(screen.getByTestId("bulk-reforge-btn")).toHaveTextContent("Reforge Selected (1)");
+
+    // Confirming Reforge Selected (1) executes ONLY for selected agent (felix) and does NOT call /api/v1/sessions/bulk-action
+    fireEvent.click(screen.getByTestId("bulk-reforge-btn"));
+    expect(screen.getByTestId("bulk-confirm-btn")).toHaveTextContent(
+      "Confirm Reforge Selected (1)",
+    );
+    fireEvent.click(screen.getByTestId("bulk-confirm-btn"));
+    await waitFor(() => {
+      expect(sessionClearRequests.length).toBe(1);
+      expect(sessionClearRequests[0].body.mode).toBe("reforge");
+      expect(bulkActionRequests.length).toBe(0);
+    });
 
     // Select All (2) -> Clear Selection
     fireEvent.click(screen.getByTestId("settings-agents-select-all-btn"));
