@@ -1272,6 +1272,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       apiClient,
       action,
       selectedAgentKeys,
+      agents.map((a) => a.name_key.toLowerCase()),
     );
     await Promise.all([
       refreshWireAndRoster(),
@@ -1434,6 +1435,38 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     [nodes],
   );
 
+  const handleOpenAgentSettingsFor = useCallback(
+    (nameKey?: string) => {
+      if (nameKey) {
+        const nextKey = nameKey.trim().toLowerCase();
+        if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+          selectedAgentNameRef.current = nameKey;
+          selectedSessionIdRef.current = null;
+          setTranscriptTurns(backgroundTranscriptsRef.current[nextKey] ?? []);
+          setSessionQueue([]);
+          setIsSessionBusy(false);
+          setSessionContextUsage(null);
+          setSessionQuotaUsage(null);
+        }
+        setSelectedAgentName(nameKey);
+        setSelectedSessionId(null);
+      }
+      if (!splitView && activeTab !== "chat") {
+        setActiveTab("chat");
+      }
+      setAgentSettingsOpen(true);
+    },
+    [splitView, activeTab],
+  );
+
+  const handleToggleSplitView = useCallback(() => {
+    setSplitView((prev) => {
+      const next = !prev;
+      setActiveTab(next ? secondaryTab : "chat");
+      return next;
+    });
+  }, [secondaryTab]);
+
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
       <RosterSidebar
@@ -1457,16 +1490,21 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSelectedSessionId(null);
           setMobileRosterOpen(false);
         }}
-        onOpenAgentSettings={() => {
-          if (!splitView && activeTab !== "chat") {
-            setActiveTab("chat");
-          }
-          setAgentSettingsOpen(true);
-        }}
+        onOpenAgentSettings={(nameKey) => handleOpenAgentSettingsFor(nameKey)}
         onOpenProjectSettings={(project) => {
           setSettingsInitialProject(project);
           setSettingsModalOpen(true);
         }}
+        onOpenSettingsModal={() => {
+          setSettingsInitialProject(null);
+          setSettingsModalOpen(true);
+        }}
+        onOpenHelpModal={() => {
+          setHelpTopic(activeTab);
+          setHelpDrawerOpen(true);
+        }}
+        themeMode={themeMode}
+        onToggleTheme={handleToggleTheme}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
         isCollapsedDesktop={desktopSidebarCollapsed}
@@ -1492,13 +1530,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           activeTab={activeTab}
           onSelectTab={handleSelectTab}
           splitView={splitView}
-          onToggleSplitView={() => {
-            setSplitView((prev) => {
-              const next = !prev;
-              setActiveTab(next ? secondaryTab : "chat");
-              return next;
-            });
-          }}
+          onToggleSplitView={handleToggleSplitView}
           themeMode={themeMode}
           onToggleTheme={handleToggleTheme}
           authority={authority}
@@ -1513,12 +1545,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             setHelpTopic(tab ?? activeTab);
             setHelpDrawerOpen(true);
           }}
-          onOpenAgentSettings={() => {
-            if (!splitView && activeTab !== "chat") {
-              setActiveTab("chat");
-            }
-            setAgentSettingsOpen(true);
-          }}
+          onOpenAgentSettings={() => handleOpenAgentSettingsFor()}
           onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
@@ -1554,7 +1581,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onOpenAgentSettings={() => setAgentSettingsOpen(true)}
             onCloseAgentSettings={() => setAgentSettingsOpen(false)}
             onToggleArtifacts={() => handleSelectTab("artifacts")}
-            onRefresh={() => void refreshSessionsAndTranscript()}
+            splitView={splitView}
+            onToggleSplitView={handleToggleSplitView}
+            onRefresh={() => {
+              void refreshSessionsAndTranscript();
+              void refreshWireAndRoster();
+            }}
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
             onCancelQueued={handleCancelQueued}
@@ -1652,6 +1684,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         onOpenNodesModal={() => setNodesModalOpen(true)}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         onOpenPairingModal={() => setPairingOpen(true)}
+        onOpenAgentSettings={(nameKey) => {
+          setSettingsModalOpen(false);
+          setSettingsInitialProject(null);
+          handleOpenAgentSettingsFor(nameKey);
+        }}
         onLogout={handleLogout}
         onAgentsUpdated={() => void refreshWireAndRoster()}
         onDecommissionAgent={async (targetId, mode) => {

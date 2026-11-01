@@ -241,7 +241,7 @@ describe("estimateSessionContextUsage", () => {
 
 describe("Compact Context button", () => {
   it("shows the meter and keeps compact disabled below 50%", () => {
-    render(
+    const { rerender } = render(
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
@@ -253,7 +253,17 @@ describe("Compact Context button", () => {
     );
 
     expect(screen.queryByTestId("context-level-meter")).toBeNull();
-    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="claude"
+        sessionId="sess-ferris-01"
+        turns={[turn({ index: 0, role: "user", content: "Hello" })]}
+        agentSettingsOpen={true}
+        onSendPrompt={vi.fn()}
+      />,
+    );
     expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/Context:/);
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).toBeDisabled();
@@ -293,12 +303,12 @@ describe("Compact Context button", () => {
         adapter={null}
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
+        agentSettingsOpen={true}
         onSendPrompt={onSendPrompt}
         apiClient={apiClient}
       />,
     );
 
-    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/51%/);
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).not.toBeDisabled();
@@ -331,12 +341,12 @@ describe("Compact Context button", () => {
         adapter={null}
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
+        agentSettingsOpen={true}
         onSendPrompt={onSendPrompt}
         apiClient={apiClient}
       />,
     );
 
-    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     fireEvent.click(screen.getByTestId("compact-context-btn"));
 
     await waitFor(() => {
@@ -685,12 +695,14 @@ describe("App theme toggle", () => {
     expect(document.documentElement.dataset.theme).toBe("dark");
     // Applying the system-derived default must not persist it.
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
-    expect(toggle).toHaveTextContent(/Light/);
+    expect(toggle).toHaveTextContent("☀");
+    expect(toggle).toHaveAttribute("title", "Switch to light theme");
 
     fireEvent.click(toggle);
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
-    expect(toggle).toHaveTextContent(/Dark/);
+    expect(toggle).toHaveTextContent("☾");
+    expect(toggle).toHaveAttribute("title", "Switch to dark theme");
 
     fireEvent.click(toggle);
     expect(document.documentElement.dataset.theme).toBe("dark");

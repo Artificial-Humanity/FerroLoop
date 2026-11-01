@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   resolveLivenessState,
@@ -8,6 +8,94 @@ import {
 } from "../types/api";
 
 export const COLLAPSED_PROJECTS_STORAGE_KEY = "fd_collapsed_projects";
+export const PINNED_PROJECTS_STORAGE_KEY = "fd_pinned_projects";
+export const PINNED_AGENTS_STORAGE_KEY = "fd_pinned_agents";
+
+const pinListeners = new Set<() => void>();
+
+function readStorageStringSet(storageKey: string): Set<string> {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const raw = window.localStorage.getItem(storageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return new Set(parsed.map((item) => String(item).trim().toLowerCase()).filter(Boolean));
+        }
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return new Set();
+}
+
+function writeStorageStringSet(storageKey: string, values: Set<string>): void {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(storageKey, JSON.stringify(Array.from(values)));
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  for (const listener of pinListeners) {
+    listener();
+  }
+}
+
+export function readPinnedProjects(): Set<string> {
+  return readStorageStringSet(PINNED_PROJECTS_STORAGE_KEY);
+}
+
+export function readPinnedAgents(): Set<string> {
+  return readStorageStringSet(PINNED_AGENTS_STORAGE_KEY);
+}
+
+export function togglePinnedProject(project: string): boolean {
+  const key = project.trim().toLowerCase();
+  if (!key) return false;
+  const next = readPinnedProjects();
+  const pinned = !next.has(key);
+  if (pinned) {
+    next.add(key);
+  } else {
+    next.delete(key);
+  }
+  writeStorageStringSet(PINNED_PROJECTS_STORAGE_KEY, next);
+  return pinned;
+}
+
+export function togglePinnedAgent(agentKey: string): boolean {
+  const key = agentKey.trim().toLowerCase();
+  if (!key) return false;
+  const next = readPinnedAgents();
+  const pinned = !next.has(key);
+  if (pinned) {
+    next.add(key);
+  } else {
+    next.delete(key);
+  }
+  writeStorageStringSet(PINNED_AGENTS_STORAGE_KEY, next);
+  return pinned;
+}
+
+export function usePinnedState(): {
+  pinnedProjects: Set<string>;
+  pinnedAgents: Set<string>;
+} {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const onChange = () => setTick((t) => t + 1);
+    pinListeners.add(onChange);
+    return () => {
+      pinListeners.delete(onChange);
+    };
+  }, []);
+  return {
+    pinnedProjects: readPinnedProjects(),
+    pinnedAgents: readPinnedAgents(),
+  };
+}
 
 export interface RosterSidebarProps {
   agents: AgentRecord[];
@@ -18,6 +106,10 @@ export interface RosterSidebarProps {
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
   onOpenProjectSettings?: (project: string) => void;
+  onOpenSettingsModal?: () => void;
+  onOpenHelpModal?: () => void;
+  themeMode?: "dark" | "light";
+  onToggleTheme?: () => void;
   onOpenSpinUpModal?: () => void;
   isOpen?: boolean;
   isCollapsedDesktop?: boolean;
@@ -73,12 +165,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onSelectAgent,
   onOpenAgentSettings,
   onOpenProjectSettings,
+  onOpenSettingsModal,
+  onOpenHelpModal,
+  themeMode = "dark",
+  onToggleTheme,
   onOpenSpinUpModal,
   isOpen = false,
   isCollapsedDesktop = false,
   onClose,
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
+  const { pinnedProjects, pinnedAgents } = usePinnedState();
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => {
     try {
       if (typeof window !== "undefined" && window.localStorage) {
@@ -209,8 +306,27 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
       groups.set(proj, list);
     }
 
-    return Array.from(groups.entries()).filter(([, list]) => list.length > 0);
-  }, [enrichedAgents, searchQuery]);
+    const entries = Array.from(groups.entries())
+      .filter(([, list]) => list.length > 0)
+      .map(([proj, list]) => {
+        const sortedList = [...list].sort((a, b) => {
+          const aPinned = pinnedAgents.has(a.record.name_key.trim().toLowerCase());
+          const bPinned = pinnedAgents.has(b.record.name_key.trim().toLowerCase());
+          if (aPinned !== bPinned) return aPinned ? -1 : 1;
+          return a.record.display_name.localeCompare(b.record.display_name);
+        });
+        return [proj, sortedList] as [string, EnrichedAgent[]];
+      });
+
+    entries.sort(([projA], [projB]) => {
+      const aPinned = pinnedProjects.has(projA.trim().toLowerCase());
+      const bPinned = pinnedProjects.has(projB.trim().toLowerCase());
+      if (aPinned !== bPinned) return aPinned ? -1 : 1;
+      return projA.localeCompare(projB);
+    });
+
+    return entries;
+  }, [enrichedAgents, searchQuery, pinnedProjects, pinnedAgents]);
 
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
 
@@ -311,6 +427,48 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           </div>
         </div>
 
+        <div
+          data-testid="roster-global-controls"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+          }}
+        >
+          <button
+            type="button"
+            data-testid="settings-modal-btn"
+            className="fd-btn"
+            onClick={() => onOpenSettingsModal?.()}
+            title="Open Settings (Agents, System, Auth)"
+            style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
+          >
+            ⚙ Settings
+          </button>
+          <button
+            type="button"
+            data-testid="context-help-btn"
+            aria-label="Open Contextual Help"
+            title="Contextual Help for current view"
+            className="fd-btn fd-help-icon-btn"
+            onClick={() => onOpenHelpModal?.()}
+            style={{ padding: "4px 8px", fontSize: "11.5px" }}
+          >
+            ?
+          </button>
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="theme-toggle-btn"
+            onClick={() => onToggleTheme?.()}
+            title={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            aria-label={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            style={{ padding: "4px 8px", fontSize: "12px" }}
+          >
+            {themeMode === "dark" ? "☀" : "☾"}
+          </button>
+        </div>
+
         <input
           type="search"
           className="fd-input"
@@ -337,10 +495,16 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           groupedByProject.map(([project, items]) => {
             const projectLower = project.toLowerCase();
             const isGroupCollapsed = collapsedProjects.has(projectLower);
+            const isGroupPinned = pinnedProjects.has(projectLower);
             const projectUnread = items.reduce((sum, a) => sum + a.unreadCount, 0);
 
             return (
-              <div key={project} style={{ marginBottom: "14px" }}>
+              <div
+                key={project}
+                data-testid={`project-group-${projectLower}`}
+                data-pinned={isGroupPinned ? "true" : "false"}
+                style={{ marginBottom: "14px" }}
+              >
                 <div
                   style={{
                     padding: "4px 8px",
@@ -381,6 +545,15 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     <span style={{ fontSize: "10px", width: "10px", display: "inline-block" }}>
                       {isGroupCollapsed ? "▸" : "▾"}
                     </span>
+                    {isGroupPinned && (
+                      <span
+                        data-testid={`project-pinned-indicator-${projectLower}`}
+                        title="Pinned Project"
+                        style={{ fontSize: "10px" }}
+                      >
+                        📌
+                      </span>
+                    )}
                     <span
                       style={{
                         overflow: "hidden",
@@ -441,6 +614,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     {items.map(({ record, livenessState, adapter, unreadCount }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
+                      const isAgentPinned = pinnedAgents.has(key);
                       const dotClass =
                         livenessState === "alive"
                           ? "fd-dot fd-dot-alive"
@@ -454,6 +628,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           role="button"
                           tabIndex={0}
                           data-testid={`agent-row-${key}`}
+                          data-pinned={isAgentPinned ? "true" : "false"}
                           onClick={() => {
                             onSelectAgent(record.name_key);
                             onClose?.();
@@ -498,6 +673,15 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               <span style={{ fontWeight: 600, fontSize: "13px" }}>
                                 {record.display_name}
                               </span>
+                              {isAgentPinned && (
+                                <span
+                                  data-testid={`agent-pinned-indicator-${key}`}
+                                  title="Pinned Agent"
+                                  style={{ fontSize: "11px" }}
+                                >
+                                  📌
+                                </span>
+                              )}
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>

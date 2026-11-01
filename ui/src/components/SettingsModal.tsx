@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
+import { togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -34,6 +35,7 @@ export interface SettingsModalProps {
   onOpenNodesModal?: () => void;
   onOpenSpinUpModal?: () => void;
   onOpenPairingModal?: () => void;
+  onOpenAgentSettings?: (nameKey: string) => void;
   onLogout?: () => void;
   onAgentsUpdated?: () => void;
   onDecommissionAgent?: (
@@ -48,7 +50,7 @@ export interface SettingsModalProps {
   apiClient?: HubApiClient;
 }
 
-const CANONICAL_PROJECTS = [
+export const CANONICAL_PROJECTS = [
   "AI-Lab-AMD",
   "FerroLoop",
   "Kaggle-Gemma4",
@@ -59,7 +61,9 @@ const CANONICAL_PROJECTS = [
   "Workspace",
 ];
 
-const RECAST_ROLE_OPTIONS = [
+export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
+
+export const RECAST_ROLE_OPTIONS = [
   { value: "lead", label: "lead" },
   { value: "assistant", label: "assistant" },
   { value: "lab_manager", label: "lab_manager" },
@@ -67,16 +71,75 @@ const RECAST_ROLE_OPTIONS = [
   { value: "custom:scribe", label: "custom:scribe" },
 ];
 
+export function normalizeRecastRole(
+  selectedRole: string,
+  customRoleInput: string,
+): string {
+  if (selectedRole === CREATE_CUSTOM_ROLE_VALUE) {
+    const clean = customRoleInput.trim();
+    if (!clean) return "assistant";
+    return clean.startsWith("custom:") ? clean : `custom:${clean}`;
+  }
+  return selectedRole;
+}
+
+export interface RecastConflictState {
+  message: string;
+  replaceLead: boolean;
+  createArea: boolean;
+}
+
+export function extractRecastConflict(
+  errOrRes: HubApiError | { retires_lead?: string | null; creates_areas?: string[] },
+): RecastConflictState {
+  if (errOrRes instanceof HubApiError) {
+    const details = errOrRes.details ?? {};
+    const msg = (errOrRes.message || "").toLowerCase();
+    const hasLead =
+      Boolean(details.current_lead) ||
+      Boolean(details.retires_lead) ||
+      msg.includes("lead");
+    const hasArea =
+      (Array.isArray(details.missing_areas) && details.missing_areas.length > 0) ||
+      (Array.isArray(details.creates_areas) && details.creates_areas.length > 0) ||
+      msg.includes("area");
+    return {
+      message: errOrRes.message || "existing Lead",
+      replaceLead: hasLead || (!hasLead && !hasArea),
+      createArea: hasArea,
+    };
+  }
+  const hasLead = Boolean(errOrRes.retires_lead);
+  const hasArea =
+    Array.isArray(errOrRes.creates_areas) && errOrRes.creates_areas.length > 0;
+  const warningParts: string[] = [];
+  if (errOrRes.retires_lead) {
+    warningParts.push(`retires active Lead (${errOrRes.retires_lead})`);
+  }
+  if (hasArea && errOrRes.creates_areas) {
+    warningParts.push(`creates area (${errOrRes.creates_areas.join(", ")})`);
+  }
+  return {
+    message: warningParts.join("; ") || "existing Lead",
+    replaceLead: hasLead || (!hasLead && !hasArea),
+    createArea: hasArea,
+  };
+}
+
 const ACTION_LABELS: Record<BulkSessionAction, string> = {
   compact: "Compact All",
   clear: "Clear All",
   reforge: "Reforge All",
+  prepare: "Prepare All",
+  teardown: "Tear Down All",
 };
 
 const ACTION_VERBS: Record<BulkSessionAction, string> = {
   compact: "Compact",
   clear: "Clear",
   reforge: "Reforge",
+  prepare: "Prepare",
+  teardown: "Tear Down",
 };
 
 const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
@@ -86,6 +149,10 @@ const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
     "Clear conversation context across all active sessions, leaving each session blank.",
   reforge:
     "Clear conversation context and immediately re-prime every active session with its registered identity, project, and role prompt.",
+  prepare:
+    "Send a pre-decommission state and worktree hygiene handshake prompt to every active session across the fleet.",
+  teardown:
+    "Immediately stop every active runtime session, clear queues and routes, and unregister each persona.",
 };
 
 export function getBulkActionLabel(
@@ -102,18 +169,31 @@ export async function executeScopedBulkSessionAction(
   client: HubApiClient,
   action: BulkSessionAction,
   selectedAgentKeys?: string[],
+  fallbackAgentKeys?: string[],
 ): Promise<BulkSessionActionResponse> {
-  if (!selectedAgentKeys || selectedAgentKeys.length === 0) {
+  if (
+    (!selectedAgentKeys || selectedAgentKeys.length === 0) &&
+    action !== "prepare" &&
+    action !== "teardown"
+  ) {
     return client.bulkSessionAction(action);
   }
+  const targetKeys =
+    selectedAgentKeys && selectedAgentKeys.length > 0
+      ? selectedAgentKeys
+      : fallbackAgentKeys && fallbackAgentKeys.length > 0
+        ? fallbackAgentKeys
+        : DEFAULT_WORKSPACE_AGENTS.map((a) => a.name_key.toLowerCase());
   const results = await Promise.all(
-    selectedAgentKeys.map(async (sessionId) => {
+    targetKeys.map(async (sessionId) => {
       try {
         if (action === "compact") {
           await client.sendSessionPrompt(sessionId, {
             prompt: "/compact",
             send_now: true,
           });
+        } else if (action === "prepare" || action === "teardown") {
+          await client.decommissionSession(sessionId, action);
         } else {
           await client.clearSession(sessionId, action);
         }
@@ -150,6 +230,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenNodesModal,
   onOpenSpinUpModal,
   onOpenPairingModal,
+  onOpenAgentSettings,
   onLogout,
   onAgentsUpdated,
   onDecommissionAgent,
@@ -158,6 +239,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   apiClient,
 }) => {
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const { pinnedProjects } = usePinnedState();
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
     initialProject || "all",
   );
@@ -175,16 +257,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [recastDrafts, setRecastDrafts] = useState<
     Record<string, { project: string; role: string }>
   >({});
-  const [recastReplaceLeadArmed, setRecastReplaceLeadArmed] = useState<
+  const [recastCustomRoleInputs, setRecastCustomRoleInputs] = useState<
     Record<string, string>
+  >({});
+  const [recastModalAgentKey, setRecastModalAgentKey] = useState<string | null>(
+    null,
+  );
+  const [recastReplaceLeadArmed, setRecastReplaceLeadArmed] = useState<
+    Record<string, RecastConflictState>
   >({});
   const [recastingAgentKey, setRecastingAgentKey] = useState<string | null>(
     null,
   );
   const [recastStatusBanner, setRecastStatusBanner] = useState<string | null>(
-    null,
-  );
-  const [decommissioningKey, setDecommissioningKey] = useState<string | null>(
     null,
   );
 
@@ -240,6 +325,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setCloudAdaptersSaved(false);
     setRecastStatusBanner(null);
     setRecastReplaceLeadArmed({});
+    setRecastModalAgentKey(null);
     setSelectedAgentKeys(new Set());
     setSelectedProjectFilter(initialProject || "all");
     setActiveTab(initialProject ? "agents" : initialTab);
@@ -305,18 +391,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
-      if (
-        event.key === "Escape" &&
-        !submitting &&
-        !savingSettings &&
-        !savingCloudAdapters
-      ) {
+      if (event.key !== "Escape") return;
+      if (recastModalAgentKey) {
+        if (!recastingAgentKey) {
+          setRecastModalAgentKey(null);
+        }
+        return;
+      }
+      if (!submitting && !savingSettings && !savingCloudAdapters) {
         onClose();
       }
     };
     window.addEventListener("keydown", handleKeyDownEscape);
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
-  }, [isOpen, submitting, savingSettings, savingCloudAdapters, onClose]);
+  }, [
+    isOpen,
+    recastModalAgentKey,
+    recastingAgentKey,
+    submitting,
+    savingSettings,
+    savingCloudAdapters,
+    onClose,
+  ]);
 
   const effectiveAgents = useMemo<AgentRecord[]>(() => {
     const base =
@@ -390,33 +486,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   ) => {
     const key = ag.name_key.toLowerCase();
     const draft = getDraftForAgent(ag);
+    const effectiveRole = normalizeRecastRole(
+      draft.role,
+      recastCustomRoleInputs[key] || "",
+    );
     if (recastingAgentKey) return;
     setRecastingAgentKey(key);
     setError(null);
     setRecastStatusBanner(null);
+    const armedConflict = recastReplaceLeadArmed[key];
     try {
       const client = apiClient ?? new HubApiClient();
       const res = await client.recastAgent(key, {
         project: draft.project,
-        role: draft.role,
-        replace_lead: confirmOverrides,
-        create_area: confirmOverrides,
+        role: effectiveRole,
+        replace_lead: confirmOverrides
+          ? (armedConflict ? armedConflict.replaceLead : true)
+          : false,
+        create_area: confirmOverrides
+          ? (armedConflict ? armedConflict.createArea : true)
+          : false,
       });
       if (
         (res?.retires_lead ||
           (Array.isArray(res?.creates_areas) && res.creates_areas.length > 0)) &&
         !confirmOverrides
       ) {
-        const warningParts: string[] = [];
-        if (res.retires_lead) {
-          warningParts.push(`retires active Lead (${res.retires_lead})`);
-        }
-        if (Array.isArray(res.creates_areas) && res.creates_areas.length > 0) {
-          warningParts.push(`creates area (${res.creates_areas.join(", ")})`);
-        }
+        const conflict = extractRecastConflict(res);
         setRecastReplaceLeadArmed((prev) => ({
           ...prev,
-          [key]: warningParts.join("; "),
+          [key]: conflict,
         }));
         return;
       }
@@ -424,18 +523,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         res?.after ?? {
           ...ag,
           project: draft.project,
-          role: draft.role,
+          role: effectiveRole,
         };
       setLoadedAgents((prev) =>
         prev.map((item) =>
           item.name_key.toLowerCase() === key ? updatedAgent : item,
         ),
       );
+      setRecastDrafts((prev) => ({
+        ...prev,
+        [key]: { project: updatedAgent.project, role: updatedAgent.role },
+      }));
       setRecastReplaceLeadArmed((prev) => {
         const next = { ...prev };
         delete next[key];
         return next;
       });
+      setRecastModalAgentKey(null);
       setRecastStatusBanner(
         `Re-cast ${ag.display_name} to ${updatedAgent.project} as ${updatedAgent.role}.`,
       );
@@ -446,9 +550,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         (err.status === 409 || err.status === 400) &&
         !confirmOverrides
       ) {
+        const conflict = extractRecastConflict(err);
         setRecastReplaceLeadArmed((prev) => ({
           ...prev,
-          [key]: err.message || "existing Lead",
+          [key]: conflict,
         }));
       } else {
         setError(
@@ -459,39 +564,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
     } finally {
       setRecastingAgentKey(null);
-    }
-  };
-
-  const handleDecommissionForAgent = async (
-    ag: AgentRecord,
-    mode: DecommissionMode,
-  ) => {
-    const key = ag.name_key.toLowerCase();
-    if (decommissioningKey) return;
-    setDecommissioningKey(`${key}:${mode}`);
-    setError(null);
-    setRecastStatusBanner(null);
-    try {
-      if (onDecommissionAgent) {
-        await onDecommissionAgent(key, mode);
-      } else {
-        const client = apiClient ?? new HubApiClient();
-        await client.decommissionSession(key, mode);
-      }
-      setRecastStatusBanner(
-        mode === "prepare"
-          ? `Dispatched decommission preparation to ${ag.display_name}.`
-          : `Completed session teardown for ${ag.display_name}.`,
-      );
-      onAgentsUpdated?.();
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Failed to ${mode} session for ${ag.display_name}`,
-      );
-    } finally {
-      setDecommissioningKey(null);
     }
   };
 
@@ -678,6 +750,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           client,
           armedAction,
           selectedKeys,
+          filteredAgents.map((a) => a.name_key.toLowerCase()),
         );
       }
       setLastResult(res);
@@ -748,7 +821,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
-        {/* 3-Tab Navigation Header */}
+        {/* 3-Tab Navigation Header (System & Auth omitted when opened from a Project cog) */}
         <div
           role="tablist"
           aria-label="Settings Categories"
@@ -771,26 +844,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           >
             {effectiveAgents.length} Agents
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "system"}
-            data-testid="settings-tab-system"
-            className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
-            onClick={() => setActiveTab("system")}
-          >
-            System
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "auth"}
-            data-testid="settings-tab-auth"
-            className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
-            onClick={() => setActiveTab("auth")}
-          >
-            Auth
-          </button>
+          {!initialProject && (
+            <>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "system"}
+                data-testid="settings-tab-system"
+                className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("system")}
+              >
+                System
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "auth"}
+                data-testid="settings-tab-auth"
+                className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("auth")}
+              >
+                Auth
+              </button>
+            </>
+          )}
         </div>
 
         {error && (
@@ -1071,12 +1148,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <span className="fd-badge fd-mono" data-testid="settings-project-summary-lead">
                       Lead: {projectSummaryLead}
                     </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="session-cwd-badge"
+                      title={`~/Projects/Artificial-Humanity/${selectedProjectFilter}`}
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      ~/Projects/Artificial-Humanity/{selectedProjectFilter}
+                    </span>
                     <span className="fd-badge fd-mono">
                       {filteredAgents.length} {filteredAgents.length === 1 ? "agent" : "agents"}
                     </span>
                   </div>
 
                   <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      data-testid="project-pin-toggle-btn"
+                      aria-pressed={pinnedProjects.has(selectedProjectFilter.trim().toLowerCase())}
+                      className={`fd-btn${pinnedProjects.has(selectedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => togglePinnedProject(selectedProjectFilter)}
+                    >
+                      {pinnedProjects.has(selectedProjectFilter.trim().toLowerCase())
+                        ? "📌 Unpin Project"
+                        : "📌 Pin Project"}
+                    </button>
                     <button
                       type="button"
                       data-testid="settings-project-open-git-btn"
@@ -1143,14 +1240,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             >
               {filteredAgents.map((ag) => {
                 const key = ag.name_key.toLowerCase();
-                const draft = getDraftForAgent(ag);
-                const armedLeadWarning = recastReplaceLeadArmed[key];
-                const projectOptions = CANONICAL_PROJECTS.includes(draft.project)
-                  ? CANONICAL_PROJECTS
-                  : [draft.project, ...CANONICAL_PROJECTS];
-                const hasRoleOption = RECAST_ROLE_OPTIONS.some(
-                  (opt) => opt.value === draft.role,
-                );
 
                 return (
                   <div
@@ -1226,140 +1315,45 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           flexWrap: "wrap",
                         }}
                       >
-                        <select
-                          aria-label={`Project for ${ag.display_name}`}
-                          data-testid={`recast-project-select-${key}`}
-                          className="fd-select fd-mono"
-                          style={{ fontSize: "11.5px", padding: "3px 6px" }}
-                          value={draft.project}
-                          onChange={(e) => {
-                            const nextProject = e.target.value;
-                            setRecastDrafts((prev) => ({
-                              ...prev,
-                              [key]: {
-                                ...getDraftForAgent(ag),
-                                project: nextProject,
-                              },
-                            }));
-                            setRecastReplaceLeadArmed((prev) => {
-                              if (!(key in prev)) return prev;
-                              const next = { ...prev };
-                              delete next[key];
-                              return next;
-                            });
-                          }}
-                        >
-                          {projectOptions.map((proj) => (
-                            <option key={proj} value={proj}>
-                              {proj}
-                            </option>
-                          ))}
-                        </select>
-
-                        <select
-                          aria-label={`Role for ${ag.display_name}`}
-                          data-testid={`recast-role-select-${key}`}
-                          className="fd-select fd-mono"
-                          style={{ fontSize: "11.5px", padding: "3px 6px" }}
-                          value={draft.role}
-                          onChange={(e) => {
-                            const nextRole = e.target.value;
-                            setRecastDrafts((prev) => ({
-                              ...prev,
-                              [key]: {
-                                ...getDraftForAgent(ag),
-                                role: nextRole,
-                              },
-                            }));
-                            setRecastReplaceLeadArmed((prev) => {
-                              if (!(key in prev)) return prev;
-                              const next = { ...prev };
-                              delete next[key];
-                              return next;
-                            });
-                          }}
-                        >
-                          {!hasRoleOption && (
-                            <option value={draft.role}>{draft.role}</option>
-                          )}
-                          {RECAST_ROLE_OPTIONS.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
-                              {opt.label}
-                            </option>
-                          ))}
-                        </select>
-
                         <button
                           type="button"
                           data-testid={`recast-agent-btn-${key}`}
                           className="fd-btn fd-btn-primary"
                           style={{ fontSize: "11px", padding: "3px 8px" }}
                           disabled={recastingAgentKey === key}
-                          onClick={() => void handleRecastAgent(ag, false)}
+                          onClick={() => {
+                            setRecastDrafts((prev) => ({
+                              ...prev,
+                              [key]: prev[key] ?? {
+                                project: ag.project || "Workspace",
+                                role: ag.role || "assistant",
+                              },
+                            }));
+                            setRecastReplaceLeadArmed((prev) => {
+                              if (!(key in prev)) return prev;
+                              const next = { ...prev };
+                              delete next[key];
+                              return next;
+                            });
+                            setRecastModalAgentKey(key);
+                          }}
                         >
                           {recastingAgentKey === key ? "Re-Casting..." : "Re-Cast"}
                         </button>
 
                         <button
                           type="button"
-                          data-testid={`settings-decommission-prepare-${key}`}
+                          data-testid={`settings-agent-cog-btn-${key}`}
                           className="fd-btn"
-                          style={{ fontSize: "11px", padding: "3px 8px" }}
-                          disabled={decommissioningKey === `${key}:prepare`}
-                          onClick={() =>
-                            void handleDecommissionForAgent(ag, "prepare")
-                          }
-                          title={`Prepare ${ag.display_name} for decommission`}
+                          title={`Settings for ${ag.display_name}`}
+                          aria-label={`Settings for ${ag.display_name}`}
+                          style={{ padding: "3px 8px", fontSize: "11px" }}
+                          onClick={() => onOpenAgentSettings?.(ag.name_key)}
                         >
-                          Prepare
-                        </button>
-
-                        <button
-                          type="button"
-                          data-testid={`settings-decommission-teardown-${key}`}
-                          className="fd-btn fd-btn-danger"
-                          style={{ fontSize: "11px", padding: "3px 8px" }}
-                          disabled={decommissioningKey === `${key}:teardown`}
-                          onClick={() =>
-                            void handleDecommissionForAgent(ag, "teardown")
-                          }
-                          title={`Tear down ${ag.display_name} session`}
-                        >
-                          Tear Down
+                          ⚙
                         </button>
                       </div>
                     </div>
-
-                    {armedLeadWarning && (
-                      <div
-                        data-testid={`recast-lead-warning-${key}`}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: "8px",
-                          padding: "6px 8px",
-                          borderRadius: "4px",
-                          backgroundColor: "rgba(245, 158, 11, 0.14)",
-                          border: "1px solid rgba(245, 158, 11, 0.4)",
-                          fontSize: "11.5px",
-                        }}
-                      >
-                        <span>
-                          Re-casting {ag.display_name} as Lead will replace the
-                          active Lead ({armedLeadWarning}).
-                        </span>
-                        <button
-                          type="button"
-                          data-testid={`recast-confirm-lead-btn-${key}`}
-                          className="fd-btn fd-btn-danger"
-                          style={{ fontSize: "11px", padding: "2px 8px" }}
-                          onClick={() => void handleRecastAgent(ag, true)}
-                        >
-                          Confirm Replace Lead
-                        </button>
-                      </div>
-                    )}
                   </div>
                 );
               })}
@@ -1447,6 +1441,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   ? `Reforge Selected (${selectedAgentKeys.size})`
                   : "Reforge All"}
               </button>
+              <button
+                type="button"
+                className={`fd-btn${armedAction === "prepare" ? " fd-btn-active" : ""}`}
+                data-testid="bulk-action-prepare-btn"
+                disabled={submitting}
+                onClick={() => {
+                  setLastResult(null);
+                  setError(null);
+                  setArmedAction("prepare");
+                }}
+              >
+                {selectedAgentKeys.size > 0
+                  ? `Prepare Selected (${selectedAgentKeys.size})`
+                  : "Prepare All"}
+              </button>
+              <button
+                type="button"
+                className={`fd-btn fd-btn-danger${armedAction === "teardown" ? " fd-btn-active" : ""}`}
+                data-testid="bulk-action-teardown-btn"
+                disabled={submitting}
+                onClick={() => {
+                  setLastResult(null);
+                  setError(null);
+                  setArmedAction("teardown");
+                }}
+              >
+                {selectedAgentKeys.size > 0
+                  ? `Tear Down Selected (${selectedAgentKeys.size})`
+                  : "Tear Down All"}
+              </button>
             </div>
 
             {armedAction && (
@@ -1490,7 +1514,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     className={
-                      armedAction === "clear"
+                      armedAction === "clear" || armedAction === "teardown"
                         ? "fd-btn fd-btn-danger"
                         : "fd-btn fd-btn-primary"
                     }
@@ -1509,16 +1533,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* TAB 2: System */}
-        <div
-          role="tabpanel"
-          aria-label="System Settings Panel"
-          data-testid="settings-panel-system"
-          style={{
-            display: activeTab === "system" ? "flex" : "none",
-            flexDirection: "column",
-            gap: "12px",
-          }}
-        >
+        {!initialProject && (
+          <>
+            <div
+              role="tabpanel"
+              aria-label="System Settings Panel"
+              data-testid="settings-panel-system"
+              style={{
+                display: activeTab === "system" ? "flex" : "none",
+                flexDirection: "column",
+                gap: "12px",
+              }}
+            >
           {/* System Views & Fleet Nodes Launcher (moved from ContextHeader SYSTEM row) */}
           <div
             className="fd-card"
@@ -2678,6 +2704,283 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
           </div>
         </div>
+          </>
+        )}
+
+        {/* Re-Cast Modal Dialog */}
+        {recastModalAgentKey && (() => {
+          const modalAgent = effectiveAgents.find(
+            (a) => a.name_key.toLowerCase() === recastModalAgentKey,
+          );
+          if (!modalAgent) return null;
+          const key = modalAgent.name_key.toLowerCase();
+          const draft = getDraftForAgent(modalAgent);
+          const armedConflict = recastReplaceLeadArmed[key];
+          const projectOptions = CANONICAL_PROJECTS.includes(draft.project)
+            ? CANONICAL_PROJECTS
+            : [draft.project, ...CANONICAL_PROJECTS];
+          const hasRoleOption =
+            draft.role === CREATE_CUSTOM_ROLE_VALUE ||
+            RECAST_ROLE_OPTIONS.some((opt) => opt.value === draft.role);
+
+          return (
+            <div
+              className="fd-modal-backdrop"
+              onClick={() => {
+                if (!recastingAgentKey) {
+                  setRecastModalAgentKey(null);
+                }
+              }}
+            >
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-label={`Re-Cast Agent — ${modalAgent.display_name}`}
+                data-testid="recast-modal"
+                className="fd-modal"
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  maxWidth: "460px",
+                  width: "92vw",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "12px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                  }}
+                >
+                  <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 700 }}>
+                    Re-Cast Agent — {modalAgent.display_name}
+                  </h3>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    aria-label="Close Re-Cast Modal"
+                    disabled={Boolean(recastingAgentKey)}
+                    onClick={() => setRecastModalAgentKey(null)}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  Re-assign <strong>{modalAgent.display_name}</strong> to a project and
+                  role across the workspace registry.
+                </p>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                  <div>
+                    <label
+                      htmlFor={`recast-project-select-${key}`}
+                      style={{
+                        display: "block",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "4px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      Project
+                    </label>
+                    <select
+                      id={`recast-project-select-${key}`}
+                      aria-label={`Project for ${modalAgent.display_name}`}
+                      data-testid={`recast-project-select-${key}`}
+                      className="fd-select fd-mono"
+                      style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
+                      value={draft.project}
+                      onChange={(e) => {
+                        const nextProject = e.target.value;
+                        setRecastDrafts((prev) => ({
+                          ...prev,
+                          [key]: {
+                            ...getDraftForAgent(modalAgent),
+                            project: nextProject,
+                          },
+                        }));
+                        setRecastReplaceLeadArmed((prev) => {
+                          if (!(key in prev)) return prev;
+                          const next = { ...prev };
+                          delete next[key];
+                          return next;
+                        });
+                      }}
+                    >
+                      {projectOptions.map((proj) => (
+                        <option key={proj} value={proj}>
+                          {proj}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor={`recast-role-select-${key}`}
+                      style={{
+                        display: "block",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "4px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      Role
+                    </label>
+                    <select
+                      id={`recast-role-select-${key}`}
+                      aria-label={`Role for ${modalAgent.display_name}`}
+                      data-testid={`recast-role-select-${key}`}
+                      className="fd-select fd-mono"
+                      style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
+                      value={draft.role}
+                      onChange={(e) => {
+                        const nextRole = e.target.value;
+                        setRecastDrafts((prev) => ({
+                          ...prev,
+                          [key]: {
+                            ...getDraftForAgent(modalAgent),
+                            role: nextRole,
+                          },
+                        }));
+                        setRecastReplaceLeadArmed((prev) => {
+                          if (!(key in prev)) return prev;
+                          const next = { ...prev };
+                          delete next[key];
+                          return next;
+                        });
+                      }}
+                    >
+                      {!hasRoleOption && (
+                        <option value={draft.role}>{draft.role}</option>
+                      )}
+                      {RECAST_ROLE_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                      <option value={CREATE_CUSTOM_ROLE_VALUE}>
+                        + Create custom role...
+                      </option>
+                    </select>
+                  </div>
+
+                  {draft.role === CREATE_CUSTOM_ROLE_VALUE && (
+                    <div>
+                      <label
+                        htmlFor={`recast-custom-role-input-${key}`}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          fontWeight: 600,
+                          color: "var(--text-muted)",
+                          marginBottom: "4px",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        Custom Role Name
+                      </label>
+                      <input
+                        id={`recast-custom-role-input-${key}`}
+                        type="text"
+                        aria-label={`Custom role for ${modalAgent.display_name}`}
+                        data-testid={`recast-custom-role-input-${key}`}
+                        className="fd-input fd-mono"
+                        placeholder="e.g. reviewer or custom:reviewer"
+                        style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
+                        value={recastCustomRoleInputs[key] || ""}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setRecastCustomRoleInputs((prev) => ({
+                            ...prev,
+                            [key]: val,
+                          }));
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+
+                {armedConflict && (
+                  <div
+                    data-testid={`recast-lead-warning-${key}`}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      padding: "8px 10px",
+                      borderRadius: "4px",
+                      backgroundColor: "rgba(245, 158, 11, 0.14)",
+                      border: "1px solid rgba(245, 158, 11, 0.4)",
+                      fontSize: "11.5px",
+                    }}
+                  >
+                    <span>
+                      {armedConflict.replaceLead
+                        ? `Re-casting ${modalAgent.display_name} as Lead will replace the active Lead (${armedConflict.message}).`
+                        : `Re-casting ${modalAgent.display_name} requires creating a new coverage area (${armedConflict.message}).`}
+                    </span>
+                    <button
+                      type="button"
+                      data-testid={`recast-confirm-lead-btn-${key}`}
+                      className="fd-btn fd-btn-danger"
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      disabled={recastingAgentKey === key}
+                      onClick={() => void handleRecastAgent(modalAgent, true)}
+                    >
+                      {armedConflict.replaceLead
+                        ? "Confirm Replace Lead"
+                        : "Confirm Create Area"}
+                    </button>
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: "8px",
+                  }}
+                >
+                  <button
+                    type="button"
+                    data-testid={`recast-cancel-btn-${key}`}
+                    className="fd-btn"
+                    disabled={recastingAgentKey === key}
+                    onClick={() => setRecastModalAgentKey(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-testid={`recast-submit-btn-${key}`}
+                    className="fd-btn fd-btn-primary"
+                    disabled={recastingAgentKey === key}
+                    onClick={() => void handleRecastAgent(modalAgent, false)}
+                  >
+                    {recastingAgentKey === key ? "Re-Casting..." : "Confirm Re-Cast"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     </div>
   );

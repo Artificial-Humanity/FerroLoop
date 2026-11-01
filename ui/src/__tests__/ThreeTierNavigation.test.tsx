@@ -78,32 +78,29 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(agentNav).getByRole("tab", { name: /^Wire Mail$/i })).toBeInTheDocument();
     expect(within(agentNav).queryByTestId("header-agent-settings-btn")).toBeNull();
 
-    // Tier 2: Project Context
+    // Tier 2: Project Context (session-cwd-badge moved into Project Settings summary card)
     const projectNav = within(tabBar).getByTestId("tier-project-nav");
     expect(within(projectNav).getByTestId("active-project-badge")).toHaveTextContent(
       "FerroLoop",
     );
-    expect(within(projectNav).getByTestId("session-cwd-badge")).toHaveTextContent(
-      "/tmp/felix-three-tier-navigation",
-    );
+    expect(within(projectNav).queryByTestId("session-cwd-badge")).toBeNull();
     expect(within(projectNav).getByRole("tab", { name: /^Artifacts$/i })).toBeInTheDocument();
     expect(within(projectNav).getByRole("tab", { name: /^Git & PRs$/i })).toBeInTheDocument();
     expect(
       within(projectNav).getByRole("tab", { name: /^Records & Board$/i }),
     ).toBeInTheDocument();
 
-    // Tier 3: System Context
+    // Tier 3: System Context (inline inside tier-system-nav)
     const systemNav = within(tabBar).getByTestId("tier-system-nav");
     expect(within(systemNav).getByRole("tab", { name: /^Terminal$/i })).toBeInTheDocument();
     expect(within(systemNav).getByRole("tab", { name: /^Hub & Arch$/i })).toBeInTheDocument();
     expect(within(systemNav).getByRole("tab", { name: /^Vault & Gate$/i })).toBeInTheDocument();
     expect(within(systemNav).getByRole("tab", { name: /^FerroState$/i })).toBeInTheDocument();
 
-    const utilityBar = within(systemNav).getByTestId("system-utility-bar");
-    expect(within(utilityBar).getByTestId("nodes-modal-btn")).toBeInTheDocument();
-    expect(within(utilityBar).getByTestId("header-spin-up-btn")).toBeInTheDocument();
-    expect(within(utilityBar).getByTestId("settings-modal-btn")).toBeInTheDocument();
-    expect(within(utilityBar).getByTestId("authority-status-btn")).toBeInTheDocument();
+    expect(within(systemNav).getByTestId("nodes-modal-btn")).toBeInTheDocument();
+    expect(within(systemNav).getByTestId("header-spin-up-btn")).toBeInTheDocument();
+    expect(within(systemNav).getByTestId("authority-status-btn")).toBeInTheDocument();
+    expect(within(systemNav).queryByTestId("system-utility-bar")).toBeNull();
   });
 
   it("updates active-context-tier-badge when switching between Agent, Project, and System tabs and opens AgentSettingsModal via header-agent-settings-btn", async () => {

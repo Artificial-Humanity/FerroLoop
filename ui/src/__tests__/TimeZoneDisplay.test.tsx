@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
+import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import {
   ArtifactPreviewPane,
   formatVersionTime,
@@ -406,10 +407,12 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     expect(screen.getByTestId("settings-tab-system")).toHaveTextContent("System");
     expect(screen.getByTestId("settings-tab-auth")).toHaveTextContent("Auth");
 
-    // Re-cast felix -> lead triggers 409 confirmation first, then succeeds with replace_lead: true
+    // Re-cast felix -> lead via Re-Cast Modal triggers 409 confirmation first, then succeeds with replace_lead: true
+    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+    expect(screen.getByTestId("recast-modal")).toBeInTheDocument();
     const roleSelect = screen.getByTestId("recast-role-select-felix") as HTMLSelectElement;
     fireEvent.change(roleSelect, { target: { value: "lead" } });
-    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+    fireEvent.click(screen.getByTestId("recast-submit-btn-felix"));
 
     const confirmBtn = await screen.findByTestId("recast-confirm-lead-btn-felix");
     expect(confirmBtn).toBeInTheDocument();
@@ -418,8 +421,20 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     await waitFor(() => {
       expect(recastRequests.length).toBe(2);
       expect(recastRequests[0].body.replace_lead).toBe(false);
+      expect(recastRequests[0].body.create_area).toBe(false);
       expect(recastRequests[1].body.replace_lead).toBe(true);
+      expect(recastRequests[1].body.create_area).toBe(false);
     });
+
+    // Re-cast with "+ Create custom role..." auto-prefixes "custom:"
+    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+    fireEvent.change(screen.getByTestId("recast-role-select-felix"), {
+      target: { value: "__create_custom__" },
+    });
+    const customInput = screen.getByTestId("recast-custom-role-input-felix");
+    fireEvent.change(customInput, { target: { value: "reviewer" } });
+    fireEvent.click(screen.getByTestId("recast-cancel-btn-felix"));
+    expect(screen.queryByTestId("recast-modal")).toBeNull();
 
     // Switch to System tab and launch Vault & Gate console
     fireEvent.click(screen.getByTestId("settings-tab-system"));
@@ -455,12 +470,139 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     fireEvent.click(screen.getByTestId("settings-agents-select-all-btn"));
     expect(screen.getByTestId("bulk-compact-btn")).toHaveTextContent("Compact All");
 
-    // Project filter renders scoped Project Summary Card
+    // Project filter renders scoped Project Summary Card with Pin Project button
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
       target: { value: "FerroLoop" },
     });
     expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
     expect(screen.getByTestId("settings-project-summary-name")).toHaveTextContent("FerroLoop");
     expect(screen.getByTestId("settings-project-summary-lead")).toHaveTextContent("Lead: Ferris");
+    expect(screen.getByTestId("session-cwd-badge")).toHaveTextContent(
+      "~/Projects/Artificial-Humanity/FerroLoop",
+    );
+    expect(screen.getByTestId("project-pin-toggle-btn")).toHaveTextContent("📌 Pin Project");
+    expect(screen.getByTestId("bulk-action-prepare-btn")).toBeInTheDocument();
+    expect(screen.getByTestId("bulk-action-teardown-btn")).toBeInTheDocument();
+  });
+
+  it("omits System and Auth tabs when SettingsModal is opened from a Project cog (initialProject non-null)", () => {
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        initialProject="FerroLoop"
+        agents={[
+          {
+            id: "ag-ferris",
+            name_key: "ferris",
+            display_name: "Ferris",
+            project: "FerroLoop",
+            role: "lead",
+            status: "idle",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByTestId("settings-tab-agents")).toBeInTheDocument();
+    expect(screen.queryByTestId("settings-tab-system")).toBeNull();
+    expect(screen.queryByTestId("settings-tab-auth")).toBeNull();
+    expect(screen.queryByTestId("settings-panel-system")).toBeNull();
+    expect(screen.queryByTestId("settings-panel-auth")).toBeNull();
+    expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
+  });
+
+  it("supports AgentSettingsModal Re-Cast modal parity, custom role auto-prefix, and granular 409 create_area confirmation", async () => {
+    const recastRequests: Array<{ body: Record<string, unknown> }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/v1/agents/felix/recast") && method === "POST") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        recastRequests.push({ body });
+        if (!body.create_area) {
+          return new Response(
+            JSON.stringify({
+              error: "Missing coverage area NewProject; pass create_area=true to confirm",
+              missing_areas: ["NewProject"],
+            }),
+            { status: 409, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            agent: {
+              id: "ag-felix",
+              name_key: "felix",
+              display_name: "Felix",
+              project: String(body.project ?? "FerroLoop"),
+              role: String(body.role ?? "custom:reviewer"),
+              status: "idle",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <AgentSettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        agentName="felix"
+        agentDisplayName="Felix"
+        agentRole="custom:ui-developer"
+        agentProject="FerroLoop"
+        adapter="antigravity"
+        sessionId="sess-felix"
+        selectedModel="gemini-4-argon"
+        selectedThinkingLevel="high"
+        onChangeModelAndThinking={vi.fn()}
+        contextEstimate={{ usedTokens: 12000, maxTokens: 200000, percent: 6 }}
+        canCompact={false}
+        compacting={false}
+        onCompactContext={vi.fn()}
+        canClear={true}
+        clearing={false}
+        onOpenClearModal={vi.fn()}
+        canDecommission={true}
+        decommissioning={false}
+        onOpenDecommissionModal={vi.fn()}
+        apiClient={apiClient}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-pin-toggle-btn")).toHaveTextContent("📌 Pin Agent");
+    fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
+    expect(screen.getByTestId("recast-modal")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("recast-role-select-felix"), {
+      target: { value: "__create_custom__" },
+    });
+    fireEvent.change(screen.getByTestId("recast-custom-role-input-felix"), {
+      target: { value: "reviewer" },
+    });
+    fireEvent.click(screen.getByTestId("recast-submit-btn-felix"));
+
+    const confirmBtn = await screen.findByTestId("recast-confirm-lead-btn-felix");
+    fireEvent.click(confirmBtn);
+
+    await waitFor(() => {
+      expect(recastRequests.length).toBe(2);
+      expect(recastRequests[0].body.role).toBe("custom:reviewer");
+      expect(recastRequests[0].body.replace_lead).toBe(false);
+      expect(recastRequests[0].body.create_area).toBe(false);
+      expect(recastRequests[1].body.role).toBe("custom:reviewer");
+      expect(recastRequests[1].body.replace_lead).toBe(false);
+      expect(recastRequests[1].body.create_area).toBe(true);
+    });
   });
 });
