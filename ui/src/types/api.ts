@@ -182,6 +182,7 @@ export interface PruneArtifactsResponse {
 
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
+  timezone: string;
   subsystems: {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
@@ -201,6 +202,7 @@ export interface HubSettings {
 
 export const DEFAULT_HUB_SETTINGS: HubSettings = {
   theme_preference: "dark",
+  timezone: "UTC",
   subsystems: {
     ferrogate_enabled: true,
     ferrostate_enabled: true,

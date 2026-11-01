@@ -20,7 +20,37 @@ import {
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
 import { ThinkingBlock } from "./ThinkingBlock";
-import { TurnCard } from "./TurnCard";
+import { isPureToolOutputTurn, TurnCard } from "./TurnCard";
+
+export interface CoalescedTurnGroup {
+  turn: TranscriptTurn;
+  attachedToolOutputs: TranscriptTurn[];
+}
+
+export function coalesceTurnsWithToolOutputs(
+  turns: TranscriptTurn[],
+): CoalescedTurnGroup[] {
+  const groups: CoalescedTurnGroup[] = [];
+  for (const turn of turns) {
+    if (isPureToolOutputTurn(turn) && groups.length > 0) {
+      const prev = groups[groups.length - 1];
+      const prevRole = (prev.turn.role || "assistant").toLowerCase();
+      const prevHasToolCalls = Boolean(
+        prev.turn.tool_calls && prev.turn.tool_calls.length > 0,
+      );
+      if (
+        prevRole === "assistant" &&
+        !isPureToolOutputTurn(prev.turn) &&
+        (prevHasToolCalls || prev.attachedToolOutputs.length > 0)
+      ) {
+        prev.attachedToolOutputs.push(turn);
+        continue;
+      }
+    }
+    groups.push({ turn, attachedToolOutputs: [] });
+  }
+  return groups;
+}
 
 export function getVendorModelOptions(
   adapter?: string | null,
@@ -1705,12 +1735,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 </button>
               </div>
             )}
-            {displayedTurns.map((turn, idx) => (
+            {coalesceTurnsWithToolOutputs(displayedTurns).map((group, idx, arr) => (
               <TurnCard
-                key={`${turn.index}-${turn.created_at ?? ""}`}
-                turn={turn}
+                key={`${group.turn.index}-${group.turn.created_at ?? ""}`}
+                turn={group.turn}
+                attachedToolOutputs={group.attachedToolOutputs}
                 agentDisplayName={agentDisplayName ?? agentName ?? undefined}
-                isActive={effectiveIsBusy && idx === displayedTurns.length - 1}
+                isActive={
+                  effectiveIsBusy &&
+                  idx === arr.length - 1 &&
+                  group.attachedToolOutputs.length === 0
+                }
                 onOpenArtifact={onOpenArtifact}
               />
             ))}

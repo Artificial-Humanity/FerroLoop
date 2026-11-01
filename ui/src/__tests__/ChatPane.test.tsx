@@ -441,6 +441,70 @@ describe("ChatPane", () => {
     expect(screen.getByText(/cargo test passed 42 tests/i)).toBeInTheDocument();
   });
 
+  it("encapsulates consecutive tool output turns into the preceding assistant TurnCard box with an orange arrow toggle", () => {
+    const turnsWithToolOutput: TranscriptTurn[] = [
+      {
+        index: 912,
+        role: "assistant",
+        content: "",
+        thinking: null,
+        tool_calls: [
+          {
+            name: "read_file",
+            arguments: { Path: "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/ui/src/App.tsx" },
+          },
+        ],
+        created_at: "2026-11-01T15:52:10Z",
+      },
+      {
+        index: 913,
+        role: "tool",
+        content:
+          "Created At: 2026-11-01T15:52:10Z\nCompleted At: 2026-11-01T15:52:11Z\nShowing lines 1-125 of 1631\nimport React from 'react';",
+        thinking: null,
+        tool_calls: [],
+        created_at: "2026-11-01T15:52:11Z",
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={turnsWithToolOutput}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    // Only a single TurnCard (turn-card-912) is rendered; turn 913 is encapsulated inside it
+    const assistantCard = screen.getByTestId("turn-card-912");
+    expect(assistantCard).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-card-913")).toBeNull();
+
+    // Both the tool call block and the attached tool output toggle live inside turn-card-912
+    const toolCallBlock = screen.getByTestId("turn-tools-912");
+    const attachedOutputsBlock = screen.getByTestId("turn-attached-tool-outputs-912");
+    expect(assistantCard).toContainElement(toolCallBlock);
+    expect(assistantCard).toContainElement(attachedOutputsBlock);
+
+    const outputToggle = screen.getByTestId("turn-tool-output-toggle-913");
+    expect(attachedOutputsBlock).toContainElement(outputToggle);
+    expect(outputToggle).toHaveAttribute("aria-expanded", "false");
+    expect(outputToggle).toHaveTextContent("Tool / Terminal Output (4 lines)");
+
+    // Arrow uses orange styling
+    const orangeArrow = screen.getByTestId("turn-tool-output-arrow-913");
+    expect(orangeArrow.style.color).toContain("#F59E0B");
+
+    // Clicking the toggle expands the tool output in place inside turn-card-912
+    expect(screen.queryByText(/Showing lines 1-125 of 1631/)).toBeNull();
+    fireEvent.click(outputToggle);
+    expect(outputToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText(/Showing lines 1-125 of 1631/)).toBeInTheDocument();
+  });
+
   it("renders Queued Prompts bar and dispatches Send Now or Remove actions", async () => {
     const onSendQueuedNow = vi.fn(async () => {});
     const onCancelQueued = vi.fn(async () => {});

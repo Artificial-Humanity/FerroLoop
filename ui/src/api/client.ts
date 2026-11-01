@@ -81,6 +81,7 @@ import {
   type RecordsListResponse,
 } from "../types/api";
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
+import { getActiveTimeZone, normalizeTimeZone } from "../lib/datetime";
 
 export function normalizeHubSettings(
   raw: unknown,
@@ -101,6 +102,8 @@ export function normalizeHubSettings(
       ? themeRaw
       : fallback.theme_preference;
 
+  const timezone = normalizeTimeZone(obj.timezone, fallback.timezone || "UTC");
+
   const subRaw =
     obj.subsystems && typeof obj.subsystems === "object"
       ? (obj.subsystems as Record<string, unknown>)
@@ -116,6 +119,7 @@ export function normalizeHubSettings(
 
   return {
     theme_preference,
+    timezone,
     subsystems: {
       ferrogate_enabled:
         typeof subRaw.ferrogate_enabled === "boolean"
@@ -1287,7 +1291,10 @@ export class HubApiClient {
 
   public async getSettings(): Promise<HubSettings> {
     const raw = await this.request<unknown>("/api/v1/settings");
-    return normalizeHubSettings(raw, DEFAULT_HUB_SETTINGS);
+    return normalizeHubSettings(raw, {
+      ...DEFAULT_HUB_SETTINGS,
+      timezone: getActiveTimeZone(),
+    });
   }
 
   public async updateSettings(

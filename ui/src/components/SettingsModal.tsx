@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient, generatePasskeyCredentialId } from "../api/client";
+import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -158,6 +159,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       const client = apiClient ?? new HubApiClient();
       const updated = await client.updateSettings(settings);
       setSettings(updated);
+      setActiveTimeZone(updated.timezone);
       setSettingsSaved(true);
       onSettingsUpdated?.(updated);
     } catch (err) {
@@ -525,6 +527,58 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <option value="dark">Dark</option>
               <option value="light">Light</option>
               <option value="system">System</option>
+            </select>
+          </div>
+
+          {/* Time Zone */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "12px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: "12.5px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Time Zone
+              </h3>
+              <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                Format dates and timestamps across transcripts, FerroWire, FerroState, Vault, and Artifacts.
+              </span>
+            </div>
+            <select
+              aria-label="Time Zone"
+              data-testid="settings-timezone-select"
+              className="fd-select fd-mono"
+              value={settings.timezone || "UTC"}
+              onChange={(e) => {
+                setSettingsSaved(false);
+                setSettings((prev) => ({
+                  ...prev,
+                  timezone: e.target.value,
+                }));
+              }}
+              style={{ fontSize: "12px", padding: "5px 10px" }}
+            >
+              {settings.timezone &&
+                !TIMEZONE_OPTIONS.some((opt) => opt.value === settings.timezone) && (
+                  <option value={settings.timezone}>{settings.timezone}</option>
+                )}
+              {TIMEZONE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
             </select>
           </div>
 

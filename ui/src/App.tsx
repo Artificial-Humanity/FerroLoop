@@ -24,6 +24,10 @@ import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
 import { WireMailPane } from "./components/WireMailPane";
 import {
+  setActiveTimeZone,
+  useActiveTimeZone,
+} from "./lib/datetime";
+import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
   type AgentRecord,
@@ -288,6 +292,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [splitView, setSplitView] = useState<boolean>(false);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+  useActiveTimeZone();
   const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
   const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
 
@@ -621,6 +626,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         archRes,
         statsRes,
         nodesRes,
+        settingsRes,
       ] = await Promise.all([
         apiClient.getAgents().catch(() => null),
         apiClient.getAgentsLiveness().catch(() => null),
@@ -633,7 +639,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         apiClient.getArchitecture().catch(() => null),
         apiClient.getStats().catch(() => null),
         apiClient.fetchNodes().catch(() => null),
+        apiClient.getSettings().catch(() => null),
       ]);
+
+      if (settingsRes?.timezone) {
+        setActiveTimeZone(settingsRes.timezone);
+      }
 
       if (nodesRes) {
         setNodes(nodesRes);
@@ -1613,6 +1624,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           ) {
             persistThemeMode(updated.theme_preference);
             setThemeMode(updated.theme_preference);
+          }
+          if (updated.timezone) {
+            setActiveTimeZone(updated.timezone);
           }
         }}
         apiClient={apiClient}
