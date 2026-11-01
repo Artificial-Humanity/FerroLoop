@@ -59,7 +59,7 @@ use fl_gate::{
     evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
     handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
-use fl_store::AnyStore;
+use fl_store::{AnyStore, IndexPolicy};
 use fl_wire::dispatcher::{
     MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
     dispatch_to_route,
@@ -2076,31 +2076,33 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
         );
     }
 
-    let outcome = scan_code_index(&state.config.repo_root).search(kind, &query, limit);
+    let index = scan_code_index(&state.config.repo_root);
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
+    // A request that reads never writes the code vector index: it answers from
+    // whatever a CLI or MCP search has already indexed.
+    let ranked = fl_store::search_code(&store, &index, kind, &query, limit, IndexPolicy::ReadOnly);
     let token_gain = match record_token_gain_query(
         &*store,
-        outcome.tokens_saved_this_query,
-        outcome.files_indexed,
-        outcome.symbols_indexed,
+        ranked.outcome.tokens_saved_this_query,
+        ranked.outcome.files_indexed,
+        ranked.outcome.symbols_indexed,
         stamp::now(),
         "fl",
     ) {
         Ok(gain) => gain,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
-    HttpResponse::json(
-        200,
-        json!({
-            "query": query,
-            "kind": kind.as_wire(),
-            "symbols": outcome.symbols,
-            "tokens_saved_this_query": outcome.tokens_saved_this_query,
-            "token_gain": token_gain,
-        }),
-    )
+    let mut body = json!({
+        "query": query,
+        "kind": kind.as_wire(),
+        "symbols": ranked.outcome.symbols,
+        "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+        "token_gain": token_gain,
+    });
+    ranked.annotate_json(&mut body);
+    HttpResponse::json(200, body)
 }
 
 fn handle_post_state(

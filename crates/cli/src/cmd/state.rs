@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord, reports_to};
 use fl_core::code_index::{
-    CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, TokenGainSummary, load_token_gain,
+    CodeIndex, CodeSearchKind, CodeSymbolHit, TokenGainSummary, load_token_gain,
     record_token_gain_index, record_token_gain_query, scan_code_index,
 };
 use fl_core::ferrostate::{
@@ -20,7 +20,10 @@ use fl_core::state::{
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
-use fl_store::{AnyStore, RankedHits, SearchMode};
+use fl_store::{
+    AnyStore, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankedCode, RankedHits, SearchMode,
+    search_code,
+};
 
 use crate::cmd::agent::{now_at, write_atomic_non_symlink};
 use crate::config::Config;
@@ -151,21 +154,24 @@ pub fn effective_code_limit(limit: Option<usize>, kind: CodeSearchKind) -> usize
 }
 
 /// Wire shape shared by the CLI, MCP, and Hub code-search surfaces
-/// (`CodeSearchResponse` in `ui/src/types/api.ts`).
+/// (`CodeSearchResponse` in `ui/src/types/api.ts`). `"mode":"knowledge"` is
+/// added only when the FerroStore hybrid answered and `"note"` only on a
+/// fallback; an exact answer has neither, so its JSON is what it always was.
 pub fn code_search_response_json(
     query: &str,
     kind: CodeSearchKind,
-    symbols: &[CodeSymbolHit],
-    tokens_saved_this_query: u64,
+    ranked: &RankedCode,
     token_gain: TokenGainSummary,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "query": query,
         "kind": kind.as_wire(),
-        "symbols": symbols,
-        "tokens_saved_this_query": tokens_saved_this_query,
+        "symbols": ranked.outcome.symbols,
+        "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
         "token_gain": token_gain,
-    })
+    });
+    ranked.annotate_json(&mut out);
+    out
 }
 
 /// One-line plain-text rendering of a code hit for the CLI:
@@ -178,32 +184,49 @@ pub fn format_code_hit(hit: &CodeSymbolHit) -> String {
 }
 
 /// Run one search over an already-scanned `index` and record its token
-/// gain in `store`, returning the outcome and the updated ledger.
+/// gain in `store`, returning the ranked result and the updated ledger.
+///
+/// On FerroStore a `Search` also brings the code vector index up to date
+/// (at most [`DEFAULT_CODE_SYNC_BUDGET`] new vectors per call). If that path
+/// failed, the exact answer is returned and the reason goes to stderr, one
+/// line, never into the JSON. The ledger is fed from the final outcome.
 ///
 /// A `limit` of `0` returns no symbols and records nothing; the returned
 /// ledger is then the currently stored one ([`load_token_gain`]). Ledger
 /// write failures (malformed/sensitive ledger, store errors) propagate.
 pub fn search_and_record(
-    store: &impl StateStore,
+    store: &AnyStore,
     index: &CodeIndex,
     kind: CodeSearchKind,
     query: &str,
     limit: usize,
-) -> Result<(CodeSearchOutcome, TokenGainSummary), String> {
-    let outcome = index.search(kind, query, limit);
+) -> Result<(RankedCode, TokenGainSummary), String> {
+    let ranked = search_code(
+        store,
+        index,
+        kind,
+        query,
+        limit,
+        IndexPolicy::Sync {
+            budget: DEFAULT_CODE_SYNC_BUDGET,
+        },
+    );
+    if let Some(line) = ranked.unavailable_line() {
+        eprintln!("{line}");
+    }
     if limit == 0 {
-        return Ok((outcome, load_token_gain(store)));
+        return Ok((ranked, load_token_gain(store)));
     }
     let token_gain = record_token_gain_query(
         store,
-        outcome.tokens_saved_this_query,
-        outcome.files_indexed,
-        outcome.symbols_indexed,
+        ranked.outcome.tokens_saved_this_query,
+        ranked.outcome.files_indexed,
+        ranked.outcome.symbols_indexed,
         now_at(),
         "fl",
     )
     .map_err(|e| e.to_string())?;
-    Ok((outcome, token_gain))
+    Ok((ranked, token_gain))
 }
 
 #[derive(Subcommand)]
@@ -1540,20 +1563,14 @@ fn run_code_query(
     let effective_limit = effective_code_limit(limit, kind);
     let index = scan_code_index(&root);
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
-    let (outcome, token_gain) = search_and_record(&store, &index, kind, query, effective_limit)?;
+    let (ranked, token_gain) = search_and_record(&store, &index, kind, query, effective_limit)?;
     if json {
-        let out = code_search_response_json(
-            query,
-            kind,
-            &outcome.symbols,
-            outcome.tokens_saved_this_query,
-            token_gain,
-        );
+        let out = code_search_response_json(query, kind, &ranked, token_gain);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
-    } else if outcome.symbols.is_empty() {
+    } else if ranked.outcome.symbols.is_empty() {
         println!("no hits for `{query}`");
     } else {
-        for hit in &outcome.symbols {
+        for hit in &ranked.outcome.symbols {
             println!("{}", format_code_hit(hit));
         }
     }

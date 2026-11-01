@@ -851,6 +851,31 @@ mod tests {
     }
 
     #[test]
+    fn the_code_vector_sidecar_is_not_a_project_store() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        fs::write(dir.join("foo.fls"), b"x").unwrap();
+        // `<store>.code.fls` is derived data beside a store, never a project.
+        fs::write(dir.join("foo.code.fls"), b"x").unwrap();
+        fs::write(dir.join("bar.code.fls"), b"x").unwrap();
+        fs::write(dir.join("fl.code.fls"), b"x").unwrap();
+        for env in [Some("ferro"), None] {
+            let found = available_projects_with(Some(tmp.path()), env);
+            assert!(
+                !found.iter().any(|n| n.contains("code") || n == "bar"),
+                "{env:?}: {found:?}"
+            );
+        }
+        assert_eq!(
+            available_projects_with(Some(tmp.path()), Some("ferro")),
+            vec!["ferroloop", "foo"]
+        );
+        // `foo.code` is not a project name, so a request cannot reach it either
+        // (every request slug passes `normalize_project` first).
+        assert!(normalize_project(Some("foo.code")).is_err());
+    }
+
+    #[test]
     fn available_projects_reads_a_bounded_number_of_entries_under_ferro() {
         let tmp = TempDir::new().unwrap();
         let dir = fl_dir(&tmp);

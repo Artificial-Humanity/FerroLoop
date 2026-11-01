@@ -2347,6 +2347,93 @@ mod tests {
         assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
     }
 
+    #[test]
+    fn code_search_route_on_ferro_never_writes_the_code_vector_index() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        // A `.fls` path selects FerroStore without touching the environment.
+        let store_path = tmp.path().join("hub.fls");
+        state.config.store_path = store_path.clone();
+        let sidecar = tmp.path().join("hub.code.fls");
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/widget.rs"),
+            "pub fn hub_widget_builder() {}\npub fn other_thing() {}\n",
+        )
+        .unwrap();
+        let get = |q: &str, kind: &str| {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new(
+                    "GET",
+                    format!("/api/v1/state/code-search?q={q}&kind={kind}"),
+                )
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+            );
+            assert_eq!(resp.status, 200);
+            resp.json_value().unwrap()
+        };
+
+        // No sidecar: the hybrid answers from the exact leg alone and makes none.
+        let first = get("hub_widget_builder", "search");
+        assert_eq!(first["mode"], "knowledge", "{first}");
+        assert_eq!(first["symbols"][0]["name"], "hub_widget_builder", "{first}");
+        assert!(first.get("note").is_none(), "{first}");
+        assert!(!sidecar.exists(), "a read request created the sidecar");
+
+        // A CLI search builds it; the route then uses it and leaves it as it was.
+        {
+            let store = fl_store::open_store(&store_path).unwrap();
+            let index = fl_core::scan_code_index(tmp.path());
+            let ranked = fl_store::search_code(
+                &store,
+                &index,
+                fl_core::CodeSearchKind::Search,
+                "hub_widget_builder",
+                10,
+                fl_store::IndexPolicy::Sync { budget: 100 },
+            );
+            assert_eq!(ranked.mode, fl_store::SearchMode::Knowledge);
+        }
+        let before = (
+            fs::read(&sidecar).unwrap(),
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        );
+        let typo = get("hub%20widgt%20bilder", "search");
+        assert_eq!(typo["mode"], "knowledge", "{typo}");
+        assert_eq!(typo["symbols"][0]["name"], "hub_widget_builder", "{typo}");
+        let after = (
+            fs::read(&sidecar).unwrap(),
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        );
+        assert_eq!(before, after, "the route wrote to the sidecar");
+
+        // Def and outline are unchanged: no mode, no note.
+        let def = get("hub_widget_builder", "def");
+        assert!(
+            def.get("mode").is_none() && def.get("note").is_none(),
+            "{def}"
+        );
+        assert_eq!(def["symbols"][0]["name"], "hub_widget_builder", "{def}");
+
+        // A corrupt sidecar costs the vector leg, never the answer.
+        fs::write(&sidecar, vec![0xA5u8; 8192]).unwrap();
+        let broken = get("hub_widget_builder", "search");
+        assert!(broken.get("mode").is_none(), "{broken}");
+        assert_eq!(
+            broken["note"], "code index unavailable; searched without vectors",
+            "{broken}"
+        );
+        assert_eq!(
+            broken["symbols"][0]["name"], "hub_widget_builder",
+            "{broken}"
+        );
+        assert!(
+            !broken.to_string().contains("superblock"),
+            "engine text leaked"
+        );
+    }
+
     fn install_webhook_route(home: &std::path::Path, persona: &str, socket: &std::path::Path) {
         use fl_core::at::At;
         use fl_wire::identity::{RouteTable, VendorRoute};
