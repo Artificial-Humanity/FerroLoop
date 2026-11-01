@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod nodes;
 mod operators;
 mod records;
+pub mod runtime_matrix;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
@@ -50,6 +51,10 @@ pub use discovery::{
     list_git_worktrees, parse_jsonl_transcript, read_session_context_usage_with_home,
     read_session_quota_usage_with_home, read_session_transcript, read_session_transcript_with_home,
     read_worktree_diff, scan_cargo_architecture_conformance, scan_workspace_for_arch,
+};
+pub use nodes::{
+    DispatchTask, FederatedTask, TaskFail, TaskResult, dispatch_task, list_node_tasks,
+    record_task_result,
 };
 pub use nodes::{
     EnrollFail, EnrollTokenInfo, EnrollWorker, EnrolledWorker, EnsureHubArgs, HeartbeatFail,
@@ -173,6 +178,8 @@ pub struct HubState {
     model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
     /// Login throttling and passkey challenges, in memory only.
     login_guard: Arc<operators::LoginGuard>,
+    /// One runtime probe at a time, and the last result (see [`runtime_matrix::ProbeGate`]).
+    probe_gate: Arc<runtime_matrix::ProbeGate>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -277,6 +284,7 @@ impl HubState {
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             login_guard: Arc::new(operators::LoginGuard::default()),
+            probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
         }
     }
 
@@ -3706,6 +3714,444 @@ mod tests {
     }
 
     #[test]
+    fn http_federation_profile_heartbeat_and_task_queue() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let peer = Some("peer-tok-secret");
+
+        let mint = |label: &str| -> String {
+            let resp = http_call(
+                &state,
+                "POST",
+                "/api/v1/nodes/enroll-token",
+                owner,
+                Some(&json!({ "label": label })),
+            );
+            resp.json_value().unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let enroll =
+            |body: Value| http_call(&state, "POST", "/api/v1/nodes/enroll", None, Some(&body));
+
+        let bad_kind = enroll(json!({
+            "code": mint("bad"), "node_id": "bad-kind", "display_name": "Bad",
+            "hostname": "h", "os": "linux", "arch": "x86_64", "environment_kind": "toaster"
+        }));
+        assert_eq!(bad_kind.status, 400, "{}", response_text(&bad_kind));
+
+        let enrolled = enroll(json!({
+            "code": mint("fed"), "node_id": "fed-a", "display_name": "Fed A",
+            "hostname": "h", "os": "linux", "arch": "x86_64",
+            "environment_kind": "cloud-worker",
+            "federated_subsystems": ["ferrowire", "FerroState", "ferrowire"]
+        }));
+        assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
+        let token = enrolled.json_value().unwrap()["node_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let token = Some(token.as_str());
+
+        let listed = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        let nodes = listed.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let worker = nodes.iter().find(|n| n["node_id"] == "fed-a").unwrap();
+        assert_eq!(worker["environment_kind"], "cloud-worker");
+        assert_eq!(
+            worker["federated_subsystems"],
+            json!(["ferrowire", "ferrostate"])
+        );
+        let hub = nodes.iter().find(|n| n["role"] == "hub").unwrap();
+        assert_eq!(
+            hub["federated_subsystems"],
+            json!([
+                "ferrowire",
+                "ferrostate",
+                "ferrogate",
+                "ferrostep",
+                "ferrodeck"
+            ])
+        );
+
+        // Heartbeat telemetry.
+        let beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/fed-a/heartbeat",
+            token,
+            Some(
+                &json!({ "status": "busy", "active_tasks": 2, "load_avg": 1.5, "capabilities": ["git"] }),
+            ),
+        );
+        assert_eq!(beat.status, 200, "{}", response_text(&beat));
+        let beat = beat.json_value().unwrap();
+        assert_eq!(beat["status"], "online");
+        assert_eq!(beat["reported_status"], "busy");
+        assert_eq!(beat["active_tasks"], 2);
+        assert_eq!(beat["load_avg"], 1.5);
+        for bad in [
+            json!({ "status": "sleeping" }),
+            json!({ "load_avg": -1 }),
+            json!({ "active_tasks": -3 }),
+            json!({ "environment_kind": "toaster" }),
+        ] {
+            let resp = http_call(
+                &state,
+                "POST",
+                "/api/v1/nodes/fed-a/heartbeat",
+                token,
+                Some(&bad),
+            );
+            assert_eq!(resp.status, 400, "{bad}: {}", response_text(&resp));
+        }
+
+        // Dispatch is owner only.
+        let task_body = json!({ "kind": "shell", "command": "cargo test", "project": "ferroloop" });
+        let dispatch = |bearer: Option<&str>, node: &str, body: &Value| {
+            http_call(
+                &state,
+                "POST",
+                &format!("/api/v1/nodes/{node}/dispatch"),
+                bearer,
+                Some(body),
+            )
+        };
+        assert_eq!(dispatch(None, "fed-a", &task_body).status, 401);
+        assert_eq!(dispatch(token, "fed-a", &task_body).status, 401);
+        assert_eq!(dispatch(peer, "fed-a", &task_body).status, 403);
+        assert_eq!(dispatch(owner, "nobody", &task_body).status, 404);
+        assert_eq!(
+            dispatch(owner, "fed-a", &json!({ "command": "  " })).status,
+            400
+        );
+        assert_eq!(
+            dispatch(owner, "fed-a", &json!({ "command": 5 })).status,
+            400
+        );
+        let hub_id = hub["node_id"].as_str().unwrap();
+        assert_eq!(dispatch(owner, hub_id, &task_body).status, 400);
+        let queued = dispatch(owner, "fed-a", &task_body);
+        assert_eq!(queued.status, 201, "{}", response_text(&queued));
+        let task = queued.json_value().unwrap()["task"].clone();
+        assert_eq!(task["status"], "queued");
+        assert_eq!(task["command"], "cargo test");
+        let task_id = task["task_id"].as_str().unwrap().to_string();
+
+        // Listing: owner and the node's own token only.
+        let list = |bearer: Option<&str>, node: &str| {
+            http_call(
+                &state,
+                "GET",
+                &format!("/api/v1/nodes/{node}/tasks"),
+                bearer,
+                None,
+            )
+        };
+        assert_eq!(list(owner, "fed-a").status, 200);
+        let own = list(token, "fed-a");
+        assert_eq!(
+            own.json_value().unwrap()["tasks"][0]["task_id"],
+            task_id.as_str()
+        );
+        assert_eq!(list(peer, "fed-a").status, 403);
+        assert_eq!(list(None, "fed-a").status, 401);
+        assert_eq!(list(owner, "nobody").status, 404);
+
+        // A different worker's token cannot touch this node's queue.
+        let other = enroll(json!({
+            "code": mint("other"), "node_id": "fed-b", "display_name": "Fed B",
+            "hostname": "h", "os": "linux", "arch": "x86_64"
+        }));
+        let other_token = other.json_value().unwrap()["node_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(list(Some(other_token.as_str()), "fed-a").status, 401);
+
+        // Results.
+        let result_path = format!("/api/v1/nodes/fed-a/tasks/{task_id}/result");
+        let post_result = |bearer: Option<&str>, path: &str, body: Value| {
+            http_call(&state, "POST", path, bearer, Some(&body))
+        };
+        assert_eq!(
+            post_result(
+                Some(other_token.as_str()),
+                &result_path,
+                json!({ "status": "running" })
+            )
+            .status,
+            401
+        );
+        assert_eq!(
+            post_result(token, &result_path, json!({ "status": "queued" })).status,
+            400
+        );
+        assert_eq!(
+            post_result(
+                token,
+                "/api/v1/nodes/fed-a/tasks/t-nope/result",
+                json!({ "status": "running" })
+            )
+            .status,
+            404
+        );
+        let running = post_result(
+            token,
+            &result_path,
+            json!({ "status": "running", "output": "start" }),
+        );
+        assert_eq!(running.status, 200, "{}", response_text(&running));
+        let done = post_result(
+            token,
+            &result_path,
+            json!({ "status": "completed", "output": "ok", "exit_code": 0 }),
+        );
+        assert_eq!(done.status, 200, "{}", response_text(&done));
+        let done = done.json_value().unwrap()["task"].clone();
+        assert_eq!(
+            (done["status"].as_str(), done["output"].as_str()),
+            (Some("completed"), Some("ok"))
+        );
+        assert_eq!(done["exit_code"], 0);
+        assert_eq!(
+            post_result(owner, &result_path, json!({ "status": "failed" })).status,
+            409
+        );
+
+        // A revoked node's token loses the queue.
+        assert_eq!(
+            http_call(&state, "DELETE", "/api/v1/nodes/fed-a", owner, None).status,
+            200
+        );
+        assert_eq!(list(token, "fed-a").status, 401);
+        assert_eq!(dispatch(owner, "fed-a", &task_body).status, 403);
+    }
+
+    #[test]
+    fn http_heartbeat_telemetry_is_only_taken_from_the_owner_or_the_node_itself() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let peer = Some("peer-tok-secret");
+        let code = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll-token",
+            owner,
+            Some(&json!({ "label": "hb" })),
+        )
+        .json_value()
+        .unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let enrolled = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": code, "node_id": "hb-a", "display_name": "HB A",
+                "hostname": "h", "os": "linux", "arch": "x86_64",
+                "environment_kind": "cloud-worker", "federated_subsystems": ["ferrowire"]
+            })),
+        );
+        assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
+        let token = enrolled.json_value().unwrap()["node_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let beat = |bearer: Option<&str>, body: Value| {
+            let resp = http_call(
+                &state,
+                "POST",
+                "/api/v1/nodes/hb-a/heartbeat",
+                bearer,
+                Some(&body),
+            );
+            assert_eq!(resp.status, 200, "{}", response_text(&resp));
+            resp.json_value().unwrap()
+        };
+        let node_row = || {
+            let listed = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+            let nodes = listed.json_value().unwrap()["nodes"].clone();
+            nodes
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["node_id"] == "hb-a")
+                .unwrap()
+                .clone()
+        };
+        let telemetry = json!({
+            "status": "busy", "active_tasks": 2, "load_avg": 1.5,
+            "environment_kind": "linux-worker", "federated_subsystems": ["ferrostate"],
+            "capabilities": ["gpu"], "labels": ["rack-1"]
+        });
+        let own = beat(Some(token.as_str()), telemetry.clone());
+        assert_eq!(own["reported_status"], "busy");
+        let before = node_row();
+        assert_eq!(before["environment_kind"], "linux-worker");
+        assert_eq!(before["federated_subsystems"], json!(["ferrostate"]));
+        assert_eq!(before["capabilities"], json!(["gpu"]));
+        assert_eq!(before["labels"], json!(["rack-1"]));
+
+        // A peer's heartbeat keeps the node alive and changes nothing it reports.
+        std::thread::sleep(Duration::from_millis(20));
+        let forged = json!({
+            "status": "draining", "active_tasks": 9, "load_avg": 8.0,
+            "environment_kind": "ai-lab", "federated_subsystems": ["ferrodeck"],
+            "capabilities": ["forged"], "labels": ["forged"]
+        });
+        let by_peer = beat(peer, forged.clone());
+        assert!(
+            by_peer["last_seen_at_ms"].as_u64() > before["last_seen_at_ms"].as_u64(),
+            "a peer heartbeat must still count as liveness"
+        );
+        let after = node_row();
+        for field in [
+            "reported_status",
+            "active_tasks",
+            "load_avg",
+            "environment_kind",
+            "federated_subsystems",
+            "capabilities",
+            "labels",
+        ] {
+            assert_eq!(after[field], before[field], "{field}");
+        }
+
+        // The owner may set them.
+        let by_owner = beat(owner, forged);
+        assert_eq!(by_owner["reported_status"], "draining");
+        let after = node_row();
+        assert_eq!(
+            (after["active_tasks"].clone(), after["load_avg"].clone()),
+            (json!(9), json!(8.0))
+        );
+        assert_eq!(after["environment_kind"], "ai-lab");
+        assert_eq!(after["federated_subsystems"], json!(["ferrodeck"]));
+        assert_eq!(after["capabilities"], json!(["forged"]));
+        assert_eq!(after["labels"], json!(["forged"]));
+
+        // The node's own bearer sets them too.
+        beat(
+            Some(token.as_str()),
+            json!({ "capabilities": ["gpu", "cpu"], "labels": ["rack-2"] }),
+        );
+        let after = node_row();
+        assert_eq!(after["capabilities"], json!(["gpu", "cpu"]));
+        assert_eq!(after["labels"], json!(["rack-2"]));
+    }
+
+    #[test]
+    fn http_runtime_matrix_and_probe() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let peer = Some("peer-tok-secret");
+
+        assert_eq!(
+            http_call(&state, "GET", "/api/v1/runtimes/matrix", None, None).status,
+            401
+        );
+        // Probing spawns CLIs, so it is owner only for GET as well as POST.
+        assert_eq!(
+            http_call(&state, "GET", "/api/v1/runtimes/matrix", peer, None).status,
+            403
+        );
+        let matrix = http_call(&state, "GET", "/api/v1/runtimes/matrix", owner, None);
+        assert_eq!(matrix.status, 200, "{}", response_text(&matrix));
+        let matrix = matrix.json_value().unwrap();
+        let names: Vec<_> = matrix["cli_runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["claude", "codex", "grok", "agy", "muse"]);
+        assert_eq!(matrix["vault_providers"].as_array().unwrap().len(), 5);
+        assert!(
+            matrix["vault_providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["status"] == "missing")
+        );
+        let engines: Vec<_> = matrix["local_engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(engines, ["ollama", "lemonade-8000", "lemonade-8097"]);
+
+        // Provision one secret; the matrix reports it and never the value.
+        let set = http_call(
+            &state,
+            "POST",
+            "/api/v1/gate/secrets",
+            owner,
+            Some(&json!({ "name": "OPENAI_API_KEY", "value": "sk-matrix-secret-value" })),
+        );
+        assert_eq!(set.status, 200, "{}", response_text(&set));
+        let probe = http_call(
+            &state,
+            "POST",
+            "/api/v1/runtimes/probe",
+            owner,
+            Some(&json!({ "target": "vault" })),
+        );
+        assert_eq!(probe.status, 200, "{}", response_text(&probe));
+        assert!(!response_text(&probe).contains("sk-matrix-secret-value"));
+        let probe = probe.json_value().unwrap();
+        assert!(probe["cli_runtimes"].as_array().unwrap().is_empty());
+        assert!(probe["local_engines"].as_array().unwrap().is_empty());
+        let openai = probe["vault_providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["provider"] == "openai")
+            .unwrap();
+        assert_eq!(openai["status"], "ready");
+
+        assert_eq!(
+            http_call(&state, "POST", "/api/v1/runtimes/probe", peer, None).status,
+            403
+        );
+        assert_eq!(
+            http_call(&state, "POST", "/api/v1/runtimes/probe", None, None).status,
+            401
+        );
+        for bad in [json!({ "target": "bogus" }), json!({ "target": 5 })] {
+            let resp = http_call(&state, "POST", "/api/v1/runtimes/probe", owner, Some(&bad));
+            assert_eq!(resp.status, 400, "{}", response_text(&resp));
+        }
+    }
+
+    #[test]
+    fn http_runtime_matrix_get_does_not_create_the_vault_key() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let key = fl_gate::resolve_master_key_path(Some(tmp.path()));
+        assert!(!key.exists());
+        let matrix = http_call(
+            &state,
+            "GET",
+            "/api/v1/runtimes/matrix",
+            Some("owner-tok-secret"),
+            None,
+        );
+        assert_eq!(matrix.status, 200, "{}", response_text(&matrix));
+        assert!(!key.exists(), "a read created the vault master key");
+    }
+
+    #[test]
     fn http_nodes_enrollment_heartbeat_and_revoke() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
@@ -5617,6 +6063,7 @@ default_target = "wire:felicity"
                 session_id: None,
                 status: "live".into(),
                 updated_at_ms: 1,
+                versions: Vec::new(),
             });
         });
         let listed = list_artifacts(&state);
@@ -5815,6 +6262,7 @@ default_target = "wire:felicity"
             session_id: None,
             status: "live".into(),
             updated_at_ms: 1,
+            versions: Vec::new(),
         };
         let canon_wt = fs::canonicalize(&wt).unwrap();
         crate::artifacts::with_registry(&artifacts_root_of(&tmp), |reg| {
@@ -5984,6 +6432,7 @@ default_target = "wire:felicity"
                 session_id: Some(session.into()),
                 status: "live".into(),
                 updated_at_ms: 1,
+                versions: Vec::new(),
             });
         });
     }

@@ -444,6 +444,7 @@ dependencies = [
  "fl-github",
  "fl-store",
  "fl-wire",
+ "flate2",
  "globset",
  "libc",
  "ring",
