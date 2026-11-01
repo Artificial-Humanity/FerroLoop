@@ -29,7 +29,8 @@ use std::time::Duration;
 use super::ws;
 
 pub(super) const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client waits for a reply before it resends a write once.
+pub(super) const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Accept is nonblocking. Drop waits at most one pause to observe the flag.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 /// Forwarders wake on this interval so a closed connection can join them.
@@ -195,6 +196,11 @@ impl FerroStoreServer {
     /// Lower the idle time after which a session is gone.
     pub(super) fn set_session_idle(&self, idle: Duration) {
         self.state.sessions.set_idle(idle);
+    }
+
+    /// Lower the time after which a session is gone however often it is read.
+    pub(super) fn set_session_lifetime(&self, lifetime: Duration) {
+        self.state.sessions.set_lifetime(lifetime);
     }
 }
 
@@ -618,8 +624,9 @@ fn exactly_once(state: &ServerState, conn: u64, method: &str, params: &Value) ->
         return reply_body(dispatch(state, conn, method, params));
     };
     match state.dedup.claim(req) {
-        Claim::Replay(reply) => reply,
-        Claim::Run(running) => {
+        Err(full) => reply_body(Err(full)),
+        Ok(Claim::Replay(reply)) => reply,
+        Ok(Claim::Run(running)) => {
             let reply = reply_body(dispatch(state, conn, method, params));
             running.finish(&reply);
             reply
@@ -647,15 +654,20 @@ fn dispatch(
         }
         "txn_read" => {
             let key = session::parse_key(params.get("read"))?;
-            let (pinned, opened) = match session::optional_u64(params, "session")? {
-                Some(id) => (state.sessions.state(conn, id)?, None),
-                None => {
-                    let pinned = store.read_state()?;
-                    let id = state.sessions.open(conn, Arc::clone(&pinned))?;
-                    (pinned, Some(id))
+            match session::optional_u64(params, "session")? {
+                Some(id) => {
+                    let pinned = state.sessions.state(conn, id)?;
+                    txn_read(&pinned, &key)
                 }
-            };
-            txn_read(&pinned, &key, opened)
+                None => {
+                    // The answer first: a read that fails opens no session,
+                    // whose id the client would never learn.
+                    let pinned = store.read_state()?;
+                    let answer = session::answer(&pinned, &key)?;
+                    let id = state.sessions.open(conn, Arc::clone(&pinned))?;
+                    Ok(txn_read_reply(&pinned, answer, Some(id)))
+                }
+            }
         }
         "commit_txn" => session::commit_txn(store, &state.sessions, conn, params),
         "put_doc" => {
@@ -888,14 +900,19 @@ fn dispatch(
     }
 }
 
-/// One read primitive against `pinned`: its answer and the answer's hash,
-/// and the session when this read opened it.
-fn txn_read(
+/// One read primitive against an open session's `pinned` state: its
+/// answer and the answer's hash.
+fn txn_read(pinned: &super::state::DocState, key: &ReadKey) -> Result<Value, StoreError> {
+    Ok(txn_read_reply(pinned, session::answer(pinned, key)?, None))
+}
+
+/// The reply to a `txn_read` whose answer at `pinned` is `(result, hash)`,
+/// with the session when this read opened it.
+fn txn_read_reply(
     pinned: &super::state::DocState,
-    key: &ReadKey,
+    (result, hash): (Value, String),
     opened: Option<u64>,
-) -> Result<Value, StoreError> {
-    let (result, hash) = session::answer(pinned, key)?;
+) -> Value {
     let mut body = serde_json::Map::new();
     body.insert("result".into(), result);
     body.insert("hash".into(), Value::String(hash));
@@ -903,7 +920,7 @@ fn txn_read(
         body.insert("session".into(), json!(session));
         body.insert("base_seq".into(), json!(pinned.last_seq));
     }
-    Ok(Value::Object(body))
+    Value::Object(body)
 }
 
 /// A reply without its frame id: what the exactly-once table keeps.

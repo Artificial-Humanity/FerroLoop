@@ -2517,8 +2517,8 @@ impl FerroStore {
 
     /// One attempt of a remote write (spec §4.5, §6.1): run `body` over a
     /// new read session and send its ops with its read set. `None` when
-    /// another writer changed what `body` read: nothing was written and the
-    /// caller may try again. `Err` from the body, from a read, or from the
+    /// another writer changed what `body` read, or the session expired under
+    /// a read: nothing was written and the caller may try again. `Err` from the body, from a read, or from the
     /// server, ends the write. A body that wrote nothing commits nothing and
     /// closes its session.
     fn remote_attempt<T>(
@@ -2534,6 +2534,11 @@ impl FerroStore {
             body(&mut txn)
         };
         if let Some(err) = txn.take_read_error() {
+            // The session expired under the body (idle, or at its lifetime):
+            // nothing was sent, so the attempt is lost and runs again.
+            if session::is_session_expired(&err) {
+                return Ok(None);
+            }
             return Err(err);
         }
         let result = result?;

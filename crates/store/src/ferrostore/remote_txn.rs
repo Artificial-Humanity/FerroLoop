@@ -129,10 +129,22 @@ impl RemoteBase {
         )
     }
 
-    /// The answers read so far (not the keys asked for), as text: what the
-    /// retry test hook knows of the state, so an id in it is not fresh.
-    pub(super) fn known(&self) -> String {
-        format!("{:?}", self.cache.borrow().values().collect::<Vec<_>>())
+    /// The answers read so far (not the keys asked for), formatted only when
+    /// the retry test hook formats them: what it knows of the state, so an id
+    /// in it is not fresh. A build without tests never formats them.
+    pub(super) fn known(&self) -> Known<'_> {
+        Known(self)
+    }
+}
+
+/// [`RemoteBase::known`]: its `Debug` lists the cached answers.
+pub(super) struct Known<'a>(&'a RemoteBase);
+
+impl std::fmt::Debug for Known<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.cache.borrow().values())
+            .finish()
     }
 }
 

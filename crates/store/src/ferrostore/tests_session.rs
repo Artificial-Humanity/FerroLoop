@@ -4,7 +4,10 @@
 
 use super::retry::{Cas, hook};
 use super::server::{self, RemoteClient};
-use super::session::{SESSIONS_PER_CONN, SESSIONS_PER_SERVER};
+use super::session::{
+    Claim, DEDUP_ENTRIES, DEDUP_FULL, DEDUP_MIN_AGE, DEDUP_TTL, Dedup, SESSION_EXPIRED,
+    SESSIONS_PER_CONN, SESSIONS_PER_SERVER,
+};
 use super::{FerroStore, FerroStoreServer, Inner, VectorMetric, VectorStorage};
 use fl_core::StoreError;
 use fl_core::store::Catalog;
@@ -414,6 +417,86 @@ fn an_idle_session_expires_and_frees_its_place() {
     assert_eq!(served.server.open_sessions(), 1);
 }
 
+#[test]
+fn a_session_read_often_still_expires_at_its_lifetime() {
+    let served = serve(FerroStore::in_memory());
+    served
+        .server
+        .set_session_lifetime(Duration::from_millis(300));
+    let raw = served.raw();
+    let session = open(&raw).unwrap();
+    let opened = Instant::now();
+    // Read well inside the idle limit, until the lifetime has passed.
+    let err = loop {
+        match read_in(&raw, session) {
+            Ok(_) => assert!(
+                opened.elapsed() < Duration::from_secs(5),
+                "the session outlived its lifetime"
+            ),
+            Err(err) => break err,
+        }
+        thread::sleep(Duration::from_millis(40));
+    };
+    assert!(opened.elapsed() >= Duration::from_millis(300));
+    assert!(err.to_string().contains(SESSION_EXPIRED), "{err}");
+    assert!(err.to_string().contains("lifetime"), "{err}");
+    assert_eq!(served.server.open_sessions(), 0);
+}
+
+#[test]
+fn closing_a_session_sweeps_the_expired_ones() {
+    let served = serve(FerroStore::in_memory());
+    served
+        .server
+        .set_session_lifetime(Duration::from_millis(100));
+    let raw = served.raw();
+    let first = open(&raw).unwrap();
+    let other = served.raw();
+    open(&other).unwrap();
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(served.server.open_sessions(), 2, "nothing swept yet");
+    // Closing a session that is not open still sweeps.
+    raw.call("close_session", json!({"session": u64::MAX}))
+        .unwrap();
+    assert_eq!(served.server.open_sessions(), 0);
+    // A read in a swept session says it expired, so the client retries it.
+    let err = read_in(&raw, first).unwrap_err();
+    assert!(err.to_string().contains(SESSION_EXPIRED), "{err}");
+}
+
+#[test]
+fn a_transaction_whose_session_expires_runs_again_over_a_new_one() {
+    let store = FerroStore::in_memory();
+    store.put_doc("d", "a", &json!(1)).unwrap();
+    store.put_doc("d", "b", &json!(2)).unwrap();
+    let served = serve(store);
+    served
+        .server
+        .set_session_lifetime(Duration::from_millis(200));
+    let client = served.client();
+    let runs = Cell::new(0);
+    let sum = client
+        .transaction(|txn| {
+            runs.set(runs.get() + 1);
+            let a = txn.get_doc("d", "a").and_then(|v| v.as_u64()).unwrap_or(0);
+            if runs.get() == 1 {
+                // The session reaches its lifetime between two reads.
+                thread::sleep(Duration::from_millis(300));
+            }
+            let b = txn.get_doc("d", "b").and_then(|v| v.as_u64()).unwrap_or(0);
+            txn.put_doc("d", "sum", &json!(a + b))?;
+            Ok(a + b)
+        })
+        .unwrap();
+    assert_eq!(sum, 3);
+    assert_eq!(runs.get(), 2, "the expired attempt ran again");
+    assert_eq!(
+        served.server.store().get_doc("d", "sum").unwrap(),
+        Some(json!(3))
+    );
+    served.wait_sessions(0);
+}
+
 // ---- exactly-once ------------------------------------------------------------------
 
 #[test]
@@ -488,6 +571,92 @@ fn a_remote_write_sends_a_fresh_request_id_per_attempt() {
     assert_eq!(served.server.store().last_seq().unwrap(), 3);
 }
 
+/// Claim `req` at `at` on `dedup`, which must run it.
+fn run_at(dedup: &Dedup, req: u128, at: Instant) -> super::session::Running<'_> {
+    match dedup.claim_at(req, || at) {
+        Ok(Claim::Run(running)) => running,
+        Ok(Claim::Replay(reply)) => panic!("request {req} replayed {reply}"),
+        Err(err) => panic!("request {req} refused: {err}"),
+    }
+}
+
+/// `dedup` holds `req`'s reply at `at`.
+fn replays(dedup: &Dedup, req: u128, at: Instant) -> Option<Value> {
+    match dedup.claim_at(req, || at) {
+        Ok(Claim::Replay(reply)) => Some(reply),
+        Ok(Claim::Run(_)) => None,
+        Err(err) => panic!("request {req} refused: {err}"),
+    }
+}
+
+#[test]
+fn a_running_request_id_survives_eviction_pressure() {
+    let dedup = Dedup::default();
+    let base = Instant::now();
+    let first = run_at(&dedup, 0, base);
+    for req in 1..DEDUP_ENTRIES as u128 {
+        run_at(&dedup, req, base).finish(&json!(req));
+    }
+    // Full, and every id is old enough to forget by count: the oldest
+    // answered one goes, not the running one.
+    let later = base + DEDUP_MIN_AGE + Duration::from_secs(1);
+    run_at(&dedup, u128::MAX, later).finish(&json!("new"));
+    assert_eq!(dedup.reply_of(1), None, "the oldest answered id stays");
+    // Past the TTL every answered id goes; the running one is kept.
+    let late = base + DEDUP_TTL + Duration::from_secs(1);
+    run_at(&dedup, u128::MAX - 1, late).finish(&json!("newer"));
+    assert_eq!(dedup.reply_of(2), None, "an id past the TTL stays");
+    first.finish(&json!("first"));
+    assert_eq!(
+        dedup.reply_of(0),
+        Some(json!("first")),
+        "the running id was forgotten: a resend of its write would apply it again"
+    );
+}
+
+#[test]
+fn an_answered_request_id_younger_than_two_call_timeouts_is_kept_when_full() {
+    let dedup = Dedup::default();
+    let base = Instant::now();
+    for req in 0..DEDUP_ENTRIES as u128 {
+        run_at(&dedup, req, base).finish(&json!(req));
+    }
+    let young = base + DEDUP_MIN_AGE;
+    let err = match dedup.claim_at(u128::MAX, || young) {
+        Err(err) => err,
+        Ok(_) => panic!("a full table took a new request id"),
+    };
+    assert!(err.to_string().contains(DEDUP_FULL), "{err}");
+    assert_eq!(
+        replays(&dedup, 0, young),
+        Some(json!(0)),
+        "evicted by count"
+    );
+    // Older than that, the oldest goes by count and the new id runs.
+    let old = young + Duration::from_secs(1);
+    run_at(&dedup, u128::MAX, old).finish(&json!("new"));
+    assert_eq!(dedup.reply_of(0), None);
+    assert_eq!(dedup.reply_of(1), Some(json!(1)));
+}
+
+#[test]
+fn a_table_full_of_running_request_ids_refuses_a_new_write() {
+    let dedup = Dedup::default();
+    let base = Instant::now();
+    let running: Vec<_> = (0..DEDUP_ENTRIES as u128)
+        .map(|req| run_at(&dedup, req, base))
+        .collect();
+    let late = base + DEDUP_TTL + Duration::from_secs(1);
+    let err = match dedup.claim_at(u128::MAX, || late) {
+        Err(err) => err,
+        Ok(_) => panic!("a running id was dropped for a new one"),
+    };
+    assert!(err.to_string().contains(DEDUP_FULL), "{err}");
+    // Released (each dropped unanswered), the ids make room again.
+    drop(running);
+    run_at(&dedup, u128::MAX, late).finish(&json!("new"));
+}
+
 // ---- commit validation of ops ---------------------------------------------------------
 
 #[test]
@@ -525,6 +694,103 @@ fn commit_txn_refuses_reserved_ops_but_the_schema_version() {
     )
     .unwrap();
     assert_eq!(served.server.store().last_seq().unwrap(), 1);
+}
+
+/// One `commit_txn` of `ops` with an empty read set.
+fn commit_ops(raw: &RemoteClient, ops: Value) -> Result<Value, StoreError> {
+    raw.call("commit_txn", json!({"reads": [], "ops": ops}))
+}
+
+fn put_schema(version: Value) -> Value {
+    json!({"op": "put", "collection": "__meta", "id": "schema_version", "doc": version})
+}
+
+#[test]
+fn a_remote_commit_only_raises_the_schema_version_of_a_store_with_data() {
+    let served = serve(FerroStore::in_memory());
+    let raw = served.raw();
+    let store = served.server.store();
+    let delete_schema = json!({"op": "delete", "collection": "__meta", "id": "schema_version"});
+    // An empty store: a lower version is accepted (what a migration writes).
+    commit_ops(&raw, json!([put_schema(json!(crate::FORMAT_WITH_STATE))])).unwrap();
+    assert_eq!(
+        store.format_version().unwrap(),
+        Some(crate::FORMAT_WITH_STATE)
+    );
+    commit_ops(
+        &raw,
+        json!([{"op": "put", "collection": "d", "id": "a", "doc": 1}]),
+    )
+    .unwrap();
+    // A raise is accepted.
+    commit_ops(&raw, json!([put_schema(json!(crate::FORMAT_WITH_WIRE))])).unwrap();
+    assert_eq!(
+        store.format_version().unwrap(),
+        Some(crate::FORMAT_WITH_WIRE)
+    );
+    // A lower or equal version, or a delete, is refused whole on a store with data.
+    let before = store.last_seq().unwrap();
+    for (op, says) in [
+        (put_schema(json!(crate::FORMAT_WITH_STATE)), "from 7 to 6"),
+        (put_schema(json!(crate::FORMAT_WITH_WIRE)), "from 7 to 7"),
+        (delete_schema.clone(), "delete the schema version 7"),
+    ] {
+        let err = commit_ops(
+            &raw,
+            json!([{"op": "put", "collection": "d", "id": "b", "doc": 2}, op]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("commit_txn refused"), "{err}");
+        assert!(err.to_string().contains(says), "{err}");
+    }
+    assert_eq!(store.last_seq().unwrap(), before, "a refused commit wrote");
+    assert_eq!(store.get_doc("d", "b").unwrap(), None);
+    assert_eq!(
+        store.format_version().unwrap(),
+        Some(crate::FORMAT_WITH_WIRE)
+    );
+    // Off the ladder, or another reserved op: refused as reserved.
+    for op in [
+        put_schema(json!(999)),
+        json!({"op": "put", "collection": "__other", "id": "x", "doc": 1}),
+        json!({"op": "delete", "collection": "__meta", "id": "other"}),
+    ] {
+        let err = commit_ops(&raw, json!([op])).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+    // A store whose only data is a vector collection holds data too.
+    let vectors = with_vectors();
+    let err = commit_ops(&vectors.raw(), json!([delete_schema.clone()])).unwrap_err();
+    assert!(err.to_string().contains("commit_txn refused"), "{err}");
+    // Emptied again, the store takes the delete.
+    commit_ops(
+        &raw,
+        json!([{"op": "delete", "collection": "d", "id": "a"}]),
+    )
+    .unwrap();
+    commit_ops(&raw, json!([delete_schema])).unwrap();
+    assert_eq!(store.format_version().unwrap(), None);
+}
+
+#[test]
+fn a_migration_into_an_empty_remote_store_copies_the_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let redb = crate::RedbStore::open(&dir.path().join("src.redb")).unwrap();
+    let project = Catalog::add_project(&redb, "/migrated").unwrap();
+    let served = serve(FerroStore::in_memory());
+    let client = served.client();
+    super::migrate_redb_to_ferrostore(&redb, &client).unwrap();
+    let store = served.server.store();
+    assert_eq!(
+        store.format_version().unwrap(),
+        redb.format_version().unwrap()
+    );
+    assert_eq!(
+        store.get_project(&project).unwrap().unwrap().root,
+        "/migrated"
+    );
+    // Into a store that now holds data, a second migration is refused.
+    assert!(super::migrate_redb_to_ferrostore(&redb, &client).is_err());
 }
 
 #[test]
@@ -687,6 +953,21 @@ fn a_read_larger_than_a_frame_is_an_error_naming_the_primitive_and_collection() 
     assert!(text.contains("scan of `big`"), "{text}");
     assert!(text.contains("16 MiB"), "{text}");
     assert_eq!(served.server.store().get_doc("d", "after").unwrap(), None);
+    // A read that opens a session and fails leaves none open: the client
+    // never learned its id.
+    let err = served
+        .raw()
+        .call(
+            "txn_read",
+            json!({"read": {"p": "scan", "collection": "big"}}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("16 MiB"), "{err}");
+    assert_eq!(
+        served.server.open_sessions(),
+        0,
+        "the failed read pinned a session"
+    );
     // One document of it is still read.
     let one = client
         .transaction(|txn| Ok(txn.get_doc("big", "03")))
