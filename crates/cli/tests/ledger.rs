@@ -264,7 +264,7 @@ impl World {
 
     /// How many gate runs `m`'s store holds, over every gate.
     fn runs(&self, m: &Machine) -> usize {
-        let store = fl_store::RedbStore::open(&m.store()).unwrap();
+        let store = fl_store::open_store(&m.store()).unwrap();
         store
             .list_projects()
             .unwrap()
@@ -276,7 +276,7 @@ impl World {
 
     /// How many attempts `m`'s store holds.
     fn attempts(&self, m: &Machine) -> usize {
-        let store = fl_store::RedbStore::open(&m.store()).unwrap();
+        let store = fl_store::open_store(&m.store()).unwrap();
         store
             .list_projects()
             .unwrap()
@@ -369,7 +369,7 @@ fn init_whose_rules_cannot_be_read_imports_nothing_on_a_machine_that_imports() {
         .code(2)
         .stderr(contains("rules/branches/fl/ledger"))
         .stdout(contains("imported\t").not());
-    let store = fl_store::RedbStore::open(&two.store()).unwrap();
+    let store = fl_store::open_store(&two.store()).unwrap();
     assert!(!store.holds_a_ledger_root().unwrap(), "no ledger root");
     assert!(
         fl_core::store::Catalog::list_projects(&store)
@@ -2763,7 +2763,7 @@ fn stats_on_another_projects_store_says_it_covers_the_local_store_only() {
     let w = World::new();
     w.ready();
     let iri = {
-        let store = fl_store::RedbStore::open(&w.one.store()).unwrap();
+        let store = fl_store::open_store(&w.one.store()).unwrap();
         let projects = store.list_projects().unwrap();
         assert_eq!(projects.len(), 1, "{projects:?}");
         projects[0].id.iri().as_str().to_string()

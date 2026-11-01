@@ -691,7 +691,7 @@ fn project_iri(g: &G, root: &Path) -> String {
 /// `project`.
 fn local_records(store: &Path, project: &str) -> usize {
     use fl_core::Tracker;
-    let s = fl_store::RedbStore::open(store).unwrap();
+    let s = fl_store::open_store(store).unwrap();
     let p = fl_core::ProjectId(fl_core::Iri::parse(project).unwrap());
     s.list_records(&p).unwrap().len()
 }
@@ -858,7 +858,7 @@ fn gated_record(g: &G) {
 /// The runs the local store holds for the project's only gate.
 fn runs_of_the_only_gate(g: &G) -> Vec<fl_core::GateRun> {
     use fl_core::store::{Catalog, Ledger};
-    let store = fl_store::RedbStore::open(&g.home.path().join("fl.redb")).unwrap();
+    let store = fl_store::open_store(&g.home.path().join("fl.redb")).unwrap();
     let p = store.list_projects().unwrap()[0].id.clone();
     let gate = store.list_gates(&p).unwrap()[0].id.clone();
     store.gate_runs(&gate).unwrap()

@@ -706,6 +706,41 @@ holds it, searching the bound store and every store any project is bound to. `--
 `$FL_DB` stop that search: they confine the command to the one store they name, and an IRI
 that store does not hold is refused, not looked for elsewhere.
 
+### Store engine
+
+A store is a FerroStore file by default. The store path you configure stays the same: for a
+path that ends in `.redb`, the store lives in the sibling `.fls` file (`fl.redb` is `fl.fls`).
+The first open of a store that still has only a `.redb` migrates it. The copy is verified table
+by table (row counts and content hashes); if it does not verify, the store stays on the
+`.redb`. After a verified copy the `.redb` stays on disk, read-only (mode `0400`), as the
+rollback copy.
+
+* `FL_STORE_BACKEND=redb` keeps every store on redb. It is the rollback, and it is one way:
+  a process on redb takes no migration lock, and nothing keeps the two files in step. To roll
+  back, set the variable for **every** process that uses the store (the hub, the wire daemon,
+  every MCP server and every shell): a process without it still reads and writes the `.fls`.
+  Then rename the `.fls` aside (for example `mv fl.fls fl.fls.old`) and `chmod 600` the `.redb`.
+  Writes made after the migration are in the `.fls` only; writes made after the rollback are in
+  the `.redb` only and are lost to the `.fls`. A `.fls` left beside a `.redb` that a process
+  opens on redb gets a one-time warning on stderr (it says NEWER when the `.fls` was written
+  after the `.redb`); `fl store verify` compares the pair. To move forward again, rename any old
+  `.fls` aside before the first open on FerroStore, so that the `.redb` is migrated afresh: a
+  stale `.fls` is opened as it is, and the newer `.redb` writes are ignored.
+* A `.redb` that another process holds open stays on redb with a one-time warning and no `.fls`
+  is made, so the store does not split; the next open after the holder lets go migrates it.
+  A migration whose copy does not verify also stays on redb with a one-time warning and no
+  `.fls`; `fl store migrate` shows the mismatch.
+* A path that ends in `.fls` is always FerroStore.
+* `fl store status` shows the engine and the file, `fl store migrate` migrates a store by
+  hand, and `fl store verify` compares a `.redb` and `.fls` pair.
+* Before the first command on the FerroStore engine, stop any `fl hub` or `fl wire daemon`
+  process that still runs on redb, or start it on the FerroStore engine in the same step. Two
+  processes that use different engines for one store is the case the migration lock guards
+  against.
+* The hub migrates only its own store. A project store (`<slug>.redb`) is migrated by the first
+  `fl` command that opens it, or by `fl store migrate`; until then the hub does not list that
+  project in `available_projects`, and answers `409` for its records.
+
 ### Store permissions
 
 A store holds hub pairing codes, session hashes and other records, so it is private to your

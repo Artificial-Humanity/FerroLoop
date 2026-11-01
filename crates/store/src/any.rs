@@ -7,7 +7,8 @@
 //!
 //! * The engine is chosen by [`choose_backend`]: a `.fls` path is always a
 //!   [`FerroStore`]; any other path takes `FL_STORE_BACKEND` (`redb` or
-//!   `ferro`), then [`DEFAULT_BACKEND`].
+//!   `ferro`), then [`DEFAULT_BACKEND`], which is FerroStore.
+//!   `FL_STORE_BACKEND=redb` keeps a store on redb.
 //! * A logical path such as `fl.redb` names the same store under either
 //!   engine: [`physical_path`] maps it to the sibling `fl.fls` when the engine
 //!   is FerroStore, so a config entry never changes at cutover.
@@ -67,8 +68,9 @@ impl BackendKind {
 /// name one by its extension.
 pub const BACKEND_ENV: &str = "FL_STORE_BACKEND";
 
-/// The engine a path takes when neither the path nor the environment names one.
-pub const DEFAULT_BACKEND: BackendKind = BackendKind::Redb;
+/// The engine a path takes when neither the path nor the environment names one:
+/// FerroStore. `FL_STORE_BACKEND=redb` selects redb instead.
+pub const DEFAULT_BACKEND: BackendKind = BackendKind::Ferro;
 
 /// The extension of a FerroStore file.
 pub const FERRO_EXTENSION: &str = "fls";
@@ -177,9 +179,25 @@ pub(crate) fn open_store_sink(
     options: &StoreOptions,
     sink: &dyn Fn(&str),
 ) -> Result<AnyStore, StoreError> {
+    open_store_sink_env(
+        path,
+        options,
+        std::env::var(BACKEND_ENV).ok().as_deref(),
+        sink,
+    )
+}
+
+/// [`open_store_sink`] with the value of [`BACKEND_ENV`] passed in, so a test
+/// can name the environment without changing the process's.
+pub(crate) fn open_store_sink_env(
+    path: &Path,
+    options: &StoreOptions,
+    env: Option<&str>,
+    sink: &dyn Fn(&str),
+) -> Result<AnyStore, StoreError> {
     let kind = match options.backend {
         Some(kind) => kind,
-        None => choose_backend(path, std::env::var(BACKEND_ENV).ok().as_deref())?,
+        None => choose_backend(path, env)?,
     };
     let physical = physical_path(path, kind);
     let (backend_store, label) = match kind {
@@ -263,16 +281,30 @@ pub fn forget_fallback(path: &Path) {
 /// Warn, once per process per store, that a `.fls` sits beside a `.redb` that
 /// is being opened with the redb engine. After a migration the redb is kept
 /// read-only; if it was made writable again and written, the `.fls` no longer
-/// matches it.
+/// matches it. When the `.fls` was written after the `.redb`, the warning says
+/// the `.fls` is newer: this process is then working on the older copy, and
+/// any process on the ferro engine still works on the newer one.
 fn warn_if_fls_beside(redb: &Path, sink: &dyn Fn(&str)) {
     let fls = redb.with_extension(FERRO_EXTENSION);
     if fls == redb || std::fs::symlink_metadata(&fls).is_err() {
         return;
     }
     if first_time("fls-beside-redb", &memory_key(redb)) {
+        let fls_is_newer = match (
+            std::fs::metadata(&fls).and_then(|m| m.modified()),
+            std::fs::metadata(redb).and_then(|m| m.modified()),
+        ) {
+            (Ok(fls_time), Ok(redb_time)) => fls_time > redb_time,
+            _ => false,
+        };
+        let differ = if fls_is_newer {
+            "the .fls is NEWER than the .redb, so the two differ: writes made on the ferro \
+             engine are not in the redb"
+        } else {
+            "if the redb was made writable again after a migration, the two may differ"
+        };
         sink(&format!(
-            "warning: {} exists beside {}, which is opened with the redb engine: if the redb \
-             was made writable again after a migration, the two may differ; run \
+            "warning: {} exists beside {}, which is opened with the redb engine: {differ}; run \
              `fl store verify` to compare them",
             fls.display(),
             redb.display()
@@ -1352,6 +1384,40 @@ mod tests {
     }
 
     #[test]
+    fn the_default_engine_is_ferrostore_and_redb_is_the_environments_rollback() {
+        assert_eq!(DEFAULT_BACKEND, BackendKind::Ferro);
+        // No engine named: a `.redb` name opens a FerroStore at the sibling `.fls`.
+        let dir = TempDir::new().unwrap();
+        let logical = dir.path().join("fl.redb");
+        let store = open_store_sink_env(&logical, &StoreOptions::default(), None, &|_| {}).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        drop(store);
+        assert!(dir.path().join("fl.fls").is_file());
+        assert!(!logical.exists(), "no redb was created");
+
+        // `FL_STORE_BACKEND=redb` keeps the store on redb, at the path itself.
+        let dir = TempDir::new().unwrap();
+        let logical = dir.path().join("fl.redb");
+        let store =
+            open_store_sink_env(&logical, &StoreOptions::default(), Some("redb"), &|_| {}).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        drop(store);
+        assert!(logical.is_file());
+        assert!(
+            !dir.path().join("fl.fls").exists(),
+            "no ferro file was created"
+        );
+
+        // A name with no extension and an empty value take the default too.
+        let dir = TempDir::new().unwrap();
+        let bare = dir.path().join("store");
+        let store =
+            open_store_sink_env(&bare, &StoreOptions::default(), Some(""), &|_| {}).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        assert!(dir.path().join("store.fls").is_file());
+    }
+
+    #[test]
     fn a_fls_path_is_ferrostore_and_other_paths_follow_the_environment() {
         let fls = Path::new("/x/fl.fls");
         let redb = Path::new("/x/fl.redb");
@@ -1395,15 +1461,19 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let redb = root.join("a.redb");
         // Absent: the directory is resolved, the name kept.
-        assert_eq!(store_identity_with(&redb, None), redb);
         assert_eq!(store_identity_with(&redb, Some("redb")), redb);
         // A sibling .fls is a different store under redb.
         assert_ne!(
-            store_identity_with(&redb, None),
+            store_identity_with(&redb, Some("redb")),
             store_identity_with(&root.join("a.fls"), None)
         );
         std::fs::write(&redb, b"x").unwrap();
-        assert_eq!(store_identity_with(&redb, None), redb);
+        assert_eq!(store_identity_with(&redb, Some("redb")), redb);
+        // With no engine named, the default (FerroStore) maps it to the sibling .fls.
+        assert_eq!(
+            store_identity_with(&redb, None),
+            store_identity_with(&root.join("a.fls"), None)
+        );
     }
 
     #[test]
@@ -1818,9 +1888,15 @@ mod tests {
             let threads: Vec<_> = (0..2)
                 .map(|_| {
                     scope.spawn(|| {
-                        let store =
-                            open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &said.sink())
-                                .unwrap();
+                        // Both threads fall back to the same redb file, which
+                        // opens once per process: the retries make the second
+                        // wait for the first to drop its store.
+                        let options = StoreOptions {
+                            backend: Some(BackendKind::Ferro),
+                            unmigrated: Unmigrated::Migrate,
+                            retries: 200,
+                        };
+                        let store = open_store_sink(&redb, &options, &said.sink()).unwrap();
                         store.kind()
                     })
                 })
@@ -2146,9 +2222,10 @@ mod tests {
         drop(store);
         assert!(!dir.path().join("empty.fls").exists());
 
-        // The convenience: UseRedb under the environment's engine (redb here).
+        // The convenience: UseRedb under the environment's engine. A lone
+        // redb is read as redb whichever engine is selected, and never migrated.
         let store = open_store_for_scan(&redb).unwrap();
-        assert_eq!(store.kind(), DEFAULT_BACKEND);
+        assert_eq!(store.kind(), BackendKind::Redb);
 
         // Migrate: a .fls, a read-only redb, and a notice.
         let (dir, redb, (project, gate, record)) = populated("c.redb");
@@ -2464,6 +2541,44 @@ mod tests {
     }
 
     #[test]
+    fn the_redb_engine_warning_says_the_fls_is_newer_when_it_is() {
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let t1 = t0 + std::time::Duration::from_secs(3600);
+        let redb_opts = StoreOptions {
+            backend: Some(BackendKind::Redb),
+            ..StoreOptions::default()
+        };
+        let set_mtime = |path: &Path, time: std::time::SystemTime| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        // (mtime of the .redb, mtime of the .fls, whether the warning says NEWER)
+        for (redb_time, fls_time, newer) in [(t0, t1, true), (t1, t0, false)] {
+            let dir = TempDir::new().unwrap();
+            let redb = dir.path().join("s.redb");
+            let fls = dir.path().join("s.fls");
+            drop(RedbStore::open(&redb).unwrap());
+            drop(FerroStore::open(&fls).unwrap());
+            set_mtime(&redb, redb_time);
+            set_mtime(&fls, fls_time);
+            let said = Lines::default();
+            drop(open_store_sink(&redb, &redb_opts, &said.sink()).unwrap());
+            let lines = said.all();
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0].contains("NEWER"), newer, "{lines:?}");
+            assert!(lines[0].contains("s.fls"), "{lines:?}");
+            assert!(lines[0].contains("fl store verify"), "{lines:?}");
+            if !newer {
+                assert!(lines[0].contains("may differ"), "{lines:?}");
+            }
+        }
+    }
+
+    #[test]
     fn migrate_locked_creates_the_fls_and_refuses_a_second_one() {
         let dir = TempDir::new().unwrap();
         let redb = dir.path().join("s.redb");
@@ -2760,7 +2875,7 @@ mod tests {
         // A directory named like the redb is not a store.
         let dir_named = dir.path().join("d.redb");
         std::fs::create_dir(&dir_named).unwrap();
-        assert!(store_exists_with(&dir_named, None));
+        assert!(store_exists_with(&dir_named, Some("redb")));
         assert!(!store_exists_with(&dir_named, Some("ferro")));
         let ferro = StoreOptions {
             backend: Some(BackendKind::Ferro),
@@ -2782,7 +2897,11 @@ mod tests {
         let physical = dir.path().join("f.fls");
         assert!(physical.exists());
         assert!(store_exists_with(&fresh, Some("ferro")));
-        assert!(!store_exists_with(&fresh, None));
+        assert!(
+            store_exists_with(&fresh, None),
+            "the default engine is ferro"
+        );
+        assert!(!store_exists_with(&fresh, Some("redb")));
         assert!(store_exists_with(&physical, None));
         // A bad environment value falls back to the path itself.
         assert!(store_exists_with(&logical, Some("bogus")));
