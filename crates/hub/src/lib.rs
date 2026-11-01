@@ -175,6 +175,9 @@ pub struct HubState {
     /// The engine every store this hub opens uses. `None` (always, outside tests) lets the path and
     /// `FL_STORE_BACKEND` choose; a test sets it instead of changing the process environment.
     pub(crate) store_backend: Option<fl_store::BackendKind>,
+    /// A few read-only handles on the code vector sidecar, so a code search does not open the
+    /// sidecar again every time. They never create or write it.
+    pub(crate) code_sidecars: Arc<fl_store::CodeSidecarCache>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -281,6 +284,7 @@ impl HubState {
             login_guard: Arc::new(operators::LoginGuard::default()),
             probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
             store_backend: None,
+            code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
         }
     }
 
@@ -2604,6 +2608,125 @@ mod tests {
             broken["symbols"][0]["name"], "hub_widget_builder",
             "{broken}"
         );
+        assert!(
+            !broken.to_string().contains("superblock"),
+            "engine text leaked"
+        );
+    }
+
+    #[test]
+    fn code_search_route_holds_a_read_only_sidecar_handle() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        let store_path = tmp.path().join("hub.fls");
+        state.config.store_path = store_path.clone();
+        let sidecar = tmp.path().join("hub.code.fls");
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/widget.rs"),
+            "pub fn hub_widget_builder() {}\npub fn other_thing() {}\n",
+        )
+        .unwrap();
+        let get = |q: &str| {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new(
+                    "GET",
+                    format!("/api/v1/state/code-search?q={q}&kind=search"),
+                )
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+            );
+            assert_eq!(resp.status, 200);
+            resp.json_value().unwrap()
+        };
+        let cli_search = |q: &str| {
+            let store = fl_store::open_store(&store_path).unwrap();
+            let index = fl_core::scan_code_index(tmp.path());
+            let ranked = fl_store::search_code(
+                &store,
+                &index,
+                fl_core::CodeSearchKind::Search,
+                q,
+                10,
+                fl_store::IndexPolicy::Sync { budget: 100 },
+            );
+            assert_eq!(ranked.mode, fl_store::SearchMode::Knowledge);
+        };
+        let names = |body: &Value| -> Vec<String> {
+            body["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // No sidecar: nothing is opened and nothing is made.
+        get("hub_widget_builder");
+        assert_eq!(state.code_sidecars.opens(), 0);
+        assert!(!sidecar.exists());
+
+        // A CLI search builds it. The first request opens it, the next ones reuse it.
+        cli_search("hub_widget_builder");
+        let before = (
+            fs::read(&sidecar).unwrap(),
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        );
+        for _ in 0..3 {
+            let body = get("hub%20widgt%20bilder");
+            assert_eq!(names(&body)[0], "hub_widget_builder", "{body}");
+        }
+        assert_eq!(state.code_sidecars.opens(), 1, "a request reopened");
+        assert_eq!(state.code_sidecars.len(), 1);
+
+        // A CLI search adds a symbol meanwhile: the held handle finds it by a typo.
+        assert!(names(&get("zebrra%20quokka%20handlr")).is_empty());
+        fs::write(
+            tmp.path().join("src/zebra.rs"),
+            "pub fn zebra_quokka_handler() {}\n",
+        )
+        .unwrap();
+        cli_search("zebra");
+        let fresh = get("zebrra%20quokka%20handlr");
+        assert_eq!(names(&fresh), ["zebra_quokka_handler"], "{fresh}");
+        assert_eq!(state.code_sidecars.opens(), 1, "freshness needed a reopen");
+
+        // Once the CLI is done, further requests leave the file's bytes and mtime alone.
+        let quiet = (
+            fs::read(&sidecar).unwrap(),
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+        );
+        for _ in 0..2 {
+            get("hub_widget_builder");
+        }
+        assert_eq!(
+            quiet,
+            (
+                fs::read(&sidecar).unwrap(),
+                fs::metadata(&sidecar).unwrap().modified().unwrap()
+            ),
+            "the route wrote to the sidecar"
+        );
+        assert_ne!(before.0, quiet.0, "the CLI search should have synced");
+
+        // Deleted while held: the answer stays right and the route makes no file.
+        fs::remove_file(&sidecar).unwrap();
+        let gone = get("hub_widget_builder");
+        assert_eq!(names(&gone)[0], "hub_widget_builder", "{gone}");
+        assert!(gone.get("note").is_none(), "{gone}");
+        assert!(!sidecar.exists(), "a read request created the sidecar");
+
+        // Rebuilt, then corrupted in place while held: the exact leg answers with
+        // the fixed note and no engine text.
+        cli_search("hub_widget_builder");
+        assert_eq!(names(&get("hub_widget_builder"))[0], "hub_widget_builder");
+        fs::write(&sidecar, vec![0xA5u8; 8192]).unwrap();
+        let broken = get("hub_widget_builder");
+        assert_eq!(
+            broken["note"], "code index unavailable; searched without vectors",
+            "{broken}"
+        );
+        assert_eq!(names(&broken)[0], "hub_widget_builder", "{broken}");
         assert!(
             !broken.to_string().contains("superblock"),
             "engine text leaked"

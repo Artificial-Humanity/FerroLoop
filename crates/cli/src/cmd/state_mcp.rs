@@ -24,7 +24,7 @@ use fl_core::workflow::{
 use fl_exec::workflow::{
     list_workflow_facts, list_workflow_handoffs, record_step_handoff, write_workflow_fact,
 };
-use fl_store::AnyStore;
+use fl_store::{AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ use crate::cmd::state::{
     DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, effective_code_limit,
     effective_search_limit, index_unavailable_line, parse_concern, parse_memory_basis,
     parse_memory_category, parse_merge_mode, ranked_result_json, render_state_markdown,
-    resolve_state_in_store, search_and_record,
+    resolve_state_in_store, search_and_record, search_and_record_in,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -381,10 +381,30 @@ fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, Str
     let root = code_root(env, args)?;
     let index = scan_code_index(&root);
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
-    let mut token_gain = load_token_gain(&store);
+    Ok(run_batch_queries(&store, &index, &queries)?.0)
+}
+
+/// Run `queries` over one scanned `index`. One [`CodeSession`] serves the whole
+/// batch: the code sidecar is opened once, synced once (its deadline bounds the
+/// batch, not each subquery) and searched by each subquery. The second value is
+/// how many times the sidecar was opened (a test hook).
+fn run_batch_queries(
+    store: &AnyStore,
+    index: &fl_core::CodeIndex,
+    queries: &[CodeQuery],
+) -> Result<(String, usize), String> {
+    let session = CodeSession::with_default_embedder(
+        store,
+        index,
+        IndexPolicy::Sync {
+            budget: DEFAULT_CODE_SYNC_BUDGET,
+        },
+    );
+    let mut token_gain = load_token_gain(store);
     let mut results = Vec::with_capacity(queries.len());
-    for sub in &queries {
-        let (ranked, updated) = search_and_record(&store, &index, sub.kind, &sub.query, sub.limit)?;
+    for sub in queries {
+        let (ranked, updated) =
+            search_and_record_in(&session, store, sub.kind, &sub.query, sub.limit)?;
         token_gain = updated;
         let mut result = json!({
             "query": sub.query,
@@ -395,11 +415,12 @@ fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, Str
         ranked.annotate_json(&mut result);
         results.push(result);
     }
-    Ok(serde_json::to_string_pretty(&json!({
+    let out = serde_json::to_string_pretty(&json!({
         "results": results,
         "token_gain": token_gain,
     }))
-    .unwrap())
+    .unwrap();
+    Ok((out, session.sidecar_opens()))
 }
 
 /// BM25-only search shape, for tests that have no store.
@@ -1877,6 +1898,50 @@ mod tests {
             );
         }
         assert_eq!(batch["token_gain"]["queries_count"], 4, "{batch}");
+    }
+
+    /// A batch opens (and syncs) the code sidecar once, whatever the number of
+    /// subqueries, and its wire JSON is what separate calls would give.
+    #[test]
+    fn a_batch_search_opens_the_sidecar_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn checkpoint_store() {}\npub fn tokenize_input() {}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("batch.fls");
+        let store = fl_store::open_store(&db).unwrap();
+        let index = scan_code_index(dir.path());
+        let queries = parse_batch_queries(&json!({ "queries": [
+            { "kind": "search", "q": "chekpoint" },
+            { "kind": "search", "q": "tokenise" },
+            { "kind": "def", "q": "checkpoint_store" },
+            { "kind": "search", "q": "tokenize_input", "limit": 1 },
+            { "kind": "search", "q": "chekpoint_stor" },
+        ] }))
+        .unwrap();
+        let (batch, opens) = run_batch_queries(&store, &index, &queries).unwrap();
+        assert_eq!(opens, 1, "one open for the whole batch");
+        let batch: Value = serde_json::from_str(&batch).unwrap();
+        let results = batch["results"].as_array().unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0]["mode"], "knowledge", "{batch}");
+        assert_eq!(
+            results[1]["symbols"][0]["name"], "tokenize_input",
+            "{batch}"
+        );
+        assert!(results[2].get("mode").is_none(), "{batch}");
+        assert_eq!(results[3]["symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(batch["token_gain"]["queries_count"], 5, "{batch}");
+        assert!(db.with_extension("code.fls").is_file());
+        // Def-only batches open nothing.
+        let defs = parse_batch_queries(&json!({ "queries": [
+            { "kind": "def", "q": "checkpoint_store" },
+            { "kind": "outline", "q": "lib.rs" },
+        ] }))
+        .unwrap();
+        assert_eq!(run_batch_queries(&store, &index, &defs).unwrap().1, 0);
     }
 
     fn seeded_entries() -> Vec<StateEntry> {

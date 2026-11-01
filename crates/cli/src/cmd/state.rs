@@ -21,8 +21,8 @@ use fl_core::state::{
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
 use fl_store::{
-    AnyStore, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankedCode, RankedHits, SearchMode,
-    search_code,
+    AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankedCode, RankedHits,
+    SearchMode,
 };
 
 use crate::cmd::agent::{now_at, write_atomic_non_symlink};
@@ -203,16 +203,27 @@ pub fn search_and_record(
     query: &str,
     limit: usize,
 ) -> Result<(RankedCode, TokenGainSummary), String> {
-    let ranked = search_code(
+    let session = CodeSession::with_default_embedder(
         store,
         index,
-        kind,
-        query,
-        limit,
         IndexPolicy::Sync {
             budget: DEFAULT_CODE_SYNC_BUDGET,
         },
     );
+    search_and_record_in(&session, store, kind, query, limit)
+}
+
+/// [`search_and_record`] on a held [`CodeSession`]: a caller with several
+/// searches over one index (`fl_batch_search`) makes the session once, so the
+/// sidecar is opened and synced once for all of them.
+pub fn search_and_record_in(
+    session: &CodeSession<'_>,
+    store: &AnyStore,
+    kind: CodeSearchKind,
+    query: &str,
+    limit: usize,
+) -> Result<(RankedCode, TokenGainSummary), String> {
+    let ranked = session.search(kind, query, limit);
     if let Some(line) = ranked.unavailable_line() {
         eprintln!("{line}");
     }
