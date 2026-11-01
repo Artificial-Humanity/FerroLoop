@@ -2983,6 +2983,101 @@ mod tests {
         assert_eq!(merge(&state, "Other-App[bot]", None).status, 200);
     }
 
+    #[test]
+    fn pr_merge_reads_reviews_by_author_id_and_refuses_the_old_ui_shape() {
+        use fl_core::AgentRegistry;
+        use fl_core::agent::AgentRole;
+        use fl_core::pr_policy::{FlReviewMarker, ReviewVerdict, format_review_body};
+
+        // The id the Reviewer App's bot user has (`ferroloop[bot]`), written out so a change to
+        // the default has to touch this test too.
+        const APP_ID: u64 = 341_521_384;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            for (name, role) in [
+                ("Felicia", AgentRole::Assistant),
+                ("Ferris", AgentRole::Lead),
+            ] {
+                store
+                    .register_agent(fl_core::agent::RegisterAgentArgs {
+                        display_name: name.into(),
+                        email: None,
+                        project: "ferroloop".into(),
+                        role,
+                        extra_areas: vec![],
+                        create_area: true,
+                        replace: true,
+                        at: stamp::now(),
+                        by: "owner".into(),
+                    })
+                    .unwrap();
+            }
+        }
+        let marker = FlReviewMarker {
+            reviewer: "ferris".into(),
+            role: AgentRole::Lead,
+            project: "ferroloop".into(),
+            head_sha: "sha1".into(),
+            verdict: ReviewVerdict::Approved,
+            at: fl_core::at::At::from_unix_millis(1),
+        };
+        let merge_with = |review: Value| {
+            let body = json!({
+                "by": "felicia",
+                "project": "ferroloop",
+                "head_sha": "sha1",
+                "files": ["crates/core/src/lib.rs"],
+                "commits": [{
+                    "sha": "sha1",
+                    "author_login": "artificially-human",
+                    "message": "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>",
+                }],
+                "reviews": [review],
+            });
+            handle_http_request(&state, &authed("POST", "/api/v1/prs/1/merge", PEER, &body))
+        };
+        // The wire shape of `PrReviewSummary`: `author_login` and `author_id`, never `reviewer_login`.
+        let review = |login: &str, id: Option<u64>| {
+            json!({
+                "id": 1,
+                "author_login": login,
+                "author_id": id,
+                "state": "APPROVED",
+                "body": format_review_body("ok", &marker),
+                "commit_id": "sha1",
+            })
+        };
+
+        // The App's user id counts, whatever login it shows (a renamed App keeps its id).
+        assert_eq!(
+            merge_with(review("ferroloop[bot]", Some(APP_ID))).status,
+            200
+        );
+        assert_eq!(merge_with(review("renamed[bot]", Some(APP_ID))).status, 200);
+        // A spoofed id, or no id at all, with the App's login does not count.
+        assert_eq!(
+            merge_with(review("ferroloop[bot]", Some(APP_ID + 1))).status,
+            403
+        );
+        assert_eq!(merge_with(review("ferroloop[bot]", None)).status, 403);
+        // The id must be a number: a string is a malformed payload, not a match.
+        let mut stringy = review("ferroloop[bot]", None);
+        stringy["author_id"] = json!(APP_ID.to_string());
+        assert_eq!(merge_with(stringy).status, 400);
+        // The shape the FerroDeck type used to declare (`reviewer_login`, no `id`, no
+        // `author_login`) is not a review the Hub accepts.
+        let old_ui_shape = json!({
+            "reviewer_login": "ferroloop[bot]",
+            "state": "APPROVED",
+            "body": format_review_body("ok", &marker),
+            "commit_id": "sha1",
+        });
+        assert_eq!(merge_with(old_ui_shape).status, 400);
+    }
+
     fn spin_up_body(persona: &str) -> Value {
         json!({
             "persona": persona,
