@@ -38,12 +38,22 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         />,
       );
 
-      // 1. Clicking Stop once enters armed state without calling onInterruptSession
+      // 1. Stop button is placed inside composer-action-bar immediately to the left of Send Message
+      const actionBar = screen.getByTestId("composer-action-bar");
       const stopBtn = screen.getByTestId("interrupt-session-btn");
+      const sendBtn = screen.getByTestId("send-prompt-btn");
+      expect(actionBar).toContainElement(stopBtn);
+      expect(actionBar).toContainElement(sendBtn);
+      expect(
+        stopBtn.compareDocumentPosition(sendBtn) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+
+      // Clicking Stop once enters armed state without calling onInterruptSession
       fireEvent.click(stopBtn);
       expect(onInterruptSession).not.toHaveBeenCalled();
       expect(screen.getByTestId("interrupt-confirm-btn")).toBeInTheDocument();
       expect(screen.getByTestId("interrupt-cancel-btn")).toBeInTheDocument();
+      expect(actionBar).toContainElement(screen.getByTestId("interrupt-confirm-btn"));
 
       // 2. Clicking Cancel disarms without firing
       fireEvent.click(screen.getByTestId("interrupt-cancel-btn"));
@@ -143,14 +153,17 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         />,
       );
 
-      // Active model badge is shown in the decluttered ChatPane top bar
-      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
-        "antigravity · gemini-4-argon (high)",
-      );
+      // Top ChatPane bar stays compact without verbose model/turn/context badges
+      expect(screen.queryByTestId("chat-active-model-badge")).toBeNull();
+      expect(screen.queryByTestId("turn-count-badge")).toBeNull();
 
       // Open AgentSettingsModal via chat-agent-settings-btn
       fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
       expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "antigravity · gemini-4-argon (high)",
+      );
+      expect(screen.getByTestId("turn-count-badge")).toHaveTextContent("0 turns");
 
       const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
       const thinkingSelect = screen.getByTestId(

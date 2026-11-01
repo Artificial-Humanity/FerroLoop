@@ -301,12 +301,18 @@ describe("ChatPane", () => {
     expect(promptTextarea).toHaveAttribute("aria-autocomplete", "none");
 
     const actionBar = screen.getByTestId("composer-action-bar");
+    const stopButton = screen.getByTestId("interrupt-session-btn");
     const sendButton = screen.getByRole("button", { name: /Send Message/i });
+    expect(actionBar).toContainElement(stopButton);
+    expect(actionBar).toContainElement(sendButton);
     expect(
       promptTextarea.compareDocumentPosition(actionBar) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
     expect(
       promptTextarea.compareDocumentPosition(sendButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      stopButton.compareDocumentPosition(sendButton) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
@@ -777,8 +783,8 @@ describe("ChatPane draft persistence", () => {
   });
 });
 
-describe("ChatPane vendor account quota allowance badge", () => {
-  it("renders Codex plus tier with 5h session and 7d weekly allowance windows and renewal countdowns", () => {
+describe("ChatPane vendor account quota allowance badge in AgentSettingsModal", () => {
+  it("keeps top toolbar compact without quota-usage-badge and renders Codex plus tier with 5h session and 7d weekly allowance windows in AgentSettingsModal", () => {
     const now = Date.now();
     render(
       <ChatPane
@@ -804,6 +810,11 @@ describe("ChatPane vendor account quota allowance badge", () => {
       />,
     );
 
+    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
+    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+
     const badge = screen.getByTestId("quota-usage-badge");
     expect(badge).not.toHaveAttribute("data-exhausted", "true");
     expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("PLUS");
@@ -813,7 +824,7 @@ describe("ChatPane vendor account quota allowance badge", () => {
     expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 6d 22h");
   });
 
-  it("renders Grok SuperGrok tier with weekly allowance window", () => {
+  it("renders Grok SuperGrok tier with weekly allowance window in AgentSettingsModal", () => {
     const now = Date.now();
     render(
       <ChatPane
@@ -834,6 +845,9 @@ describe("ChatPane vendor account quota allowance badge", () => {
       />,
     );
 
+    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+
     const badge = screen.getByTestId("quota-usage-badge");
     expect(badge).not.toHaveAttribute("data-exhausted", "true");
     expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("SUPERGROK");
@@ -842,7 +856,7 @@ describe("ChatPane vendor account quota allowance badge", () => {
     expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 4d 5h");
   });
 
-  it("highlights Muse 429 quota exhaustion with danger/coral styling and tooltip", () => {
+  it("shows compact quota-exhausted-toolbar-pill in toolbar when exhausted and highlights full Muse 429 quota details in AgentSettingsModal", () => {
     const now = Date.now();
     render(
       <ChatPane
@@ -863,6 +877,12 @@ describe("ChatPane vendor account quota allowance badge", () => {
         onSendPrompt={vi.fn()}
       />,
     );
+
+    const toolbarPill = screen.getByTestId("quota-exhausted-toolbar-pill");
+    expect(toolbarPill).toHaveTextContent("HTTP 429: quota exhausted, resets at 03:15 UTC");
+    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
+
+    fireEvent.click(toolbarPill);
 
     const badge = screen.getByTestId("quota-usage-badge");
     expect(badge).toHaveAttribute("data-exhausted", "true");
@@ -1229,6 +1249,7 @@ describe("Resizable chat composer (Record 57)", () => {
       />,
     );
 
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
       "claude · claude-opus-5-5 (high)",
     );
@@ -1247,7 +1268,6 @@ describe("Resizable chat composer (Record 57)", () => {
       "antigravity · gemini-4-argon (high)",
     );
 
-    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
     expect(select.value).toBe("gemini-4-argon");
   });

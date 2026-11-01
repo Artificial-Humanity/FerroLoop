@@ -1494,15 +1494,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           alignItems: "center",
           justifyContent: "space-between",
           gap: "8px",
-          padding: "8px 16px",
+          padding: "6px 16px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
+          flexWrap: "nowrap",
         }}
       >
         <div
           className="chat-header-meta"
-          style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, flexWrap: "wrap", minWidth: 0 }}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            flex: 1,
+            flexWrap: "nowrap",
+            minWidth: 0,
+          }}
         >
           <input
             type="search"
@@ -1521,9 +1528,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             onChange={(e) => setFilterQuery(e.target.value)}
             style={{ width: "100%", maxWidth: "320px", fontSize: "12px", padding: "5px 9px" }}
           />
-          <span className="fd-badge" data-testid="turn-count-badge">
-            {filteredTurns.length} {filteredTurns.length === 1 ? "turn" : "turns"}
-          </span>
           <span
             className="fd-badge"
             data-testid="session-busy-badge"
@@ -1535,260 +1539,37 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               borderColor: effectiveIsBusy
                 ? "rgba(245, 158, 11, 0.35)"
                 : "rgba(16, 185, 129, 0.3)",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
             }}
           >
             {effectiveIsBusy ? "Busy · Working" : "Idle"}
           </span>
-          <span
-            className="fd-badge fd-mono"
-            data-testid="chat-active-model-badge"
-            title="Click to configure model, thinking level, or session lifecycle"
-            onClick={handleOpenAgentSettings}
-            style={{ cursor: "pointer" }}
-          >
-            {adapter ? `${adapter} · ` : ""}
-            {selectedModel}
-            {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
-          </span>
-          <div
-            data-testid="context-level-meter"
-            title="Click to open Agent Settings & Context Lifecycle"
-            onClick={handleOpenAgentSettings}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              minWidth: "190px",
-              cursor: "pointer",
-            }}
-          >
-            <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-              Context: {formatTokenCount(contextEstimate.usedTokens)} /{" "}
-              {formatTokenCount(contextEstimate.maxTokens)} ({contextEstimate.percent}%)
-            </span>
-            <div
-              role="progressbar"
-              aria-label="Context level"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={contextEstimate.percent}
-              style={{
-                width: "64px",
-                height: "6px",
-                borderRadius: "3px",
-                backgroundColor: "var(--bg-input)",
-                border: "1px solid var(--border-subtle)",
-                overflow: "hidden",
-                flexShrink: 0,
-              }}
-            >
-              <div
-                style={{
-                  width: `${contextEstimate.percent}%`,
-                  height: "100%",
-                  backgroundColor:
-                    contextEstimate.percent >= 80
-                      ? "var(--status-danger)"
-                      : contextEstimate.percent >= 50
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)",
-                }}
-              />
-            </div>
-          </div>
-          {showQuotaBadge && effectiveQuotaUsage && (
-            <div
-              data-testid="quota-usage-badge"
-              data-exhausted={quotaExhausted ? "true" : undefined}
-              className={`fd-badge fd-quota-badge${quotaExhausted ? " is-exhausted" : ""}`}
+          {showQuotaBadge && effectiveQuotaUsage && quotaExhausted && (
+            <button
+              type="button"
+              data-testid="quota-exhausted-toolbar-pill"
+              className="fd-badge fd-quota-badge is-exhausted"
               title={
                 effectiveQuotaUsage.exhausted_reason?.trim() ||
-                "Vendor account usage allowance"
+                "Vendor account quota exhausted — click to open Agent Settings"
               }
+              onClick={handleOpenAgentSettings}
               style={{
                 display: "inline-flex",
                 alignItems: "center",
-                gap: "8px",
-                padding: "3px 8px",
-                flexWrap: "wrap",
-                borderColor: quotaExhausted
-                  ? "var(--diff-del-border, rgba(239, 68, 68, 0.45))"
-                  : "var(--border-subtle)",
-                backgroundColor: quotaExhausted
-                  ? "var(--diff-del-bg, rgba(239, 68, 68, 0.14))"
-                  : "var(--bg-elevated)",
-                color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--text-secondary)",
+                gap: "4px",
+                padding: "2px 8px",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+                borderColor: "var(--diff-del-border, rgba(239, 68, 68, 0.45))",
+                backgroundColor: "var(--diff-del-bg, rgba(239, 68, 68, 0.14))",
+                color: "var(--diff-del-text, #FCA5A5)",
+                fontWeight: 600,
+                flexShrink: 0,
               }}
             >
-              {effectiveQuotaUsage.tier && effectiveQuotaUsage.tier.trim().length > 0 && (
-                <span
-                  data-testid="quota-tier-chip"
-                  style={{
-                    padding: "1px 5px",
-                    borderRadius: "3px",
-                    fontSize: "10px",
-                    fontWeight: 700,
-                    letterSpacing: "0.04em",
-                    backgroundColor: quotaExhausted
-                      ? "rgba(239, 68, 68, 0.2)"
-                      : "var(--accent-subtle)",
-                    color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--accent-hover)",
-                    border: `1px solid ${
-                      quotaExhausted
-                        ? "rgba(239, 68, 68, 0.45)"
-                        : "var(--border-accent)"
-                    }`,
-                  }}
-                >
-                  {effectiveQuotaUsage.tier.trim().toUpperCase()}
-                </span>
-              )}
-              {effectiveQuotaUsage.primary_window && (() => {
-                const win = effectiveQuotaUsage.primary_window;
-                const remaining = formatQuotaWindowRemaining(win);
-                const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                const barColor =
-                  win.used_percent >= 100 || remaining <= 10
-                    ? "var(--status-danger)"
-                    : remaining <= 25
-                      ? "var(--status-stale)"
-                      : "var(--status-alive)";
-                return (
-                  <span
-                    data-testid="quota-primary-window"
-                    style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                  >
-                    <span>5h: {remaining}% left</span>
-                    <span
-                      role="progressbar"
-                      aria-label="5h session allowance remaining"
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={remaining}
-                      style={{
-                        width: "36px",
-                        height: "5px",
-                        borderRadius: "3px",
-                        backgroundColor: "var(--bg-input)",
-                        border: "1px solid var(--border-subtle)",
-                        overflow: "hidden",
-                        display: "inline-block",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "block",
-                          width: `${remaining}%`,
-                          height: "100%",
-                          backgroundColor: barColor,
-                        }}
-                      />
-                    </span>
-                    {resetLabel && (
-                      <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                        ({resetLabel})
-                      </span>
-                    )}
-                  </span>
-                );
-              })()}
-              {effectiveQuotaUsage.secondary_window && (() => {
-                const win = effectiveQuotaUsage.secondary_window;
-                const remaining = formatQuotaWindowRemaining(win);
-                const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                const barColor =
-                  win.used_percent >= 100 || remaining <= 10
-                    ? "var(--status-danger)"
-                    : remaining <= 25
-                      ? "var(--status-stale)"
-                      : "var(--status-alive)";
-                return (
-                  <span
-                    data-testid="quota-secondary-window"
-                    style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                  >
-                    <span>7d: {remaining}% left</span>
-                    <span
-                      role="progressbar"
-                      aria-label="Weekly allowance remaining"
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={remaining}
-                      style={{
-                        width: "36px",
-                        height: "5px",
-                        borderRadius: "3px",
-                        backgroundColor: "var(--bg-input)",
-                        border: "1px solid var(--border-subtle)",
-                        overflow: "hidden",
-                        display: "inline-block",
-                      }}
-                    >
-                      <span
-                        style={{
-                          display: "block",
-                          width: `${remaining}%`,
-                          height: "100%",
-                          backgroundColor: barColor,
-                        }}
-                      />
-                    </span>
-                    {resetLabel && (
-                      <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                        ({resetLabel})
-                      </span>
-                    )}
-                  </span>
-                );
-              })()}
-              {quotaExhausted && (
-                <span
-                  data-testid="quota-exhausted-alert"
-                  style={{
-                    fontWeight: 600,
-                    color: "var(--diff-del-text, #FCA5A5)",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {effectiveQuotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
-                </span>
-              )}
-            </div>
-          )}
-          {interruptArmed ? (
-            <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
-              <button
-                type="button"
-                className="fd-btn fd-btn-danger"
-                data-testid="interrupt-confirm-btn"
-                disabled={interrupting}
-                onClick={() => void handleConfirmInterrupt()}
-                style={{ whiteSpace: "nowrap" }}
-              >
-                {interrupting ? "Stopping..." : "Confirm Stop"}
-              </button>
-              <button
-                type="button"
-                className="fd-btn"
-                data-testid="interrupt-cancel-btn"
-                disabled={interrupting}
-                onClick={disarmInterrupt}
-                style={{ whiteSpace: "nowrap" }}
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              className="fd-btn fd-btn-danger"
-              data-testid="interrupt-session-btn"
-              disabled={!canInterrupt}
-              title="Stop active session execution (requires confirmation click)"
-              onClick={handleArmInterrupt}
-              style={{ whiteSpace: "nowrap" }}
-            >
-              {interrupting ? "Stopping..." : "Stop"}
+              {effectiveQuotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
             </button>
           )}
           {compactFeedback && (
@@ -1796,14 +1577,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               role="status"
               data-testid="compact-feedback"
               className="fd-badge"
-              style={{ color: "var(--diff-add-text)" }}
+              style={{ color: "var(--diff-add-text)", whiteSpace: "nowrap", flexShrink: 0 }}
             >
               {compactFeedback}
             </span>
           )}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
           {onToggleArtifacts && (
             <button
               type="button"
@@ -2398,15 +2179,55 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               </label>
             </div>
 
-            <button
-              type="button"
-              className="fd-btn fd-btn-primary"
-              disabled={!canSend}
-              onClick={() => void submitPrompt()}
-              style={{ height: "34px", padding: "0 16px" }}
-            >
-              {submitting ? "Sending..." : "Send Message"}
-            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              {interruptArmed ? (
+                <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-danger"
+                    data-testid="interrupt-confirm-btn"
+                    disabled={interrupting}
+                    onClick={() => void handleConfirmInterrupt()}
+                    style={{ height: "34px", padding: "0 12px", whiteSpace: "nowrap" }}
+                  >
+                    {interrupting ? "Stopping..." : "Confirm Stop"}
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="interrupt-cancel-btn"
+                    disabled={interrupting}
+                    onClick={disarmInterrupt}
+                    style={{ height: "34px", padding: "0 10px", whiteSpace: "nowrap" }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="fd-btn fd-btn-danger"
+                  data-testid="interrupt-session-btn"
+                  disabled={!canInterrupt}
+                  title="Stop active session execution (requires confirmation click)"
+                  onClick={handleArmInterrupt}
+                  style={{ height: "34px", padding: "0 12px", whiteSpace: "nowrap" }}
+                >
+                  {interrupting ? "Stopping..." : "Stop"}
+                </button>
+              )}
+
+              <button
+                type="button"
+                className="fd-btn fd-btn-primary"
+                data-testid="send-prompt-btn"
+                disabled={!canSend}
+                onClick={() => void submitPrompt()}
+                style={{ height: "34px", padding: "0 16px" }}
+              >
+                {submitting ? "Sending..." : "Send Message"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -2679,6 +2500,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         contextEstimate={contextEstimate}
         quotaUsage={effectiveQuotaUsage}
+        turnCount={filteredTurns.length}
         canCompact={canCompact}
         compacting={compacting}
         onCompactContext={() => void handleCompactContext()}
