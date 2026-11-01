@@ -2450,6 +2450,23 @@ mod tests {
             (BackendKind::Redb, "store.redb", "rows"),
             (BackendKind::Ferro, "store.fls", "columnar"),
         ] {
+            // The hub opens its store through `fl_store::open_store`, which lets
+            // `FL_STORE_BACKEND` pick the engine for a `.redb` path; only a `.fls` path is
+            // pinned to FerroStore. So the redb leg needs the variable to leave redb in
+            // charge. This test binary runs tests in parallel, so the test must not set or
+            // clear the variable itself: it skips that leg, visibly, when it is set otherwise.
+            if kind == BackendKind::Redb {
+                let env = std::env::var(fl_store::BACKEND_ENV).ok();
+                let chosen = fl_store::choose_backend(Path::new(file), env.as_deref());
+                if !matches!(chosen, Ok(BackendKind::Redb)) {
+                    eprintln!(
+                        "SKIPPED: the redb leg, because {}={:?} makes the hub open `{file}` as {chosen:?}",
+                        fl_store::BACKEND_ENV,
+                        env.unwrap_or_default(),
+                    );
+                    continue;
+                }
+            }
             let tmp = TempDir::new().unwrap();
             let mut state = test_hub_state(&tmp);
             state.config.store_path = tmp.path().join(file);
@@ -2480,9 +2497,13 @@ mod tests {
                 "gate_runs": {"pass": 1, "fail": 1, "error": 2},
             })
         );
-        assert_eq!(summaries[0], summaries[1]);
-        assert_eq!(defaults[0]["attempts"], defaults[1]["attempts"]);
-        assert_eq!(defaults[0]["by_status"], defaults[1]["by_status"]);
+        // Both legs ran unless the redb leg was skipped above; the ferro leg always runs.
+        assert!(!summaries.is_empty());
+        if summaries.len() == 2 {
+            assert_eq!(summaries[0], summaries[1]);
+            assert_eq!(defaults[0]["attempts"], defaults[1]["attempts"]);
+            assert_eq!(defaults[0]["by_status"], defaults[1]["by_status"]);
+        }
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! Ledger totals that never load the rows when the engine can sum them natively.
+//! Ledger totals that do not hand the rows to the caller when the engine can sum them natively.
+//! The engine still scans the whole table (every project, even for one project's totals), so
+//! the gain is CPU and memory in the caller, not I/O.
 //!
 //! FerroStore has a columnar scan over its attempt and gate-run tables
 //! ([`FerroStore::attempt_rollup`], [`FerroStore::gate_run_rollup`]). A caller that only needs

@@ -2441,8 +2441,8 @@ fn handle_post_state_import_workspace(
     )
 }
 
-/// `GET /api/v1/stats?summary=1`: totals across every project, with no row loaded on the ferro
-/// engine. `source` is `columnar` only when every figure came from the engine's columnar scan.
+/// `GET /api/v1/stats?summary=1`: totals across every project; on the ferro engine no row is
+/// handed to the hub, though the engine still scans the tables. `source` is `columnar` only when every figure came from the engine's columnar scan.
 fn handle_get_stats_summary(store: &AnyStore) -> HttpResponse {
     let totals = fl_store::attempt_totals(store, None)
         .and_then(|(a, sa)| fl_store::gate_run_totals(store, None).map(|(g, sg)| (a, sa, g, sg)));
@@ -2475,6 +2475,9 @@ fn handle_get_stats_summary(store: &AnyStore) -> HttpResponse {
     )
 }
 
+/// `GET /api/v1/stats`: the full report. Only the literal `summary=1` selects the totals-only
+/// response of [`handle_get_stats_summary`]; any other value, `summary=0` included, gives this
+/// default response.
 fn handle_get_stats(store: &AnyStore, req: &HttpRequest) -> HttpResponse {
     if matches!(req.query.get("summary").map(String::as_str), Some("1")) {
         return handle_get_stats_summary(store);

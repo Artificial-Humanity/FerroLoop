@@ -30,7 +30,9 @@ pub struct Cmd {
     #[arg(long)]
     pub json: bool,
     /// Totals only: attempts, wall clock, tokens, cost and gate-run counts. On a FerroStore
-    /// store with no GitHub ledger involved this never loads the attempt rows.
+    /// store with no GitHub ledger involved this does not hand attempt rows to the caller and
+    /// skips the per-attempt and breakdown work. The engine still scans the table, so the gain
+    /// is CPU and memory in `fl`, not I/O.
     #[arg(long)]
     pub summary: bool,
 }
@@ -182,6 +184,9 @@ fn totals_of_rows(attempts: &[Attempt]) -> AttemptTotals {
 /// ⚠ The columnar rollup reads the local store's own tables and cannot see GitHub entries, so
 /// it answers only for [`Source::Local`]. With a GitHub ledger involved the totals come from
 /// the same rows `fl stats` reads, and `source` says `rows`.
+///
+/// On the ferro engine this calls `gate_run_totals` once per gate and each call scans the table,
+/// so the cost is gates x runs, the same shape as the row path.
 fn run_summary(
     store: &AnyStore,
     project: &ProjectId,
