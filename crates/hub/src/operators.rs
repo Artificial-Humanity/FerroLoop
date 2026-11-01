@@ -2270,7 +2270,7 @@ mod tests {
             repo_root: tmp.path().to_path_buf(),
             ui_dir: None,
             owner_login: owner_login.into(),
-            reviewer_logins: crate::default_reviewer_logins(),
+            reviewer_apps: fl_core::pr_policy::ReviewerApps::default(),
             owner_token: Some(OWNER_TOKEN.into()),
             peer_token: Some(PEER_TOKEN.into()),
             trust_tailscale_headers: false,

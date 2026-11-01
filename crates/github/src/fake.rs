@@ -13,6 +13,26 @@ use std::thread::JoinHandle;
 pub const INSTALLATION_TOKEN: &str = "fake-installation-token";
 pub const USER_LOGIN: &str = "fake-user";
 pub const APP_SLUG: &str = "fake-app";
+/// The GitHub user id of the App's bot user, `{APP_SLUG}[bot]`.
+pub const APP_BOT_ID: u64 = 7_000_001;
+/// The GitHub user id of [`USER_LOGIN`].
+pub const USER_ID: u64 = 7_000_002;
+
+/// The fake's GitHub user id for `login`: [`APP_BOT_ID`] for the App's bot, [`USER_ID`] for
+/// [`USER_LOGIN`], and for any other login a fixed id derived from it that is neither.
+pub fn user_id(login: &str) -> u64 {
+    if login == format!("{APP_SLUG}[bot]") {
+        return APP_BOT_ID;
+    }
+    if login == USER_LOGIN {
+        return USER_ID;
+    }
+    // FNV-1a: fixed across runs, unlike `DefaultHasher`'s seed.
+    let hash = login.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    10_000_000 + hash % 1_000_000_000
+}
 /// The id of the repository a transferred issue moves to.
 pub const TRANSFERRED_REPO: u64 = 99;
 
@@ -791,10 +811,26 @@ impl FakeGithub {
         pull.files = files;
     }
 
+    /// Adds a review by `author_login`, with that login's [`user_id`].
     pub fn add_pull_review(
         &self,
         number: u64,
         author_login: &str,
+        state: &str,
+        body: &str,
+        commit_id: &str,
+    ) {
+        let author_id = Some(user_id(author_login));
+        self.add_pull_review_as(number, author_login, author_id, state, body, commit_id);
+    }
+
+    /// Adds a review by `author_login` whose user id is `author_id`, for an account that shows
+    /// another account's login (or a deleted one, with `None`).
+    pub fn add_pull_review_as(
+        &self,
+        number: u64,
+        author_login: &str,
+        author_id: Option<u64>,
         state: &str,
         body: &str,
         commit_id: &str,
@@ -805,6 +841,7 @@ impl FakeGithub {
         pull.reviews.push(fl_core::pr_policy::PrReviewSummary {
             id,
             author_login: author_login.to_string(),
+            author_id,
             state: state.to_string(),
             body: body.to_string(),
             commit_id: Some(commit_id.to_string()),
@@ -959,6 +996,7 @@ impl State {
             },
             "user": {
                 "login": p.user_login,
+                "id": user_id(&p.user_login),
             },
             "merged": p.merged,
             "requested_reviewers": p.requested_reviewers.iter().map(|r| json!({"login": r})).collect::<Vec<_>>(),
@@ -1057,7 +1095,7 @@ fn comment_items(i: &Issue) -> Vec<Value> {
         .enumerate()
         .map(|(k, body)| {
             let by = i.comment_authors.get(k).map_or(USER_LOGIN, String::as_str);
-            json!({"id": k as u64 + 1, "body": body, "user": {"login": by}})
+            json!({"id": k as u64 + 1, "body": body, "user": {"login": by, "id": user_id(by)}})
         })
         .collect()
 }
@@ -1501,7 +1539,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .map(|r| r.id);
             installation(s, current)
         }
-        ("GET", ["user"]) => answer(200, json!({"login": USER_LOGIN})),
+        ("GET", ["user"]) => answer(200, json!({"login": USER_LOGIN, "id": USER_ID})),
         ("GET", ["app"]) => {
             if auth.trim_start_matches("Bearer ").split('.').count() != 3 {
                 return answer(
@@ -1993,7 +2031,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     .map(|rv| {
                         json!({
                             "id": rv.id,
-                            "user": {"login": rv.author_login},
+                            "user": {"login": rv.author_login, "id": rv.author_id},
                             "state": rv.state,
                             "body": rv.body,
                             "commit_id": rv.commit_id,
@@ -2062,6 +2100,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .push(fl_core::pr_policy::PrReviewSummary {
                     id,
                     author_login: by.clone(),
+                    author_id: Some(user_id(&by)),
                     state: state.clone(),
                     body: review_body.clone(),
                     commit_id: commit_id.clone(),
@@ -2070,7 +2109,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 200,
                 json!({
                     "id": id,
-                    "user": {"login": by},
+                    "user": {"login": by, "id": user_id(&by)},
                     "state": state,
                     "body": review_body,
                     "commit_id": commit_id,

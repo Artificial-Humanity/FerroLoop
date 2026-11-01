@@ -80,11 +80,12 @@ pub use model::{
     Selector, State, Transition,
 };
 pub use pr_policy::{
-    CommitTrailerAuthor, DEFAULT_OWNER_LOGIN, DEFAULT_PROTECTED_PATTERNS,
+    CommitTrailerAuthor, DEFAULT_OWNER_LOGIN, DEFAULT_PROTECTED_PATTERNS, DEFAULT_REVIEWER_APP_IDS,
     DEFAULT_REVIEWER_APP_LOGINS, FlReviewMarker, PolicyRefusal, PrCommitSummary,
-    PrPolicyEvaluation, PrReviewSummary, RequiredTier, ReviewVerdict, authorize_agent_action,
-    authorize_agent_merge, evaluate_pr_policy, extract_review_marker, format_review_body,
-    is_protected_path, parse_co_authors, verify_merge_approvals, verify_review_integrity,
+    PrPolicyEvaluation, PrReviewSummary, RequiredTier, ReviewVerdict, ReviewerApps,
+    authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, extract_review_marker,
+    format_review_body, is_protected_path, parse_co_authors, verify_merge_approvals,
+    verify_review_integrity,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
