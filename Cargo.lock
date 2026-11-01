@@ -483,6 +483,7 @@ dependencies = [
  "fl-core",
  "libc",
  "redb",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

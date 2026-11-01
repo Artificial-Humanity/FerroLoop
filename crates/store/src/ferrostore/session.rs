@@ -8,6 +8,7 @@
 //! and when the commit validates it, so the client never re-encodes a value
 //! to hash it.
 
+use super::auth::Principal;
 use super::columnar;
 use super::doc;
 use super::layout::{Op, backend};
@@ -32,8 +33,25 @@ pub(super) const SESSION_LIFETIME: Duration = Duration::from_secs(300);
 pub(super) const SESSIONS_PER_CONN: usize = 64;
 /// The most sessions one server holds open.
 pub(super) const SESSIONS_PER_SERVER: usize = 1024;
+/// The most sessions one TCP principal (`token:*`, `psk`) holds open, over all its
+/// connections: a quarter of the server's, so one credential cannot take them all.
+/// A `unix:<uid>` principal has no such quota: every Unix client of a server is the
+/// owner's own uid (`SO_PEERCRED`), so only the connection and server limits bound it.
+pub(super) const SESSIONS_PER_PRINCIPAL: usize = SESSIONS_PER_SERVER / 4;
+/// The start of the error a principal at [`SESSIONS_PER_PRINCIPAL`] gets.
+pub(super) const SESSION_QUOTA: &str = "session quota for this credential reached";
 /// The most request ids the exactly-once table remembers.
 pub(super) const DEDUP_ENTRIES: usize = 10_000;
+/// The most request ids one TCP principal (`token:*`, `psk`) holds in the table: a
+/// quarter of it. A `unix:<uid>` principal has no such quota, only the table's own limit.
+pub(super) const DEDUP_PER_PRINCIPAL: usize = DEDUP_ENTRIES / 4;
+
+/// `true` when the per-principal quotas apply to `principal`: a TCP credential
+/// (`token:*`, `psk`). A `unix:<uid>` principal is the server's own user, shared by
+/// every local client, so a per-credential quota would cap all of them together.
+pub(super) fn quota_applies(principal: &str) -> bool {
+    !principal.starts_with("unix:")
+}
 /// How long the exactly-once table remembers a request id.
 pub(super) const DEDUP_TTL: Duration = Duration::from_secs(600);
 /// An answered request id younger than this is kept even when the table is
@@ -43,6 +61,14 @@ pub(super) const DEDUP_MIN_AGE: Duration =
 /// The start of the error a new write gets while the exactly-once table is
 /// full of ids it may not forget yet.
 pub(super) const DEDUP_FULL: &str = "dedup table full, retry";
+/// The start of the error a new write gets while its principal holds
+/// [`DEDUP_PER_PRINCIPAL`] ids the table may not forget yet. Like
+/// [`DEDUP_FULL`] it ran nothing.
+pub(super) const DEDUP_QUOTA: &str = "dedup quota for this credential reached, retry";
+/// The start of the error a write gets when its principal already used its
+/// request id for another method: it runs nothing, and is not answered with
+/// that method's reply.
+pub(super) const DEDUP_OTHER_METHOD: &str = "request id already used for another method";
 /// Room a read's reply keeps in its frame for the envelope around the result.
 const ENVELOPE_BYTES: usize = 4096;
 
@@ -389,6 +415,14 @@ pub(super) fn is_session_expired(err: &StoreError) -> bool {
     matches!(err, StoreError::Backend(detail) if detail.contains(SESSION_EXPIRED))
 }
 
+/// `true` for the refusal [`DEDUP_FULL`] or [`DEDUP_QUOTA`] starts, also as
+/// the client rebuilds it from the server's message: the write ran
+/// nothing, so the client may send it again.
+pub(super) fn is_dedup_full(err: &StoreError) -> bool {
+    matches!(err, StoreError::Backend(detail)
+        if detail.contains(DEDUP_FULL) || detail.contains(DEDUP_QUOTA))
+}
+
 fn expired(detail: impl std::fmt::Display) -> StoreError {
     backend(format!("{SESSION_EXPIRED}: {detail}"))
 }
@@ -400,6 +434,7 @@ const SWEPT_REMEMBERED: usize = 2 * SESSIONS_PER_SERVER;
 
 struct Session {
     conn: u64,
+    principal: Principal,
     state: Arc<DocState>,
     opened: Instant,
     last_used: Instant,
@@ -496,10 +531,16 @@ impl Sessions {
         }
     }
 
-    /// Pin `state` for `conn`. Expired sessions are dropped first; then a
-    /// connection or a server still at its limit refuses the new session,
-    /// and the sessions already open are kept.
-    pub(super) fn open(&self, conn: u64, state: Arc<DocState>) -> Result<u64, StoreError> {
+    /// Pin `state` for `conn` of `principal`. Expired sessions are dropped
+    /// first; then a connection, a TCP principal ([`SESSIONS_PER_PRINCIPAL`];
+    /// not a Unix one, see [`quota_applies`]) or a server still at its limit refuses the new session, and the
+    /// sessions already open are kept.
+    pub(super) fn open(
+        &self,
+        conn: u64,
+        principal: &Principal,
+        state: Arc<DocState>,
+    ) -> Result<u64, StoreError> {
         let now = Instant::now();
         let mut guard = lock_mutex(&self.open);
         self.sweep(&mut guard, now);
@@ -508,6 +549,19 @@ impl Sessions {
         if mine >= SESSIONS_PER_CONN {
             return Err(backend(format!(
                 "too many open read sessions: this connection holds {SESSIONS_PER_CONN}"
+            )));
+        }
+        let theirs = if quota_applies(principal) {
+            open.values()
+                .filter(|session| session.principal == *principal)
+                .count()
+        } else {
+            0
+        };
+        if theirs >= SESSIONS_PER_PRINCIPAL {
+            return Err(backend(format!(
+                "{SESSION_QUOTA}: its connections hold {SESSIONS_PER_PRINCIPAL} of this \
+                 server's {SESSIONS_PER_SERVER} read sessions"
             )));
         }
         if open.len() >= SESSIONS_PER_SERVER {
@@ -520,6 +574,7 @@ impl Sessions {
             id,
             Session {
                 conn,
+                principal: Arc::clone(principal),
                 state,
                 opened: now,
                 last_used: now,
@@ -582,29 +637,59 @@ impl Sessions {
 
 // ---- exactly-once --------------------------------------------------------------
 
-enum Entry {
-    /// The first request with this id is running.
-    Running(Instant),
-    /// Its reply, without the frame id.
-    Done(Instant, Value),
-}
+/// A request id in the table: ids are per principal, so one principal's id
+/// never answers another's request.
+type Key = (Principal, u128);
 
-impl Entry {
-    fn at(&self) -> Instant {
-        match self {
-            Self::Running(at) | Self::Done(at, _) => *at,
-        }
-    }
+struct Entry {
+    /// When it was claimed.
+    at: Instant,
+    /// The method it was claimed for: the same id for another method is
+    /// refused.
+    method: &'static str,
+    /// Its reply, without the frame id; `None` while the first request with
+    /// this id is running.
+    reply: Option<Value>,
 }
 
 #[derive(Default)]
 struct Table {
-    entries: HashMap<u128, Entry>,
+    entries: HashMap<Key, Entry>,
     /// Ids in arrival order, with the time each was claimed.
-    order: VecDeque<(Instant, u128)>,
+    order: VecDeque<(Instant, Key)>,
+    /// How many entries each principal holds.
+    held: HashMap<Principal, usize>,
 }
 
 impl Table {
+    fn held_by(&self, principal: &str) -> usize {
+        self.held.get(principal).copied().unwrap_or(0)
+    }
+
+    fn insert(&mut self, key: Key, entry: Entry) {
+        *self.held.entry(Arc::clone(&key.0)).or_default() += 1;
+        self.order.push_back((entry.at, key.clone()));
+        self.entries.insert(key, entry);
+    }
+
+    fn remove(&mut self, key: &Key) {
+        if self.entries.remove(key).is_none() {
+            return;
+        }
+        if let Some(count) = self.held.get_mut(&*key.0) {
+            *count -= 1;
+            if *count == 0 {
+                self.held.remove(&*key.0);
+            }
+        }
+    }
+
+    /// The entry an `order` item stands for, unless it was released or
+    /// claimed again since.
+    fn live(&self, at: Instant, key: &Key) -> Option<&Entry> {
+        self.entries.get(key).filter(|entry| entry.at == at)
+    }
+
     /// Forget answered ids older than [`DEDUP_TTL`], then, while the table
     /// holds [`DEDUP_ENTRIES`] or more, the oldest answered ids older than
     /// [`DEDUP_MIN_AGE`]. A running id is never forgotten: its reply is
@@ -613,16 +698,13 @@ impl Table {
     fn evict(&mut self, now: Instant) {
         // Running ids at the front, set aside and put back in order.
         let mut running = Vec::new();
-        while let Some((at, req)) = self.order.front().copied() {
-            let entry = match self.entries.get(&req) {
-                Some(entry) if entry.at() == at => entry,
+        while let Some((at, key)) = self.order.front().cloned() {
+            let Some(entry) = self.live(at, &key) else {
                 // Released, or claimed again since: nothing to forget.
-                _ => {
-                    self.order.pop_front();
-                    continue;
-                }
+                self.order.pop_front();
+                continue;
             };
-            if matches!(entry, Entry::Running(_)) {
+            if entry.reply.is_none() {
                 running.extend(self.order.pop_front());
                 continue;
             }
@@ -633,10 +715,41 @@ impl Table {
                 break;
             }
             self.order.pop_front();
-            self.entries.remove(&req);
+            self.remove(&key);
         }
         for item in running.into_iter().rev() {
             self.order.push_front(item);
+        }
+    }
+
+    /// For `principal` at its quota: forget its own oldest answered ids
+    /// older than [`DEDUP_MIN_AGE`] until it is below the quota, under the
+    /// same rule as [`Self::evict`] for a full table.
+    fn evict_own(&mut self, principal: &str, now: Instant) {
+        let excess = (self.held_by(principal) + 1).saturating_sub(DEDUP_PER_PRINCIPAL);
+        let mut gone = Vec::new();
+        for (at, key) in &self.order {
+            if gone.len() >= excess || now.duration_since(*at) <= DEDUP_MIN_AGE {
+                // Every id behind it is younger still.
+                break;
+            }
+            if *key.0 == *principal
+                && self
+                    .live(*at, key)
+                    .is_some_and(|entry| entry.reply.is_some())
+            {
+                gone.push(key.clone());
+            }
+        }
+        for key in &gone {
+            self.remove(key);
+        }
+        // Items of forgotten ids stay in `order` until they reach its front;
+        // keep it from growing past twice the table.
+        if self.order.len() > 2 * DEDUP_ENTRIES {
+            let entries = &self.entries;
+            self.order
+                .retain(|(at, key)| entries.get(key).is_some_and(|entry| entry.at == *at));
         }
     }
 }
@@ -660,7 +773,7 @@ pub(super) enum Claim<'a> {
 /// it releases the id, so a later request with it runs.
 pub(super) struct Running<'a> {
     dedup: &'a Dedup,
-    req: u128,
+    key: Key,
     at: Instant,
     done: bool,
 }
@@ -668,14 +781,10 @@ pub(super) struct Running<'a> {
 impl Running<'_> {
     pub(super) fn finish(mut self, reply: &Value) {
         let mut table = lock_mutex(&self.dedup.table);
-        if table
-            .entries
-            .get(&self.req)
-            .is_some_and(|entry| entry.at() == self.at)
+        if let Some(entry) = table.entries.get_mut(&self.key)
+            && entry.at == self.at
         {
-            table
-                .entries
-                .insert(self.req, Entry::Done(self.at, reply.clone()));
+            entry.reply = Some(reply.clone());
         }
         self.done = true;
         self.dedup.cv.notify_all();
@@ -688,60 +797,93 @@ impl Drop for Running<'_> {
             return;
         }
         let mut table = lock_mutex(&self.dedup.table);
-        if table
-            .entries
-            .get(&self.req)
-            .is_some_and(|entry| entry.at() == self.at)
-        {
-            table.entries.remove(&self.req);
+        if table.live(self.at, &self.key).is_some() {
+            table.remove(&self.key);
         }
         self.dedup.cv.notify_all();
     }
 }
 
 impl Dedup {
-    /// Claim `req`. A request with the same id still running elsewhere is
-    /// waited for, then replayed. A new id when the table holds
-    /// [`DEDUP_ENTRIES`] ids it may not forget yet is refused with
-    /// [`DEDUP_FULL`]: nothing runs, and the client may send it again.
-    pub(super) fn claim(&self, req: u128) -> Result<Claim<'_>, StoreError> {
-        self.claim_at(req, Instant::now)
+    /// Claim `principal`'s `req` for `method`. A request with the same id
+    /// still running elsewhere is waited for, then replayed; one with the
+    /// same id for another method is refused with [`DEDUP_OTHER_METHOD`]. A
+    /// new id is refused, and nothing runs (the client may send it again),
+    /// with [`DEDUP_FULL`] when the table holds [`DEDUP_ENTRIES`] ids it may
+    /// not forget yet, and with [`DEDUP_QUOTA`] when `principal` holds
+    /// [`DEDUP_PER_PRINCIPAL`] of them.
+    pub(super) fn claim(
+        &self,
+        principal: &Principal,
+        method: &'static str,
+        req: u128,
+    ) -> Result<Claim<'_>, StoreError> {
+        self.claim_at(principal, method, req, Instant::now)
     }
 
-    /// The reply the table keeps for `req`, without evicting anything.
+    /// The reply the table keeps for `principal`'s `req`, without evicting
+    /// anything.
     #[cfg(test)]
-    pub(super) fn reply_of(&self, req: u128) -> Option<Value> {
-        match lock_mutex(&self.table).entries.get(&req) {
-            Some(Entry::Done(_, reply)) => Some(reply.clone()),
-            _ => None,
-        }
+    pub(super) fn reply_of(&self, principal: &Principal, req: u128) -> Option<Value> {
+        lock_mutex(&self.table)
+            .entries
+            .get(&(Arc::clone(principal), req))
+            .and_then(|entry| entry.reply.clone())
     }
 
     /// [`Self::claim`] with the clock `now`, which a test sets.
     pub(super) fn claim_at(
         &self,
+        principal: &Principal,
+        method: &'static str,
         req: u128,
         now: impl Fn() -> Instant,
     ) -> Result<Claim<'_>, StoreError> {
+        let key = (Arc::clone(principal), req);
         let mut table = lock_mutex(&self.table);
         loop {
             let now = now();
             table.evict(now);
-            match table.entries.get(&req) {
-                Some(Entry::Done(_, reply)) => return Ok(Claim::Replay(reply.clone())),
-                Some(Entry::Running(_)) => table = wait_mutex(&self.cv, table),
-                None if table.entries.len() >= DEDUP_ENTRIES => {
+            match table.entries.get(&key) {
+                Some(entry) if entry.method != method => {
                     return Err(backend(format!(
-                        "{DEDUP_FULL}: the server holds {DEDUP_ENTRIES} recent writes it \
-                         cannot forget yet"
+                        "{DEDUP_OTHER_METHOD}: this credential sent request id {req:032x} \
+                         for `{}`, and this request is `{method}`; nothing ran",
+                        entry.method
                     )));
                 }
+                Some(Entry {
+                    reply: Some(reply), ..
+                }) => return Ok(Claim::Replay(reply.clone())),
+                Some(_) => table = wait_mutex(&self.cv, table),
                 None => {
-                    table.entries.insert(req, Entry::Running(now));
-                    table.order.push_back((now, req));
+                    let capped = quota_applies(principal);
+                    if capped && table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
+                        table.evict_own(principal, now);
+                    }
+                    if table.entries.len() >= DEDUP_ENTRIES {
+                        return Err(backend(format!(
+                            "{DEDUP_FULL}: the server holds {DEDUP_ENTRIES} recent writes it \
+                             cannot forget yet"
+                        )));
+                    }
+                    if capped && table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
+                        return Err(backend(format!(
+                            "{DEDUP_QUOTA}: it holds {DEDUP_PER_PRINCIPAL} of the server's \
+                             {DEDUP_ENTRIES} recent writes, which cannot be forgotten yet"
+                        )));
+                    }
+                    table.insert(
+                        key.clone(),
+                        Entry {
+                            at: now,
+                            method,
+                            reply: None,
+                        },
+                    );
                     return Ok(Claim::Run(Running {
                         dedup: self,
-                        req,
+                        key,
                         at: now,
                         done: false,
                     }));

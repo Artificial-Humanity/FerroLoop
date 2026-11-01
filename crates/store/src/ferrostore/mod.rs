@@ -1,6 +1,7 @@
 //! Document store and FerroMQ log in a `.fls` file, and a socket server.
 //! See `docs/ferrostore-spec.md`.
 
+mod auth;
 mod columnar;
 mod compact;
 mod compat;
@@ -29,6 +30,8 @@ mod ws;
 mod crash_sim;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_auth;
 #[cfg(test)]
 mod tests_cache;
 #[cfg(test)]
@@ -71,6 +74,7 @@ use state::{
     mq_message_collection, next_mq_seq, publish_overlay, stage_ops, unread_mq,
 };
 
+pub use auth::{ConnectOptions, ServerAuth};
 pub use columnar::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
     GateRunRollup, ZoneMap,
@@ -1470,7 +1474,7 @@ impl FerroStore {
         let sock = default_socket_path_for_store(path);
         match UnixStream::connect(&sock) {
             Ok(stream) => {
-                let remote = server::client_from_unix(stream)?;
+                let remote = server::client_from_unix(stream, &auth::ClientCred::None)?;
                 Ok(Self::assemble(
                     Inner::Remote(remote),
                     sock.display().to_string(),
@@ -1484,23 +1488,70 @@ impl FerroStore {
     }
 
     /// `mem://`, `file://`, `unix://`, and `ws://`. `wss://` is recognized and refused.
+    ///
+    /// A `ws://` URI may name its credential in its query (spec §6.2), only
+    /// by a `FERROSTORE_*` environment variable:
+    /// `?psk_env=FERROSTORE_PSK&server_id=<name>` or
+    /// `?token_env=FERROSTORE_TOKEN`. A file, another variable or a secret
+    /// itself is never accepted in a URI; name a file in [`ConnectOptions`].
+    /// A `unix://` URI takes none: its server checks the peer's uid; use
+    /// [`Self::connect_with`] for a PSK there.
     pub fn connect_uri(uri: &str) -> Result<Self, StoreError> {
+        Self::connect_with(uri, &ConnectOptions::new())
+    }
+
+    /// [`Self::connect_uri`], authenticating with `options` (spec §6.2).
+    /// `options` apply to `unix://` and `ws://` alone, and a `ws://` URI
+    /// that also names a credential in its query is refused. Over plain
+    /// `ws://` a credential goes only to a loopback address, unless
+    /// `options` set [`ConnectOptions::allow_plaintext`]. The handle
+    /// is returned only after the server accepted the connection and, for
+    /// a PSK, proved that it holds the same PSK under the expected
+    /// `server_id`.
+    pub fn connect_with(uri: &str, options: &ConnectOptions) -> Result<Self, StoreError> {
+        let local_only = || {
+            if options.has_auth() {
+                Err(backend(
+                    "authentication options apply to unix:// and ws:// only",
+                ))
+            } else {
+                Ok(())
+            }
+        };
         if uri == "mem://" || uri == "mem:///" {
+            local_only()?;
             return Ok(Self::in_memory());
         }
         if let Some(rest) = uri.strip_prefix("file://") {
+            local_only()?;
             return Self::open(file_uri_path(rest));
         }
         if let Some(rest) = uri.strip_prefix("unix://") {
             let path = file_uri_path(rest);
-            let remote = server::connect_unix(&path)?;
+            let remote = server::connect_unix_with(&path, &options.resolve()?)?;
             return Ok(Self::assemble(Inner::Remote(remote), path));
         }
         if uri.starts_with("wss://") {
             return Err(backend("wss is not implemented"));
         }
         if let Some(rest) = uri.strip_prefix("ws://") {
-            let remote = server::connect_ws(rest)?;
+            let (target, from_uri) = auth::split_uri_query(rest)?;
+            let outer_plaintext = options.plaintext_allowed();
+            let options = match (options.has_auth(), from_uri.has_auth()) {
+                (true, true) => {
+                    return Err(backend(
+                        "the credential is given twice: in the ws:// URI and in the options",
+                    ));
+                }
+                (false, true) => &from_uri,
+                _ => options,
+            };
+            let remote = server::connect_ws(
+                &target,
+                &options.resolve()?,
+                // Only the caller's options allow plaintext, never a URI.
+                outer_plaintext,
+            )?;
             return Ok(Self::assemble(Inner::Remote(remote), uri.to_string()));
         }
         Err(backend(format!("unknown FerroStore URI scheme in `{uri}`")))
