@@ -59,6 +59,15 @@ pub(super) const WORKFLOW_DEFS: &str = "workflow_defs";
 pub(super) const WORKFLOW_SLUGS: &str = "workflow_slugs";
 pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";
 
+/// The store's own bookkeeping. Not a redb table: no trait lists it, the
+/// migration writes it from redb's `meta.format_version`, and the verifier
+/// checks it as its own entry.
+pub(super) const SCHEMA_COLLECTION: &str = "__meta";
+/// `(SCHEMA_COLLECTION, SCHEMA_KEY)` holds the schema version: the same ladder
+/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`).
+pub(super) const SCHEMA_KEY: &str = "schema_version";
+/// redb's key for the schema version in `meta`. A FerroStore written before
+/// `__meta` existed may hold it in the `meta` collection.
 pub(super) const FORMAT_KEY: &str = "format_version";
 pub(super) const NEXT_RUN: &str = "next_run";
 pub(super) const NEXT_ATTEMPT: &str = "next_attempt";
@@ -313,10 +322,32 @@ pub(super) fn alias_unpublished(
     Ok(())
 }
 
+/// The schema version `txn` records: `("__meta", "schema_version")`, else the
+/// `("meta", "format_version")` a store from before `__meta` raised, else `None`.
+pub(super) fn schema_version(txn: &Txn) -> Result<Option<u64>, StoreError> {
+    schema_version_in(|collection, id| txn.get(collection, id))
+}
+
+/// [`schema_version`] over any document lookup.
+pub(super) fn schema_version_in(
+    get: impl Fn(&str, &str) -> Option<Value>,
+) -> Result<Option<u64>, StoreError> {
+    for (collection, id) in [(SCHEMA_COLLECTION, SCHEMA_KEY), (META, FORMAT_KEY)] {
+        if let Some(doc) = get(collection, id) {
+            return doc.as_u64().map(Some).ok_or_else(|| {
+                decode(format!(
+                    "the schema version at `{collection}`/`{id}` is not an unsigned integer: {doc}"
+                ))
+            });
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn raise_format(txn: &mut Txn, to: u64) -> Result<(), StoreError> {
-    let now = get_json::<u64>(txn, META, FORMAT_KEY)?.unwrap_or(crate::FORMAT_VERSION);
+    let now = schema_version(txn)?.unwrap_or(crate::FORMAT_VERSION);
     if now < to {
-        put_json(txn, META, FORMAT_KEY, &to)?;
+        put_json(txn, SCHEMA_COLLECTION, SCHEMA_KEY, &to)?;
     }
     Ok(())
 }

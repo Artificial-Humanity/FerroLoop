@@ -31,7 +31,7 @@ fn slots(path: &Path) -> [Option<Superblock>; 2] {
         let mut buf = [0u8; layout::SLOT_LEN];
         file.read_exact_at(&mut buf, index as u64 * layout::SLOT_LEN as u64)
             .unwrap();
-        *slot = layout::parse_superblock(&buf);
+        *slot = layout::parse_superblock(&buf).valid();
     }
     out
 }
@@ -91,13 +91,13 @@ fn crc32_iso_hdlc_and_superblock_round_trip() {
         snapshot_seq: 5,
     };
     let bytes = layout::encode_superblock(&sb);
-    assert_eq!(layout::parse_superblock(&bytes), Some(sb));
+    assert_eq!(layout::parse_superblock(&bytes).valid(), Some(sb));
     let mut torn = bytes;
     torn[20] ^= 0xff;
-    assert!(layout::parse_superblock(&torn).is_none());
+    assert!(layout::parse_superblock(&torn).valid().is_none());
     torn = bytes;
     torn[64] = 1;
-    assert!(layout::parse_superblock(&torn).is_none());
+    assert!(layout::parse_superblock(&torn).valid().is_none());
 }
 
 #[test]
@@ -1630,10 +1630,13 @@ fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
         assert!(handle.is_some(), "{kind:?} has no handle");
         assert_eq!(ferro.handle_of(kind, id).unwrap(), handle);
     }
+    // The schema version is the source's, kept once, in `__meta`.
+    assert_eq!(ferro.format_version().unwrap(), Some(version));
     assert_eq!(
-        ferro.get_doc("meta", "format_version").unwrap(),
+        ferro.get_doc("__meta", "schema_version").unwrap(),
         Some(json!(version))
     );
+    assert_eq!(ferro.get_doc("meta", "format_version").unwrap(), None);
 }
 
 #[test]
@@ -1709,10 +1712,17 @@ fn nonzero_short_file_is_not_initialized() {
     {
         FerroStore::open(&path).unwrap();
     }
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
     let created = slots(&path);
     assert!(created[0].is_some());
     assert!(created[1].is_none());
+    // The header, then the snapshot that holds the new store's schema version.
+    let first = created[0].unwrap();
+    assert_eq!(first.snapshot_offset, 8192);
+    assert!(first.snapshot_length > 0);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        8192 + first.snapshot_length
+    );
     corrupt_live_crc(&path);
     assert!(slots(&path).iter().all(Option::is_none));
     let file = File::open(&path).unwrap();
@@ -1728,7 +1738,10 @@ fn nonzero_short_file_is_not_initialized() {
         matches!(err, StoreError::Backend(_)) && msg.contains("no valid FerroStore superblock"),
         "{msg}"
     );
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        8192 + first.snapshot_length
+    );
     let file = File::open(&path).unwrap();
     let mut after = [0u8; 8192];
     file.read_exact_at(&mut after, 0).unwrap();
@@ -1756,32 +1769,52 @@ fn parse_superblock_rejects_epoch_zero_and_illegal_extents() {
         snapshot_seq: 0,
     };
     assert_eq!(
-        layout::parse_superblock(&layout::encode_superblock(&legal)),
+        layout::parse_superblock(&layout::encode_superblock(&legal)).valid(),
         Some(legal)
     );
 
     let mut epoch_zero = legal;
     epoch_zero.epoch = 0;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&epoch_zero)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&epoch_zero))
+            .valid()
+            .is_none()
+    );
 
     let mut snapshot_short = legal;
     snapshot_short.snapshot_offset = 8191;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_short)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&snapshot_short))
+            .valid()
+            .is_none()
+    );
 
     let mut wal_inside_header = legal;
     wal_inside_header.wal_offset = 0;
     wal_inside_header.wal_length = 0;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_inside_header)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&wal_inside_header))
+            .valid()
+            .is_none()
+    );
 
     let mut snapshot_wraps = legal;
     snapshot_wraps.snapshot_offset = 8192;
     snapshot_wraps.snapshot_length = u64::MAX;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_wraps)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&snapshot_wraps))
+            .valid()
+            .is_none()
+    );
 
     let mut wal_wraps = legal;
     wal_wraps.wal_offset = 8192;
     wal_wraps.wal_length = u64::MAX;
-    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_wraps)).is_none());
+    assert!(
+        layout::parse_superblock(&layout::encode_superblock(&wal_wraps))
+            .valid()
+            .is_none()
+    );
 }
 
 #[test]

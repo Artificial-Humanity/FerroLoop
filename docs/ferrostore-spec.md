@@ -14,14 +14,14 @@ A `.fls` file begins with two 4096-byte superblocks.
 | `4096..8192` | Superblock slot 1 |
 | `8192..` | Snapshot and WAL bytes |
 
-Creating a missing file writes slot 0 and leaves slot 1 as zeros, then `fsync`s:
+Creating a missing file makes it mode `0600` from its first byte, and makes its parent directory mode `0700` when that is missing too. An existing file or directory keeps its mode; a store file that other users can read gets a warning (`private::warn_if_loose`), never a `chmod`. The create writes a snapshot at `8192` that holds one document, the schema version (below), at sequence `0`, `fsync`s, writes slot 0 and leaves slot 1 as zeros, `fsync`s, then `fsync`s the parent directory:
 
 | Field | Initial value |
 | --- | --- |
 | `epoch` | `1` |
 | `snapshot_offset` | `8192` |
-| `snapshot_length` | `0` |
-| `wal_offset` | `8192` |
+| `snapshot_length` | the length of that snapshot |
+| `wal_offset` | `8192 + snapshot_length` |
 | `wal_length` | `0` |
 | `snapshot_seq` | `0` |
 
@@ -29,12 +29,12 @@ The create path holds the same short exclusive `flock` as a commit, only while i
 
 ### Superblock
 
-Each slot is 4096 bytes.
+Each slot is 4096 bytes. Every slot this build writes is container format `2`.
 
 | Offset | Type | Contents |
 | --- | --- | --- |
 | `0..8` | bytes | Magic `FERRSTR1` |
-| `8..12` | `u32` | Format version `1` |
+| `8..12` | `u32` | Container format version: `2` (format `1` is still read) |
 | `12..20` | `u64` | `epoch`, monotonic, starting at `1` |
 | `20..24` | `u32` | CRC-32 of this 4096-byte block with bytes `20..24` set to zero |
 | `24..32` | `u64` | `snapshot_offset` (absolute) |
@@ -42,11 +42,17 @@ Each slot is 4096 bytes.
 | `40..48` | `u64` | `wal_offset` (absolute) |
 | `48..56` | `u64` | `wal_length` |
 | `56..64` | `u64` | `snapshot_seq` |
-| `64..4096` | bytes | Zeros |
+| `64..68` | `u32` | `engine`: `0` is snapshot plus WAL. Format `2` only |
+| `68..76` | `u64` | `incompat` feature bits. None are defined. Format `2` only |
+| `76..4096` | bytes | Zeros (`64..4096` in format `1`) |
 
 `snapshot_seq` is the highest committed transaction sequence included in the snapshot, or `0` when no snapshot holds a commit.
 
-A slot is valid only when magic, version, padding, and CRC all match. Any other bytes are ignored. The current superblock is the valid slot with the highest `epoch`. A torn write fails the CRC, so the other slot stays current. Equal epochs on two valid slots are corruption.
+A slot is valid only when magic, a known version, padding, and CRC all match, and its engine is `0` with no unknown `incompat` bit. A CRC-valid slot with a newer version, another engine, or an unknown `incompat` bit was written by a newer build: `open` fails with `StoreError::ContainerFormat`, which names the version found, and reads neither slot. Every later format keeps the magic at `0..8`, the version at `8..12` and the CRC at `20..24`, so a newer slot is told from a torn one. Any other bytes are ignored. The current superblock is the valid slot with the highest `epoch`. A torn write fails the CRC, so the other slot stays current. Equal epochs on two valid slots are corruption. A format-1 file is upgraded at its next slot write; both slots stay CRC-valid throughout.
+
+### Schema version
+
+The document `("__meta", "schema_version")` holds the schema version, on the same ladder as `RedbStore` (`FORMAT_VERSION` to `FORMAT_WITH_WORKFLOW` in `crates/store/src/lib.rs`), so `format_version()` means the same on both. A new store starts at the newest constant. A write that needs a newer schema raises it in the same transaction, and a raise never lowers it. `open` refuses a version off the ladder with `StoreError::FormatVersion`. A store from before `__meta` reads its version from `("meta", "format_version")`, or has none: it opens, and `format_version()` is `None`. No trait method lists `__meta`.
 
 Every committed WAL append and every `checkpoint` publishes a new generation: write the inactive slot (the slot that does not hold the highest valid epoch) with `epoch + 1`, then `fsync`. The live slot is never rewritten in place.
 
@@ -215,6 +221,8 @@ A columnar cell is `{"t":"null"}`, `{"t":"i64","v":1}`, `{"t":"f64","v":1.5}`, `
 
 `default_socket_path_for_store(path)` appends `.sock` to the file name. `dir/store.fls` is `dir/store.fls.sock`. A path with no file name (`/` or `..`) is that path joined with `ferrostore.sock`.
 
+`FerroStoreServer::bind_unix(path, store)` makes the socket mode `0600` before it listens: `socket`, `bind`, `chmod 0600`, then `listen`, so no peer can connect while the mode is wider. A missing parent directory is created mode `0700`; an existing one keeps its mode. A socket already at `path` is removed only after a `connect` to it is refused. One that accepts belongs to a live server and the bind fails. A `path` that is not a socket is never removed.
+
 `FerroStore::auto(path)` connects to that socket. When the connect is accepted, the handle is a client of that server, and that connection is the client: it does not connect again. A refused connect — nothing listening, or the socket file missing — opens `path` in embedded mode and is not an error. An error from `open` is still returned.
 
 ## Documents
@@ -295,7 +303,9 @@ HNSW parameters live on the collection. There is no hidden default `M`. The leve
 
 `search_knowledge` uses that fusion and those two collections. Each hit is the id, the fused score, the vector metadata when the id is in the vector collection (`None` when it is absent or when the id is BM25-only), and the document when the id is in the document collection (`None` otherwise). The caller stores a knowledge entry with `put_doc` and its embedding with `upsert_vector` under the same id. FerroStore does not call an embedding model, and this phase does not change the redb state format.
 
-A checkpoint with any vector collection writes snapshot version 3. A document-only store stays version 1 and byte-identical. Columnar tables with no vector collections stay version 2. `migrate_redb_to_ferrostore` refuses a non-empty document map, column-table map, or vector map.
+A checkpoint with any vector collection writes snapshot version 3. A document-only store stays version 1 and byte-identical. Columnar tables with no vector collections stay version 2. `migrate_redb_to_ferrostore` refuses a non-empty document map (the new store's own `__meta` document aside), column-table map, or vector map. It writes redb's `meta.format_version` to `("__meta", "schema_version")`.
+
+`fl_store::migrate::verify_redb_vs_ferrostore(src, dst)` returns a `ParityReport`: one `TableParity` per redb table the migration copies, plus `__meta`, `redb:<name>` for a redb table outside the copy list, and `ferrostore:unlisted` for FerroStore data outside it; and one per list-style trait view, run on both stores. Each side is a row count and a SHA-256 over its rows sorted by key, each row `len(key) ‖ key ‖ len(value) ‖ canonical-JSON(value)` (lengths `u64` little-endian, canonical JSON with sorted object keys and no whitespace). A raw `&str` is hashed as the JSON string the migration stores. A view's items are keyed by their own canonical JSON, so a view compares content, not order. It is `Ok` when the stores differ and `Err` only when one cannot be read. `fl_store::migrate::migrate_verified(redb_path, fls_path)` migrates into `<name>.migrating-<pid>` (mode `0600`), verifies, and on a report that is not clean deletes that file and returns the report with no `fls_path` made. Otherwise it `fsync`s the file, moves it to `fls_path` (`link` then `unlink`, so an `fls_path` that appeared meanwhile is never replaced), `fsync`s the directory, and makes the `.redb` mode `0400`. It refuses an existing `fls_path`.
 
 ## Sync adapter
 

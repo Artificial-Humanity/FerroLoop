@@ -481,6 +481,7 @@ name = "fl-store"
 version = "0.1.0"
 dependencies = [
  "fl-core",
+ "libc",
  "redb",
  "serde",
  "serde_json",

@@ -4,6 +4,7 @@
 mod columnar;
 mod doc;
 mod layout;
+mod manifest_ops;
 mod migrate;
 mod server;
 mod state;
@@ -13,18 +14,23 @@ mod traits_state;
 mod traits_wire;
 mod traits_workflow;
 mod vector;
+mod verify;
 mod ws;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_track0;
+#[cfg(test)]
+mod tests_verify;
 
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 pub use layout::Op;
 use layout::{
-    HEADER_BYTES, SLOT_LEN, Superblock, backend, corrupt, decode_snapshot, decode_wal,
-    encode_frame, encode_snapshot, encode_snapshot_v2, encode_snapshot_v3, encode_superblock,
-    parse_superblock,
+    HEADER_BYTES, KNOWN_INCOMPAT, SLOT_LEN, SlotRead, Superblock, backend, corrupt,
+    decode_snapshot, decode_wal, encode_frame, encode_snapshot, encode_snapshot_v2,
+    encode_snapshot_v3, encode_superblock, parse_superblock,
 };
 use serde_json::{Value, json};
 use state::{
@@ -51,6 +57,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
 pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
+pub use verify::{
+    PER_ITEM_SAMPLE, ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore,
+};
 
 const LOCK_EX: i32 = 2;
 const LOCK_UN: i32 = 8;
@@ -211,26 +220,50 @@ impl FerroStore {
         }
     }
 
-    /// Empty in-memory store. `checkpoint` succeeds and writes nothing.
+    /// Empty in-memory store at the newest schema version. `checkpoint`
+    /// succeeds and writes nothing.
     pub fn in_memory() -> Self {
-        Self::assemble(
-            Inner::Memory(Mutex::new(DocState::default())),
-            "mem://".to_string(),
-        )
+        let state = DocState {
+            docs: new_store_docs(),
+            ..DocState::default()
+        };
+        Self::assemble(Inner::Memory(Mutex::new(state)), "mem://".to_string())
     }
 
     /// Open or create a `.fls` file. A second open of the same path succeeds.
+    ///
+    /// A new file is created mode 0600 from its first byte, in a parent made
+    /// 0700 when the parent is missing too, and starts at the newest schema
+    /// version; its directory is synced once the first superblock is down. An
+    /// existing file keeps its mode and is only reported when it is loose
+    /// (`private::warn_if_loose`). A container a newer fl wrote is
+    /// [`StoreError::ContainerFormat`]; a schema version off the ladder is
+    /// [`StoreError::FormatVersion`]. A file from before schema versioning
+    /// (no version document) opens, and [`Self::format_version`] reads `None`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
+        let created = create_store_file(path)?;
+        // Not `create(true)`: a file this open makes must come from
+        // `create_private_file`, so it is never made with the umask's mode.
         let write = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
             .open(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        ensure_superblock(&write)?;
-        read_consistent(&write)?;
+        ensure_superblock(&write).map_err(|err| name_store(err, path))?;
+        let (_, _, state) = read_consistent(&write).map_err(|err| name_store(err, path))?;
+        if created {
+            sync_dir(&parent_dir(path))?;
+        }
+        if let Some(found) = doc::schema_version_in(|collection, id| {
+            state
+                .docs
+                .get(&(collection.to_string(), id.to_string()))
+                .cloned()
+        })? {
+            crate::check_format(Some(found))?;
+        }
+        crate::private::warn_if_loose(path);
         // `OpenOptions::read` without write is `O_RDONLY`.
         let read = OpenOptions::new()
             .read(true)
@@ -290,6 +323,14 @@ impl FerroStore {
             return Ok(Self::assemble(Inner::Remote(remote), uri.to_string()));
         }
         Err(backend(format!("unknown FerroStore URI scheme in `{uri}`")))
+    }
+
+    /// The schema version the store records, `None` for a store with no
+    /// version document (a FerroStore written before schema versioning), the
+    /// same meaning as [`crate::RedbStore::format_version`]. The value is on
+    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`.
+    pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
+        self.with_read(doc::schema_version)
     }
 
     pub fn checkpoint(&self) -> Result<(), StoreError> {
@@ -2036,19 +2077,92 @@ fn append_frame(
     Ok(new_sb)
 }
 
+/// The documents a new store starts with: its schema version, the newest on
+/// the ladder. They sit in the snapshot at sequence 0, so a new store still
+/// has `last_seq` 0 and no WAL frame.
+fn new_store_docs() -> BTreeMap<(String, String), Value> {
+    let mut docs = BTreeMap::new();
+    docs.insert(
+        (
+            doc::SCHEMA_COLLECTION.to_string(),
+            doc::SCHEMA_KEY.to_string(),
+        ),
+        json!(crate::FORMAT_WITH_WORKFLOW),
+    );
+    docs
+}
+
 fn init_empty(file: &File) -> Result<(), StoreError> {
+    let blob = encode_snapshot(0, &new_store_docs())?;
+    let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     file.set_len(HEADER_BYTES).map_err(io_err)?;
+    file.write_all_at(&blob, HEADER_BYTES).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
     let sb = Superblock {
         epoch: 1,
         snapshot_offset: HEADER_BYTES,
-        snapshot_length: 0,
-        wal_offset: HEADER_BYTES,
+        snapshot_length: blob_len,
+        wal_offset: HEADER_BYTES + blob_len,
         wal_length: 0,
         snapshot_seq: 0,
     };
     write_slot(file, 0, &sb)?;
     file.sync_all().map_err(io_err)?;
     Ok(())
+}
+
+/// Make the store file 0600 when it is missing, and its parent 0700 when that
+/// is missing too. `true` when this call created the file. An error from the
+/// file create is left to the open that follows, which reports it in its own
+/// words (the same rule as `RedbStore::open`).
+fn create_store_file(path: &Path) -> Result<bool, StoreError> {
+    let parent = parent_dir(path);
+    if !parent.exists() {
+        crate::private::create_private_dir_all(&parent)
+            .map_err(|err| backend(format!("create directory {}: {err}", parent.display())))?;
+        sync_dir(&parent_dir(&parent))?;
+    }
+    Ok(crate::private::create_private_file(path).unwrap_or(false))
+}
+
+/// The directory that holds `path`: its parent, or `.` for a bare name.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// `fsync` a directory so an entry made in it is durable. A file system that
+/// cannot sync a directory (`EINVAL`) has nothing more to give.
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), StoreError> {
+    let handle =
+        File::open(dir).map_err(|err| backend(format!("open {}: {err}", dir.display())))?;
+    match handle.sync_all() {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(err) => Err(backend(format!("sync {}: {err}", dir.display()))),
+    }
+}
+
+/// Name `path` in a container-format error that was raised without one.
+fn name_store(err: StoreError, path: &Path) -> StoreError {
+    match err {
+        StoreError::ContainerFormat {
+            store,
+            found,
+            engine,
+            unknown_incompat,
+            newest,
+        } if store.is_empty() => StoreError::ContainerFormat {
+            store: path.display().to_string(),
+            found,
+            engine,
+            unknown_incompat,
+            newest,
+        },
+        other => other,
+    }
 }
 
 // No valid slot yet. Publish slot 0 only for an empty file, or when every byte
@@ -2111,13 +2225,29 @@ fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreEr
         }
         let mut buf = [0u8; SLOT_LEN];
         file.read_exact_at(&mut buf, offset).map_err(io_err)?;
-        if let Some(sb) = parse_superblock(&buf) {
-            match &best {
+        match parse_superblock(&buf) {
+            SlotRead::Valid(sb) => match &best {
                 Some((_, current)) if sb.epoch < current.epoch => {}
                 Some((_, current)) if sb.epoch == current.epoch => {
                     return Err(corrupt("two valid superblocks share an epoch"));
                 }
                 _ => best = Some((index, sb)),
+            },
+            SlotRead::Invalid => {}
+            // Either slot from a newer build stops the read: falling back to
+            // the other slot would read, and then overwrite, a stale state.
+            SlotRead::Newer {
+                version,
+                engine,
+                incompat,
+            } => {
+                return Err(StoreError::ContainerFormat {
+                    store: String::new(),
+                    found: version,
+                    engine,
+                    unknown_incompat: incompat & !KNOWN_INCOMPAT,
+                    newest: layout::FORMAT_VERSION,
+                });
             }
         }
     }
