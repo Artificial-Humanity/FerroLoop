@@ -16,11 +16,11 @@ use fl_core::iri::Iri;
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs, search_state_entries, validate_slug,
+    StateSearchHit, UpsertStateArgs, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
-use fl_store::AnyStore;
+use fl_store::{AnyStore, RankedHits, SearchMode};
 
 use crate::cmd::agent::{now_at, write_atomic_non_symlink};
 use crate::config::Config;
@@ -42,7 +42,10 @@ pub fn effective_search_limit(limit: Option<usize>) -> usize {
 
 /// Rank `entries` with the core BM25 searcher and truncate at the surface,
 /// returning the full ranked count before truncation as the second value.
-/// Stores are local, so fetching the full ranked list is cheap.
+/// Stores are local, so fetching the full ranked list is cheap. The surfaces
+/// rank through `fl_store::rank_state_entries`; this BM25-only form needs no
+/// store.
+#[cfg(test)]
 pub fn collect_search_hits(
     entries: &[StateEntry],
     query: &str,
@@ -50,10 +53,8 @@ pub fn collect_search_hits(
     concern: Option<StateConcern>,
     limit: usize,
 ) -> (Vec<StateSearchHit>, usize) {
-    let all = search_state_entries(entries, query, scope, concern, usize::MAX);
-    let total_hits = all.len();
-    let hits: Vec<StateSearchHit> = all.into_iter().take(limit).collect();
-    (hits, total_hits)
+    let ranked = fl_store::rank_bm25(entries, query, scope, concern, limit);
+    (ranked.hits, ranked.total_hits)
 }
 
 /// Wire shape shared by the CLI, MCP, and Hub search surfaces.
@@ -67,6 +68,22 @@ pub fn search_result_json(
         "hits": hits,
         "total_hits": total_hits,
     })
+}
+
+/// [`search_result_json`] for a ranked result. A BM25 result with no note has
+/// the exact shape above; `mode` is added only when the knowledge ranker
+/// answered, and `note` only when it failed over to BM25.
+pub fn ranked_result_json(query: &str, ranked: &RankedHits) -> serde_json::Value {
+    let mut out = search_result_json(query, &ranked.hits, ranked.total_hits);
+    if let Some(map) = out.as_object_mut() {
+        if ranked.mode == SearchMode::Knowledge {
+            map.insert("mode".into(), ranked.mode.as_str().into());
+        }
+        if let Some(note) = &ranked.note {
+            map.insert("note".into(), note.clone().into());
+        }
+    }
+    out
 }
 
 /// One-line plain-text rendering of a search hit for the CLI.
@@ -1095,20 +1112,22 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             let entries: Vec<StateEntry> = store
                 .list_state(parsed_scope.as_ref(), parsed_concern)
                 .map_err(|e| e.to_string())?;
-            let (hits, total_hits) = collect_search_hits(
+            let ranked = fl_store::rank_state_entries(
+                &store,
                 &entries,
                 &query,
                 parsed_scope.as_ref(),
                 parsed_concern,
                 effective_limit,
             );
+            let hits = &ranked.hits;
             if json {
-                let out = search_result_json(&query, &hits, total_hits);
+                let out = ranked_result_json(&query, &ranked);
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else if hits.is_empty() {
                 println!("no hits for `{query}`");
             } else {
-                for hit in &hits {
+                for hit in hits {
                     println!("{}", format_search_hit(hit));
                 }
             }
@@ -1809,6 +1828,32 @@ mod tests {
         assert_eq!(effective_search_limit(Some(0)), 0);
         assert_eq!(effective_search_limit(Some(250)), MAX_SEARCH_LIMIT);
         assert!(parse_concern("bogus").is_err());
+    }
+
+    #[test]
+    fn ranked_result_json_adds_mode_and_note_only_when_not_plain_bm25() {
+        let plain = RankedHits {
+            hits: Vec::new(),
+            total_hits: 0,
+            mode: SearchMode::Bm25,
+            note: None,
+        };
+        assert_eq!(
+            ranked_result_json("q", &plain),
+            search_result_json("q", &[], 0)
+        );
+        let knowledge = RankedHits {
+            mode: SearchMode::Knowledge,
+            ..plain.clone()
+        };
+        assert_eq!(ranked_result_json("q", &knowledge)["mode"], "knowledge");
+        let fell_back = RankedHits {
+            note: Some("why".into()),
+            ..plain
+        };
+        let value = ranked_result_json("q", &fell_back);
+        assert_eq!(value["note"], "why");
+        assert!(value.get("mode").is_none());
     }
 
     #[test]

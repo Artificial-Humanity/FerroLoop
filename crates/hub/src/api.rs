@@ -38,7 +38,7 @@ use fl_core::pr_policy::{
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs, search_state_entries,
+    StateSearchHit, UpsertStateArgs,
 };
 use fl_core::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, WorkflowStore,
@@ -1943,14 +1943,14 @@ fn search_state_for_hub(
         .filter(|e| !is_internal_hub_entry(e))
         .cloned()
         .collect();
-    let all = search_state_entries(&candidates, query, scope, concern, usize::MAX);
-    let total_hits = all.len();
-    let hits: Vec<StateSearchHit> = all
+    // The hub holds a redb store, so its ranker is BM25.
+    let ranked = fl_store::rank_bm25(&candidates, query, scope, concern, limit);
+    let hits: Vec<StateSearchHit> = ranked
+        .hits
         .into_iter()
-        .take(limit)
         .map(|hit| redact_search_hit(hit, is_owner))
         .collect();
-    (hits, total_hits)
+    (hits, ranked.total_hits)
 }
 
 fn handle_get_state_search(
