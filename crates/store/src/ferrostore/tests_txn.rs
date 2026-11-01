@@ -283,26 +283,48 @@ fn a_disk_transaction_runs_its_body_once() {
 const THREADS: u64 = 8;
 const PER_THREAD: u64 = 25;
 
-fn increment(store: &FerroStore) {
-    store
-        .transaction(|txn| {
+/// Retries of one increment that lost every compare-and-swap attempt. A
+/// finite cap, so a real livelock fails the test instead of hanging it.
+const MAX_CONFLICT_RETRIES: u32 = 1_000;
+
+/// Increments the counter once. A remote handle may return
+/// `StoreError::Conflict` when its bounded compare-and-swap loop is exhausted
+/// (spec §4.5); that write committed nothing, so the caller retries, and the
+/// retry cannot count twice. Any other error panics. Returns the number of
+/// conflicts seen.
+fn increment(store: &FerroStore) -> u32 {
+    let mut conflicts = 0;
+    loop {
+        let result = store.transaction(|txn| {
             let n = counter(txn);
             txn.put_doc("counters", "c", &json!({"n": n + 1}))
-        })
-        .unwrap();
+        });
+        match result {
+            Ok(_) => return conflicts,
+            Err(StoreError::Conflict { .. }) => {
+                conflicts += 1;
+                assert!(
+                    conflicts <= MAX_CONFLICT_RETRIES,
+                    "increment still conflicting after {MAX_CONFLICT_RETRIES} retries"
+                );
+            }
+            Err(err) => panic!("increment failed: {err}"),
+        }
+    }
 }
 
-fn hammer(make: impl Fn() -> FerroStore + Sync) {
+/// Runs the contending threads, one handle each, and returns the conflicts
+/// they retried through.
+fn hammer(make: impl Fn() -> FerroStore + Sync) -> u32 {
     thread::scope(|scope| {
-        for _ in 0..THREADS {
-            let store = make();
-            scope.spawn(move || {
-                for _ in 0..PER_THREAD {
-                    increment(&store);
-                }
-            });
-        }
-    });
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let store = make();
+                scope.spawn(move || (0..PER_THREAD).map(|_| increment(&store)).sum::<u32>())
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).sum()
+    })
 }
 
 fn count(store: &FerroStore) -> u64 {
@@ -320,7 +342,12 @@ fn concurrent_read_modify_write_transactions_lose_no_update() {
             for _ in 0..THREADS {
                 scope.spawn(|| {
                     for _ in 0..PER_THREAD {
-                        increment(store);
+                        // Only a remote handle may conflict.
+                        let conflicts = increment(store);
+                        assert!(
+                            conflicts == 0 || *mode == "remote",
+                            "{mode}: unexpected conflict"
+                        );
                     }
                 });
             }
@@ -330,13 +357,18 @@ fn concurrent_read_modify_write_transactions_lose_no_update() {
     // A handle per thread: disk handles serialize on the flock, remote
     // clients on the server's compare-and-swap.
     let disk = modes.disk_path.clone();
-    hammer(|| FerroStore::open(&disk).unwrap());
+    assert_eq!(
+        hammer(|| FerroStore::open(&disk).unwrap()),
+        0,
+        "disk conflicts"
+    );
     assert_eq!(
         count(&FerroStore::open(&disk).unwrap()),
         2 * THREADS * PER_THREAD
     );
     let uri = format!("unix://{}", modes.sock.display());
-    hammer(|| FerroStore::connect_uri(&uri).unwrap());
+    let conflicts = hammer(|| FerroStore::connect_uri(&uri).unwrap());
+    eprintln!("remote hammer: {conflicts} conflicts retried");
     assert_eq!(
         count(&FerroStore::connect_uri(&uri).unwrap()),
         2 * THREADS * PER_THREAD
