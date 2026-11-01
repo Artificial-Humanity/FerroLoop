@@ -1,4 +1,4 @@
-//! `fl store status`, `checkpoint`, `migrate` and `verify`, black box, on both
+//! `fl store status`, `checkpoint`, `compact`, `migrate` and `verify`, black box, on both
 //! engines.
 //!
 //! Every run gets private HOME, XDG and `$FL_DB` so nothing reads the
@@ -236,6 +236,266 @@ fn checkpoint_on_ferro_does_not_create_a_missing_store() {
         .failure()
         .stderr(contains("no store at"));
     assert!(env.files().is_empty(), "{:?}", env.files());
+}
+
+/// A `.fls` with several checkpoints behind it, so earlier snapshots and logs
+/// are dead extents.
+fn ferro_with_dead_extents(path: &Path) {
+    let store = fl_store::FerroStore::open(path).unwrap();
+    for round in 0..5 {
+        for i in 0..20 {
+            store
+                .put_doc(
+                    "docs",
+                    &format!("r{round}-{i:02}"),
+                    &serde_json::json!({"round": round, "i": i}),
+                )
+                .unwrap();
+        }
+        store.checkpoint().unwrap();
+    }
+}
+
+#[test]
+fn status_on_ferro_reports_live_and_dead_bytes_and_keeps_the_other_keys() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let v = status_json(env.ferro(), &env.logical());
+    let size = v["size_bytes"].as_u64().unwrap();
+    let live = v["live_bytes"].as_u64().unwrap();
+    let dead = v["dead_bytes"].as_u64().unwrap();
+    assert!(dead > 0, "{v}");
+    assert_eq!(live + dead, size, "{v}");
+    for key in [
+        "engine",
+        "logical_path",
+        "physical_path",
+        "exists",
+        "format_version",
+    ] {
+        assert!(v.get(key).is_some(), "{key} missing: {v}");
+    }
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "status"])
+        .assert()
+        .success()
+        .stdout(contains("live:           "))
+        .stdout(contains("dead:           "));
+}
+
+#[test]
+fn status_has_null_live_and_dead_bytes_where_the_engine_cannot_say() {
+    let env = Env::new();
+    open_with(&env.logical(), BackendKind::Redb);
+    let v = status_json(env.fl(), &env.logical());
+    assert_eq!(v["live_bytes"], Value::Null, "{v}");
+    assert_eq!(v["dead_bytes"], Value::Null, "{v}");
+    // A ferro selection with no store yet has none either, and none is made.
+    let env = Env::new();
+    let v = status_json(env.ferro(), &env.logical());
+    assert_eq!(v["live_bytes"], Value::Null, "{v}");
+    assert_eq!(v["dead_bytes"], Value::Null, "{v}");
+    assert!(env.files().is_empty(), "{:?}", env.files());
+}
+
+#[test]
+fn status_leaves_an_empty_and_a_garbage_fls_untouched_and_reports_null_sizes() {
+    let garbage: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    for bytes in [Vec::new(), vec![0u8; 100], vec![0u8; 8192 + 64], garbage] {
+        let env = Env::new();
+        std::fs::write(env.physical_ferro(), &bytes).unwrap();
+        let before = snapshot(&[env.stores.path()]);
+        let v = status_json(env.ferro(), &env.logical());
+        assert_eq!(v["exists"], true, "{v}");
+        assert_eq!(v["live_bytes"], Value::Null, "{v}");
+        assert_eq!(v["dead_bytes"], Value::Null, "{v}");
+        assert_eq!(v["size_bytes"], bytes.len(), "{v}");
+        assert!(
+            v["sizes_note"].as_str().unwrap().contains("could not read"),
+            "{v}"
+        );
+        env.ferro()
+            .arg("--db")
+            .arg(env.logical())
+            .args(["store", "status"])
+            .assert()
+            .success()
+            .stdout(contains("live/dead:      -"))
+            .stderr("");
+        assert_eq!(snapshot(&[env.stores.path()]), before, "status wrote");
+        assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+    }
+}
+
+#[test]
+fn status_works_on_a_read_only_fls_and_writes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let rw = status_json(env.ferro(), &env.logical());
+    let path = env.physical_ferro();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let before = snapshot(&[env.stores.path()]);
+    let out = env
+        .ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["live_bytes"], rw["live_bytes"], "{v}");
+    assert_eq!(v["dead_bytes"], rw["dead_bytes"], "{v}");
+    assert_eq!(mode(&path) & 0o777, 0o400);
+    assert_eq!(snapshot(&[env.stores.path()]), before);
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+}
+
+#[test]
+fn status_size_is_the_sum_of_the_live_and_dead_bytes_of_one_reading() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let v = status_json(env.ferro(), &env.logical());
+    assert_eq!(
+        v["size_bytes"].as_u64().unwrap(),
+        v["live_bytes"].as_u64().unwrap() + v["dead_bytes"].as_u64().unwrap(),
+        "{v}"
+    );
+}
+
+#[test]
+fn compact_on_ferro_leaves_no_lock_or_sibling_file() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .success();
+    assert_eq!(env.files(), vec!["fl.fls".to_string()]);
+}
+
+#[test]
+fn compact_on_ferro_gives_back_the_dead_bytes() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    let before = status_json(env.ferro(), &env.logical());
+    assert!(before["dead_bytes"].as_u64().unwrap() > 0, "{before}");
+
+    let out = env
+        .ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["command"], "compact");
+    assert_eq!(v["compacted"], true);
+    assert_eq!(v["before"]["file_bytes"], before["size_bytes"]);
+    assert_eq!(v["before"]["dead_bytes"], before["dead_bytes"]);
+    assert_eq!(v["after"]["dead_bytes"], 0, "{v}");
+    assert!(v["after"]["file_bytes"].as_u64() < v["before"]["file_bytes"].as_u64());
+
+    let after = status_json(env.ferro(), &env.logical());
+    assert_eq!(after["dead_bytes"], 0, "{after}");
+    assert_eq!(after["size_bytes"], v["after"]["file_bytes"]);
+    // A second compaction of a compact file is fine and gives back nothing.
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("compacted"))
+        .stdout(contains("dead bytes: 0 -> 0"));
+}
+
+#[test]
+fn compact_in_text_prints_before_and_after() {
+    let env = Env::new();
+    ferro_with_dead_extents(&env.physical_ferro());
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .success()
+        .stdout(contains("file bytes: "))
+        .stdout(contains(" -> "))
+        .stdout(contains("-> 0"));
+}
+
+#[test]
+fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
+    let env = Env::new();
+    open_with(&env.logical(), BackendKind::Redb);
+    let bytes = std::fs::read(env.logical()).unwrap();
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "compaction applies to the FerroStore (.fls) engine only",
+        ));
+    let out = env
+        .fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_of(&out);
+    assert_eq!(v["compacted"], false);
+    assert_eq!(v["engine"], "redb");
+    assert_eq!(std::fs::read(env.logical()).unwrap(), bytes);
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+}
+
+#[test]
+fn compact_on_ferro_does_not_create_or_migrate_a_store() {
+    let env = Env::new();
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .failure()
+        .stderr(contains("no store at"));
+    assert!(env.files().is_empty(), "{:?}", env.files());
+
+    // A lone redb under a ferro selection is not migrated just to compact it.
+    open_with(&env.logical(), BackendKind::Redb);
+    env.ferro()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["store", "compact"])
+        .assert()
+        .failure()
+        .stderr(contains("no store at"));
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
 }
 
 // ---- ordinary commands with ferro selected, and the missing-directory rule ----

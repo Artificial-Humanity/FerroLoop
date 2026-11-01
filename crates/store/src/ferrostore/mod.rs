@@ -1570,6 +1570,31 @@ impl FerroStore {
         }
     }
 
+    /// The size accounting of the store file at `path` (see [`StoreStats`]),
+    /// read without opening a store: the file is opened read-only, takes no
+    /// lock, and nothing is created, initialised, repaired or written, so it is
+    /// safe beside a live store and works on a 0400 file. The figures are of
+    /// one open file, so `file_bytes`, `live_bytes` and `dead_bytes` agree
+    /// with each other even while a writer publishes.
+    ///
+    /// A file that holds no valid superblock (missing, shorter than the
+    /// header, zeroed, or not a FerroStore) is an error; [`Self::open`] would
+    /// initialise some of those, and this never does.
+    pub fn stats_at(path: impl AsRef<Path>) -> Result<StoreStats, StoreError> {
+        Self::stats_at_with(&RealFs, path.as_ref())
+    }
+
+    fn stats_at_with(fs: &dyn ContainerFs, given: &Path) -> Result<StoreStats, StoreError> {
+        let file = fs
+            .open_ro(given)
+            .map_err(|err| backend(format!("open {}: {err}", given.display())))?;
+        let id = file.file_id().map_err(io_err)?;
+        let (_, sb) = latest_superblock(&*file).map_err(|err| name_store(err, given))?;
+        let cache = load_full(&*file, id, sb).map_err(|err| name_store(err, given))?;
+        let file_bytes = file.len().map_err(io_err)?;
+        Ok(compact::store_stats(file_bytes, &cache))
+    }
+
     /// The container's size accounting (see [`StoreStats`]), read without a
     /// lock, as a read is. `mem://` has no file: every byte count is 0 and
     /// the epoch is 0. A remote handle does not serve it.
@@ -3889,6 +3914,15 @@ fn parsed_superblock(file: &dyn ContainerIo) -> Result<Option<(usize, Superblock
 
 fn latest_superblock(file: &dyn ContainerIo) -> Result<(usize, Superblock), StoreError> {
     parsed_superblock(file)?.ok_or_else(|| backend("no valid FerroStore superblock"))
+}
+
+/// Bytes in the live WAL of the store file at `path`, from its newest
+/// superblock: `0` right after a checkpoint. For tests in other modules that
+/// must tell a folded log from an unfolded one.
+#[cfg(test)]
+pub(crate) fn wal_length_on_disk(path: &Path) -> u64 {
+    let file = RealFs.open_ro(path).unwrap();
+    latest_superblock(&*file).unwrap().1.wal_length
 }
 
 fn write_slot(file: &dyn ContainerIo, index: usize, sb: &Superblock) -> Result<(), StoreError> {

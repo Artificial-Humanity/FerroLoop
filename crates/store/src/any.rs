@@ -192,9 +192,12 @@ pub(crate) fn open_store_sink(
         }
         BackendKind::Ferro => open_ferro(path, &physical, options, sink)?,
     };
+    // The file of a disk FerroStore, as a path and not as the lossy label.
+    let file = matches!(backend_store, Backend::Ferro(_)).then_some(physical);
     Ok(AnyStore {
         backend: backend_store,
         label,
+        file,
     })
 }
 
@@ -755,10 +758,49 @@ enum Backend {
     Redb(RedbStore),
 }
 
+/// The size accounting of a store file, engine-neutral (see
+/// [`AnyStore::stats`]).
+///
+/// `file_bytes` is the file's length under either engine. `live_bytes` and
+/// `dead_bytes` are `Some` only for FerroStore, which knows which bytes its
+/// live superblock names; they are `None` for redb, which does not report
+/// them, so a redb store is never shown as having zero dead bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnyStats {
+    pub engine: BackendKind,
+    pub file_bytes: u64,
+    /// Bytes the live superblock names. `None` on redb.
+    pub live_bytes: Option<u64>,
+    /// Bytes only a compaction gives back. `None` on redb.
+    pub dead_bytes: Option<u64>,
+}
+
+/// Why compaction does nothing on redb. The one wording, shared by
+/// [`AnyStore::compact`]'s refusal and `fl store compact`'s report.
+pub const COMPACT_FERRO_ONLY: &str =
+    "compaction applies to the FerroStore (.fls) engine only; redb is not compacted";
+
+/// The size accounting of the FerroStore file `path`, read without opening a
+/// store (see [`FerroStore::stats_at`]): read-only, no lock, nothing created
+/// or initialised, so it is safe beside a live store and on a 0400 file. The
+/// three byte counts come from one open file and agree with each other.
+pub fn ferro_stats_at(path: &Path) -> Result<AnyStats, StoreError> {
+    let st = FerroStore::stats_at(path)?;
+    Ok(AnyStats {
+        engine: BackendKind::Ferro,
+        file_bytes: st.file_bytes,
+        live_bytes: Some(st.live_bytes),
+        dead_bytes: Some(st.dead_bytes),
+    })
+}
+
 /// A store on either engine. See the [module documentation](self).
 pub struct AnyStore {
     backend: Backend,
     label: String,
+    /// The real path of a FerroStore opened from a file, kept as a `Path`
+    /// because [`label`](Self::label) is lossy for a name that is not UTF-8.
+    file: Option<PathBuf>,
 }
 
 impl From<RedbStore> for AnyStore {
@@ -767,6 +809,7 @@ impl From<RedbStore> for AnyStore {
         Self {
             backend: Backend::Redb(store),
             label,
+            file: None,
         }
     }
 }
@@ -777,6 +820,7 @@ impl From<FerroStore> for AnyStore {
         Self {
             backend: Backend::Ferro(Box::new(store)),
             label,
+            file: None,
         }
     }
 }
@@ -797,6 +841,13 @@ impl AnyStore {
     /// The store's name in messages: the file it was opened from.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The file a FerroStore was opened from, as the path it was opened with.
+    /// `None` for a redb store and for a FerroStore with no file of its own
+    /// (in memory, or converted with `From<FerroStore>`).
+    pub fn ferro_file(&self) -> Option<&Path> {
+        self.file.as_deref()
     }
 
     pub fn as_redb(&self) -> Option<&RedbStore> {
@@ -866,6 +917,51 @@ impl AnyStore {
         match &self.backend {
             Backend::Ferro(s) => s.set_routes(project, map),
             Backend::Redb(s) => s.set_routes(project, map),
+        }
+    }
+
+    /// Rewrite a FerroStore as one snapshot and an empty WAL, giving back
+    /// every extent earlier checkpoints left dead (see
+    /// [`FerroStore::compact`]).
+    ///
+    /// Compaction is a FerroStore operation. A redb store is refused with a
+    /// clear error rather than reported as done: redb has no dead extents of
+    /// this kind to give back, so an `Ok(())` would claim a file was
+    /// compacted that was not touched.
+    pub fn compact(&self) -> Result<(), StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => s.compact(),
+            Backend::Redb(_) => Err(backend(format!("{}: {COMPACT_FERRO_ONLY}", self.label))),
+        }
+    }
+
+    /// The size accounting of the store file (see [`AnyStats`]). FerroStore
+    /// reports live and dead bytes; redb reports the file's length only, and
+    /// `None` for both, because redb does not expose them.
+    pub fn stats(&self) -> Result<AnyStats, StoreError> {
+        match &self.backend {
+            Backend::Ferro(s) => {
+                let st = s.stats()?;
+                Ok(AnyStats {
+                    engine: BackendKind::Ferro,
+                    file_bytes: st.file_bytes,
+                    live_bytes: Some(st.live_bytes),
+                    dead_bytes: Some(st.dead_bytes),
+                })
+            }
+            Backend::Redb(_) => {
+                let file_bytes = std::fs::metadata(&self.label)
+                    .map_err(|e| {
+                        backend(format!("could not read the size of {}: {e}", self.label))
+                    })?
+                    .len();
+                Ok(AnyStats {
+                    engine: BackendKind::Redb,
+                    file_bytes,
+                    live_bytes: None,
+                    dead_bytes: None,
+                })
+            }
         }
     }
 
@@ -1071,6 +1167,160 @@ mod tests {
 
     fn both() -> [BackendKind; 2] {
         [BackendKind::Redb, BackendKind::Ferro]
+    }
+
+    #[test]
+    fn stats_and_compact_on_ferro_report_dead_bytes_and_give_them_back() {
+        let (store, _dir) = on(BackendKind::Ferro);
+        let ferro = store.as_ferro().unwrap();
+        for round in 0..4 {
+            for i in 0..20 {
+                ferro
+                    .put_doc(
+                        "docs",
+                        &format!("r{round}-{i}"),
+                        &serde_json::json!({"round": round, "i": i}),
+                    )
+                    .unwrap();
+            }
+            ferro.checkpoint().unwrap();
+        }
+        let before = store.stats().unwrap();
+        assert_eq!(before.engine, BackendKind::Ferro);
+        let (live, dead) = (before.live_bytes.unwrap(), before.dead_bytes.unwrap());
+        assert!(dead > 0, "{before:?}");
+        assert_eq!(before.file_bytes, live + dead, "{before:?}");
+
+        store.compact().unwrap();
+
+        let after = store.stats().unwrap();
+        assert_eq!(after.dead_bytes, Some(0), "{after:?}");
+        assert_eq!(Some(after.file_bytes), after.live_bytes);
+        assert!(after.file_bytes < before.file_bytes);
+        let on_disk = std::fs::metadata(store.label()).unwrap().len();
+        assert_eq!(after.file_bytes, on_disk);
+    }
+
+    /// Every name in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn ferro_stats_at_agrees_with_an_open_handle_and_works_on_a_0400_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (store, dir) = on(BackendKind::Ferro);
+        let ferro = store.as_ferro().unwrap();
+        for round in 0..4 {
+            for i in 0..20 {
+                ferro
+                    .put_doc(
+                        "docs",
+                        &format!("r{round}-{i}"),
+                        &serde_json::json!({"i": i}),
+                    )
+                    .unwrap();
+            }
+            ferro.checkpoint().unwrap();
+        }
+        let path = PathBuf::from(store.label());
+        let open = store.stats().unwrap();
+        let at = ferro_stats_at(&path).unwrap();
+        assert_eq!(at, open);
+        assert!(at.dead_bytes.unwrap() > 0);
+        assert_eq!(
+            at.file_bytes,
+            at.live_bytes.unwrap() + at.dead_bytes.unwrap()
+        );
+        assert_eq!(FerroStore::stats_at(&path).unwrap(), ferro.stats().unwrap());
+
+        let before = names(dir.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(ferro_stats_at(&path).unwrap(), open);
+        assert_eq!(names(dir.path()), before);
+    }
+
+    #[test]
+    fn ferro_stats_at_never_initialises_or_writes_a_file_that_is_not_a_store() {
+        let dir = TempDir::new().unwrap();
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("empty.fls", Vec::new()),
+            ("short.fls", vec![0u8; 100]),
+            ("zeroed.fls", vec![0u8; 8192 + 64]),
+            (
+                "garbage.fls",
+                (0..20_000u32).map(|i| (i % 251) as u8).collect(),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            let before = names(dir.path());
+            let err = ferro_stats_at(&path).unwrap_err().to_string();
+            assert!(!err.is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name} was modified");
+            assert_eq!(names(dir.path()), before, "{name} made a sibling");
+        }
+        let missing = dir.path().join("missing.fls");
+        assert!(ferro_stats_at(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn compact_leaves_no_lock_or_sibling_file_beside_the_store() {
+        let (store, dir) = on(BackendKind::Ferro);
+        let ferro = store.as_ferro().unwrap();
+        for round in 0..3 {
+            ferro
+                .put_doc(
+                    "docs",
+                    &format!("r{round}"),
+                    &serde_json::json!({"r": round}),
+                )
+                .unwrap();
+            ferro.checkpoint().unwrap();
+        }
+        let before = names(dir.path());
+        store.compact().unwrap();
+        assert_eq!(names(dir.path()), before);
+    }
+
+    #[test]
+    fn stats_on_redb_is_the_file_length_with_no_live_or_dead_figure() {
+        let (store, _dir) = on(BackendKind::Redb);
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.engine, BackendKind::Redb);
+        assert_eq!(
+            stats.file_bytes,
+            std::fs::metadata(store.label()).unwrap().len()
+        );
+        assert!(stats.file_bytes > 0);
+        assert_eq!((stats.live_bytes, stats.dead_bytes), (None, None));
+    }
+
+    #[test]
+    fn compact_on_redb_is_refused_in_words_and_leaves_the_file_alone() {
+        let (store, _dir) = on(BackendKind::Redb);
+        let before = std::fs::read(store.label()).unwrap();
+        let err = store.compact().unwrap_err().to_string();
+        assert!(err.contains(COMPACT_FERRO_ONLY), "{err}");
+        assert_eq!(std::fs::read(store.label()).unwrap(), before);
+    }
+
+    #[test]
+    fn stats_and_compact_on_an_in_memory_store_are_empty_and_ok() {
+        let store = AnyStore::in_memory();
+        store.compact().unwrap();
+        let stats = store.stats().unwrap();
+        assert_eq!(
+            (stats.file_bytes, stats.live_bytes, stats.dead_bytes),
+            (0, Some(0), Some(0))
+        );
     }
 
     #[test]

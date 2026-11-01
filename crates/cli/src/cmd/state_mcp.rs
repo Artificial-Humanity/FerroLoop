@@ -368,15 +368,9 @@ fn run_code_tool(env: &StateEnv<'_>, kind: CodeSearchKind, args: &Value) -> Resu
     let root = code_root(env, args)?;
     let index = scan_code_index(&root);
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
-    let (outcome, token_gain) =
+    let (ranked, token_gain) =
         search_and_record(&store, &index, parsed.kind, &parsed.query, parsed.limit)?;
-    let out = code_search_response_json(
-        &parsed.query,
-        parsed.kind,
-        &outcome.symbols,
-        outcome.tokens_saved_this_query,
-        token_gain,
-    );
+    let out = code_search_response_json(&parsed.query, parsed.kind, &ranked, token_gain);
     Ok(serde_json::to_string_pretty(&out).unwrap())
 }
 
@@ -390,15 +384,16 @@ fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, Str
     let mut token_gain = load_token_gain(&store);
     let mut results = Vec::with_capacity(queries.len());
     for sub in &queries {
-        let (outcome, updated) =
-            search_and_record(&store, &index, sub.kind, &sub.query, sub.limit)?;
+        let (ranked, updated) = search_and_record(&store, &index, sub.kind, &sub.query, sub.limit)?;
         token_gain = updated;
-        results.push(json!({
+        let mut result = json!({
             "query": sub.query,
             "kind": sub.kind.as_wire(),
-            "symbols": outcome.symbols,
-            "tokens_saved_this_query": outcome.tokens_saved_this_query,
-        }));
+            "symbols": ranked.outcome.symbols,
+            "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+        });
+        ranked.annotate_json(&mut result);
+        results.push(result);
     }
     Ok(serde_json::to_string_pretty(&json!({
         "results": results,
@@ -1764,6 +1759,57 @@ mod tests {
         .expect("an alias of the primary is not opened again");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(store.label(), primary.display().to_string());
+    }
+
+    /// `fl_code_search` and `fl_batch_search` on a FerroStore (an explicit `.fls`
+    /// path selects it without touching the environment) add `mode`, and only
+    /// to a search; `def` and `outline` answers keep today's JSON.
+    #[test]
+    fn code_tools_on_ferro_add_mode_to_a_search_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn checkpoint_store() {}\npub fn tokenize_input() {}\n",
+        )
+        .unwrap();
+        let db = dir.path().join("mcp.fls");
+        let cfg = crate::config::Config::default();
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: &db,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+        let single =
+            run_code_tool(&env, CodeSearchKind::Search, &json!({ "q": "tokenise" })).unwrap();
+        let single: Value = serde_json::from_str(&single).unwrap();
+        assert_eq!(single["mode"], "knowledge", "{single}");
+        assert_eq!(single["symbols"][0]["name"], "tokenize_input", "{single}");
+        assert!(db.with_extension("code.fls").is_file());
+
+        let batch = run_batch_search_tool(
+            &env,
+            &json!({ "queries": [
+                { "kind": "search", "q": "chekpoint" },
+                { "kind": "def", "q": "checkpoint_store" },
+                { "kind": "outline", "q": "lib.rs" },
+            ] }),
+        )
+        .unwrap();
+        let batch: Value = serde_json::from_str(&batch).unwrap();
+        let results = batch["results"].as_array().unwrap();
+        assert_eq!(results[0]["mode"], "knowledge", "{batch}");
+        assert_eq!(
+            results[0]["symbols"][0]["name"], "checkpoint_store",
+            "{batch}"
+        );
+        for exact in &results[1..] {
+            assert!(
+                exact.get("mode").is_none() && exact.get("note").is_none(),
+                "{exact}"
+            );
+        }
+        assert_eq!(batch["token_gain"]["queries_count"], 4, "{batch}");
     }
 
     fn seeded_entries() -> Vec<StateEntry> {
