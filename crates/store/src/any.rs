@@ -12,6 +12,11 @@
 //! * A logical path such as `fl.redb` names the same store under either
 //!   engine: [`physical_path`] maps it to the sibling `fl.fls` when the engine
 //!   is FerroStore, so a config entry never changes at cutover.
+//! * A FerroStore is opened with [`FerroStore::auto`]: when a `ferrostore
+//!   serve` server listens at the file's socket (`<file>.fls.sock`, see
+//!   [`crate::default_socket_path_for_store`]) the store is that server's
+//!   client ([`AnyStore::is_remote`]); otherwise the file is opened embedded.
+//!   The label and [`AnyStore::ferro_file`] name the `.fls` either way.
 //! * A scan that only asks [`AnyStore::owns`] ([`Unmigrated::UseRedb`]) opens
 //!   a lone `.redb` read-only first and falls back to today's ordinary open
 //!   only when the read-only open fails for a non-busy reason (so, as before
@@ -210,7 +215,8 @@ pub(crate) fn open_store_sink_env(
         }
         BackendKind::Ferro => open_ferro(path, &physical, options, sink)?,
     };
-    // The file of a disk FerroStore, as a path and not as the lossy label.
+    // The file of a FerroStore (embedded, or served at the file's socket), as
+    // a path and not as the lossy label.
     let file = matches!(backend_store, Backend::Ferro(_)).then_some(physical);
     Ok(AnyStore {
         backend: backend_store,
@@ -476,9 +482,13 @@ fn present(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+/// Open the `.fls` at `physical` with [`FerroStore::auto`]: a client of the
+/// `ferrostore serve` server listening at its socket
+/// ([`crate::default_socket_path_for_store`]), or else the file itself.
+/// Either way the label is the `.fls` file, never the socket.
 fn open_fls(physical: &Path) -> Result<(Backend, String), StoreError> {
     Ok((
-        Backend::Ferro(Box::new(FerroStore::open(physical)?)),
+        Backend::Ferro(Box::new(FerroStore::auto(physical)?)),
         physical.display().to_string(),
     ))
 }
@@ -850,8 +860,9 @@ pub fn ferro_stats_at(path: &Path) -> Result<AnyStats, StoreError> {
 pub struct AnyStore {
     backend: Backend,
     label: String,
-    /// The real path of a FerroStore opened from a file, kept as a `Path`
-    /// because [`label`](Self::label) is lossy for a name that is not UTF-8.
+    /// The real path of a FerroStore opened from a file (embedded, or through
+    /// the server at that file's socket), kept as a `Path` because
+    /// [`label`](Self::label) is lossy for a name that is not UTF-8.
     file: Option<PathBuf>,
 }
 
@@ -890,14 +901,28 @@ impl AnyStore {
         }
     }
 
-    /// The store's name in messages: the file it was opened from.
+    /// The store's name in messages: the file it was opened from. For a
+    /// FerroStore reached through its `ferrostore serve` socket this is still
+    /// the `.fls` file, not the socket; the engine handle's own
+    /// [`FerroStore::label`] names the socket.
     pub fn label(&self) -> &str {
         &self.label
     }
 
-    /// The file a FerroStore was opened from, as the path it was opened with.
-    /// `None` for a redb store and for a FerroStore with no file of its own
-    /// (in memory, or converted with `From<FerroStore>`).
+    /// Whether this store is a client of a FerroStore server: [`open_store`]
+    /// found a server listening at the `.fls` file's socket
+    /// ([`crate::default_socket_path_for_store`]). `false` for redb, for an
+    /// embedded FerroStore and for one in memory.
+    pub fn is_remote(&self) -> bool {
+        matches!(&self.backend, Backend::Ferro(s) if s.is_remote())
+    }
+
+    /// The file a FerroStore was opened from, as the path it was opened with:
+    /// for one reached through its server's socket, the `.fls` that server
+    /// serves. Every use of a FerroStore's file goes through this, never through
+    /// [`label`](Self::label). `None` for a redb store and for a FerroStore
+    /// with no file of its own (in memory, or converted with
+    /// `From<FerroStore>`, as a `unix://` or `ws://` client is).
     pub fn ferro_file(&self) -> Option<&Path> {
         self.file.as_deref()
     }
@@ -990,8 +1015,21 @@ impl AnyStore {
     /// The size accounting of the store file (see [`AnyStats`]). FerroStore
     /// reports live and dead bytes; redb reports the file's length only, and
     /// `None` for both, because redb does not expose them.
+    ///
+    /// A FerroStore reached through its server serves no stats over the
+    /// socket: they are read from its file with [`ferro_stats_at`], as
+    /// `fl store status` reads them. One with no file of its own (converted
+    /// with `From<FerroStore>`) is an error.
     pub fn stats(&self) -> Result<AnyStats, StoreError> {
         match &self.backend {
+            Backend::Ferro(s) if s.is_remote() => match &self.file {
+                Some(file) => ferro_stats_at(file),
+                None => Err(backend(format!(
+                    "{}: a FerroStore served over a socket with no file of its own has no \
+                     stats here: read them on the server",
+                    self.label
+                ))),
+            },
             Backend::Ferro(s) => {
                 let st = s.stats()?;
                 Ok(AnyStats {
@@ -1001,6 +1039,7 @@ impl AnyStore {
                     dead_bytes: Some(st.dead_bytes),
                 })
             }
+            // A redb store's label is always the file it opened.
             Backend::Redb(_) => {
                 let file_bytes = std::fs::metadata(&self.label)
                     .map_err(|e| {
@@ -1249,7 +1288,9 @@ mod tests {
         assert_eq!(after.dead_bytes, Some(0), "{after:?}");
         assert_eq!(Some(after.file_bytes), after.live_bytes);
         assert!(after.file_bytes < before.file_bytes);
-        let on_disk = std::fs::metadata(store.label()).unwrap().len();
+        let on_disk = std::fs::metadata(store.ferro_file().unwrap())
+            .unwrap()
+            .len();
         assert_eq!(after.file_bytes, on_disk);
     }
 
@@ -1280,7 +1321,7 @@ mod tests {
             }
             ferro.checkpoint().unwrap();
         }
-        let path = PathBuf::from(store.label());
+        let path = store.ferro_file().unwrap().to_path_buf();
         let open = store.stats().unwrap();
         let at = ferro_stats_at(&path).unwrap();
         assert_eq!(at, open);
