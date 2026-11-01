@@ -328,26 +328,40 @@ body,
 .fd-gear-btn,
 .fd-roster-gear-btn,
 .fd-roster-project-gear-btn {
-  font-size: 16px;
+  font-size: 14px;
   line-height: 1;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   border: none;
   background: transparent;
-  padding: 2px 4px;
+  padding: 0;
   color: var(--text-muted);
   cursor: pointer;
   border-radius: var(--radius-sm);
-  transition: color 0.12s ease;
+  transition: color 0.12s ease, opacity 0.12s ease, transform 0.12s ease;
+}
+
+.fd-roster-project-gear-btn {
+  color: var(--accent-primary);
+  opacity: 0.88;
 }
 
 .fd-gear-btn:hover:not(:disabled),
-.fd-roster-gear-btn:hover:not(:disabled),
-.fd-roster-project-gear-btn:hover:not(:disabled) {
+.fd-roster-gear-btn:hover:not(:disabled) {
   background: transparent;
   border-color: transparent;
-  color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.fd-roster-project-gear-btn:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.12);
+  border-color: transparent;
+  color: var(--accent-hover);
+  opacity: 1;
 }
 
 .fd-gear-icon {
