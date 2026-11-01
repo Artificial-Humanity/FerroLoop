@@ -246,8 +246,28 @@ fn note_agy_proc_env(
     }
 }
 
+/// Test code must never touch the machine's real route table: `RouteTable::load(None)` reads
+/// the default path and, unless host discovery is disabled, `~/.cache/agent-bus/routes.json`
+/// (what live agent sessions registered), and `RouteTable::save(None)` overwrites the default
+/// path. A test that reaches either would pass or fail depending on which agents run on the
+/// machine, and could dispatch to a real session. When fl-wire's own unit tests are built
+/// (`cfg(test)` on this crate) a `None` path therefore panics, so those tests must hand the
+/// table a path in their own temp directory. The guard does not cover other crates' tests:
+/// fl-hub and fl-cli tests compile fl-wire without `cfg(test)`, so there a `None` path still
+/// reaches the real route table.
+#[cfg(test)]
+fn refuse_default_route_path(custom_path: Option<&Path>, operation: &str) {
+    assert!(
+        custom_path.is_some(),
+        "fl-wire test code called RouteTable::{operation}(None): pass an explicit route table path \
+         in a temp directory, never the machine's real route table"
+    );
+}
+
 impl RouteTable {
     pub fn load(custom_path: Option<&Path>) -> Self {
+        #[cfg(test)]
+        refuse_default_route_path(custom_path, "load");
         let primary = custom_path
             .map(Path::to_path_buf)
             .unwrap_or_else(default_routes_path);
@@ -336,6 +356,8 @@ impl RouteTable {
     }
 
     pub fn save(&self, custom_path: Option<&Path>) -> std::io::Result<()> {
+        #[cfg(test)]
+        refuse_default_route_path(custom_path, "save");
         let target = custom_path
             .map(Path::to_path_buf)
             .unwrap_or_else(default_routes_path);
@@ -2283,6 +2305,18 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    #[should_panic(expected = "never the machine's real route table")]
+    fn test_code_cannot_load_the_default_route_table() {
+        let _ = RouteTable::load(None);
+    }
+
+    #[test]
+    #[should_panic(expected = "never the machine's real route table")]
+    fn test_code_cannot_save_to_the_default_route_table() {
+        let _ = RouteTable::default().save(None);
+    }
 
     #[test]
     fn resolve_persona_respects_priority_and_cwd_lead_fallback() {

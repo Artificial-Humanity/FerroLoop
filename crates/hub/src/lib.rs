@@ -4135,6 +4135,17 @@ mod tests {
     }
 
     #[test]
+    fn a_hub_with_a_home_override_never_searches_the_host_path_for_cli_runtimes() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let Ok(inputs) = runtime_matrix::gather_inputs(&state) else {
+            panic!("the probe inputs of a fresh hub");
+        };
+        assert_eq!(inputs.path_env, "");
+        assert_eq!(inputs.home.as_deref(), Some(tmp.path()));
+    }
+
+    #[test]
     fn http_runtime_matrix_get_does_not_create_the_vault_key() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

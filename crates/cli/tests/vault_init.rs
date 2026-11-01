@@ -1,11 +1,17 @@
 use assert_cmd::Command;
 use predicates::str::contains;
 
-/// `fl` with a private vault and master key, so no test touches the developer's own.
+/// `fl` with a private vault and master key, so no test touches the developer's own. HOME and the
+/// XDG directories are private too: `fl` reads `$XDG_CONFIG_HOME/fl/config.toml` (a real
+/// developer's project bindings) before it opens any store.
 fn fl(dir: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
     c.env("FL_VAULT_PATH", dir.join("vault.enc"))
         .env("FL_VAULT_KEY_PATH", dir.join("vault.key"))
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env_remove("FL_DB")
         .env_remove("FL_VAULT_MASTER_KEY")
         .current_dir(dir);
     c

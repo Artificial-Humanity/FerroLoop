@@ -3332,6 +3332,49 @@ fn should_skip_dir(name: &str) -> bool {
     )
 }
 
+/// The paths listed under `[workspace] exclude` in `repo_root/Cargo.toml`, joined onto
+/// `repo_root`. Cargo reads each entry as a plain path relative to the workspace root and
+/// excludes everything beneath it; it expands no globs there, so neither does this. A missing
+/// or unparsable root manifest excludes nothing.
+fn workspace_exclude_paths(repo_root: &Path) -> Vec<PathBuf> {
+    let Ok(raw) = fs::read_to_string(repo_root.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&raw) else {
+        return Vec::new();
+    };
+    parsed
+        .get("workspace")
+        .and_then(|w| w.get("exclude"))
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter(|ex| !ex.trim().is_empty())
+        .map(|ex| repo_root.join(ex))
+        .collect()
+}
+
+/// Walk `repo_root` for the architecture scan (`fl arch check`, `fl arch init`, and the hub's
+/// architecture API). Skips build and tool directories, and every path the root manifest's
+/// `[workspace] exclude` lists, so a directory cargo does not treat as part of the workspace
+/// (for example a mounted git submodule) contributes no packages, sources or files.
+pub fn arch_scan_walk(repo_root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    let excluded = workspace_exclude_paths(repo_root);
+    WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(move |e| {
+            e.depth() == 0
+                || !e.file_type().is_dir()
+                || (e
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| !should_skip_dir(name))
+                    && !excluded.iter().any(|ex| e.path() == ex))
+        })
+        .flatten()
+}
+
 /// Scan `repo_root` for Cargo package dependencies, Rust source crate references, and
 /// repository files for architecture conformance checking (spec §1.3).
 pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, String> {
@@ -3341,17 +3384,7 @@ pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, St
         manifest_paths.insert(root_cargo);
     }
 
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !e.file_type().is_dir()
-                || e.file_name()
-                    .to_str()
-                    .is_none_or(|name| !should_skip_dir(name))
-        })
-        .flatten()
-    {
+    for entry in arch_scan_walk(repo_root) {
         let path = entry.path();
         if path.is_file() && path.file_name().and_then(|s| s.to_str()) == Some("Cargo.toml") {
             manifest_paths.insert(path.to_path_buf());
@@ -3415,17 +3448,7 @@ pub fn scan_workspace_for_arch(repo_root: &Path) -> Result<WorkspaceArchScan, St
     let mut repo_files = Vec::new();
     let has_crates_or_ui = repo_root.join("crates").is_dir() || repo_root.join("ui").is_dir();
 
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| {
-            e.depth() == 0
-                || !e.file_type().is_dir()
-                || e.file_name()
-                    .to_str()
-                    .is_none_or(|name| !should_skip_dir(name))
-        })
-        .flatten()
-    {
+    for entry in arch_scan_walk(repo_root) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -3515,6 +3538,82 @@ pub fn scan_cargo_architecture_conformance(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A workspace with `crates/a`, a nested `crates/a/submodules` package, a top-level
+    /// `submodules/Standalone` package whose source imports `pkg_a`, and a `vendor/lib`
+    /// package, under a root manifest whose `[workspace]` table ends with `extra`.
+    fn arch_scan_fixture(workspace_extra: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        write(
+            "Cargo.toml",
+            &format!("[workspace]\nmembers = [\"crates/a\"]\n{workspace_extra}"),
+        );
+        write(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"pkg-a\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "crates/a/submodules/Cargo.toml",
+            "[package]\nname = \"pkg-nested\"\nversion = \"0.1.0\"\n",
+        );
+        write(
+            "submodules/Standalone/Cargo.toml",
+            "[package]\nname = \"pkg-standalone\"\nversion = \"0.1.0\"\n",
+        );
+        write("submodules/Standalone/src/lib.rs", "use pkg_a::x;\n");
+        write(
+            "vendor/lib/Cargo.toml",
+            "[package]\nname = \"pkg-vendor\"\nversion = \"0.1.0\"\n",
+        );
+        tmp
+    }
+
+    fn scanned_packages(scan: &WorkspaceArchScan) -> BTreeSet<&str> {
+        scan.package_deps
+            .iter()
+            .map(|d| d.from_package.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn arch_scan_skips_the_paths_the_root_manifest_excludes() {
+        let tmp = arch_scan_fixture("exclude = [\"./submodules/\", \"vendor/lib\"]\n");
+        let scan = scan_workspace_for_arch(tmp.path()).unwrap();
+        assert_eq!(
+            scanned_packages(&scan),
+            BTreeSet::from(["pkg-a", "pkg-nested"])
+        );
+        assert!(
+            scan.source_refs
+                .iter()
+                .all(|r| !r.from_path.starts_with("submodules/")),
+            "{:?}",
+            scan.source_refs
+        );
+    }
+
+    #[test]
+    fn arch_scan_reads_a_top_level_submodules_directory_the_manifest_does_not_exclude() {
+        let tmp = arch_scan_fixture("");
+        let scan = scan_workspace_for_arch(tmp.path()).unwrap();
+        assert_eq!(
+            scanned_packages(&scan),
+            BTreeSet::from(["pkg-a", "pkg-nested", "pkg-standalone", "pkg-vendor"])
+        );
+        assert!(
+            scan.source_refs
+                .iter()
+                .any(|r| r.from_path == "submodules/Standalone/src/lib.rs"),
+            "{:?}",
+            scan.source_refs
+        );
+    }
 
     #[test]
     fn parse_jsonl_transcript_normalizes_antigravity_claude_and_codex_turns() {

@@ -46,8 +46,8 @@ Every command below passes `--db <path>` explicitly so the walkthrough doesn't t
 whatever store you already have. In real use you can skip it: `fl` falls back to
 `$FL_DB`, then an XDG data directory, creating whichever directory it lands on. A store file
 it creates is mode `0600` and a directory it creates is `0700`; an existing store or directory is
-never changed, only warned about at a terminal when others can reach it (see "Where the store
-lives" in the README).
+never changed, only warned about at a terminal when others can reach it (see [Where the store
+lives](#where-the-store-lives) below).
 
 ```
 $ fl --help
@@ -676,3 +676,85 @@ Everything above ran on one machine against one store. When a gate needs to be r
 a different checkout — another machine, or a teammate's clone of the same repository — see
 [Sharing gates across machines](sharing-gates.md) for `fl manifest export`, `import` and
 `check`.
+
+## Where the store lives
+
+`fl` resolves which store to open, in order:
+
+1. `--db <path>` on the command line.
+2. `$FL_DB`.
+3. The store bound to the current project in `$XDG_CONFIG_HOME/fl/config.toml` (default
+   `~/.config/fl/config.toml`) — the entry whose `root` is the longest ancestor of the
+   current directory. For `fl project add <path>`, the project is `<path>`, not the current
+   directory.
+4. The default: `$XDG_DATA_HOME/fl/fl.redb`, or `~/.local/share/fl/fl.redb`. An empty or
+   relative `$XDG_DATA_HOME` is ignored, as is an empty or relative `$XDG_CONFIG_HOME`.
+
+Binding a project keeps its store path out of the repository — a store path belongs to a
+machine, and a public repository would publish it:
+
+```toml
+# $XDG_CONFIG_HOME/fl/config.toml (default ~/.config/fl/config.toml)
+[[project]]
+root = "/home/you/code/app"
+store = "/home/you/.local/share/fl/app.redb"
+```
+
+A full IRI on the command line (rather than a handle such as `3`) selects the store that
+holds it, searching the bound store and every store any project is bound to. `--db` and
+`$FL_DB` stop that search: they confine the command to the one store they name, and an IRI
+that store does not hold is refused, not looked for elsewhere.
+
+### Store permissions
+
+A store holds hub pairing codes, session hashes and other records, so it is private to your
+Unix user. A store file `fl` creates is mode `0600`, and a store directory `fl` creates is mode
+`0700` (only the innermost directory that `fl` makes; the directories above it, such as
+`~/.local/share`, keep the default mode), whatever your umask is. `fl` never changes the mode of
+a file or directory that already exists.
+
+If an existing store is open to other users, `fl` still opens it and prints a warning with the
+fix. The warning is for a person at a terminal: `fl` prints it only when stderr is a terminal,
+so hooks, MCP servers, scripts and CI stay quiet. `fl hub serve` is the exception: it records
+the warning in the service log on every start, terminal or not. Each path is warned about once
+per process. To silence it everywhere, including the hub, set `FL_QUIET_STORE_PERMS=1` (any
+non-empty value except `0`).
+
+* A store file with a group or other permission bit is reported: `chmod 600 <store file>`. The
+  path in the command is absolute, without `.` or `..`, and in single quotes, so it pastes safely
+  whatever the directory is called. A path with a control character or bytes that are not UTF-8
+  gets no command: the warning shows it escaped and tells you to run the `chmod` yourself.
+* Its directory is reported only when the file is loose as well, or when your group or other
+  users can write in the directory: `chmod 700 <directory>`. A directory that others can only
+  enter or list, around a `0600` file, is not a finding, because they cannot read the file
+  through it. A directory with the sticky bit (such as `/tmp`), the current directory and its
+  parents are never reported.
+
+A store configured inside a repository's `.fl/` directory makes a `.fl` that `fl` creates mode
+`0700`, so other local users lose access to the tracked files in that directory (the manifest,
+the MCP catalog). Git does not track directory modes, so a checkout elsewhere is unaffected; to
+share the directory on this machine, `chmod 755 .fl` yourself.
+
+## Submodules
+
+Six repositories hold standalone extractions of parts of FerroLoop: FerroDeck, FerroStore,
+FerroState, FerroWire, FerroTrack and FerroGate. Each is mounted as a git submodule under
+`submodules/<Name>`, pinned to a commit of that repository's `main` branch (`.gitmodules` lists
+the `https` URLs).
+
+The submodules are optional and the build does not use them. The workspace in `Cargo.toml`
+lists `submodules` under `exclude` (so `cargo` run inside one treats it as its own workspace),
+`fl arch check` and `fl arch init` skip every path that `exclude` lists (plain paths relative
+to the workspace root, as cargo reads them; no globs), and a clone that did not fetch them
+builds and tests the same. The crates in `crates/` are the code that is built here; the
+submodules only pin the standalone repositories next to it.
+
+```
+$ git clone --recurse-submodules https://github.com/Artificial-Humanity/FerroLoop.git
+$ git submodule update --init --recursive              # in a clone made without the flag
+$ git submodule update --remote submodules/FerroGate   # move one pin to its latest main
+$ git submodule status                                 # the pinned commits
+```
+
+`git submodule update --remote` changes the pinned commit in your working tree. Commit the
+changed `submodules/<Name>` entry to record the new pin.

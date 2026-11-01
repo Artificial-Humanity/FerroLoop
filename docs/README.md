@@ -38,13 +38,13 @@ In addition to the guides above, `fl --help` documents the full command surface:
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.
-* `fl hub` — HTTP/1.1 + `/ws/v1` WebSocket daemon (`fl hub serve`), one-time QR/code pairing (`fl hub pair`), PTY terminal streaming, and static serving for **FerroDeck** (`ui/`).
+* `fl hub` — HTTP/1.1 + `/ws/v1` WebSocket daemon (`fl hub serve`), one-time QR/code pairing (`fl hub pair`), PTY terminal streaming, and static serving for **FerroDeck** (`ui/`). A request has one of two authorities. **Owner**: a session cookie (from redeeming a `fl hub pair` code, or an operator login), the owner token (`FL_HUB_OWNER_TOKEN` or `[hub].owner_token_file`), or a `Tailscale-User-Login` header when `--trust-tailscale-headers` (or `[hub].trust_tailscale_headers`) is set. **Peer**: a bearer token equal to the FerroWire token (`FL_WIRE_TOKEN` or `[wire].token_file`), naming itself with `X-Fl-Agent`; a Peer is refused Owner-only routes and reads sensitive state redacted.
 
 ## Root documents
 
 These stay at the repository root and are not duplicated here:
 
-* [README.md](../README.md) — what FerroLoop is, and how to build it.
+* [README.md](../README.md) — what FerroLoop is, the Ferro Suite, and how to build it.
 * [AGENTS.md](../AGENTS.md) — working rules, stack matrix, and conventions.
 * [WORKFLOW.md](../WORKFLOW.md) — branching, review, and landing on `main`.
 * [PERSONA.md](../PERSONA.md) — the developer persona.

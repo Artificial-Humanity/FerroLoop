@@ -1,0 +1,24 @@
+[submodule "submodules/FerroDeck"]
+	path = submodules/FerroDeck
+	url = https://github.com/Artificial-Humanity/FerroDeck.git
+	branch = main
+[submodule "submodules/FerroStore"]
+	path = submodules/FerroStore
+	url = https://github.com/Artificial-Humanity/FerroStore.git
+	branch = main
+[submodule "submodules/FerroState"]
+	path = submodules/FerroState
+	url = https://github.com/Artificial-Humanity/FerroState.git
+	branch = main
+[submodule "submodules/FerroWire"]
+	path = submodules/FerroWire
+	url = https://github.com/Artificial-Humanity/FerroWire.git
+	branch = main
+[submodule "submodules/FerroTrack"]
+	path = submodules/FerroTrack
+	url = https://github.com/Artificial-Humanity/FerroTrack.git
+	branch = main
+[submodule "submodules/FerroGate"]
+	path = submodules/FerroGate
+	url = https://github.com/Artificial-Humanity/FerroGate.git
+	branch = main
