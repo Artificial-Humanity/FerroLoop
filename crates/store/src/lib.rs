@@ -27,9 +27,9 @@ pub mod workflow;
 mod manifest_conformance;
 
 pub use any::{
-    AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, StoreOptions, choose_backend,
-    is_redb_busy, open_redb, open_store, open_store_with, physical_path, store_exists,
-    store_identity,
+    AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, MigrationLock, StoreOptions, Unmigrated,
+    choose_backend, forget_fallback, is_redb_busy, migrate_locked, open_redb, open_store,
+    open_store_for_scan, open_store_with, physical_path, store_exists, store_identity,
 };
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
