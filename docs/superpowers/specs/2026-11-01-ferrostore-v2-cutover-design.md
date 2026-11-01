@@ -139,14 +139,21 @@ pub fn verify_redb_vs_ferrostore(src: &RedbStore, dst: &FerroStore)
 - It is `Err` only for an I/O or decode failure.
 
 **The verified cutover sequence.** `open_store` (§8) and `ferrostore migrate` both use this sequence:
-1. Migrate into a sibling `<name>.fls.migrating-<pid>` created 0600.
+1. Migrate into a sibling temp file with a name unique to this call: process id, a counter and a nonce. It is created with `create_new`, mode 0600. A call removes only a temp it created.
 2. Verify. If the report is not clean, delete the temp file and keep running on redb.
-3. `fsync` the file.
-4. `rename` it to `<name>.fls`.
+3. `fsync` the file. Check that the temp path still names the inode that was verified (by `dev` and `ino`).
+4. `link` it to `<name>.fls`, then `unlink` the temp. Unlike `rename`, `link` refuses a `.fls` that another process created in the meantime.
 5. `fsync` the directory.
 6. `chmod 0400` the `.redb`. It is kept, not deleted.
 
+After step 4 the `.fls` is the store. A later failure in cleanup, `fsync` or `chmod` is a warning, not an error.
+
 **Acceptance.** A dry run against a copy of the real `~/.local/share/fl/fl.redb` gives `is_clean()`. Record the row counts and the time taken in the PR.
+
+**Reserved collections.** Collections whose names start with `__` belong to the store, and `__meta` is one of them. The public document API refuses them.
+- Sync sends every committed op, so the stream of sequence numbers has no gaps.
+- A receiver applies `__meta/schema_version` only as a raise to a value on the ladder that is higher than its own. It drops any other reserved op, but the batch's sequence number still advances.
+- A version newer than the binary knows is refused.
 
 ### 3.5 Crash-consistency harness
 
