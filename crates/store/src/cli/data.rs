@@ -231,50 +231,27 @@ fn refuse_beside_redb(path: &Path, physical: &Path, w: &Wording) -> Result<()> {
 }
 
 /// The migration lock of the store whose `.fls` is `physical`, taken without
-/// waiting, for as long as the returned file is open: a held lock is refused
+/// waiting, for as long as the returned guard lives: a held lock is refused
 /// (a migration of this store is running, and will make the `.fls` itself).
 ///
-/// It is the same lock as [`crate::MigrationLock`] (whose `acquire` is
-/// private to `any.rs`): the same file, [`crate::MigrationLock::path_for`]
-/// (`<fls>.migrate.lock`, left in place as that lock leaves it), opened the
-/// same way (read-write, mode 0600, `O_NOFOLLOW`, created if missing) and
-/// the same exclusive `flock` (`File::try_lock`), so a migration and a
-/// creation exclude each other.
-fn creation_lock(physical: &Path) -> Result<std::fs::File> {
-    use std::fs::TryLockError;
-    use std::os::unix::fs::OpenOptionsExt;
-    let path = crate::MigrationLock::path_for(physical);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|e| {
-            Error::context(
-                format!("could not take the migration lock {}", path.display()),
-                e,
-            )
-        })?;
-    loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(TryLockError::WouldBlock) => refuse!(
-                "{} is being migrated (another process holds {}): no store was created; run \
-                 this again once the migration is done",
-                physical.display(),
-                path.display()
+/// It is [`crate::MigrationLock`] itself (`<fls>.migrate.lock`, left in place
+/// as that lock leaves it), so a migration and a creation exclude each other.
+fn creation_lock(physical: &Path) -> Result<crate::MigrationLock> {
+    match crate::MigrationLock::acquire_within(physical, std::time::Duration::ZERO) {
+        Ok(lock) => Ok(lock),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => refuse!(
+            "{} is being migrated (another process holds {}): no store was created; run \
+             this again once the migration is done",
+            physical.display(),
+            crate::MigrationLock::path_for(physical).display()
+        ),
+        Err(e) => Err(Error::context(
+            format!(
+                "could not take the migration lock {}",
+                crate::MigrationLock::path_for(physical).display()
             ),
-            Err(TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(TryLockError::Error(e)) => {
-                return Err(Error::context(
-                    format!("could not take the migration lock {}", path.display()),
-                    e,
-                ));
-            }
-        }
+            e,
+        )),
     }
 }
 
