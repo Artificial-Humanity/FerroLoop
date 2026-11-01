@@ -37,7 +37,8 @@ pub use ferrostore::{
     VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
 };
 pub use knowledge::{
-    RankedHits, SearchMode, rank_bm25, rank_state_entries, rank_state_entries_with,
+    DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,
+    rank_state_entries_read_only, rank_state_entries_with,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};

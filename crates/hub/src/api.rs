@@ -1931,6 +1931,8 @@ fn redact_search_hit(mut hit: StateSearchHit, is_owner: bool) -> StateSearchHit 
 /// full ranked count returned before `limit` truncation, sensitive hits
 /// redacted for non-owners (entry and snippet) after ranking. The ranker
 /// follows the store's engine: BM25 on redb, knowledge search on FerroStore.
+/// A search is a read request: it never writes to the vector index, so on
+/// FerroStore the vector leg covers what an earlier CLI or MCP search indexed.
 fn search_state_for_hub(
     store: &AnyStore,
     entries: &[StateEntry],
@@ -1945,7 +1947,8 @@ fn search_state_for_hub(
         .filter(|e| !is_internal_hub_entry(e))
         .cloned()
         .collect();
-    let ranked = fl_store::rank_state_entries(store, &candidates, query, scope, concern, limit);
+    let ranked =
+        fl_store::rank_state_entries_read_only(store, &candidates, query, scope, concern, limit);
     let hits: Vec<StateSearchHit> = ranked
         .hits
         .into_iter()
@@ -6307,7 +6310,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_search_on_ferro_finds_stem_and_typo_queries_and_keeps_redaction() {
+    fn hub_search_on_ferro_is_read_only_and_keeps_redaction() {
         let (_dir, store) = test_store(fl_store::BackendKind::Ferro);
         put_memory(
             &store,
@@ -6344,6 +6347,16 @@ mod tests {
         let entries = store.list_state(None, None).unwrap();
         assert!(entries.iter().any(|e| e.slug == "hub-session-abc123"));
 
+        // A hub search never creates the vector index: a stem query finds
+        // nothing before a CLI-style search has indexed the entries.
+        let (hits, _) =
+            search_state_for_hub(&store, &entries, "checkpointing", None, None, 10, true);
+        assert!(hits.is_empty(), "read-only search indexed: {hits:?}");
+
+        // A CLI or MCP style search (it may write) indexes the entries.
+        let cli = fl_store::rank_state_entries(&store, &entries, "checkpoint", None, None, 10);
+        assert!(!cli.hits.is_empty());
+
         // A stem query and a lone typo, which BM25 cannot match.
         for q in ["checkpointing", "chekpoint"] {
             let (hits, total) = search_state_for_hub(&store, &entries, q, None, None, 10, false);
@@ -6354,26 +6367,32 @@ mod tests {
                 "internal hub entry leaked for `{q}`: {slugs:?}"
             );
             assert!(!slugs.contains(&"lunch-notes"), "`{q}` found {slugs:?}");
+            // Sensitive entries are never indexed, so a vector-only query
+            // cannot reach them, for anyone.
+            assert!(!slugs.contains(&"secret-cache"), "`{q}` found {slugs:?}");
             assert_eq!(total, hits.len(), "`{q}`");
-
-            // Non-owner: the sensitive hit is redacted, entry and snippet.
-            let secret = hits
-                .iter()
-                .find(|h| h.entry.slug == "secret-cache")
-                .unwrap_or_else(|| panic!("sensitive hit missing for `{q}`: {slugs:?}"));
-            assert_eq!(secret.snippet, "[REDACTED]", "`{q}`");
-            let serialized = serde_json::to_string(secret).unwrap();
-            assert!(!serialized.contains("secretbodytoken"), "{serialized}");
-
-            // Owner sees the real entry.
-            let (owner, _) = search_state_for_hub(&store, &entries, q, None, None, 10, true);
-            let secret = owner
-                .iter()
-                .find(|h| h.entry.slug == "secret-cache")
-                .unwrap();
-            assert_ne!(secret.snippet, "[REDACTED]", "`{q}`");
-            assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
         }
+
+        // A lexical query reaches the sensitive entry: redacted for a
+        // non-owner (entry and snippet), real for the owner.
+        let (hits, _) = search_state_for_hub(&store, &entries, "checkpoint", None, None, 10, false);
+        let slugs: Vec<&str> = hits.iter().map(|h| h.entry.slug.as_str()).collect();
+        let secret = hits
+            .iter()
+            .find(|h| h.entry.slug == "secret-cache")
+            .unwrap_or_else(|| panic!("sensitive hit missing: {slugs:?}"));
+        assert_eq!(secret.snippet, "[REDACTED]");
+        let serialized = serde_json::to_string(secret).unwrap();
+        assert!(!serialized.contains("secretbodytoken"), "{serialized}");
+        assert!(!slugs.contains(&"hub-session-abc123"), "{slugs:?}");
+
+        let (owner, _) = search_state_for_hub(&store, &entries, "checkpoint", None, None, 10, true);
+        let secret = owner
+            .iter()
+            .find(|h| h.entry.slug == "secret-cache")
+            .unwrap();
+        assert_ne!(secret.snippet, "[REDACTED]");
+        assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
     }
 
     fn sensitive_handoff_entry(n: u64) -> StateEntry {
