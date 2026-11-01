@@ -761,6 +761,33 @@ fn assert_clean(scenario: &Scenario, report: &Report, elapsed: Duration) {
     );
 }
 
+/// Guards against a vacuous pass: if writes became durable at once, every cut
+/// would yield one all-kept case and the harness would prove nothing.
+fn assert_floors(report: &Report, min_cuts: usize) {
+    assert!(
+        report.cuts > min_cuts,
+        "the workload is too small: {} cuts, need more than {min_cuts}: {report:?}",
+        report.cuts
+    );
+    assert!(
+        report.cases > report.cuts,
+        "cuts are not forking into several cases: {} cases for {} cuts: {report:?}",
+        report.cases,
+        report.cuts
+    );
+    assert!(
+        report.torn_cases > 0,
+        "no case had a torn write: {} torn of {} cases: {report:?}",
+        report.torn_cases,
+        report.cases
+    );
+    assert!(
+        report.max_pending >= 1,
+        "no cut had an unsynced op: max pending {}: {report:?}",
+        report.max_pending
+    );
+}
+
 #[test]
 fn every_cut_of_the_new_store_workload_recovers_to_an_acknowledged_prefix() {
     let start = Instant::now();
@@ -770,7 +797,7 @@ fn every_cut_of_the_new_store_workload_recovers_to_an_acknowledged_prefix() {
         steps: WORKLOAD,
     };
     let report = run_scenario(&scenario);
-    assert!(report.cuts > 100, "the workload is too small: {report:?}");
+    assert_floors(&report, 100);
     assert_clean(&scenario, &report, start.elapsed());
 }
 
@@ -783,6 +810,7 @@ fn every_cut_of_a_v1_file_upgrade_recovers_to_an_acknowledged_prefix() {
         steps: V1_WORKLOAD,
     };
     let report = run_scenario(&scenario);
+    assert_floors(&report, 40);
     assert_clean(&scenario, &report, start.elapsed());
 }
 
