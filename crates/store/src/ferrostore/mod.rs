@@ -3,6 +3,7 @@
 
 mod columnar;
 mod compat;
+mod container_io;
 mod doc;
 mod layout;
 mod manifest_ops;
@@ -19,12 +20,17 @@ mod verify;
 mod ws;
 
 #[cfg(test)]
+mod crash_sim;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_crash;
 #[cfg(test)]
 mod tests_track0;
 #[cfg(test)]
 mod tests_verify;
 
+use container_io::{ContainerFs, ContainerIo, RealFs};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 pub use layout::Op;
@@ -47,10 +53,9 @@ pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -70,12 +75,17 @@ unsafe extern "C" {
     fn flock(fd: i32, op: i32) -> i32;
 }
 
+/// `None` holds no lock: a file with no descriptor (the crash harness's
+/// simulated disk) is not locked.
 struct FlockGuard {
-    fd: i32,
+    fd: Option<RawFd>,
 }
 
 impl FlockGuard {
-    fn acquire(fd: i32) -> Result<Self, StoreError> {
+    fn acquire(fd: Option<RawFd>) -> Result<Self, StoreError> {
+        let Some(fd) = fd else {
+            return Ok(Self { fd: None });
+        };
         // SAFETY: `fd` is an open file descriptor owned by the caller. `LOCK_EX`
         // waits until this description holds the advisory lock, or returns -1.
         let rc = unsafe { flock(fd, LOCK_EX) };
@@ -83,16 +93,19 @@ impl FlockGuard {
             let err = io::Error::last_os_error();
             return Err(backend(format!("exclusive flock failed: {err}")));
         }
-        Ok(Self { fd })
+        Ok(Self { fd: Some(fd) })
     }
 }
 
 impl Drop for FlockGuard {
     fn drop(&mut self) {
+        let Some(fd) = self.fd else {
+            return;
+        };
         // SAFETY: the descriptor stays open until after this guard is dropped.
         // `LOCK_UN` releases the advisory lock held by that description.
         unsafe {
-            flock(self.fd, LOCK_UN);
+            flock(fd, LOCK_UN);
         }
     }
 }
@@ -135,10 +148,12 @@ enum SeqCommit {
     Wrote(Committed),
 }
 
+/// The two descriptions of one `.fls` file. Production holds `File`s; the
+/// crash harness holds simulated files (`container_io`, `crash_sim`).
 struct Disk {
-    write: Mutex<File>,
+    write: Mutex<Box<dyn ContainerIo>>,
     /// Separate `O_RDONLY` description. Reads never flock it.
-    read: File,
+    read: Box<dyn ContainerIo>,
 }
 
 /// One transaction: a clone of the document map plus the ops that produced it.
@@ -242,21 +257,22 @@ impl FerroStore {
     /// [`StoreError::FormatVersion`]. A file from before schema versioning
     /// (no version document) opens, and [`Self::format_version`] reads `None`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        let created = create_store_file(path)?;
-        // Not `create(true)`: a file this open makes must come from
-        // `create_private_file`, so it is never made with the umask's mode.
-        let write = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
+        Self::open_with(&RealFs, path.as_ref())
+    }
+
+    /// [`Self::open`] through `fs`. Production passes [`RealFs`]; the crash
+    /// harness passes its simulated disk.
+    fn open_with(fs: &dyn ContainerFs, path: &Path) -> Result<Self, StoreError> {
+        let created = fs.create_store_file(path)?;
+        let write = fs
+            .open_rw(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        let initialized = ensure_superblock(&write).map_err(|err| name_store(err, path))?;
-        let (_, _, state) = read_consistent(&write).map_err(|err| name_store(err, path))?;
+        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, path))?;
+        let (_, _, state) = read_consistent(&*write).map_err(|err| name_store(err, path))?;
         // Also when an earlier open created the file and stopped before its
         // first superblock: the entry is only durable once the directory is.
         if created || initialized {
-            sync_dir(&parent_dir(path))?;
+            fs.sync_dir(&parent_dir(path))?;
         }
         if let Some(found) = doc::schema_version_in(|collection, id| {
             state
@@ -266,11 +282,9 @@ impl FerroStore {
         })? {
             crate::check_format(Some(found))?;
         }
-        crate::private::warn_if_loose(path);
-        // `OpenOptions::read` without write is `O_RDONLY`.
-        let read = OpenOptions::new()
-            .read(true)
-            .open(path)
+        fs.warn_if_loose(path);
+        let read = fs
+            .open_ro(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
         Ok(Self::assemble(
             Inner::Disk(Disk {
@@ -1073,7 +1087,7 @@ impl FerroStore {
     fn read_state(&self) -> Result<DocState, StoreError> {
         match &self.inner {
             Inner::Memory(state) => Ok(lock_mutex(state).clone()),
-            Inner::Disk(disk) => Ok(read_consistent(&disk.read)?.2),
+            Inner::Disk(disk) => Ok(read_consistent(&*disk.read)?.2),
             Inner::Remote(remote) => remote.read_state(),
         }
     }
@@ -1411,8 +1425,8 @@ impl FerroStore {
             }
             Inner::Disk(disk) => {
                 let file = lock_mutex(&disk.write);
-                let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-                let (index, sb, state) = read_consistent(&file)?;
+                let _locked = FlockGuard::acquire(file.lock_fd())?;
+                let (index, sb, state) = read_consistent(&**file)?;
                 let mut sync = lock_mutex(&self.sync);
                 if !sync.is_idle() {
                     return Ok(state.docs.get(&key).cloned());
@@ -1427,7 +1441,7 @@ impl FerroStore {
                 };
                 let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                append_frame(&file, index, &sb, &frame)?;
+                append_frame(&**file, index, &sb, &frame)?;
                 if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
                 }
@@ -1495,8 +1509,8 @@ impl FerroStore {
                     let _gate = lock_mutex(&self.commit_gate);
                     let committed = {
                         let file = lock_mutex(&disk.write);
-                        let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-                        let (index, sb, state) = read_consistent(&file)?;
+                        let _locked = FlockGuard::acquire(file.lock_fd())?;
+                        let (index, sb, state) = read_consistent(&**file)?;
                         if let Some(existing) = state.docs.get(&key).cloned() {
                             return Ok(IfAbsent {
                                 wrote: false,
@@ -1511,7 +1525,7 @@ impl FerroStore {
                         };
                         let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
                         let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                        append_frame(&file, index, &sb, &frame)?;
+                        append_frame(&**file, index, &sb, &frame)?;
                         (seq, op)
                     };
                     (
@@ -1903,14 +1917,14 @@ fn publish_sync_batches(
         }
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
-            let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-            let (index, sb, state) = read_consistent(&file)?;
+            let _locked = FlockGuard::acquire(file.lock_fd())?;
+            let (index, sb, state) = read_consistent(&**file)?;
             let (next, prepared) = prepare_sync_batches(&state, batches)?;
             let mut frames = Vec::with_capacity(prepared.len());
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            publish_frames(&file, index, &sb, &frames)?;
+            publish_frames(&**file, index, &sb, &frames)?;
             Ok((next.last_seq, prepared))
         }
     }
@@ -1981,8 +1995,8 @@ fn file_uri_path(rest: &str) -> String {
 
 fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<SeqCommit, StoreError> {
     let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-    let (index, sb, state) = read_consistent(&file)?;
+    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let (index, sb, state) = read_consistent(&**file)?;
     if state.last_seq != expected_seq {
         return Ok(SeqCommit::Lost);
     }
@@ -1991,7 +2005,7 @@ fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<SeqC
     }
     let seq = stage_ops(state, ops)?.last_seq;
     let frame = encode_frame(seq, ops)?;
-    append_frame(&file, index, &sb, &frame)?;
+    append_frame(&**file, index, &sb, &frame)?;
     Ok(SeqCommit::Wrote(Committed {
         seq,
         ops: ops.to_vec(),
@@ -2003,8 +2017,8 @@ fn with_write_disk<T>(
     mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
 ) -> Result<(T, Option<Committed>), StoreError> {
     let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-    let (index, sb, state) = read_consistent(&file)?;
+    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let (index, sb, state) = read_consistent(&**file)?;
     let baseline = state.clone();
     let mut txn = Txn {
         docs: state.docs,
@@ -2018,7 +2032,7 @@ fn with_write_disk<T>(
     }
     let seq = stage_ops(baseline, &txn.ops)?.last_seq;
     let frame = encode_frame(seq, &txn.ops)?;
-    append_frame(&file, index, &sb, &frame)?;
+    append_frame(&**file, index, &sb, &frame)?;
     Ok((result, Some(Committed { seq, ops: txn.ops })))
 }
 
@@ -2027,19 +2041,19 @@ fn commit_disk<T>(
     build: impl FnOnce(&DocState) -> Result<(Op, T), StoreError>,
 ) -> Result<(T, Committed), StoreError> {
     let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-    let (index, sb, state) = read_consistent(&file)?;
+    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let (index, sb, state) = read_consistent(&**file)?;
     let (op, extra) = build(&state)?;
     let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-    append_frame(&file, index, &sb, &frame)?;
+    append_frame(&**file, index, &sb, &frame)?;
     Ok((extra, Committed { seq, ops: vec![op] }))
 }
 
 /// Write every frame at the current WAL end, then publish one superblock.
 /// A failure before `write_slot` leaves the previous superblock current.
 fn publish_frames(
-    file: &File,
+    file: &dyn ContainerIo,
     index: usize,
     sb: &Superblock,
     frames: &[Vec<u8>],
@@ -2067,7 +2081,7 @@ fn publish_frames(
         .epoch
         .checked_add(1)
         .ok_or_else(|| backend("epoch overflow"))?;
-    file.write_all_at(&bytes, at).map_err(io_err)?;
+    file.write_at(&bytes, at).map_err(io_err)?;
     file.sync_all().map_err(io_err)?;
     let new_sb = Superblock {
         epoch,
@@ -2084,8 +2098,8 @@ fn publish_frames(
 
 fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-    let (index, sb, state) = read_consistent(&file)?;
+    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let (index, sb, state) = read_consistent(&**file)?;
     let blob = if !state.vectors.is_empty() {
         encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
     } else if state.tables.is_empty() {
@@ -2094,8 +2108,8 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)?
     };
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
-    let offset = allocate_extent(&file, &sb, blob_len)?;
-    file.write_all_at(&blob, offset).map_err(io_err)?;
+    let offset = allocate_extent(&**file, &sb, blob_len)?;
+    file.write_at(&blob, offset).map_err(io_err)?;
     file.sync_all().map_err(io_err)?;
     let new_sb = Superblock {
         epoch: sb
@@ -2110,13 +2124,13 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         wal_length: 0,
         snapshot_seq: state.last_seq,
     };
-    write_slot(&file, index ^ 1, &new_sb)?;
+    write_slot(&**file, index ^ 1, &new_sb)?;
     file.sync_all().map_err(io_err)?;
     Ok(())
 }
 
-fn allocate_extent(file: &File, sb: &Superblock, len: u64) -> Result<u64, StoreError> {
-    let file_len = file.metadata().map_err(io_err)?.len();
+fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<u64, StoreError> {
+    let file_len = file.len().map_err(io_err)?;
     let live_end = sb
         .snapshot_offset
         .saturating_add(sb.snapshot_length)
@@ -2130,7 +2144,7 @@ fn allocate_extent(file: &File, sb: &Superblock, len: u64) -> Result<u64, StoreE
 }
 
 fn append_frame(
-    file: &File,
+    file: &dyn ContainerIo,
     index: usize,
     sb: &Superblock,
     frame: &[u8],
@@ -2140,7 +2154,7 @@ fn append_frame(
         .wal_offset
         .checked_add(sb.wal_length)
         .ok_or_else(|| backend("wal offset overflow"))?;
-    file.write_all_at(frame, at).map_err(io_err)?;
+    file.write_at(frame, at).map_err(io_err)?;
     file.sync_all().map_err(io_err)?;
     let new_sb = Superblock {
         epoch: sb
@@ -2176,11 +2190,11 @@ fn new_store_docs() -> BTreeMap<(String, String), Value> {
     docs
 }
 
-fn init_empty(file: &File) -> Result<(), StoreError> {
+fn init_empty(file: &dyn ContainerIo) -> Result<(), StoreError> {
     let blob = encode_snapshot(0, &new_store_docs())?;
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     file.set_len(HEADER_BYTES).map_err(io_err)?;
-    file.write_all_at(&blob, HEADER_BYTES).map_err(io_err)?;
+    file.write_at(&blob, HEADER_BYTES).map_err(io_err)?;
     file.sync_all().map_err(io_err)?;
     let sb = Superblock {
         epoch: 1,
@@ -2255,15 +2269,15 @@ fn name_store(err: StoreError, path: &Path) -> StoreError {
 // `init_empty` writes. Any other file is not rewritten: it could hold real
 // data, and `read_consistent` reports it. `true` when this call ran
 // `init_empty`.
-fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
+fn ensure_superblock(file: &dyn ContainerIo) -> Result<bool, StoreError> {
     if parsed_superblock(file)?.is_some() {
         return Ok(false);
     }
-    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+    let _locked = FlockGuard::acquire(file.lock_fd())?;
     if parsed_superblock(file)?.is_some() {
         return Ok(false);
     }
-    let len = file.metadata().map_err(io_err)?.len();
+    let len = file.len().map_err(io_err)?;
     if len == 0 {
         init_empty(file)?;
         return Ok(true);
@@ -2271,7 +2285,7 @@ fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
     let header_len = len.min(HEADER_BYTES);
     let n = usize::try_from(header_len).map_err(|_| backend("header length exceeds usize"))?;
     let mut buf = vec![0u8; n];
-    file.read_exact_at(&mut buf, 0).map_err(io_err)?;
+    file.read_at(&mut buf, 0).map_err(io_err)?;
     if buf.iter().any(|byte| *byte != 0) {
         return Ok(false);
     }
@@ -2285,8 +2299,7 @@ fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
             return Ok(false);
         }
         let mut held = vec![0u8; tail];
-        file.read_exact_at(&mut held, HEADER_BYTES)
-            .map_err(io_err)?;
+        file.read_at(&mut held, HEADER_BYTES).map_err(io_err)?;
         if held != blob[..tail] {
             return Ok(false);
         }
@@ -2295,7 +2308,7 @@ fn ensure_superblock(file: &File) -> Result<bool, StoreError> {
     Ok(true)
 }
 
-fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreError> {
+fn read_consistent(file: &dyn ContainerIo) -> Result<(usize, Superblock, DocState), StoreError> {
     let (index, sb) = latest_superblock(file)?;
     let mut state = if sb.snapshot_length == 0 {
         DocState::at_seq(sb.snapshot_seq)
@@ -2318,8 +2331,8 @@ fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreEr
     Ok((index, sb, state))
 }
 
-fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreError> {
-    let file_len = file.metadata().map_err(io_err)?.len();
+fn parsed_superblock(file: &dyn ContainerIo) -> Result<Option<(usize, Superblock)>, StoreError> {
+    let file_len = file.len().map_err(io_err)?;
     let mut best: Option<(usize, Superblock)> = None;
     for index in 0..2 {
         let offset = slot_offset(index);
@@ -2327,7 +2340,7 @@ fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreEr
             continue;
         }
         let mut buf = [0u8; SLOT_LEN];
-        file.read_exact_at(&mut buf, offset).map_err(io_err)?;
+        file.read_at(&mut buf, offset).map_err(io_err)?;
         match parse_superblock(&buf) {
             SlotRead::Valid(sb) => match &best {
                 Some((_, current)) if sb.epoch < current.epoch => {}
@@ -2357,27 +2370,26 @@ fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreEr
     Ok(best)
 }
 
-fn latest_superblock(file: &File) -> Result<(usize, Superblock), StoreError> {
+fn latest_superblock(file: &dyn ContainerIo) -> Result<(usize, Superblock), StoreError> {
     parsed_superblock(file)?.ok_or_else(|| backend("no valid FerroStore superblock"))
 }
 
-fn write_slot(file: &File, index: usize, sb: &Superblock) -> Result<(), StoreError> {
+fn write_slot(file: &dyn ContainerIo, index: usize, sb: &Superblock) -> Result<(), StoreError> {
     if index > 1 {
         return Err(backend("superblock slot out of range"));
     }
     let bytes = encode_superblock(sb);
-    file.write_all_at(&bytes, slot_offset(index))
-        .map_err(io_err)?;
+    file.write_at(&bytes, slot_offset(index)).map_err(io_err)?;
     Ok(())
 }
 
-fn read_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
+fn read_range(file: &dyn ContainerIo, offset: u64, length: u64) -> Result<Vec<u8>, StoreError> {
     if length == 0 {
         return Ok(Vec::new());
     }
     let len =
         usize::try_from(length).map_err(|_| corrupt("extent length does not fit in memory"))?;
-    let file_len = file.metadata().map_err(io_err)?.len();
+    let file_len = file.len().map_err(io_err)?;
     let end = offset
         .checked_add(length)
         .ok_or_else(|| corrupt("extent range overflows"))?;
@@ -2385,7 +2397,7 @@ fn read_range(file: &File, offset: u64, length: u64) -> Result<Vec<u8>, StoreErr
         return Err(corrupt("extent extends past the end of the file"));
     }
     let mut buf = vec![0u8; len];
-    file.read_exact_at(&mut buf, offset).map_err(io_err)?;
+    file.read_at(&mut buf, offset).map_err(io_err)?;
     Ok(buf)
 }
 
