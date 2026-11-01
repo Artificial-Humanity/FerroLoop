@@ -140,7 +140,7 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         method: "slash_model",
       });
 
-      render(
+      const { rerender } = render(
         <ChatPane
           agentName="felix"
           agentDisplayName="Felix"
@@ -157,8 +157,20 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       expect(screen.queryByTestId("chat-active-model-badge")).toBeNull();
       expect(screen.queryByTestId("turn-count-badge")).toBeNull();
 
-      // Open AgentSettingsModal via chat-agent-settings-btn
-      fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+      // Open AgentSettingsModal
+      rerender(
+        <ChatPane
+          agentName="felix"
+          agentDisplayName="Felix"
+          adapter="antigravity"
+          model="gemini-4-argon"
+          thinkingLevel="high"
+          sessionId="sess-felix-01"
+          turns={[]}
+          agentSettingsOpen={true}
+          onSetSessionModel={onSetSessionModel}
+        />,
+      );
       expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
       expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
         "antigravity · gemini-4-argon (high)",

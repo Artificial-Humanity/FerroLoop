@@ -573,12 +573,14 @@ export class HubApiError extends Error {
   public readonly status: number;
   public readonly detail?: string;
   public readonly requires_totp?: boolean;
+  public readonly details?: Record<string, unknown>;
 
   constructor(
     status: number,
     message: string,
     detail?: string,
     requiresTotp?: boolean,
+    details?: Record<string, unknown> | null,
   ) {
     super(message);
     this.name = "HubApiError";
@@ -586,6 +588,9 @@ export class HubApiError extends Error {
     this.detail = detail;
     if (requiresTotp !== undefined) {
       this.requires_totp = requiresTotp;
+    }
+    if (details && typeof details === "object") {
+      this.details = details;
     }
   }
 }
@@ -689,7 +694,7 @@ export class HubApiClient {
         typeof parsed?.requires_totp === "boolean"
           ? parsed.requires_totp
           : undefined;
-      throw new HubApiError(response.status, errMsg, detail, requiresTotp);
+      throw new HubApiError(response.status, errMsg, detail, requiresTotp, parsed);
     }
 
     return (parsed ?? ({} as unknown)) as T;

@@ -129,7 +129,7 @@ describe("Wave A UI — Records 10, 4 & 29", () => {
 
       // Switch back to Chat, open AgentSettingsModal -> Clear/Reforge modal -> '?' popover -> open-full-help-btn
       fireEvent.click(within(tabBar).getByRole("tab", { name: /^Chat$/i }));
-      fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+      fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
       fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
       fireEvent.click(screen.getByTestId("clear-modal-help-btn"));
 

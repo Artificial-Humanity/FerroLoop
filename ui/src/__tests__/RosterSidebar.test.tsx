@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
@@ -7,7 +7,11 @@ import { ContextHeader } from "../components/ContextHeader";
 import { PairingModal } from "../components/PairingModal";
 import {
   COLLAPSED_PROJECTS_STORAGE_KEY,
+  PINNED_AGENTS_STORAGE_KEY,
+  PINNED_PROJECTS_STORAGE_KEY,
   RosterSidebar,
+  togglePinnedAgent,
+  togglePinnedProject,
 } from "../components/RosterSidebar";
 import {
   DEFAULT_WORKSPACE_AGENTS,
@@ -19,6 +23,8 @@ import {
 describe("RosterSidebar", () => {
   beforeEach(() => {
     window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+    window.localStorage.removeItem(PINNED_PROJECTS_STORAGE_KEY);
+    window.localStorage.removeItem(PINNED_AGENTS_STORAGE_KEY);
   });
 
   const sampleRoutes: DiscoveredSessionSummary[] = [
@@ -210,6 +216,93 @@ describe("RosterSidebar", () => {
     ).toContain("ferroloop");
     window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
   });
+
+  it("renders roster-global-controls (Settings, ?, icon-only theme toggle) and sorts pinned projects and pinned agents alphabetically to top", () => {
+    const onOpenSettingsModal = vi.fn();
+    const onOpenHelpModal = vi.fn();
+    const onToggleTheme = vi.fn();
+    const customAgents: AgentRecord[] = [
+      ...DEFAULT_WORKSPACE_AGENTS,
+      {
+        id: "urn:fl:agent:felix",
+        name_key: "felix",
+        display_name: "Felix",
+        project: "FerroLoop",
+        role: "ui-developer",
+        status: "active",
+      },
+      {
+        id: "urn:fl:agent:felicity",
+        name_key: "felicity",
+        display_name: "Felicity",
+        project: "FerroLoop",
+        role: "assistant",
+        status: "active",
+      },
+    ];
+
+    render(
+      <RosterSidebar
+        agents={customAgents}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{}}
+        selectedAgentName="ferris"
+        onSelectAgent={() => {}}
+        onOpenSettingsModal={onOpenSettingsModal}
+        onOpenHelpModal={onOpenHelpModal}
+        themeMode="dark"
+        onToggleTheme={onToggleTheme}
+      />,
+    );
+
+    const globalControls = screen.getByTestId("roster-global-controls");
+    expect(globalControls).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("settings-modal-btn"));
+    expect(onOpenSettingsModal).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByTestId("context-help-btn"));
+    expect(onOpenHelpModal).toHaveBeenCalledTimes(1);
+
+    const themeBtn = screen.getByTestId("theme-toggle-btn");
+    expect(themeBtn).toHaveTextContent("☀");
+    expect(themeBtn).not.toHaveTextContent(/Light/i);
+    fireEvent.click(themeBtn);
+    expect(onToggleTheme).toHaveBeenCalledTimes(1);
+
+    // Pin Website and Sonora -> both pinned projects move to top in alphabetical order (Sonora, Website)
+    act(() => {
+      togglePinnedProject("Website");
+      togglePinnedProject("Sonora");
+    });
+    expect(screen.getByTestId("project-pinned-indicator-sonora")).toBeInTheDocument();
+    expect(screen.getByTestId("project-pinned-indicator-website")).toBeInTheDocument();
+    const projectGroups = screen.getAllByTestId(/^project-group-(?!toggle)/);
+    expect(projectGroups[0]).toHaveAttribute("data-testid", "project-group-sonora");
+    expect(projectGroups[0]).toHaveAttribute("data-pinned", "true");
+    expect(projectGroups[1]).toHaveAttribute("data-testid", "project-group-website");
+    expect(projectGroups[1]).toHaveAttribute("data-pinned", "true");
+    expect(projectGroups[2]).toHaveAttribute("data-testid", "project-group-ai-lab-amd");
+
+    // Pin Felix and Ferris inside FerroLoop -> pinned agents sort alphabetically (Felix, Ferris) above unpinned Felicia and Felicity
+    act(() => {
+      togglePinnedAgent("ferris");
+      togglePinnedAgent("felix");
+    });
+    expect(screen.getByTestId("agent-pinned-indicator-felix")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-pinned-indicator-ferris")).toBeInTheDocument();
+    const ferroGroup = screen.getByTestId("project-group-ferroloop");
+    const ferroAgentRows = Array.from(
+      ferroGroup.querySelectorAll('[data-testid^="agent-row-"]'),
+    );
+    expect(ferroAgentRows.map((el) => el.getAttribute("data-testid"))).toEqual([
+      "agent-row-felix",
+      "agent-row-ferris",
+      "agent-row-felicia",
+      "agent-row-felicity",
+    ]);
+  });
 });
 
 describe("ContextHeader", () => {
@@ -233,11 +326,11 @@ describe("ContextHeader", () => {
     },
   ];
 
-  it("renders agent context, mode tabs, session selector, authority pill, and split-view toggle", () => {
+  it("renders agent context, mode tabs, session selector, authority pill, and inline mobile roster toggle", () => {
     const onSelectTab = vi.fn();
-    const onToggleSplitView = vi.fn();
     const onSelectSession = vi.fn();
     const onOpenPairingModal = vi.fn();
+    const onOpenMobileRoster = vi.fn();
 
     render(
       <ContextHeader
@@ -247,12 +340,10 @@ describe("ContextHeader", () => {
         onSelectSession={onSelectSession}
         activeTab="chat"
         onSelectTab={onSelectTab}
-        splitView={false}
-        onToggleSplitView={onToggleSplitView}
         authority={{ tier: "owner", login: "lmcfarlin" }}
         wsConnected={true}
         onOpenPairingModal={onOpenPairingModal}
-        onOpenMobileRoster={() => {}}
+        onOpenMobileRoster={onOpenMobileRoster}
       />,
     );
 
@@ -264,9 +355,9 @@ describe("ContextHeader", () => {
     fireEvent.click(screen.getByRole("tab", { name: /Git & PRs/i }));
     expect(onSelectTab).toHaveBeenCalledWith("git");
 
-    // Toggle split view
-    fireEvent.click(screen.getByTestId("split-view-toggle"));
-    expect(onToggleSplitView).toHaveBeenCalledTimes(1);
+    // Inline mobile roster toggle
+    fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));
+    expect(onOpenMobileRoster).toHaveBeenCalledTimes(1);
 
     // Select second session
     fireEvent.change(screen.getByTestId("session-selector"), {
@@ -333,22 +424,13 @@ describe("ContextHeader session pill and header controls", () => {
         onSelectSession={() => {}}
         activeTab="chat"
         onSelectTab={() => {}}
-        splitView={false}
-        onToggleSplitView={() => {}}
-        themeMode="dark"
-        onToggleTheme={() => {}}
         onOpenPairingModal={() => {}}
       />,
     );
 
     expect(screen.queryByTestId("session-selector")).toBeNull();
     expect(screen.getByTestId("session-id-pill")).toHaveTextContent("#1234abcd");
-    expect(screen.getByTestId("theme-toggle-btn")).toHaveTextContent(/Light/);
-    const splitToggle = screen.getByTestId("split-view-toggle");
-    expect(splitToggle).toHaveAttribute("aria-label", "Open right split panel");
-    expect(splitToggle).toHaveAttribute("aria-pressed", "false");
-    expect(splitToggle.querySelector("svg")).not.toBeNull();
-    expect(splitToggle).not.toHaveTextContent(/Split:/);
+    expect(screen.queryByTestId("system-utility-bar")).toBeNull();
   });
 
   it("keeps the selector when the agent has multiple sessions", () => {
@@ -369,21 +451,12 @@ describe("ContextHeader session pill and header controls", () => {
         onSelectSession={() => {}}
         activeTab="chat"
         onSelectTab={() => {}}
-        splitView={true}
-        onToggleSplitView={() => {}}
-        themeMode="light"
-        onToggleTheme={() => {}}
         onOpenPairingModal={() => {}}
       />,
     );
 
     expect(screen.getByTestId("session-selector")).toBeInTheDocument();
     expect(screen.queryByTestId("session-id-pill")).toBeNull();
-    expect(screen.getByTestId("theme-toggle-btn")).toHaveTextContent(/Dark/);
-    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute(
-      "aria-label",
-      "Close right split panel",
-    );
   });
 });
 

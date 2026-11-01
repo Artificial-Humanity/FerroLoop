@@ -557,7 +557,12 @@ export interface SetSessionModelResponse {
   method: string;
 }
 
-export type BulkSessionAction = "compact" | "clear" | "reforge";
+export type BulkSessionAction =
+  | "compact"
+  | "clear"
+  | "reforge"
+  | "prepare"
+  | "teardown";
 
 export interface BulkSessionActionResponse {
   action: BulkSessionAction;

@@ -511,6 +511,8 @@ export interface ChatPaneProps {
   onOpenAgentSettings?: () => void;
   onCloseAgentSettings?: () => void;
   onToggleArtifacts?: () => void;
+  splitView?: boolean;
+  onToggleSplitView?: () => void;
   onRefresh?: () => void;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
@@ -575,6 +577,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onOpenAgentSettings,
   onCloseAgentSettings,
   onToggleArtifacts,
+  splitView = false,
+  onToggleSplitView,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -1829,16 +1833,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               Artifacts
             </button>
           )}
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="chat-agent-settings-btn"
-            aria-label="Agent Settings"
-            title="Agent Settings (Model, Thinking Level, Context & Lifecycle)"
-            onClick={handleOpenAgentSettings}
-          >
-            ⚙ Settings
-          </button>
           {(onRefresh || apiClient) && (
             <button
               type="button"
@@ -1862,6 +1856,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             title="Scroll to latest turn"
           >
             ↓ Latest
+          </button>
+          <button
+            type="button"
+            data-testid="split-view-toggle"
+            className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+            onClick={() => onToggleSplitView?.()}
+            title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+            aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+            aria-pressed={splitView}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
+              <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
+              <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
+            </svg>
           </button>
         </div>
       </div>
@@ -3059,6 +3068,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         canDecommission={canDecommission}
         decommissioning={decommissioning}
         onOpenDecommissionModal={handleOpenDecommissionModal}
+        apiClient={apiClient}
+        onAgentsUpdated={onRefresh}
       />
     </section>
   );
