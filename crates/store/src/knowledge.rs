@@ -65,10 +65,10 @@ use std::sync::OnceLock;
 /// Smallest number of nearest vectors asked of the index.
 const MIN_CANDIDATES: usize = 200;
 /// Reciprocal-rank-fusion constant.
-const RRF_K: f64 = 60.0;
+pub(crate) const RRF_K: f64 = 60.0;
 /// A vector-only hit needs at least this cosine to the query, measured
 /// against the entry's summary or its whole text.
-const MIN_VECTOR_COSINE: f32 = 0.25;
+pub(crate) const MIN_VECTOR_COSINE: f32 = 0.25;
 /// Longest fallback snippet, in characters.
 const SNIPPET_CHARS: usize = 160;
 /// Vectors one [`rank_state_entries`] call may write.
@@ -87,7 +87,7 @@ const INDEX_DOC_COLLECTION: &str = "state_vec_index";
 /// local engine's wording. A Remote engine may word it differently; its
 /// missing-collection error is then not recognised, the search fails over to
 /// BM25 and the real cause is kept in [`RankedHits::cause`].
-const MISSING_COLLECTION: &str = "no vector collection";
+pub(crate) const MISSING_COLLECTION: &str = "no vector collection";
 /// Index-document `rev` meaning "a vector may exist for this id, its revision
 /// is unknown". Outside the 53-bit range of [`stamp`], so no entry hashes to it.
 const PENDING_REV: u64 = 1 << 53;
@@ -177,7 +177,7 @@ fn bm25_ranked(all: Vec<StateSearchHit>, limit: usize) -> RankedHits {
     }
 }
 
-fn default_embedder() -> &'static HashingEmbedder {
+pub(crate) fn default_embedder() -> &'static HashingEmbedder {
     static EMBEDDER: OnceLock<HashingEmbedder> = OnceLock::new();
     EMBEDDER.get_or_init(HashingEmbedder::default)
 }
@@ -392,7 +392,7 @@ fn rank_knowledge(
     }))
 }
 
-fn rrf(rank: usize) -> f64 {
+pub(crate) fn rrf(rank: usize) -> f64 {
     1.0 / (RRF_K + rank as f64)
 }
 
@@ -400,7 +400,7 @@ fn score_millis(fused: f64) -> u64 {
     ((fused * SCORE_SCALE).round() as u64).max(1)
 }
 
-fn is_zero(v: &[f32]) -> bool {
+pub(crate) fn is_zero(v: &[f32]) -> bool {
     v.iter().all(|x| *x == 0.0)
 }
 
@@ -617,7 +617,7 @@ impl IndexDoc {
 
 /// `Ok(None)` only for the engine's own "no vector collection" error; any
 /// other failure is returned.
-fn missing_as_none<T>(result: Result<T, StoreError>) -> Result<Option<T>, StoreError> {
+pub(crate) fn missing_as_none<T>(result: Result<T, StoreError>) -> Result<Option<T>, StoreError> {
     match result {
         Ok(value) => Ok(Some(value)),
         Err(err) if is_missing_collection(&err) => Ok(None),
@@ -629,7 +629,7 @@ fn is_missing_collection(err: &StoreError) -> bool {
     matches!(err, StoreError::Backend(msg) if msg.starts_with(MISSING_COLLECTION))
 }
 
-fn ensure_vector_collection(
+pub(crate) fn ensure_vector_collection(
     ferro: &FerroStore,
     embedder: &dyn Embedder,
     name: &str,
@@ -656,7 +656,7 @@ fn ensure_vector_collection(
     }
 }
 
-fn stamp(text: &str) -> u64 {
+pub(crate) fn stamp(text: &str) -> u64 {
     let digest = Sha256::digest(text.as_bytes());
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest[..8]);

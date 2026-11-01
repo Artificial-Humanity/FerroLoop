@@ -47,9 +47,9 @@ pub use arch::{
 };
 pub use at::{At, AtError};
 pub use code_index::{
-    CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, MAX_CODE_FILE_BYTES,
-    TOKEN_GAIN_SLUG, TokenGainSummary, load_token_gain, record_token_gain_index,
-    record_token_gain_query, scan_code_index, search_code_index,
+    CodeFileRef, CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, CodeSymbolRef,
+    MAX_CODE_FILE_BYTES, TOKEN_GAIN_SLUG, TokenGainSummary, load_token_gain, outcome_from_hits,
+    record_token_gain_index, record_token_gain_query, scan_code_index, search_code_index,
 };
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
 pub use embed::{
