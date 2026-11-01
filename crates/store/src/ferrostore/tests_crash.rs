@@ -1,0 +1,834 @@
+//! Crash-consistency harness (spec §3.5).
+//!
+//! # How it runs
+//!
+//! 1. **Reference run.** The scenario's workload runs once on a [`SimFs`]
+//!    that never cuts. That gives the full op trace, and the logical state
+//!    after every acknowledged operation (`states[k]` is the state after `k`
+//!    acknowledged operations; `states[0]` is the state before the first).
+//! 2. **Cut runs.** For every `N` from 0 to the trace length, the workload runs
+//!    again from the same start on a disk that cuts power after op `N`. Its
+//!    trace must be the reference trace's first `N` ops.
+//! 3. **Survivors.** For each cut, every combination of fates of the ops not
+//!    yet durable (kept, dropped, torn: see `crash_sim`) is one case, up to
+//!    [`FATE_CAP`] combinations; past that, a sample seeded from [`SEED`]
+//!    and the cut. No case in today's workload reaches the cap.
+//! 4. **Checks** ([`check_recovery`]), on each survivor image, reopened
+//!    through the normal `FerroStore::open` path on the simulated disk:
+//!    - no two valid slots share an epoch, and no slot is from a newer build;
+//!    - a store file whose creation was acknowledged still exists; a cut
+//!      during first-use init leaves the file absent, empty, re-initialisable
+//!      (zero header and a prefix of the first snapshot) or initialised;
+//!    - `open` succeeds and `format_version()` is on the ladder;
+//!    - `last_seq` is not below the acknowledged prefix's;
+//!    - the state is exactly `states[j]` for some `j` from the acknowledged
+//!      count to the started count: every acknowledged operation is present
+//!      with its exact content, and an unacknowledged one is all there or
+//!      not there at all;
+//!    - a state past the starting one is published in a format-2 slot;
+//!    - one more commit after recovery lands, and reads back after a reopen.
+//!
+//! # Extending it
+//!
+//! - **A new workload step:** a [`Step`] in [`WORKLOAD`] (or a scenario's own
+//!   list). Each acknowledged call goes through [`Ctx::op`]; nothing else is
+//!   needed. Compaction (§5) has its marked place in [`WORKLOAD`].
+//! - **A new kind of I/O op:** a method on `ContainerIo`/`ContainerFs`, an
+//!   [`IoOp`] variant, and its fates in `SimFs::pending` (`crash_sim`).
+//! - **Group commit (§4.3):** see [`three_writers`].
+
+use super::container_io::{ContainerFs, RealFs};
+use super::crash_sim::{Image, IoOp, SimFs, fate_vectors};
+use super::layout::{
+    self, FORMAT_V1, FORMAT_V2, HEADER_BYTES, Op, SLOT_LEN, SlotRead, Superblock, backend,
+    encode_frame, encode_snapshot, encode_superblock_as, parse_superblock,
+};
+use super::state::DocState;
+use super::vector::VectorCollection;
+use super::{
+    ColumnDef, ColumnType, ColumnValue, FerroStore, VectorMetric, VectorStorage, new_store_docs,
+};
+use fl_core::StoreError;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// Where the simulated store lives.
+const STORE: &str = "/sim/store.fls";
+/// The most fate combinations tried exhaustively at one cut.
+const FATE_CAP: usize = 64;
+/// The base seed of a sampled cut. A failure message prints the seed it used.
+const SEED: u64 = 0x5EED_0003_0005_F1F0;
+/// Spec §3.5: the harness stays under 30 s in a debug `cargo test`.
+const TIME_BUDGET: Duration = Duration::from_secs(30);
+
+// ---- logical state -----------------------------------------------------------
+
+/// What a reader can observe: everything but the physical layout.
+#[derive(Clone, Debug, PartialEq)]
+struct Logical {
+    last_seq: u64,
+    docs: BTreeMap<(String, String), Value>,
+    tables: BTreeMap<String, (Vec<ColumnDef>, Vec<Vec<u8>>)>,
+    vectors: BTreeMap<String, VectorCollection>,
+}
+
+impl Logical {
+    fn of(state: DocState) -> Self {
+        Self {
+            last_seq: state.last_seq,
+            docs: state.docs,
+            tables: state
+                .tables
+                .into_iter()
+                .map(|(name, table)| (name, (table.columns, table.groups)))
+                .collect(),
+            vectors: state.vectors,
+        }
+    }
+
+    fn read(store: &FerroStore) -> Result<Self, String> {
+        store
+            .read_state()
+            .map(Self::of)
+            .map_err(|err| format!("read_state failed: {err}"))
+    }
+
+    fn summary(&self) -> String {
+        let docs: Vec<String> = self
+            .docs
+            .keys()
+            .map(|(collection, id)| format!("{collection}/{id}"))
+            .collect();
+        let tables: Vec<String> = self
+            .tables
+            .iter()
+            .map(|(name, (_, groups))| format!("{name}:{} groups", groups.len()))
+            .collect();
+        let vectors: Vec<String> = self
+            .vectors
+            .iter()
+            .map(|(name, col)| format!("{name}:{:?}", col.vectors.keys().collect::<Vec<_>>()))
+            .collect();
+        format!(
+            "last_seq {} docs [{}] tables [{}] vectors [{}]",
+            self.last_seq,
+            docs.join(", "),
+            tables.join(", "),
+            vectors.join(", ")
+        )
+    }
+}
+
+// ---- the workload -------------------------------------------------------------
+
+/// Counts the operations a workload starts and has acknowledged.
+struct Ctx<'a> {
+    /// Set on the reference run: each acknowledged op records the live image.
+    record: Option<&'a SimFs>,
+    images: Mutex<Vec<Image>>,
+    labels: Mutex<Vec<String>>,
+    started: AtomicUsize,
+    acked: AtomicUsize,
+    failed: AtomicBool,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(record: Option<&'a SimFs>) -> Self {
+        Self {
+            record,
+            images: Mutex::new(Vec::new()),
+            labels: Mutex::new(Vec::new()),
+            started: AtomicUsize::new(0),
+            acked: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    /// One acknowledged operation: `Ok` from `call` is the acknowledgement.
+    /// After any failure no further op starts.
+    fn op<T>(
+        &self,
+        label: &str,
+        call: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err(backend("an earlier operation failed"));
+        }
+        self.started.fetch_add(1, Ordering::SeqCst);
+        lock(&self.labels).push(label.to_string());
+        match call() {
+            Ok(value) => {
+                self.acked.fetch_add(1, Ordering::SeqCst);
+                if let Some(fs) = self.record {
+                    lock(&self.images).push(fs.live_image());
+                }
+                Ok(value)
+            }
+            Err(err) => {
+                self.failed.store(true, Ordering::SeqCst);
+                Err(err)
+            }
+        }
+    }
+
+    fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    fn acked(&self) -> usize {
+        self.acked.load(Ordering::SeqCst)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+type StepFn = fn(&Ctx<'_>, &FerroStore) -> Result<(), StoreError>;
+
+/// One scripted step of a workload. It may make several acknowledged calls.
+struct Step {
+    name: &'static str,
+    run: StepFn,
+}
+
+/// The spec §3.5 workload, after the first-use `open`.
+const WORKLOAD: &[Step] = &[
+    Step {
+        name: "1 puts and deletes",
+        run: puts_and_deletes,
+    },
+    Step {
+        name: "2 column-table append",
+        run: column_table_append,
+    },
+    Step {
+        name: "3 vector upsert",
+        run: vector_upsert,
+    },
+    Step {
+        name: "4 checkpoint",
+        run: checkpoint,
+    },
+    Step {
+        name: "5 three writers",
+        run: three_writers,
+    },
+    // EXTENSION POINT, spec §3.5 step 6: compaction. When §5 lands, add
+    //     Step { name: "6 compaction", run: compaction },
+    // with `compaction` calling `ctx.op("6 compaction", || store.compact())`.
+    // Its I/O (the sibling file, its fsync, the rename, the directory sync)
+    // goes through the seam, so every op it does becomes a cut point and the
+    // checks below apply unchanged. Give `pending` a case for any new op.
+    Step {
+        name: "7 commits after the checkpoint",
+        run: tail,
+    },
+];
+
+/// The first write to a format-1 file publishes its first format-2 slot.
+const V1_WORKLOAD: &[Step] = &[
+    Step {
+        name: "first write upgrades the slot",
+        run: |ctx, store| {
+            ctx.op("put notes/new", || {
+                store.put_doc("notes", "new", &json!({"v": 2}))
+            })
+        },
+    },
+    Step {
+        name: "delete a v1 document",
+        run: |ctx, store| ctx.op("delete notes/old", || store.delete_doc("notes", "old")),
+    },
+    Step {
+        name: "checkpoint",
+        run: checkpoint,
+    },
+    Step {
+        name: "put after the checkpoint",
+        run: |ctx, store| {
+            ctx.op("put notes/after", || {
+                store.put_doc("notes", "after", &json!({"v": 3}))
+            })
+        },
+    },
+];
+
+fn puts_and_deletes(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    ctx.op("put notes/a", || {
+        store.put_doc("notes", "a", &json!({"n": 1}))
+    })?;
+    ctx.op("put notes/b", || {
+        store.put_doc("notes", "b", &json!({"n": 2}))
+    })?;
+    ctx.op("delete notes/a", || store.delete_doc("notes", "a"))?;
+    // One commit of three ops: all three or none.
+    ctx.op("txn put c, delete b, put a", || {
+        store.with_write(|txn| {
+            txn.put("notes", "c", json!({"n": 3}));
+            txn.delete("notes", "b");
+            txn.put("notes", "a", json!({"n": 4}));
+            Ok(())
+        })
+    })?;
+    // A frame that spans several sectors, so it can tear.
+    let big = "x".repeat(1500);
+    ctx.op("put notes/big", || {
+        store.put_doc("notes", "big", &json!({"text": big}))
+    })
+}
+
+fn column_table_append(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    let columns = [
+        ColumnDef {
+            name: "n".to_string(),
+            ty: ColumnType::Int64,
+        },
+        ColumnDef {
+            name: "label".to_string(),
+            ty: ColumnType::Utf8,
+        },
+    ];
+    ctx.op("create table runs", || {
+        store.create_column_table("runs", &columns)
+    })?;
+    let row = |n: i64, label: &str| vec![ColumnValue::Int64(n), ColumnValue::Utf8(label.into())];
+    ctx.op("append runs group 1", || {
+        store.append_column_rows("runs", &[row(1, "a"), row(2, "b")])
+    })?;
+    ctx.op("append runs group 2", || {
+        store.append_column_rows("runs", &[row(3, "c")])
+    })
+}
+
+fn vector_upsert(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    ctx.op("create vectors emb", || {
+        store.create_vector_collection("emb", 4, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+    })?;
+    ctx.op("upsert emb/v1", || {
+        store.upsert_vector("emb", "v1", &[1.0, 0.0, 0.0, 0.0], None)
+    })?;
+    ctx.op("upsert emb/v2", || {
+        store.upsert_vector("emb", "v2", &[0.0, 1.0, 0.0, 0.0], Some(&json!({"k": 2})))
+    })?;
+    ctx.op("upsert emb/v1 again", || {
+        store.upsert_vector("emb", "v1", &[0.5, 0.5, 0.0, 0.0], None)
+    })
+}
+
+fn checkpoint(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    ctx.op("checkpoint", || store.checkpoint())
+}
+
+/// Spec §3.5 step 5, "a group commit of three writers". Group commit is
+/// Track 1 (§4.3) and does not exist yet, so today three threads each make
+/// one commit in turn: each is joined before the next starts, so the op
+/// order, and with it every cut point, is the same in every run.
+///
+/// When §4.3 lands, spawn all three before joining any (behind a barrier), so
+/// they queue into one group. The checks need no change: a recovered state
+/// may be any prefix from the acknowledged count to the started count, and
+/// each writer's commit stays all-or-nothing. The cut runs then need the
+/// group's op order to be deterministic, or the trace-prefix check relaxed.
+fn three_writers(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    std::thread::scope(|scope| {
+        for writer in 0..3 {
+            let handle = scope.spawn(move || {
+                ctx.op(&format!("writer {writer}"), || {
+                    store.put_doc("writers", &format!("w{writer}"), &json!({"writer": writer}))
+                })
+            });
+            handle
+                .join()
+                .map_err(|_| backend("writer thread panicked"))??;
+        }
+        Ok(())
+    })
+}
+
+fn tail(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    ctx.op("put writers/w0 again", || {
+        store.put_doc("writers", "w0", &json!({"writer": "again"}))
+    })?;
+    ctx.op("delete notes/c", || store.delete_doc("notes", "c"))?;
+    ctx.op("second checkpoint", || store.checkpoint())?;
+    ctx.op("put notes/last", || {
+        store.put_doc("notes", "last", &json!({"n": 5}))
+    })
+}
+
+// ---- scenarios ------------------------------------------------------------------
+
+struct Scenario {
+    name: &'static str,
+    /// What is on disk before the workload. Empty: a new store.
+    initial: Image,
+    steps: &'static [Step],
+}
+
+impl Scenario {
+    fn new_file(&self) -> bool {
+        self.initial.file(Path::new(STORE)).is_none()
+    }
+}
+
+/// `open`, then every step. Stops at the first failure.
+fn run_workload(
+    scenario: &Scenario,
+    fs: &dyn ContainerFs,
+    path: &Path,
+    ctx: &Ctx<'_>,
+) -> Result<(), StoreError> {
+    let store = ctx.op("open", || FerroStore::open_with(fs, path))?;
+    for step in scenario.steps {
+        (step.run)(ctx, &store).map_err(|err| backend(format!("{}: {err}", step.name)))?;
+    }
+    Ok(())
+}
+
+/// The snapshot a new store's `init_empty` writes after the header.
+fn init_blob() -> Vec<u8> {
+    encode_snapshot(0, &new_store_docs()).unwrap()
+}
+
+/// A format-1 container: slot 0 only, a snapshot and one WAL frame.
+fn v1_image() -> Image {
+    let mut docs = new_store_docs();
+    docs.insert(
+        ("notes".to_string(), "old".to_string()),
+        json!({"from": "v1"}),
+    );
+    let blob = encode_snapshot(0, &docs).unwrap();
+    let frame = encode_frame(
+        1,
+        &[Op::Put {
+            collection: "notes".to_string(),
+            id: "v1-wal".to_string(),
+            doc: json!({"from": "v1 wal"}),
+        }],
+    )
+    .unwrap();
+    let snapshot_length = blob.len() as u64;
+    let sb = Superblock {
+        epoch: 1,
+        snapshot_offset: HEADER_BYTES,
+        snapshot_length,
+        wal_offset: HEADER_BYTES + snapshot_length,
+        wal_length: frame.len() as u64,
+        snapshot_seq: 0,
+    };
+    let mut bytes = vec![0u8; HEADER_BYTES as usize];
+    bytes[..SLOT_LEN].copy_from_slice(&encode_superblock_as(&sb, FORMAT_V1, 0, 0));
+    bytes.extend_from_slice(&blob);
+    bytes.extend_from_slice(&frame);
+    Image::single(Path::new(STORE), bytes)
+}
+
+// ---- the harness ----------------------------------------------------------------
+
+struct Reference {
+    trace: Vec<IoOp>,
+    labels: Vec<String>,
+    /// `states[k]`: the state after `k` acknowledged operations.
+    states: Vec<Logical>,
+}
+
+/// Open `image` on a fresh simulated disk and read its state.
+fn decode(image: &Image) -> Logical {
+    let fs = SimFs::new(image, None);
+    let store = FerroStore::open_with(&fs, Path::new(STORE)).expect("reference image opens");
+    Logical::read(&store).expect("reference image reads")
+}
+
+fn reference(scenario: &Scenario) -> Reference {
+    let fs = SimFs::new(&scenario.initial, None);
+    let ctx = Ctx::new(Some(&fs));
+    run_workload(scenario, &fs, Path::new(STORE), &ctx).expect("the uncut workload succeeds");
+    let images = lock(&ctx.images).clone();
+    assert_eq!(images.len(), ctx.acked());
+    let mut states: Vec<Logical> = Vec::with_capacity(images.len() + 1);
+    // Before anything: a new file reopens as the store `open` initialises.
+    states.push(decode(if scenario.new_file() {
+        &images[0]
+    } else {
+        &scenario.initial
+    }));
+    states.extend(images.iter().map(decode));
+    for pair in states.windows(2) {
+        assert!(
+            pair[1].last_seq >= pair[0].last_seq,
+            "{}: last_seq went backwards in the reference run",
+            scenario.name
+        );
+    }
+    let labels = lock(&ctx.labels).clone();
+    Reference {
+        trace: fs.trace(),
+        labels,
+        states,
+    }
+}
+
+/// The two slots of a container image, where present.
+fn slots(bytes: &[u8]) -> Vec<(usize, &[u8])> {
+    (0..2)
+        .filter(|index| bytes.len() >= (index + 1) * SLOT_LEN)
+        .map(|index| (index, &bytes[index * SLOT_LEN..(index + 1) * SLOT_LEN]))
+        .collect()
+}
+
+/// No two valid slots share an epoch; no slot is from a newer build.
+/// Returns the live slot's container version.
+fn check_slots(bytes: &[u8]) -> Result<Option<u32>, String> {
+    let mut valid: Vec<(Superblock, &[u8])> = Vec::new();
+    for (index, buf) in slots(bytes) {
+        match parse_superblock(buf) {
+            SlotRead::Valid(sb) => valid.push((sb, buf)),
+            SlotRead::Invalid => {}
+            SlotRead::Newer { version, .. } => {
+                return Err(format!(
+                    "slot {index} reads as from a newer build (v{version})"
+                ));
+            }
+        }
+    }
+    if let [(a, _), (b, _)] = valid.as_slice()
+        && a.epoch == b.epoch
+    {
+        return Err(format!("both slots hold epoch {}", a.epoch));
+    }
+    Ok(valid
+        .iter()
+        .max_by_key(|(sb, _)| sb.epoch)
+        .and_then(|(_, buf)| layout::slot_version(buf)))
+}
+
+/// A cut during first-use init, before `open` returned. The file may be:
+/// empty; re-initialisable (every header byte present is zero and the rest
+/// is a prefix of the first snapshot: `ensure_superblock` re-runs
+/// `init_empty`); or initialised (slot 0 valid at epoch 1 and slot 1 not).
+fn check_init_cut(bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.is_empty() {
+        return Ok("empty");
+    }
+    let header = bytes.len().min(HEADER_BYTES as usize);
+    let blob = init_blob();
+    let tail = bytes.get(HEADER_BYTES as usize..).unwrap_or(&[]);
+    if bytes[..header].iter().all(|byte| *byte == 0) && blob.starts_with(tail) {
+        return Ok("re-initialisable");
+    }
+    let slot = |index: usize| {
+        bytes
+            .get(index * SLOT_LEN..(index + 1) * SLOT_LEN)
+            .map(parse_superblock)
+    };
+    if let Some(SlotRead::Valid(sb)) = slot(0)
+        && sb.epoch == 1
+        && !matches!(slot(1), Some(SlotRead::Valid(_)))
+        && tail.starts_with(&blob)
+    {
+        return Ok("initialised");
+    }
+    Err(format!(
+        "a cut during first-use init left a {}-byte file that is not empty, \
+         re-initialisable, or initialised",
+        bytes.len()
+    ))
+}
+
+/// Every check of spec §3.5 on one survivor image.
+fn check_recovery(
+    scenario: &Scenario,
+    reference: &Reference,
+    acked: usize,
+    started: usize,
+    image: &Image,
+) -> Result<(), String> {
+    let path = Path::new(STORE);
+    let first_use = scenario.new_file() && acked == 0;
+    match image.file(path) {
+        None if first_use => {}
+        None => return Err("the store file is gone after `open` was acknowledged".into()),
+        Some(bytes) => {
+            check_slots(bytes)?;
+            if first_use {
+                check_init_cut(bytes)?;
+            }
+        }
+    }
+    let fs = SimFs::new(image, None);
+    let store = FerroStore::open_with(&fs, path).map_err(|err| format!("reopen failed: {err}"))?;
+    let version = store
+        .format_version()
+        .map_err(|err| format!("format_version failed: {err}"))?;
+    if version.is_none() {
+        return Err("format_version is None".into());
+    }
+    crate::check_format(version).map_err(|err| format!("format_version {version:?}: {err}"))?;
+    let state = Logical::read(&store)?;
+    let floor = &reference.states[acked];
+    if state.last_seq < floor.last_seq {
+        return Err(format!(
+            "last_seq {} is below the acknowledged {}",
+            state.last_seq, floor.last_seq
+        ));
+    }
+    let Some(matched) = (acked..=started).find(|k| reference.states[*k] == state) else {
+        return Err(format!(
+            "the recovered state is no prefix from {acked} acknowledged to {started} started \
+             operations (a lost acknowledged commit, or a partly applied one)\n      \
+             recovered:    {}\n      acknowledged: {}",
+            state.summary(),
+            floor.summary()
+        ));
+    };
+    let live = fs.live_image();
+    let bytes = live.file(path).ok_or("no store file after reopen")?;
+    let live_version = check_slots(bytes)?;
+    if state.last_seq > reference.states[0].last_seq && live_version != Some(FORMAT_V2) {
+        return Err(format!(
+            "state past the start is published in a v{live_version:?} slot, not v{FORMAT_V2}"
+        ));
+    }
+    // The recovered store takes a commit, and it reads back after a reopen.
+    store
+        .put_doc("probe", "after-crash", &json!(matched))
+        .map_err(|err| format!("a commit after recovery failed: {err}"))?;
+    drop(store);
+    let again =
+        FerroStore::open_with(&fs, path).map_err(|err| format!("reopen after probe: {err}"))?;
+    let after = Logical::read(&again)?;
+    let mut want = state;
+    want.last_seq += 1;
+    want.docs.insert(
+        ("probe".to_string(), "after-crash".to_string()),
+        json!(matched),
+    );
+    if after != want {
+        return Err(format!(
+            "the commit after recovery did not land cleanly\n      got:  {}\n      want: {}",
+            after.summary(),
+            want.summary()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct Report {
+    cuts: usize,
+    cases: usize,
+    /// Cases with at least one torn write.
+    torn_cases: usize,
+    /// The most ops pending at one cut.
+    max_pending: usize,
+    sampled_cuts: usize,
+    failures: Vec<String>,
+    failed_cases: usize,
+}
+
+fn run_scenario(scenario: &Scenario) -> Report {
+    let reference = reference(scenario);
+    let total = reference.trace.len();
+    let path = PathBuf::from(STORE);
+    let mut report = Report::default();
+    for cut in 0..=total {
+        let fs = SimFs::new(&scenario.initial, Some(cut));
+        let ctx = Ctx::new(None);
+        let result = run_workload(scenario, &fs, &path, &ctx);
+        let trace = fs.trace();
+        assert_eq!(
+            trace[..],
+            reference.trace[..cut],
+            "{}: the workload is not deterministic up to cut {cut}",
+            scenario.name
+        );
+        if cut == total {
+            assert!(
+                result.is_ok(),
+                "{}: the full budget run failed",
+                scenario.name
+            );
+        } else {
+            assert!(
+                result.is_err() && fs.is_cut(),
+                "{}: the workload ran past the cut at {cut}: {result:?}",
+                scenario.name
+            );
+        }
+        let (acked, started) = (ctx.acked(), ctx.started());
+        let pending = fs.pending();
+        let seed = SEED ^ (cut as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let (fates, sampled) = fate_vectors(&pending, FATE_CAP, seed);
+        report.cuts += 1;
+        report.sampled_cuts += usize::from(sampled);
+        report.max_pending = report.max_pending.max(pending.len());
+        for fate in &fates {
+            report.cases += 1;
+            report.torn_cases += usize::from(fate.iter().any(|fate| *fate >= 2));
+            let image = fs.survivor(&pending, fate);
+            if let Err(why) = check_recovery(scenario, &reference, acked, started, &image) {
+                report.failed_cases += 1;
+                if report.failures.len() < 6 {
+                    report.failures.push(describe_failure(
+                        scenario, &reference, cut, acked, &pending, fate, sampled, seed, &why,
+                    ));
+                }
+            }
+        }
+    }
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
+fn describe_failure(
+    scenario: &Scenario,
+    reference: &Reference,
+    cut: usize,
+    acked: usize,
+    pending: &[super::crash_sim::Pending],
+    fate: &[usize],
+    sampled: bool,
+    seed: u64,
+    why: &str,
+) -> String {
+    let done = cut
+        .checked_sub(1)
+        .map(|last| format!("#{last} {}", reference.trace[last]))
+        .unwrap_or_else(|| "nothing".into());
+    let refused = reference
+        .trace
+        .get(cut)
+        .map(|op| format!("#{cut} {op}"))
+        .unwrap_or_else(|| "nothing (the workload finished)".into());
+    let acked_label = acked
+        .checked_sub(1)
+        .and_then(|last| reference.labels.get(last))
+        .map_or("nothing", String::as_str);
+    let in_flight = reference
+        .labels
+        .get(acked)
+        .map_or("nothing", String::as_str);
+    let fates: Vec<String> = pending
+        .iter()
+        .zip(fate)
+        .map(|(item, fate)| item.describe(*fate))
+        .collect();
+    let sample = if sampled {
+        format!(" (sampled, seed {seed:#x})")
+    } else {
+        String::new()
+    };
+    format!(
+        "[{}] power cut after {done}; refused {refused}\n    \
+         acknowledged through `{acked_label}`, in flight `{in_flight}`\n    \
+         unsynced ops{sample}: [{}]\n    FAILED: {why}",
+        scenario.name,
+        fates.join("; ")
+    )
+}
+
+fn assert_clean(scenario: &Scenario, report: &Report, elapsed: Duration) {
+    println!(
+        "crash harness [{}]: {} cut points, {} cases ({} with a torn write; at most {} ops \
+         pending at a cut; {} cuts sampled), {:.2?}",
+        scenario.name,
+        report.cuts,
+        report.cases,
+        report.torn_cases,
+        report.max_pending,
+        report.sampled_cuts,
+        elapsed
+    );
+    assert!(
+        report.failures.is_empty(),
+        "crash harness [{}]: {} of {} cases failed. First failures:\n\n{}\n",
+        scenario.name,
+        report.failed_cases,
+        report.cases,
+        report.failures.join("\n\n")
+    );
+    assert!(
+        elapsed < TIME_BUDGET,
+        "crash harness [{}] took {elapsed:.2?}, over the {TIME_BUDGET:?} budget of spec §3.5",
+        scenario.name
+    );
+}
+
+/// Guards against a vacuous pass: if writes became durable at once, every cut
+/// would yield one all-kept case and the harness would prove nothing.
+fn assert_floors(report: &Report, min_cuts: usize) {
+    assert!(
+        report.cuts > min_cuts,
+        "the workload is too small: {} cuts, need more than {min_cuts}: {report:?}",
+        report.cuts
+    );
+    assert!(
+        report.cases > report.cuts,
+        "cuts are not forking into several cases: {} cases for {} cuts: {report:?}",
+        report.cases,
+        report.cuts
+    );
+    assert!(
+        report.torn_cases > 0,
+        "no case had a torn write: {} torn of {} cases: {report:?}",
+        report.torn_cases,
+        report.cases
+    );
+    assert!(
+        report.max_pending >= 1,
+        "no cut had an unsynced op: max pending {}: {report:?}",
+        report.max_pending
+    );
+}
+
+#[test]
+fn every_cut_of_the_new_store_workload_recovers_to_an_acknowledged_prefix() {
+    let start = Instant::now();
+    let scenario = Scenario {
+        name: "new store",
+        initial: Image::default(),
+        steps: WORKLOAD,
+    };
+    let report = run_scenario(&scenario);
+    assert_floors(&report, 100);
+    assert_clean(&scenario, &report, start.elapsed());
+}
+
+#[test]
+fn every_cut_of_a_v1_file_upgrade_recovers_to_an_acknowledged_prefix() {
+    let start = Instant::now();
+    let scenario = Scenario {
+        name: "v1 upgrade",
+        initial: v1_image(),
+        steps: V1_WORKLOAD,
+    };
+    let report = run_scenario(&scenario);
+    assert_floors(&report, 40);
+    assert_clean(&scenario, &report, start.elapsed());
+}
+
+/// The scripted workload also runs on a real file through [`RealFs`], so the
+/// harness never drifts from what production does.
+#[test]
+fn the_workload_runs_on_a_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.fls");
+    let scenario = Scenario {
+        name: "real file",
+        initial: Image::default(),
+        steps: WORKLOAD,
+    };
+    let ctx = Ctx::new(None);
+    run_workload(&scenario, &RealFs, &path, &ctx).unwrap();
+    let store = FerroStore::open(&path).unwrap();
+    let real = Logical::read(&store).unwrap();
+    let simulated = reference(&scenario);
+    assert_eq!(&real, simulated.states.last().unwrap());
+}
