@@ -1,0 +1,11 @@
+$ fl store status
+exit: 0
+--- stdout
+engine:         ferro
+logical path:   <DIR>/stores/fl.redb
+physical path:  <DIR>/stores/fl.fls
+exists:         yes
+size:           11 bytes
+live/dead:      - (could not read them: backend failure: no valid FerroStore superblock)
+format version: n/a (not available on ferro yet)
+--- stderr
