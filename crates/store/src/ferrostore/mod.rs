@@ -3602,6 +3602,15 @@ fn latest_superblock(file: &dyn ContainerIo) -> Result<(usize, Superblock), Stor
     parsed_superblock(file)?.ok_or_else(|| backend("no valid FerroStore superblock"))
 }
 
+/// Bytes in the live WAL of the store file at `path`, from its newest
+/// superblock: `0` right after a checkpoint. For tests in other modules that
+/// must tell a folded log from an unfolded one.
+#[cfg(test)]
+pub(crate) fn wal_length_on_disk(path: &Path) -> u64 {
+    let file = RealFs.open_ro(path).unwrap();
+    latest_superblock(&*file).unwrap().1.wal_length
+}
+
 fn write_slot(file: &dyn ContainerIo, index: usize, sb: &Superblock) -> Result<(), StoreError> {
     if index > 1 {
         return Err(backend("superblock slot out of range"));

@@ -192,9 +192,12 @@ pub(crate) fn open_store_sink(
         }
         BackendKind::Ferro => open_ferro(path, &physical, options, sink)?,
     };
+    // The file of a disk FerroStore, as a path and not as the lossy label.
+    let file = matches!(backend_store, Backend::Ferro(_)).then_some(physical);
     Ok(AnyStore {
         backend: backend_store,
         label,
+        file,
     })
 }
 
@@ -795,6 +798,9 @@ pub fn ferro_stats_at(path: &Path) -> Result<AnyStats, StoreError> {
 pub struct AnyStore {
     backend: Backend,
     label: String,
+    /// The real path of a FerroStore opened from a file, kept as a `Path`
+    /// because [`label`](Self::label) is lossy for a name that is not UTF-8.
+    file: Option<PathBuf>,
 }
 
 impl From<RedbStore> for AnyStore {
@@ -803,6 +809,7 @@ impl From<RedbStore> for AnyStore {
         Self {
             backend: Backend::Redb(store),
             label,
+            file: None,
         }
     }
 }
@@ -813,6 +820,7 @@ impl From<FerroStore> for AnyStore {
         Self {
             backend: Backend::Ferro(Box::new(store)),
             label,
+            file: None,
         }
     }
 }
@@ -833,6 +841,13 @@ impl AnyStore {
     /// The store's name in messages: the file it was opened from.
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The file a FerroStore was opened from, as the path it was opened with.
+    /// `None` for a redb store and for a FerroStore with no file of its own
+    /// (in memory, or converted with `From<FerroStore>`).
+    pub fn ferro_file(&self) -> Option<&Path> {
+        self.file.as_deref()
     }
 
     pub fn as_redb(&self) -> Option<&RedbStore> {
