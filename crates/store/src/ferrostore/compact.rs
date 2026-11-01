@@ -28,7 +28,12 @@
 //! writer that opened the new file after the rename cannot commit into it
 //! before its name is durable: a crash before the directory sync can still
 //! bring the old name back, and a commit already acknowledged in the new
-//! file would then be lost.
+//! file would then be lost. A failed directory sync poisons this handle and
+//! releases that lock with the name still not durable; every other handle
+//! then reaches the new file through a description that is not
+//! `name_durable`, and syncs the directory itself before its first write
+//! there ([`Disk::lock_current`]). So no handle ever commits into a file
+//! whose name it has not itself made durable.
 
 use super::layout::{HEADER_BYTES, Superblock, backend};
 use super::{
@@ -270,7 +275,8 @@ fn write_sibling(disk: &Disk, base: &DiskCache) -> Result<Sibling, StoreError> {
 /// and move this handle to the new file. The caller still holds the old
 /// file's lock. A failed rename removes the sibling. A failed directory
 /// sync poisons the handle: the rename stands in the running system, and
-/// its name may not be durable.
+/// its name may not be durable. The next writer of any other handle syncs
+/// the directory before it writes ([`Disk::lock_current`]).
 fn publish_sibling(
     disk: &Disk,
     write: &mut Descriptor,
@@ -305,9 +311,16 @@ fn publish_sibling(
         state: Arc::clone(&base.state),
         wal_applied: 0,
     };
-    *write = new_write;
+    // This handle made the new name durable: its writes need no other sync.
+    *write = Descriptor {
+        name_durable: true,
+        ..new_write
+    };
     *lock_mutex(&disk.read) = new_read;
-    install_newer(&mut lock_mutex(&disk.cache), Arc::new(entry));
+    // The path names the new file, and no writer moves it while the old
+    // file's lock is held.
+    let current = entry.file_id;
+    install_newer(&mut lock_mutex(&disk.cache), Arc::new(entry), current);
     drop(flock);
     Ok(())
 }

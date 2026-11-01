@@ -271,7 +271,7 @@ A remote CAS retry is bounded to 8 attempts, with jittered exponential backoff f
 
 **The compactor's steps.** It first sweeps this store's stale `.compact-` temps (24 hours, the migration's rule). While it holds the write mutex and `flock` on the **current** inode, the compactor:
 1. Refreshes.
-2. Creates `<name>.fls.compact-<pid>-<n>-<nonce>` with `O_EXCL`, mode 0600, and takes that file's own `flock`. A store path that is a symlink is refused.
+2. Creates `<name>.fls.compact-<pid>-<n>-<nonce>` with `O_EXCL`, mode 0600, and takes that file's own `flock`. `<name>` is the store's real path: `open` resolves the given path once, and every name operation uses it, so a store opened through a symlink compacts beside its file and the link still names it.
 3. Writes a v2 header (slot 0 only), a snapshot of the current state and an empty WAL. The epoch is the old file's current epoch + 1; `last_seq` is kept.
 4. Calls `fsync` (`sync_all`) on that file.
 5. Renames it over `<name>.fls`.
@@ -279,7 +279,9 @@ A remote CAS retry is bounded to 8 attempts, with jittered exponential backoff f
 7. Installs the state in its own cache and moves its own descriptors to the new file.
 8. Only then releases the new file's lock and the old inode's lock.
 
-A failure before the rename removes the temp and leaves the old file untouched. The new file's own lock keeps any writer from committing into it before its name is durable.
+A failure before the rename removes the temp and leaves the old file untouched. The new file's own lock keeps any writer from committing into it before the compactor's directory sync. A failed directory sync poisons the compactor and releases that lock with the name not durable.
+
+**A handle never commits into a file whose name it has not itself made durable.** Each write descriptor carries `name_durable`: true when this handle created the file at open, or compacted into it, and its directory sync succeeded; false when `open` found the file already there, or a swap check reopened the path. Before the first commit, checkpoint or compaction through a descriptor whose `name_durable` is false, under the `flock` and after the swap check has validated the identity, the writer calls `fsync` on the directory and sets it true. A failure refuses the write before any byte is written and poisons the handle: after a failed `fsync` a later one can report success without the entry on disk, so a retry is not trusted. Reads never sync the directory.
 
 **Swap detection is mandatory on every path.**
 - After a writer takes `flock` on its descriptor, it compares `stat(path)` `(dev, ino)` with `fstat(fd)`.
@@ -289,13 +291,16 @@ A failure before the rename removes the temp and leaves the old file untouched. 
 
 **Readers.** A reader already reading the old inode finishes on it. The old inode stays valid until its last descriptor closes. Descriptors are `Arc`s swapped under short mutexes, so reads stay lock-free.
 
-**Epochs across inodes.** The old inode is never published after the rename, and the new one starts one epoch past it, so the epoch orders states along the path's history. The cache keeps the higher epoch whatever inode it came from: an install from the old inode never replaces a state of the new one, and reads stay monotonic across the swap.
+**Epochs across inodes.** The old inode is never published after the rename, and the new one starts one epoch past it, so the epoch orders states along the path's history. The cache orders two states of one inode by epoch. Between two inodes, the one the path names (as the last swap check found it) wins whatever the epochs, so a file put in place at a lower epoch (a restore by rename) is read at once, and an install from an inode the path no longer names never replaces a state of the current one. Reads stay monotonic along the path's history across the swap.
 
 **Tests.**
 - Compaction runs while another process (the test binary re-run as a child writer) keeps writing. Every acknowledged write is present afterwards.
 - A writer blocked on the old inode's lock during the rename lands its write in the new file.
 - A reader part way through a tail read of the old inode finishes on it, then moves to the new inode and never goes back.
 - The crash harness covers each step of the compaction, and checks that exactly one file is the store after recovery.
+- After a compactor's failed directory sync, another handle syncs the directory before its first write into the new file (or, when that sync fails too, refuses the write), and a crash then loses no acknowledged commit.
+- A file renamed in at a lower epoch is read at the next refresh; a slow read of the old inode never replaces its state.
+- A store opened through a symlink compacts, and the link still names the store.
 
 ---
 

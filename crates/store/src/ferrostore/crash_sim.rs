@@ -605,6 +605,12 @@ impl ContainerFs for SimFs {
         Ok((SIM_DEV, self.inode_of(path)? as u64))
     }
 
+    /// The simulated disk has no symlinks: every path is its own real path.
+    /// No operation: resolving a name is not a cut point.
+    fn resolve(&self, path: &Path) -> Result<PathBuf, StoreError> {
+        Ok(path.to_path_buf())
+    }
+
     fn temp_path(&self, target: &Path, mark: &str) -> Result<PathBuf, StoreError> {
         let name = target
             .file_name()

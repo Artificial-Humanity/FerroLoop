@@ -119,6 +119,14 @@ struct Descriptor {
     file: Arc<dyn ContainerIo>,
     /// `(dev, ino)` of `file`, read once (`fstat`) when it was opened.
     id: FileId,
+    /// The write description only: this handle made the directory entry
+    /// that names `file` durable (spec §5). `false` for a description opened
+    /// on a file that already existed (`open`, or a reopen after a swap):
+    /// another handle may have renamed it into place and failed its
+    /// directory sync, so after a crash the path could name the file before
+    /// it again. [`Disk::lock_current`] syncs the directory before the first
+    /// write through such a description. A read description never needs it.
+    name_durable: bool,
 }
 
 impl Descriptor {
@@ -127,7 +135,11 @@ impl Descriptor {
         let id = file
             .file_id()
             .map_err(|err| backend(format!("fstat {}: {err}", path.display())))?;
-        Ok(Self { file, id })
+        Ok(Self {
+            file,
+            id,
+            name_durable: false,
+        })
     }
 }
 
@@ -427,11 +439,13 @@ impl Disk {
     ///
     /// Before the slots are read, the read description is checked against
     /// the path ([`Self::current_read`], spec §5): after a compaction the
-    /// path names a new file, and the read moves to it. The epoch orders
-    /// states across that swap too: the new file starts at the old file's
-    /// last epoch + 1, and the old file is never published again, so a
-    /// cached state of either file at a later epoch than the slots just read
-    /// is still the answer ([`install_newer`]).
+    /// path names a new file, and the read moves to it. A cached state of
+    /// the file just read at a later epoch is still the answer; a cached
+    /// state of another file is not, whatever its epoch: the file the path
+    /// names is read and replaces it, so a file put in place at a lower
+    /// epoch is seen at once ([`install_newer`]). A compaction's new file
+    /// starts at the old file's last epoch + 1, so across a compaction the
+    /// epoch rises too.
     fn refresh_read(&self) -> Result<Arc<DiskCache>, StoreError> {
         Ok(self.refresh_read_on()?.0)
     }
@@ -447,7 +461,11 @@ impl Disk {
         }
         let read = self.current_read()?;
         let (_, sb) = latest_superblock(&*read.file)?;
+        // A later epoch of the same file: the slot read fell back past a torn
+        // slot. A state of another file is no answer here: the path names
+        // the file just read ([`install_newer`]).
         if let Some(held) = &cached
+            && held.file_id == read.id
             && held.sb.epoch > sb.epoch
         {
             return Ok((Arc::clone(held), read));
@@ -508,10 +526,35 @@ impl Disk {
     /// The caller holds the write mutex, whose `write` this is. Once this
     /// returns, no compaction can swap the file until the lock is dropped:
     /// a compactor takes the same lock, on the same file, first.
+    ///
+    /// Every caller is a writer, so this is also where a handle makes the
+    /// name of the file it writes durable (spec §5): a handle never commits
+    /// into a file whose directory entry it has not itself made durable. A
+    /// compactor whose directory sync failed after its rename leaves the
+    /// path naming a file whose name a crash can still take back (to the
+    /// old, unlinked file, without every commit made into the new one). So
+    /// before the first write through a description that is not
+    /// [`Descriptor::name_durable`], under the lock and once the path is
+    /// known to name it, the directory is synced. A failure refuses the
+    /// write and poisons the handle, as every failed sync does ([`Poison`]):
+    /// after a failed `fsync` a later one can return success without the
+    /// entry having reached the disk, so no retry is trusted.
     fn lock_current(&self, write: &mut Descriptor) -> Result<HeldFlock, StoreError> {
         loop {
             let held = HeldFlock::acquire(write)?;
             if self.stat_path()? == write.id {
+                if !write.name_durable {
+                    self.fs.sync_dir(&parent_dir(&self.path)).map_err(|err| {
+                        self.poison.mark();
+                        backend(format!(
+                            "{} was not written: its directory entry could not be made \
+                                 durable before the first write through this handle, so a \
+                                 crash could lose the write: {err}",
+                            self.path.display()
+                        ))
+                    })?;
+                    write.name_durable = true;
+                }
                 return Ok(held);
             }
             drop(held);
@@ -520,7 +563,9 @@ impl Disk {
     }
 
     /// Open the path again for writes (into `write`) and reads (into the read
-    /// slot), after a compaction swapped the file under it.
+    /// slot), after a compaction swapped the file under it. The new write
+    /// description is not [`Descriptor::name_durable`]: another handle made
+    /// the name.
     fn reopen(&self, write: &mut Descriptor) -> Result<(), StoreError> {
         let open_err = |err: io::Error| backend(format!("open {}: {err}", self.path.display()));
         let rw = self.fs.open_rw(&self.path).map_err(open_err)?;
@@ -575,7 +620,12 @@ impl Disk {
         {
             return Ok(Arc::clone(held));
         }
-        install_newer(&mut slot, Arc::clone(&fresh));
+        // The file the path names, as the last swap check found it. Taken
+        // under the cache mutex (never the other way round), so the
+        // compaction that moved it has either installed its state already
+        // or installs after this one.
+        let current = lock_mutex(&self.read).id;
+        install_newer(&mut slot, Arc::clone(&fresh), current);
         Ok(fresh)
     }
 
@@ -729,7 +779,8 @@ impl Disk {
             wal_applied,
         });
         if !torn {
-            install_newer(&mut slot, Arc::clone(&entry));
+            // The writer checked under the `flock` that the path names it.
+            install_newer(&mut slot, Arc::clone(&entry), file_id);
         }
         entry
     }
@@ -762,29 +813,32 @@ impl Disk {
             state: Arc::clone(&base.state),
             wal_applied: 0,
         };
-        install_newer(&mut lock_mutex(&self.cache), Arc::new(entry));
+        let current = entry.file_id;
+        install_newer(&mut lock_mutex(&self.cache), Arc::new(entry), current);
     }
 }
 
-/// Put `fresh` in the cache unless the cache already holds a state at the
-/// same or a later epoch: a slow refresh never replaces a newer install.
+/// Put `fresh` in the cache when it is newer than what the cache holds.
+/// `current` is `(dev, ino)` of the file the path names, as this handle
+/// last found it (its read description, which every swap check moves).
 ///
-/// The epoch orders states across files too (spec §5). A compaction gives
-/// the new file the old file's current epoch + 1, under the old file's lock,
-/// and the old file is never published again (every writer checks the path
-/// under the lock), so along one path's history the epoch only rises. An
-/// install from the old file, which a slow read of it can still make, is
-/// older than any state of the new file and never replaces it. On a tie
-/// between two files, which no compaction makes (only a file put in place
-/// by other means), the one just read wins: it was read through the
-/// description the path named last.
-fn install_newer(slot: &mut Option<Arc<DiskCache>>, fresh: Arc<DiskCache>) {
+/// - The same file: the later epoch wins, so a slow refresh never replaces
+///   a newer install.
+/// - Another file: the file the path names wins, whatever the epochs. A
+///   state of the current file replaces a state of any other file, so a
+///   file put in place at a *lower* epoch (a restore by rename, a file
+///   replaced by hand) is read as soon as a refresh finds it. A state of a
+///   file the path no longer names (a slow read through a description
+///   cloned before the swap) never replaces a state of the current one.
+///   When neither is the current file, the later epoch wins: along a
+///   compacted path's history the epoch only rises (spec §5).
+fn install_newer(slot: &mut Option<Arc<DiskCache>>, fresh: Arc<DiskCache>, current: FileId) {
     let replace = match slot.as_ref() {
         None => true,
-        Some(held) => {
-            fresh.sb.epoch > held.sb.epoch
-                || (fresh.sb.epoch == held.sb.epoch && fresh.file_id != held.file_id)
-        }
+        Some(held) if held.file_id == fresh.file_id => fresh.sb.epoch > held.sb.epoch,
+        Some(_) if fresh.file_id == current => true,
+        Some(held) if held.file_id == current => false,
+        Some(held) => fresh.sb.epoch > held.sb.epoch,
     };
     if replace {
         *slot = Some(fresh);
@@ -1080,20 +1134,32 @@ impl FerroStore {
 
     /// [`Self::open`] through `fs`. Production passes [`RealFs`]; the crash
     /// harness passes its simulated disk.
-    fn open_with(fs: &dyn ContainerFs, path: &Path) -> Result<Self, StoreError> {
-        let created = fs.create_store_file(path)?;
+    ///
+    /// `path` is resolved once, after the file exists ([`ContainerFs::resolve`]):
+    /// every later operation on a name (the swap check, a compaction's
+    /// sibling, its rename and directory sync, the sweep of stale temps) is
+    /// made on the file's real path, in its own directory, so a store opened
+    /// through a symlink compacts in place and the link goes on naming it.
+    /// The handle's label stays `path` as given.
+    fn open_with(fs: &dyn ContainerFs, given: &Path) -> Result<Self, StoreError> {
+        let created = fs.create_store_file(given)?;
+        let resolved = fs.resolve(given)?;
+        let path = resolved.as_path();
         let write = fs
             .open_rw(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, path))?;
-        let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, path))?;
-        let write = Descriptor::new(write, path)?;
-        let seed = load_full(&*write.file, write.id, sb).map_err(|err| name_store(err, path))?;
+        let initialized = ensure_superblock(&*write).map_err(|err| name_store(err, given))?;
+        let (_, sb) = latest_superblock(&*write).map_err(|err| name_store(err, given))?;
+        let mut write = Descriptor::new(write, path)?;
+        let seed = load_full(&*write.file, write.id, sb).map_err(|err| name_store(err, given))?;
         let state = &seed.state;
         // Also when an earlier open created the file and stopped before its
         // first superblock: the entry is only durable once the directory is.
+        // Any other open did not make the name, so its first write syncs the
+        // directory ([`Disk::lock_current`]).
         if created || initialized {
             fs.sync_dir(&parent_dir(path))?;
+            write.name_durable = true;
         }
         if let Some(found) =
             doc::schema_version_in(|collection, id| state.docs.get(collection, id).cloned())?
@@ -1108,12 +1174,12 @@ impl FerroStore {
         Ok(Self::assemble(
             Inner::Disk(Box::new(Disk {
                 fs: fs.shared(),
-                path: path.to_path_buf(),
+                path: resolved.clone(),
                 write: Mutex::new(write),
                 read: Mutex::new(read),
                 cache: Mutex::new(Some(Arc::new(seed))),
                 group: group::Group::default(),
-                poison: Poison::new(path),
+                poison: Poison::new(given),
                 checkpoint_failed_at: AtomicU64::new(0),
                 compact_failed_at: AtomicU64::new(0),
                 #[cfg(test)]
@@ -1121,7 +1187,7 @@ impl FerroStore {
                 #[cfg(test)]
                 auto_compact_floor: std::sync::atomic::AtomicU64::new(AUTO_COMPACT_BYTES),
             })),
-            path.display().to_string(),
+            given.display().to_string(),
         ))
     }
 

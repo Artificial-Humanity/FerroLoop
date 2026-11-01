@@ -7,7 +7,8 @@
 //! keeps writing while the parent compacts, on a real file.
 
 use super::compact::{AUTO_COMPACT_BYTES, auto_compact_warnings};
-use super::crash_sim::{IoOp, SIM_DEV, SimFs};
+use super::container_io::ContainerFs;
+use super::crash_sim::{IoOp, SIM_DEV, SimFs, fate_vectors};
 use super::layout::{HEADER_BYTES, SLOT_LEN};
 use super::state::DocState;
 use super::{FerroStore, FerroStoreServer, Inner, lock_mutex};
@@ -462,6 +463,94 @@ fn a_slow_read_of_the_old_inode_never_replaces_the_compacted_cache_of_its_own_ha
     );
 }
 
+const RESTORE: &str = "/sim/restore.fls";
+
+/// A second store beside `STORE`, at a much lower epoch than a store
+/// [`with_dead_extents`] wrote: one commit, `restored/r`.
+fn lower_epoch_store(fs: &SimFs) -> u64 {
+    let restore = FerroStore::open_with(fs, Path::new(RESTORE)).unwrap();
+    restore.put_doc("restored", "r", &json!(1)).unwrap();
+    restore.stats().unwrap().epoch
+}
+
+#[test]
+fn a_file_renamed_in_at_a_lower_epoch_is_read_at_once_and_written_without_full_loads() {
+    let fs = SimFs::default();
+    let store = open(&fs);
+    with_dead_extents(&store, 2);
+    let high = store.stats().unwrap().epoch;
+    let low = lower_epoch_store(&fs);
+    assert!(low < high, "{low} < {high}");
+    // A restore by rename: not a compaction, and at a lower epoch.
+    ContainerFs::rename(&fs, Path::new(RESTORE), Path::new(STORE)).unwrap();
+    let restored = store_ino(&fs);
+    assert_eq!(
+        store.get_doc("restored", "r").unwrap(),
+        Some(json!(1)),
+        "the next read still served the cache of the file the path no longer names"
+    );
+    assert_eq!(store.get_doc("docs", "in-the-wal").unwrap(), None);
+    assert_eq!(store.stats().unwrap().epoch, low);
+    assert_eq!(cached_identity(&store), (SIM_DEV, restored as u64));
+    // Writes land on it, and after the first one each only reads the slots:
+    // the cache holds the new file's state, so no write loads it in full.
+    store.put_doc("restored", "w0", &json!(0)).unwrap();
+    for i in 1..4 {
+        let mark = fs.trace().len();
+        store
+            .put_doc("restored", &format!("w{i}"), &json!(i))
+            .unwrap();
+        for op in &fs.trace()[mark..] {
+            if let IoOp::Read { ino, .. } = op {
+                assert!(is_slot_read(op), "write {i} loaded the file in full: {op}");
+                assert_eq!(*ino, restored);
+            }
+        }
+    }
+    assert_eq!(cached_identity(&store), (SIM_DEV, restored as u64));
+    assert_eq!(store.get_doc("restored", "w3").unwrap(), Some(json!(3)));
+    assert_eq!(open(&fs).get_doc("restored", "w3").unwrap(), Some(json!(3)));
+}
+
+#[test]
+fn a_slow_read_of_the_old_inode_never_replaces_a_lower_epoch_state_of_the_current_one() {
+    let fs = SimFs::default();
+    let store = Arc::new(open(&fs));
+    with_dead_extents(&store, 2);
+    // A frame this handle has not read yet, so its next read reads a tail
+    // of the old inode, at an epoch past every state of the new one.
+    let other = open(&fs);
+    other.put_doc("docs", "tail", &json!(1)).unwrap();
+    let low = lower_epoch_store(&fs);
+    let old = store_ino(&fs);
+    {
+        let (store, fs2) = (Arc::clone(&store), fs.clone());
+        fs.after_next_read(
+            move |op| matches!(op, IoOp::Read { ino, .. } if *ino == old) && !is_slot_read(op),
+            move || {
+                // The file is replaced while the slow read is in the old
+                // inode's tail, and this same handle reads the new file
+                // first, installing its state.
+                ContainerFs::rename(&fs2, Path::new(RESTORE), Path::new(STORE)).unwrap();
+                assert_eq!(store.get_doc("restored", "r").unwrap(), Some(json!(1)));
+            },
+        );
+    }
+    // The slow read's own answer is the old inode's tail, which it read.
+    assert_eq!(store.get_doc("docs", "tail").unwrap(), Some(json!(1)));
+    let new = store_ino(&fs);
+    assert_ne!(new, old);
+    assert_eq!(
+        cached_identity(&store),
+        (SIM_DEV, new as u64),
+        "the slow read of the old inode, at a higher epoch, replaced the state of the file \
+         the path names"
+    );
+    assert_eq!(store.stats().unwrap().epoch, low);
+    assert_eq!(store.get_doc("docs", "tail").unwrap(), None);
+    assert_eq!(store.get_doc("restored", "r").unwrap(), Some(json!(1)));
+}
+
 #[test]
 fn every_generation_of_the_path_has_a_strictly_newer_epoch() {
     let fs = SimFs::default();
@@ -704,21 +793,155 @@ fn a_failed_directory_sync_after_the_rename_poisons_the_handle() {
     with_dead_extents(&store, 2);
     let state = store.read_state().unwrap();
     let old = store_ino(&fs);
-    let renamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let renamed = Arc::clone(&renamed);
-        fs.fail_next(move |op| {
-            if matches!(op, IoOp::Rename { .. }) {
-                renamed.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            renamed.load(std::sync::atomic::Ordering::SeqCst) && matches!(op, IoOp::SyncDir { .. })
-        });
-    }
+    fail_the_directory_sync_after_the_next_rename(&fs);
     assert!(store.compact().is_err());
     assert_ne!(store_ino(&fs), old, "the rename stands");
     let refused = store.put_doc("c", "x", &json!(1)).unwrap_err();
     assert!(refused.to_string().contains("poisoned"), "{refused}");
     assert_eq!(view(&open(&fs).read_state().unwrap()), view(&state));
+}
+
+/// Fail the first directory sync after the next rename (a compaction's
+/// step 6), once.
+fn fail_the_directory_sync_after_the_next_rename(fs: &SimFs) {
+    let renamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    fs.fail_next(move |op| {
+        if matches!(op, IoOp::Rename { .. }) {
+            renamed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        renamed.load(std::sync::atomic::Ordering::SeqCst) && matches!(op, IoOp::SyncDir { .. })
+    });
+}
+
+fn is_store_dir_sync(op: &IoOp) -> bool {
+    matches!(op, IoOp::SyncDir { dir } if dir == Path::new("/sim"))
+}
+
+/// A compactor whose directory sync failed after its rename, and a handle
+/// opened on the old file before it. The rename stands, its name is not
+/// durable, and the compactor is poisoned.
+fn after_a_failed_compaction_directory_sync(fs: &SimFs) -> (FerroStore, FerroStore, usize) {
+    let compactor = open(fs);
+    with_dead_extents(&compactor, 2);
+    let before = open(fs);
+    assert!(before.get_doc("docs", "in-the-wal").unwrap().is_some());
+    let old = store_ino(fs);
+    fail_the_directory_sync_after_the_next_rename(fs);
+    assert!(compactor.compact().is_err());
+    assert_ne!(store_ino(fs), old, "the rename stands");
+    assert_eq!(
+        fs.durable_image().names[Path::new(STORE)],
+        old,
+        "the new name is not durable yet"
+    );
+    (compactor, before, old)
+}
+
+#[test]
+fn after_a_failed_compaction_directory_sync_each_handle_syncs_it_before_its_first_write() {
+    let fs = SimFs::default();
+    let (_compactor, before, _old) = after_a_failed_compaction_directory_sync(&fs);
+    let new = store_ino(&fs);
+    // Reads never sync the directory, the swap check's reopen included.
+    let reader = open(&fs);
+    let mark = fs.trace().len();
+    assert!(reader.get_doc("docs", "in-the-wal").unwrap().is_some());
+    assert!(before.get_doc("docs", "in-the-wal").unwrap().is_some());
+    assert!(
+        !fs.trace()[mark..].iter().any(is_store_dir_sync),
+        "a read synced the directory"
+    );
+    // One handle that moves to the new file through its swap check, one
+    // opened on it: neither made its name, so each syncs the directory
+    // before it writes, then never again.
+    let after = open(&fs);
+    let mut acked = Vec::new();
+    for (who, handle) in [("opened before", &before), ("opened after", &after)] {
+        let mark = fs.trace().len();
+        handle.put_doc("acked", who, &json!(who)).unwrap();
+        acked.push(who.to_string());
+        let ops = fs.trace()[mark..].to_vec();
+        let sync = ops.iter().position(is_store_dir_sync);
+        let write = ops.iter().position(|op| matches!(op, IoOp::Write { .. }));
+        let (Some(sync), Some(write)) = (sync, write) else {
+            panic!("the handle {who} wrote with no directory sync before it: {ops:?}");
+        };
+        assert!(
+            sync < write,
+            "the handle {who} wrote (op {write}) before it synced the directory (op {sync})"
+        );
+        // Under the lock, once the path was checked to name the file.
+        assert!(
+            matches!(&ops[sync - 1], IoOp::StatId { path } if path == Path::new(STORE)),
+            "{:?}",
+            &ops[..=sync]
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op, IoOp::Write { ino, .. } if *ino != new)),
+            "{ops:?}"
+        );
+        for again in 0..2 {
+            let mark = fs.trace().len();
+            let key = format!("{who} {again}");
+            handle.put_doc("acked", &key, &json!(again)).unwrap();
+            acked.push(key);
+            assert!(
+                !fs.trace()[mark..].iter().any(is_store_dir_sync),
+                "the handle {who} synced the directory again"
+            );
+        }
+    }
+    assert_eq!(fs.durable_image().names[Path::new(STORE)], new);
+    // A crash now, whatever is still pending: every acknowledged commit is
+    // in the file the path names afterwards.
+    let pending = fs.pending();
+    let (fates, _) = fate_vectors(&pending, 1 << 12, 0x5EED);
+    assert!(!fates.is_empty());
+    for fate in &fates {
+        let image = fs.survivor(&pending, fate);
+        let survivor = FerroStore::open_with(&SimFs::new(&image, None), Path::new(STORE))
+            .unwrap_or_else(|err| panic!("{err}: {pending:?} {fate:?}"));
+        for key in &acked {
+            assert!(
+                survivor.get_doc("acked", key).unwrap().is_some(),
+                "acknowledged commit {key} lost after a crash: {pending:?} {fate:?}"
+            );
+        }
+        assert!(survivor.get_doc("docs", "in-the-wal").unwrap().is_some());
+    }
+}
+
+#[test]
+fn a_failed_directory_sync_before_a_first_write_refuses_it_and_acknowledges_nothing() {
+    let fs = SimFs::default();
+    let (_compactor, before, _old) = after_a_failed_compaction_directory_sync(&fs);
+    fs.fail_next(is_store_dir_sync);
+    let mark = fs.trace().len();
+    let err = before.put_doc("acked", "refused", &json!(1)).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("its directory entry could not be made durable"),
+        "{err}"
+    );
+    assert!(
+        !fs.trace()[mark..]
+            .iter()
+            .any(|op| matches!(op, IoOp::Write { .. })),
+        "the refused write wrote: {:?}",
+        &fs.trace()[mark..]
+    );
+    // A failed sync poisons the handle: no retry is trusted.
+    let again = before.put_doc("acked", "retry", &json!(2)).unwrap_err();
+    assert!(again.to_string().contains("poisoned"), "{again}");
+    assert_eq!(before.get_doc("acked", "refused").unwrap(), None);
+    assert!(before.get_doc("docs", "in-the-wal").unwrap().is_some());
+    // Nothing was acknowledged, and a fresh handle writes once its own
+    // directory sync succeeds.
+    let fresh = open(&fs);
+    assert_eq!(fresh.get_doc("acked", "refused").unwrap(), None);
+    fresh.put_doc("acked", "fresh", &json!(3)).unwrap();
+    assert_eq!(fs.durable_image().names[Path::new(STORE)], store_ino(&fs));
 }
 
 #[test]
@@ -802,23 +1025,58 @@ fn a_compaction_sweeps_only_this_stores_stale_compaction_temps() {
 }
 
 #[test]
-fn a_store_opened_through_a_symlink_is_not_compacted() {
+fn a_store_opened_through_a_symlink_compacts_beside_its_file_and_the_link_still_names_it() {
+    use std::os::unix::fs::MetadataExt;
     let tmp = tempfile::tempdir().unwrap();
-    let real = tmp.path().join("real.fls");
-    let link = tmp.path().join("link.fls");
+    let real_dir = tmp.path().join("real");
+    let link_dir = tmp.path().join("links");
+    std::fs::create_dir(&real_dir).unwrap();
+    std::fs::create_dir(&link_dir).unwrap();
+    let real = real_dir.join("real.fls");
+    let link = link_dir.join("link.fls");
     drop(FerroStore::open(&real).unwrap());
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let store = FerroStore::open(&link).unwrap();
-    with_dead_extents(&store, 2);
-    let err = store.compact().unwrap_err();
-    assert!(err.to_string().contains("symlink"), "{err}");
-    assert!(
-        std::fs::symlink_metadata(&link)
+    store.set_auto_compact_floor(u64::MAX);
+    with_dead_extents(&store, 3);
+    let state = view(&store.read_state().unwrap());
+    let before = store.stats().unwrap();
+    let old_ino = std::fs::metadata(&real).unwrap().ino();
+    store.compact().unwrap();
+    let after = store.stats().unwrap();
+    assert_eq!(after.dead_bytes, 0, "{after:?}");
+    assert!(after.file_bytes < before.file_bytes);
+    // The link is still a link, to the real path, which names the new file.
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(meta.file_type().is_symlink());
+    assert_eq!(std::fs::read_link(&link).unwrap(), real);
+    let new_ino = std::fs::metadata(&real).unwrap().ino();
+    assert_ne!(new_ino, old_ino, "the real path names a new file");
+    assert_eq!(std::fs::metadata(&link).unwrap().ino(), new_ino);
+    // The sibling was made beside the file, and none is left in either
+    // directory.
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    store.put_doc("c", "still", &json!(1)).unwrap();
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&real_dir), ["real.fls"]);
+    assert_eq!(names(&link_dir), ["link.fls"]);
+    // The data is intact, through the handle, the link and the real path.
+    assert_eq!(view(&store.read_state().unwrap()), state);
+    store.put_doc("c", "after", &json!(1)).unwrap();
+    drop(store);
+    for path in [&link, &real] {
+        let again = FerroStore::open(path).unwrap();
+        assert_eq!(
+            again.get_doc("docs", "in-the-wal").unwrap(),
+            Some(json!("tail"))
+        );
+        assert_eq!(again.get_doc("c", "after").unwrap(), Some(json!(1)));
+    }
 }
 
 // ---- another process -----------------------------------------------------------
@@ -849,6 +1107,18 @@ fn child_writer(path: &Path, stop: &Path) {
     }
 }
 
+/// A child process that is killed and reaped when the guard is dropped, so
+/// a parent that panics leaves no child writing behind it. Killing one that
+/// already exited, or waiting on one already reaped, is an error ignored.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn compaction_while_another_process_writes_keeps_every_acknowledged_write() {
     if let (Some(path), Some(stop)) = (std::env::var_os(CHILD), std::env::var_os(CHILD_STOP)) {
@@ -862,7 +1132,7 @@ fn compaction_while_another_process_writes_keeps_every_acknowledged_write() {
     store.set_auto_compact_floor(u64::MAX);
     with_dead_extents(&store, 2);
     let exe = std::env::current_exe().unwrap();
-    let mut child = std::process::Command::new(exe)
+    let mut child = KillOnDrop(std::process::Command::new(exe)
         .args([
             "--exact",
             "ferrostore::tests_compact::compaction_while_another_process_writes_keeps_every_acknowledged_write",
@@ -874,8 +1144,8 @@ fn compaction_while_another_process_writes_keeps_every_acknowledged_write() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
+        .unwrap());
+    let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel::<String>();
     let reader = std::thread::spawn(move || {
         let mut lines = Vec::new();
@@ -914,10 +1184,10 @@ fn compaction_while_another_process_writes_keeps_every_acknowledged_write() {
         wait_for_more_acks(&mut acks, 3);
     }
     std::fs::write(&stop, b"stop").unwrap();
-    let status = child.wait().unwrap();
+    let status = child.0.wait().unwrap();
     let lines = reader.join().unwrap();
     let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
     assert!(
         status.success(),
         "child failed:\n{}\n{stderr}",

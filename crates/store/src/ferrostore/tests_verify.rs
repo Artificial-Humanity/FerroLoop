@@ -886,12 +886,12 @@ fn a_temp_file_replaced_before_the_link_is_not_published_or_removed() {
         Ok(())
     })
     .unwrap_err();
-    // The verify's own reads already refuse the swap: they check the path
-    // (spec §5) and find a file that is no store. The check before the link
-    // is the backstop for a swap after the last read.
+    // The verify's own reads refuse the swap first: they check the path
+    // (spec §5) and find a file that is no store. The identity check before
+    // the link has its own test, with an impostor the verify accepts
+    // (`a_temp_file_replaced_by_a_valid_copy_before_the_link_...`).
     assert!(
-        err.to_string().contains("no longer the file")
-            || err.to_string().contains("no valid FerroStore superblock"),
+        err.to_string().contains("no valid FerroStore superblock"),
         "{err}"
     );
     assert!(!fls.exists(), "nothing is published");
@@ -903,6 +903,44 @@ fn a_temp_file_replaced_before_the_link_is_not_published_or_removed() {
     assert_eq!(
         std::fs::read(tmp.path().join(&left[0])).unwrap(),
         b"unverified"
+    );
+    assert_eq!(mode(&redb_path), 0o600, "the redb stays writable");
+}
+
+#[test]
+fn a_temp_file_replaced_by_a_valid_copy_before_the_link_is_refused_by_the_identity_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    let dir = tmp.path().to_path_buf();
+    let err = verify::migrate_verified_with(&redb_path, &fls, |_| {
+        let temp = entries(&dir)
+            .into_iter()
+            .find(|name| name.contains(".migrating-"))
+            .expect("the temp file exists during the copy");
+        // A byte copy of the migrated temp: a valid store holding exactly
+        // what was migrated, so the verify passes, and only the identity
+        // check can tell that it is not the file this call created.
+        let impostor = dir.join("impostor");
+        std::fs::copy(dir.join(&temp), &impostor).unwrap();
+        std::fs::rename(&impostor, dir.join(temp)).unwrap();
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("is no longer the file this migration verified (before the link)"),
+        "{err}"
+    );
+    assert!(!fls.exists(), "nothing is published");
+    let left: Vec<String> = entries(tmp.path())
+        .into_iter()
+        .filter(|name| name.contains(".migrating-"))
+        .collect();
+    assert_eq!(left.len(), 1, "the file this call did not create is left");
+    assert!(
+        FerroStore::open(tmp.path().join(&left[0])).is_ok(),
+        "the copy is a valid store"
     );
     assert_eq!(mode(&redb_path), 0o600, "the redb stays writable");
 }

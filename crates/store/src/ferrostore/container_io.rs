@@ -135,9 +135,14 @@ pub(super) trait ContainerFs: Send + Sync {
     fn link(&self, from: &Path, to: &Path) -> io::Result<()>;
     /// `unlink(2)`.
     fn unlink(&self, path: &Path) -> io::Result<()>;
+    /// The real path of the existing file `path` names (`realpath`: every
+    /// symlink and `.`/`..` resolved). A store is opened through it, so a
+    /// compaction's sibling, rename and directory sync (spec §5) are made
+    /// beside the file itself, not beside a link to it.
+    fn resolve(&self, path: &Path) -> Result<PathBuf, StoreError>;
     /// A sibling name for `target` that no other call uses:
-    /// `<target><mark><pid>-<n>-<nonce>` (spec §5). Refuses a `target` that
-    /// is a symlink: a sibling of the link is not beside the file.
+    /// `<target><mark><pid>-<n>-<nonce>` (spec §5). `target` is a store's
+    /// resolved path ([`Self::resolve`]).
     fn temp_path(&self, target: &Path, mark: &str) -> Result<PathBuf, StoreError>;
     /// Remove the stale temps [`Self::temp_path`] made for `target` with
     /// `mark` that a crash left behind. Never an error: see
@@ -171,14 +176,12 @@ impl ContainerFs for RealFs {
         Ok((meta.dev(), meta.ino()))
     }
 
+    fn resolve(&self, path: &Path) -> Result<PathBuf, StoreError> {
+        std::fs::canonicalize(path)
+            .map_err(|err| super::layout::backend(format!("resolve {}: {err}", path.display())))
+    }
+
     fn temp_path(&self, target: &Path, mark: &str) -> Result<PathBuf, StoreError> {
-        if std::fs::symlink_metadata(target).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            return Err(super::layout::backend(format!(
-                "{} is a symlink: a compaction replaces the file at the path it is given, so \
-                 compact the store through its real path",
-                target.display()
-            )));
-        }
         super::verify::unique_temp_path(target, mark)
     }
 
