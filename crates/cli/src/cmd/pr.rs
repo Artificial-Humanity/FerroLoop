@@ -18,7 +18,7 @@ use fl_github::{
     list_pr_commits, list_pr_files, list_pr_reviews, merge_pr, request_pr_reviewers,
     submit_pr_review,
 };
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -247,7 +247,7 @@ fn emit_refusal(refusal: &PolicyRefusal, json_out: bool) -> Result<i32> {
 }
 
 fn send_wire_notification(
-    ws_store: &RedbStore,
+    ws_store: &AnyStore,
     sender_id: Option<AgentId>,
     sender_name: &str,
     recipient_name: &str,
@@ -279,7 +279,7 @@ fn send_wire_notification(
 pub fn run(
     _ctx: &Ctx<'_>,
     gh: &GithubTracker,
-    ws_store: &RedbStore,
+    ws_store: &AnyStore,
     binding: Option<&config::TrackerBinding>,
     github_app: Option<&config::GithubApp>,
     default_project: Option<&str>,

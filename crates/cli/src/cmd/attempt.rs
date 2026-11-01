@@ -55,7 +55,7 @@ impl Cmd {
     }
 }
 
-fn write_heartbeat(store: &fl_store::RedbStore, hb: &AttemptHeartbeat) {
+fn write_heartbeat(store: &fl_store::AnyStore, hb: &AttemptHeartbeat) {
     let Ok(val) = serde_json::to_value(hb) else {
         return;
     };

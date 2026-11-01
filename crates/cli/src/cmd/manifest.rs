@@ -9,7 +9,7 @@ use fl_core::model::{GateKind, Selector};
 use fl_core::store::{Bindings, Catalog};
 use fl_core::{Iri, Kind, Routes};
 use fl_exec::git::Git;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use fl_store::manifest::{Currency, MANIFEST_PATH, Manifest};
 use std::path::{Path, PathBuf};
 
@@ -88,7 +88,7 @@ fn manifest_of(root: &Path, project: &ProjectId, authoring: bool) -> Result<Mani
     read(root)
 }
 
-fn root_of(store: &RedbStore, project: &ProjectId) -> Result<PathBuf> {
+fn root_of(store: &AnyStore, project: &ProjectId) -> Result<PathBuf> {
     let Some(p) = store.get_project(project)? else {
         bail!("{project} is held by this store, but it is not a project");
     };
@@ -97,7 +97,7 @@ fn root_of(store: &RedbStore, project: &ProjectId) -> Result<PathBuf> {
 
 /// Spec §4.5: on an importing machine, the working tree's manifest must be
 /// the one this store imported. A project this store authors passes.
-pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<()> {
+pub fn ensure_import_current(store: &AnyStore, project: &ProjectId) -> Result<()> {
     // The check itself is shared with the hub, which refuses a gated move the same way.
     fl_store::manifest::ensure_import_current(store, project).map_err(|e| match e {
         fl_store::manifest::ImportCheckError::Store(e) => anyhow::Error::from(e),
@@ -110,7 +110,7 @@ pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<(
 /// manifest in the working tree must carry the store's map; with no
 /// manifest, no other machine can import the project, so there is no other
 /// rule to disagree with.
-pub fn ensure_routing_current(store: &RedbStore, project: &ProjectId) -> Result<()> {
+pub fn ensure_routing_current(store: &AnyStore, project: &ProjectId) -> Result<()> {
     let root = root_of(store, project)?;
     let path = root.join(MANIFEST_PATH);
     if let Some(recorded) = store.imported_hash(project)? {
@@ -146,7 +146,7 @@ pub fn ensure_routing_current(store: &RedbStore, project: &ProjectId) -> Result<
 /// reads it, the committed manifest must carry that gate as this store has
 /// it. `gate: None` checks every gate of the project.
 pub fn ensure_publishable(
-    store: &RedbStore,
+    store: &AnyStore,
     project: &ProjectId,
     gate: Option<&GateId>,
 ) -> Result<()> {
@@ -243,7 +243,7 @@ pub fn ensure_publishable(
 /// `held`, which this store records for the repository `node_id` — the one
 /// way every other machine learns the ledger's anchor.
 pub fn ensure_manifest_carries_root(
-    store: &RedbStore,
+    store: &AnyStore,
     project: &ProjectId,
     node_id: &str,
     held: &str,
@@ -281,7 +281,7 @@ pub fn ensure_manifest_carries_root(
 
 /// What an import did, for a person: the project, its gates and
 /// transitions, and each gate's handle in this store.
-fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport) -> Result<()> {
+fn print_import(store: &AnyStore, m: &Manifest, report: &fl_store::ImportReport) -> Result<()> {
     if let Some((old, new)) = &report.root_moved {
         println!("moved\tthe project's gates now run over {new}, not {old}");
     }
@@ -323,7 +323,7 @@ fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport
 /// commit: where the ledger was deleted it would create a second one and
 /// hide the deletion, and it would offer an existing ledger for
 /// confirmation as if no machine knew it.
-pub fn import_before_ledger_init(store: &RedbStore, root: &Path) -> Result<()> {
+pub fn import_before_ledger_init(store: &AnyStore, root: &Path) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("`{}` could not be resolved", root.display()))?;
@@ -377,7 +377,7 @@ impl Binding {
 /// tell which repository is this project's — the entry was not read, or it
 /// names a repository this store has no node for — it is refused rather
 /// than written without one.
-fn ledger_node(store: &RedbStore, binding: &Binding) -> Result<Option<String>> {
+fn ledger_node(store: &AnyStore, binding: &Binding) -> Result<Option<String>> {
     match binding {
         Binding::Github { repo, .. } => match store.bound_node_id(repo)? {
             Some(node) => Ok(Some(node)),
@@ -407,7 +407,7 @@ fn ledger_node(store: &RedbStore, binding: &Binding) -> Result<Option<String>> {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
+pub fn run(store: &AnyStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
     match cmd {
         Cmd::Export { project } => {
             let p = ProjectId(refs::resolve(
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn a_gate_of_another_project_is_refused_before_any_manifest_is_read() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let p1 = store.add_project("/one").unwrap();
         let p2 = store.add_project("/two").unwrap();
         let kind = GateKind::Command(CommandSpec {
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn ensure_manifest_carries_root_refuses_another_commit_for_the_same_node() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let root = tempfile::tempdir().unwrap();
         let p = store
             .add_project(&root.path().display().to_string())
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn ensure_manifest_carries_root_refuses_another_node_id() {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("s.redb")).unwrap();
         let root = tempfile::tempdir().unwrap();
         let p = store
             .add_project(&root.path().display().to_string())
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn init_imports_no_manifest_outside_a_git_working_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let author = RedbStore::open(&dir.path().join("author.redb")).unwrap();
+        let author = fl_store::open_redb(&dir.path().join("author.redb")).unwrap();
         let p = author.add_project("/one").unwrap();
         let m = author
             .export_manifest(&p, "0123456789abcdef0123456789abcdef01234567", 0, None)
@@ -612,7 +612,7 @@ mod tests {
         let path = plain.path().join(MANIFEST_PATH);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, m.to_json()).unwrap();
-        let other = RedbStore::open(&dir.path().join("other.redb")).unwrap();
+        let other = fl_store::open_redb(&dir.path().join("other.redb")).unwrap();
         let err = import_before_ledger_init(&other, plain.path()).unwrap_err();
         assert!(
             err.to_string().contains("is not a git working tree"),

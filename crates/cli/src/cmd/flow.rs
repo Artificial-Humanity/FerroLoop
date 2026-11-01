@@ -23,7 +23,7 @@ use fl_exec::workflow::{
     parse_workflow_file, record_step_handoff, reject_workflow_step, start_workflow_run,
     write_workflow_fact,
 };
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde_json::{Value, json};
 
 use crate::cmd::agent::write_atomic_non_symlink;
@@ -445,7 +445,7 @@ fn emit_exec_err(err: WorkflowExecError, json_out: bool) -> Result<i32> {
     Err(err.into())
 }
 
-fn pick_registry_store<'a>(ctx_store: &'a RedbStore, ws_store: &'a RedbStore) -> &'a RedbStore {
+fn pick_registry_store<'a>(ctx_store: &'a AnyStore, ws_store: &'a AnyStore) -> &'a AnyStore {
     if ws_store
         .list_agents(None, true)
         .map(|v| !v.is_empty())
@@ -533,7 +533,7 @@ fn print_runs_list(
 pub fn run(
     ctx: &Ctx<'_>,
     adapters: &BTreeMap<AdapterKind, AdapterConfig>,
-    ws_store: &RedbStore,
+    ws_store: &AnyStore,
     cwd: &Path,
     cmd: FlowCmd,
 ) -> Result<i32> {

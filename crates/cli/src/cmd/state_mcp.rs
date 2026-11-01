@@ -1,6 +1,6 @@
 //! Newline-delimited JSON-RPC 2.0 MCP server over `stdin`/`stdout` (spec §5.3).
 //!
-//! Opens and drops `RedbStore` inside each individual `tools/call` invocation so the
+//! Opens and drops `AnyStore` inside each individual `tools/call` invocation so the
 //! exclusive `redb` file lock is never held while waiting on `stdin`.
 
 use std::io::{BufRead, Write};
@@ -24,7 +24,7 @@ use fl_core::workflow::{
 use fl_exec::workflow::{
     list_workflow_facts, list_workflow_handoffs, record_step_handoff, write_workflow_fact,
 };
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -422,7 +422,7 @@ fn open_workflow_store(
     env: &StateEnv<'_>,
     project_filter: Option<&str>,
     run_id_hint: Option<&str>,
-) -> Result<RedbStore, String> {
+) -> Result<AnyStore, String> {
     if let Some(db) = env.explicit_db {
         if let Some(dir) = db.parent()
             && !dir.as_os_str().is_empty()
@@ -430,7 +430,7 @@ fn open_workflow_store(
             fl_store::private::create_private_dir_all(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        return RedbStore::open(db).map_err(|e| format!("{}: {e}", db.display()));
+        return fl_store::open_store(db).map_err(|e| format!("{}: {e}", db.display()));
     }
 
     let primary_path = if let Some(proj_slug) = project_filter
@@ -449,8 +449,8 @@ fn open_workflow_store(
         fl_store::private::create_private_dir_all(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let primary =
-        RedbStore::open(&primary_path).map_err(|e| format!("{}: {e}", primary_path.display()))?;
+    let primary = fl_store::open_store(&primary_path)
+        .map_err(|e| format!("{}: {e}", primary_path.display()))?;
 
     if let Some(raw_run) = run_id_hint
         && let Ok(Ref::Iri(iri)) = raw_run.parse::<Ref>()
@@ -459,17 +459,17 @@ fn open_workflow_store(
             return Ok(primary);
         }
         let ws_path = env.cfg.workspace_state_store(env.default_store);
-        if ws_path != primary_path && ws_path.exists() {
-            let other = RedbStore::open(&ws_path).map_err(|e| e.to_string())?;
+        if ws_path != primary_path && fl_store::store_exists(&ws_path) {
+            let other = fl_store::open_store(&ws_path).map_err(|e| e.to_string())?;
             if other.owns(&iri).map_err(|e| e.to_string())? {
                 return Ok(other);
             }
         }
         for entry in &env.cfg.projects {
-            if entry.store == primary_path || !entry.store.exists() {
+            if entry.store == primary_path || !fl_store::store_exists(&entry.store) {
                 continue;
             }
-            let other = RedbStore::open(&entry.store).map_err(|e| e.to_string())?;
+            let other = fl_store::open_store(&entry.store).map_err(|e| e.to_string())?;
             if other.owns(&iri).map_err(|e| e.to_string())? {
                 return Ok(other);
             }
@@ -479,7 +479,7 @@ fn open_workflow_store(
     Ok(primary)
 }
 
-fn resolve_workflow_run_in_store(store: &RedbStore, raw: &str) -> Result<WorkflowRun, String> {
+fn resolve_workflow_run_in_store(store: &AnyStore, raw: &str) -> Result<WorkflowRun, String> {
     let r = raw.parse::<Ref>()?;
     let iri =
         refs::resolve(store, store.label(), Kind::WorkflowRun, &r).map_err(|e| e.to_string())?;
@@ -490,7 +490,7 @@ fn resolve_workflow_run_in_store(store: &RedbStore, raw: &str) -> Result<Workflo
 }
 
 fn resolve_optional_project_filter(
-    store: &RedbStore,
+    store: &AnyStore,
     raw_project: Option<&str>,
 ) -> Result<Option<ProjectId>, String> {
     let Some(raw) = raw_project.map(str::trim).filter(|s| !s.is_empty()) else {

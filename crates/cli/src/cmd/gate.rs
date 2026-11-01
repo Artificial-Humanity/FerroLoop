@@ -6,7 +6,7 @@ use fl_core::model::{CommandSpec, GateDef, GateKind, PopulationDelivery, Selecto
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
 use fl_exec::evaluate::run_single_gate;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 
 /// Declare a gate: a population to examine, and a program to run over it.
 ///
@@ -118,7 +118,7 @@ impl Cmd {
 }
 
 /// The gate `id` names, or a refusal that echoes what was typed.
-fn gate(store: &RedbStore, id: &Ref) -> Result<GateDef> {
+fn gate(store: &AnyStore, id: &Ref) -> Result<GateDef> {
     let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, id)?);
     let Some(g) = store.get_gate(&gid)? else {
         bail!(
@@ -130,7 +130,7 @@ fn gate(store: &RedbStore, id: &Ref) -> Result<GateDef> {
     Ok(g)
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &AnyStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add(args) => {
             let AddArgs {
