@@ -40,8 +40,7 @@ use fl_core::store::{
     AgentRegistry, Catalog, Ledger, MessageStore, StateStore, StoreError, Tracker, WorkflowStore,
 };
 use redb::{
-    MultimapTableHandle, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-    TableHandle,
+    MultimapTableHandle, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle,
 };
 use serde::Serialize;
 use serde_json::Value;

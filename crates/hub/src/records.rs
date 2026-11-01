@@ -827,6 +827,30 @@ mod tests {
     }
 
     #[test]
+    fn available_projects_ignores_the_migration_lock_file() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        fs::write(dir.join("foo.fls"), b"x").unwrap();
+        // Left beside a store by an automatic migration; also one with no store.
+        fs::write(dir.join("foo.fls.migrate.lock"), b"").unwrap();
+        fs::write(dir.join("bar.fls.migrate.lock"), b"").unwrap();
+        fs::write(dir.join("baz.redb.migrate.lock"), b"").unwrap();
+        for env in [Some("ferro"), None] {
+            let found = available_projects_with(Some(tmp.path()), env);
+            assert!(
+                !found
+                    .iter()
+                    .any(|n| n.contains("lock") || n == "bar" || n == "baz"),
+                "{env:?}: {found:?}"
+            );
+        }
+        assert_eq!(
+            available_projects_with(Some(tmp.path()), Some("ferro")),
+            vec!["ferroloop", "foo"]
+        );
+    }
+
+    #[test]
     fn available_projects_reads_a_bounded_number_of_entries_under_ferro() {
         let tmp = TempDir::new().unwrap();
         let dir = fl_dir(&tmp);

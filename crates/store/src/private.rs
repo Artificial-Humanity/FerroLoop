@@ -377,6 +377,22 @@ pub(crate) fn loose_warnings(
     }
 }
 
+/// Bytes a process that is not root can still write on the filesystem that holds `dir`
+/// (`statvfs`'s available blocks). For a command that is about to make a large copy there.
+// The `statvfs` fields are `u64` here and narrower on other targets.
+#[allow(clippy::useless_conversion)]
+pub fn available_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path holds a NUL byte"))?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `stat` a writable, correctly sized buffer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+}
+
 /// Write `text` and a newline to `w`, ignoring any error: a closed pipe (EPIPE) or a full disk on
 /// stderr must not turn a reminder into a panic or a failed command.
 fn write_line(w: &mut dyn Write, text: &str) {
@@ -1233,5 +1249,12 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("nowhere.redb"), &dangling).unwrap();
         assert!(!create_private_file(&dangling).unwrap());
         assert!(!tmp.path().join("nowhere.redb").exists());
+    }
+
+    #[test]
+    fn available_bytes_reports_the_free_space_of_a_directory_and_fails_on_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(available_bytes(tmp.path()).unwrap() > 0);
+        assert!(available_bytes(&tmp.path().join("missing")).is_err());
     }
 }

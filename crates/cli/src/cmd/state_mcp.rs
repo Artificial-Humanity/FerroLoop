@@ -461,11 +461,11 @@ fn open_workflow_store(
             return Ok(primary);
         }
         let ws_path = env.cfg.workspace_state_store(env.default_store);
-        if !crate::same_store(&ws_path, &primary_path) && fl_store::store_exists(&ws_path) {
-            let other = fl_store::open_store(&ws_path).map_err(|e| e.to_string())?;
-            if other.owns(&iri).map_err(|e| e.to_string())? {
-                return Ok(other);
-            }
+        if !crate::same_store(&ws_path, &primary_path)
+            && fl_store::store_exists(&ws_path)
+            && super::state::scan_owns(&ws_path, &iri)?
+        {
+            return fl_store::open_store(&ws_path).map_err(|e| e.to_string());
         }
         for entry in &env.cfg.projects {
             if crate::same_store(&entry.store, &primary_path)
@@ -473,9 +473,8 @@ fn open_workflow_store(
             {
                 continue;
             }
-            let other = fl_store::open_store(&entry.store).map_err(|e| e.to_string())?;
-            if other.owns(&iri).map_err(|e| e.to_string())? {
-                return Ok(other);
+            if super::state::scan_owns(&entry.store, &iri)? {
+                return fl_store::open_store(&entry.store).map_err(|e| e.to_string());
             }
         }
     }

@@ -1344,7 +1344,6 @@ fn gate_selector() -> fl_core::model::Selector {
 }
 
 fn redb_format(store: &crate::RedbStore) -> u64 {
-    use redb::ReadableDatabase;
     let tx = store.db.begin_read().unwrap();
     let meta = tx.open_table(crate::META).unwrap();
     meta.get(crate::FORMAT_KEY)
