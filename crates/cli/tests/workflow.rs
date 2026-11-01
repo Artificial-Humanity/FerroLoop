@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use fl_core::store::{Catalog, Ledger};
-use fl_store::RedbStore;
+
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -393,7 +393,7 @@ on = "pass"
     assert!(!status_out["handoffs"].as_array().unwrap().is_empty());
 
     // Verify ledger recorded attempts and gate runs in the store.
-    let store = RedbStore::open(&f.store_path).unwrap();
+    let store = fl_store::open_store(&f.store_path).unwrap();
     let proj_id = store.list_projects().unwrap()[0].id.clone();
     let attempts = store.attempts(&proj_id).unwrap();
     assert_eq!(

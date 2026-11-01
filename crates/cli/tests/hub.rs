@@ -596,7 +596,7 @@ fn fl_hub_init_json_writes_config_tokens_and_hub_node() {
     assert_eq!(toml_key_count(&text, "listen"), 1);
     assert_eq!(toml_key_count(&text, "store"), 1);
 
-    let store_db = fl_store::open_redb(Path::new(store)).unwrap();
+    let store_db = fl_store::open_store(Path::new(store)).unwrap();
     let hub = fl_hub::find_hub_node(&store_db).unwrap().expect("hub node");
     assert_eq!(hub.node_id, node_id);
     assert_eq!(hub.role, "hub");

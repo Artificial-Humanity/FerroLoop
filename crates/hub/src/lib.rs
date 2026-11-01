@@ -172,6 +172,9 @@ pub struct HubState {
     login_guard: Arc<operators::LoginGuard>,
     /// One runtime probe at a time, and the last result (see [`runtime_matrix::ProbeGate`]).
     probe_gate: Arc<runtime_matrix::ProbeGate>,
+    /// The engine every store this hub opens uses. `None` (always, outside tests) lets the path and
+    /// `FL_STORE_BACKEND` choose; a test sets it instead of changing the process environment.
+    pub(crate) store_backend: Option<fl_store::BackendKind>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -277,6 +280,7 @@ impl HubState {
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             login_guard: Arc::new(operators::LoginGuard::default()),
             probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
+            store_backend: None,
         }
     }
 
@@ -562,7 +566,13 @@ impl HubState {
         }
         let mut last_err = None;
         for attempt in 0..200 {
-            match fl_store::open_store(path) {
+            match fl_store::open_store_with(
+                path,
+                &fl_store::StoreOptions {
+                    backend: self.store_backend,
+                    ..fl_store::StoreOptions::default()
+                },
+            ) {
                 Ok(store) => {
                     return Ok(HubStoreGuard {
                         store: Some(store),
@@ -615,6 +625,7 @@ impl HubState {
         match fl_store::open_store_with(
             path,
             &fl_store::StoreOptions {
+                backend: self.store_backend,
                 retries,
                 ..fl_store::StoreOptions::default()
             },
@@ -2201,14 +2212,16 @@ mod tests {
         let state = test_hub_state(&tmp);
 
         // A new per-project store in a directory the hub creates: 0600 in 0700.
+        // (The default engine keeps a logical `.redb` name's store at the sibling `.fls`.)
+        let physical = |p: &Path| fl_store::physical_path(p, fl_store::DEFAULT_BACKEND);
         let path = tmp.path().join("projects").join("demo.redb");
         drop(state.open_store_at(&path).expect("open a new store"));
-        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&physical(&path)), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         // The hub-wide store the same way.
         let hub_store = tmp.path().join("hub").join("store.redb");
         drop(state.open_store_at(&hub_store).expect("open the hub store"));
-        assert_eq!(mode(&hub_store), 0o600);
+        assert_eq!(mode(&physical(&hub_store)), 0o600);
         assert_eq!(mode(hub_store.parent().unwrap()), 0o700);
 
         // The per-project open path: `open_with_retries` creates the missing file itself, with
@@ -2219,17 +2232,30 @@ mod tests {
                 .open_project_store_at(&second)
                 .unwrap_or_else(|_| panic!("open a new project store")),
         );
-        assert_eq!(mode(&second), 0o600);
+        assert_eq!(mode(&physical(&second)), 0o600);
 
         // An existing loose store keeps its mode: it is warned about, never changed.
         let old_dir = tmp.path().join("old");
         fs::create_dir(&old_dir).unwrap();
         fs::set_permissions(&old_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        let old = old_dir.join("legacy.redb");
-        fs::write(&old, b"").unwrap();
+        let old = old_dir.join("legacy-ferro.fls");
+        drop(fl_store::open_store(&old).unwrap());
         fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
         drop(state.open_store_at(&old).expect("open an existing store"));
         assert_eq!(mode(&old), 0o644);
+        assert_eq!(mode(&old_dir), 0o755);
+        // The same on the redb engine (the rollback), named explicitly.
+        let mut redb_state = test_hub_state(&tmp);
+        redb_state.store_backend = Some(fl_store::BackendKind::Redb);
+        let old_redb = old_dir.join("legacy.redb");
+        fs::write(&old_redb, b"").unwrap();
+        fs::set_permissions(&old_redb, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(
+            redb_state
+                .open_store_at(&old_redb)
+                .expect("open an existing redb store"),
+        );
+        assert_eq!(mode(&old_redb), 0o644);
         assert_eq!(mode(&old_dir), 0o755);
     }
 
@@ -2450,26 +2476,11 @@ mod tests {
             (BackendKind::Redb, "store.redb", "rows"),
             (BackendKind::Ferro, "store.fls", "columnar"),
         ] {
-            // The hub opens its store through `fl_store::open_store`, which lets
-            // `FL_STORE_BACKEND` pick the engine for a `.redb` path; only a `.fls` path is
-            // pinned to FerroStore. So the redb leg needs the variable to leave redb in
-            // charge. This test binary runs tests in parallel, so the test must not set or
-            // clear the variable itself: it skips that leg, visibly, when it is set otherwise.
-            if kind == BackendKind::Redb {
-                let env = std::env::var(fl_store::BACKEND_ENV).ok();
-                let chosen = fl_store::choose_backend(Path::new(file), env.as_deref());
-                if !matches!(chosen, Ok(BackendKind::Redb)) {
-                    eprintln!(
-                        "SKIPPED: the redb leg, because {}={:?} makes the hub open `{file}` as {chosen:?}",
-                        fl_store::BACKEND_ENV,
-                        env.unwrap_or_default(),
-                    );
-                    continue;
-                }
-            }
             let tmp = TempDir::new().unwrap();
             let mut state = test_hub_state(&tmp);
             state.config.store_path = tmp.path().join(file);
+            // Name the engine: neither leg depends on `FL_STORE_BACKEND` or the default.
+            state.store_backend = Some(kind);
             seed_stats_store(&state.config.store_path, kind);
 
             let mut summary = stats_body(&state, "/api/v1/stats?summary=1");
@@ -2497,13 +2508,11 @@ mod tests {
                 "gate_runs": {"pass": 1, "fail": 1, "error": 2},
             })
         );
-        // Both legs ran unless the redb leg was skipped above; the ferro leg always runs.
-        assert!(!summaries.is_empty());
-        if summaries.len() == 2 {
-            assert_eq!(summaries[0], summaries[1]);
-            assert_eq!(defaults[0]["attempts"], defaults[1]["attempts"]);
-            assert_eq!(defaults[0]["by_status"], defaults[1]["by_status"]);
-        }
+        // Both legs ran.
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0], summaries[1]);
+        assert_eq!(defaults[0]["attempts"], defaults[1]["attempts"]);
+        assert_eq!(defaults[0]["by_status"], defaults[1]["by_status"]);
     }
 
     #[test]

@@ -1758,7 +1758,18 @@ mod tests {
         )
         .expect("an alias of the primary is not opened again");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
-        assert_eq!(store.label(), primary.display().to_string());
+        // The label names the file the engine keeps the store in.
+        let kind = fl_store::choose_backend(
+            &primary,
+            std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.label(),
+            fl_store::physical_path(&primary, kind)
+                .display()
+                .to_string()
+        );
     }
 
     /// `fl_code_search` and `fl_batch_search` on a FerroStore (an explicit `.fls`

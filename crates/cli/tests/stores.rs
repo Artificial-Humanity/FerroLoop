@@ -43,8 +43,11 @@ impl Env {
     }
     fn fl(&self, cwd: &Path) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
+        // These tests are about which store file a command resolves, and they look for that file
+        // by its `.redb` name: the redb engine is named so they do not depend on the default.
         c.env("XDG_CONFIG_HOME", self.config.path())
             .env("XDG_DATA_HOME", self.data.path())
+            .env("FL_STORE_BACKEND", "redb")
             .env_remove("FL_DB")
             .current_dir(cwd);
         c

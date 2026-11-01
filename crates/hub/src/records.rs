@@ -756,13 +756,13 @@ mod tests {
     #[test]
     fn a_project_store_file_follows_the_selected_engine() {
         let logical = Path::new("/h/.local/share/fl/foo.redb");
-        assert_eq!(physical_store_file_with(logical, None), logical);
+        let ferro = Path::new("/h/.local/share/fl/foo.fls");
+        // No engine named: the default, FerroStore.
+        assert_eq!(physical_store_file_with(logical, None), ferro);
         assert_eq!(physical_store_file_with(logical, Some("redb")), logical);
-        assert_eq!(
-            physical_store_file_with(logical, Some("ferro")),
-            Path::new("/h/.local/share/fl/foo.fls")
-        );
-        assert_eq!(store_extension_with(None), "redb");
+        assert_eq!(physical_store_file_with(logical, Some("ferro")), ferro);
+        assert_eq!(store_extension_with(None), "fls");
+        assert_eq!(store_extension_with(Some("redb")), "redb");
         assert_eq!(store_extension_with(Some("ferro")), "fls");
         // A bad engine name falls back to the logical path; the open reports the error.
         assert_eq!(physical_store_file_with(logical, Some("sqlite")), logical);
@@ -779,18 +779,27 @@ mod tests {
             project_redb_with(home, "foo", Some("ferro")).unwrap(),
             Some(dir.join("foo.redb"))
         );
-        assert_eq!(project_redb_with(home, "foo", None).unwrap(), None);
+        assert_eq!(
+            project_redb_with(home, "foo", None).unwrap(),
+            Some(dir.join("foo.redb")),
+            "ferro is the default"
+        );
         assert_eq!(project_redb_with(home, "foo", Some("redb")).unwrap(), None);
 
         // Only `bar.redb`: redb finds it; ferro refuses rather than fall back to the hub store.
         fs::write(dir.join("bar.redb"), b"x").unwrap();
         assert_eq!(
-            project_redb_with(home, "bar", None).unwrap(),
+            project_redb_with(home, "bar", Some("redb")).unwrap(),
             Some(dir.join("bar.redb"))
         );
         let err = project_redb_with(home, "bar", Some("ferro")).unwrap_err();
         assert_eq!(err.status, 409);
         assert!(String::from_utf8_lossy(&err.body).contains("not been migrated"));
+        // The same under the default engine.
+        assert_eq!(
+            project_redb_with(home, "bar", None).unwrap_err().status,
+            409
+        );
         // Neither file: ferro still falls back (no project by that name).
         assert_eq!(project_redb_with(home, "baz", Some("ferro")).unwrap(), None);
     }
@@ -804,8 +813,18 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.join("link.fls")).unwrap();
         let err = project_redb_with(tmp.path(), "link", Some("ferro")).unwrap_err();
         assert_eq!(err.status, 400);
+        assert_eq!(
+            project_redb_with(tmp.path(), "link", None)
+                .unwrap_err()
+                .status,
+            400,
+            "ferro is the default"
+        );
         // Under redb the `.fls` link is not a store at all.
-        assert_eq!(project_redb_with(tmp.path(), "link", None).unwrap(), None);
+        assert_eq!(
+            project_redb_with(tmp.path(), "link", Some("redb")).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -821,8 +840,13 @@ mod tests {
             vec!["ferroloop", "foo"]
         );
         assert_eq!(
-            available_projects_with(home, None),
+            available_projects_with(home, Some("redb")),
             vec!["ferroloop", "old"]
+        );
+        // No engine named: the default, FerroStore.
+        assert_eq!(
+            available_projects_with(home, None),
+            vec!["ferroloop", "foo"]
         );
     }
 
@@ -890,7 +914,7 @@ mod tests {
 
     /// A store at `path` holding one project and one record per `(title, state)`.
     fn seed(path: &Path, records: &[(&str, State)]) -> (AnyStore, ProjectId, Vec<RecordId>) {
-        let store = fl_store::open_redb(path).unwrap();
+        let store = fl_store::open_store(path).unwrap();
         let project = store.add_project("/workspace/seed").unwrap();
         let ids = records
             .iter()
@@ -964,7 +988,9 @@ mod tests {
         {
             let (_s, _p, _) = seed(&evil, &[("secret", State::Todo)]);
         }
-        let before = fs::read(&evil).unwrap();
+        // The default engine keeps the store at the sibling `.fls`.
+        let evil_file = fl_store::physical_path(&evil, fl_store::DEFAULT_BACKEND);
+        let before = fs::read(&evil_file).unwrap();
         for bad in [
             "../evil",
             "..%2Fevil",
@@ -988,7 +1014,7 @@ mod tests {
             assert_eq!(call(&state, &mv).0, 400, "move project={bad}");
         }
         assert_eq!(
-            fs::read(&evil).unwrap(),
+            fs::read(&evil_file).unwrap(),
             before,
             "the outside store is untouched"
         );
@@ -1049,26 +1075,25 @@ mod tests {
         assert_eq!(available_projects(Some(tmp.path())), vec!["ferroloop"]);
         assert_eq!(available_projects(None), vec!["ferroloop"]);
         for name in [
-            "fl.redb",
-            "zeta.redb",
-            "alpha.redb",
-            "Upper.redb",
-            "bad name.redb",
+            "fl.fls",
+            "zeta.fls",
+            "alpha.fls",
+            "Upper.fls",
+            "bad name.fls",
             "notes.txt",
-            ".redb",
+            ".fls",
         ] {
             fs::write(dir.join(name), b"x").unwrap();
         }
-        fs::create_dir(dir.join("adir.redb")).unwrap();
-        fs::write(tmp.path().join("target.redb"), b"x").unwrap();
-        std::os::unix::fs::symlink(tmp.path().join("target.redb"), dir.join("linked.redb"))
-            .unwrap();
+        fs::create_dir(dir.join("adir.fls")).unwrap();
+        fs::write(tmp.path().join("target.fls"), b"x").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("target.fls"), dir.join("linked.fls")).unwrap();
         assert_eq!(
             available_projects(Some(tmp.path())),
             vec!["alpha", "ferroloop", "zeta"]
         );
-        // `ferroloop.redb` present does not list it twice.
-        fs::write(dir.join("ferroloop.redb"), b"x").unwrap();
+        // `ferroloop.fls` present does not list it twice.
+        fs::write(dir.join("ferroloop.fls"), b"x").unwrap();
         assert_eq!(
             available_projects(Some(tmp.path())),
             vec!["alpha", "ferroloop", "zeta"]
@@ -1082,7 +1107,8 @@ mod tests {
         for i in 0..(MAX_PROJECT_SCAN + 50) {
             fs::write(dir.join(format!("p{i:04}.redb")), b"x").unwrap();
         }
-        let found = available_projects(Some(tmp.path()));
+        let found = available_projects_with(Some(tmp.path()), Some("redb"));
+        assert!(found.len() > 1, "{}", found.len());
         assert!(found.len() <= MAX_PROJECT_SCAN + 1, "{}", found.len());
         assert!(found.contains(&"ferroloop".to_string()));
     }
@@ -1095,8 +1121,10 @@ mod tests {
         {
             seed(&target, &[("outside", State::Todo)]);
         }
+        // The default engine keeps the store at the sibling `.fls`; a link to it is refused.
+        let target = fl_store::physical_path(&target, fl_store::DEFAULT_BACKEND);
         let before = fs::read(&target).unwrap();
-        std::os::unix::fs::symlink(&target, fl_dir(&tmp).join("link.redb")).unwrap();
+        std::os::unix::fs::symlink(&target, fl_dir(&tmp).join("link.fls")).unwrap();
 
         let (status, body) = call(&state, &owner("GET", "/api/v1/records?project=link"));
         assert_eq!(status, 400, "{body}");
@@ -1110,8 +1138,8 @@ mod tests {
     fn a_project_store_that_cannot_be_opened_is_a_503_not_a_panic() {
         let tmp = TempDir::new().unwrap();
         let state = test_state(&tmp);
-        // Not a redb file: opening fails, whatever holds the file.
-        fs::write(fl_dir(&tmp).join("junk.redb"), b"this is not a database").unwrap();
+        // Not a store file: opening fails, whatever holds the file.
+        fs::write(fl_dir(&tmp).join("junk.fls"), b"this is not a database").unwrap();
         let (status, body) = call(&state, &owner("GET", "/api/v1/records?project=junk"));
         assert_eq!(status, 503, "{body}");
         assert!(body["error"].is_string());
@@ -1357,7 +1385,7 @@ mod tests {
             .with_json_body(&json!({ "project": "foo", "title": "x", "area": "  " }));
         assert_eq!(call(&state, &none).1["record"]["area"], Value::Null);
         // ⚠ Creating a record is not a format upgrade: an older fl still reads the store.
-        let store = fl_store::open_redb(&path).unwrap();
+        let store = fl_store::open_store(&path).unwrap();
         assert_eq!(store.format_version().unwrap(), format_before);
     }
 
@@ -1383,9 +1411,8 @@ mod tests {
         }
         let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
         assert_eq!(titles(&listed), vec!["existing"]);
-        let store = fl_store::open_redb(&path).unwrap();
+        let store = fl_store::open_store(&path).unwrap();
         assert_eq!(store.format_version().unwrap(), format_before);
-        assert!(format_before < Some(fl_store::FORMAT_WITH_ROUTING));
     }
 
     #[test]
@@ -1885,7 +1912,7 @@ mod tests {
         let repo = git_repo();
         let root = repo.path().display().to_string();
         let head = fl_exec::git::Git::head(repo.path()).unwrap();
-        let author = fl_store::open_redb(&tmp.path().join("author.redb")).unwrap();
+        let author = fl_store::open_store(&tmp.path().join("author.redb")).unwrap();
         let project = author.add_project(&root).unwrap();
         let gate = author
             .add_gate(
@@ -1924,7 +1951,7 @@ mod tests {
         )
         .unwrap();
         let path = fl_dir(tmp).join("foo.redb");
-        let store = fl_store::open_redb(&path).unwrap();
+        let store = fl_store::open_store(&path).unwrap();
         store.import_manifest(&manifest, &root).unwrap();
         store.add_record(&project, "imported").unwrap();
         let newer = author.export_manifest(&project, "c2", 2, None).unwrap();
@@ -1950,7 +1977,7 @@ mod tests {
 
         // Put the record back, then change the manifest under the store.
         {
-            let store = fl_store::open_redb(&path).unwrap();
+            let store = fl_store::open_store(&path).unwrap();
             let record = store
                 .list_records(&store.list_projects().unwrap()[0].id)
                 .unwrap();
@@ -1972,7 +1999,7 @@ mod tests {
             "{body}"
         );
         {
-            let store = fl_store::open_redb(&path).unwrap();
+            let store = fl_store::open_store(&path).unwrap();
             let project = store.list_projects().unwrap().remove(0).id;
             assert_eq!(store.list_records(&project).unwrap()[0].state, State::Todo);
         }
@@ -2048,22 +2075,32 @@ mod tests {
     const BOUND: Duration = Duration::from_secs(6);
 
     #[test]
-    fn a_project_held_by_another_process_is_a_503_busy_within_a_bounded_time() {
+    fn a_redb_project_held_by_another_process_is_a_503_busy_within_a_bounded_time() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_state(&tmp);
+        // The rollback engine, named explicitly: redb takes one process per file.
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let path = fl_dir(&tmp).join("foo.redb");
+        let holder = fl_store::open_redb(&path).unwrap();
+        // `holder` is open on the file, as a CLI process would be.
+        let started = Instant::now();
+        let busy = state.open_project_store_at(&path);
+        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+        assert!(matches!(busy, Err(ProjectOpenError::Busy)));
+        drop(holder);
+        assert!(state.open_project_store_at(&path).is_ok());
+    }
+
+    #[test]
+    fn a_ferro_project_held_by_another_handle_is_not_busy() {
         let tmp = TempDir::new().unwrap();
         let state = test_state(&tmp);
         let path = fl_dir(&tmp).join("foo.redb");
         let (_holder, _, _) = seed(&path, &[("x", State::Todo)]);
-        // `_holder` is open on the file, as a CLI process would be.
-        let started = Instant::now();
+        // FerroStore is multi-process safe: a second handle on the file opens at once.
         let (status, body) = call(&state, &peer("GET", "/api/v1/records?project=foo"));
-        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
-        assert_eq!(status, 503, "{body}");
-        assert_eq!(body, json!({ "error": "project busy" }));
-        let mv = owner("POST", "/api/v1/records/1/move?project=foo")
-            .with_json_body(&json!({ "to": "doing" }));
-        let started = Instant::now();
-        assert_eq!(call(&state, &mv).0, 503);
-        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(titles(&body), vec!["x"]);
     }
 
     #[test]
@@ -2238,7 +2275,7 @@ mod tests {
             .with_json_body(&json!({ "project": "..\\outside", "to": "done" }));
         assert_eq!(call(&state, &req).0, 400);
         // The outside store is untouched.
-        let store = fl_store::open_redb(&outside).unwrap();
+        let store = fl_store::open_store(&outside).unwrap();
         let project = store.list_projects().unwrap().remove(0);
         assert_eq!(store.list_records(&project.id).unwrap().len(), 1);
     }

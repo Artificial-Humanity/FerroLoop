@@ -23,7 +23,7 @@ impl Env {
         }
     }
 
-    /// `fl` with no engine selected in the environment.
+    /// `fl` with no engine selected in the environment: the default engine, FerroStore.
     fn fl(&self) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
         c.env("HOME", self.home.path())
@@ -38,6 +38,13 @@ impl Env {
     fn ferro(&self) -> Command {
         let mut c = self.fl();
         c.env("FL_STORE_BACKEND", "ferro");
+        c
+    }
+
+    /// `fl` on the redb engine (the rollback), named explicitly.
+    fn redb(&self) -> Command {
+        let mut c = self.fl();
+        c.env("FL_STORE_BACKEND", "redb");
         c
     }
 
@@ -101,7 +108,7 @@ fn status_json(mut cmd: Command, db: &Path) -> Value {
 #[test]
 fn status_on_redb_reports_a_store_that_does_not_exist_and_creates_nothing() {
     let env = Env::new();
-    let v = status_json(env.fl(), &env.logical());
+    let v = status_json(env.redb(), &env.logical());
     assert_eq!(v["engine"], "redb");
     assert_eq!(v["exists"], false);
     assert_eq!(v["size_bytes"], Value::Null);
@@ -115,7 +122,7 @@ fn status_on_redb_reports_a_store_that_does_not_exist_and_creates_nothing() {
 fn status_on_redb_reports_size_and_format_version() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    let v = status_json(env.fl(), &env.logical());
+    let v = status_json(env.redb(), &env.logical());
     assert_eq!(v["engine"], "redb");
     assert_eq!(v["exists"], true);
     assert_eq!(
@@ -129,7 +136,7 @@ fn status_on_redb_reports_size_and_format_version() {
 fn status_in_text_names_each_field() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status"])
@@ -201,7 +208,7 @@ fn status_refuses_an_unknown_engine() {
 #[test]
 fn checkpoint_on_redb_does_nothing_and_succeeds() {
     let env = Env::new();
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "checkpoint"])
@@ -450,7 +457,7 @@ fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
     let bytes = std::fs::read(env.logical()).unwrap();
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact"])
@@ -460,7 +467,7 @@ fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
             "compaction applies to the FerroStore (.fls) engine only",
         ));
     let out = env
-        .fl()
+        .redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact", "--json"])
@@ -619,7 +626,7 @@ fn status_and_checkpoint_do_not_create_a_missing_directory_on_either_engine() {
             let env = Env::new();
             let missing = env.stores.path().join("not-yet");
             let db = missing.join("fl.redb");
-            let mut cmd = if ferro { env.ferro() } else { env.fl() };
+            let mut cmd = if ferro { env.ferro() } else { env.redb() };
             cmd.arg("--db").arg(&db).args(["store", sub]);
             let out = cmd.output().unwrap();
             // status succeeds; checkpoint succeeds on redb and is refused on ferro.
@@ -647,7 +654,7 @@ fn status_on_an_empty_redb_file_reports_it_and_does_not_modify_it() {
         .unwrap()
         .modified()
         .unwrap();
-    let v = status_json(env.fl(), &env.logical());
+    let v = status_json(env.redb(), &env.logical());
     assert_eq!(v["exists"], true);
     assert_eq!(v["size_bytes"], 0);
     assert_eq!(v["format_version"], Value::Null);
@@ -655,7 +662,7 @@ fn status_on_an_empty_redb_file_reports_it_and_does_not_modify_it() {
     assert_eq!(meta.len(), 0, "status initialised the file");
     assert_eq!(meta.modified().unwrap(), mtime);
 
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status"])
@@ -762,13 +769,13 @@ fn git_repo() -> tempfile::TempDir {
 
 /// A redb store with a project and a gate in it, made with the CLI.
 fn populate_redb(env: &Env, repo: &Path) {
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args(["project", "add", repo.to_str().unwrap()])
         .assert()
         .success();
-    env.fl()
+    env.redb()
         .arg("--db")
         .arg(env.logical())
         .args([
@@ -1080,7 +1087,7 @@ fn an_ordinary_ferro_command_migrates_a_redb_only_home() {
         .open(env.logical())
         .is_err()
     {
-        env.fl()
+        env.redb()
             .arg("--db")
             .arg(env.logical())
             .args(["project", "list"])
@@ -1093,6 +1100,39 @@ fn an_ordinary_ferro_command_migrates_a_redb_only_home() {
              0400 file (running as root), so the refusal cannot be observed"
         );
     }
+}
+
+#[test]
+fn a_command_that_names_no_engine_uses_ferro_and_migrates_a_redb_only_home() {
+    let env = Env::new();
+    let repo = git_repo();
+    populate_redb(&env, repo.path());
+    assert_eq!(env.files(), vec!["fl.redb".to_string()]);
+
+    // No `FL_STORE_BACKEND`: FerroStore is the default engine.
+    let v = status_json(env.fl(), &env.logical());
+    assert_eq!(v["engine"], "ferro");
+    assert_eq!(v["redb_beside_ferro"], true);
+    assert_eq!(
+        env.files(),
+        vec!["fl.redb".to_string()],
+        "status migrates nothing"
+    );
+
+    env.fl()
+        .arg("--db")
+        .arg(env.logical())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains(repo.path().to_str().unwrap()));
+    assert_eq!(env.files(), with_lock());
+    assert_eq!(mode(&env.physical_ferro()), 0o600);
+    assert_eq!(mode(&env.logical()), 0o400, "the redb is kept read-only");
+
+    // `FL_STORE_BACKEND=redb` is the rollback: it still names the redb engine.
+    let v = status_json(env.redb(), &env.logical());
+    assert_eq!(v["engine"], "redb");
 }
 
 #[test]

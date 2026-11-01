@@ -203,8 +203,8 @@ impl R {
     }
 
     /// The local store, opened between commands.
-    fn store(&self) -> fl_store::RedbStore {
-        fl_store::RedbStore::open(&self.home.path().join("fl.redb")).unwrap()
+    fn store(&self) -> fl_store::AnyStore {
+        fl_store::open_store(&self.home.path().join("fl.redb")).unwrap()
     }
 
     /// How many gate runs the store holds, over every gate: a routed

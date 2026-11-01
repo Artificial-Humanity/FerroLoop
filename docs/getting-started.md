@@ -706,6 +706,29 @@ holds it, searching the bound store and every store any project is bound to. `--
 `$FL_DB` stop that search: they confine the command to the one store they name, and an IRI
 that store does not hold is refused, not looked for elsewhere.
 
+### Store engine
+
+A store is a FerroStore file by default. The store path you configure stays the same: for a
+path that ends in `.redb`, the store lives in the sibling `.fls` file (`fl.redb` is `fl.fls`).
+The first open of a store that still has only a `.redb` migrates it. The copy is verified table
+by table (row counts and content hashes); if it does not verify, the store stays on the
+`.redb`. After a verified copy the `.redb` stays on disk, read-only (mode `0400`), as the
+rollback copy.
+
+* `FL_STORE_BACKEND=redb` keeps every store on redb. It is the rollback. To go back after a
+  migration, `chmod 600` the `.redb` and set the variable; writes made since the migration are
+  in the `.fls` only.
+* A path that ends in `.fls` is always FerroStore.
+* `fl store status` shows the engine and the file, `fl store migrate` migrates a store by
+  hand, and `fl store verify` compares a `.redb` and `.fls` pair.
+* Before the first command on the FerroStore engine, stop any `fl hub` or `fl wire daemon`
+  process that still runs on redb, or start it on the FerroStore engine in the same step. Two
+  processes that use different engines for one store is the case the migration lock guards
+  against.
+* The hub migrates only its own store. A project store (`<slug>.redb`) is migrated by the first
+  `fl` command that opens it, or by `fl store migrate`; until then the hub answers `409` for
+  that project.
+
 ### Store permissions
 
 A store holds hub pairing codes, session hashes and other records, so it is private to your
