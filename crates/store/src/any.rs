@@ -11,6 +11,11 @@
 //! * A logical path such as `fl.redb` names the same store under either
 //!   engine: [`physical_path`] maps it to the sibling `fl.fls` when the engine
 //!   is FerroStore, so a config entry never changes at cutover.
+//! * A scan that only asks [`AnyStore::owns`] ([`Unmigrated::UseRedb`]) opens
+//!   a lone `.redb` read-only first and falls back to today's ordinary open
+//!   only when the read-only open fails for a non-busy reason (so, as before
+//!   this module existed, that fallback can repair a crash-damaged redb or
+//!   initialise an empty file). It never migrates.
 
 use crate::manifest::{Manifest, ManifestError};
 use crate::{FerroStore, ImportReport, RedbStore, backend};
@@ -104,10 +109,13 @@ pub enum Unmigrated {
     /// Open the `.redb` with the redb engine and migrate nothing. For the scans
     /// that open other configured stores only to ask [`AnyStore::owns`]: a
     /// read-only lookup must not migrate (and `chmod`) every project store.
-    /// The store is opened read-only (writes through it fail; its bytes and
-    /// mtime stay as they were), creates no file and takes no lock file that
-    /// does not exist already. A redb that cannot be read that way (it needs
-    /// repair) is opened the ordinary way.
+    /// The redb is opened read-only first (writes through it fail; its bytes
+    /// and mtime stay as they were), and no file is created and no lock file
+    /// that does not exist already. Only when that read-only open fails for a
+    /// reason other than "held by another process" (the file needs repair, or
+    /// is not initialised) does the scan fall back to today's ordinary
+    /// writable open, which can repair a crash-damaged redb or initialise an
+    /// empty file, exactly as before auto-migration existed.
     UseRedb,
     /// Refuse, naming `fl store migrate`.
     Refuse,
@@ -294,10 +302,23 @@ impl MigrationLock {
         PathBuf::from(name)
     }
 
-    /// Take the lock, waiting for its holder. With `create` false, a lock file
-    /// that does not exist is not created: `Ok(None)`, and nobody can be
-    /// holding it.
+    /// Take the lock, waiting up to [`LOCK_WAIT`] for its holder. With `create`
+    /// false, a lock file that does not exist is not created: `Ok(None)`, and
+    /// nobody can be holding it.
     fn acquire(physical: &Path, create: bool) -> std::io::Result<Option<Self>> {
+        Self::acquire_for(physical, create, LOCK_WAIT)
+    }
+
+    /// [`acquire`](Self::acquire) with its own deadline. The lock is polled
+    /// (`try_lock`), not waited on, so a holder that hangs or is stopped cannot
+    /// block every ferro process for ever: after `wait` the error is
+    /// `TimedOut`, naming the lock file.
+    fn acquire_for(
+        physical: &Path,
+        create: bool,
+        wait: std::time::Duration,
+    ) -> std::io::Result<Option<Self>> {
+        use std::fs::TryLockError;
         use std::os::unix::fs::OpenOptionsExt;
         let path = Self::path_for(physical);
         let mut options = std::fs::OpenOptions::new();
@@ -305,16 +326,69 @@ impl MigrationLock {
         if create {
             options.create(true).truncate(false);
         }
-        let file = match options.open(&path) {
-            Ok(file) => file,
-            Err(err) if !create && err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
+        let file = loop {
+            match options.open(&path) {
+                Ok(file) => break file,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) if !create && err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         };
-        file.lock()?;
-        Ok(Some(Self { _file: file }))
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(Self { _file: file })),
+                Err(TryLockError::Error(err)) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(TryLockError::Error(err)) => return Err(err),
+                Err(TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "another process is migrating this store (or holds its lock): \
+                                 {} stayed locked for {} s",
+                                path.display(),
+                                wait.as_secs_f32()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+            }
+        }
     }
+}
+
+/// How long a process waits for the [`MigrationLock`] before it gives up with an
+/// error. A migration of a large store takes seconds; this is long past that.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often a waiting process tries the [`MigrationLock`] again.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Whether a failure to take the [`MigrationLock`] is one where no other process
+/// can be holding it either: the user may not write the directory or the lock
+/// file (`PermissionDenied`), the filesystem is read-only, or the directory is
+/// gone. Only then may the redb be opened without the lock. Any other failure
+/// (`ENOLCK`, an unexpected I/O error, a timeout: someone IS holding it) says
+/// nothing about whether another process holds the lock, so it is an error.
+fn lock_error_is_benign(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    const EROFS: i32 = 30;
+    matches!(
+        err.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem | ErrorKind::NotFound
+    ) || err.raw_os_error() == Some(EROFS)
+}
+
+/// The error for a lock that could not be taken and may not be skipped.
+fn lock_failed(physical: &Path, err: &std::io::Error) -> StoreError {
+    backend(format!(
+        "could not take the migration lock {}: {err}",
+        MigrationLock::path_for(physical).display()
+    ))
 }
 
 /// Migrate the redb store `redb` into the new `fls` under the [`MigrationLock`]
@@ -363,14 +437,18 @@ enum Access {
     /// The store a command works on: opened for writing, and the
     /// [`MigrationLock`] file created if need be.
     Use,
-    /// A store only asked `owns`: opened read-only (the file is not rewritten,
-    /// not even its mtime), and the lock taken only if its file exists already.
+    /// A store only asked `owns`: opened read-only first (the file is not
+    /// rewritten, not even its mtime) and, if that fails for a non-busy reason,
+    /// with the ordinary open; the lock is taken only if its file exists already.
     Scan,
 }
 
-/// Open the redb at `path`: for [`Access::Scan`] read-only, falling back to the
-/// ordinary open when the file cannot be read that way (it needs repair, or is
-/// not initialised yet), so a scan never sees less than an ordinary open does.
+/// Open the redb at `path`: for [`Access::Scan`] read-only first, falling back
+/// to today's ordinary (writable) open only when the read-only open fails for a
+/// non-busy reason (the file needs repair, or is not initialised yet), so a scan
+/// never sees less than an ordinary open does. That fallback is an ordinary
+/// open: it can repair a crash-damaged redb or initialise an empty file. A busy
+/// redb is reported, not opened the other way.
 fn open_redb_engine(path: &Path, retries: u32, access: Access) -> Result<RedbStore, StoreError> {
     if access == Access::Scan {
         match RedbStore::open_read_only(path, retries) {
@@ -402,12 +480,15 @@ fn redb_engine(
     loop {
         let lock = match held.take() {
             Some(lock) => Some(lock),
-            // A lock that cannot be taken (a directory or file this user may
-            // not write) is treated as absent: nothing in this process can do
-            // better, and the same directory refuses a migration.
-            None => MigrationLock::acquire(physical, access == Access::Use)
-                .ok()
-                .flatten(),
+            // A lock that cannot be taken because no one else can hold it
+            // either (a directory or file this user may not write, a read-only
+            // filesystem) is treated as absent: the same directory refuses a
+            // migration. Any other failure is an error, never an unlocked open.
+            None => match MigrationLock::acquire(physical, access == Access::Use) {
+                Ok(lock) => lock,
+                Err(err) if lock_error_is_benign(&err) => None,
+                Err(err) => return Err(lock_failed(physical, &err)),
+            },
         };
         let Some(lock) = lock else {
             return match open_redb_engine(path, retries, access) {
@@ -484,6 +565,8 @@ fn open_ferro(
     }
     let lock = match MigrationLock::acquire(physical, true) {
         Ok(lock) => lock.expect("created"),
+        // A lock that cannot be taken, and may not be skipped: an error.
+        Err(err) if !lock_error_is_benign(&err) => return Err(lock_failed(physical, &err)),
         Err(err) => {
             // Without the lock a migration could split the store: do not run one.
             if first_time("no-lock", &key) {
@@ -1793,6 +1876,163 @@ mod tests {
         );
         drop(holder);
         assert_eq!(scanner.join().unwrap(), BackendKind::Redb);
+    }
+
+    #[test]
+    fn a_lock_that_stays_held_times_out_with_an_error_naming_the_lock_file() {
+        let dir = TempDir::new().unwrap();
+        let fls = dir.path().join("s.fls");
+        let lock_path = MigrationLock::path_for(&fls);
+        let holder = MigrationLock::acquire(&fls, true).unwrap().unwrap();
+
+        for create in [true, false] {
+            let started = std::time::Instant::now();
+            let err =
+                MigrationLock::acquire_for(&fls, create, std::time::Duration::from_millis(80))
+                    .err()
+                    .expect("the holder still has the lock");
+            assert!(started.elapsed() >= std::time::Duration::from_millis(80));
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+            let text = err.to_string();
+            assert!(text.contains(&lock_path.display().to_string()), "{text}");
+            assert!(text.contains("another process is migrating"), "{text}");
+            // Waiting out a holder is not benign: no unlocked open.
+            assert!(!lock_error_is_benign(&err));
+        }
+
+        // Released: the same call takes it at once.
+        drop(holder);
+        assert!(
+            MigrationLock::acquire_for(&fls, true, std::time::Duration::from_millis(80))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn only_a_lock_error_that_rules_out_a_holder_is_benign() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::NotFound,
+        ] {
+            assert!(lock_error_is_benign(&Error::from(kind)), "{kind:?}");
+        }
+        // EROFS by number, whatever kind std gives it.
+        assert!(lock_error_is_benign(&Error::from_raw_os_error(30)));
+        assert!(lock_error_is_benign(&Error::from_raw_os_error(13))); // EACCES
+        assert!(lock_error_is_benign(&Error::from_raw_os_error(2))); // ENOENT
+        for err in [
+            Error::from_raw_os_error(37), // ENOLCK
+            Error::from_raw_os_error(5),  // EIO
+            Error::from_raw_os_error(21), // EISDIR
+            Error::from(ErrorKind::TimedOut),
+            Error::from(ErrorKind::WouldBlock),
+            Error::from(ErrorKind::Interrupted),
+            Error::from(ErrorKind::Other),
+            Error::other("unexpected"),
+        ] {
+            assert!(!lock_error_is_benign(&err), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_lock_error_that_is_not_benign_is_an_error_not_an_unlocked_open() {
+        // A directory where the lock file belongs: opening it for writing fails
+        // with EISDIR, which says nothing about another holder.
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        let (project, gate, record) = {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src)
+        };
+        std::fs::create_dir(MigrationLock::path_for(&fls)).unwrap();
+        let before = std::fs::read(&redb).unwrap();
+
+        for unmigrated in [Unmigrated::Migrate, Unmigrated::UseRedb] {
+            let said = Lines::default();
+            let err = open_store_sink(&redb, &ferro_opts(unmigrated), &said.sink())
+                .err()
+                .unwrap_or_else(|| panic!("{unmigrated:?} opened the redb with no lock"));
+            let text = err.to_string();
+            assert!(text.contains("could not take the migration lock"), "{text}");
+            assert!(text.contains("s.fls.migrate.lock"), "{text}");
+            assert!(said.all().is_empty(), "{:?}", said.all());
+        }
+        assert!(!fls.exists());
+        assert_eq!(std::fs::read(&redb).unwrap(), before);
+
+        // The directory gone, the same redb opens and migrates normally.
+        std::fs::remove_dir(MigrationLock::path_for(&fls)).unwrap();
+        let store = open_store_with(&redb, &ferro_opts(Unmigrated::Migrate)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
+        assert_populated(&store, &project, &gate, &record);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_that_refuses_the_lock_file_keeps_the_redb_engine_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("ro");
+        std::fs::create_dir(&sub).unwrap();
+        let redb = sub.join("s.redb");
+        let fls = sub.join("s.fls");
+        let (project, gate, record) = {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src)
+        };
+        // Put the directory back so the TempDir can clean up, however this ends.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(sub.clone());
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(sub.join("probe")).is_ok() {
+            eprintln!(
+                "SKIPPED a_directory_that_refuses_the_lock_file_keeps_the_redb_engine_and_says_so: \
+                 the directory is writable despite mode 0555 (running as root)"
+            );
+            return;
+        }
+        let before = std::fs::read(&redb).unwrap();
+
+        let said = Lines::default();
+        let store = open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &said.sink()).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(store.label().ends_with("s.redb"), "{}", store.label());
+        assert_populated(&store, &project, &gate, &record);
+        assert_eq!(
+            said.count_containing("could not take the migration lock"),
+            1
+        );
+        assert_eq!(said.count_containing("stays on redb"), 1);
+        assert_eq!(said.all().len(), 1, "{:?}", said.all());
+        // No .fls and no lock file (or anything else) was made.
+        assert!(!fls.exists());
+        assert!(!MigrationLock::path_for(&fls).exists());
+        let names: Vec<_> = std::fs::read_dir(&sub)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["s.redb".to_string()]);
+        // The redb is opened by the ordinary (writable) open on this path, so
+        // it is a live store. Observed below: whether its bytes changed.
+        drop(store);
+        let unchanged = std::fs::read(&redb).unwrap() == before;
+        eprintln!("redb bytes unchanged by the unlocked open: {unchanged}");
+        // Opened again: the warning is given once per store.
+        let again = Lines::default();
+        let store =
+            open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &again.sink()).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(again.all().is_empty(), "{:?}", again.all());
     }
 
     #[test]
