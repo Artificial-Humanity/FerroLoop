@@ -13,6 +13,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod any;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod manifest;
@@ -20,6 +21,10 @@ pub mod private;
 pub mod state;
 pub mod workflow;
 
+pub use any::{
+    AnyStore, BACKEND_ENV, BackendKind, DEFAULT_BACKEND, StoreOptions, choose_backend, open_store,
+    open_store_with, physical_path,
+};
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
     EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit,
