@@ -2,11 +2,14 @@
 //! and every method needs a scope.
 //!
 //! Unix: `SO_PEERCRED` (the peer's uid is the server's), and a PSK when the
-//! bind configures one. TCP (`ws://`): the mutual PSK challenge-response, or
-//! a bearer token in the upgrade's `Authorization` header.
+//! bind configures one. TCP (`ws://`, and `wss://` where a test runs over
+//! both [`NETS`]): the mutual PSK challenge-response, or a bearer token in
+//! the upgrade's `Authorization` header.
 
 use super::auth::{self, ClientCred, Psk, Scope};
 use super::server::{self, read_frame, write_frame};
+use super::tests_tls::{test_ca, with_test_tls};
+use super::tls::{Binding, Verify, Wire};
 use super::ws;
 use super::{ConnectOptions, FerroStore, FerroStoreServer, Inner, ServerAuth};
 use fl_core::StoreError;
@@ -43,6 +46,74 @@ pub(super) fn ws_client(addr: SocketAddr) -> FerroStore {
     FerroStore::connect_with(&format!("ws://{addr}"), &psk_options()).unwrap()
 }
 
+/// The TCP transports a test runs over: plain `ws://`, and `wss://` with
+/// the test certificate, whose clients trust the test CA alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Net {
+    Ws,
+    Wss,
+}
+
+pub(super) const NETS: [Net; 2] = [Net::Ws, Net::Wss];
+
+impl Net {
+    /// The URI of the server at `addr`.
+    pub(super) fn url(self, addr: SocketAddr) -> String {
+        match self {
+            Net::Ws => format!("ws://{addr}"),
+            Net::Wss => format!("wss://{addr}"),
+        }
+    }
+
+    /// `auth`, with the test certificate over `wss://`.
+    pub(super) fn auth(self, auth: ServerAuth) -> ServerAuth {
+        match self {
+            Net::Ws => auth,
+            Net::Wss => with_test_tls(auth),
+        }
+    }
+
+    /// `options`, trusting the test CA over `wss://`.
+    pub(super) fn options(self, options: ConnectOptions) -> ConnectOptions {
+        match self {
+            Net::Ws => options,
+            Net::Wss => options.ca_file(test_ca()),
+        }
+    }
+
+    /// How a raw client checks the server.
+    pub(super) fn verify(self) -> Option<Verify> {
+        match self {
+            Net::Ws => None,
+            Net::Wss => Some(Verify::CaFile(test_ca())),
+        }
+    }
+
+    /// A served test store over this transport under `auth`.
+    pub(super) fn serve(self, store: FerroStore, auth: ServerAuth) -> FerroStoreServer {
+        FerroStoreServer::bind_tcp("127.0.0.1:0", store, self.auth(auth)).unwrap()
+    }
+
+    /// A client of the server at `addr` under the test PSK.
+    pub(super) fn psk_client(self, addr: SocketAddr) -> FerroStore {
+        FerroStore::connect_with(&self.url(addr), &self.options(psk_options())).unwrap()
+    }
+
+    fn token_client(self, addr: SocketAddr, token: &str) -> Result<FerroStore, StoreError> {
+        FerroStore::connect_with(&self.url(addr), &self.options(ConnectOptions::token(token)))
+    }
+
+    fn token_raw(self, addr: SocketAddr, token: &str) -> server::RemoteClient {
+        server::connect_tcp(
+            &addr.to_string(),
+            &ClientCred::Bearer(token.to_string()),
+            false,
+            self.verify().as_ref(),
+        )
+        .unwrap()
+    }
+}
+
 fn remote(store: &FerroStore) -> &server::RemoteClient {
     match &store.inner {
         Inner::Remote(remote) => remote,
@@ -63,27 +134,39 @@ fn unhex32(text: &str) -> [u8; 32] {
     out
 }
 
-/// A raw `ws://` connection the test drives frame by frame.
-struct RawWs {
-    stream: TcpStream,
+/// A raw `ws://` or `wss://` connection the test drives frame by frame.
+pub(super) struct RawWs {
+    pub(super) stream: Wire,
+    /// The writing half, kept open with the reading one.
+    pub(super) write_half: Wire,
 }
 
 impl RawWs {
-    fn connect(addr: SocketAddr, bearer: Option<&str>) -> Self {
-        let stream = ws::connect(&addr.to_string(), bearer, |_| Ok(())).unwrap();
+    pub(super) fn over(net: Net, addr: SocketAddr, bearer: Option<&str>) -> Self {
+        let (stream, write) =
+            server::dial_wire(&addr.to_string(), bearer, net.verify().as_ref(), |_| Ok(()))
+                .unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        Self { stream }
+        Self {
+            stream,
+            write_half: write,
+        }
     }
 
-    fn send(&mut self, value: &Value) {
+    /// This connection's TLS channel binding (`None` over `ws://`).
+    pub(super) fn binding(&self) -> Option<Binding> {
+        self.stream.channel_binding().unwrap()
+    }
+
+    pub(super) fn send(&mut self, value: &Value) {
         let bytes = serde_json::to_vec(value).unwrap();
-        ws::write_frame(&mut self.stream, true, 0x1, &bytes).unwrap();
+        ws::write_frame(&mut self.write_half, true, 0x1, &bytes).unwrap();
     }
 
     /// The next JSON frame; `None` once the server closed.
-    fn recv(&mut self) -> Option<Value> {
+    pub(super) fn recv(&mut self) -> Option<Value> {
         match ws::read_event(&mut self.stream, true, ws::MAX_PAYLOAD) {
             Ok(ws::WsEvent::Data(payload)) => Some(serde_json::from_slice(&payload).unwrap()),
             Ok(ws::WsEvent::Ping(_)) => self.recv(),
@@ -91,16 +174,18 @@ impl RawWs {
         }
     }
 
-    /// The server's challenge nonce.
-    fn challenge(&mut self) -> [u8; 32] {
+    /// The server's challenge nonce. Its version is 1 over `ws://` and 2,
+    /// bound to the TLS session, over `wss://`.
+    pub(super) fn challenge(&mut self) -> [u8; 32] {
         let frame = self.recv().expect("a challenge");
         assert_eq!(frame["auth"], "challenge", "{frame}");
-        assert_eq!(frame["v"], 1, "{frame}");
+        let version = if self.binding().is_some() { 2 } else { 1 };
+        assert_eq!(frame["v"], version, "{frame}");
         unhex32(frame["ns"].as_str().unwrap())
     }
 
     /// Send a PSK hello; the server's answer, `None` when it closed.
-    fn hello(&mut self, nc: &[u8; 32], proof: &[u8]) -> Option<Value> {
+    pub(super) fn hello(&mut self, nc: &[u8; 32], proof: &[u8]) -> Option<Value> {
         self.hello_value(&json!({"auth": "psk", "nc": hex(nc), "proof": hex(proof)}))
     }
 
@@ -111,7 +196,7 @@ impl RawWs {
     }
 
     /// After a refusal: the failure frame, then the close.
-    fn refused(&mut self, first: Option<Value>) {
+    pub(super) fn refused(&mut self, first: Option<Value>) {
         assert_eq!(
             first,
             Some(json!({"auth": "failed", "error": "authentication failed"}))
@@ -160,6 +245,14 @@ fn token_client(addr: SocketAddr, token: &str) -> Result<FerroStore, StoreError>
 /// A served in-memory store over TCP that accepts `n` write-scope tokens,
 /// each its own principal; the tokens.
 pub(super) fn token_principals(n: usize) -> (FerroStoreServer, Vec<String>, tempfile::TempDir) {
+    token_principals_over(Net::Ws, n)
+}
+
+/// [`token_principals`] over `net`.
+pub(super) fn token_principals_over(
+    net: Net,
+    n: usize,
+) -> (FerroStoreServer, Vec<String>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let tokens: Vec<String> = (0..n).map(|i| format!("principal-token-{i:04}")).collect();
     let lines: String = tokens
@@ -167,7 +260,7 @@ pub(super) fn token_principals(n: usize) -> (FerroStoreServer, Vec<String>, temp
         .map(|token| format!("{} write\n", sha256_hex(token)))
         .collect();
     let path = token_file(dir.path(), &lines);
-    let server = serve_tcp(
+    let server = net.serve(
         FerroStore::in_memory(),
         ServerAuth::new().with_token_file(&path).unwrap(),
     );
@@ -323,19 +416,27 @@ fn a_psk_client_refuses_a_unix_server_that_proves_nothing() {
 
 #[test]
 fn the_psk_handshake_serves_a_client_with_the_psk() {
-    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
-    let client = ws_client(server.local_addr());
-    client.put_doc("docs", "a", &json!({"n": 1})).unwrap();
-    assert_eq!(client.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
-    // PSK connections hold the admin scope.
-    remote(&client).call("checkpoint", json!({})).unwrap();
-    remote(&client).call("compact", json!({})).unwrap();
+    for net in NETS {
+        let server = net.serve(FerroStore::in_memory(), psk_auth());
+        let client = net.psk_client(server.local_addr());
+        client.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        assert_eq!(client.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+        // PSK connections hold the admin scope.
+        remote(&client).call("checkpoint", json!({})).unwrap();
+        remote(&client).call("compact", json!({})).unwrap();
+    }
 }
 
 #[test]
 fn the_server_refuses_a_wrong_psk_and_a_wrong_server_id() {
-    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
-    let url = format!("ws://{}", server.local_addr());
+    for net in NETS {
+        refuses_a_wrong_psk_and_a_wrong_server_id(net);
+    }
+}
+
+fn refuses_a_wrong_psk_and_a_wrong_server_id(net: Net) {
+    let server = net.serve(FerroStore::in_memory(), psk_auth());
+    let url = net.url(server.local_addr());
     let before = server.dispatched();
     for options in [
         ConnectOptions::psk(
@@ -345,11 +446,13 @@ fn the_server_refuses_a_wrong_psk_and_a_wrong_server_id() {
         ConnectOptions::psk("some-other-store", TEST_PSK),
         ConnectOptions::new(),
     ] {
-        let err = FerroStore::connect_with(&url, &options).err().unwrap();
+        let err = FerroStore::connect_with(&url, &net.options(options))
+            .err()
+            .unwrap();
         let message = err.to_string();
         assert!(
             message.contains(auth::AUTH_FAILED) || message.contains("requires authentication"),
-            "{message}"
+            "{net:?}: {message}"
         );
     }
     assert_eq!(server.dispatched(), before);
@@ -396,7 +499,7 @@ fn the_client_refuses_a_server_that_does_not_hold_the_psk() {
         // Proof under another PSK.
         Box::new(move |hello, ns| {
             let nc = unhex32(hello["nc"].as_str().unwrap());
-            json!({"auth": "ok", "scope": "admin", "proof": hex(&wrong.server_proof(&nc, ns))})
+            json!({"auth": "ok", "scope": "admin", "proof": hex(&wrong.server_proof(&nc, ns, None))})
         }),
         // No proof at all.
         Box::new(|_, _| json!({"auth": "ok", "scope": "admin"})),
@@ -418,7 +521,7 @@ fn the_client_refuses_a_server_that_does_not_hold_the_psk() {
     let right = Psk::new(TEST_SERVER_ID, TEST_PSK).unwrap();
     let (uri, _handle, _dir) = fake_server(move |hello, ns| {
         let nc = unhex32(hello["nc"].as_str().unwrap());
-        json!({"auth": "ok", "scope": "admin", "proof": hex(&right.server_proof(&nc, ns))})
+        json!({"auth": "ok", "scope": "admin", "proof": hex(&right.server_proof(&nc, ns, None))})
     });
     FerroStore::connect_with(&uri, &psk_options()).unwrap();
 }
@@ -427,42 +530,53 @@ fn the_client_refuses_a_server_that_does_not_hold_the_psk() {
 /// the other, and no proof outlives the connection whose nonce it covers.
 #[test]
 fn psk_handshake_is_not_open_to_a_reflection_or_a_replay() {
-    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    for net in NETS {
+        not_open_to_a_reflection_or_a_replay(net);
+    }
+}
+
+fn not_open_to_a_reflection_or_a_replay(net: Net) {
+    let server = net.serve(FerroStore::in_memory(), psk_auth());
     let addr = server.local_addr();
     let psk = Psk::new(TEST_SERVER_ID, TEST_PSK).unwrap();
     let before = server.dispatched();
 
     // An honest connection, recorded.
-    let mut honest = RawWs::connect(addr, None);
+    let mut honest = RawWs::over(net, addr, None);
+    let bound = honest.binding();
+    assert_eq!(bound.is_some(), net == Net::Wss);
     let ns_a = honest.challenge();
     let nc_a = [0x11u8; 32];
-    let client_a = psk.client_proof(&ns_a, &nc_a);
+    let client_a = psk.client_proof(&ns_a, &nc_a, bound.as_ref());
     let ok = honest.hello(&nc_a, &client_a).expect("an answer");
     assert_eq!(ok["auth"], "ok", "{ok}");
     assert_eq!(ok["scope"], "admin", "{ok}");
     let server_a = unhex32(ok["proof"].as_str().unwrap());
-    assert!(psk.verify_server(&nc_a, &ns_a, &server_a));
+    assert!(psk.verify_server(&nc_a, &ns_a, bound.as_ref(), &server_a));
 
     // Direction separation: the server's proof is no client proof for the
     // transposed transcript (a server that had issued `nc_a`), and the
     // client's proof is no server proof for it.
-    assert!(!psk.verify_client(&nc_a, &ns_a, &server_a));
-    assert!(!psk.verify_server(&ns_a, &nc_a, &client_a));
+    assert!(!psk.verify_client(&nc_a, &ns_a, bound.as_ref(), &server_a));
+    assert!(!psk.verify_server(&ns_a, &nc_a, bound.as_ref(), &client_a));
 
     // The server's proof, presented as a client proof over its own nonce.
-    let mut reflect = RawWs::connect(addr, None);
+    let mut reflect = RawWs::over(net, addr, None);
     let ns_b = reflect.challenge();
     let answer = reflect.hello(&ns_a, &server_a);
     reflect.refused(answer);
 
     // The server's challenge echoed back as the client nonce.
-    let mut echo = RawWs::connect(addr, None);
+    let mut echo = RawWs::over(net, addr, None);
     let ns_c = echo.challenge();
-    let answer = echo.hello(&ns_c, &psk.client_proof(&ns_c, &ns_c));
+    let answer = echo.hello(
+        &ns_c,
+        &psk.client_proof(&ns_c, &ns_c, echo.binding().as_ref()),
+    );
     echo.refused(answer);
 
     // A captured client hello replayed on a new connection: a fresh `ns`.
-    let mut replay = RawWs::connect(addr, None);
+    let mut replay = RawWs::over(net, addr, None);
     let ns_d = replay.challenge();
     assert_ne!(ns_d, ns_a, "every connection gets a fresh nonce");
     assert_ne!(ns_d, ns_b);
@@ -476,14 +590,21 @@ fn psk_handshake_is_not_open_to_a_reflection_or_a_replay() {
 
 #[test]
 fn a_bearer_token_gets_its_scope_and_no_more() {
+    for net in NETS {
+        a_bearer_token_gets_its_scope(net);
+    }
+}
+
+fn a_bearer_token_gets_its_scope(net: Net) {
     let dir = tempfile::tempdir().unwrap();
     let tokens = three_tokens(dir.path());
     let file = dir.path().join("s.fls");
-    let server = serve_tcp(
+    let server = net.serve(
         FerroStore::open(&file).unwrap(),
         ServerAuth::new().with_token_file(&tokens).unwrap(),
     );
     let addr = server.local_addr();
+    let token_client = |addr: SocketAddr, token: &str| net.token_client(addr, token);
 
     let admin = token_client(addr, ADMIN_TOKEN).unwrap();
     admin.put_doc("docs", "a", &json!(1)).unwrap();
@@ -537,7 +658,7 @@ fn a_bearer_token_gets_its_scope_and_no_more() {
     let err = token_client(addr, "no-such-token").err().unwrap();
     assert!(err.to_string().contains(auth::AUTH_FAILED), "{err}");
     // A PSK client of a token-only server is refused too.
-    let err = FerroStore::connect_with(&format!("ws://{addr}"), &psk_options())
+    let err = FerroStore::connect_with(&net.url(addr), &net.options(psk_options()))
         .err()
         .unwrap();
     assert!(err.to_string().contains(auth::AUTH_FAILED), "{err}");
@@ -703,7 +824,15 @@ fn the_uri_names_only_a_ferrostore_variable_never_a_file_or_a_secret() {
         .err()
         .unwrap();
     assert!(err.to_string().contains("unix:// and ws://"), "{err}");
-    // A bearer token is for ws:// alone.
+    // A TLS option outside wss:// is refused: it would check nothing.
+    let err = FerroStore::connect_with(
+        &format!("ws://{}", by_psk.local_addr()),
+        &psk_options().ca_file(test_ca()),
+    )
+    .err()
+    .unwrap();
+    assert!(err.to_string().contains("wss:// only"), "{err}");
+    // A bearer token is for ws:// and wss:// alone.
     let err = FerroStore::connect_with(
         &format!("unix://{}", dir.path().join("none.sock").display()),
         &ConnectOptions::token(WRITE_TOKEN),
@@ -912,7 +1041,13 @@ fn every_method_the_server_dispatches_is_classified_once() {
 
 #[test]
 fn no_request_runs_before_the_connection_authenticates() {
-    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
+    for net in NETS {
+        no_request_runs_before_authentication(net);
+    }
+}
+
+fn no_request_runs_before_authentication(net: Net) {
+    let server = net.serve(FerroStore::in_memory(), psk_auth());
     let addr = server.local_addr();
     let before = server.dispatched();
     for request in [
@@ -924,7 +1059,7 @@ fn no_request_runs_before_the_connection_authenticates() {
         // challenge. The counter is checked before the frames: a server
         // that ran the request has already counted it when it replies.
         for read_challenge_first in [false, true] {
-            let mut raw = RawWs::connect(addr, None);
+            let mut raw = RawWs::over(net, addr, None);
             if read_challenge_first {
                 raw.challenge();
             }
@@ -954,14 +1089,20 @@ fn no_request_runs_before_the_connection_authenticates() {
 
 #[test]
 fn a_failed_authentication_closes_after_the_fixed_delay_and_names_no_check() {
+    for net in NETS {
+        a_failed_authentication_names_no_check(net);
+    }
+}
+
+fn a_failed_authentication_names_no_check(net: Net) {
     let dir = tempfile::tempdir().unwrap();
     let tokens = three_tokens(dir.path());
-    let server = serve_tcp(
+    let server = net.serve(
         FerroStore::in_memory(),
         psk_auth().with_token_file(&tokens).unwrap(),
     );
     let addr = server.local_addr();
-    let url = format!("ws://{addr}");
+    let url = net.url(addr);
     let mut messages = BTreeSet::new();
 
     let started = Instant::now();
@@ -970,7 +1111,7 @@ fn a_failed_authentication_closes_after_the_fixed_delay_and_names_no_check() {
         b"another-32-byte-pre-shared-key!!".as_slice(),
     );
     messages.insert(
-        FerroStore::connect_with(&url, &wrong)
+        FerroStore::connect_with(&url, &net.options(wrong))
             .err()
             .unwrap()
             .to_string(),
@@ -978,10 +1119,10 @@ fn a_failed_authentication_closes_after_the_fixed_delay_and_names_no_check() {
     assert!(started.elapsed() >= auth::AUTH_FAIL_DELAY, "wrong PSK");
 
     let started = Instant::now();
-    messages.insert(token_client(addr, "unknown").err().unwrap().to_string());
+    messages.insert(net.token_client(addr, "unknown").err().unwrap().to_string());
     assert!(started.elapsed() >= auth::AUTH_FAIL_DELAY, "unknown token");
 
-    let mut raw = RawWs::connect(addr, None);
+    let mut raw = RawWs::over(net, addr, None);
     raw.challenge();
     let started = Instant::now();
     raw.send(&json!({"auth": "psk", "nc": "zz"}));
@@ -1007,7 +1148,7 @@ fn bind_tcp_without_authentication_is_an_error() {
 // ---- unauthenticated peers are bounded ---------------------------------------------
 
 /// Wait until `server` has `n` connections authenticating.
-fn wait_handshakes(server: &FerroStoreServer, n: usize) {
+pub(super) fn wait_handshakes(server: &FerroStoreServer, n: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while server.handshakes_in_flight() != n {
         assert!(
@@ -1020,7 +1161,7 @@ fn wait_handshakes(server: &FerroStoreServer, n: usize) {
 }
 
 /// `true` once `stream` reads end-of-stream (or a reset) within `within`.
-fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
+pub(super) fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
     stream
         .set_read_timeout(Some(Duration::from_millis(20)))
         .unwrap();
@@ -1124,8 +1265,14 @@ fn a_trickling_handshake_is_cut_off_at_the_total_deadline() {
 /// server answers at once, without waiting for (or allocating) the payload.
 #[test]
 fn an_oversized_hello_is_refused_from_its_declared_length() {
-    let server = serve_tcp(FerroStore::in_memory(), psk_auth());
-    let mut raw = RawWs::connect(server.local_addr(), None);
+    for net in NETS {
+        an_oversized_hello_is_refused(net);
+    }
+}
+
+fn an_oversized_hello_is_refused(net: Net) {
+    let server = net.serve(FerroStore::in_memory(), psk_auth());
+    let mut raw = RawWs::over(net, server.local_addr(), None);
     raw.challenge();
     let mut header = vec![0x81, 0x80 | 127];
     header.extend_from_slice(&(1u64 << 20).to_be_bytes());
@@ -1160,7 +1307,7 @@ fn an_oversized_hello_is_refused_from_its_declared_length() {
         json!({"auth": "failed", "error": "authentication failed"})
     );
     // A hello at the limit is read whole (and refused as malformed).
-    let mut raw = RawWs::connect(server.local_addr(), None);
+    let mut raw = RawWs::over(net, server.local_addr(), None);
     raw.challenge();
     let padding = "x".repeat(auth::PRE_AUTH_FRAME_BYTES - 40);
     let answer = raw.hello_value(&json!({"auth": "psk", "pad": padding}));
@@ -1239,12 +1386,18 @@ fn the_129th_concurrent_unauthenticated_connection_is_refused() {
 
 #[test]
 fn one_credential_holds_at_most_a_quarter_of_the_sessions() {
+    for net in NETS {
+        one_credential_holds_a_quarter_of_the_sessions(net);
+    }
+}
+
+fn one_credential_holds_a_quarter_of_the_sessions(net: Net) {
     use super::session::{SESSION_QUOTA, SESSIONS_PER_CONN, SESSIONS_PER_PRINCIPAL};
     assert_eq!(SESSIONS_PER_PRINCIPAL, 256);
-    let (server, tokens, _dir) = token_principals(2);
+    let (server, tokens, _dir) = token_principals_over(net, 2);
     let addr = server.local_addr();
     let hog: Vec<server::RemoteClient> = (0..SESSIONS_PER_PRINCIPAL / SESSIONS_PER_CONN + 1)
-        .map(|_| token_raw(addr, &tokens[0]))
+        .map(|_| net.token_raw(addr, &tokens[0]))
         .collect();
     let open = |client: &server::RemoteClient| client.call("open_session", json!({}));
     for client in &hog[..hog.len() - 1] {
@@ -1264,7 +1417,7 @@ fn one_credential_holds_at_most_a_quarter_of_the_sessions() {
         .unwrap_err();
     assert!(err.to_string().contains(SESSION_QUOTA), "{err}");
     // Another credential is not.
-    let other = token_raw(addr, &tokens[1]);
+    let other = net.token_raw(addr, &tokens[1]);
     open(&other).unwrap();
     assert_eq!(server.open_sessions(), SESSIONS_PER_PRINCIPAL + 1);
 }
@@ -1274,11 +1427,17 @@ fn one_credential_holds_at_most_a_quarter_of_the_sessions() {
 /// principal's id for another method is refused and runs nothing.
 #[test]
 fn a_request_id_is_per_credential_and_names_one_method() {
+    for net in NETS {
+        a_request_id_is_per_credential(net);
+    }
+}
+
+fn a_request_id_is_per_credential(net: Net) {
     use super::session::DEDUP_OTHER_METHOD;
-    let (server, tokens, _dir) = token_principals(2);
+    let (server, tokens, _dir) = token_principals_over(net, 2);
     let addr = server.local_addr();
-    let a = token_raw(addr, &tokens[0]);
-    let b = token_raw(addr, &tokens[1]);
+    let a = net.token_raw(addr, &tokens[0]);
+    let b = net.token_raw(addr, &tokens[1]);
     let store = server.store();
     let req = format!("{:032x}", 0xfeed_u128);
 

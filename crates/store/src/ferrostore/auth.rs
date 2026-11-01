@@ -21,8 +21,10 @@
 //!
 //! [`FerroStoreServer::bind_unix_with`]: super::FerroStoreServer::bind_unix_with
 
+use super::bind;
 use super::layout::backend;
 use super::server::{Incoming, JsonIo};
+use super::tls::{self, Binding, ServerTls, Verify};
 use fl_core::StoreError;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -56,12 +58,20 @@ pub(super) const AUTH_FAILED: &str = "FerroStore authentication failed";
 /// The `error` of the failure frame: it names no check.
 const FAILED_FRAME_ERROR: &str = "authentication failed";
 
-/// The labels of the two proofs: the same length, and never equal, so a
-/// proof made in one direction is never valid in the other.
+/// The labels of the two proofs over a Unix socket or plain `ws://`
+/// (version 1): the same length, and never equal, so a proof made in one
+/// direction is never valid in the other.
 const CLIENT_LABEL: &[u8; 17] = b"fl-store/1/client";
 const SERVER_LABEL: &[u8; 17] = b"fl-store/1/server";
-/// The handshake version the challenge names.
+/// The labels over `wss://` (version 2), whose input also ends with the
+/// TLS channel binding (spec §6.3). They differ from the version-1 labels,
+/// so a proof of one version is never valid in the other.
+const CLIENT_LABEL_TLS: &[u8; 17] = b"fl-store/2/client";
+const SERVER_LABEL_TLS: &[u8; 17] = b"fl-store/2/server";
+/// The handshake version the challenge names: 1 without TLS.
 const AUTH_VERSION: u64 = 1;
+/// The handshake version over TLS: the proofs are bound to the TLS session.
+const AUTH_VERSION_TLS: u64 = 2;
 const NONCE_LEN: usize = 32;
 /// The shortest PSK accepted, in bytes.
 pub(super) const MIN_PSK_LEN: usize = 32;
@@ -238,18 +248,36 @@ impl Psk {
         })
     }
 
-    /// `label ‖ len(server_id) as one byte ‖ server_id ‖ first ‖ second`:
-    /// every part but `server_id` has a fixed length, and its length is
-    /// written first, so no two inputs read the same.
-    fn input(&self, label: &[u8; 17], first: &Nonce, second: &Nonce) -> Vec<u8> {
+    /// Without TLS (`binding` is `None`):
+    /// `label ‖ len(server_id) as one byte ‖ server_id ‖ first ‖ second`.
+    /// Over TLS: the same with the version-2 label, then the 32-byte TLS
+    /// exporter `binding` at the end. Every part but `server_id` has a fixed
+    /// length, its length is written first, and the label names whether a
+    /// binding follows, so no two inputs read the same.
+    fn input(
+        &self,
+        labels: (&[u8; 17], &[u8; 17]),
+        first: &Nonce,
+        second: &Nonce,
+        binding: Option<&Binding>,
+    ) -> Vec<u8> {
+        let label = if binding.is_some() {
+            labels.1
+        } else {
+            labels.0
+        };
         let id = self.server_id.as_bytes();
-        let mut input = Vec::with_capacity(label.len() + 1 + id.len() + 2 * NONCE_LEN);
+        let mut input =
+            Vec::with_capacity(label.len() + 1 + id.len() + 2 * NONCE_LEN + tls::BINDING_LEN);
         input.extend_from_slice(label);
         // `check_server_id` bounds it to one byte.
         input.push(u8::try_from(id.len()).unwrap_or(u8::MAX));
         input.extend_from_slice(id);
         input.extend_from_slice(first);
         input.extend_from_slice(second);
+        if let Some(binding) = binding {
+            input.extend_from_slice(binding);
+        }
         input
     }
 
@@ -260,24 +288,52 @@ impl Psk {
         out
     }
 
-    /// `HMAC-SHA256(psk, "fl-store/1/client" ‖ server_id ‖ ns ‖ nc)`.
-    pub(super) fn client_proof(&self, ns: &Nonce, nc: &Nonce) -> [u8; 32] {
-        self.sign(&self.input(CLIENT_LABEL, ns, nc))
+    /// `HMAC-SHA256(psk, "fl-store/1/client" ‖ L ‖ server_id ‖ ns ‖ nc)`,
+    /// or over TLS
+    /// `HMAC-SHA256(psk, "fl-store/2/client" ‖ L ‖ server_id ‖ ns ‖ nc ‖ binding)`.
+    pub(super) fn client_proof(
+        &self,
+        ns: &Nonce,
+        nc: &Nonce,
+        binding: Option<&Binding>,
+    ) -> [u8; 32] {
+        self.sign(&self.input((CLIENT_LABEL, CLIENT_LABEL_TLS), ns, nc, binding))
     }
 
-    /// `HMAC-SHA256(psk, "fl-store/1/server" ‖ server_id ‖ nc ‖ ns)`.
-    pub(super) fn server_proof(&self, nc: &Nonce, ns: &Nonce) -> [u8; 32] {
-        self.sign(&self.input(SERVER_LABEL, nc, ns))
+    /// `HMAC-SHA256(psk, "fl-store/1/server" ‖ L ‖ server_id ‖ nc ‖ ns)`,
+    /// or over TLS
+    /// `HMAC-SHA256(psk, "fl-store/2/server" ‖ L ‖ server_id ‖ nc ‖ ns ‖ binding)`.
+    pub(super) fn server_proof(
+        &self,
+        nc: &Nonce,
+        ns: &Nonce,
+        binding: Option<&Binding>,
+    ) -> [u8; 32] {
+        self.sign(&self.input((SERVER_LABEL, SERVER_LABEL_TLS), nc, ns, binding))
     }
 
     /// [`Self::client_proof`] checked in constant time.
-    pub(super) fn verify_client(&self, ns: &Nonce, nc: &Nonce, proof: &[u8]) -> bool {
-        hmac::verify(&self.key, &self.input(CLIENT_LABEL, ns, nc), proof).is_ok()
+    pub(super) fn verify_client(
+        &self,
+        ns: &Nonce,
+        nc: &Nonce,
+        binding: Option<&Binding>,
+        proof: &[u8],
+    ) -> bool {
+        let input = self.input((CLIENT_LABEL, CLIENT_LABEL_TLS), ns, nc, binding);
+        hmac::verify(&self.key, &input, proof).is_ok()
     }
 
     /// [`Self::server_proof`] checked in constant time.
-    pub(super) fn verify_server(&self, nc: &Nonce, ns: &Nonce, proof: &[u8]) -> bool {
-        hmac::verify(&self.key, &self.input(SERVER_LABEL, nc, ns), proof).is_ok()
+    pub(super) fn verify_server(
+        &self,
+        nc: &Nonce,
+        ns: &Nonce,
+        binding: Option<&Binding>,
+        proof: &[u8],
+    ) -> bool {
+        let input = self.input((SERVER_LABEL, SERVER_LABEL_TLS), nc, ns, binding);
+        hmac::verify(&self.key, &input, proof).is_ok()
     }
 }
 
@@ -413,24 +469,33 @@ fn check_token(token: &str) -> Result<(), StoreError> {
 // ---- the server's configuration ---------------------------------------------------
 
 /// How a [`FerroStoreServer`](super::FerroStoreServer) authenticates its
-/// connections (spec §6.2).
+/// connections (spec §6.2), and how its TCP bind is secured (spec §6.3).
 ///
 /// `bind_tcp` needs a PSK, a token file, or both. On a Unix socket the
 /// peer's uid is always checked; `bind_unix_with` given a PSK requires the
-/// PSK as well. A token file applies to `ws://` alone.
+/// PSK as well. A token file, TLS and `allow_plaintext_on` apply to TCP
+/// alone.
+///
+/// With [`Self::with_tls_files`], `bind_tcp` serves `wss://` and may bind any
+/// address. Without TLS it serves plain `ws://` and binds a loopback address,
+/// or an address of an interface named in [`Self::allow_plaintext_on`];
+/// anything else, the unspecified `0.0.0.0` and `::` included, is refused.
 ///
 /// ```no_run
 /// use fl_store::ferrostore::{FerroStore, FerroStoreServer, ServerAuth};
 /// let auth = ServerAuth::new()
 ///     .with_psk_file("lab-store", "/etc/ferrostore/psk")?
-///     .with_token_file("/etc/ferrostore/tokens")?;
-/// let server = FerroStoreServer::bind_tcp("127.0.0.1:7878", FerroStore::in_memory(), auth)?;
+///     .with_token_file("/etc/ferrostore/tokens")?
+///     .with_tls_files("/etc/ferrostore/cert.pem", "/etc/ferrostore/key.pem")?;
+/// let server = FerroStoreServer::bind_tcp("0.0.0.0:7878", FerroStore::in_memory(), auth)?;
 /// # Ok::<(), fl_core::StoreError>(())
 /// ```
 #[derive(Default)]
 pub struct ServerAuth {
     psk: Option<Psk>,
     tokens: Option<TokenTable>,
+    tls: Option<ServerTls>,
+    allow_plaintext_on: Vec<String>,
 }
 
 impl std::fmt::Debug for ServerAuth {
@@ -441,6 +506,8 @@ impl std::fmt::Debug for ServerAuth {
                 "tokens",
                 &self.tokens.as_ref().map(|table| table.entries.len()),
             )
+            .field("tls", &self.tls.is_some())
+            .field("allow_plaintext_on", &self.allow_plaintext_on)
             .finish()
     }
 }
@@ -489,6 +556,37 @@ impl ServerAuth {
         Ok(self)
     }
 
+    /// Serve `wss://`: TLS with the certificate chain in the PEM file
+    /// `cert_chain` (leaf first) and the private key in the PEM file `key`
+    /// (PKCS#8, PKCS#1 or SEC1). The key file is a secret file, under the
+    /// same rules as a PSK file (mode 0600 or stricter, owned by this uid or
+    /// root, no FIFO). TLS 1.3 is preferred and TLS 1.2 allowed.
+    pub fn with_tls_files(
+        mut self,
+        cert_chain: impl AsRef<Path>,
+        key: impl AsRef<Path>,
+    ) -> Result<Self, StoreError> {
+        self.tls = Some(ServerTls::from_pem_files(
+            cert_chain.as_ref(),
+            key.as_ref(),
+        )?);
+        Ok(self)
+    }
+
+    /// Let plain `ws://` bind an address of one of these interfaces (by
+    /// name: `["tailscale0"]`) as well as loopback. The bound address must
+    /// be one of the named interface's own; `0.0.0.0` and `::` are refused
+    /// whatever is named. Authentication is still required there.
+    #[must_use]
+    pub fn allow_plaintext_on<I, S>(mut self, interfaces: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allow_plaintext_on = interfaces.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// `true` when a TCP client has a way in.
     pub(super) fn any_method(&self) -> bool {
         self.psk.is_some() || self.tokens.is_some()
@@ -496,6 +594,39 @@ impl ServerAuth {
 
     pub(super) fn has_tokens(&self) -> bool {
         self.tokens.is_some()
+    }
+
+    /// The TLS configuration, when the server serves `wss://`.
+    pub(super) fn tls(&self) -> Option<&ServerTls> {
+        self.tls.as_ref()
+    }
+
+    /// `true` when this names anything only a TCP bind uses beyond the
+    /// token file: TLS or `allow_plaintext_on`.
+    pub(super) fn has_tcp_transport(&self) -> bool {
+        self.tls.is_some() || !self.allow_plaintext_on.is_empty()
+    }
+
+    /// `Ok` when `addr` may be bound: anything with TLS; without it, see
+    /// [`bind::check_plaintext_bind`]. `Some(name)`: a plaintext bind on an
+    /// address of the named interface `name`, which the listener must be
+    /// pinned to (`SO_BINDTODEVICE`, [`bind::listen`]).
+    pub(super) fn check_bind(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Result<Option<String>, StoreError> {
+        if self.tls.is_some() {
+            return Ok(None);
+        }
+        // The unspecified address, or nothing named, needs no interface
+        // list. A loopback address does when an interface is named: `lo`
+        // named pins the listener to `lo`.
+        if addr.ip().is_unspecified() || self.allow_plaintext_on.is_empty() {
+            return bind::check_plaintext_bind(addr, &self.allow_plaintext_on, &[]);
+        }
+        let interfaces = bind::interfaces()
+            .map_err(|err| backend(format!("list network interfaces (getifaddrs): {err}")))?;
+        bind::check_plaintext_bind(addr, &self.allow_plaintext_on, &interfaces)
     }
 }
 
@@ -741,14 +872,24 @@ fn send_ok(write: &mut dyn JsonIo, scope: Scope, proof: Option<&[u8; 32]>) -> Re
 
 /// The server's half of the mutual PSK challenge-response. A server with no
 /// PSK still sends its challenge, and refuses every answer.
+///
+/// Over TLS the challenge names version 2 and both proofs cover the
+/// connection's channel binding (spec §6.3); a TLS connection whose binding
+/// cannot be read is refused, never served unbound.
 fn psk_exchange(
     read: &mut dyn JsonIo,
     write: &mut dyn JsonIo,
     psk: Option<&Psk>,
 ) -> Result<Scope, ()> {
+    let binding = read.channel_binding().map_err(|_| ())?;
+    let version = if binding.is_some() {
+        AUTH_VERSION_TLS
+    } else {
+        AUTH_VERSION
+    };
     let ns = random_nonce().map_err(|_| ())?;
     write
-        .write_value(&json!({"auth": "challenge", "v": AUTH_VERSION, "ns": hex(&ns)}))
+        .write_value(&json!({"auth": "challenge", "v": version, "ns": hex(&ns)}))
         .map_err(|_| ())?;
     let hello = match read.read_value(PRE_AUTH_FRAME_BYTES) {
         Ok(Incoming::Value(hello)) => hello,
@@ -760,10 +901,14 @@ fn psk_exchange(
     if nc == ns {
         return Err(());
     }
-    if !psk.verify_client(&ns, &nc, &proof) {
+    if !psk.verify_client(&ns, &nc, binding.as_ref(), &proof) {
         return Err(());
     }
-    send_ok(write, Scope::Admin, Some(&psk.server_proof(&nc, &ns)))
+    send_ok(
+        write,
+        Scope::Admin,
+        Some(&psk.server_proof(&nc, &ns, binding.as_ref())),
+    )
 }
 
 /// `{"auth": "psk", "nc": <64 hex>, "proof": <64 hex>}`, and nothing else.
@@ -857,7 +1002,7 @@ enum ClientAuth {
 /// The default is no credential: a Unix socket whose server checks the
 /// peer's uid alone. A PSK proves both sides to each other, over a Unix
 /// socket or `ws://`; the client refuses a server that cannot prove the same
-/// PSK under the `server_id` it expects. A bearer token is for `ws://`, sent
+/// PSK under the `server_id` it expects. A bearer token is for `ws://` and `wss://`, sent
 /// in the upgrade's `Authorization` header. A secret is read from a file
 /// (mode 0600 or stricter) or an environment variable at connect time.
 ///
@@ -867,11 +1012,23 @@ enum ClientAuth {
 /// Over plain `ws://` to an address that is not loopback, the client sends
 /// no bearer token and runs no PSK handshake unless
 /// [`Self::allow_plaintext`] is set: a token travels in clear there, and a
-/// PSK handshake can be relayed. `wss://` is the remote path (spec §6.3).
+/// PSK handshake can be relayed. `wss://` is the remote path (spec §6.3):
+/// there a credential goes to any host, inside TLS, and the PSK proofs are
+/// bound to the TLS session. A bearer token proves the client alone; the
+/// client knows the server only by TLS, so use a token over `wss://` (or
+/// to loopback, or an allowed plaintext interface on a network you trust).
+///
+/// A `wss://` client checks the server's certificate against the bundled
+/// Mozilla root certificates (`webpki-roots`) by default: they are compiled
+/// into the binary, and the OS trust store is not read. [`Self::ca_file`]
+/// trusts the CA in one PEM file instead (an enterprise or private CA), and [`Self::pin_spki_sha256`] trusts one server key. A URI never
+/// sets these.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOptions {
     auth: ClientAuth,
     allow_plaintext: bool,
+    ca_file: Option<PathBuf>,
+    pin: Option<String>,
 }
 
 impl ConnectOptions {
@@ -922,7 +1079,49 @@ impl ConnectOptions {
     fn with(auth: ClientAuth) -> Self {
         Self {
             auth,
-            allow_plaintext: false,
+            ..Self::default()
+        }
+    }
+
+    /// Over `wss://`, trust only the CA certificates in the PEM file at
+    /// `path` (not the bundled Mozilla roots). Use it for a server whose
+    /// certificate comes from an enterprise or private CA: the OS trust
+    /// store is never read. The server's chain must reach one of
+    /// them, be valid now, and name the URI's host.
+    #[must_use]
+    pub fn ca_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_file = Some(path.into());
+        self
+    }
+
+    /// Over `wss://`, trust the server whose leaf certificate's
+    /// SubjectPublicKeyInfo has this SHA-256 (64 hex digits, `:` between
+    /// bytes allowed), and no CA. The handshake must still be signed by that
+    /// key; the certificate's chain, name and dates are not checked (the
+    /// pinned key is the server's identity). Make a pin with
+    /// `openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum`.
+    #[must_use]
+    pub fn pin_spki_sha256(mut self, hex: impl Into<String>) -> Self {
+        self.pin = Some(hex.into());
+        self
+    }
+
+    /// `true` when these options name a TLS verification.
+    pub(super) fn has_tls_options(&self) -> bool {
+        self.ca_file.is_some() || self.pin.is_some()
+    }
+
+    /// How a `wss://` connection checks the server: the bundled Mozilla roots,
+    /// the CA file, or the pin; both named is an error.
+    pub(super) fn verify(&self) -> Result<Verify, StoreError> {
+        match (&self.ca_file, &self.pin) {
+            (None, None) => Ok(Verify::BundledRoots),
+            (Some(path), None) => Ok(Verify::CaFile(path.clone())),
+            (None, Some(pin)) => Ok(Verify::Pin(tls::parse_pin(pin)?)),
+            (Some(_), Some(_)) => Err(backend(
+                "ConnectOptions names both ca_file and pin_spki_sha256: choose one way to \
+                 check the server",
+            )),
         }
     }
 
@@ -1026,12 +1225,7 @@ pub(super) fn is_loopback(ip: IpAddr) -> bool {
     if LOOPBACK_IS_REMOTE.with(std::cell::Cell::get) {
         return false;
     }
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-    }
+    bind::ip_is_loopback(ip)
 }
 
 #[cfg(test)]
@@ -1153,7 +1347,15 @@ pub(super) fn client_handshake(
                      over ws://, a bearer token (ConnectOptions)",
                 ));
             };
-            if first.get("v").and_then(Value::as_u64) != Some(AUTH_VERSION) {
+            // Each side takes the version from its own transport: a client
+            // over TLS never answers an unbound (version 1) challenge.
+            let binding = read.channel_binding()?;
+            let version = if binding.is_some() {
+                AUTH_VERSION_TLS
+            } else {
+                AUTH_VERSION
+            };
+            if first.get("v").and_then(Value::as_u64) != Some(version) {
                 return Err(backend(
                     "the FerroStore server speaks another authentication version",
                 ));
@@ -1167,7 +1369,7 @@ pub(super) fn client_handshake(
             write.write_value(&json!({
                 "auth": "psk",
                 "nc": hex(&nc),
-                "proof": hex(&psk.client_proof(&ns, &nc)),
+                "proof": hex(&psk.client_proof(&ns, &nc, binding.as_ref())),
             }))?;
             let answer = recv_auth(read)?;
             match answer.get("auth").and_then(Value::as_str) {
@@ -1177,7 +1379,7 @@ pub(super) fn client_handshake(
                         .and_then(Value::as_str)
                         .and_then(unhex32)
                         .ok_or_else(|| unproven(psk))?;
-                    if !psk.verify_server(&nc, &ns, &proof) {
+                    if !psk.verify_server(&nc, &ns, binding.as_ref(), &proof) {
                         return Err(unproven(psk));
                     }
                     ok_scope(&answer)
@@ -1237,7 +1439,8 @@ mod tests {
     #[test]
     fn the_mac_input_is_fixed_length_but_for_the_length_prefixed_server_id() {
         let psk = Psk::new("ab", &[1u8; 32]).unwrap();
-        let input = psk.input(CLIENT_LABEL, &[2u8; 32], &[3u8; 32]);
+        let labels = (CLIENT_LABEL, CLIENT_LABEL_TLS);
+        let input = psk.input(labels, &[2u8; 32], &[3u8; 32], None);
         assert_eq!(input.len(), 17 + 1 + 2 + 64);
         assert_eq!(&input[..17], b"fl-store/1/client");
         assert_eq!(input[17], 2);
@@ -1247,9 +1450,31 @@ mod tests {
         // is a different input.
         let other = Psk::new("a", &[1u8; 32]).unwrap();
         assert_ne!(
-            other.client_proof(&[2u8; 32], &[3u8; 32]),
-            psk.client_proof(&[2u8; 32], &[3u8; 32])
+            other.client_proof(&[2u8; 32], &[3u8; 32], None),
+            psk.client_proof(&[2u8; 32], &[3u8; 32], None)
         );
+        // Over TLS: the version-2 label, and the 32-byte binding at the end.
+        let bound = psk.input(labels, &[2u8; 32], &[3u8; 32], Some(&[9u8; 32]));
+        assert_eq!(bound.len(), 17 + 1 + 2 + 64 + 32);
+        assert_eq!(&bound[..17], b"fl-store/2/client");
+        assert_eq!(&bound[17..17 + 1 + 2 + 64], &input[17..]);
+        assert_eq!(&bound[bound.len() - 32..], &[9u8; 32]);
+        let server = psk.input(
+            (SERVER_LABEL, SERVER_LABEL_TLS),
+            &[2u8; 32],
+            &[3u8; 32],
+            Some(&[9u8; 32]),
+        );
+        assert_eq!(&server[..17], b"fl-store/2/server");
+        for label in [CLIENT_LABEL, SERVER_LABEL] {
+            assert_ne!(label, CLIENT_LABEL_TLS);
+            assert_ne!(label, SERVER_LABEL_TLS);
+        }
+        // Another binding, or none, is another proof.
+        let proof = psk.client_proof(&[2u8; 32], &[3u8; 32], Some(&[9u8; 32]));
+        assert!(psk.verify_client(&[2u8; 32], &[3u8; 32], Some(&[9u8; 32]), &proof));
+        assert!(!psk.verify_client(&[2u8; 32], &[3u8; 32], Some(&[8u8; 32]), &proof));
+        assert!(!psk.verify_client(&[2u8; 32], &[3u8; 32], None, &proof));
     }
 
     #[test]

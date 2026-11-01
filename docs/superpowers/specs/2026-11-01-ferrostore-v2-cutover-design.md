@@ -383,24 +383,35 @@ A failed authentication closes the connection after a fixed delay. It says nothi
 - **Unauthenticated peers are bounded.** One total handshake deadline per connection (10 s from accept), enforced by the accept loop through the transport's `shutdown_both`, so it is transport-agnostic and `wss://` reuses it; at most 128 connections authenticate at once (more are closed at accept, with no thread started); frames before authentication are at most 4 KiB, checked from the declared length before allocating; the 16 KiB upgrade header block falls under the deadline.
 - **PSK encoding.** A PSK file or variable is 64+ hex digits (32+ random bytes), decoded to the key; anything else is refused with `head -c 32 /dev/urandom | xxd -p -c 64`. Programmatic PSKs are raw bytes (32+). This keeps a guessable passphrase out of a file, which over `ws://` the handshake would expose to an offline dictionary attack.
 - **URI credentials** name only a `FERROSTORE_*` environment variable, never a file or another variable, so a URI from a less trusted source cannot pick the secret that is sent to its host. A client sends no credential over plain `ws://` to a non-loopback address unless `ConnectOptions::allow_plaintext(true)`.
-- **Over plain `ws://`** the PSK proves both ends but does not bind the session that follows: an on-path attacker can relay a handshake and then use the connection, and a bearer token travels in clear. §6.3 adds `wss://` with the same handshake inside TLS.
+- **Over plain `ws://`** the PSK proves both ends but does not bind the session that follows: an on-path attacker can relay a handshake and then use the connection, and a bearer token travels in clear. Over `wss://` (§6.3) the same handshake runs inside TLS and is bound to the TLS session.
 
 ### 6.3 TLS and bind policy
 
-`wss://` uses `rustls` with a certificate and key from config.
-- By default the client verifies against the system roots.
-- It can instead pin a CA file or an SPKI SHA-256.
+`wss://` uses `rustls` 0.23 (`ring` provider) with a certificate chain and key from PEM files (`ServerAuth::with_tls_files`). The key file follows the secret-file rules of a PSK file. TLS 1.3 is preferred and TLS 1.2 allowed; TLS 1.2 requires the extended master secret on both sides, so its exporter is unique to the connection.
+
+**Client verification.** Set in `ConnectOptions`, never in a URI:
+- By default the client verifies the chain against the system roots (`webpki-roots`), with the name and dates for the URI's host.
+- `ca_file(path)` trusts only the CAs in that file, with the same checks.
+- `pin_spki_sha256(hex)` trusts one key: the SHA-256 of the leaf's SubjectPublicKeyInfo. The pin replaces the chain, the name and the dates, as an SSH host key does. The handshake signature is still verified with the pinned key, so a peer with the certificate but not its key fails.
+
+**Channel binding.** Over TLS the PSK handshake is version 2. Both MAC inputs end with `E`, 32 bytes of `export_keying_material("EXPORTER-fl-store-psk", no context)`, under the labels `fl-store/2/client` and `fl-store/2/server`. Unix and plain `ws://` keep version 1, unchanged. Each side takes the version from its own transport, never from the peer. So a handshake relayed into another TLS session does not verify, which closes the relay gap of §6.2. A PSK does not pass a proxy that terminates TLS; a bearer token does.
 
 **Bind policy for `ws://`.**
-- Plain `ws://` is refused on any non-loopback address, unless the config's `allow_plaintext_on = ["tailscale0"]` names the interface **and** the bound address is on that interface.
-- Authentication is still required on Tailscale.
+- With TLS, `bind_tcp` may bind any address.
+- Without TLS, a loopback address is allowed. `0.0.0.0` and `::` are always refused, because they cover every interface.
+- Any other address needs the config's `allow_plaintext_on = ["tailscale0"]` (`ServerAuth::allow_plaintext_on`) to name the interface, **and** the bound address must be one of that interface's own (`getifaddrs`).
+- Authentication is still required on an allowed plaintext interface.
 
-**Notes for the TLS work.**
-- **Split I/O.** The server and client clone a `TcpStream` (`try_clone`) into a reader, a writer and a watcher (the watcher's `shutdown_both` is what the handshake deadline and server shutdown call). A `rustls` stream cannot be cloned, so the transport needs a split I/O abstraction: one owner of the TLS state with a read half, a write half and a shutdown handle (for example a mutex-guarded `StreamOwned`, or the socket's own fd kept for `shutdown`).
-- **Channel binding.** Over TLS, bind the PSK proofs to the session by mixing the TLS exporter (RFC 5705/8446 `export_keying_material`, a fixed label) into both MAC inputs. That closes the relay gap of §6.2: a handshake relayed into another TLS session does not verify.
-- **Plaintext refusal.** The client rule of §6.2 stays: no credential over plain `ws://` to a non-loopback address without `allow_plaintext(true)`. `wss://` becomes the normal remote path.
+**Client plaintext rule.** The rule of §6.2 stays: no credential over plain `ws://` to a non-loopback address without `allow_plaintext(true)`. Over `wss://` a credential goes to any host. A bearer token authenticates only the client, so it belongs on `wss://`, loopback or an allowed plaintext interface.
 
-**Dependencies.** `rustls` 0.23 (with `ring`) and `rustls-pki-types` are already workspace dependencies. HMAC uses `ring::hmac`, the same as `crates/wire/src/peer.rs`. If roots are needed, add `webpki-roots` or `rustls-native-certs`, which are Apache-2.0/MIT/ISC.
+**Transport.** A `rustls` stream cannot be cloned. The reader, the writer and the watcher are halves that share one TLS state behind a mutex, and each keeps its own `try_clone` of the socket:
+- The reader waits for socket bytes without holding the lock, then takes it only to decrypt.
+- A writer seals at most one record under the lock, then writes the bytes holding only a send lock that keeps records in order.
+- The watcher is the bare socket. Its `shutdown_both` ends a TLS handshake like any read, so the handshake deadline of §6.2 covers the TLS handshake, which runs on the connection's thread.
+
+No lock is held across a blocking socket call that the other direction needs, so a blocked read never stops a writer and a blocked write never stops the reader.
+
+The wire bytes, the configuration and the bind rules are in `docs/ferrostore-spec.md` (Served mode, Authentication, TLS).
 
 ---
 
