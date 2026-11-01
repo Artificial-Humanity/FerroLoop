@@ -10,8 +10,10 @@ mod group;
 mod layout;
 mod manifest_ops;
 mod migrate;
+mod remote_txn;
 mod retry;
 mod server;
+mod session;
 mod state;
 mod sync;
 mod traits_catalog;
@@ -44,6 +46,8 @@ mod tests_reentry;
 #[cfg(test)]
 mod tests_retry;
 #[cfg(test)]
+mod tests_session;
+#[cfg(test)]
 mod tests_track0;
 #[cfg(test)]
 mod tests_txn;
@@ -63,8 +67,8 @@ use layout::{
 };
 use serde_json::{Value, json};
 use state::{
-    DocState, Docs, MQ_HIGH_WATER_ID, Overlay, apply_commit, apply_frames, commit_ops,
-    mq_hw_collection, mq_message_collection, next_mq_seq, publish_overlay, stage_ops, unread_mq,
+    DocState, Docs, MQ_HIGH_WATER_ID, Overlay, apply_commit, apply_frames, mq_hw_collection,
+    mq_message_collection, next_mq_seq, publish_overlay, stage_ops, unread_mq,
 };
 
 pub use columnar::{
@@ -75,7 +79,7 @@ pub use compact::{AUTO_COMPACT_BYTES, StoreStats};
 pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -240,6 +244,7 @@ struct RemoteCommit {
 }
 
 /// How a compare-and-swap commit went.
+#[cfg(test)]
 enum SeqCommit {
     Lost,
     Same,
@@ -912,7 +917,7 @@ fn load_full(
 /// transaction. Every write is staged through [`Overlay::stage`], which checks
 /// it as applying it would, so a commit applies the overlay as it is.
 struct Txn {
-    base: Arc<DocState>,
+    base: Base,
     overlay: Overlay,
     ops: Vec<Op>,
     /// A staged op failed part way. The body saw that error; a body that
@@ -920,8 +925,27 @@ struct Txn {
     failed: bool,
 }
 
+/// What a transaction's overlay sits on.
+enum Base {
+    /// A state in this process (`mem://`, `file://`, and the server's side
+    /// of a remote commit).
+    Local(Arc<DocState>),
+    /// A read session on a server (spec §6.1). Boxed: it is much larger
+    /// than an `Arc`, and a local transaction should not carry its size.
+    Remote(Box<remote_txn::RemoteBase>),
+}
+
 impl Txn {
     fn new(base: Arc<DocState>) -> Self {
+        Self::over(Base::Local(base))
+    }
+
+    /// A transaction whose reads go to `shared`'s server.
+    fn remote(shared: Arc<server::RemoteShared>) -> Self {
+        Self::over(Base::Remote(Box::new(remote_txn::RemoteBase::new(shared))))
+    }
+
+    fn over(base: Base) -> Self {
         Self {
             base,
             overlay: Overlay::default(),
@@ -930,19 +954,57 @@ impl Txn {
         }
     }
 
-    /// The state this transaction started from, without its own changes. A
-    /// read transaction stages nothing, so this is everything it sees.
-    fn base(&self) -> &DocState {
-        &self.base
+    /// The state a local transaction started from, without its own changes.
+    /// A remote transaction holds none.
+    fn local_base(&self) -> Result<&DocState, StoreError> {
+        match &self.base {
+            Base::Local(state) => Ok(state),
+            Base::Remote(_) => Err(backend(
+                "a remote transaction holds no state: it reads through its session",
+            )),
+        }
     }
 
-    /// The document at `(collection, id)`, borrowed.
-    fn doc(&self, collection: &str, id: &str) -> Option<&Value> {
-        self.overlay.doc(&self.base, collection, id)
+    /// [`Self::local_base`], shared.
+    fn local_arc(&self) -> Result<Arc<DocState>, StoreError> {
+        match &self.base {
+            Base::Local(state) => Ok(Arc::clone(state)),
+            Base::Remote(_) => Err(backend(
+                "a remote transaction holds no state: it reads through its session",
+            )),
+        }
+    }
+
+    fn remote_base(&self) -> Option<&remote_txn::RemoteBase> {
+        match &self.base {
+            Base::Remote(remote) => Some(remote),
+            Base::Local(_) => None,
+        }
+    }
+
+    /// The error a remote read recorded: the transaction's result, whatever
+    /// the body returned.
+    fn take_read_error(&self) -> Option<StoreError> {
+        self.remote_base()
+            .and_then(remote_txn::RemoteBase::take_error)
     }
 
     fn get(&self, collection: &str, id: &str) -> Option<Value> {
-        self.doc(collection, id).cloned()
+        match &self.base {
+            Base::Local(state) => self.overlay.doc(state, collection, id).cloned(),
+            Base::Remote(remote) => {
+                if let Some(staged) = self.overlay.staged_doc(collection, id) {
+                    return staged.cloned();
+                }
+                remote
+                    .read(session::ReadKey::Get {
+                        collection: collection.to_string(),
+                        id: id.to_string(),
+                    })?
+                    .get("doc")
+                    .cloned()
+            }
+        }
     }
 
     fn put(&mut self, collection: impl Into<String>, id: impl Into<String>, doc: Value) {
@@ -966,7 +1028,70 @@ impl Txn {
 
     /// Every document in `collection`, borrowed, in document-id order.
     fn visit(&self, collection: &str, f: impl FnMut(&str, &Value)) {
-        self.overlay.visit(&self.base, collection, f);
+        match &self.base {
+            Base::Local(state) => self.overlay.visit(state, collection, f),
+            Base::Remote(remote) => {
+                let Some(held) = remote.read(session::ReadKey::Scan {
+                    collection: collection.to_string(),
+                }) else {
+                    return;
+                };
+                // The form was checked when the answer came in.
+                let pairs = held.as_array().into_iter().flatten().filter_map(|pair| {
+                    let id = pair.get(0)?.as_str()?;
+                    Some((id, pair.get(1)?))
+                });
+                self.overlay.visit_over(collection, pairs, f);
+            }
+        }
+    }
+
+    /// Ids in `collection` whose top-level `field` matches `value`, in
+    /// ascending order, with this transaction's writes.
+    fn query_by_field(&self, collection: &str, field: &str, value: &str) -> Vec<String> {
+        let Base::Remote(remote) = &self.base else {
+            let mut ids = Vec::new();
+            self.visit(collection, |id, doc| {
+                if state::field_matches(doc, field, value) {
+                    ids.push(id.to_string());
+                }
+            });
+            return ids;
+        };
+        let Some(held) = remote.read(session::ReadKey::Query {
+            collection: collection.to_string(),
+            field: field.to_string(),
+            value: value.to_string(),
+        }) else {
+            return Vec::new();
+        };
+        let staged: BTreeMap<&str, Option<&Value>> = self.overlay.staged_in(collection).collect();
+        let mut ids: Vec<String> = held
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|id| !staged.contains_key(id))
+            .map(str::to_string)
+            .collect();
+        ids.extend(staged.iter().filter_map(|(id, doc)| {
+            doc.filter(|doc| state::field_matches(doc, field, value))
+                .map(|_| (*id).to_string())
+        }));
+        ids.sort();
+        ids
+    }
+
+    /// The names of the base's document collections that hold a document,
+    /// without this transaction's writes.
+    fn collections(&self) -> Vec<String> {
+        match &self.base {
+            Base::Local(state) => state.docs.collections().cloned().collect(),
+            Base::Remote(remote) => remote
+                .read(session::ReadKey::Inventory)
+                .map(|held| remote_txn::inventory_names(&held, "collections"))
+                .unwrap_or_default(),
+        }
     }
 
     /// Every document in `collection`, in document-id order.
@@ -981,7 +1106,11 @@ impl Txn {
     /// Stage a column-table or vector op (or a document op). `Err` stages
     /// nothing the commit could use: the transaction will not commit.
     fn stage(&mut self, op: Op) -> Result<(), StoreError> {
-        if let Err(err) = self.overlay.stage(&self.base, &op) {
+        let staged = match &self.base {
+            Base::Local(state) => self.overlay.stage(state, &op),
+            Base::Remote(_) => self.stage_remote(&op),
+        };
+        if let Err(err) = staged {
             self.failed = true;
             return Err(err);
         }
@@ -989,22 +1118,161 @@ impl Txn {
         Ok(())
     }
 
-    /// The columns of column table `name`, with this transaction's creates.
-    fn table_columns(&self, name: &str) -> Option<&[ColumnDef]> {
-        self.overlay.table_columns(&self.base, name)
+    /// Check `op` as [`Overlay::stage`] would, against the session's reads,
+    /// and record it. A vector op is not applied here: the server applies
+    /// it, HNSW and all, when it commits (spec §6.1).
+    fn stage_remote(&mut self, op: &Op) -> Result<(), StoreError> {
+        match op {
+            Op::Put {
+                collection,
+                id,
+                doc,
+            } => self
+                .overlay
+                .put(collection.clone(), id.clone(), Arc::new(doc.clone())),
+            Op::Delete { collection, id } => self.overlay.delete(collection.clone(), id.clone()),
+            Op::CreateColumnTable { name, columns } => {
+                let taken = self.table_columns(name).is_some();
+                columnar::check_new_table(taken, name, columns)?;
+                self.overlay.record_table_create(name, columns);
+            }
+            Op::AppendColumnGroup { name, bytes } => {
+                let Some(columns) = self.table_columns(name) else {
+                    return Err(layout::corrupt(format!(
+                        "append to missing column table `{name}`"
+                    )));
+                };
+                columnar::validate_row_group(&columns, bytes)?;
+                self.overlay.record_table_append(name, bytes);
+            }
+            Op::CreateVectorCollection {
+                name,
+                dim,
+                storage,
+                metric,
+                m,
+                ef_construction,
+                ef_search,
+            } => {
+                vector::check_create(name, *dim, *storage, *m, *ef_construction, *ef_search)?;
+                if self.vector_params(name).is_some() {
+                    return Err(backend(format!(
+                        "vector collection `{name}` already exists"
+                    )));
+                }
+                let params = vector::VectorParams {
+                    dim: *dim,
+                    storage: *storage,
+                    metric: *metric,
+                    m: *m,
+                    ef_construction: *ef_construction,
+                    ef_search: *ef_search,
+                };
+                let Base::Remote(remote) = &mut self.base else {
+                    return Err(backend("a local transaction staged as a remote one"));
+                };
+                remote.created_vectors.insert(name.clone(), params);
+                remote.written_vectors.insert(name.clone());
+            }
+            Op::UpsertVector { collection, .. } | Op::DeleteVector { collection, .. } => {
+                if self.vector_params(collection).is_none() {
+                    return Err(backend(format!("no vector collection `{collection}`")));
+                }
+                let Base::Remote(remote) = &mut self.base else {
+                    return Err(backend("a local transaction staged as a remote one"));
+                };
+                remote.written_vectors.insert(collection.clone());
+            }
+        }
+        Ok(())
     }
 
-    /// Vector collection `name`, with this transaction's changes.
-    fn vector(&self, name: &str) -> Option<&vector::VectorCollection> {
-        self.overlay.vector(&self.base, name)
+    /// The columns of column table `name`, with this transaction's creates.
+    fn table_columns(&self, name: &str) -> Option<Vec<ColumnDef>> {
+        match &self.base {
+            Base::Local(state) => self.overlay.table_columns(state, name).map(<[_]>::to_vec),
+            Base::Remote(remote) => {
+                if let Some(created) = self.overlay.created_columns(name) {
+                    return Some(created.to_vec());
+                }
+                let held = remote.read(session::ReadKey::Columns {
+                    name: name.to_string(),
+                })?;
+                if held.is_null() {
+                    return None;
+                }
+                match columnar::parse_columns(&held) {
+                    Ok(columns) => Some(columns),
+                    Err(err) => {
+                        remote.fail(err);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// The parameters of vector collection `name`, with this transaction's
+    /// creates. A read of its parameters, not of its vectors: a remote
+    /// transaction may make it after writing the collection.
+    fn vector_params(&self, name: &str) -> Option<vector::VectorParams> {
+        match &self.base {
+            Base::Local(state) => self
+                .overlay
+                .vector(state, name)
+                .map(vector::VectorParams::of),
+            Base::Remote(remote) => {
+                if let Some(created) = remote.created_vectors.get(name) {
+                    return Some(*created);
+                }
+                let held = remote.read(session::ReadKey::VectorParams {
+                    name: name.to_string(),
+                })?;
+                if held.is_null() {
+                    return None;
+                }
+                match vector::VectorParams::parse(&held) {
+                    Ok(params) => Some(params),
+                    Err(err) => {
+                        remote.fail(err);
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    /// Vector collection `name` of a local transaction, with its changes.
+    fn local_vector(&self, name: &str) -> Result<Option<&vector::VectorCollection>, StoreError> {
+        Ok(self.overlay.vector(self.local_base()?, name))
     }
 
     fn has_tables(&self) -> bool {
-        self.overlay.has_tables(&self.base)
+        match &self.base {
+            Base::Local(state) => self.overlay.has_tables(state),
+            Base::Remote(remote) => {
+                self.overlay.creates_table()
+                    || remote
+                        .read(session::ReadKey::Inventory)
+                        .is_some_and(|held| {
+                            !remote_txn::inventory_names(&held, "tables").is_empty()
+                        })
+            }
+        }
     }
 
     fn has_vectors(&self) -> bool {
-        self.overlay.has_vectors(&self.base)
+        match &self.base {
+            Base::Local(state) => self.overlay.has_vectors(state),
+            Base::Remote(remote) => {
+                !remote.created_vectors.is_empty()
+                    || remote
+                        .read(session::ReadKey::Inventory)
+                        .is_some_and(|held| {
+                            !remote_txn::inventory_names(&held, "vectors").is_empty()
+                        })
+            }
+        }
     }
 
     /// The ops and the overlay to commit. Drops this transaction's hold on
@@ -1353,7 +1621,7 @@ impl FerroStore {
         let id = id.to_string();
         let doc = doc.clone();
         self.commit(
-            move |_| {
+            move || {
                 Ok((
                     Op::Put {
                         collection,
@@ -1398,7 +1666,7 @@ impl FerroStore {
     fn delete_doc_unchecked(&self, collection: &str, id: &str) -> Result<(), StoreError> {
         let collection = collection.to_string();
         let id = id.to_string();
-        self.commit(move |_| Ok((Op::Delete { collection, id }, ())), false)
+        self.commit(move || Ok((Op::Delete { collection, id }, ())), false)
     }
 
     pub fn query_by_field(
@@ -1468,14 +1736,11 @@ impl FerroStore {
             )?;
             return columnar::parse_scan(&value);
         }
-        let name = name.to_string();
-        let filters = filters.to_vec();
-        self.with_read(move |txn| {
-            let Some(table) = txn.base().tables.get(&name) else {
-                return Err(backend(format!("no column table `{name}`")));
-            };
-            columnar::scan_groups(&table.columns, &table.groups, &filters)
-        })
+        let state = self.read_state()?;
+        let Some(table) = state.tables.get(name) else {
+            return Err(backend(format!("no column table `{name}`")));
+        };
+        columnar::scan_groups(&table.columns, &table.groups, filters)
     }
 
     /// Sum attempt ledger rows through an in-memory columnar scan. `None` is every attempt.
@@ -1545,7 +1810,7 @@ impl FerroStore {
                 .as_bool()
                 .ok_or_else(|| backend("has_vector_collection result is not a bool"));
         }
-        self.with_read(|txn| Ok(txn.vector(name).is_some()))
+        Ok(self.read_state()?.vectors.contains_key(name))
     }
 
     /// Insert or replace one vector. `None` metadata is absent. `Some(Null)` stores JSON null.
@@ -1631,14 +1896,11 @@ impl FerroStore {
             }
             return vector::parse_hits(&remote.call("search_vectors", Value::Object(params))?);
         }
-        let collection = collection.to_string();
-        let values = values.to_vec();
-        self.with_read(move |txn| {
-            let Some(col) = txn.vector(&collection) else {
-                return Err(backend(format!("no vector collection `{collection}`")));
-            };
-            vector::search(col, &values, limit, ef)
-        })
+        let state = self.read_state()?;
+        let Some(col) = state.vectors.get(collection) else {
+            return Err(backend(format!("no vector collection `{collection}`")));
+        };
+        vector::search(col, values, limit, ef)
     }
 
     /// Fuse at most `limit` BM25 hits with at most `limit` vector hits, then keep `limit`.
@@ -1677,22 +1939,17 @@ impl FerroStore {
                 )?,
             )?);
         }
-        let doc_collection = doc_collection.to_string();
-        let vector_collection = vector_collection.to_string();
-        let query = query.to_string();
-        let values = values.to_vec();
-        self.with_read(move |txn| {
-            state::search_hybrid(
-                &txn.base().docs,
-                &txn.base().vectors,
-                &doc_collection,
-                &vector_collection,
-                &query,
-                &values,
-                limit,
-                fusion,
-            )
-        })
+        let state = self.read_state()?;
+        state::search_hybrid(
+            &state.docs,
+            &state.vectors,
+            doc_collection,
+            vector_collection,
+            query,
+            values,
+            limit,
+            fusion,
+        )
     }
 
     /// Same fusion as [`Self::search_hybrid`]. `doc` is the document at that id, if any.
@@ -1720,22 +1977,17 @@ impl FerroStore {
                 )?,
             )?);
         }
-        let doc_collection = doc_collection.to_string();
-        let vector_collection = vector_collection.to_string();
-        let query = query.to_string();
-        let values = values.to_vec();
-        self.with_read(move |txn| {
-            state::search_knowledge(
-                &txn.base().docs,
-                &txn.base().vectors,
-                &doc_collection,
-                &vector_collection,
-                &query,
-                &values,
-                limit,
-                fusion,
-            )
-        })
+        let state = self.read_state()?;
+        state::search_knowledge(
+            &state.docs,
+            &state.vectors,
+            doc_collection,
+            vector_collection,
+            query,
+            values,
+            limit,
+            fusion,
+        )
     }
 
     /// Append one message. The returned sequence starts at 1 per topic and is
@@ -1764,7 +2016,7 @@ impl FerroStore {
         if let Inner::Remote(remote) = &self.inner {
             let registered = {
                 let _gate = lock_mutex(&self.commit_gate);
-                let value = remote.call(
+                let value = remote.call_req(
                     "publish_mq",
                     json!({"topic": topic, "key": key, "payload": payload}),
                 )?;
@@ -1855,7 +2107,7 @@ impl FerroStore {
         let topic = topic.to_string();
         let group = group.to_string();
         self.commit(
-            move |_| {
+            move || {
                 Ok((
                     Op::Put {
                         collection: format!("mq_ack:{topic}:{group}"),
@@ -2013,7 +2265,7 @@ impl FerroStore {
         self.refuse_reentry()?;
         let adapter = self.require_sync_adapter()?;
         self.require_sync_idle()?;
-        let last = self.read_state()?.last_seq;
+        let last = self.last_seq()?;
         let batches = adapter.pull_since(last)?;
         self.apply_inbound(batches)
     }
@@ -2027,23 +2279,50 @@ impl FerroStore {
         self.apply_inbound(batches)
     }
 
+    /// Run a read-only `body` over the current state. A remote handle runs it
+    /// over a read session (spec §6.1): every read is one RPC against the
+    /// session's snapshot, and the session is closed when `body` returns.
     fn with_read<T>(
         &self,
         body: impl FnOnce(&Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let txn = Txn::new(self.read_state()?);
-        body(&txn)
+        self.refuse_reentry()?;
+        let txn = match &self.inner {
+            Inner::Remote(remote) => Txn::remote(Arc::clone(remote.shared())),
+            Inner::Memory(_) | Inner::Disk(_) => Txn::new(self.read_state()?),
+        };
+        let result = body(&txn);
+        match txn.take_read_error() {
+            Some(err) => Err(err),
+            None => result,
+        }
     }
 
     /// The current state. Memory shares the live `Arc`, and Disk the cached
     /// one, refreshed without a lock (spec §4.1): a later commit replaces it
-    /// and leaves this one as it was.
+    /// and leaves this one as it was. A remote handle never receives the
+    /// whole state (spec §6.1): it reads through a session.
     fn read_state(&self) -> Result<Arc<DocState>, StoreError> {
         self.refuse_reentry()?;
         match &self.inner {
             Inner::Memory(state) => Ok(Arc::clone(&lock_mutex(state))),
             Inner::Disk(disk) => Ok(Arc::clone(&disk.refresh_read()?.state)),
-            Inner::Remote(remote) => Ok(Arc::new(remote.read_state()?)),
+            Inner::Remote(_) => Err(backend(
+                "a remote FerroStore does not receive the whole state: it reads through a \
+                 session",
+            )),
+        }
+    }
+
+    /// The last committed sequence. A remote handle opens a session for its
+    /// `base_seq` and closes it.
+    fn last_seq(&self) -> Result<u64, StoreError> {
+        match &self.inner {
+            Inner::Remote(remote) => {
+                self.refuse_reentry()?;
+                remote.last_seq()
+            }
+            Inner::Memory(_) | Inner::Disk(_) => Ok(self.read_state()?.last_seq),
         }
     }
 
@@ -2052,12 +2331,14 @@ impl FerroStore {
     /// `Ok(false)` means the sequence moved and nothing was written. An empty `ops`
     /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
     /// non-empty disk success is one WAL frame at `expected_seq + 1`. Ops that do
-    /// not apply return `Err` and write nothing. A remote handle sends `commit_ops`.
+    /// not apply return `Err` and write nothing. A remote handle has no such
+    /// swap: it commits through a validated transaction (spec §6.1).
     #[cfg(test)]
     fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
         self.commit_if_seq_inner(expected_seq, ops, false)
     }
 
+    #[cfg(test)]
     fn commit_if_seq_inner(
         &self,
         expected_seq: u64,
@@ -2078,7 +2359,7 @@ impl FerroStore {
                             return Ok(true);
                         }
                         let owned = ops.to_vec();
-                        commit_ops(&mut state, &owned)?;
+                        state::commit_ops(&mut state, &owned)?;
                         Committed {
                             seq: state.last_seq,
                             ops: owned,
@@ -2105,20 +2386,10 @@ impl FerroStore {
                 })?;
                 Ok(!matches!(outcome, SeqCommit::Lost))
             }
-            Inner::Remote(remote) => {
-                if ops.is_empty() {
-                    return Ok(remote.read_state()?.last_seq == expected_seq);
-                }
-                let committed = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    match self.commit_remote(remote, expected_seq, ops.to_vec(), silent)? {
-                        Some(committed) => committed,
-                        None => return Ok(false),
-                    }
-                };
-                self.deliver_remote(committed)?;
-                Ok(true)
-            }
+            Inner::Remote(_) => Err(backend(
+                "a remote FerroStore has no compare-and-swap on the sequence: it commits \
+                 through a validated transaction",
+            )),
         }
     }
 
@@ -2130,16 +2401,19 @@ impl FerroStore {
     /// added), and `body` runs, on this thread, over that state with the
     /// commits of the group's earlier members. `Ok` with at least one op
     /// appends one WAL frame (`seq = last_seq + 1`), published with the
-    /// group's superblock. `Err` or an empty op list writes nothing. A remote
-    /// handle compare-and-swaps those ops and runs `body` again when
-    /// `last_seq` changed, at most [`retry::REMOTE_ATTEMPTS`] times in all,
-    /// with a jittered backoff between attempts; then it is
-    /// [`StoreError::Conflict`] (spec §4.5). The body may run more than once
-    /// only on a remote handle, so it must be free of side effects. On disk,
-    /// a commit that leaves the WAL past the threshold auto-checkpoints
-    /// (spec §4.4, [`AUTO_CHECKPOINT_BYTES`]). The sync adapter runs after the
-    /// slot is synced, on the committing thread, with none of this thread's
-    /// locks or the commit gate held.
+    /// group's superblock. `Err` or an empty op list writes nothing.
+    ///
+    /// A remote handle runs `body` over a read session (spec §6.1) and sends
+    /// its ops with its read set as `commit_txn`; the server recomputes every
+    /// read inside its write lock and commits only when each still has the
+    /// value `body` saw. A lost commit runs `body` again over a new session,
+    /// at most [`retry::REMOTE_ATTEMPTS`] times in all, with a jittered
+    /// backoff between attempts; then it is [`StoreError::Conflict`] (spec
+    /// §4.5). The body may run more than once only on a remote handle, so it
+    /// must be free of side effects. On disk, a commit that leaves the WAL
+    /// past the threshold auto-checkpoints (spec §4.4, [`AUTO_CHECKPOINT_BYTES`]).
+    /// The sync adapter runs after the slot is synced, on the committing
+    /// thread, with none of this thread's locks or the commit gate held.
     ///
     /// While `body` runs, every call this thread makes on this handle is
     /// refused ([`Self::refuse_reentry`]).
@@ -2173,6 +2447,22 @@ impl FerroStore {
                 }
                 Err(self.remote_conflict())
             }
+            Inner::Memory(_) | Inner::Disk(_) => self.write_local(false, body),
+        }
+    }
+
+    /// The body of a `mem://` or `file://` write ([`Self::with_write_outcome`]),
+    /// and of a remote client's `commit_txn` on the server. `silent` commits
+    /// without the sync adapter.
+    fn write_local<T>(
+        &self,
+        silent: bool,
+        mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
+    ) -> Result<(T, Option<u64>), StoreError> {
+        match &self.inner {
+            Inner::Remote(_) => Err(backend(
+                "a remote FerroStore cannot run a write body in this process",
+            )),
             Inner::Memory(slot) => {
                 let (result, seq, registered) = {
                     let _gate = lock_mutex(&self.commit_gate);
@@ -2200,14 +2490,14 @@ impl FerroStore {
                     };
                     let seq = committed.as_ref().map(|committed| committed.seq);
                     let registered = committed.as_ref().map_or(Registered::Nothing, |committed| {
-                        self.register_committed(committed, false)
+                        self.register_committed(committed, silent)
                     });
                     (result, seq, registered)
                 };
                 self.deliver_owned(registered)?;
                 Ok((result, seq))
             }
-            Inner::Disk(disk) => self.group_write(disk, false, |state| {
+            Inner::Disk(disk) => self.group_write(disk, silent, |state| {
                 let mut txn = Txn::new(state);
                 // On the thread running the body: in a group, the member's
                 // own thread at its turn (spec §4.3).
@@ -2225,10 +2515,12 @@ impl FerroStore {
         }
     }
 
-    /// One attempt of a remote write (spec §4.5): run `body` against the
-    /// server's state and compare-and-swap its ops. `None` when another
-    /// writer committed first: nothing was written and the caller may try
-    /// again. `Err` from the body, or from the server, ends the write.
+    /// One attempt of a remote write (spec §4.5, §6.1): run `body` over a
+    /// new read session and send its ops with its read set. `None` when
+    /// another writer changed what `body` read: nothing was written and the
+    /// caller may try again. `Err` from the body, from a read, or from the
+    /// server, ends the write. A body that wrote nothing commits nothing and
+    /// closes its session.
     fn remote_attempt<T>(
         &self,
         remote: &server::RemoteClient,
@@ -2236,28 +2528,41 @@ impl FerroStore {
         attempt: u32,
         body: &mut impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<Option<(T, Option<u64>)>, StoreError> {
-        let state = Arc::new(remote.read_state()?);
-        let seq_base = state.last_seq;
-        let mut txn = Txn::new(Arc::clone(&state));
+        let mut txn = Txn::remote(Arc::clone(remote.shared()));
         let result = {
             let _body = self.enter_body();
             body(&mut txn)
-        }?;
-        let (ops, _) = txn.finish()?;
-        if ops.is_empty() {
+        };
+        if let Some(err) = txn.take_read_error() {
+            return Err(err);
+        }
+        let result = result?;
+        if txn.failed {
+            return Err(backend(
+                "a transaction whose staged op failed cannot commit",
+            ));
+        }
+        if txn.ops.is_empty() {
             return Ok(Some((result, None)));
         }
+        let Some(session) = txn.remote_base() else {
+            return Err(backend("a remote write ran over a local state"));
+        };
+        let known = session.known();
         let forced = retry::forced_loss(&retry::Cas {
             caller,
             attempt,
-            base: &state,
-            ops: &ops,
+            known: &known,
+            ops: &txn.ops,
         });
-        let committed = if forced {
-            None
-        } else {
+        if forced {
+            return Ok(None);
+        }
+        let (pinned, reads) = session.take_for_commit();
+        let ops = std::mem::take(&mut txn.ops);
+        let committed = {
             let _gate = lock_mutex(&self.commit_gate);
-            self.commit_remote(remote, seq_base, ops, false)?
+            self.commit_remote(remote, pinned, &reads, ops, false)?
         };
         match committed {
             Some(committed) => {
@@ -2268,10 +2573,11 @@ impl FerroStore {
         }
     }
 
-    /// Compare-and-swap `ops` on the server at `expected` and, when the
-    /// server committed them, register this handle's own batch for them.
-    /// The caller holds the commit gate. `None`: another writer committed
-    /// first and nothing was written.
+    /// Send `ops` with the read set `reads` (taken at `session`) as one
+    /// `commit_txn`, under a new request id, and, when the server committed
+    /// them, register this handle's own batch for them. The caller holds the
+    /// commit gate. `None`: a read no longer has the value it had, and
+    /// nothing was written.
     ///
     /// The server's [`StoreError::Undelivered`] (its own adapter refused) is
     /// a commit too: the batch is registered here all the same, and the
@@ -2280,19 +2586,22 @@ impl FerroStore {
     fn commit_remote(
         &self,
         remote: &server::RemoteClient,
-        expected: u64,
+        session: Option<(u64, u64)>,
+        reads: &[(session::ReadKey, String)],
         ops: Vec<Op>,
         silent: bool,
     ) -> Result<Option<RemoteCommit>, StoreError> {
-        let server = match remote.commit_ops(expected, &ops, silent) {
-            Ok(false) => return Ok(None),
-            Ok(true) => None,
-            Err(err @ StoreError::Undelivered { .. }) => Some(err),
+        let (seq, server) = match remote.commit_txn(session, reads, &ops, silent) {
+            Ok(None) => return Ok(None),
+            Ok(Some(seq)) => (seq, None),
+            Err(err @ StoreError::Undelivered { .. }) => {
+                let StoreError::Undelivered { seq, .. } = &err else {
+                    return Err(err);
+                };
+                (*seq, Some(err))
+            }
             Err(err) => return Err(err),
         };
-        let seq = expected
-            .checked_add(1)
-            .ok_or_else(|| backend("transaction sequence overflow"))?;
         let registered = self.register_committed(&Committed { seq, ops }, silent);
         Ok(Some(RemoteCommit {
             seq,
@@ -2328,36 +2637,36 @@ impl FerroStore {
         }
     }
 
+    /// Commit the one op `build` makes, without reading anything. A remote
+    /// handle sends it as a `commit_txn` with an empty read set, which no
+    /// other writer can make lose.
     #[track_caller]
     fn commit<T>(
         &self,
-        build: impl FnOnce(&DocState) -> Result<(Op, T), StoreError>,
+        build: impl FnOnce() -> Result<(Op, T), StoreError>,
         silent: bool,
     ) -> Result<T, StoreError> {
         self.refuse_reentry()?;
         let caller = std::panic::Location::caller();
         match &self.inner {
             Inner::Remote(remote) => {
-                let mut state = remote.read_state()?;
-                let (op, extra) = build(&state)?;
+                let (op, extra) = build()?;
                 let mut backoff = retry::Backoff::new();
                 for attempt in 1..=retry::REMOTE_ATTEMPTS {
                     if attempt > 1 {
                         backoff.wait(attempt - 1);
-                        state = remote.read_state()?;
                     }
-                    let expected = state.last_seq;
                     let forced = retry::forced_loss(&retry::Cas {
                         caller,
                         attempt,
-                        base: &state,
+                        known: &"",
                         ops: std::slice::from_ref(&op),
                     });
                     let committed = if forced {
                         None
                     } else {
                         let _gate = lock_mutex(&self.commit_gate);
-                        self.commit_remote(remote, expected, vec![op.clone()], silent)?
+                        self.commit_remote(remote, None, &[], vec![op.clone()], silent)?
                     };
                     if let Some(committed) = committed {
                         self.deliver_remote(committed)?;
@@ -2371,7 +2680,7 @@ impl FerroStore {
                     let _gate = lock_mutex(&self.commit_gate);
                     let (extra, committed) = {
                         let mut state = lock_mutex(slot);
-                        let (op, extra) = build(&state)?;
+                        let (op, extra) = build()?;
                         apply_commit(&mut state, op.clone())?;
                         (
                             extra,
@@ -2388,7 +2697,7 @@ impl FerroStore {
             }
             Inner::Disk(disk) => {
                 let (extra, _) = self.group_write(disk, silent, |state| {
-                    let (op, extra) = build(&state)?;
+                    let (op, extra) = build()?;
                     let (overlay, _) = stage_ops(&state, std::slice::from_ref(&op))?;
                     let ops = vec![op];
                     Ok((extra, Some(Staged { ops, overlay })))
@@ -2445,7 +2754,7 @@ impl FerroStore {
                 drop(_gate);
                 return remote.call_option("get_doc", json!({"collection": collection, "id": id}));
             }
-            let value = remote.call(
+            let value = remote.call_req(
                 "put_doc",
                 json!({
                     "collection": collection,

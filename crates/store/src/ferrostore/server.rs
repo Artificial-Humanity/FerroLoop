@@ -6,7 +6,7 @@
 
 use super::columnar;
 use super::layout::{Op, backend};
-use super::state::{DocState, Docs, Tables, Vectors};
+use super::session::{self, Claim, Dedup, ReadKey, Sessions};
 use super::vector;
 use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
 use fl_core::StoreError;
@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use super::ws;
 
-const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+pub(super) const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Accept is nonblocking. Drop waits at most one pause to observe the flag.
 const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
@@ -40,6 +40,10 @@ struct ServerState {
     shutdown: AtomicBool,
     conns: Mutex<HashMap<u64, Box<dyn JsonIo>>>,
     next_conn: AtomicU64,
+    /// Every connection's open read sessions (spec §6.1).
+    sessions: Sessions,
+    /// Recent request ids and their replies (spec §6.1).
+    dedup: Dedup,
 }
 
 struct ConnReg {
@@ -48,9 +52,21 @@ struct ConnReg {
 }
 
 impl Drop for ConnReg {
+    /// A closed connection's sessions go with it.
     fn drop(&mut self) {
         lock_mutex(&self.state.conns).remove(&self.id);
+        self.state.sessions.drop_conn(self.id);
     }
+}
+
+/// Calls of the removed whole-state methods (`read_state`, `commit_ops`,
+/// `commit_if_seq`), counted by every server in this test process.
+#[cfg(test)]
+static LEGACY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(super) fn legacy_calls() -> u64 {
+    LEGACY_CALLS.load(Ordering::SeqCst)
 }
 
 enum Bound {
@@ -160,6 +176,8 @@ fn new_state(store: FerroStore) -> Arc<ServerState> {
         shutdown: AtomicBool::new(false),
         conns: Mutex::new(HashMap::new()),
         next_conn: AtomicU64::new(1),
+        sessions: Sessions::new(),
+        dedup: Dedup::default(),
     })
 }
 
@@ -167,6 +185,16 @@ fn new_state(store: FerroStore) -> Arc<ServerState> {
 impl FerroStoreServer {
     pub(super) fn store(&self) -> &FerroStore {
         &self.state.store
+    }
+
+    /// Read sessions open on this server, over every connection.
+    pub(super) fn open_sessions(&self) -> usize {
+        self.state.sessions.count()
+    }
+
+    /// Lower the idle time after which a session is gone.
+    pub(super) fn set_session_idle(&self, idle: Duration) {
+        self.state.sessions.set_idle(idle);
     }
 }
 
@@ -392,9 +420,9 @@ fn unix_accepted(stream: UnixStream) -> Result<Accepted, StoreError> {
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;
     Ok(Accepted {
-        read: Box::new(UnixIo(stream)),
-        write: Box::new(UnixIo(write)),
-        watch: Box::new(UnixIo(watch)),
+        read: Box::new(UnixIo::new(stream, FrameCounter::default())),
+        write: Box::new(UnixIo::new(write, FrameCounter::default())),
+        watch: Box::new(UnixIo::new(watch, FrameCounter::default())),
     })
 }
 
@@ -476,21 +504,23 @@ fn serve_connection(
                 };
                 let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-                let result = if method == "subscribe_mq" {
-                    subscribe_topic(
-                        &state.store,
-                        &params,
-                        &write,
-                        &alive,
-                        &mut subscribed,
-                        &mut forwarders,
+                let reply = if method == "subscribe_mq" {
+                    reply_body(
+                        subscribe_topic(
+                            &state.store,
+                            &params,
+                            &write,
+                            &alive,
+                            &mut subscribed,
+                            &mut forwarders,
+                        )
+                        .map(|()| Value::Null),
                     )
-                    .map(|()| Value::Null)
                 } else {
-                    dispatch(&state.store, method, &params)
+                    exactly_once(&state, conn_id, method, &params)
                 };
                 // An unknown method is an error response. The connection stays up.
-                if send_result(&write, id, result).is_err() {
+                if send_reply(&write, id, reply).is_err() {
                     break;
                 }
             }
@@ -558,8 +588,57 @@ fn forward_mq(
     }
 }
 
-fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, StoreError> {
+/// Run one request. A request that carries `req` runs once: a repeat of
+/// its id gets the first reply and applies nothing (spec §6.1).
+fn exactly_once(state: &ServerState, conn: u64, method: &str, params: &Value) -> Value {
+    let req = match session::request_id(params) {
+        Ok(req) => req,
+        Err(err) => return reply_body(Err(err)),
+    };
+    let Some(req) = req else {
+        return reply_body(dispatch(state, conn, method, params));
+    };
+    match state.dedup.claim(req) {
+        Claim::Replay(reply) => reply,
+        Claim::Run(running) => {
+            let reply = reply_body(dispatch(state, conn, method, params));
+            running.finish(&reply);
+            reply
+        }
+    }
+}
+
+fn dispatch(
+    state: &ServerState,
+    conn: u64,
+    method: &str,
+    params: &Value,
+) -> Result<Value, StoreError> {
+    let store = &*state.store;
     match method {
+        "open_session" => {
+            let pinned = store.read_state()?;
+            let base_seq = pinned.last_seq;
+            let session = state.sessions.open(conn, pinned)?;
+            Ok(json!({"session": session, "base_seq": base_seq}))
+        }
+        "close_session" => {
+            state.sessions.close(conn, param_u64(params, "session")?);
+            Ok(Value::Null)
+        }
+        "txn_read" => {
+            let key = session::parse_key(params.get("read"))?;
+            let (pinned, opened) = match session::optional_u64(params, "session")? {
+                Some(id) => (state.sessions.state(conn, id)?, None),
+                None => {
+                    let pinned = store.read_state()?;
+                    let id = state.sessions.open(conn, Arc::clone(&pinned))?;
+                    (pinned, Some(id))
+                }
+            };
+            txn_read(&pinned, &key, opened)
+        }
+        "commit_txn" => session::commit_txn(store, &state.sessions, conn, params),
         "put_doc" => {
             let collection = param_str(params, "collection")?;
             let id = param_str(params, "id")?;
@@ -771,22 +850,6 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
                 )?,
             )?,
         ),
-        "read_state" => Ok(doc_state_value(&*store.read_state()?)),
-        "commit_ops" => {
-            let expected_seq = param_u64(params, "expected_seq")?;
-            let ops = parse_ops(
-                params
-                    .get("ops")
-                    .ok_or_else(|| backend("missing param `ops`"))?,
-            )?;
-            let silent = optional_bool(params, "silent")?;
-            // `false` is a sequence mismatch, not an error response.
-            Ok(Value::Bool(store.commit_if_seq_inner(
-                expected_seq,
-                &ops,
-                silent,
-            )?))
-        }
         "apply_sync_batches" => {
             let batches = parse_sync_batches(
                 params
@@ -796,19 +859,52 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             let silent = optional_bool(params, "silent")?;
             Ok(Value::from(store.apply_sync_batches(batches, silent)?))
         }
-        _ => Err(backend(format!("no such method `{method}`"))),
+        _ => {
+            #[cfg(test)]
+            if matches!(method, "read_state" | "commit_ops" | "commit_if_seq") {
+                LEGACY_CALLS.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(backend(format!("no such method `{method}`")))
+        }
     }
 }
 
-fn send_result(
-    write: &Mutex<Box<dyn JsonIo>>,
-    id: u64,
-    result: Result<Value, StoreError>,
-) -> Result<(), StoreError> {
-    let body = match result {
-        Ok(result) => json!({"id": id, "ok": true, "result": result}),
-        Err(err) => error_value(id, &err),
-    };
+/// One read primitive against `pinned`: its answer and the answer's hash,
+/// and the session when this read opened it.
+fn txn_read(
+    pinned: &super::state::DocState,
+    key: &ReadKey,
+    opened: Option<u64>,
+) -> Result<Value, StoreError> {
+    let (result, hash) = session::answer(pinned, key)?;
+    let mut body = serde_json::Map::new();
+    body.insert("result".into(), result);
+    body.insert("hash".into(), Value::String(hash));
+    if let Some(session) = opened {
+        body.insert("session".into(), json!(session));
+        body.insert("base_seq".into(), json!(pinned.last_seq));
+    }
+    Ok(Value::Object(body))
+}
+
+/// A reply without its frame id: what the exactly-once table keeps.
+fn reply_body(result: Result<Value, StoreError>) -> Value {
+    match result {
+        Ok(result) => json!({"ok": true, "result": result}),
+        Err(err) => {
+            let mut body = error_value(0, &err);
+            if let Some(object) = body.as_object_mut() {
+                object.remove("id");
+            }
+            body
+        }
+    }
+}
+
+fn send_reply(write: &Mutex<Box<dyn JsonIo>>, id: u64, mut body: Value) -> Result<(), StoreError> {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("id".into(), json!(id));
+    }
     let mut stream = lock_mutex(write);
     stream.write_value(&body)
 }
@@ -924,61 +1020,6 @@ fn param_value(params: &Value, key: &str) -> Result<Value, StoreError> {
         .ok_or_else(|| backend(format!("missing param `{key}`")))
 }
 
-fn doc_state_value(state: &DocState) -> Value {
-    let docs = state
-        .docs
-        .iter()
-        .map(|(collection, id, doc)| {
-            json!({
-                "collection": collection,
-                "id": id,
-                "doc": doc,
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "last_seq": state.last_seq,
-        "docs": docs,
-        "tables": columnar::tables_json(&state.tables),
-        "vectors": vector::vectors_json(&state.vectors),
-    })
-}
-
-fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
-    let last_seq = value
-        .get("last_seq")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| backend("read_state result is missing last_seq"))?;
-    let items = value
-        .get("docs")
-        .and_then(Value::as_array)
-        .ok_or_else(|| backend("read_state result is missing docs"))?;
-    let mut docs = Docs::default();
-    for item in items {
-        let collection = param_str(item, "collection")?.to_string();
-        let id = param_str(item, "id")?.to_string();
-        let doc = item
-            .get("doc")
-            .cloned()
-            .ok_or_else(|| backend("read_state doc is missing doc"))?;
-        docs.insert(collection, id, Arc::new(doc));
-    }
-    let tables = match value.get("tables") {
-        None => Tables::new(),
-        Some(tables) => columnar::parse_tables(tables)?,
-    };
-    let vectors = match value.get("vectors") {
-        None => Vectors::new(),
-        Some(vectors) => vector::parse_vectors(vectors)?,
-    };
-    Ok(DocState {
-        docs,
-        tables,
-        vectors,
-        last_seq,
-    })
-}
-
 fn optional_project(params: &Value) -> Result<Option<ProjectId>, StoreError> {
     match params.get("project") {
         Some(Value::Null) => Ok(None),
@@ -1073,7 +1114,7 @@ fn op_value(op: &Op) -> Value {
     }
 }
 
-fn parse_ops(value: &Value) -> Result<Vec<Op>, StoreError> {
+pub(super) fn parse_ops(value: &Value) -> Result<Vec<Op>, StoreError> {
     let items = value
         .as_array()
         .ok_or_else(|| backend("param `ops` is not an array"))?;
@@ -1172,19 +1213,56 @@ trait JsonIo: Send {
     fn shutdown_both(&self);
 }
 
-struct UnixIo(UnixStream);
+/// Frame bytes one client moved, both ways (`cfg(test)` only: a build
+/// without tests counts nothing and holds nothing).
+#[derive(Clone, Default)]
+pub(super) struct FrameCounter(#[cfg(test)] Arc<AtomicU64>);
+
+impl FrameCounter {
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn add(&self, _bytes: usize) {
+        #[cfg(test)]
+        self.0
+            .fetch_add(u64::try_from(_bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+}
+
+struct UnixIo {
+    stream: UnixStream,
+    counter: FrameCounter,
+}
+
+impl UnixIo {
+    fn new(stream: UnixStream, counter: FrameCounter) -> Self {
+        Self { stream, counter }
+    }
+}
 
 impl JsonIo for UnixIo {
     fn read_value(&mut self) -> Result<Incoming, StoreError> {
-        Ok(Incoming::Value(read_frame(&mut self.0)?))
+        let (value, len) = read_frame(&mut self.stream)?;
+        self.counter.add(len);
+        Ok(Incoming::Value(value))
     }
 
     fn write_value(&mut self, value: &Value) -> Result<(), StoreError> {
-        write_frame(&mut self.0, value)
+        let len = write_frame(&mut self.stream, value)?;
+        self.counter.add(len);
+        Ok(())
     }
 
     fn shutdown_both(&self) {
-        let _ = self.0.shutdown(Shutdown::Both);
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -1255,7 +1333,8 @@ impl JsonIo for WsIo {
     }
 }
 
-fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), StoreError> {
+/// Write one frame; the bytes it took, length prefix included.
+fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<usize, StoreError> {
     let bytes = serde_json::to_vec(value).map_err(|err| backend(format!("encode frame: {err}")))?;
     let len = u32::try_from(bytes.len()).map_err(|_| backend("frame length exceeds u32"))?;
     if len == 0 || len > MAX_FRAME_BYTES {
@@ -1263,10 +1342,11 @@ fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), StoreError>
     }
     stream.write_all(&len.to_be_bytes()).map_err(backend)?;
     stream.write_all(&bytes).map_err(backend)?;
-    Ok(())
+    Ok(bytes.len() + 4)
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<Value, StoreError> {
+/// Read one frame, and the bytes it took, length prefix included.
+fn read_frame(stream: &mut UnixStream) -> Result<(Value, usize), StoreError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).map_err(backend)?;
     let len = u32::from_be_bytes(len_buf);
@@ -1276,14 +1356,91 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, StoreError> {
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).map_err(backend)?;
     let text = std::str::from_utf8(&buf).map_err(|_| backend("frame is not utf-8"))?;
-    serde_json::from_str(text).map_err(|_| backend("frame is not json"))
+    let value = serde_json::from_str(text).map_err(|_| backend("frame is not json"))?;
+    Ok((value, buf.len() + 4))
 }
 
-struct RemoteShared {
+/// One client connection, shared by the handle and its transactions.
+pub(super) struct RemoteShared {
     write: Mutex<Box<dyn JsonIo>>,
     pending: Mutex<HashMap<u64, Sender<Result<Value, StoreError>>>>,
     next_id: AtomicU64,
     subs: Mutex<HashMap<String, Vec<Arc<Sender<MqRecord>>>>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    counter: FrameCounter,
+}
+
+/// A call that got no reply in [`CALL_TIMEOUT`].
+struct TimedOut;
+
+impl RemoteShared {
+    pub(super) fn call(&self, method: &str, params: Value) -> Result<Value, StoreError> {
+        match self.call_once(method, &params) {
+            Ok(result) => result,
+            Err(TimedOut) => Err(backend("timed out waiting for the FerroStore server")),
+        }
+    }
+
+    fn call_once(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Result<Value, StoreError>, TimedOut> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        lock_mutex(&self.pending).insert(id, tx);
+        let request = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        // Release the write lock before waiting. The reader must run, and a
+        // response must not need this task to still hold the mutex.
+        {
+            let mut stream = lock_mutex(&self.write);
+            if let Err(err) = stream.write_value(&request) {
+                lock_mutex(&self.pending).remove(&id);
+                return Ok(Err(err));
+            }
+        }
+        match rx.recv_timeout(CALL_TIMEOUT) {
+            Ok(result) => Ok(result),
+            Err(RecvTimeoutError::Timeout) => {
+                lock_mutex(&self.pending).remove(&id);
+                Err(TimedOut)
+            }
+            Err(RecvTimeoutError::Disconnected) => Ok(Err(backend("FerroStore connection closed"))),
+        }
+    }
+
+    /// A write `method` that runs once (spec §6.1): `params` gets a new
+    /// request id. A request that times out is sent once more with the same
+    /// id, so the server, which ran it or is running it, replies with the
+    /// first result and applies nothing again.
+    pub(super) fn call_req(&self, method: &str, mut params: Value) -> Result<Value, StoreError> {
+        if let Some(object) = params.as_object_mut() {
+            object.insert("req".into(), Value::String(session::new_request_id()));
+        }
+        for _ in 0..2 {
+            if let Ok(result) = self.call_once(method, &params) {
+                return result;
+            }
+        }
+        Err(backend(
+            "timed out waiting for the FerroStore server, twice: the write may have committed",
+        ))
+    }
+
+    /// Send `method` and do not wait: its reply is dropped when it comes.
+    pub(super) fn send_only(&self, method: &str, params: Value) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let _ = lock_mutex(&self.write).write_value(&request);
+    }
 }
 
 pub(super) struct RemoteClient {
@@ -1293,30 +1450,78 @@ pub(super) struct RemoteClient {
 
 impl RemoteClient {
     pub(super) fn call(&self, method: &str, params: Value) -> Result<Value, StoreError> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        lock_mutex(&self.shared.pending).insert(id, tx);
-        let request = json!({
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-        // Release the write lock before waiting. The reader must run, and a
-        // response must not need this task to still hold the mutex.
-        {
-            let mut stream = lock_mutex(&self.shared.write);
-            if let Err(err) = stream.write_value(&request) {
-                lock_mutex(&self.shared.pending).remove(&id);
-                return Err(err);
-            }
+        self.shared.call(method, params)
+    }
+
+    /// See [`RemoteShared::call_req`].
+    pub(super) fn call_req(&self, method: &str, params: Value) -> Result<Value, StoreError> {
+        self.shared.call_req(method, params)
+    }
+
+    pub(super) fn shared(&self) -> &Arc<RemoteShared> {
+        &self.shared
+    }
+
+    /// The frame bytes this client moved.
+    #[cfg(test)]
+    pub(super) fn counter(&self) -> &FrameCounter {
+        &self.shared.counter
+    }
+
+    /// The server's last committed sequence: a session's `base_seq`, and
+    /// the session closed again.
+    pub(super) fn last_seq(&self) -> Result<u64, StoreError> {
+        let opened = self.call("open_session", json!({}))?;
+        let session = opened.get("session").and_then(Value::as_u64);
+        let base_seq = opened.get("base_seq").and_then(Value::as_u64);
+        let (Some(session), Some(base_seq)) = (session, base_seq) else {
+            return Err(backend(
+                "open_session result is missing session or base_seq",
+            ));
+        };
+        self.shared
+            .send_only("close_session", json!({ "session": session }));
+        Ok(base_seq)
+    }
+
+    /// `commit_txn` (spec §6.1) under a new request id. `Ok(None)` is lost:
+    /// a read no longer has the value it had, and nothing was written.
+    /// `Ok(Some(seq))` committed at `seq`.
+    pub(super) fn commit_txn(
+        &self,
+        session: Option<(u64, u64)>,
+        reads: &[(ReadKey, String)],
+        ops: &[Op],
+        silent: bool,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut params = serde_json::Map::new();
+        if let Some((session, base_seq)) = session {
+            params.insert("session".into(), json!(session));
+            params.insert("base_seq".into(), json!(base_seq));
         }
-        match rx.recv_timeout(CALL_TIMEOUT) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => {
-                lock_mutex(&self.shared.pending).remove(&id);
-                Err(backend("timed out waiting for the FerroStore server"))
-            }
-            Err(RecvTimeoutError::Disconnected) => Err(backend("FerroStore connection closed")),
+        let mut encoded = Vec::with_capacity(reads.len());
+        for (key, hash) in reads {
+            let key =
+                serde_json::to_value(key).map_err(|err| backend(format!("encode read: {err}")))?;
+            encoded.push(json!({ "read": key, "hash": hash }));
+        }
+        params.insert("reads".into(), Value::Array(encoded));
+        params.insert(
+            "ops".into(),
+            Value::Array(ops.iter().map(op_value).collect()),
+        );
+        if silent {
+            params.insert("silent".into(), Value::Bool(true));
+        }
+        let value = self.call_req("commit_txn", Value::Object(params))?;
+        match value.get("committed").and_then(Value::as_bool) {
+            Some(false) => Ok(None),
+            Some(true) => value
+                .get("seq")
+                .and_then(Value::as_u64)
+                .map(Some)
+                .ok_or_else(|| backend("commit_txn committed ops but named no sequence")),
+            None => Err(backend("commit_txn result has no `committed`")),
         }
     }
 
@@ -1403,31 +1608,6 @@ impl RemoteClient {
         items.iter().map(parse_record).collect()
     }
 
-    pub(super) fn read_state(&self) -> Result<DocState, StoreError> {
-        parse_doc_state(&self.call("read_state", json!({}))?)
-    }
-
-    pub(super) fn commit_ops(
-        &self,
-        expected_seq: u64,
-        ops: &[Op],
-        silent: bool,
-    ) -> Result<bool, StoreError> {
-        let mut params = serde_json::Map::new();
-        params.insert("expected_seq".into(), json!(expected_seq));
-        params.insert(
-            "ops".into(),
-            Value::Array(ops.iter().map(op_value).collect()),
-        );
-        if silent {
-            params.insert("silent".into(), Value::Bool(true));
-        }
-        let value = self.call("commit_ops", Value::Object(params))?;
-        value
-            .as_bool()
-            .ok_or_else(|| backend("commit_ops result is not a bool"))
-    }
-
     pub(super) fn apply_sync_batches(
         &self,
         batches: &[SyncBatch],
@@ -1440,7 +1620,7 @@ impl RemoteClient {
         if silent {
             params.insert("silent".into(), Value::Bool(true));
         }
-        let value = self.call("apply_sync_batches", Value::Object(params))?;
+        let value = self.call_req("apply_sync_batches", Value::Object(params))?;
         value
             .as_u64()
             .ok_or_else(|| backend("apply_sync_batches result is not a u64"))
@@ -1494,7 +1674,12 @@ pub(super) fn client_from_unix(stream: UnixStream) -> Result<RemoteClient, Store
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;
-    finish_client(Box::new(UnixIo(stream)), Box::new(UnixIo(writer)))
+    let counter = FrameCounter::default();
+    finish_client(
+        Box::new(UnixIo::new(stream, counter.clone())),
+        Box::new(UnixIo::new(writer, counter.clone())),
+        counter,
+    )
 }
 
 pub(super) fn connect_ws(rest: &str) -> Result<RemoteClient, StoreError> {
@@ -1505,18 +1690,21 @@ pub(super) fn connect_ws(rest: &str) -> Result<RemoteClient, StoreError> {
     finish_client(
         Box::new(WsIo::client(stream)),
         Box::new(WsIo::client(writer)),
+        FrameCounter::default(),
     )
 }
 
 fn finish_client(
     read: Box<dyn JsonIo>,
     write: Box<dyn JsonIo>,
+    counter: FrameCounter,
 ) -> Result<RemoteClient, StoreError> {
     let shared = Arc::new(RemoteShared {
         write: Mutex::new(write),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         subs: Mutex::new(HashMap::new()),
+        counter,
     });
     let reader_shared = Arc::clone(&shared);
     let reader = thread::Builder::new()
@@ -1674,8 +1862,8 @@ mod tests {
     }
 
     #[test]
-    fn read_state_and_ops_round_trip_column_tables_and_a_null_document() {
-        use super::columnar::{self, ColumnDef, ColumnTable, ColumnType, ColumnValue};
+    fn ops_round_trip_column_tables_and_a_null_document() {
+        use super::columnar::{self, ColumnDef, ColumnType, ColumnValue};
         let columns = vec![ColumnDef {
             name: "n".into(),
             ty: ColumnType::Int64,
@@ -1689,28 +1877,6 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut tables = Tables::new();
-        tables.insert(
-            "t".into(),
-            ColumnTable {
-                columns: columns.clone(),
-                groups: vec![blob.clone()],
-            }
-            .into(),
-        );
-        let mut docs = Docs::default();
-        docs.insert("c".into(), "id".into(), Value::Null.into());
-        let state = DocState {
-            docs,
-            tables,
-            vectors: Vectors::new(),
-            last_seq: 4,
-        };
-        let parsed = parse_doc_state(&doc_state_value(&state)).unwrap();
-        assert_eq!(parsed.last_seq, 4);
-        assert_eq!(parsed.docs.get("c", "id"), Some(&Value::Null));
-        assert_eq!(parsed.tables.get("t").unwrap().groups, vec![blob.clone()]);
-        assert_eq!(parsed.tables.get("t").unwrap().columns, columns);
 
         let ops = [
             Op::CreateColumnTable {
@@ -1719,7 +1885,7 @@ mod tests {
             },
             Op::AppendColumnGroup {
                 name: "t".into(),
-                bytes: blob,
+                bytes: blob.clone(),
             },
             Op::Put {
                 collection: "c".into(),
@@ -1749,7 +1915,7 @@ mod tests {
                 assert_eq!(name, "t");
                 assert_eq!(cols, &columns);
                 assert_eq!(appended, "t");
-                assert_eq!(bytes, &state.tables.get("t").unwrap().groups[0]);
+                assert_eq!(bytes, &blob);
                 assert_eq!(doc, &Value::Null);
                 assert_eq!(id, "gone");
             }

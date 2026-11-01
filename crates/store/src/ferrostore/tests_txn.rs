@@ -44,7 +44,7 @@ fn modes() -> Modes {
 }
 
 fn last_seq(store: &FerroStore) -> u64 {
-    store.read_state().unwrap().last_seq
+    store.last_seq().unwrap()
 }
 
 fn make_vectors(store: &FerroStore, name: &str, dim: u32) {
@@ -187,13 +187,26 @@ fn a_transaction_reads_its_own_writes() {
                 )?;
                 assert!(txn.has_vector_collection("v"), "{mode}");
                 txn.upsert_vector("v", "p", &[1.0, 2.0], Some(&json!("m")))?;
-                assert_eq!(
-                    txn.get_vector("v", "p")?,
-                    Some((vec![1.0, 2.0], Some(json!("m")))),
-                    "{mode}"
-                );
+                // A remote transaction refuses to read its own vector writes
+                // back (spec §6.1): the server applies them.
+                if *mode == "remote" {
+                    let err = txn.get_vector("v", "p").unwrap_err();
+                    assert!(
+                        err.to_string()
+                            .contains("cannot read back its own vector writes"),
+                        "{err}"
+                    );
+                } else {
+                    assert_eq!(
+                        txn.get_vector("v", "p")?,
+                        Some((vec![1.0, 2.0], Some(json!("m")))),
+                        "{mode}"
+                    );
+                }
                 txn.delete_vector("v", "p")?;
-                assert_eq!(txn.get_vector("v", "p")?, None, "{mode}");
+                if *mode != "remote" {
+                    assert_eq!(txn.get_vector("v", "p")?, None, "{mode}");
+                }
 
                 txn.put_doc("docs", "new", &json!({"tag": "x"}))?;
                 assert_eq!(txn.get_doc("docs", "new"), Some(json!({"tag": "x"})));
@@ -775,6 +788,8 @@ fn a_servers_undelivered_still_reaches_the_clients_own_adapter() {
         .unwrap();
     let base = last_seq(&client);
 
+    // A remote handle has no sequence compare-and-swap (spec §6.1): its
+    // writes are a blind `commit_txn` and a validated one.
     let writes: [(&str, Write<'_>); 3] = [
         (
             "put_doc",
@@ -785,17 +800,12 @@ fn a_servers_undelivered_still_reaches_the_clients_own_adapter() {
             Box::new(|| client.transaction(|txn| txn.put_doc("docs", "b", &json!(2)))),
         ),
         (
-            "commit_if_seq",
+            "read-modify-write transaction",
             Box::new(|| {
-                let expected = last_seq(&client);
-                let op = super::Op::Put {
-                    collection: "docs".into(),
-                    id: "c".into(),
-                    doc: json!(3),
-                };
-                client
-                    .commit_if_seq(expected, &[op])
-                    .map(|wrote| assert!(wrote))
+                client.transaction(|txn| {
+                    let n = txn.get_doc("docs", "b").and_then(|doc| doc.as_u64());
+                    txn.put_doc("docs", "c", &json!(n.unwrap_or(0) + 1))
+                })
             }),
         ),
     ];

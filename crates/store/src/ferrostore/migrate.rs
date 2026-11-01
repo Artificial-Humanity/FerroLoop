@@ -34,9 +34,8 @@ pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Resul
         // A new store's own schema document is not data: it is overwritten below.
         // The body has staged nothing yet, so the base is the whole view.
         let holds_data = txn
-            .base()
-            .docs
             .collections()
+            .iter()
             .any(|collection| collection != doc::SCHEMA_COLLECTION);
         if holds_data || txn.has_tables() || txn.has_vectors() {
             return Err(backend(

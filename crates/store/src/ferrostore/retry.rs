@@ -1,15 +1,14 @@
 //! Bounded retry of a remote compare-and-swap write (spec §4.5).
 //!
-//! A remote handle runs a write body against the server's state, then sends
-//! its ops as a compare-and-swap on the server's sequence. When another
-//! writer committed first, the swap is lost and the body runs again, against
-//! the new state. One write makes at most [`REMOTE_ATTEMPTS`] attempts. After
+//! A remote handle runs a write body over a read session on the server, then
+//! sends its ops with its read set (spec §6.1). When another writer changed
+//! what the body read, the commit is lost and the body runs again, over a
+//! new session. One write makes at most [`REMOTE_ATTEMPTS`] attempts. After
 //! each lost attempt but the last it waits a jittered, exponentially growing
 //! time ([`Backoff`]). When every attempt is lost the write is
 //! `StoreError::Conflict` and has committed nothing.
 
 use super::layout::Op;
-use super::state::DocState;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::panic::Location;
@@ -72,15 +71,16 @@ impl Backoff {
     }
 }
 
-/// One remote compare-and-swap attempt, as it is about to be sent: the
-/// write's call site, the attempt number (from 1), the state the body ran
-/// against, and the ops it staged. A test hook sees it (`cfg(test)` only) and
-/// may make the attempt lose, as if another writer had committed first.
+/// One remote commit attempt, as it is about to be sent: the write's call
+/// site, the attempt number (from 1), what the body read of the state (the
+/// session's answers), and the ops it staged. A test hook sees it
+/// (`cfg(test)` only) and may make the attempt lose, as if another writer
+/// had changed what the body read.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct Cas<'a> {
     pub(super) caller: &'static Location<'static>,
     pub(super) attempt: u32,
-    pub(super) base: &'a DocState,
+    pub(super) known: &'a dyn std::fmt::Debug,
     pub(super) ops: &'a [Op],
 }
 

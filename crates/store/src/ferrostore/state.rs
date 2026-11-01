@@ -224,17 +224,50 @@ impl Overlay {
         }
     }
 
+    /// The staged put (`Some(Some)`) or delete (`Some(None)`) at
+    /// `(collection, id)`; `None` when this overlay has not touched it.
+    pub(super) fn staged_doc(&self, collection: &str, id: &str) -> Option<Option<&Value>> {
+        if self.docs.is_empty() {
+            return None;
+        }
+        self.docs
+            .get(&(collection.to_string(), id.to_string()))
+            .map(|staged| staged.as_deref())
+    }
+
+    /// Every staged put (`Some`) and delete (`None`) in `collection`, in id order.
+    pub(super) fn staged_in<'a>(
+        &'a self,
+        collection: &'a str,
+    ) -> impl Iterator<Item = (&'a str, Option<&'a Value>)> + 'a {
+        self.docs
+            .range((collection.to_string(), String::new())..)
+            .take_while(move |((held, _), _)| held == collection)
+            .map(|((_, id), doc)| (id.as_str(), doc.as_deref()))
+    }
+
     /// Every document in `collection` seen through this overlay, in id order:
     /// a staged put replaces or adds, a staged delete hides.
-    pub(super) fn visit(&self, base: &DocState, collection: &str, mut f: impl FnMut(&str, &Value)) {
-        let start = (collection.to_string(), String::new());
-        let mut staged = self
-            .docs
-            .range(start..)
-            .take_while(|((held, _), _)| held == collection)
-            .map(|((_, id), doc)| (id, doc))
-            .peekable();
-        let mut held = base.docs.in_collection(collection).peekable();
+    pub(super) fn visit(&self, base: &DocState, collection: &str, f: impl FnMut(&str, &Value)) {
+        self.visit_over(
+            collection,
+            base.docs
+                .in_collection(collection)
+                .map(|(id, doc)| (id.as_str(), doc)),
+            f,
+        );
+    }
+
+    /// [`Self::visit`] over `held`, the base's documents of `collection` in
+    /// id order, wherever they came from.
+    pub(super) fn visit_over<'b>(
+        &self,
+        collection: &str,
+        held: impl Iterator<Item = (&'b str, &'b Value)>,
+        mut f: impl FnMut(&str, &Value),
+    ) {
+        let mut staged = self.staged_in(collection).peekable();
+        let mut held = held.peekable();
         loop {
             let take_staged = match (held.peek(), staged.peek()) {
                 (None, None) => break,
@@ -276,6 +309,40 @@ impl Overlay {
             return Some(created);
         }
         base.tables.get(name).map(|table| table.columns.as_slice())
+    }
+
+    /// The columns of `name` when this overlay creates it.
+    pub(super) fn created_columns(&self, name: &str) -> Option<&[ColumnDef]> {
+        self.tables.get(name).and_then(|t| t.created.as_deref())
+    }
+
+    /// `true` when this overlay creates a column table.
+    pub(super) fn creates_table(&self) -> bool {
+        self.tables.values().any(|t| t.created.is_some())
+    }
+
+    /// Record a create the caller has checked, for a remote transaction,
+    /// whose overlay holds no base to check it against.
+    pub(super) fn record_table_create(&mut self, name: &str, columns: &[ColumnDef]) {
+        self.tables.insert(
+            name.to_string(),
+            TableStage {
+                created: Some(columns.to_vec()),
+                groups: Vec::new(),
+            },
+        );
+    }
+
+    /// Record an append the caller has checked (see [`Self::record_table_create`]).
+    pub(super) fn record_table_append(&mut self, name: &str, bytes: &[u8]) {
+        self.tables
+            .entry(name.to_string())
+            .or_insert_with(|| TableStage {
+                created: None,
+                groups: Vec::new(),
+            })
+            .groups
+            .push(bytes.to_vec());
     }
 
     /// The vector collection `name` seen through this overlay.
@@ -867,7 +934,7 @@ pub(super) fn next_mq_seq(txn: &Txn, topic: &str) -> Result<u64, StoreError> {
 }
 
 fn mq_high_water(txn: &Txn, topic: &str) -> Result<Option<u64>, StoreError> {
-    let Some(doc) = txn.doc(&mq_hw_collection(topic), MQ_HIGH_WATER_ID) else {
+    let Some(doc) = txn.get(&mq_hw_collection(topic), MQ_HIGH_WATER_ID) else {
         return Ok(None);
     };
     let Some(seq) = doc.get("seq").and_then(Value::as_u64) else {
