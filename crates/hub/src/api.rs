@@ -59,7 +59,7 @@ use fl_gate::{
     evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
     handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
-use fl_store::{AnyStore, IndexPolicy};
+use fl_store::AnyStore;
 use fl_wire::dispatcher::{
     MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
     dispatch_to_route,
@@ -2081,8 +2081,15 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
         return store_open_failure();
     };
     // A request that reads never writes the code vector index: it answers from
-    // whatever a CLI or MCP search has already indexed.
-    let ranked = fl_store::search_code(&store, &index, kind, &query, limit, IndexPolicy::ReadOnly);
+    // whatever a CLI or MCP search has already indexed. It searches through a
+    // cached read-only handle on the sidecar (opening one costs more than the
+    // search); the handle reads what a CLI search syncs afterwards.
+    let (ranked, cache_cause) = state
+        .code_sidecars
+        .search_read_only(&store, &index, kind, &query, limit);
+    if let Some(cause) = cache_cause {
+        eprintln!("fl: code sidecar cache unavailable: {cause}");
+    }
     // The engine's error behind a fallback goes to the operator's stderr, never
     // into the JSON body.
     if let Some(line) = ranked.unavailable_line() {
