@@ -2347,6 +2347,152 @@ mod tests {
         assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
     }
 
+    /// Seed one store, on the engine named, with a fixed ledger; the store is closed on return.
+    fn seed_stats_store(path: &std::path::Path, kind: fl_store::BackendKind) {
+        use fl_core::ids::{RecordId, seq_iri};
+        use fl_core::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
+        use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+        use fl_core::store::Ledger;
+        use fl_core::verdict::Verdict;
+
+        let store = fl_store::open_store_with(
+            path,
+            &fl_store::StoreOptions {
+                backend: Some(kind),
+                ..fl_store::StoreOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.kind(), kind);
+        let p1 = store.add_project("one").unwrap();
+        let p2 = store.add_project("two").unwrap();
+        for (project, status, cost, ms) in [
+            (&p1, AttemptStatus::Completed, 1_000, 100),
+            (&p1, AttemptStatus::Refused, 0, 0),
+            (&p2, AttemptStatus::Crashed, 25, 40),
+        ] {
+            store
+                .append_attempt(Attempt {
+                    id: None,
+                    at: None,
+                    project: project.clone(),
+                    record: RecordId(seq_iri(9)),
+                    adapter: "claude".into(),
+                    status,
+                    duration_ms: ms,
+                    tokens_in: 10,
+                    tokens_out: 4,
+                    cost_usd_micros: cost,
+                    paths_touched: PathsTouched::Counted(0),
+                    output_excerpt: None,
+                })
+                .unwrap();
+        }
+        let gate = store
+            .add_gate(
+                &p2,
+                "fmt",
+                GateKind::Command(CommandSpec {
+                    program: "true".into(),
+                    args: vec![],
+                    delivery: PopulationDelivery::Args,
+                    timeout_secs: 5,
+                    pass_codes: vec![0],
+                }),
+                Selector::Glob {
+                    pattern: "**/*.rs".into(),
+                },
+                1,
+                "c1",
+                "o",
+            )
+            .unwrap();
+        for verdict in [
+            Verdict::from_predicate(true, 1),
+            Verdict::from_predicate(false, 1),
+            Verdict::error("boom"),
+            Verdict::error("again"),
+        ] {
+            store
+                .append_gate_run(GateRun {
+                    id: None,
+                    at: None,
+                    gate: gate.clone(),
+                    record: None,
+                    commit: "c1".into(),
+                    verdict,
+                    population: 1,
+                    output_excerpt: None,
+                    duration_ms: 3,
+                    cost_usd_micros: 1,
+                })
+                .unwrap();
+        }
+    }
+
+    fn stats_body(state: &HubState, target: &str) -> Value {
+        let resp = handle_http_request(
+            state,
+            &HttpRequest::new("GET", target)
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(resp.status, 200, "{target}");
+        resp.json_value().unwrap()
+    }
+
+    #[test]
+    fn stats_summary_gives_equal_totals_on_both_engines_and_leaves_the_default_alone() {
+        use fl_store::BackendKind;
+
+        let mut summaries = Vec::new();
+        let mut defaults = Vec::new();
+        for (kind, file, source) in [
+            (BackendKind::Redb, "store.redb", "rows"),
+            (BackendKind::Ferro, "store.fls", "columnar"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = test_hub_state(&tmp);
+            state.config.store_path = tmp.path().join(file);
+            seed_stats_store(&state.config.store_path, kind);
+
+            let mut summary = stats_body(&state, "/api/v1/stats?summary=1");
+            assert_eq!(summary["source"], source, "{kind:?}");
+            summary.as_object_mut().unwrap().remove("source");
+            summaries.push(summary);
+
+            let default = stats_body(&state, "/api/v1/stats");
+            for key in ["source", "gate_runs"] {
+                assert!(default.get(key).is_none(), "{key} leaked: {default}");
+            }
+            assert!(default.get("by_adapter").is_some(), "{default}");
+            // `summary=0` and any other value are the default response too.
+            assert_eq!(stats_body(&state, "/api/v1/stats?summary=0"), default);
+            defaults.push(default);
+        }
+        assert_eq!(
+            summaries[0],
+            json!({
+                "attempts": 3,
+                "wall_clock_ms": 140,
+                "tokens_in": 30,
+                "tokens_out": 12,
+                "cost_usd_micros": 1025,
+                "gate_runs": {"pass": 1, "fail": 1, "error": 2},
+            })
+        );
+        assert_eq!(summaries[0], summaries[1]);
+        assert_eq!(defaults[0]["attempts"], defaults[1]["attempts"]);
+        assert_eq!(defaults[0]["by_status"], defaults[1]["by_status"]);
+    }
+
+    #[test]
+    fn stats_summary_keeps_the_auth_of_the_stats_route() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let resp = handle_http_request(&state, &HttpRequest::new("GET", "/api/v1/stats?summary=1"));
+        assert_eq!(resp.status, 401);
+    }
+
     fn install_webhook_route(home: &std::path::Path, persona: &str, socket: &std::path::Path) {
         use fl_core::at::At;
         use fl_wire::identity::{RouteTable, VendorRoute};
