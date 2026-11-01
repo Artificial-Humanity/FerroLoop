@@ -186,17 +186,29 @@ impl<'a> CodeSymbolRef<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndex {
     files: Vec<IndexedFile>,
-    /// The scanned root, canonicalized when that works and as given when it
-    /// does not. `None` only for an index that was not made by a scan.
+    /// The scanned root, canonicalized when that works. For a root that could
+    /// not be scanned it is the path as given (made absolute), never the
+    /// target of a link. `None` only for an index that was not made by a scan.
     root: Option<PathBuf>,
+    /// Whether the walk really read the root. `false` for a symlink, a missing
+    /// or unreadable root, and for an index not made by a scan: such an index
+    /// is empty because nothing was read, not because the files are gone.
+    scanned: bool,
 }
 
 impl CodeIndex {
     /// The root this index was scanned from: what a ranker that keeps derived
     /// data per index keys it by, so that two roots never share it. The path is
-    /// canonical when the filesystem could canonicalize it, otherwise as given.
+    /// canonical when the root was scanned, otherwise as given.
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Whether the root was read. An index that was not is empty because the
+    /// scan could not look, so its absence of files says nothing about what is
+    /// stored for the root: a ranker must not delete or write anything for it.
+    pub fn scanned(&self) -> bool {
+        self.scanned
     }
 
     pub fn files_indexed(&self) -> u64 {
@@ -476,23 +488,31 @@ fn line_hit(file: &IndexedFile, line_no: u64, line: &str) -> CodeSymbolHit {
 /// Deterministically scan `root` (sorted walk, no symlink following).
 /// Directories named `.git`/`target`/`node_modules`/`dist`/`.next` are
 /// skipped at any depth; non-UTF-8 files and files over
-/// [`MAX_CODE_FILE_BYTES`] are skipped. A missing root yields an empty index.
+/// [`MAX_CODE_FILE_BYTES`] are skipped. A root that is a symlink, is missing
+/// or cannot be read yields an empty index that is not [`CodeIndex::scanned`]
+/// and whose root is the path as given, not the target of a link.
 pub fn scan_code_index(root: &Path) -> CodeIndex {
-    let identity = Some(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
-    let empty = || CodeIndex {
+    let unscanned = || CodeIndex {
         files: Vec::new(),
-        root: identity.clone(),
+        root: Some(std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())),
+        scanned: false,
     };
+    let identity = Some(fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
     let mut paths: Vec<PathBuf> = Vec::new();
     match fs::symlink_metadata(root) {
-        Ok(md) if md.file_type().is_symlink() => return empty(),
+        Ok(md) if md.file_type().is_symlink() => return unscanned(),
         Ok(md) if md.is_file() => {
             if has_indexed_extension(root) {
                 paths.push(root.to_path_buf());
             }
         }
-        Ok(_) => collect_files(root, &mut paths),
-        Err(_) => return empty(),
+        Ok(_) => {
+            if fs::read_dir(root).is_err() {
+                return unscanned();
+            }
+            collect_files(root, &mut paths);
+        }
+        Err(_) => return unscanned(),
     }
     paths.sort();
     let root_is_file = paths.len() == 1 && root.is_file();
@@ -516,6 +536,7 @@ pub fn scan_code_index(root: &Path) -> CodeIndex {
     CodeIndex {
         files,
         root: identity,
+        scanned: true,
     }
 }
 
@@ -1353,6 +1374,39 @@ mod tests {
         assert_eq!(none.root(), Some(missing.as_path()));
         assert_eq!(none.files_indexed(), 0);
         assert_eq!(CodeIndex::default().root(), None);
+    }
+
+    #[test]
+    fn a_root_that_could_not_be_read_is_not_scanned_and_is_not_its_target() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        write(&real, "a.rs", "pub fn one() {}\n");
+        let link = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let aliased = scan_code_index(&link);
+        assert!(!aliased.scanned());
+        assert_eq!(aliased.files_indexed(), 0);
+        assert_eq!(
+            aliased.root(),
+            Some(link.as_path()),
+            "the link was followed"
+        );
+        let missing = scan_code_index(&tmp.path().join("missing"));
+        assert!(!missing.scanned());
+        // A directory that cannot be listed.
+        use std::os::unix::fs::PermissionsExt;
+        let locked = tmp.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_err() {
+            assert!(!scan_code_index(&locked).scanned());
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        // Read, empty or not: scanned.
+        assert!(scan_code_index(&real).scanned());
+        assert!(scan_code_index(&locked).scanned());
+        assert!(!CodeIndex::default().scanned());
     }
 
     #[test]

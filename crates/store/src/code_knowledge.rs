@@ -283,13 +283,19 @@ fn hex_prefix(bytes: &[u8], take: usize) -> String {
 /// The vector collection for an embedding space and a scanned root: another
 /// space, dimension or root never shares one. The root is the index's own
 /// ([`CodeIndex::root`]; an index not made by a scan has none and shares the
-/// root-less collection).
+/// root-less collection). An index that was not scanned (a symlink, a missing
+/// or unreadable root) is keyed apart from every scanned root, so that it can
+/// never name the collection of the tree a link points at.
 pub fn code_vector_collection_name(embedder: &dyn Embedder, index: &CodeIndex) -> String {
     let space = hex_prefix(embedder.space_id().as_bytes(), 4);
-    let root = index
-        .root()
-        .map_or(&[][..], |r| r.as_os_str().as_encoded_bytes());
-    format!("code_vec_{space}_{}", hex_prefix(root, 8))
+    let mut root = Vec::new();
+    if !index.scanned() {
+        root.extend_from_slice(b"unscanned\0");
+    }
+    if let Some(r) = index.root() {
+        root.extend_from_slice(r.as_os_str().as_encoded_bytes());
+    }
+    format!("code_vec_{space}_{}", hex_prefix(&root, 8))
 }
 
 /// An id for a symbol (or a matched line): a hash of its path, kind, name and
@@ -344,6 +350,11 @@ fn hybrid(
 ) -> Result<Option<RankedCode>, StoreError> {
     let query_vec = embedder.embed(query);
     if is_zero(&query_vec) {
+        return Ok(None);
+    }
+    // An index that was not scanned says nothing about the stored vectors:
+    // no sidecar is opened, nothing is synced, and the exact leg answers.
+    if !index.scanned() {
         return Ok(None);
     }
     let path = sidecar_path(store).ok_or_else(|| {
@@ -700,6 +711,11 @@ pub(crate) fn sync_files_batched(
     batch: usize,
 ) -> Result<CodeSyncStats, StoreError> {
     let batch = batch.max(1);
+    // Never plan from an index that was not scanned: its empty file list is
+    // "could not look", and every stored file would read as gone.
+    if !index.scanned() {
+        return Ok(CodeSyncStats::default());
+    }
     let started = Instant::now();
     let space = stamp(&embedder.space_id());
     let doc = IndexDoc::load(ferro, collection, space)?;
@@ -1955,6 +1971,140 @@ pub fn lunch_menu_planner() {}
         let missing = scan_code_index(&a.path().join("missing"));
         assert_eq!(missing.root(), Some(a.path().join("missing").as_path()));
         assert_ne!(col(&missing), col(&direct));
+    }
+
+    /// Every vector of a synced tree is still there, and so is its document.
+    fn assert_untouched(fd: &TempDir, real: &CodeIndex, files: usize, vectors: usize) {
+        let side = open_side(fd);
+        assert_eq!(vector_count(&side, real), vectors, "vectors changed");
+        let space = stamp(&default_embedder().space_id());
+        let doc = IndexDoc::load(&side, &col(real), space).unwrap();
+        assert_eq!(doc.files.len(), files, "the document changed");
+        assert!(
+            doc.files.values().all(|r| r.digest != PENDING_DIGEST),
+            "a file was left pending"
+        );
+    }
+
+    #[test]
+    fn a_symlink_root_never_touches_the_tree_it_points_at() {
+        let real = TempDir::new().unwrap();
+        write(
+            real.path(),
+            "src/lib.rs",
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        );
+        let links = TempDir::new().unwrap();
+        let link = links.path().join("alias");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let index_real = scan_code_index(real.path());
+        let (_rd, _redb, fd, ferro) = pair();
+        run(&ferro, &index_real, SYNC, "alpha");
+        assert_untouched(&fd, &index_real, 1, 2);
+        let before = std::fs::read(sidecar(&fd)).unwrap();
+
+        let alias = scan_code_index(&link);
+        assert!(!alias.scanned());
+        assert_eq!(alias.files_indexed(), 0);
+        assert_ne!(
+            col(&alias),
+            col(&index_real),
+            "the alias names the target's collection"
+        );
+        // Through the search path, with and without a write policy.
+        let (ranked, stats) = run(&ferro, &alias, SYNC, "alpha");
+        assert_eq!(stats, CodeSyncStats::default());
+        assert!(ranked.outcome.symbols.is_empty());
+        run(&ferro, &alias, IndexPolicy::ReadOnly, "alpha");
+        // And straight at the sync, even when handed the target's collection.
+        let side = open_side(&fd);
+        let stats = sync_files(
+            &side,
+            default_embedder(),
+            &col(&index_real),
+            &alias,
+            100,
+            LONG,
+        )
+        .unwrap();
+        assert_eq!(stats, CodeSyncStats::default());
+        drop(side);
+        assert_untouched(&fd, &index_real, 1, 2);
+        assert_eq!(
+            std::fs::read(sidecar(&fd)).unwrap(),
+            before,
+            "the sidecar was written"
+        );
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_root_never_touches_a_synced_tree() {
+        let real = TempDir::new().unwrap();
+        write(
+            real.path(),
+            "src/lib.rs",
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        );
+        let index_real = scan_code_index(real.path());
+        let (_rd, _redb, fd, ferro) = pair();
+        run(&ferro, &index_real, SYNC, "alpha");
+        let before = std::fs::read(sidecar(&fd)).unwrap();
+
+        let missing = scan_code_index(&real.path().join("gone"));
+        assert!(!missing.scanned());
+        let (_, stats) = run(&ferro, &missing, SYNC, "alpha");
+        assert_eq!(stats, CodeSyncStats::default());
+        let side = open_side(&fd);
+        let stats = sync_files(
+            &side,
+            default_embedder(),
+            &col(&index_real),
+            &missing,
+            100,
+            LONG,
+        )
+        .unwrap();
+        assert_eq!(stats, CodeSyncStats::default());
+        drop(side);
+        assert_untouched(&fd, &index_real, 1, 2);
+        assert_eq!(
+            std::fs::read(sidecar(&fd)).unwrap(),
+            before,
+            "the sidecar was written"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_emptied_directory_still_removes_its_vectors() {
+        let real = TempDir::new().unwrap();
+        write(
+            real.path(),
+            "src/lib.rs",
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        );
+        let index_real = scan_code_index(real.path());
+        let (_rd, _redb, fd, ferro) = pair();
+        run(&ferro, &index_real, SYNC, "alpha");
+        assert_untouched(&fd, &index_real, 1, 2);
+        std::fs::remove_file(real.path().join("src/lib.rs")).unwrap();
+        let emptied = scan_code_index(real.path());
+        assert!(emptied.scanned());
+        assert_eq!(col(&emptied), col(&index_real));
+        let (_, stats) = run(&ferro, &emptied, SYNC, "alpha");
+        assert_eq!(stats.deleted, 2, "{stats:?}");
+        let side = open_side(&fd);
+        let space = stamp(&default_embedder().space_id());
+        let doc = IndexDoc::load(&side, &col(&emptied), space).unwrap();
+        assert!(doc.files.is_empty());
+        let left = side
+            .search_vectors(
+                &col(&emptied),
+                &default_embedder().embed("alpha"),
+                100,
+                None,
+            )
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
