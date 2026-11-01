@@ -457,12 +457,14 @@ pub fn status(path: &Path, kind: BackendKind) -> StatusReport {
             (FormatVersion::Unknown, Some("empty file".into()))
         }
         (BackendKind::Redb, true) => {
-            // No retries: a store another process holds is reported, not waited on.
-            let options = StoreOptions {
-                retries: 0,
-                ..engine_options(BackendKind::Redb)
-            };
-            match crate::open_store_with(path, &options).and_then(|s| s.format_version()) {
+            // Opened for reading only (`open_read_only`): an ordinary open
+            // rewrites redb's internal pages and may repair or initialise the
+            // file, and status must change nothing, not even on a 0400 file.
+            // No retries: a store another process holds is reported, not
+            // waited on. A file that needs repair or is not an initialised
+            // store is reported as unreadable; `fl` repairs it on its next
+            // ordinary open.
+            match RedbStore::open_read_only(path, 0).and_then(|s| s.format_version()) {
                 Ok(Some(v)) => (FormatVersion::Known(v), None),
                 Ok(None) => (FormatVersion::Unknown, Some("the file records none".into())),
                 Err(e) => (
@@ -1505,6 +1507,62 @@ mod tests {
             std::fs::metadata(&redb).unwrap().permissions().mode() & 0o777,
             0o600,
             "status changed the .redb's mode"
+        );
+    }
+
+    #[test]
+    fn status_on_redb_changes_no_byte_and_no_mtime_and_works_on_a_0400_file() {
+        if !env_is_unset() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("s.redb");
+        drop(RedbStore::open(&redb).unwrap());
+        std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let before = (
+            std::fs::read(&redb).unwrap(),
+            std::fs::metadata(&redb).unwrap().modified().unwrap(),
+        );
+        let report = status(&redb, BackendKind::Redb);
+        assert!(
+            matches!(report.format_version, FormatVersion::Known(_)),
+            "{:?} {:?}",
+            report.format_version,
+            report.format_note
+        );
+        let after = (
+            std::fs::read(&redb).unwrap(),
+            std::fs::metadata(&redb).unwrap().modified().unwrap(),
+        );
+        assert!(before.0 == after.0, "status changed the .redb's bytes");
+        assert_eq!(before.1, after.1, "status changed the .redb's mtime");
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[test]
+    fn status_on_a_redb_without_the_store_tables_reports_it_and_does_not_initialise_it() {
+        if !env_is_unset() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let redb = dir.path().join("s.redb");
+        // A valid redb database that is not a store: no tables at all.
+        drop(redb::Database::create(&redb).unwrap());
+        let before = std::fs::read(&redb).unwrap();
+        let report = status(&redb, BackendKind::Redb);
+        assert!(
+            matches!(report.format_version, FormatVersion::Unknown),
+            "{:?}",
+            report.format_version
+        );
+        let note = report.format_note.expect("the report says why");
+        assert!(note.contains("could not read it"), "{note}");
+        assert!(
+            std::fs::read(&redb).unwrap() == before,
+            "status wrote the file"
         );
     }
 
