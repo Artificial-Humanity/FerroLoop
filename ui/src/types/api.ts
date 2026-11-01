@@ -180,9 +180,20 @@ export interface PruneArtifactsResponse {
   pruned_paths?: string[];
 }
 
+export interface PruneAttachmentsRequest {
+  older_than_days?: number;
+}
+
+export interface PruneAttachmentsResponse {
+  deleted_count: number;
+  deleted_bytes: number;
+  kept_count: number;
+}
+
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;
+  attachment_retention_days?: number;
   subsystems: {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
@@ -202,9 +213,12 @@ export interface HubSettings {
   attachment_retention_days?: number;
 }
 
+export type HubSettingsPatch = Partial<HubSettings>;
+
 export const DEFAULT_HUB_SETTINGS: HubSettings = {
   theme_preference: "dark",
   timezone: "UTC",
+  attachment_retention_days: 7,
   subsystems: {
     ferrogate_enabled: true,
     ferrostate_enabled: true,

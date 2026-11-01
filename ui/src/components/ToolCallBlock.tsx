@@ -47,7 +47,7 @@ export const ToolCallBlock: React.FC<ToolCallBlockProps> = ({
       data-testid={`tool-call-block-${tool.name}`}
       style={{
         padding: "8px 10px",
-        backgroundColor: "rgba(17, 22, 31, 0.85)",
+        backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
         borderColor: "var(--border-subtle)",
         marginBottom: "6px",
       }}

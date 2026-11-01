@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
-import { togglePinnedProject, usePinnedState } from "./RosterSidebar";
+import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -33,7 +33,7 @@ export interface SettingsModalProps {
   activeCockpitTab?: CockpitTab;
   onSelectCockpitTab?: (tab: CockpitTab) => void;
   onOpenNodesModal?: () => void;
-  onOpenSpinUpModal?: () => void;
+  onOpenSpinUpModal?: (initialProject?: string | null) => void;
   onOpenPairingModal?: () => void;
   onOpenAgentSettings?: (nameKey: string) => void;
   onLogout?: () => void;
@@ -60,6 +60,29 @@ export const CANONICAL_PROJECTS = [
   "Website",
   "Workspace",
 ];
+
+export const ATTACHMENT_RETENTION_OPTIONS = [
+  { value: 1, label: "1 day" },
+  { value: 3, label: "3 days" },
+  { value: 7, label: "7 days (Default)" },
+  { value: 14, label: "14 days" },
+  { value: 30, label: "30 days" },
+  { value: 90, label: "90 days" },
+  { value: 0, label: "Never (0)" },
+] as const;
+
+export function resolveProjectFilterValue(
+  rawProject: string | null | undefined,
+  options: readonly string[] = CANONICAL_PROJECTS,
+): string {
+  const trimmed = (rawProject ?? "").trim();
+  if (!trimmed || trimmed.toLowerCase() === "all") {
+    return "all";
+  }
+  const lower = trimmed.toLowerCase();
+  const matched = options.find((opt) => opt.toLowerCase() === lower);
+  return matched ?? trimmed;
+}
 
 export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
 
@@ -241,7 +264,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const { pinnedProjects } = usePinnedState();
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
-    initialProject || "all",
+    () => resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
   );
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<Set<string>>(
     () => new Set(),
@@ -249,6 +272,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [settings, setSettings] = useState<HubSettings>(DEFAULT_HUB_SETTINGS);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [pruningAttachments, setPruningAttachments] = useState(false);
+  const [pruneStatusMessage, setPruneStatusMessage] = useState<string | null>(
+    null,
+  );
 
   // Agents Fleet & Re-Cast state
   const [loadedAgents, setLoadedAgents] = useState<AgentRecord[]>(
@@ -311,7 +338,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [initialTab]);
 
   useEffect(() => {
-    setSelectedProjectFilter(initialProject || "all");
+    setSelectedProjectFilter(
+      resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
+    );
     if (initialProject) {
       setActiveTab("agents");
     }
@@ -322,12 +351,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setError(null);
     setLastResult(null);
     setSettingsSaved(false);
+    setPruneStatusMessage(null);
     setCloudAdaptersSaved(false);
     setRecastStatusBanner(null);
     setRecastReplaceLeadArmed({});
     setRecastModalAgentKey(null);
     setSelectedAgentKeys(new Set());
-    setSelectedProjectFilter(initialProject || "all");
+    setSelectedProjectFilter(
+      resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
+    );
     setActiveTab(initialProject ? "agents" : initialTab);
     setTotpEnrollment(null);
     setTotpVerifyCode("");
@@ -433,15 +465,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return out;
   }, [propAgents, loadedAgents]);
 
+  const projectOptions = useMemo<string[]>(() => {
+    const out: string[] = [...CANONICAL_PROJECTS];
+    const addProjectOption = (raw?: string | null) => {
+      const trimmed = (raw ?? "").trim();
+      if (!trimmed || trimmed.toLowerCase() === "all") return;
+      const lower = trimmed.toLowerCase();
+      if (!out.some((opt) => opt.toLowerCase() === lower)) {
+        out.push(trimmed);
+      }
+    };
+    for (const ag of effectiveAgents) {
+      addProjectOption(ag.project || "Workspace");
+    }
+    addProjectOption(initialProject);
+    addProjectOption(selectedProjectFilter);
+    return out;
+  }, [effectiveAgents, initialProject, selectedProjectFilter]);
+
+  const resolvedProjectFilter = useMemo<string>(
+    () => resolveProjectFilterValue(selectedProjectFilter, projectOptions),
+    [selectedProjectFilter, projectOptions],
+  );
+
   const filteredAgents = useMemo<AgentRecord[]>(() => {
-    if (!selectedProjectFilter || selectedProjectFilter === "all") {
+    if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
       return effectiveAgents;
     }
-    const target = selectedProjectFilter.toLowerCase();
+    const target = resolvedProjectFilter.toLowerCase();
     return effectiveAgents.filter(
       (ag) => (ag.project || "Workspace").toLowerCase() === target,
     );
-  }, [effectiveAgents, selectedProjectFilter]);
+  }, [effectiveAgents, resolvedProjectFilter]);
 
   const allFilteredSelected = useMemo(() => {
     if (filteredAgents.length === 0) return false;
@@ -451,12 +506,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [filteredAgents, selectedAgentKeys]);
 
   const projectSummaryLead = useMemo(() => {
-    if (!selectedProjectFilter || selectedProjectFilter === "all") return null;
+    if (!resolvedProjectFilter || resolvedProjectFilter === "all") return null;
     const lead = filteredAgents.find(
       (ag) => ag.role === "lead" || ag.role === "lab_manager",
     );
     return lead ? lead.display_name : "Unassigned";
-  }, [filteredAgents, selectedProjectFilter]);
+  }, [filteredAgents, resolvedProjectFilter]);
 
   const authorityText = useMemo(() => {
     if (!authority) return "Unauthenticated";
@@ -585,6 +640,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       );
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const handlePruneAttachments = async (olderThanDays?: number) => {
+    if (pruningAttachments) return;
+    setPruningAttachments(true);
+    setError(null);
+    setPruneStatusMessage(null);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.pruneAttachments(olderThanDays);
+      const deletedCount = res?.deleted_count ?? 0;
+      const deletedBytes = res?.deleted_bytes ?? 0;
+      const keptCount = res?.kept_count ?? 0;
+      setPruneStatusMessage(
+        olderThanDays === 0
+          ? `Purged ${deletedCount} screenshot/attachment file${deletedCount === 1 ? "" : "s"} (${deletedBytes} bytes freed).`
+          : `Cleaned up ${deletedCount} expired screenshot/attachment file${deletedCount === 1 ? "" : "s"} (${deletedBytes} bytes freed; ${keptCount} kept).`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to clean up screenshot attachments",
+      );
+    } finally {
+      setPruningAttachments(false);
     }
   };
 
@@ -842,7 +924,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
             onClick={() => setActiveTab("agents")}
           >
-            {effectiveAgents.length} Agents
+            {filteredAgents.length} Agents
           </button>
           {!initialProject && (
             <>
@@ -1011,7 +1093,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     fontWeight: 700,
                   }}
                 >
-                  {effectiveAgents.length} Agents
+                  {filteredAgents.length} Agents
                 </h3>
                 <p
                   style={{
@@ -1020,7 +1102,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     color: "var(--text-secondary)",
                   }}
                 >
-                  Spin up new sessions, re-cast an agent&apos;s project or role, or
+                  Create new agent sessions, re-cast an agent&apos;s project or role, or
                   decommission sessions across the fleet.
                 </p>
               </div>
@@ -1029,11 +1111,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 data-testid="settings-spin-up-btn"
                 className="fd-btn fd-btn-primary"
                 onClick={() => {
-                  onOpenSpinUpModal?.();
+                  onOpenSpinUpModal?.(
+                    resolvedProjectFilter !== "all" ? resolvedProjectFilter : undefined,
+                  );
                   onClose();
                 }}
               >
-                + Spin Up Agent
+                + New Agent
               </button>
             </div>
 
@@ -1065,11 +1149,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   data-testid="settings-project-filter-select"
                   className="fd-select fd-mono"
                   style={{ fontSize: "11.5px", padding: "3px 8px" }}
-                  value={selectedProjectFilter}
+                  value={resolvedProjectFilter}
                   onChange={(e) => setSelectedProjectFilter(e.target.value)}
                 >
                   <option value="all">All Projects ({effectiveAgents.length})</option>
-                  {CANONICAL_PROJECTS.map((proj) => (
+                  {projectOptions.map((proj) => (
                     <option key={proj} value={proj}>
                       {proj}
                     </option>
@@ -1116,7 +1200,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             {/* Scoped Project Summary Card (shown when a project is selected) */}
-            {selectedProjectFilter !== "all" && (
+            {resolvedProjectFilter !== "all" && (
               <div
                 data-testid="settings-project-summary-card"
                 className="fd-card"
@@ -1143,7 +1227,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       data-testid="settings-project-summary-name"
                       style={{ fontSize: "13px" }}
                     >
-                      {selectedProjectFilter}
+                      {resolvedProjectFilter}
                     </strong>
                     <span className="fd-badge fd-mono" data-testid="settings-project-summary-lead">
                       Lead: {projectSummaryLead}
@@ -1151,10 +1235,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <span
                       className="fd-badge fd-mono"
                       data-testid="session-cwd-badge"
-                      title={`~/Projects/Artificial-Humanity/${selectedProjectFilter}`}
+                      title={`~/Projects/Artificial-Humanity/${resolvedProjectFilter}`}
                       style={{ color: "var(--text-muted)" }}
                     >
-                      ~/Projects/Artificial-Humanity/{selectedProjectFilter}
+                      ~/Projects/Artificial-Humanity/{resolvedProjectFilter}
                     </span>
                     <span className="fd-badge fd-mono">
                       {filteredAgents.length} {filteredAgents.length === 1 ? "agent" : "agents"}
@@ -1165,14 +1249,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <button
                       type="button"
                       data-testid="project-pin-toggle-btn"
-                      aria-pressed={pinnedProjects.has(selectedProjectFilter.trim().toLowerCase())}
-                      className={`fd-btn${pinnedProjects.has(selectedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => togglePinnedProject(selectedProjectFilter)}
+                      aria-pressed={pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())}
+                      title={
+                        pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
+                          ? "Unpin Project"
+                          : "Pin Project"
+                      }
+                      aria-label={
+                        pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
+                          ? "Unpin Project"
+                          : "Pin Project"
+                      }
+                      className={`fd-btn${pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
+                      style={{
+                        padding: "4px 6px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        lineHeight: 1,
+                      }}
+                      onClick={() => togglePinnedProject(resolvedProjectFilter)}
                     >
-                      {pinnedProjects.has(selectedProjectFilter.trim().toLowerCase())
-                        ? "📌 Unpin Project"
-                        : "📌 Pin Project"}
+                      <PinIcon
+                        pinned={pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())}
+                        circled={true}
+                        size={16}
+                      />
                     </button>
                     <button
                       type="button"
@@ -1209,18 +1311,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }}
                     >
                       Project Artifacts
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="settings-project-spin-up-btn"
-                      className="fd-btn fd-btn-primary"
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => {
-                        onOpenSpinUpModal?.();
-                        onClose();
-                      }}
-                    >
-                      + Spin Up in {selectedProjectFilter}
                     </button>
                   </div>
                 </div>
@@ -1344,10 +1434,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <button
                           type="button"
                           data-testid={`settings-agent-cog-btn-${key}`}
-                          className="fd-btn"
+                          className="fd-gear-btn"
                           title={`Settings for ${ag.display_name}`}
                           aria-label={`Settings for ${ag.display_name}`}
-                          style={{ padding: "3px 8px", fontSize: "11px" }}
+                          style={{
+                            border: "none",
+                            background: "transparent",
+                            padding: "2px 4px",
+                            fontSize: "16px",
+                            lineHeight: 1,
+                          }}
                           onClick={() => onOpenAgentSettings?.(ag.name_key)}
                         >
                           ⚙
@@ -1737,6 +1833,113 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </option>
                 ))}
               </select>
+            </div>
+
+            {/* Screenshot & Attachment Retention */}
+            <div
+              data-testid="settings-attachment-retention-row"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Screenshot &amp; Attachment Retention
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Configure automatic cleanup for pasted screenshots and
+                    uploaded prompt attachments, or prune files on demand.
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <select
+                    aria-label="Screenshot & Attachment Retention"
+                    data-testid="settings-attachment-retention-select"
+                    className="fd-select fd-mono"
+                    value={String(settings.attachment_retention_days ?? 7)}
+                    onChange={(e) => {
+                      const nextDays = Number(e.target.value);
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        attachment_retention_days: Number.isFinite(nextDays)
+                          ? nextDays
+                          : 7,
+                      }));
+                    }}
+                    style={{ fontSize: "12px", padding: "5px 10px" }}
+                  >
+                    {ATTACHMENT_RETENTION_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={String(opt.value)}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    data-testid="prune-expired-attachments-btn"
+                    className="fd-btn"
+                    disabled={pruningAttachments}
+                    onClick={() => void handlePruneAttachments()}
+                    style={{ fontSize: "11.5px", padding: "5px 10px" }}
+                  >
+                    {pruningAttachments ? "Cleaning..." : "Clean Up Expired Now"}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="purge-all-attachments-btn"
+                    className="fd-btn fd-btn-danger"
+                    disabled={pruningAttachments}
+                    onClick={() => void handlePruneAttachments(0)}
+                    style={{ fontSize: "11.5px", padding: "5px 10px" }}
+                  >
+                    Purge All Screenshots
+                  </button>
+                </div>
+              </div>
+
+              {pruneStatusMessage && (
+                <div
+                  role="status"
+                  data-testid="attachment-prune-status"
+                  className="fd-card"
+                  style={{
+                    borderColor: "var(--diff-add-border)",
+                    backgroundColor: "var(--diff-add-bg)",
+                    color: "var(--diff-add-text)",
+                    fontSize: "11.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  {pruneStatusMessage}
+                </div>
+              )}
             </div>
 
             <hr

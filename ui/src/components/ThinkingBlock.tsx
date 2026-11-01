@@ -30,7 +30,7 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
       data-active={isActive ? "true" : "false"}
       style={{
         padding: "8px 10px",
-        backgroundColor: "rgba(13, 17, 24, 0.72)",
+        backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
         borderColor: "var(--border-subtle)",
         marginBottom: "8px",
       }}

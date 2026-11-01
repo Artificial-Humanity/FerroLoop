@@ -34,6 +34,8 @@ import {
   type PrReviewResponse,
   type PruneArtifactsRequest,
   type PruneArtifactsResponse,
+  type PruneAttachmentsRequest,
+  type PruneAttachmentsResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
   type RecastAgentRequest,
@@ -106,6 +108,15 @@ export function normalizeHubSettings(
 
   const timezone = normalizeTimeZone(obj.timezone, fallback.timezone || "UTC");
 
+  const retentionRaw = obj.attachment_retention_days;
+  const attachment_retention_days =
+    typeof retentionRaw === "number" &&
+    Number.isFinite(retentionRaw) &&
+    retentionRaw >= 0 &&
+    retentionRaw <= 365
+      ? Math.round(retentionRaw)
+      : (fallback.attachment_retention_days ?? 7);
+
   const subRaw =
     obj.subsystems && typeof obj.subsystems === "object"
       ? (obj.subsystems as Record<string, unknown>)
@@ -122,6 +133,7 @@ export function normalizeHubSettings(
   return {
     theme_preference,
     timezone,
+    attachment_retention_days,
     subsystems: {
       ferrogate_enabled:
         typeof subRaw.ferrogate_enabled === "boolean"
@@ -1309,6 +1321,20 @@ export class HubApiClient {
     });
   }
 
+  public async pruneAttachments(
+    olderThanDays?: number,
+  ): Promise<PruneAttachmentsResponse> {
+    const body: PruneAttachmentsRequest =
+      olderThanDays !== undefined ? { older_than_days: olderThanDays } : {};
+    return this.request<PruneAttachmentsResponse>(
+      "/api/v1/attachments/prune",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
   public async getSettings(): Promise<HubSettings> {
     const raw = await this.request<unknown>("/api/v1/settings");
     return normalizeHubSettings(raw, {
@@ -1877,4 +1903,11 @@ export async function recastAgent(
   client?: HubApiClient,
 ): Promise<RecastAgentResponse> {
   return (client ?? new HubApiClient()).recastAgent(nameKey, payload);
+}
+
+export async function pruneAttachments(
+  olderThanDays?: number,
+  client?: HubApiClient,
+): Promise<PruneAttachmentsResponse> {
+  return (client ?? new HubApiClient()).pruneAttachments(olderThanDays);
 }
