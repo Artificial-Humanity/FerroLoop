@@ -14,7 +14,7 @@ use fl_core::state::{
 };
 use fl_core::store::StateStore;
 use fl_exec::stamp;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -238,7 +238,7 @@ pub fn resolve_peer_token(wire_token_file: Option<&Path>) -> Option<String> {
 /// Mint and persist a single-use pairing code directly in `store` (`StateScope::Workspace`),
 /// usable by `fl hub pair` while `fl hub serve` is running (spec §2.2).
 pub fn mint_pairing_code_in_store(
-    store: &RedbStore,
+    store: &AnyStore,
     base_url: &str,
     ttl_secs: u64,
 ) -> Result<PairingInfo, String> {
@@ -267,7 +267,7 @@ pub fn mint_pairing_code_in_store(
     })
 }
 
-fn persist_pairing_entry(store: &RedbStore, entry: &StoredPairingEntry) -> Result<(), String> {
+fn persist_pairing_entry(store: &AnyStore, entry: &StoredPairingEntry) -> Result<(), String> {
     let val = serde_json::to_value(entry).map_err(|e| e.to_string())?;
     store
         .upsert_state(UpsertStateArgs {
@@ -285,7 +285,7 @@ fn persist_pairing_entry(store: &RedbStore, entry: &StoredPairingEntry) -> Resul
     Ok(())
 }
 
-fn load_pairing_entry(store: &RedbStore, code: &str) -> Option<StoredPairingEntry> {
+fn load_pairing_entry(store: &AnyStore, code: &str) -> Option<StoredPairingEntry> {
     let state_entry = store
         .get_state_by_key(
             &StateScope::Workspace,
@@ -302,7 +302,7 @@ fn load_pairing_entry(store: &RedbStore, code: &str) -> Option<StoredPairingEntr
     serde_json::from_value(rt.value).ok()
 }
 
-fn persist_session_entry(store: &RedbStore, entry: &StoredSessionEntry) -> Result<(), String> {
+fn persist_session_entry(store: &AnyStore, entry: &StoredSessionEntry) -> Result<(), String> {
     let val = serde_json::to_value(entry).map_err(|e| e.to_string())?;
     store
         .upsert_state(UpsertStateArgs {
@@ -320,7 +320,7 @@ fn persist_session_entry(store: &RedbStore, entry: &StoredSessionEntry) -> Resul
     Ok(())
 }
 
-fn load_session_entry(store: &RedbStore, token_hash: &str) -> Option<StoredSessionEntry> {
+fn load_session_entry(store: &AnyStore, token_hash: &str) -> Option<StoredSessionEntry> {
     let state_entry = store
         .get_state_by_key(
             &StateScope::Workspace,
@@ -340,7 +340,7 @@ fn load_session_entry(store: &RedbStore, token_hash: &str) -> Option<StoredSessi
 /// Every persisted session entry: a prefix scan of the sensitive runtime state under the
 /// `hub-session-` slug. The persisted entries are the only index of sessions that outlive the
 /// in-memory cache, so there is no second one to keep in step.
-fn list_session_entries(store: &RedbStore) -> Vec<StoredSessionEntry> {
+fn list_session_entries(store: &AnyStore) -> Vec<StoredSessionEntry> {
     let Ok(entries) = store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
     else {
         return Vec::new();
@@ -453,7 +453,7 @@ impl AuthManager {
     /// Mint a one-time pairing code and persist it in `store` (when provided) and in memory.
     pub fn mint_pairing_code(
         &self,
-        store: Option<&RedbStore>,
+        store: Option<&AnyStore>,
         base_url: &str,
         ttl_secs: u64,
     ) -> Result<PairingInfo, String> {
@@ -487,7 +487,7 @@ impl AuthManager {
     }
 
     /// Mint a 256-bit owner session token and persist its SHA-256 hash in `store` and memory.
-    pub fn mint_session(&self, store: Option<&RedbStore>, login: &str) -> Result<String, String> {
+    pub fn mint_session(&self, store: Option<&AnyStore>, login: &str) -> Result<String, String> {
         let session_token = try_generate_hex_token(32)?;
         let token_hash = sha256_hex(&session_token);
         let expires_at_ms = now_millis().saturating_add(self.session_ttl_secs.saturating_mul(1000));
@@ -511,7 +511,7 @@ impl AuthManager {
     /// Exchange a one-time pairing `code` or owner `token` for a new session token (spec §2.2).
     pub fn exchange_pairing_or_token(
         &self,
-        store: Option<&RedbStore>,
+        store: Option<&AnyStore>,
         code: Option<&str>,
         token: Option<&str>,
     ) -> Result<(String, HubAuthority, u64), String> {
@@ -578,7 +578,7 @@ impl AuthManager {
     /// Verify a session token against memory cache or `store`.
     pub fn verify_session_token(
         &self,
-        store: Option<&RedbStore>,
+        store: Option<&AnyStore>,
         token: &str,
     ) -> Option<HubAuthority> {
         let trimmed = token.trim();
@@ -617,7 +617,7 @@ impl AuthManager {
     }
 
     /// Revoke an active session token on logout (`POST /api/v1/auth/logout`).
-    pub fn revoke_session_token(&self, store: Option<&RedbStore>, token: &str) {
+    pub fn revoke_session_token(&self, store: Option<&AnyStore>, token: &str) {
         let trimmed = token.trim();
         if trimmed.is_empty() {
             return;
@@ -654,7 +654,7 @@ impl AuthManager {
     ///
     /// This is best effort on the store half: when `store` cannot be listed or written, the
     /// memory half still ends the sessions this process holds.
-    pub fn revoke_sessions_for_login(&self, store: Option<&RedbStore>, login: &str) -> usize {
+    pub fn revoke_sessions_for_login(&self, store: Option<&AnyStore>, login: &str) -> usize {
         let wanted = login.trim();
         if wanted.is_empty() {
             return 0;
@@ -701,7 +701,7 @@ impl AuthManager {
     /// 5. Otherwise `None` (`401 Unauthorized`).
     pub fn authenticate_request(
         &self,
-        store: Option<&RedbStore>,
+        store: Option<&AnyStore>,
         headers: &BTreeMap<String, String>,
         query: &BTreeMap<String, String>,
     ) -> Option<HubAuthority> {
@@ -786,7 +786,7 @@ mod tests {
     fn pairing_code_stored_in_redb_is_single_use_and_mints_owner_session() {
         let tmp = TempDir::new().unwrap();
         let store_path = tmp.path().join("store.redb");
-        let store = RedbStore::open(&store_path).unwrap();
+        let store = fl_store::open_redb(&store_path).unwrap();
 
         // Simulate `fl hub pair` minting a code directly into the workspace store.
         let info = mint_pairing_code_in_store(&store, "http://127.0.0.1:8420", 600).unwrap();
@@ -841,7 +841,7 @@ mod tests {
                 .is_none()
         );
 
-        // Non-sensitive `hub-pairing-*` and `hub-session-*` entries in RedbStore are ignored.
+        // Non-sensitive `hub-pairing-*` and `hub-session-*` entries in AnyStore are ignored.
         let forged_code = "forgedcode123456";
         let forged_pairing = StoredPairingEntry {
             kind: "hub/pairing".into(),
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn revoking_a_login_ends_its_sessions_in_memory_and_in_the_store() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let make = || AuthManager::new("lmcfarlin", Some("owner-secret".into()), None, false, 3600);
         let auth = make();
         let alice_1 = auth.mint_session(Some(&store), "Alice").unwrap();
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn a_pairing_code_redeemed_by_racing_requests_yields_exactly_one_session() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         for with_store in [true, false] {
             let auth = test_auth();
             let info = auth
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn a_pairing_code_minted_by_the_cli_redeems_once_through_a_cold_cache() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let info = mint_pairing_code_in_store(&store, "http://127.0.0.1:8420", 600).unwrap();
         let auth = test_auth();
         let wins = std::sync::atomic::AtomicUsize::new(0);
@@ -1067,7 +1067,7 @@ mod tests {
     #[test]
     fn an_expired_or_unknown_pairing_code_mints_nothing() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let auth = test_auth();
         for bad in ["", "   ", "nope", "../../etc/passwd", &"f".repeat(4096)] {
             assert!(
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn a_revocation_racing_a_cold_cache_lookup_is_never_undone() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let minter = test_auth();
         for round in 0..60 {
             let token = minter.mint_session(Some(&store), "racer").unwrap();
@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn logging_out_through_a_cold_cache_sticks_in_cache_and_store() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let token = test_auth().mint_session(Some(&store), "alice").unwrap();
         let daemon = test_auth();
         daemon.revoke_session_token(Some(&store), &token);
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn revocation_matches_the_whole_login_and_ignores_expired_sessions() {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         let auth = test_auth();
         let live = |t: &str| auth.verify_session_token(Some(&store), t).is_some();
         let ali = auth.mint_session(Some(&store), "ali").unwrap();

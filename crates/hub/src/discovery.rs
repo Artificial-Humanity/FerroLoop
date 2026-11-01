@@ -14,7 +14,7 @@ use fl_core::arch::{
 };
 use fl_core::store::{AgentRegistry, Catalog, Ledger};
 use fl_exec::stamp;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use fl_wire::identity::{RouteTable, VendorRoute};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,7 +120,7 @@ pub struct SessionQuotaUsage {
     pub exhausted_reason: Option<String>,
 }
 
-/// B-tree rows discovery needs, captured while a [`RedbStore`] guard is held.
+/// B-tree rows discovery needs, captured while a [`AnyStore`] guard is held.
 /// Filesystem walks use this snapshot after the guard is dropped.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryStoreSnapshot {
@@ -142,7 +142,7 @@ struct DiscoveryAttemptRow {
 }
 
 /// Read agent names and attempt rows. Does not walk the filesystem.
-pub fn snapshot_discovery_store(store: &RedbStore) -> DiscoveryStoreSnapshot {
+pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     let registered_names = store
         .list_agents(None, true)
         .unwrap_or_default()
@@ -222,13 +222,13 @@ pub struct WorkspaceArchScan {
 }
 
 /// Discover active sessions from `RouteTable` and recorded `Attempt` runs in `store` (spec §3.2).
-pub fn discover_sessions(store: &RedbStore) -> Vec<DiscoveredSessionSummary> {
+pub fn discover_sessions(store: &AnyStore) -> Vec<DiscoveredSessionSummary> {
     discover_sessions_with_home(store, None)
 }
 
 /// Discover active sessions with an optional `HOME` directory override for hermetic tests.
 pub fn discover_sessions_with_home(
-    store: &RedbStore,
+    store: &AnyStore,
     home_override: Option<&Path>,
 ) -> Vec<DiscoveredSessionSummary> {
     let snap = snapshot_discovery_store(store);
@@ -236,7 +236,7 @@ pub fn discover_sessions_with_home(
 }
 
 /// Discover sessions from a store snapshot. Filesystem route discovery runs here, with no
-/// live [`RedbStore`] borrow.
+/// live [`AnyStore`] borrow.
 pub fn discover_sessions_from_snapshot(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
@@ -1724,7 +1724,7 @@ fn adapter_for_transcript(path: &Path) -> Option<String> {
 /// Antigravity `PLANNER_RESPONSE`, or Muse `model_completed`) is available.
 pub fn read_session_context_usage_with_home(
     session_id: &str,
-    store: &RedbStore,
+    store: &AnyStore,
     home_override: Option<&Path>,
 ) -> Option<SessionContextUsage> {
     let snap = snapshot_discovery_store(store);
@@ -1947,14 +1947,14 @@ pub fn read_session_context_usage_from_snapshot(
 }
 
 /// Read and normalize a session transcript by `session_id` (or persona name / attempt IRI) (spec §3.2).
-pub fn read_session_transcript(session_id: &str, store: &RedbStore) -> Vec<TranscriptTurn> {
+pub fn read_session_transcript(session_id: &str, store: &AnyStore) -> Vec<TranscriptTurn> {
     read_session_transcript_with_home(session_id, store, None)
 }
 
 /// Read and normalize a session transcript with an optional `HOME` directory override.
 pub fn read_session_transcript_with_home(
     session_id: &str,
-    store: &RedbStore,
+    store: &AnyStore,
     home_override: Option<&Path>,
 ) -> Vec<TranscriptTurn> {
     let snap = snapshot_discovery_store(store);
@@ -4008,7 +4008,7 @@ mod tests {
     }
 
     fn discover_in(home: &Path) -> Vec<DiscoveredSessionSummary> {
-        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
         discover_sessions_with_home(&store, Some(home))
     }
 
@@ -5759,7 +5759,7 @@ mod tests {
     fn grok_nested_transcript_discovery_normalization_and_context_usage() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
 
         let grok_session_dir = home
             .join(".grok")
@@ -5892,7 +5892,7 @@ mod tests {
     fn codex_rollout_transcript_normalization_and_context_usage() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
 
         let codex_dir = home.join(".codex");
         let day_dir = codex_dir
@@ -6041,7 +6041,7 @@ mod tests {
     fn antigravity_planner_response_context_usage_uses_latest_nonzero_sum() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
         let conv = "conv-agy-ctx";
         let logs = home
             .join(".gemini")

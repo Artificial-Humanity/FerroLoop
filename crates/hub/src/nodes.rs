@@ -11,7 +11,7 @@ use fl_core::state::{
 };
 use fl_core::store::StateStore;
 use fl_exec::stamp;
-use fl_store::RedbStore;
+use fl_store::AnyStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -203,7 +203,7 @@ pub fn node_status(role: &str, revoked: bool, last_seen_at_ms: u64, now_ms: u64)
     }
 }
 
-pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRecord, String> {
+pub fn ensure_hub_node(store: &AnyStore, args: EnsureHubArgs) -> Result<NodeRecord, String> {
     let node_id = canonical_node_id(&args.node_id)?;
     let slug = node_state_slug(&node_id)?;
     let existing = load_node(store, &slug)?;
@@ -271,7 +271,7 @@ pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRec
     Ok(record)
 }
 
-pub fn list_visible_nodes(store: &RedbStore, now_ms: u64) -> Result<Vec<NodeView>, String> {
+pub fn list_visible_nodes(store: &AnyStore, now_ms: u64) -> Result<Vec<NodeView>, String> {
     let mut views: Vec<NodeView> = iter_node_records(store)?
         .into_iter()
         .filter(|rec| !rec.revoked)
@@ -286,7 +286,7 @@ pub fn list_visible_nodes(store: &RedbStore, now_ms: u64) -> Result<Vec<NodeView
 }
 
 pub fn mint_enroll_token(
-    store: &RedbStore,
+    store: &AnyStore,
     label: Option<String>,
     ttl_secs: u64,
     hub_url: &str,
@@ -318,7 +318,7 @@ pub fn mint_enroll_token(
     })
 }
 
-pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWorker, EnrollFail> {
+pub fn enroll_worker(store: &AnyStore, req: EnrollWorker) -> Result<EnrolledWorker, EnrollFail> {
     if req.code.is_empty() || req.node_id.is_empty() || req.display_name.is_empty() {
         return Err(EnrollFail::Invalid);
     }
@@ -399,7 +399,7 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
     })
 }
 
-pub fn node_token_matches(store: &RedbStore, node_id: &str, bearer: &str) -> Result<bool, String> {
+pub fn node_token_matches(store: &AnyStore, node_id: &str, bearer: &str) -> Result<bool, String> {
     let Ok(slug) = node_state_slug(node_id) else {
         return Ok(false);
     };
@@ -415,7 +415,7 @@ pub fn node_token_matches(store: &RedbStore, node_id: &str, bearer: &str) -> Res
     Ok(constant_time_eq(&sha256_hex(bearer), &token_hash))
 }
 
-pub fn touch_node(store: &RedbStore, update: HeartbeatUpdate) -> Result<NodeView, HeartbeatFail> {
+pub fn touch_node(store: &AnyStore, update: HeartbeatUpdate) -> Result<NodeView, HeartbeatFail> {
     let slug = match node_state_slug(&update.node_id) {
         Ok(slug) => slug,
         Err(_) => return Err(HeartbeatFail::NotFound),
@@ -480,7 +480,7 @@ pub fn touch_node(store: &RedbStore, update: HeartbeatUpdate) -> Result<NodeView
     Ok(to_view(&rec, update.now_ms))
 }
 
-pub fn revoke_node(store: &RedbStore, node_id: &str) -> Result<NodeRecord, RevokeFail> {
+pub fn revoke_node(store: &AnyStore, node_id: &str) -> Result<NodeRecord, RevokeFail> {
     let slug = match node_state_slug(node_id) {
         Ok(slug) => slug,
         Err(_) => return Err(RevokeFail::NotFound),
@@ -571,7 +571,7 @@ fn lock_tasks() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn load_task_list(store: &RedbStore, slug: &str) -> Result<TaskList, String> {
+fn load_task_list(store: &AnyStore, slug: &str) -> Result<TaskList, String> {
     let Some(entry) = load_runtime(store, slug)? else {
         return Ok(TaskList::default());
     };
@@ -584,12 +584,12 @@ fn load_task_list(store: &RedbStore, slug: &str) -> Result<TaskList, String> {
     serde_json::from_value(rt.value).map_err(|err| err.to_string())
 }
 
-fn persist_task_list(store: &RedbStore, slug: &str, list: &TaskList) -> Result<(), String> {
+fn persist_task_list(store: &AnyStore, slug: &str, list: &TaskList) -> Result<(), String> {
     let value = serde_json::to_value(list).map_err(|err| err.to_string())?;
     persist_runtime(store, slug, value)
 }
 
-fn load_worker(store: &RedbStore, node_id: &str) -> Result<NodeRecord, TaskFail> {
+fn load_worker(store: &AnyStore, node_id: &str) -> Result<NodeRecord, TaskFail> {
     let slug = node_state_slug(node_id).map_err(|_| TaskFail::NodeNotFound)?;
     load_node(store, &slug)
         .map_err(TaskFail::Store)?
@@ -610,7 +610,7 @@ fn truncate_utf8(mut text: String, max: usize) -> String {
 /// Queue a task for a worker node. The hub only records it; the worker pulls it from
 /// `GET /api/v1/nodes/:id/tasks` and reports back with `record_task_result`.
 pub fn dispatch_task(
-    store: &RedbStore,
+    store: &AnyStore,
     node_id: &str,
     args: DispatchTask,
 ) -> Result<FederatedTask, TaskFail> {
@@ -687,7 +687,7 @@ pub fn dispatch_task(
 }
 
 /// Tasks for a node, newest first.
-pub fn list_node_tasks(store: &RedbStore, node_id: &str) -> Result<Vec<FederatedTask>, TaskFail> {
+pub fn list_node_tasks(store: &AnyStore, node_id: &str) -> Result<Vec<FederatedTask>, TaskFail> {
     let node = load_worker(store, node_id)?;
     let slug = task_state_slug(&node.node_id).map_err(TaskFail::Invalid)?;
     let _guard = lock_tasks();
@@ -699,7 +699,7 @@ pub fn list_node_tasks(store: &RedbStore, node_id: &str) -> Result<Vec<Federated
 /// Record progress or completion. `queued` -> `running`/`completed`/`failed`,
 /// `running` -> `running`/`completed`/`failed`; a finished task is immutable.
 pub fn record_task_result(
-    store: &RedbStore,
+    store: &AnyStore,
     node_id: &str,
     task_id: &str,
     result: TaskResult,
@@ -780,7 +780,7 @@ pub fn local_hostname() -> String {
     ])
 }
 
-pub fn find_hub_node(store: &RedbStore) -> Result<Option<NodeRecord>, String> {
+pub fn find_hub_node(store: &AnyStore) -> Result<Option<NodeRecord>, String> {
     let mut hubs: Vec<NodeRecord> = iter_node_records(store)?
         .into_iter()
         .filter(|rec| rec.role == "hub" && !rec.revoked)
@@ -1001,7 +1001,7 @@ fn path_has_file(path_env: &str, name: &str) -> bool {
         })
 }
 
-fn persist_runtime(store: &RedbStore, slug: &str, value: Value) -> Result<(), String> {
+fn persist_runtime(store: &AnyStore, slug: &str, value: Value) -> Result<(), String> {
     store
         .upsert_state(UpsertStateArgs {
             scope: StateScope::Workspace,
@@ -1018,23 +1018,23 @@ fn persist_runtime(store: &RedbStore, slug: &str, value: Value) -> Result<(), St
         .map_err(|err| err.to_string())
 }
 
-fn persist_node(store: &RedbStore, slug: &str, record: &NodeRecord) -> Result<(), String> {
+fn persist_node(store: &AnyStore, slug: &str, record: &NodeRecord) -> Result<(), String> {
     let value = serde_json::to_value(record).map_err(|err| err.to_string())?;
     persist_runtime(store, slug, value)
 }
 
-fn persist_enroll(store: &RedbStore, slug: &str, record: &EnrollRecord) -> Result<(), String> {
+fn persist_enroll(store: &AnyStore, slug: &str, record: &EnrollRecord) -> Result<(), String> {
     let value = serde_json::to_value(record).map_err(|err| err.to_string())?;
     persist_runtime(store, slug, value)
 }
 
-fn load_runtime(store: &RedbStore, slug: &str) -> Result<Option<StateEntry>, String> {
+fn load_runtime(store: &AnyStore, slug: &str) -> Result<Option<StateEntry>, String> {
     store
         .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)
         .map_err(|err| err.to_string())
 }
 
-fn load_node(store: &RedbStore, slug: &str) -> Result<Option<NodeRecord>, String> {
+fn load_node(store: &AnyStore, slug: &str) -> Result<Option<NodeRecord>, String> {
     let Some(entry) = load_runtime(store, slug)? else {
         return Ok(None);
     };
@@ -1049,7 +1049,7 @@ fn load_node(store: &RedbStore, slug: &str) -> Result<Option<NodeRecord>, String
         .map_err(|err| err.to_string())
 }
 
-fn load_enroll(store: &RedbStore, slug: &str) -> Result<Option<EnrollRecord>, String> {
+fn load_enroll(store: &AnyStore, slug: &str) -> Result<Option<EnrollRecord>, String> {
     let Some(entry) = load_runtime(store, slug)? else {
         return Ok(None);
     };
@@ -1074,7 +1074,7 @@ fn node_from_entry(entry: &StateEntry) -> Option<NodeRecord> {
     serde_json::from_value(rt.value.clone()).ok()
 }
 
-fn iter_node_records(store: &RedbStore) -> Result<Vec<NodeRecord>, String> {
+fn iter_node_records(store: &AnyStore) -> Result<Vec<NodeRecord>, String> {
     let entries = store
         .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
         .map_err(|err| err.to_string())?;
@@ -1097,9 +1097,9 @@ mod tests {
     use fl_core::store::StateStore;
     use tempfile::TempDir;
 
-    fn open_store() -> (TempDir, RedbStore) {
+    fn open_store() -> (TempDir, AnyStore) {
         let tmp = TempDir::new().unwrap();
-        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
         (tmp, store)
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
         }
     }
 
-    fn stored_enroll(store: &RedbStore, code: &str) -> (String, Value) {
+    fn stored_enroll(store: &AnyStore, code: &str) -> (String, Value) {
         let code_hash = sha256_hex(code);
         let slug = enroll_state_slug(&code_hash);
         let entry = store
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!(lab_node.node_id, "lab-local");
     }
 
-    fn entry_sensitive(store: &RedbStore, slug: &str) -> bool {
+    fn entry_sensitive(store: &AnyStore, slug: &str) -> bool {
         store
             .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)
             .unwrap()
@@ -1694,7 +1694,7 @@ mod tests {
             .sensitive
     }
 
-    fn enroll_worker_node(store: &RedbStore, node_id: &str) {
+    fn enroll_worker_node(store: &AnyStore, node_id: &str) {
         let info = mint_enroll_token(store, None, 600, "http://hub", 1_000).unwrap();
         enroll_worker(store, enroll_req(&info.code, node_id, node_id, 2_000)).unwrap();
     }

@@ -15,7 +15,7 @@ use fl_hub::{
     find_hub_node, generate_hex_token, list_visible_nodes, local_hostname, mint_enroll_token,
     mint_pairing_code_in_store, node_id_from_hostname, resolve_owner_token, resolve_peer_token,
 };
-use fl_store::RedbStore;
+use fl_store::{AnyStore, StoreOptions};
 use serde_json::{Value, json};
 
 use crate::cmd::agent::write_atomic_non_symlink;
@@ -195,24 +195,18 @@ fn resolve_hub_store_path(env: &StateEnv<'_>) -> PathBuf {
     env.cfg.workspace_state_store(env.default_store)
 }
 
-/// The hub's functions (`fl_hub`) still take a `RedbStore`, so `fl hub` runs on
-/// redb only until the hub moves to `AnyStore`. A path or environment that
-/// selects FerroStore is refused by name rather than opened as the wrong file.
-fn open_hub_store_with_retry(store_path: &Path) -> Result<RedbStore, (i32, String)> {
-    open_hub_store_with_retry_env(
-        store_path,
-        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
-    )
+/// Open the hub's store on whichever engine the path and `FL_STORE_BACKEND` select.
+fn open_hub_store_with_retry(store_path: &Path) -> Result<AnyStore, (i32, String)> {
+    open_hub_store_with_options(store_path, &StoreOptions::default())
 }
 
-/// [`open_hub_store_with_retry`] with the value of `FL_STORE_BACKEND` passed
-/// in. The engine check runs first: a refused store leaves no file or
-/// directory behind.
-fn open_hub_store_with_retry_env(
+/// [`open_hub_store_with_retry`] with explicit [`StoreOptions`]: the hub's private-directory
+/// creation, then up to 40 tries at the open, 5 ms apart. A test passes the engine here instead
+/// of changing the process environment.
+fn open_hub_store_with_options(
     store_path: &Path,
-    env: Option<&str>,
-) -> Result<RedbStore, (i32, String)> {
-    refuse_ferro(store_path, env)?;
+    options: &StoreOptions,
+) -> Result<AnyStore, (i32, String)> {
     if let Some(dir) = store_path.parent()
         && !dir.as_os_str().is_empty()
     {
@@ -221,7 +215,7 @@ fn open_hub_store_with_retry_env(
     }
     let mut last_err = None;
     for attempt in 0..40 {
-        match RedbStore::open(store_path) {
+        match fl_store::open_store_with(store_path, options) {
             Ok(store) => return Ok(store),
             Err(e) => {
                 last_err = Some(e);
@@ -239,23 +233,6 @@ fn open_hub_store_with_retry_env(
             last_err.expect("at least one attempt ran")
         ),
     ))
-}
-
-/// `Ok` when `store_path` selects redb under `env`; otherwise the refusal.
-fn refuse_ferro(store_path: &Path, env: Option<&str>) -> Result<(), (i32, String)> {
-    match fl_store::choose_backend(store_path, env) {
-        Ok(fl_store::BackendKind::Redb) => Ok(()),
-        Ok(fl_store::BackendKind::Ferro) => Err((
-            2,
-            format!(
-                "`fl hub` does not run on the FerroStore engine yet; the store at {} selects \
-                 it. Unset {} (or point the hub at a .redb store)",
-                store_path.display(),
-                fl_store::BACKEND_ENV
-            ),
-        )),
-        Err(e) => Err((2, e.to_string())),
-    }
 }
 
 fn resolve_listen_addr(env: &StateEnv<'_>, listen_override: Option<String>) -> String {
@@ -787,7 +764,7 @@ fn cmd_init(
     Ok(0)
 }
 
-fn choose_hub_node_id(store: &RedbStore, name: Option<String>) -> Result<String, (i32, String)> {
+fn choose_hub_node_id(store: &AnyStore, name: Option<String>) -> Result<String, (i32, String)> {
     let existing = find_hub_node(store).map_err(|e| (2, e))?;
     if let Some(requested) = name {
         let canonical = canonical_node_id(&requested).map_err(|e| (2, e))?;
@@ -1182,9 +1159,9 @@ fn xml_escape(text: &str) -> String {
 mod tests {
     use super::*;
 
-    fn open_store() -> (tempfile::TempDir, RedbStore) {
+    fn open_store() -> (tempfile::TempDir, AnyStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = RedbStore::open(&dir.path().join("store.redb")).unwrap();
+        let store = fl_store::open_redb(&dir.path().join("store.redb")).unwrap();
         (dir, store)
     }
 
@@ -1201,53 +1178,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_hub_refuses_ferro_before_creating_anything() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("not-yet");
-        let fls = missing.join("hub.fls");
-        let redb = missing.join("hub.redb");
-
-        // An explicit .fls path selects ferro whatever the environment says.
-        for env in [None, Some("redb"), Some("ferro")] {
-            let (code, msg) = open_hub_store_with_retry_env(&fls, env).err().unwrap();
-            assert_eq!(code, 2);
-            assert!(msg.contains("FerroStore"), "{msg}");
+    fn options(backend: fl_store::BackendKind) -> StoreOptions {
+        StoreOptions {
+            backend: Some(backend),
+            ..StoreOptions::default()
         }
-        // So does the environment, for a .redb path.
-        let (code, msg) = open_hub_store_with_retry_env(&redb, Some("ferro"))
-            .err()
-            .unwrap();
-        assert_eq!(code, 2);
-        assert!(msg.contains("FL_STORE_BACKEND"), "{msg}");
-        // A bad value is refused by name.
-        let (code, msg) = open_hub_store_with_retry_env(&redb, Some("sqlite"))
-            .err()
-            .unwrap();
-        assert_eq!(code, 2);
-        assert!(msg.contains("sqlite"), "{msg}");
-
-        assert!(!missing.exists(), "the directory was created");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
-    fn refuse_ferro_admits_redb_only() {
-        let redb = Path::new("/x/hub.redb");
-        assert!(refuse_ferro(redb, None).is_ok());
-        assert!(refuse_ferro(redb, Some("redb")).is_ok());
-        assert!(refuse_ferro(redb, Some("")).is_ok());
-        assert!(refuse_ferro(redb, Some("ferro")).is_err());
-        assert!(refuse_ferro(redb, Some("nonsense")).is_err());
-        assert!(refuse_ferro(Path::new("/x/hub.fls"), None).is_err());
-    }
-
-    #[test]
-    fn the_hub_opens_a_redb_store_when_redb_is_selected() {
+    fn the_hub_store_opens_on_the_redb_engine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("hub.redb");
-        open_hub_store_with_retry_env(&path, Some("redb")).unwrap();
+        let store =
+            open_hub_store_with_options(&path, &options(fl_store::BackendKind::Redb)).unwrap();
+        assert_eq!(store.kind(), fl_store::BackendKind::Redb);
         assert!(path.exists());
+        assert!(!path.with_extension("fls").exists());
+    }
+
+    #[test]
+    fn the_hub_store_opens_on_the_ferro_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("hub.redb");
+        let store =
+            open_hub_store_with_options(&path, &options(fl_store::BackendKind::Ferro)).unwrap();
+        assert_eq!(store.kind(), fl_store::BackendKind::Ferro);
+        // The configured `.redb` path names the physical `.fls` file.
+        assert!(path.with_extension("fls").exists());
+        assert!(!path.exists());
+        // The hub's own functions work on it.
+        ensure_hub_node(&store, hub_args("primary")).unwrap();
+        assert_eq!(
+            choose_hub_node_id(&store, Some("Primary".to_string())).unwrap(),
+            "primary"
+        );
     }
 
     #[test]
