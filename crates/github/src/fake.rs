@@ -17,9 +17,19 @@ pub const APP_SLUG: &str = "fake-app";
 pub const APP_BOT_ID: u64 = 7_000_001;
 /// The GitHub user id of [`USER_LOGIN`].
 pub const USER_ID: u64 = 7_000_002;
+/// A GitHub user id the fake never gives any login: for a test's "another account".
+pub const LOOKALIKE_ID: u64 = 7_000_003;
+
+/// The first id of the band [`user_id`] derives ids in, for logins it has no fixed id for.
+const DERIVED_ID_BASE: u64 = 2_000_000_000;
+/// The width of that band.
+const DERIVED_ID_SPAN: u64 = 1_000_000_000;
 
 /// The fake's GitHub user id for `login`: [`APP_BOT_ID`] for the App's bot, [`USER_ID`] for
-/// [`USER_LOGIN`], and for any other login a fixed id derived from it that is neither.
+/// [`USER_LOGIN`], and for any other login a fixed id derived from it in
+/// `2_000_000_000..3_000_000_000`. That band is above [`APP_BOT_ID`], [`USER_ID`],
+/// [`LOOKALIKE_ID`] and every id in [`fl_core::pr_policy::DEFAULT_REVIEWER_APP_IDS`], so a
+/// derived id is never one of them.
 pub fn user_id(login: &str) -> u64 {
     if login == format!("{APP_SLUG}[bot]") {
         return APP_BOT_ID;
@@ -31,7 +41,7 @@ pub fn user_id(login: &str) -> u64 {
     let hash = login.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });
-    10_000_000 + hash % 1_000_000_000
+    DERIVED_ID_BASE + hash % DERIVED_ID_SPAN
 }
 /// The id of the repository a transferred issue moves to.
 pub const TRANSFERRED_REPO: u64 = 99;
@@ -2245,5 +2255,32 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             404,
             json!({"message": format!("the fake does not serve {method} {path}")}),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fixed_ids_lie_outside_the_derived_band() {
+        let band = DERIVED_ID_BASE..DERIVED_ID_BASE + DERIVED_ID_SPAN;
+        let fixed = [APP_BOT_ID, USER_ID, LOOKALIKE_ID]
+            .into_iter()
+            .chain(fl_core::pr_policy::DEFAULT_REVIEWER_APP_IDS.iter().copied());
+        let mut count = 0;
+        for id in fixed {
+            assert!(!band.contains(&id), "{id} is in the derived band {band:?}");
+            count += 1;
+        }
+        assert!(count >= 4, "only {count} fixed ids checked");
+        assert_ne!(LOOKALIKE_ID, APP_BOT_ID);
+        assert_ne!(LOOKALIKE_ID, USER_ID);
+        // The fixed logins keep their fixed ids; any other login lands in the band.
+        assert_eq!(user_id(&format!("{APP_SLUG}[bot]")), APP_BOT_ID);
+        assert_eq!(user_id(USER_LOGIN), USER_ID);
+        for login in ["ferris", "someone-else[bot]", ""] {
+            assert!(band.contains(&user_id(login)), "{login:?}");
+        }
     }
 }

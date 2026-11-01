@@ -8,7 +8,7 @@ use fl_core::at::At;
 use fl_core::pr_policy::{
     FlReviewMarker, PrCommitSummary, ReviewVerdict, extract_review_marker, format_review_body,
 };
-use fl_github::fake::{APP_BOT_ID, APP_SLUG, FakeGithub, USER_LOGIN};
+use fl_github::fake::{APP_BOT_ID, APP_SLUG, FakeGithub, LOOKALIKE_ID, USER_LOGIN};
 use predicates::str::contains;
 use serde_json::Value;
 use std::fs;
@@ -866,7 +866,7 @@ fn a_lookalike_of_the_reviewer_apps_login_counts_for_nothing_under_reviewer_ids(
     f.fake.add_pull_review_as(
         1,
         &format!("{APP_SLUG}[bot]"),
-        Some(APP_BOT_ID + 1),
+        Some(LOOKALIKE_ID),
         "APPROVED",
         &format_review_body("lookalike", &marker),
         "sha-look",
