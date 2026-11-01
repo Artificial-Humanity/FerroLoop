@@ -380,10 +380,10 @@ fn migrate_into(
     // the copy until after the `chmod`, and is dropped only once the steps
     // below (and any temp cleanup on their error paths) are done, so no other
     // process can write the `.redb` after it was copied.
-    let src = RedbStore::open(redb_path).map_err(&cleanup)?;
+    let src = RedbStore::open(redb_path).map_err(cleanup)?;
     let result = (|| {
         let report = {
-            let dst = FerroStore::open(temp).map_err(&cleanup)?;
+            let dst = FerroStore::open(temp).map_err(cleanup)?;
             let outcome = super::migrate_redb_to_ferrostore(&src, &dst)
                 .and_then(|()| after_copy(&dst))
                 .and_then(|()| verify_redb_vs_ferrostore(&src, &dst));
