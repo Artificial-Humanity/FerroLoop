@@ -9,6 +9,6 @@ exit: 0
   "live_bytes": null,
   "logical_path": "<DIR>/stores/fl.redb",
   "physical_path": "<DIR>/stores/fl.redb",
-  "size_bytes": 69632
+  "size_bytes": 1056768
 }
 --- stderr
