@@ -286,8 +286,9 @@ pub fn run(
     cmd: PrCmd,
 ) -> Result<i32> {
     let repo = &gh.repo().full_name;
-    // Which logins may speak for an agent in a review marker (`[github] reviewer_logins`).
-    let reviewer_logins = config::reviewer_logins(github_app);
+    // Which accounts may speak for an agent in a review marker (`[github] reviewer_ids` and
+    // `reviewer_logins`).
+    let reviewer_apps = config::reviewer_apps(github_app);
     match cmd {
         PrCmd::Create {
             title,
@@ -416,7 +417,7 @@ pub fn run(
                 &reviews,
                 &agents,
                 DEFAULT_OWNER_LOGIN,
-                &reviewer_logins,
+                &reviewer_apps,
             )
             .ok();
 
@@ -590,6 +591,7 @@ pub fn run(
                         "role": caller.role,
                         "head_sha": pr.head_sha,
                         "author_login": review.author_login,
+                        "author_id": review.author_id,
                     }))?
                 );
             } else {
@@ -639,7 +641,7 @@ pub fn run(
                 &reviews,
                 &agents,
                 DEFAULT_OWNER_LOGIN,
-                &reviewer_logins,
+                &reviewer_apps,
             ) {
                 Ok(who) => who,
                 Err(refusal) => return emit_refusal(&refusal, json),
@@ -742,7 +744,7 @@ pub fn run(
                 &reviews,
                 &agents,
                 DEFAULT_OWNER_LOGIN,
-                &reviewer_logins,
+                &reviewer_apps,
             ) {
                 return emit_refusal(&refusal, json);
             }
@@ -754,7 +756,7 @@ pub fn run(
                     &reviews,
                     &agents,
                     DEFAULT_OWNER_LOGIN,
-                    &reviewer_logins,
+                    &reviewer_apps,
                 ) {
                     Ok(who) => Some(who),
                     Err(refusal) => return emit_refusal(&refusal, json),
@@ -766,7 +768,7 @@ pub fn run(
                     &reviews,
                     &agents,
                     DEFAULT_OWNER_LOGIN,
-                    &reviewer_logins,
+                    &reviewer_apps,
                 )
                 .ok()
             };

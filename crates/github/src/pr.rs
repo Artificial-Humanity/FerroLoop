@@ -208,6 +208,11 @@ fn parse_review_summary(v: &Value) -> Result<PrReviewSummary, StoreError> {
             })?
             .to_string(),
     };
+    // The author's numeric user id: stable identity, unlike a login. A deleted account has none.
+    let author_id = v
+        .pointer("/user/id")
+        .or_else(|| v.get("author_id"))
+        .and_then(Value::as_u64);
     let state = v
         .get("state")
         .and_then(Value::as_str)
@@ -230,6 +235,7 @@ fn parse_review_summary(v: &Value) -> Result<PrReviewSummary, StoreError> {
     Ok(PrReviewSummary {
         id,
         author_login,
+        author_id,
         state,
         body,
         commit_id,
@@ -514,12 +520,33 @@ mod tests {
         let v = serde_json::json!({
             "id": 9, "user": null, "state": "APPROVED", "body": "", "commit_id": "abc"
         });
-        assert_eq!(parse_review_summary(&v).unwrap().author_login, "ghost");
+        let review = parse_review_summary(&v).unwrap();
+        assert_eq!(review.author_login, "ghost");
+        assert_eq!(review.author_id, None);
+    }
+
+    #[test]
+    fn a_review_carries_its_authors_user_id() {
+        let v = serde_json::json!({
+            "id": 9, "user": {"login": "x[bot]", "id": 341_521_384_u64},
+            "state": "APPROVED", "body": "", "commit_id": "abc"
+        });
+        let review = parse_review_summary(&v).unwrap();
+        assert_eq!(review.author_login, "x[bot]");
+        assert_eq!(review.author_id, Some(341_521_384));
+        // The flat form a CLI sends the hub.
+        let v = serde_json::json!({
+            "id": 9, "author_login": "x[bot]", "author_id": 7, "state": "APPROVED"
+        });
+        assert_eq!(parse_review_summary(&v).unwrap().author_id, Some(7));
+        // A user with no id, or a flat review without one, has none.
+        let v = serde_json::json!({ "id": 9, "user": {"login": "x"}, "state": "APPROVED" });
+        assert_eq!(parse_review_summary(&v).unwrap().author_id, None);
     }
 
     use super::*;
     use crate::creds::{AppCredentials, EnvToken, throwaway_key};
-    use crate::fake::{APP_SLUG, FakeGithub, USER_LOGIN};
+    use crate::fake::{APP_BOT_ID, APP_SLUG, FakeGithub, USER_LOGIN};
 
     fn user_client(fake: &FakeGithub) -> Client {
         Client::new(
@@ -633,6 +660,8 @@ mod tests {
             submit_pr_review(&author, repo, 1, "sha-111", "COMMENT", "Author note").unwrap();
         assert_eq!(comment_rev.state, "COMMENTED");
         assert_eq!(comment_rev.author_login, USER_LOGIN);
+        assert_ne!(comment_rev.author_id, Some(APP_BOT_ID));
+        assert!(comment_rev.author_id.is_some());
 
         // 5. Approving via `AppCredentials` (`fake-app[bot]`) succeeds with `200`
         let app_rev = submit_pr_review(
@@ -645,6 +674,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app_rev.author_login, format!("{APP_SLUG}[bot]"));
+        assert_eq!(app_rev.author_id, Some(APP_BOT_ID));
         assert_eq!(app_rev.state, "APPROVED");
         assert_eq!(app_rev.commit_id.as_deref(), Some("sha-111"));
 

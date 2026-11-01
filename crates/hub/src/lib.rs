@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use fl_core::pr_policy::{DEFAULT_OWNER_LOGIN, DEFAULT_REVIEWER_APP_LOGINS};
+use fl_core::pr_policy::{DEFAULT_OWNER_LOGIN, ReviewerApps};
 use fl_core::store::StoreError;
 use fl_exec::stamp;
 use fl_store::RedbStore;
@@ -124,24 +124,16 @@ pub struct HubServerConfig {
     pub repo_root: PathBuf,
     pub ui_dir: Option<PathBuf>,
     pub owner_login: String,
-    /// GitHub logins whose reviews may carry an agent marker when `POST /api/v1/prs/:n/merge`
-    /// checks the approvals it is sent (`[github] reviewer_logins`; the Reviewer App's login by
-    /// default).
-    pub reviewer_logins: Vec<String>,
+    /// The GitHub accounts whose reviews may carry an agent marker when
+    /// `POST /api/v1/prs/:n/merge` checks the approvals it is sent (`[github] reviewer_ids` and
+    /// `reviewer_logins`; the Reviewer App's user id by default).
+    pub reviewer_apps: ReviewerApps,
     pub owner_token: Option<String>,
     pub peer_token: Option<String>,
     pub trust_tailscale_headers: bool,
     pub enable_terminal: bool,
     pub session_ttl_secs: u64,
     pub home_override: Option<PathBuf>,
-}
-
-/// [`DEFAULT_REVIEWER_APP_LOGINS`] as owned strings, for [`HubServerConfig::reviewer_logins`].
-pub fn default_reviewer_logins() -> Vec<String> {
-    DEFAULT_REVIEWER_APP_LOGINS
-        .iter()
-        .map(|l| (*l).to_string())
-        .collect()
 }
 
 impl Default for HubServerConfig {
@@ -152,7 +144,7 @@ impl Default for HubServerConfig {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ui_dir: None,
             owner_login: DEFAULT_OWNER_LOGIN.to_string(),
-            reviewer_logins: default_reviewer_logins(),
+            reviewer_apps: ReviewerApps::default(),
             owner_token: None,
             peer_token: None,
             trust_tailscale_headers: false,
@@ -676,7 +668,7 @@ mod tests {
             repo_root: tmp.path().to_path_buf(),
             ui_dir: Some(ui_dir),
             owner_login: "lmcfarlin".into(),
-            reviewer_logins: default_reviewer_logins(),
+            reviewer_apps: ReviewerApps::default(),
             owner_token: Some("owner-tok-secret".into()),
             peer_token: Some("peer-tok-secret".into()),
             trust_tailscale_headers: true,
@@ -2491,11 +2483,12 @@ mod tests {
     }
 
     #[test]
-    fn pr_merge_counts_an_agent_approval_only_from_a_reviewer_login() {
+    fn pr_merge_counts_an_agent_approval_only_from_a_reviewer_app() {
         use fl_core::AgentRegistry;
         use fl_core::agent::AgentRole;
         use fl_core::pr_policy::{
-            FlReviewMarker, PrCommitSummary, PrReviewSummary, ReviewVerdict, format_review_body,
+            DEFAULT_REVIEWER_APP_IDS, FlReviewMarker, PrCommitSummary, PrReviewSummary,
+            ReviewVerdict, format_review_body,
         };
 
         let tmp = TempDir::new().unwrap();
@@ -2530,7 +2523,7 @@ mod tests {
             verdict: ReviewVerdict::Approved,
             at: fl_core::at::At::from_unix_millis(1),
         };
-        let merge = |state: &HubState, login: &str| {
+        let merge = |state: &HubState, login: &str, id: Option<u64>| {
             let body = json!({
                 "by": "felicia",
                 "project": "ferroloop",
@@ -2545,6 +2538,7 @@ mod tests {
                 "reviews": [PrReviewSummary {
                     id: 1,
                     author_login: login.into(),
+                    author_id: id,
                     state: "APPROVED".into(),
                     body: format_review_body("ok", &marker),
                     commit_id: Some("sha1".into()),
@@ -2552,13 +2546,25 @@ mod tests {
             });
             handle_http_request(state, &authed("POST", "/api/v1/prs/1/merge", PEER, &body))
         };
-        // The default list names the Reviewer App's login: an outsider's marker is refused.
-        assert_eq!(merge(&state, "mallory").status, 403);
-        assert_eq!(merge(&state, DEFAULT_REVIEWER_APP_LOGINS[0]).status, 200);
-        // `[github] reviewer_logins` reaches the hub through its config.
-        state.config.reviewer_logins = vec!["other-app[bot]".into()];
-        assert_eq!(merge(&state, DEFAULT_REVIEWER_APP_LOGINS[0]).status, 403);
-        assert_eq!(merge(&state, "Other-App[bot]").status, 200);
+        // The default set names the Reviewer App's user id: an outsider's marker is refused,
+        // and so is one from another account that shows the App's login.
+        let app_id = DEFAULT_REVIEWER_APP_IDS[0];
+        assert_eq!(merge(&state, "mallory", Some(1)).status, 403);
+        assert_eq!(merge(&state, "ferroloop[bot]", None).status, 403);
+        assert_eq!(
+            merge(&state, "ferroloop[bot]", Some(app_id + 1)).status,
+            403
+        );
+        assert_eq!(merge(&state, "ferroloop[bot]", Some(app_id)).status, 200);
+        assert_eq!(merge(&state, "renamed[bot]", Some(app_id)).status, 200);
+        // `[github] reviewer_ids` and `reviewer_logins` reach the hub through its config.
+        state.config.reviewer_apps = ReviewerApps {
+            ids: vec![5],
+            logins: vec!["other-app[bot]".into()],
+        };
+        assert_eq!(merge(&state, "ferroloop[bot]", Some(app_id)).status, 403);
+        assert_eq!(merge(&state, "x[bot]", Some(5)).status, 200);
+        assert_eq!(merge(&state, "Other-App[bot]", None).status, 200);
     }
 
     fn spin_up_body(persona: &str) -> Value {

@@ -2,6 +2,7 @@
 //! See `docs/ferrostore-spec.md`.
 
 mod columnar;
+mod compat;
 mod doc;
 mod layout;
 mod manifest_ops;

@@ -32,8 +32,8 @@ use fl_core::iri::Iri;
 use fl_core::log::{AttemptStatus, GateRun};
 use fl_core::pr_policy::{
     DEFAULT_OWNER_LOGIN, FlReviewMarker, PrCommitSummary, PrReviewSummary, ReviewVerdict,
-    authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, format_review_body,
-    verify_merge_approvals,
+    ReviewerApps, authorize_agent_action, authorize_agent_merge, evaluate_pr_policy,
+    format_review_body, verify_merge_approvals,
 };
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
@@ -4016,7 +4016,7 @@ fn handle_dynamic_api_routes(
                 return handle_post_pr_merge(
                     &store,
                     authority,
-                    &state.config.reviewer_logins,
+                    &state.config.reviewer_apps,
                     number,
                     req,
                 );
@@ -5531,7 +5531,7 @@ fn handle_post_pr_review(
 fn handle_post_pr_merge(
     store: &RedbStore,
     authority: &HubAuthority,
-    reviewer_logins: &[String],
+    reviewer_apps: &ReviewerApps,
     number: u64,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -5598,7 +5598,7 @@ fn handle_post_pr_merge(
             &payload.reviews,
             &agents,
             DEFAULT_OWNER_LOGIN,
-            reviewer_logins,
+            reviewer_apps,
         ) {
             return HttpResponse::json(
                 403,
