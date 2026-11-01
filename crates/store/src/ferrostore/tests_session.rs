@@ -408,6 +408,31 @@ fn a_server_holds_at_most_1024_sessions() {
     assert_eq!(server.open_sessions(), SESSIONS_PER_SERVER);
 }
 
+/// Every Unix client of a server is the owner's own `unix:<uid>`: the per-credential
+/// quota would cap them all together, so only the connection and server limits bind.
+#[test]
+fn unix_clients_of_one_uid_share_no_per_credential_session_quota() {
+    let served = serve(FerroStore::in_memory());
+    let conns: Vec<RemoteClient> = (0..SESSIONS_PER_SERVER / SESSIONS_PER_CONN)
+        .map(|_| served.raw())
+        .collect();
+    for raw in &conns {
+        for _ in 0..SESSIONS_PER_CONN {
+            open(raw).unwrap();
+        }
+    }
+    const { assert!(SESSIONS_PER_SERVER > SESSIONS_PER_PRINCIPAL) };
+    assert_eq!(served.server.open_sessions(), SESSIONS_PER_SERVER);
+    // The server-wide cap still holds.
+    let late = served.raw();
+    let err = open(&late).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("too many open read sessions: this server holds 1024"),
+        "{err}"
+    );
+}
+
 #[test]
 fn an_idle_session_expires_and_frees_its_place() {
     let served = serve(FerroStore::in_memory());
@@ -727,6 +752,30 @@ fn one_credential_holds_at_most_a_quarter_of_the_dedup_table() {
     assert_eq!(dedup.reply_of(&hog, 0), None);
     assert_eq!(dedup.reply_of(&hog, 1), Some(json!(1)));
     assert_eq!(dedup.reply_of(&newcomer(), 1), Some(json!("other")));
+}
+
+/// A Unix principal has no per-credential dedup quota: it can hold more than a
+/// quarter of the table, up to the table's own limit.
+#[test]
+fn a_unix_principal_is_not_held_to_the_dedup_quota() {
+    let dedup = Dedup::default();
+    let unix = Principal::from("unix:1000");
+    let base = Instant::now();
+    let running: Vec<_> = (0..(DEDUP_PER_PRINCIPAL + 500) as u128)
+        .map(|req| run_as(&dedup, &unix, req, base))
+        .collect();
+    assert!(running.len() > DEDUP_PER_PRINCIPAL);
+    // Still bounded by the table as a whole.
+    let more: Vec<_> = (running.len() as u128..DEDUP_ENTRIES as u128)
+        .map(|req| run_as(&dedup, &unix, req, base))
+        .collect();
+    let err = match dedup.claim_at(&unix, "put_doc", u128::MAX, || base) {
+        Err(err) => err,
+        Ok(_) => panic!("the table took more than its limit"),
+    };
+    assert!(err.to_string().contains(DEDUP_FULL), "{err}");
+    assert!(!err.to_string().contains(DEDUP_QUOTA), "{err}");
+    drop((running, more));
 }
 
 #[test]

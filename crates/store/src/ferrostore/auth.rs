@@ -80,9 +80,10 @@ type Nonce = [u8; NONCE_LEN];
 // ---- scopes ---------------------------------------------------------------------
 
 /// Who a connection authenticated as: `token:<sha256 hex>` for a bearer
-/// token, `psk` for the PSK over TCP, `unix:<uid>` for a Unix peer. Quotas
-/// (sessions, exactly-once ids) are per principal, and so is the key space
-/// of request ids (spec §6.1).
+/// token, `psk` for the PSK over TCP, `unix:<uid>` for a Unix peer. The key
+/// space of request ids is per principal; the quotas (sessions, exactly-once
+/// ids) bind TCP principals only, since every Unix peer is the owner's own uid
+/// (spec §6.1).
 pub(super) type Principal = Arc<str>;
 
 /// What a connection may do. `Admin` covers `Write`, which covers `Read`.

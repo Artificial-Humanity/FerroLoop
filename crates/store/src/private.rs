@@ -102,28 +102,20 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
 /// any permission bit: a secret others can read is no secret, and one they can write is not ours.
 /// The mode is read from the opened file, so the bytes read are the file that was checked.
 ///
-/// The open does not block and does not follow a symlink (`O_NONBLOCK | O_NOFOLLOW`): a FIFO or a
-/// device is opened without waiting for a writer and refused as not a regular file, and a path
-/// whose last component is a symlink is refused, so a secret path names the file itself. On a
-/// regular file `O_NONBLOCK` changes nothing.
+/// A symlink is followed and its TARGET is checked: the checks run on the opened descriptor
+/// (`fstat`), so they apply to the final file with no window between check and read, and a
+/// symlinked secret (a Kubernetes secret volume, say) works. The open does not block
+/// (`O_NONBLOCK`): a FIFO or a device, also one a symlink points to, is opened without waiting
+/// for a writer and refused as not a regular file. On a regular file `O_NONBLOCK` changes
+/// nothing.
 pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     use std::io::Read;
     #[cfg(unix)]
     let file = {
         std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|err| {
-                if err.raw_os_error() == Some(libc::ELOOP) {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "it is a symbolic link; name the file it points to",
-                    )
-                } else {
-                    err
-                }
-            })?
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?
     };
     #[cfg(not(unix))]
     let file = std::fs::File::open(path)?;
@@ -512,17 +504,48 @@ mod secret_file_tests {
         assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
-    #[test]
-    fn a_symlinked_secret_is_refused_and_the_file_itself_is_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("psk");
+    fn secret(dir: &Path, name: &str, mode: u32) -> PathBuf {
+        let file = dir.join(name);
         std::fs::write(&file, b"secret").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    fn fifo_at(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn a_symlink_to_a_private_secret_is_followed_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o600);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_within(link).unwrap(), b"secret");
+        assert_eq!(read_within(file).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_symlink_to_a_loose_secret_is_refused_for_its_target_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o644);
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let err = read_within(link).unwrap_err();
-        assert!(err.to_string().contains("symbolic link"), "{err}");
-        assert_eq!(read_within(file).unwrap(), b"secret");
+        assert!(err.to_string().contains("mode 644"), "{err}");
+    }
+
+    #[test]
+    fn a_symlink_to_a_fifo_is_refused_without_waiting_for_a_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        fifo_at(&fifo);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let err = read_within(link).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 }
 

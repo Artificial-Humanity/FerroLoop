@@ -33,15 +33,25 @@ pub(super) const SESSION_LIFETIME: Duration = Duration::from_secs(300);
 pub(super) const SESSIONS_PER_CONN: usize = 64;
 /// The most sessions one server holds open.
 pub(super) const SESSIONS_PER_SERVER: usize = 1024;
-/// The most sessions one principal holds open, over all its connections: a
-/// quarter of the server's, so one credential cannot take them all.
+/// The most sessions one TCP principal (`token:*`, `psk`) holds open, over all its
+/// connections: a quarter of the server's, so one credential cannot take them all.
+/// A `unix:<uid>` principal has no such quota: every Unix client of a server is the
+/// owner's own uid (`SO_PEERCRED`), so only the connection and server limits bound it.
 pub(super) const SESSIONS_PER_PRINCIPAL: usize = SESSIONS_PER_SERVER / 4;
 /// The start of the error a principal at [`SESSIONS_PER_PRINCIPAL`] gets.
 pub(super) const SESSION_QUOTA: &str = "session quota for this credential reached";
 /// The most request ids the exactly-once table remembers.
 pub(super) const DEDUP_ENTRIES: usize = 10_000;
-/// The most request ids one principal holds in the table: a quarter of it.
+/// The most request ids one TCP principal (`token:*`, `psk`) holds in the table: a
+/// quarter of it. A `unix:<uid>` principal has no such quota, only the table's own limit.
 pub(super) const DEDUP_PER_PRINCIPAL: usize = DEDUP_ENTRIES / 4;
+
+/// `true` when the per-principal quotas apply to `principal`: a TCP credential
+/// (`token:*`, `psk`). A `unix:<uid>` principal is the server's own user, shared by
+/// every local client, so a per-credential quota would cap all of them together.
+pub(super) fn quota_applies(principal: &str) -> bool {
+    !principal.starts_with("unix:")
+}
 /// How long the exactly-once table remembers a request id.
 pub(super) const DEDUP_TTL: Duration = Duration::from_secs(600);
 /// An answered request id younger than this is kept even when the table is
@@ -522,8 +532,8 @@ impl Sessions {
     }
 
     /// Pin `state` for `conn` of `principal`. Expired sessions are dropped
-    /// first; then a connection, a principal ([`SESSIONS_PER_PRINCIPAL`]) or
-    /// a server still at its limit refuses the new session, and the
+    /// first; then a connection, a TCP principal ([`SESSIONS_PER_PRINCIPAL`];
+    /// not a Unix one, see [`quota_applies`]) or a server still at its limit refuses the new session, and the
     /// sessions already open are kept.
     pub(super) fn open(
         &self,
@@ -541,10 +551,13 @@ impl Sessions {
                 "too many open read sessions: this connection holds {SESSIONS_PER_CONN}"
             )));
         }
-        let theirs = open
-            .values()
-            .filter(|session| session.principal == *principal)
-            .count();
+        let theirs = if quota_applies(principal) {
+            open.values()
+                .filter(|session| session.principal == *principal)
+                .count()
+        } else {
+            0
+        };
         if theirs >= SESSIONS_PER_PRINCIPAL {
             return Err(backend(format!(
                 "{SESSION_QUOTA}: its connections hold {SESSIONS_PER_PRINCIPAL} of this \
@@ -844,7 +857,8 @@ impl Dedup {
                 }) => return Ok(Claim::Replay(reply.clone())),
                 Some(_) => table = wait_mutex(&self.cv, table),
                 None => {
-                    if table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
+                    let capped = quota_applies(principal);
+                    if capped && table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
                         table.evict_own(principal, now);
                     }
                     if table.entries.len() >= DEDUP_ENTRIES {
@@ -853,7 +867,7 @@ impl Dedup {
                              cannot forget yet"
                         )));
                     }
-                    if table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
+                    if capped && table.held_by(principal) >= DEDUP_PER_PRINCIPAL {
                         return Err(backend(format!(
                             "{DEDUP_QUOTA}: it holds {DEDUP_PER_PRINCIPAL} of the server's \
                              {DEDUP_ENTRIES} recent writes, which cannot be forgotten yet"
