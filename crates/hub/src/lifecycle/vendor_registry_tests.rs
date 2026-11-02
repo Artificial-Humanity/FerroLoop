@@ -694,6 +694,58 @@ fn stored_record(session_id: &str) -> HostedSessionRecord {
 }
 
 #[test]
+fn a_plugin_vendor_that_extends_a_built_in_id_disables_no_built_in() {
+    // `claude-code` extends the built-in `claude`: the longer id is allowed every persona and the
+    // shorter id loses only the personas that would collide with it.
+    let plugin = custom_cli("claude-code");
+    let validate = |vendor: &str, persona: &str| req(persona, vendor).validate();
+    for persona in ["ada", "code-ada", "bob", "x-y"] {
+        validate(&plugin, persona).unwrap_or_else(|e| panic!("{plugin}:{persona}: {e}"));
+    }
+    for vendor in spin_up_vendor_ids()
+        .into_iter()
+        .filter(|v| VendorRegistry::is_builtin(v))
+    {
+        validate(&vendor, "ada").unwrap_or_else(|e| panic!("{vendor}:ada: {e}"));
+    }
+    let LifecycleError::Invalid(message) = validate("claude", "code-ada").unwrap_err() else {
+        panic!("claude:code-ada must be Invalid");
+    };
+    assert!(message.contains("`claude-code:ada`"), "{message}");
+    // The remainder must itself be a persona: `claude:code-9` collides with nothing.
+    validate("claude", "code-9").unwrap();
+    validate("claude", "codex").unwrap();
+}
+
+#[test]
+fn the_stored_slug_conflict_holds_in_both_orders() {
+    let short = custom_cli("hubreg-order");
+    let long = custom_cli("hubreg-order-y");
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    // A live session of the longer id first: the shorter id's colliding persona is refused by
+    // validation (400), and its stored record would be refused by the store (409).
+    let store = MemStore::default();
+    spin(&store, &env, "ada", &long).unwrap();
+    let err = spin(&store, &env, "y-ada", &short).unwrap_err();
+    assert!(matches!(err, LifecycleError::Invalid(_)), "{err:?}");
+    let err = persist_hosted_session(&store, &stored_record(&format!("{short}:y-ada")), "owner")
+        .unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+    assert!(err.to_string().contains(&format!("{long}:ada")), "{err}");
+    // A live record of the shorter id first (written before the longer vendor existed): the
+    // longer id's session is refused with a Conflict, and the record stays.
+    let store = MemStore::default();
+    persist_hosted_session(&store, &stored_record(&format!("{short}:y-bob")), "owner").unwrap();
+    let err = spin(&store, &env, "bob", &long).unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+    assert!(err.to_string().contains(&format!("{short}:y-bob")), "{err}");
+    assert!(store.agent_by_name("bob").unwrap().is_none());
+    assert_eq!(record(&store, &format!("{short}:y-bob")).status, "running");
+}
+
+#[test]
 fn a_stored_record_of_another_session_id_on_the_same_slug_is_never_overwritten() {
     // `ghost` is not a registered vendor (a legacy record), so only the stored record can
     // reveal that `ghost-y:ada` shares the slug of `ghost:y-ada`.

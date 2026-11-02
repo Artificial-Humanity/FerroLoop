@@ -493,8 +493,8 @@ fn check_persona_fits_slug(vendor: &str, persona: &str) -> Result<(), LifecycleE
     if let Some(other) = colliding_session_id(vendor, persona, &spin_up_vendor_ids()) {
         return Err(LifecycleError::Invalid(format!(
             "session `{vendor}:{persona}` would share its hosted-session state slug `{}` with \
-             session `{other}`: choose another persona (every persona collides when this vendor's \
-             id extends another vendor's id), or rename one of the vendors",
+             session `{other}` of the longer vendor id: choose a persona that does not start with \
+             that vendor's remainder, or rename one of the vendors",
             hosted_session_slug(&format!("{vendor}:{persona}"))
         )));
     }
@@ -512,15 +512,20 @@ fn is_valid_persona(persona: &str) -> bool {
         && !fl_wire::dispatcher::is_owner_sender(persona)
 }
 
-/// Another session id `o:p` whose hosted-session slug equals the slug of `vendor:persona`, over
-/// the vendor ids `vendor_ids`. The slug turns `:` into `-`, so `x:y-ada` and `x-y:ada` share
-/// `hosted-session-x-y-ada` when both `x` and `x-y` are vendors; the second would overwrite the
-/// first one's record. `None` when the slug is the session id's alone.
+/// A session id `o:p` of a LONGER vendor id `o` whose hosted-session slug equals the slug of
+/// `vendor:persona`, over the vendor ids `vendor_ids`. The slug turns `:` into `-`, so `x:y-ada`
+/// and `x-y:ada` share `hosted-session-x-y-ada` when both `x` and `x-y` are vendors.
+///
+/// Only the shorter id's persona is refused (`x:y-ada`); every persona of the longer id (`x-y`)
+/// is allowed. A plugin vendor `x` can therefore never disable a built-in or other longer-id
+/// vendor, and the longer id wins as it does in [`vendor_of_session_id`]. A session of the longer
+/// id that is already stored blocks the shorter one's through [`check_slug_free`], and the other
+/// way round. `None` when the slug is the session id's alone.
 fn colliding_session_id(vendor: &str, persona: &str, vendor_ids: &[String]) -> Option<String> {
     let tail = format!("{vendor}-{persona}");
     vendor_ids
         .iter()
-        .filter(|o| o.as_str() != vendor)
+        .filter(|o| o.len() > vendor.len())
         .find_map(|o| {
             let rest = tail.strip_prefix(o.as_str())?.strip_prefix('-')?;
             is_valid_persona(rest).then(|| format!("{o}:{rest}"))
@@ -3832,29 +3837,27 @@ mod tests {
                 }
             }
         }
-        // The pair: each colliding spin-up is refused, naming the other session.
-        for (vendor, persona, other) in [
-            (&x, "y-ada", format!("{xy}:ada")),
-            (&xy, "ada", format!("{x}:y-ada")),
-        ] {
-            let LifecycleError::Invalid(message) = collide(vendor, persona).unwrap_err() else {
-                panic!("{vendor}:{persona} must be Invalid");
-            };
-            assert!(message.contains(&format!("`{other}`")), "{message}");
-            assert!(message.contains("state slug"), "{message}");
-        }
-        // Every persona on the longer id `x-y` shares a slug with `x:y-<persona>`, so that vendor
-        // hosts nothing while `x` is registered.
-        let LifecycleError::Invalid(message) = collide(&xy, "bob").unwrap_err() else {
-            panic!("{xy}:bob must be Invalid");
+        // The shorter id's colliding persona is refused, naming the longer id's session.
+        let LifecycleError::Invalid(message) = collide(&x, "y-ada").unwrap_err() else {
+            panic!("{x}:y-ada must be Invalid");
         };
-        assert!(message.contains(&format!("`{x}:y-bob`")), "{message}");
-        // A persona that does not collide still works on the shorter vendor, through a real
-        // spin-up.
+        assert!(message.contains(&format!("`{xy}:ada`")), "{message}");
+        assert!(message.contains("state slug"), "{message}");
+        // Every persona of the longer id is allowed, and so is a non-colliding one of the shorter.
+        for persona in ["ada", "bob", "y-ada", "z-ada"] {
+            collide(&xy, persona).unwrap_or_else(|e| panic!("{xy}:{persona}: {e}"));
+        }
+        // Real spin-ups on both vendors.
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        for (vendor, persona) in [(&x, "z-ada"), (&x, "y"), (&x, "ada")] {
+        for (vendor, persona) in [
+            (&x, "z-ada"),
+            (&x, "y"),
+            (&x, "ada"),
+            (&xy, "ada"),
+            (&xy, "bob"),
+        ] {
             let out = spin_up(
                 &store,
                 &env,
@@ -3876,22 +3879,52 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status(), 400, "{err:?}");
         assert!(store.agent_by_name("y-ada").unwrap().is_none());
-        // The pure check: the persona rules apply to the remainder, and an unrelated vendor
-        // never collides.
+        // The pure check: only the shorter id is refused; the persona rules apply to the
+        // remainder; an unrelated vendor never collides.
         let ids = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert_eq!(
             colliding_session_id("x", "y-ada", &ids(&["x", "x-y"])).as_deref(),
             Some("x-y:ada")
         );
         assert_eq!(
-            colliding_session_id("x-y", "ada", &ids(&["x", "x-y"])).as_deref(),
-            Some("x:y-ada")
+            colliding_session_id("x-y", "ada", &ids(&["x", "x-y"])),
+            None
         );
-        // The remainder `9-a` is not a persona (starts with a digit); `xa` is another id; a
+        // The remainder `9` of `x-y-9` is not a persona (starts with a digit); `xa` is another id; a
         // vendor id that is the whole tail leaves no persona.
         assert_eq!(colliding_session_id("x-9", "a", &ids(&["x", "x-9"])), None);
+        assert_eq!(colliding_session_id("x", "y-9", &ids(&["x", "x-y"])), None);
         assert_eq!(colliding_session_id("x", "a", &ids(&["x", "xa"])), None);
         assert_eq!(colliding_session_id("x", "y", &ids(&["x", "x-y"])), None);
+        // A shorter plugin vendor (`kimi`, `claude`) disables no built-in: every built-in id
+        // hosts any persona, even one that reads like the rest of a longer id.
+        let all = ids(&[
+            "claude",
+            "kimi",
+            "kimi-api",
+            "claude-code",
+            "openrouter-api",
+            "openrouter",
+            "ollama",
+            "lemonade",
+        ]);
+        for vendor in ["kimi-api", "claude-code", "openrouter-api", "ollama"] {
+            for persona in ["ada", "api-ada", "code-ada", "y-ada", "a-b"] {
+                assert_eq!(
+                    colliding_session_id(vendor, persona, &all),
+                    None,
+                    "{vendor}:{persona}"
+                );
+            }
+        }
+        assert_eq!(
+            colliding_session_id("kimi", "api-ada", &all).as_deref(),
+            Some("kimi-api:ada")
+        );
+        assert_eq!(
+            colliding_session_id("claude", "code-ada", &all).as_deref(),
+            Some("claude-code:ada")
+        );
     }
 
     // ---- audit 2026-10-30 regressions ----
