@@ -15,8 +15,8 @@ use tempfile::TempDir;
 use crate::artifact_dirs::{
     MigrateError, RELOCATE_LOCK, Scope, check_relation, copy_then_remove, count_tree,
     default_project_dir, default_system_dir, effective_project_dir, effective_system_dir,
-    ensure_startup_dirs, hub_data_home, is_cross_device, migrate_dir, order_entries, resolve_path,
-    rollback, validate_target,
+    ensure_startup_dirs, hub_data_home, is_cross_device, migrate_dir, migrate_dir_with,
+    order_entries, resolve_path, rollback, serving_roots, validate_target,
 };
 use crate::settings;
 use crate::{HttpRequest, HttpResponse, HubServerConfig, HubState, handle_http_request};
@@ -461,6 +461,43 @@ fn a_project_directory_may_not_contain_the_system_directory_or_the_registry_file
     );
 }
 
+#[test]
+fn a_system_directory_may_not_be_contain_or_sit_inside_a_project_override() {
+    let env = env();
+    let proj = env.target("work/proj");
+    fs::create_dir_all(&proj).unwrap();
+    let alias = env.target("alias");
+    std::os::unix::fs::symlink(&proj, &alias).unwrap();
+    settings::update_artifact_dirs(&env.home(), |s| {
+        s.project_artifacts_dirs
+            .insert("alpha".into(), proj.display().to_string());
+        // A hand-edited override that does not resolve is skipped, not fatal.
+        s.project_artifacts_dirs
+            .insert("beta".into(), "/nonexistent-root-xyz/p".into());
+    })
+    .unwrap();
+    let old = env.data().join("artifacts");
+    for (raw, what) in [
+        (proj.clone(), "equal"),
+        (proj.join("inner"), "inside"),
+        (env.target("work"), "containing"),
+        (alias.join("inner"), "inside through a symlink"),
+    ] {
+        let err = validate_target(&env.state, &raw.display().to_string(), &old, Scope::System)
+            .unwrap_err();
+        assert!(err.contains("project `alpha`"), "{what}: {err}");
+    }
+    let ok = env.target("elsewhere");
+    assert_eq!(
+        validate_target(&env.state, &ok.display().to_string(), &old, Scope::System).unwrap(),
+        ok
+    );
+    // Through the endpoint it is a 400 and nothing changes.
+    let resp = post_system(&env, OWNER, &json!({ "new_path": proj }));
+    assert_eq!(resp.status, 400, "{}", error_of(&resp));
+    assert_eq!(stored(&env).artifacts_dir, None);
+}
+
 // --- migration helpers ------------------------------------------------------------------------
 
 #[test]
@@ -599,6 +636,73 @@ fn rollback_puts_moved_entries_back() {
     assert!(rollback(&old, &new, &done.moved));
     assert_eq!(tree(&old), before);
     assert!(tree(&new).is_empty());
+}
+
+#[test]
+fn a_copy_that_cannot_remove_its_source_is_reported_as_kept_in_both_places() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = env();
+    let old = env.target("old");
+    let new = env.target("new");
+    write(&old.join("a/one.md"), "1");
+    write(&old.join("b/locked/two.md"), "22");
+    // A read-only directory: the copy works, deleting the original fails part-way.
+    let locked = old.join("b/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = copy_then_remove(&old.join("b"), &env.target("probe"));
+    if probe.is_ok() {
+        // Running as a user the permission bits do not bind (root): nothing to test.
+        return;
+    }
+    let _ = fs::remove_dir_all(env.target("probe"));
+    let result = migrate_dir_with(&old, &new, &copy_then_remove);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let Err(MigrateError::Failed {
+        message,
+        files_moved,
+        rolled_back,
+    }) = result
+    else {
+        panic!("the removal failure must fail the migration: {result:?}");
+    };
+    assert!(
+        !rolled_back,
+        "an entry left in both places is not rolled back"
+    );
+    assert_eq!(files_moved, 1);
+    assert!(message.contains("`b`"), "{message}");
+    assert!(message.contains("both directories"), "{message}");
+    // The first entry went back; `b` is still whole in both places.
+    assert_eq!(fs::read_to_string(old.join("a/one.md")).unwrap(), "1");
+    assert!(!new.join("a").exists());
+    assert_eq!(
+        fs::read_to_string(new.join("b/locked/two.md")).unwrap(),
+        "22"
+    );
+    assert!(old.join("b").exists());
+}
+
+#[test]
+fn an_entry_that_appears_in_the_target_after_the_preflight_is_a_clash() {
+    let env = env();
+    let old = env.target("old");
+    let new = env.target("new");
+    write(&old.join("a/one.md"), "1");
+    write(&old.join("b"), "old b");
+    let before = tree(&old);
+    // The mover plants `b` in the target while the first entry moves, after the preflight.
+    let result = migrate_dir_with(&old, &new, &|from, to| {
+        write(&new.join("b"), "newcomer");
+        fs::rename(from, to)
+    });
+    let Err(MigrateError::Conflict(names)) = result else {
+        panic!("a late clash must be a conflict: {result:?}");
+    };
+    assert_eq!(names, ["b"]);
+    assert_eq!(tree(&old), before, "what moved is put back");
+    assert_eq!(fs::read_to_string(new.join("b")).unwrap(), "newcomer");
+    assert_eq!(fs::read_to_string(old.join("b")).unwrap(), "old b");
 }
 
 // --- the system endpoint ----------------------------------------------------------------------
@@ -1021,6 +1125,20 @@ fn project_relocation_is_owner_only_and_unknown_projects_are_404() {
 #[test]
 fn the_artifacts_dir_route_does_not_shadow_the_project_merge_routes() {
     let env = env();
+    let unconfigured = "GitHub is not configured on this Hub: no repository is bound to project \
+                        `ferroloop`";
+    // `/prs/:n/merge` reaches the merge handler: the number is in the path, and the test hub has
+    // no GitHub repository, so the handler answers 503.
+    let resp = send(
+        &env,
+        "POST",
+        "/api/v1/projects/ferroloop/prs/5/merge",
+        Some(OWNER),
+        Some(&json!({})),
+    );
+    assert_eq!((resp.status, error_of(&resp)), (503, unconfigured.into()));
+    // `/pr/merge` reaches it too: with no number in the path or the body it is a 400 from the
+    // handler; with one it gets as far as the missing repository.
     let resp = send(
         &env,
         "POST",
@@ -1028,35 +1146,45 @@ fn the_artifacts_dir_route_does_not_shadow_the_project_merge_routes() {
         Some(OWNER),
         Some(&json!({})),
     );
-    let text = String::from_utf8_lossy(&resp.body).to_string();
-    assert!(
-        !text.contains("artifacts-dir") && !text.contains("no project"),
-        "{text}"
+    assert_eq!(
+        (resp.status, error_of(&resp)),
+        (400, "a pull request number is required".into())
     );
     let resp = send(
         &env,
         "POST",
-        "/api/v1/projects/ferroloop/prs/7/merge",
+        "/api/v1/projects/ferroloop/pr/merge",
         Some(OWNER),
-        Some(&json!({})),
+        Some(&json!({ "number": 5 })),
     );
-    let text = String::from_utf8_lossy(&resp.body).to_string();
-    assert!(
-        !text.contains("artifacts-dir") && !text.contains("no project"),
-        "{text}"
+    assert_eq!((resp.status, error_of(&resp)), (503, unconfigured.into()));
+
+    // The artifacts-dir path is five segments with that exact last segment and takes GET and
+    // POST only: any other method falls through the router to its 404.
+    let resp = send(
+        &env,
+        "DELETE",
+        "/api/v1/projects/ferroloop/artifacts-dir",
+        Some(OWNER),
+        None,
     );
-    // And the artifacts-dir path takes only GET and POST.
-    assert_ne!(
-        send(
-            &env,
-            "DELETE",
-            "/api/v1/projects/ferroloop/artifacts-dir",
-            Some(OWNER),
-            None
-        )
-        .status,
-        200
-    );
+    assert_eq!(resp.status, 404);
+    assert_eq!(error_of(&resp), "not found");
+    // A different last segment, or an extra one, is not the artifacts-dir route either.
+    for path in [
+        "/api/v1/projects/ferroloop/artifacts",
+        "/api/v1/projects/ferroloop/artifacts-dir/x",
+    ] {
+        for method in ["GET", "POST"] {
+            let resp = send(&env, method, path, Some(OWNER), Some(&json!({})));
+            assert_eq!(resp.status, 404, "{method} {path}");
+            assert_eq!(error_of(&resp), "not found", "{method} {path}");
+        }
+    }
+    // And the real thing is the 200 these tests use elsewhere.
+    let resp = owner_get(&env, "/api/v1/projects/ferroloop/artifacts-dir");
+    assert_eq!(resp.status, 200);
+    assert_eq!(json_of(&resp)["id"], "ferroloop");
 }
 
 // --- serving ----------------------------------------------------------------------------------
@@ -1148,6 +1276,100 @@ fn an_override_never_makes_a_forbidden_path_servable() {
     })
     .unwrap();
     assert_eq!(preview(&env, &sys.join("link/passwd")).status, 403);
+}
+
+#[test]
+fn a_project_root_that_reaches_the_registry_files_is_not_served() {
+    let env = env();
+    let sys = env.target("sys");
+    write(&sys.join("registry.json"), "{}");
+    write(&sys.join("versions/h/x.md"), "# v");
+    write(&sys.join("managed/m.md"), "# m");
+    write(&env.target("sibling.md"), "# sibling");
+    let inner = sys.join("versions/h");
+    // Hand-edited settings: the project roots are the parent of the system directory and a
+    // directory inside the registry's versions.
+    settings::update_artifact_dirs(&env.home(), |s| {
+        s.artifacts_dir = Some(sys.display().to_string());
+        s.project_artifacts_dirs
+            .insert("alpha".into(), env.target("").display().to_string());
+        s.project_artifacts_dirs
+            .insert("beta".into(), inner.display().to_string());
+    })
+    .unwrap();
+    for path in [
+        sys.join("registry.json"),
+        sys.join("versions/h/x.md"),
+        env.target("sibling.md"),
+    ] {
+        assert_eq!(preview(&env, &path).status, 403, "{}", path.display());
+    }
+    // The system directory's own entries are still served.
+    assert_eq!(preview(&env, &sys.join("managed/m.md")).status, 200);
+    let roots = serving_roots(&env.state);
+    assert!(
+        roots
+            .iter()
+            .all(|r| !sys.starts_with(r) && !r.starts_with(sys.join("versions"))),
+        "{roots:?}"
+    );
+}
+
+#[test]
+fn temporary_entries_of_the_system_directory_are_not_served() {
+    let env = env();
+    let sys = env.target("sys");
+    write(&sys.join(".tmp-abc123/half.md"), "# partial");
+    write(&sys.join("managed/ok.md"), "# ok");
+    assert_eq!(
+        post_system(&env, OWNER, &json!({ "new_path": sys })).status,
+        200
+    );
+    assert_eq!(preview(&env, &sys.join("managed/ok.md")).status, 200);
+    assert_eq!(preview(&env, &sys.join(".tmp-abc123/half.md")).status, 403);
+}
+
+#[test]
+fn a_hand_edited_protected_directory_is_never_written_to_or_created() {
+    let env = env();
+    let bad_sys = env.target("x/.ssh/arts");
+    let bad_proj = env.target("y/.git/proj");
+    settings::update_artifact_dirs(&env.home(), |s| {
+        s.artifacts_dir = Some(bad_sys.display().to_string());
+        s.project_artifacts_dirs
+            .insert("ferroloop".into(), bad_proj.display().to_string());
+        s.project_artifacts_dirs
+            .insert("home".into(), env.home().display().to_string());
+    })
+    .unwrap();
+    let default = env.data().join("artifacts");
+    assert_eq!(effective_system_dir(&env.state), default);
+    assert_eq!(
+        effective_project_dir(&env.state, "ferroloop"),
+        default.join("ferroloop")
+    );
+    assert_eq!(
+        effective_project_dir(&env.state, "home"),
+        default.join("home")
+    );
+    let view = json_of(&owner_get(&env, "/api/v1/settings"));
+    assert_eq!(
+        view["effective_artifacts_dir"],
+        default.display().to_string()
+    );
+    // The stored value is still shown as stored; only the directory in use changes.
+    assert_eq!(view["artifacts_dir"], bad_sys.display().to_string());
+
+    ensure_startup_dirs(&env.state);
+    assert!(default.is_dir());
+    assert!(!env.target("x").exists() && !env.target("y").exists());
+
+    // A relocation measures from the directory in use, not the stored one, and does not create it.
+    let new = env.target("fine");
+    let resp = post_system(&env, OWNER, &json!({ "new_path": new, "migrate": true }));
+    assert_eq!(resp.status, 200, "{}", error_of(&resp));
+    assert_eq!(json_of(&resp)["old_path"], default.display().to_string());
+    assert!(!env.target("x").exists());
 }
 
 // --- startup ----------------------------------------------------------------------------------

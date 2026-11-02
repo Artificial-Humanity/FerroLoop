@@ -121,7 +121,9 @@ moves the old directory's contents to the new one:
    failed copy removes the partial destination and leaves the source.
 3. `registry.json` moves last.
 4. The setting changes only after the move succeeded. If a move fails, entries already moved are
-   put back where possible, the setting is unchanged, and the error is `500`.
+   put back where possible, the setting is unchanged, and the error is `500`. An entry that
+   was copied but whose source could not be fully removed stays in both directories; the error
+   names it and says the moved entries were not all put back.
 
 The whole move runs while the artifact registry lock is held, so a registry write cannot land in
 the old directory half way. `migrated_files` and `migrated_bytes` count regular files, counted
@@ -135,4 +137,16 @@ reads and writes the new directory from then on, so the old registry is not seen
 `GET /api/v1/artifacts/preview` and the other artifact routes serve files under the default and
 the effective system directory (not its `registry.json*` or `versions/`) and under each project
 override. The forbidden-path rules still apply, and a directory that resolves into a protected
-place is not served, so an override never makes such a path readable.
+place is not served, so an override never makes such a path readable. A project override that
+contains the registry's `registry.json` or `versions/` is not served, and `.tmp-*` entries of the
+system directory are skipped. A stored directory that resolves into a protected place (for
+example a hand-edited `/etc`) is ignored for writes and startup too: the Hub uses the default.
+
+## Known limits
+
+- A request that resolved the artifacts root just before a relocation finished can still write
+  one registry update to the old directory. A later migrate back may then report a clash on
+  `registry.json`; move or delete the stray file and repeat.
+- The check that a target name is free runs before each entry moves, but a file created in the
+  target in that instant can still be replaced by the move.
+

@@ -99,16 +99,27 @@ fn current_settings(state: &HubState) -> Settings {
         .unwrap_or_default()
 }
 
+/// A stored directory is usable only when it is not somewhere an artifacts directory must never
+/// be. A hand-edited settings file naming `/etc` or `$HOME` is ignored, so it is never written
+/// to or created.
+fn usable_stored(state: &HubState, stored: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(stored);
+    let resolved = resolve_path(&path).unwrap_or_else(|_| path.clone());
+    sensitive_reason(state, &resolved).is_none().then_some(path)
+}
+
 fn system_dir_in(state: &HubState, s: &Settings) -> PathBuf {
     s.artifacts_dir
         .as_deref()
-        .map_or_else(|| default_system_dir(state), PathBuf::from)
+        .and_then(|stored| usable_stored(state, stored))
+        .unwrap_or_else(|| default_system_dir(state))
 }
 
 fn project_dir_in(state: &HubState, s: &Settings, slug: &str) -> PathBuf {
     s.project_artifacts_dirs
         .get(slug)
-        .map_or_else(|| system_dir_in(state, s).join(slug), PathBuf::from)
+        .and_then(|stored| usable_stored(state, stored))
+        .unwrap_or_else(|| system_dir_in(state, s).join(slug))
 }
 
 /// The system artifacts directory in use: the setting, else [`default_system_dir`].
@@ -118,13 +129,13 @@ pub(crate) fn effective_system_dir(state: &HubState) -> PathBuf {
 
 /// `<effective system dir>/<slug>`. The handlers use `project_dir_in` and `system_dir_in` on one
 /// settings snapshot instead, so a response never mixes two reads.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn default_project_dir(state: &HubState, slug: &str) -> PathBuf {
     effective_system_dir(state).join(slug)
 }
 
 /// A project's artifacts directory in use: its override, else [`default_project_dir`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn effective_project_dir(state: &HubState, slug: &str) -> PathBuf {
     project_dir_in(state, &current_settings(state), slug)
 }
@@ -278,8 +289,9 @@ pub(crate) fn sensitive_reason(state: &HubState, path: &Path) -> Option<String> 
 /// Refuses (with the reason) a path that is empty, over 4096 bytes, holds a NUL, is relative,
 /// has a `.` or `..` component, is `/`, resolves into a system directory or one with a secret
 /// name (`.ssh`, `.git`, `secrets`, ...), is or contains a home directory or the attachments
-/// directory, or moves `old` into itself. A project directory also must not contain the
-/// system directory or sit in the registry's own files.
+/// directory, or moves `old` into itself. A system directory also must not be, contain or sit
+/// inside a project override. A project directory also must not contain the system directory or
+/// sit in the registry's own files.
 pub(crate) fn validate_target(
     state: &HubState,
     raw: &str,
@@ -314,6 +326,22 @@ pub(crate) fn validate_target(
         return Err(reason);
     }
     check_relation(&resolved, old)?;
+    if matches!(scope, Scope::System) {
+        let s = current_settings(state);
+        for (slug, dir) in &s.project_artifacts_dirs {
+            let Ok(dir) = resolve_path(Path::new(dir)) else {
+                continue;
+            };
+            if resolved.starts_with(&dir) || dir.starts_with(&resolved) {
+                return Err(format!(
+                    "{} is, contains or is inside the artifacts directory {} of project `{slug}`; \
+                     change or reset that project's directory first",
+                    resolved.display(),
+                    dir.display()
+                ));
+            }
+        }
+    }
     if matches!(scope, Scope::Project(_)) {
         let system = effective_system_dir(state);
         let system = resolve_path(&system).unwrap_or(system);
@@ -360,11 +388,14 @@ pub(crate) struct Migrated {
 
 #[derive(Debug)]
 pub(crate) enum MigrateError {
-    /// These top-level names already exist in the target. Nothing was moved.
+    /// These top-level names already exist in the target. Nothing was moved (or what moved was
+    /// put back).
     Conflict(Vec<String>),
     /// The target could not be created. Nothing was moved.
     Prepare(String),
-    /// A move failed. The entries moved before it were rolled back where possible.
+    /// A move failed. The entries moved before it were rolled back where possible;
+    /// `rolled_back` is false when any of them, or the failed entry itself, is left in both
+    /// directories or in the wrong one.
     Failed {
         message: String,
         files_moved: u64,
@@ -487,6 +518,15 @@ pub(crate) fn order_entries(names: &mut [OsString]) {
 /// `registry.json` moves last. Symlinks are never followed. The caller must hold the registry
 /// lock (see [`artifacts::with_registry_lock`]).
 pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Migrated, MigrateError> {
+    migrate_dir_with(old, new, &move_entry)
+}
+
+/// [`migrate_dir`] with the per-entry mover chosen by the caller (tests force the copy path).
+pub(crate) fn migrate_dir_with(
+    old: &Path,
+    new: &Path,
+    mover: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<Migrated, MigrateError> {
     let mut names: Vec<OsString> = match fs::symlink_metadata(old) {
         Ok(_) if old.is_dir() => fs::read_dir(old)
             .map_err(|e| MigrateError::Prepare(format!("could not read {}: {e}", old.display())))?
@@ -511,11 +551,42 @@ pub(crate) fn migrate_dir(old: &Path, new: &Path) -> Result<Migrated, MigrateErr
     let sizes: Vec<(u64, u64)> = names.iter().map(|n| count_tree(&old.join(n))).collect();
     let mut done = Migrated::default();
     for (name, (files, bytes)) in names.iter().zip(sizes) {
-        if let Err(e) = move_entry(&old.join(name), &new.join(name)) {
+        let (from, to) = (old.join(name), new.join(name));
+        // Something may have appeared in the target since the preflight; `rename` would replace
+        // a file or an empty directory silently. This narrows that window, it cannot close it.
+        if fs::symlink_metadata(&to).is_ok() {
             let files_moved = done.files;
-            let rolled_back = rollback(old, new, &done.moved);
+            return if rollback(old, new, &done.moved) {
+                Err(MigrateError::Conflict(vec![
+                    name.to_string_lossy().into_owned(),
+                ]))
+            } else {
+                Err(MigrateError::Failed {
+                    message: format!(
+                        "`{}` appeared in {} during the move",
+                        name.to_string_lossy(),
+                        new.display()
+                    ),
+                    files_moved,
+                    rolled_back: false,
+                })
+            };
+        }
+        if let Err(e) = mover(&from, &to) {
+            let files_moved = done.files;
+            // A copy that finished but whose source could not be fully removed leaves the entry
+            // in both directories; it is not in `done.moved`, so the rollback cannot put it back.
+            let in_both = fs::symlink_metadata(&from).is_ok() && fs::symlink_metadata(&to).is_ok();
+            let mut message = format!("could not move `{}`: {e}", name.to_string_lossy());
+            if in_both {
+                message.push_str(&format!(
+                    " (`{}` exists in both directories; keep one and delete the other)",
+                    name.to_string_lossy()
+                ));
+            }
+            let rolled_back = rollback(old, new, &done.moved) && !in_both;
             return Err(MigrateError::Failed {
-                message: format!("could not move `{}`: {e}", name.to_string_lossy()),
+                message,
                 files_moved,
                 rolled_back,
             });
@@ -708,7 +779,7 @@ fn relocate(
             let tail = if rolled_back {
                 "the moved entries were put back"
             } else {
-                "some moved entries could not be put back; look in both directories"
+                "not every moved entry could be put back; look in both directories"
             };
             error(
                 500,
@@ -804,7 +875,8 @@ pub(crate) fn serving_roots(state: &HubState) -> Vec<PathBuf> {
         };
         for entry in entries.take(MAX_SERVING_ENTRIES).flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let internal = name == REGISTRY_FILE
+            let internal = name.starts_with(".tmp-")
+                || name == REGISTRY_FILE
                 || name.starts_with(&format!("{REGISTRY_FILE}."))
                 || name == VERSIONS_DIR;
             // A symlink inside the directory could point anywhere.
@@ -813,12 +885,25 @@ pub(crate) fn serving_roots(state: &HubState) -> Vec<PathBuf> {
             }
         }
     }
+    // The registry's own files in any system directory: no project root may serve them.
+    let registry_paths: Vec<PathBuf> = [default_system_dir(state), system_dir_in(state, &s)]
+        .iter()
+        .flat_map(|dir| {
+            let dir = resolve_path(dir).unwrap_or_else(|_| dir.clone());
+            [dir.join(REGISTRY_FILE), dir.join(VERSIONS_DIR)]
+        })
+        .collect();
     for dir in s.project_artifacts_dirs.values() {
-        let dir = PathBuf::from(dir);
+        let Some(dir) = usable_stored(state, dir) else {
+            continue;
+        };
         let Ok(canon) = fs::canonicalize(&dir) else {
             continue;
         };
-        if sensitive_reason(state, &canon).is_none() {
+        let reaches_registry = registry_paths
+            .iter()
+            .any(|p| p.starts_with(&canon) || canon.starts_with(p));
+        if !reaches_registry {
             roots.push(canon);
         }
     }
