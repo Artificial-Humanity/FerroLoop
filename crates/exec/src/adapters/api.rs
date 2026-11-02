@@ -1196,8 +1196,10 @@ mod tests {
         let dir = repo();
         let elsewhere = Mock::start(|_| openai_reply());
         let target = format!("{}/stolen", elsewhere.url);
+        // A 302 is the redirect an HTTP client does follow for a POST (as a GET), so this is the
+        // case that would carry the key's header along if redirects were on.
         let mock = Mock::start(move |_| Reply {
-            status: 307,
+            status: 302,
             body: String::new(),
             delay: Duration::ZERO,
             location: Some(target.clone()),
@@ -1207,10 +1209,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.status, AttemptStatus::Crashed, "{}", out.output_excerpt);
+        assert!(out.output_excerpt.contains("302"), "{}", out.output_excerpt);
+        let leaked: Vec<_> = elsewhere
+            .requests()
+            .into_iter()
+            .filter(|r| r.headers.iter().any(|(_, v)| v.contains(KEY)))
+            .collect();
         assert!(
             elsewhere.requests().is_empty(),
             "the redirect target saw a request"
         );
+        assert!(leaked.is_empty());
     }
 
     #[tokio::test]
