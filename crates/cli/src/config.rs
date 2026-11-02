@@ -321,28 +321,6 @@ pub enum VendorTransportKind {
     SubscriptionCli,
 }
 
-/// The wire protocol of a new vendor, as `[vendors.<id>]` spells it. (`fl_core::ApiDialect`'s own
-/// serde name for the first is `open_ai_chat_completions`; the config says
-/// `openai_chat_completions` and still accepts that.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VendorDialect {
-    #[serde(rename = "openai_chat_completions", alias = "open_ai_chat_completions")]
-    OpenAiChatCompletions,
-    AnthropicMessages,
-    GeminiGenerateContent,
-}
-
-impl From<VendorDialect> for ApiDialect {
-    fn from(d: VendorDialect) -> Self {
-        match d {
-            VendorDialect::OpenAiChatCompletions => Self::OpenAiChatCompletions,
-            VendorDialect::AnthropicMessages => Self::AnthropicMessages,
-            VendorDialect::GeminiGenerateContent => Self::GeminiGenerateContent,
-        }
-    }
-}
-
 /// Per-vendor `[vendors.<id>]` configuration.
 ///
 /// For one of the 13 built-in vendors it is a set of OVERRIDES (`base_url`, `default_model`,
@@ -358,7 +336,7 @@ pub struct VendorConfig {
     /// The wire protocol of a new vendor: `openai_chat_completions`, `anthropic_messages` or
     /// `gemini_generate_content`.
     #[serde(default)]
-    pub dialect: Option<VendorDialect>,
+    pub dialect: Option<ApiDialect>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -982,7 +960,7 @@ fn new_vendor_descriptor(id: &str, cfg: &VendorConfig) -> Result<VendorDescripto
         },
         transport: VendorTransport::HttpApi {
             default_base_url: base_url,
-            api_dialect: api_dialect.into(),
+            api_dialect,
             vault_secret_name,
             env_key_name,
         },
