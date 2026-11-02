@@ -477,4 +477,267 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       });
     }
   });
+
+  it("opens System and Project Change Artifacts Directory modals (#207), submits POST requests with migrate checkbox, and strips read-only fields on PUT /api/v1/settings", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method || "GET").toUpperCase();
+      const parsedBody =
+        typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, body: parsedBody });
+
+      if (url.endsWith("/api/v1/settings") && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            theme_preference: "dark",
+            timezone: "UTC",
+            attachment_retention_days: 7,
+            home_dir: "/home/lmcfarlin/.local/share/fl",
+            artifacts_dir: null,
+            default_artifacts_dir: "/home/lmcfarlin/.local/share/fl/artifacts",
+            effective_artifacts_dir: "/home/lmcfarlin/.local/share/fl/artifacts",
+            project_artifacts_dirs: {
+              ferroloop: "/mnt/nvme/ferroloop-artifacts",
+            },
+            subsystems: {
+              ferrogate_enabled: true,
+              ferrostate_enabled: true,
+              ferrostep_enabled: true,
+            },
+            notifications: {
+              notify_on_pr_review: true,
+              notify_on_session_error: true,
+              notify_on_wire_urgent: true,
+              sound_enabled: false,
+            },
+            hub_connection: {
+              auto_reconnect_ws: true,
+              poll_interval_secs: 3,
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (url.endsWith("/api/v1/projects") && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            projects: [
+              {
+                id: "ferroloop",
+                artifacts_dir: "/mnt/nvme/ferroloop-artifacts",
+                default_artifacts_dir:
+                  "/home/lmcfarlin/.local/share/fl/artifacts/ferroloop",
+                effective_artifacts_dir: "/mnt/nvme/ferroloop-artifacts",
+              },
+              {
+                id: "sonora",
+                artifacts_dir: null,
+                default_artifacts_dir:
+                  "/home/lmcfarlin/.local/share/fl/artifacts/sonora",
+                effective_artifacts_dir:
+                  "/home/lmcfarlin/.local/share/fl/artifacts/sonora",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (url.endsWith("/api/v1/settings/artifacts-dir") && method === "POST") {
+        const body = parsedBody as { new_path: string | null; migrate: boolean };
+        const effective =
+          body.new_path || "/home/lmcfarlin/.local/share/fl/artifacts";
+        return new Response(
+          JSON.stringify({
+            old_path: "/home/lmcfarlin/.local/share/fl/artifacts",
+            new_path: effective,
+            migrated_files: body.migrate ? 14 : 0,
+            migrated_bytes: body.migrate ? 20480 : 0,
+            artifacts_dir: body.new_path,
+            default_artifacts_dir: "/home/lmcfarlin/.local/share/fl/artifacts",
+            effective_artifacts_dir: effective,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (
+        url.endsWith("/api/v1/projects/sonora/artifacts-dir") &&
+        method === "POST"
+      ) {
+        const body = parsedBody as { new_path: string | null; migrate: boolean };
+        const effective =
+          body.new_path || "/home/lmcfarlin/.local/share/fl/artifacts/sonora";
+        return new Response(
+          JSON.stringify({
+            project: "sonora",
+            old_path: "/home/lmcfarlin/.local/share/fl/artifacts/sonora",
+            new_path: effective,
+            migrated_files: body.migrate ? 5 : 0,
+            migrated_bytes: body.migrate ? 8192 : 0,
+            artifacts_dir: body.new_path,
+            default_artifacts_dir:
+              "/home/lmcfarlin/.local/share/fl/artifacts/sonora",
+            effective_artifacts_dir: effective,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (url.endsWith("/api/v1/settings") && method === "PUT") {
+        return new Response(JSON.stringify(parsedBody ?? {}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        initialTab="system"
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    // Wait for GET /api/v1/settings and GET /api/v1/projects to resolve
+    const sysDirVal = await screen.findByTestId(
+      "settings-system-artifacts-dir-value",
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(sysDirVal).toHaveTextContent(
+      "/home/lmcfarlin/.local/share/fl/artifacts",
+    );
+
+    // Open System Change Artifacts Directory modal
+    fireEvent.click(
+      screen.getByTestId("settings-system-change-artifacts-dir-btn"),
+    );
+    const modal = screen.getByTestId("change-artifacts-dir-modal");
+    expect(modal).toBeInTheDocument();
+    expect(
+      within(modal).getByTestId("change-artifacts-dir-modal-title"),
+    ).toHaveTextContent("Change System Artifacts Directory");
+    expect(
+      (
+        within(modal).getByTestId(
+          "change-artifacts-dir-old-path",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("/home/lmcfarlin/.local/share/fl/artifacts");
+
+    const newPathInput = within(modal).getByTestId(
+      "change-artifacts-dir-new-path",
+    ) as HTMLInputElement;
+    const migrateCheckbox = within(modal).getByTestId(
+      "change-artifacts-dir-migrate-checkbox",
+    ) as HTMLInputElement;
+    expect(migrateCheckbox.checked).toBe(true);
+
+    fireEvent.change(newPathInput, {
+      target: { value: "/mnt/fast-ssd/fl-artifacts" },
+    });
+    fireEvent.click(within(modal).getByTestId("change-artifacts-dir-confirm-btn"));
+
+    const sysStatus = await screen.findByTestId("system-artifacts-dir-status");
+    expect(sysStatus).toHaveTextContent(
+      /Updated artifacts directory to \/mnt\/fast-ssd\/fl-artifacts \(migrated 14 files, 20480 bytes\)/i,
+    );
+    expect(
+      screen.getByTestId("settings-system-artifacts-dir-value"),
+    ).toHaveTextContent("/mnt/fast-ssd/fl-artifacts");
+    expect(
+      screen.getByTestId("settings-system-artifacts-dir-override-badge"),
+    ).toHaveTextContent("Override");
+
+    const sysPostCall = calls.find(
+      (c) => c.url.endsWith("/api/v1/settings/artifacts-dir") && c.method === "POST",
+    );
+    expect(sysPostCall?.body).toEqual({
+      new_path: "/mnt/fast-ssd/fl-artifacts",
+      migrate: true,
+    });
+
+    // Save System Settings and verify read-only artifacts_dir fields are stripped from PUT /api/v1/settings
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    await screen.findByTestId("settings-saved-banner");
+    const putCall = calls.find(
+      (c) => c.url.endsWith("/api/v1/settings") && c.method === "PUT",
+    );
+    expect(putCall?.body).toBeDefined();
+    expect(putCall?.body).not.toHaveProperty("home_dir");
+    expect(putCall?.body).not.toHaveProperty("artifacts_dir");
+    expect(putCall?.body).not.toHaveProperty("default_artifacts_dir");
+    expect(putCall?.body).not.toHaveProperty("effective_artifacts_dir");
+    expect(putCall?.body).not.toHaveProperty("project_artifacts_dirs");
+
+    // Switch to Agents & Projects tab and select Sonora (derived from the updated system artifacts root)
+    fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
+      target: { value: "Sonora" },
+    });
+
+    expect(
+      screen.getByTestId("settings-project-artifacts-dir-value"),
+    ).toHaveTextContent("/mnt/fast-ssd/fl-artifacts/sonora");
+
+    fireEvent.click(
+      screen.getByTestId("settings-project-change-artifacts-dir-btn"),
+    );
+    const projModal = screen.getByTestId("change-artifacts-dir-modal");
+    expect(
+      within(projModal).getByTestId("change-artifacts-dir-modal-title"),
+    ).toHaveTextContent("Change Sonora Artifacts Directory");
+    expect(
+      (
+        within(projModal).getByTestId(
+          "change-artifacts-dir-old-path",
+        ) as HTMLInputElement
+      ).value,
+    ).toBe("/mnt/fast-ssd/fl-artifacts/sonora");
+
+    fireEvent.change(
+      within(projModal).getByTestId("change-artifacts-dir-new-path"),
+      { target: { value: "/mnt/nvme/sonora-artifacts" } },
+    );
+    fireEvent.click(
+      within(projModal).getByTestId("change-artifacts-dir-migrate-checkbox"),
+    );
+    fireEvent.click(
+      within(projModal).getByTestId("change-artifacts-dir-confirm-btn"),
+    );
+
+    const projStatus = await screen.findByTestId("project-artifacts-dir-status");
+    expect(projStatus).toHaveTextContent(
+      /Updated Sonora artifacts directory to \/mnt\/nvme\/sonora-artifacts/i,
+    );
+    expect(
+      screen.getByTestId("settings-project-artifacts-dir-value"),
+    ).toHaveTextContent("/mnt/nvme/sonora-artifacts");
+
+    const projPostCall = calls.find(
+      (c) =>
+        c.url.endsWith("/api/v1/projects/sonora/artifacts-dir") &&
+        c.method === "POST",
+    );
+    expect(projPostCall?.body).toEqual({
+      new_path: "/mnt/nvme/sonora-artifacts",
+      migrate: false,
+    });
+  });
 });
