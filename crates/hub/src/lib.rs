@@ -11,6 +11,7 @@ pub mod cloud_adapters;
 pub mod commands;
 mod direct_quota;
 pub mod discovery;
+pub mod github_pr;
 pub mod lifecycle;
 pub mod nodes;
 mod operators;
@@ -129,9 +130,12 @@ pub struct HubServerConfig {
     pub ui_dir: Option<PathBuf>,
     pub owner_login: String,
     /// The GitHub accounts whose reviews may carry an agent marker when
-    /// `POST /api/v1/prs/:n/merge` checks the approvals it is sent (`[github] reviewer_ids` and
-    /// `reviewer_logins`; the Reviewer App's user id by default).
+    /// `POST /api/v1/prs/:n/merge` checks the reviews it reads from GitHub (`[github] reviewer_ids`
+    /// and `reviewer_logins`; the Reviewer App's user id by default).
     pub reviewer_apps: ReviewerApps,
+    /// The GitHub repositories and credentials the Hub reads pull requests from and merges
+    /// through. Empty: the Hub refuses to merge (see [`github_pr`]).
+    pub github: github_pr::HubGithub,
     pub owner_token: Option<String>,
     pub peer_token: Option<String>,
     pub trust_tailscale_headers: bool,
@@ -149,6 +153,7 @@ impl Default for HubServerConfig {
             ui_dir: None,
             owner_login: DEFAULT_OWNER_LOGIN.to_string(),
             reviewer_apps: ReviewerApps::default(),
+            github: github_pr::HubGithub::default(),
             owner_token: None,
             peer_token: None,
             trust_tailscale_headers: false,
@@ -726,6 +731,7 @@ mod tests {
             ui_dir: Some(ui_dir),
             owner_login: "lmcfarlin".into(),
             reviewer_apps: ReviewerApps::default(),
+            github: github_pr::HubGithub::default(),
             owner_token: Some("owner-tok-secret".into()),
             peer_token: Some("peer-tok-secret".into()),
             trust_tailscale_headers: true,
@@ -2935,186 +2941,6 @@ mod tests {
         HttpRequest::new(method, path)
             .with_header("Authorization", format!("Bearer {token}"))
             .with_json_body(body)
-    }
-
-    #[test]
-    fn pr_merge_counts_an_agent_approval_only_from_a_reviewer_app() {
-        use fl_core::AgentRegistry;
-        use fl_core::agent::AgentRole;
-        use fl_core::pr_policy::{
-            DEFAULT_REVIEWER_APP_IDS, FlReviewMarker, PrCommitSummary, PrReviewSummary,
-            ReviewVerdict, format_review_body,
-        };
-
-        let tmp = TempDir::new().unwrap();
-        let mut state = test_hub_state(&tmp);
-        {
-            let store = state.open_store().unwrap();
-            for (name, role) in [
-                ("Felicia", AgentRole::Assistant),
-                ("Ferris", AgentRole::Lead),
-            ] {
-                store
-                    .register_agent(fl_core::agent::RegisterAgentArgs {
-                        display_name: name.into(),
-                        email: None,
-                        project: "ferroloop".into(),
-                        role,
-                        extra_areas: vec![],
-                        create_area: true,
-                        replace: true,
-                        at: stamp::now(),
-                        by: "owner".into(),
-                    })
-                    .unwrap();
-            }
-        }
-        // A pull request `felicia` co-authored (Lead tier): she may merge it once `ferris` approves.
-        let marker = FlReviewMarker {
-            reviewer: "ferris".into(),
-            role: AgentRole::Lead,
-            project: "ferroloop".into(),
-            head_sha: "sha1".into(),
-            verdict: ReviewVerdict::Approved,
-            at: fl_core::at::At::from_unix_millis(1),
-        };
-        let merge = |state: &HubState, login: &str, id: Option<u64>| {
-            let body = json!({
-                "by": "felicia",
-                "project": "ferroloop",
-                "head_sha": "sha1",
-                "files": ["crates/core/src/lib.rs"],
-                "commits": [PrCommitSummary {
-                    sha: "sha1".into(),
-                    author_login: Some("artificially-human".into()),
-                    message: "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
-                        .into(),
-                }],
-                "reviews": [PrReviewSummary {
-                    id: 1,
-                    author_login: login.into(),
-                    author_id: id,
-                    state: "APPROVED".into(),
-                    body: format_review_body("ok", &marker),
-                    commit_id: Some("sha1".into()),
-                }],
-            });
-            handle_http_request(state, &authed("POST", "/api/v1/prs/1/merge", PEER, &body))
-        };
-        // The default set names the Reviewer App's user id: an outsider's marker is refused,
-        // and so is one from another account that shows the App's login.
-        let app_id = DEFAULT_REVIEWER_APP_IDS[0];
-        assert_eq!(merge(&state, "mallory", Some(1)).status, 403);
-        assert_eq!(merge(&state, "ferroloop[bot]", None).status, 403);
-        assert_eq!(
-            merge(&state, "ferroloop[bot]", Some(app_id + 1)).status,
-            403
-        );
-        assert_eq!(merge(&state, "ferroloop[bot]", Some(app_id)).status, 200);
-        assert_eq!(merge(&state, "renamed[bot]", Some(app_id)).status, 200);
-        // `[github] reviewer_ids` and `reviewer_logins` reach the hub through its config.
-        state.config.reviewer_apps = ReviewerApps {
-            ids: vec![5],
-            logins: vec!["other-app[bot]".into()],
-        };
-        assert_eq!(merge(&state, "ferroloop[bot]", Some(app_id)).status, 403);
-        assert_eq!(merge(&state, "x[bot]", Some(5)).status, 200);
-        assert_eq!(merge(&state, "Other-App[bot]", None).status, 200);
-    }
-
-    #[test]
-    fn pr_merge_reads_reviews_by_author_id_and_refuses_the_old_ui_shape() {
-        use fl_core::AgentRegistry;
-        use fl_core::agent::AgentRole;
-        use fl_core::pr_policy::{FlReviewMarker, ReviewVerdict, format_review_body};
-
-        // The id the Reviewer App's bot user has (`ferroloop[bot]`), written out so a change to
-        // the default has to touch this test too.
-        const APP_ID: u64 = 341_521_384;
-
-        let tmp = TempDir::new().unwrap();
-        let state = test_hub_state(&tmp);
-        {
-            let store = state.open_store().unwrap();
-            for (name, role) in [
-                ("Felicia", AgentRole::Assistant),
-                ("Ferris", AgentRole::Lead),
-            ] {
-                store
-                    .register_agent(fl_core::agent::RegisterAgentArgs {
-                        display_name: name.into(),
-                        email: None,
-                        project: "ferroloop".into(),
-                        role,
-                        extra_areas: vec![],
-                        create_area: true,
-                        replace: true,
-                        at: stamp::now(),
-                        by: "owner".into(),
-                    })
-                    .unwrap();
-            }
-        }
-        let marker = FlReviewMarker {
-            reviewer: "ferris".into(),
-            role: AgentRole::Lead,
-            project: "ferroloop".into(),
-            head_sha: "sha1".into(),
-            verdict: ReviewVerdict::Approved,
-            at: fl_core::at::At::from_unix_millis(1),
-        };
-        let merge_with = |review: Value| {
-            let body = json!({
-                "by": "felicia",
-                "project": "ferroloop",
-                "head_sha": "sha1",
-                "files": ["crates/core/src/lib.rs"],
-                "commits": [{
-                    "sha": "sha1",
-                    "author_login": "artificially-human",
-                    "message": "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>",
-                }],
-                "reviews": [review],
-            });
-            handle_http_request(&state, &authed("POST", "/api/v1/prs/1/merge", PEER, &body))
-        };
-        // The wire shape of `PrReviewSummary`: `author_login` and `author_id`, never `reviewer_login`.
-        let review = |login: &str, id: Option<u64>| {
-            json!({
-                "id": 1,
-                "author_login": login,
-                "author_id": id,
-                "state": "APPROVED",
-                "body": format_review_body("ok", &marker),
-                "commit_id": "sha1",
-            })
-        };
-
-        // The App's user id counts, whatever login it shows (a renamed App keeps its id).
-        assert_eq!(
-            merge_with(review("ferroloop[bot]", Some(APP_ID))).status,
-            200
-        );
-        assert_eq!(merge_with(review("renamed[bot]", Some(APP_ID))).status, 200);
-        // A spoofed id, or no id at all, with the App's login does not count.
-        assert_eq!(
-            merge_with(review("ferroloop[bot]", Some(APP_ID + 1))).status,
-            403
-        );
-        assert_eq!(merge_with(review("ferroloop[bot]", None)).status, 403);
-        // The id must be a number: a string is a malformed payload, not a match.
-        let mut stringy = review("ferroloop[bot]", None);
-        stringy["author_id"] = json!(APP_ID.to_string());
-        assert_eq!(merge_with(stringy).status, 400);
-        // A review in the pre-`PrReviewSummary` UI shape (`reviewer_login`, no `id`, no
-        // `author_login`) is not one the Hub accepts.
-        let old_ui_shape = json!({
-            "reviewer_login": "ferroloop[bot]",
-            "state": "APPROVED",
-            "body": format_review_body("ok", &marker),
-            "commit_id": "sha1",
-        });
-        assert_eq!(merge_with(old_ui_shape).status, 400);
     }
 
     fn spin_up_body(persona: &str) -> Value {

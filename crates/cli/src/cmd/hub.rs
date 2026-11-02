@@ -253,6 +253,82 @@ fn resolve_base_url(env: &StateEnv<'_>, url_override: Option<String>) -> String 
     format!("http://{}", listen.trim().trim_end_matches('/'))
 }
 
+/// The GitHub side of the Hub's server-verified PR merge and review (`fl_hub::github_pr`): every
+/// project bound to a GitHub tracker in `config.toml`, a user token from `$FL_GITHUB_TOKEN`,
+/// `$GITHUB_TOKEN` or `$GH_TOKEN`, and the Reviewer App from `$FL_GITHUB_APP_ID` +
+/// `$FL_GITHUB_PRIVATE_KEY_PATH` or `[github]`. `$FL_GITHUB_API_URL` is checked like the other
+/// `fl github` commands, because the credential is sent there.
+fn hub_github(
+    cfg: &crate::config::Config,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Result<fl_hub::github_pr::HubGithub, (i32, String)> {
+    let get = |k: &str| {
+        get_env(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let api_url = match get("FL_GITHUB_API_URL") {
+        None => None,
+        Some(url) => {
+            crate::api_override_host(&url).map_err(|e| (2, e.to_string()))?;
+            Some(url)
+        }
+    };
+    // A peer picks the slug and the slug sets the required tier, so one slug must map to one
+    // repository and one repository to one slug.
+    let mut repos = std::collections::BTreeMap::<String, String>::new();
+    let mut owners = std::collections::BTreeMap::<String, String>::new();
+    for entry in &cfg.projects {
+        if let (Some(slug), Some(binding)) = (entry.inferred_slug(), entry.tracker.as_ref()) {
+            let slug = slug.to_ascii_lowercase();
+            let repo = binding.github.clone();
+            if let Some(prev) = repos.get(&slug) {
+                if !prev.eq_ignore_ascii_case(&repo) {
+                    return Err((
+                        2,
+                        format!(
+                            "project slug `{slug}` is bound to two GitHub repositories (`{prev}` and `{repo}`)"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            if let Some(other) = owners.get(&repo.to_ascii_lowercase()) {
+                return Err((
+                    2,
+                    format!(
+                        "GitHub repository `{repo}` is bound to two project slugs (`{other}` and `{slug}`)"
+                    ),
+                ));
+            }
+            owners.insert(repo.to_ascii_lowercase(), slug.clone());
+            repos.insert(slug, repo);
+        }
+    }
+    let token = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(get);
+    let (app_id, private_key) = match (get("FL_GITHUB_APP_ID"), get("FL_GITHUB_PRIVATE_KEY_PATH")) {
+        (Some(id), Some(path)) => {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| (2, format!("invalid $FL_GITHUB_APP_ID `{id}`")))?;
+            (Some(id), Some(PathBuf::from(path)))
+        }
+        _ => match cfg.github.as_ref() {
+            Some(app) => (Some(app.app_id), Some(app.private_key.clone())),
+            None => (None, None),
+        },
+    };
+    Ok(fl_hub::github_pr::HubGithub {
+        api_url,
+        repos,
+        token,
+        app_id,
+        private_key,
+    })
+}
+
 fn cmd_serve(
     env: &StateEnv<'_>,
     listen_flag: Option<String>,
@@ -307,6 +383,7 @@ fn cmd_serve(
         ui_dir,
         owner_login: DEFAULT_OWNER_LOGIN.to_string(),
         reviewer_apps: crate::config::reviewer_apps(env.cfg.github.as_ref()),
+        github: hub_github(env.cfg, |k| std::env::var(k).ok())?,
         owner_token,
         peer_token,
         trust_tailscale_headers,
@@ -1241,5 +1318,126 @@ mod tests {
             choose_hub_node_id(&empty, Some("Primary".to_string())).unwrap(),
             "primary"
         );
+    }
+
+    fn github_cfg() -> crate::config::Config {
+        use crate::config::{Config, Credential, Entry, GithubApp, TrackerBinding};
+        let entry = |name: &str, repo: Option<&str>| Entry {
+            name: Some(name.to_string()),
+            root: PathBuf::from(format!("/work/{name}")),
+            store: PathBuf::from(format!("/work/{name}.redb")),
+            tracker: repo.map(|r| TrackerBinding {
+                github: r.to_string(),
+                credential: Credential::Env,
+                ledger: None,
+            }),
+            state: None,
+        };
+        Config {
+            projects: vec![
+                entry("ferroloop", Some("Artificial-Humanity/FerroLoop")),
+                entry("local-only", None),
+            ],
+            github: Some(GithubApp {
+                app_id: 7,
+                private_key: PathBuf::from("/keys/app.pem"),
+                reviewer_ids: None,
+                reviewer_logins: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn hub_github_binds_tracked_projects_and_reads_credentials() {
+        let none = |_: &str| None;
+        let g = hub_github(&github_cfg(), none).unwrap();
+        assert_eq!(
+            g.repos.get("ferroloop").map(String::as_str),
+            Some("Artificial-Humanity/FerroLoop")
+        );
+        assert!(!g.repos.contains_key("local-only"));
+        assert_eq!((g.app_id, g.token.as_deref()), (Some(7), None));
+        assert_eq!(g.private_key, Some(PathBuf::from("/keys/app.pem")));
+
+        // The environment wins for the App, and the first token variable that is set is the token.
+        let env = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("9".to_string()),
+            "FL_GITHUB_PRIVATE_KEY_PATH" => Some(" /env/key.pem ".to_string()),
+            "GITHUB_TOKEN" => Some(" tok ".to_string()),
+            "GH_TOKEN" => Some("other".to_string()),
+            _ => None,
+        };
+        let g = hub_github(&github_cfg(), env).unwrap();
+        assert_eq!(g.app_id, Some(9));
+        assert_eq!(g.private_key, Some(PathBuf::from("/env/key.pem")));
+        assert_eq!(g.token.as_deref(), Some("tok"));
+    }
+
+    fn cfg_with(bindings: &[(&str, &str)]) -> crate::config::Config {
+        let mut cfg = github_cfg();
+        let template = cfg.projects[0].clone();
+        cfg.projects = bindings
+            .iter()
+            .map(|(name, repo)| {
+                let mut e = template.clone();
+                e.name = Some((*name).to_string());
+                e.root = PathBuf::from(format!("/work/{name}"));
+                e.store = PathBuf::from(format!("/work/{name}.redb"));
+                e.tracker.as_mut().unwrap().github = (*repo).to_string();
+                e
+            })
+            .collect();
+        cfg
+    }
+
+    #[test]
+    fn hub_github_refuses_one_slug_bound_to_two_repositories() {
+        let cfg = cfg_with(&[("alpha", "o/one"), ("alpha", "o/two")]);
+        let (code, msg) = hub_github(&cfg, |_| None).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(
+            msg.contains("alpha") && msg.contains("o/one") && msg.contains("o/two"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn hub_github_refuses_one_repository_bound_to_two_slugs() {
+        let cfg = cfg_with(&[("alpha", "Org/Repo"), ("beta", "org/repo")]);
+        let (code, msg) = hub_github(&cfg, |_| None).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
+    }
+
+    #[test]
+    fn hub_github_accepts_the_same_slug_repeated_with_the_same_repository() {
+        let cfg = cfg_with(&[
+            ("alpha", "Org/Repo"),
+            ("alpha", "org/repo"),
+            ("beta", "o/b"),
+        ]);
+        let g = hub_github(&cfg, |_| None).unwrap();
+        assert_eq!(g.repos.len(), 2);
+        assert_eq!(g.repos.get("alpha").map(String::as_str), Some("Org/Repo"));
+    }
+
+    #[test]
+    fn hub_github_refuses_a_credential_destination_that_is_not_https_or_loopback() {
+        let bad = |k: &str| (k == "FL_GITHUB_API_URL").then(|| "http://evil.example".to_string());
+        let (code, msg) = hub_github(&github_cfg(), bad).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("FL_GITHUB_API_URL"), "{msg}");
+        let ok = |k: &str| (k == "FL_GITHUB_API_URL").then(|| "http://127.0.0.1:9".to_string());
+        assert_eq!(
+            hub_github(&github_cfg(), ok).unwrap().api_url.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        let id = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("nope".to_string()),
+            "FL_GITHUB_PRIVATE_KEY_PATH" => Some("/k".to_string()),
+            _ => None,
+        };
+        assert_eq!(hub_github(&github_cfg(), id).unwrap_err().0, 2);
     }
 }

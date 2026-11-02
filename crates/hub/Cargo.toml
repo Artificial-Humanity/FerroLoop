@@ -29,4 +29,5 @@ uuid.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+fl-github = { path = "../github", features = ["fake"] }
 tempfile.workspace = true

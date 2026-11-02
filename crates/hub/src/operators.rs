@@ -2271,6 +2271,7 @@ mod tests {
             ui_dir: None,
             owner_login: owner_login.into(),
             reviewer_apps: fl_core::pr_policy::ReviewerApps::default(),
+            github: crate::github_pr::HubGithub::default(),
             owner_token: Some(OWNER_TOKEN.into()),
             peer_token: Some(PEER_TOKEN.into()),
             trust_tailscale_headers: false,
