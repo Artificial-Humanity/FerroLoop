@@ -1595,6 +1595,18 @@ fn all_wire_receipts_by_message(store: &AnyStore) -> BTreeMap<MessageId, Vec<Del
     grouped
 }
 
+/// Scan the host into `routes` unless this request already did; `started` records when.
+fn scan_routes_once(
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    started: &mut Option<Instant>,
+) {
+    if started.is_none() {
+        *started = Some(Instant::now());
+        crate::discovery::discover_routes_into(routes, home_override);
+    }
+}
+
 fn handle_post_wire_send(
     state: &HubState,
     authority: &HubAuthority,
@@ -1682,13 +1694,15 @@ fn handle_post_wire_send(
     };
     drop(store);
 
-    // The saved route table first, as fl-wire's dispatcher does: the host is scanned only when a
-    // recipient still to deliver has no route there, or a saved route refuses the push. At most
-    // one scan per send, and it is saved so the next send finds the route without one.
+    // The saved route table first, as fl-wire's dispatcher does. The host is scanned at most once
+    // per send, and the scan saved, when the saved table is older than fl-wire's
+    // `ROUTE_REDISCOVERY_INTERVAL`, when a recipient still to deliver has no route there, or when
+    // a saved route fails the pre-delivery check. Each recipient gets one push at most: a push
+    // that fails stays `Pending` and is never repeated here, since part of it may have landed.
     let home = state.config.home_override.as_deref();
     let saved = RouteTable::load(crate::discovery::route_table_path(home).as_deref());
     let mut routes = saved.clone();
-    let mut scanned = false;
+    let mut scan_started: Option<Instant> = None;
     let deliverable = |rcpt: &DeliveryReceipt| {
         !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             && rcpt.attempts < MAX_DELIVER
@@ -1698,31 +1712,26 @@ fn handle_post_wire_send(
             && normalize_persona(&rcpt.recipient_name).is_some()
             && routes.get(&rcpt.recipient_name).is_none()
     });
-    if missing_route {
-        crate::discovery::discover_routes_into(&mut routes, home);
-        scanned = true;
+    if missing_route || !crate::discovery::saved_routes_fresh(home, Instant::now()) {
+        scan_routes_once(&mut routes, home, &mut scan_started);
     }
     let mut any_updated = false;
     for rcpt in &receipts {
         if !deliverable(rcpt) {
             continue;
         }
-        let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
+        let Some(mut entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
-        let mut pushed = dispatch_to_route(&entry.route, &msg);
-        if pushed.is_err() && !scanned {
-            // The session may have restarted since its route was saved: scan once, and push
-            // again only when its route changed.
-            crate::discovery::discover_routes_into(&mut routes, home);
-            scanned = true;
-            if let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
-                && fresh.route != entry.route
-            {
-                pushed = dispatch_to_route(&fresh.route, &msg);
+        if scan_started.is_none() && crate::lifecycle::undeliverable(&entry.route).is_some() {
+            // Nothing was sent on the saved route: the session may have been replaced since it
+            // was saved, so scan once and push on the route the scan found, if any.
+            scan_routes_once(&mut routes, home, &mut scan_started);
+            if let Some(fresh) = routes.get(&rcpt.recipient_name).cloned() {
+                entry = fresh;
             }
         }
-        let target_status = match pushed {
+        let target_status = match dispatch_to_route(&entry.route, &msg) {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
@@ -1742,8 +1751,8 @@ fn handle_post_wire_send(
             any_updated = true;
         }
     }
-    if scanned {
-        crate::discovery::save_route_scan(home, &saved, &routes);
+    if let Some(started) = scan_started {
+        crate::discovery::save_route_scan(home, &saved, &routes, started);
     }
     if any_updated
         && let Ok(store) = state.open_store()
@@ -4331,17 +4340,30 @@ pub(crate) fn route_matches_session_id(
     }
 }
 
+/// The route lookup for a session a request resolved: `canonical_id` is the id discovery gave
+/// the session (or the raw id when discovery found none), so a saved route that names another
+/// vendor session is stale and the host is scanned again.
+fn session_route_query<'a>(
+    persona: Option<&'a str>,
+    canonical_id: &'a str,
+) -> crate::lifecycle::RouteQuery<'a> {
+    crate::lifecycle::RouteQuery {
+        persona,
+        fallback_session_id: canonical_id,
+        session_id: Some(canonical_id),
+    }
+}
+
 fn vendor_route_for_session(
     state: &HubState,
     persona: Option<&str>,
-    fallback_session_id: &str,
+    canonical_id: &str,
 ) -> Result<fl_wire::identity::VendorRoute, String> {
     crate::lifecycle::find_route(
         state.config.home_override.as_deref(),
-        persona,
-        fallback_session_id,
+        session_route_query(persona, canonical_id),
     )
-    .ok_or_else(|| no_route_error(persona, fallback_session_id))
+    .ok_or_else(|| no_route_error(persona, canonical_id))
 }
 
 fn no_route_error(persona: Option<&str>, fallback_session_id: &str) -> String {
@@ -4351,21 +4373,21 @@ fn no_route_error(persona: Option<&str>, fallback_session_id: &str) -> String {
     )
 }
 
-/// Run `send` on the session's route, rescanning and retrying once when a saved route refuses
-/// (see [`crate::lifecycle::dispatch_with_rediscovery`]). The outer `Err` is the no-route error.
+/// Run `send` once on the session's route; a saved route that fails the pre-delivery check is
+/// swapped for the one a rescan finds before anything is sent (see
+/// [`crate::lifecycle::dispatch_with_rediscovery`]). The outer `Err` is the no-route error.
 fn dispatch_to_session_route<T>(
     state: &HubState,
     persona: Option<&str>,
-    fallback_session_id: &str,
-    send: impl FnMut(&fl_wire::identity::VendorRoute) -> Result<T, String>,
+    canonical_id: &str,
+    send: impl FnOnce(&fl_wire::identity::VendorRoute) -> Result<T, String>,
 ) -> Result<Result<T, String>, String> {
     crate::lifecycle::dispatch_with_rediscovery(
         state.config.home_override.as_deref(),
-        persona,
-        fallback_session_id,
+        session_route_query(persona, canonical_id),
         send,
     )
-    .ok_or_else(|| no_route_error(persona, fallback_session_id))
+    .ok_or_else(|| no_route_error(persona, canonical_id))
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -4938,9 +4960,14 @@ fn reset_session(
     } else {
         SessionResetMode::Clear
     };
-    let reset = dispatch_to_session_route(state, persona, canonical_id, |route| {
-        clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref())
-    })
+    // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
+    // that then fails is never run again on another route.
+    let reset = crate::lifecycle::dispatch_once(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, canonical_id),
+        |route| clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref()),
+    )
+    .ok_or_else(|| no_route_error(persona, canonical_id))
     .map_err(|e| (404, e))?;
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();

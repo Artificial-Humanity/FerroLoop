@@ -380,10 +380,11 @@ pub(crate) fn invalidate_route_discovery_cache() {
 /// during the scan stays removed ([`merge_route_scan`]). Like the daemon, it writes only when
 /// the scan changed a route. Hub writers are serialized ([`with_route_file_lock`]).
 pub(crate) fn scan_and_save_route_table(home_override: Option<&Path>) -> RouteTable {
+    let started = Instant::now();
     let saved = RouteTable::load(route_table_path(home_override).as_deref());
     let mut scanned = saved.clone();
     discover_routes_into(&mut scanned, home_override);
-    save_route_scan(home_override, &saved, &scanned);
+    save_route_scan(home_override, &saved, &scanned, started);
     scanned
 }
 
@@ -396,22 +397,60 @@ pub(crate) fn discover_routes_into(routes: &mut RouteTable, home_override: Optio
 
 /// Save the routes `scanned` learned over `base` (the table the scan started from) to the route
 /// table file. See [`scan_and_save_route_table`] for how this shares the file with the daemon.
+/// `started` is when the scan began: once the file holds the scan, saved routes count as fresh
+/// from then ([`saved_routes_fresh`]).
 pub(crate) fn save_route_scan(
     home_override: Option<&Path>,
     base: &RouteTable,
     scanned: &RouteTable,
+    started: Instant,
 ) {
     if scanned.same_routes(base) {
+        // The file already held what the scan found.
+        note_route_file_scan(home_override, started);
         return;
     }
     let path = route_table_path(home_override);
-    with_route_file_lock(|| {
+    let saved = with_route_file_lock(|| {
         let mut live = RouteTable::load(path.as_deref());
         merge_route_scan(&mut live, base, scanned);
-        let _ = live.save(path.as_deref());
+        live.save(path.as_deref()).is_ok()
     });
+    if saved {
+        note_route_file_scan(home_override, started);
+    }
     // The hub wrote the route table: the shared scan must not hide it.
     invalidate_route_discovery_cache();
+}
+
+/// When the hub last scanned the host and the route table file then held the scan, per file
+/// ([`route_table_path`]; `None` is the default file). Kept per file so a `Some(home)` test never
+/// sees another test's scan. Only scans saved to the file count: the shared discovery scan
+/// ([`discovered_route_table`]) is not saved, so it does not make saved routes fresh.
+static ROUTE_FILE_SCANS: Mutex<BTreeMap<Option<PathBuf>, Instant>> = Mutex::new(BTreeMap::new());
+
+/// Record that the route table file for `home_override` holds a host scan that began at `started`.
+pub(crate) fn note_route_file_scan(home_override: Option<&Path>, started: Instant) {
+    let mut scans = ROUTE_FILE_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    let last = scans
+        .entry(route_table_path(home_override))
+        .or_insert(started);
+    *last = (*last).max(started);
+}
+
+/// `true` when the route table file for `home_override` holds a host scan that began no more
+/// than fl-wire's [`ROUTE_REDISCOVERY_INTERVAL`] before `now`. A route read from a file that is
+/// not fresh may name a session the persona has since replaced, so the caller scans again.
+/// `false` until this process has saved a scan.
+///
+/// [`ROUTE_REDISCOVERY_INTERVAL`]: fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+pub(crate) fn saved_routes_fresh(home_override: Option<&Path>, now: Instant) -> bool {
+    let scans = ROUTE_FILE_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    scans
+        .get(&route_table_path(home_override))
+        .is_some_and(|last| {
+            now.saturating_duration_since(*last) <= fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+        })
 }
 
 /// Fold what a scan learned into `live`, the route table file as it is now. `scanned` started

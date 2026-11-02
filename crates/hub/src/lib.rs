@@ -5238,7 +5238,13 @@ mod tests {
                 .with_body(b"{nope".to_vec()),
         );
         assert_eq!(bad_body.status, 400);
-        assert_eq!(tmux.log(), "", "an interrupt types nothing into the pane");
+        // The pre-delivery check asks tmux whether the route's pane exists (`display-message`,
+        // a read); nothing is typed into it.
+        let log = tmux.log();
+        assert!(
+            log.lines().all(|l| l.starts_with("display-message ")),
+            "an interrupt types nothing into the pane: {log}"
+        );
     }
 
     #[test]
