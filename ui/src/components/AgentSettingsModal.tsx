@@ -10,13 +10,26 @@ import {
   RECAST_ROLE_OPTIONS,
   type RecastConflictState,
 } from "./SettingsModal";
-import { QuotaUsageBadge } from "./QuotaUsageBadge";
 import {
   formatTokenCount,
   getVendorModelOptions,
-  hasQuotaUsageData,
   type EstimatedContextUsage,
 } from "./ChatPane";
+
+const EXECUTION_MODE_LABELS: Readonly<Record<string, string>> = {
+  auto: "Auto",
+  yolo: "Yolo",
+  plan: "Plan",
+  default: "Default",
+  "accept-edits": "Accept edits",
+};
+
+/** Display label for the hub's normalized execution mode; a vendor value the hub passed through is shown as is. */
+export function formatExecutionMode(mode?: string | null): string {
+  const raw = (mode ?? "").trim();
+  if (!raw) return "Unknown";
+  return EXECUTION_MODE_LABELS[raw.toLowerCase()] ?? raw;
+}
 
 export const THINKING_LEVEL_OPTIONS = [
   { value: "low", label: "low (Fast)" },
@@ -40,7 +53,17 @@ export interface AgentSettingsModalProps {
   switchingModel?: boolean;
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
+  /**
+   * Ignored. The quota summary moved out of this modal; callers that still pass it keep
+   * compiling until they drop the prop.
+   */
   quotaUsage?: SessionQuotaUsage | null;
+  /**
+   * Effective execution mode the hub reports for the session (`auto`, `yolo`, `plan`, `default`,
+   * `accept-edits`, or a vendor value). `null` means the hub reported none ("Unknown"). When the
+   * prop is omitted the modal reads the mode from `GET /api/v1/sessions` through `apiClient`.
+   */
+  executionMode?: string | null;
   turnCount?: number;
   canCompact: boolean;
   compacting: boolean;
@@ -70,7 +93,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   switchingModel = false,
   onChangeModelAndThinking,
   contextEstimate,
-  quotaUsage = null,
+  executionMode,
   turnCount,
   canCompact,
   compacting,
@@ -102,6 +125,35 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastStatusBanner(null);
     setRecastModalOpen(false);
   }, [isOpen, agentName, agentProject, agentRole]);
+  const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
+  useEffect(() => {
+    setFetchedExecutionMode(null);
+    if (
+      !isOpen ||
+      executionMode !== undefined ||
+      !apiClient ||
+      !sessionId ||
+      typeof apiClient.getSessions !== "function"
+    ) {
+      return;
+    }
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => apiClient.getSessions())
+      .then((res) => {
+        if (cancelled) return;
+        const sessions = res?.sessions ?? [];
+        const wanted = agentName?.trim().toLowerCase();
+        const match =
+          sessions.find((s) => s.id === sessionId) ??
+          (wanted ? sessions.find((s) => s.persona?.trim().toLowerCase() === wanted) : undefined);
+        setFetchedExecutionMode(match?.execution_mode ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, executionMode, apiClient, sessionId, agentName]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -182,7 +234,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
       ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
       : THINKING_LEVEL_OPTIONS;
-  const showQuota = hasQuotaUsageData(quotaUsage);
+  const effectiveExecutionMode =
+    executionMode !== undefined ? executionMode : fetchedExecutionMode;
+  const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
+  const executionModeIsYolo = executionModeKey === "yolo";
 
   return (
     <div className="fd-modal-backdrop" onClick={onClose}>
@@ -221,7 +276,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                 color: "var(--text-secondary)",
               }}
             >
-              Configure live model &amp; thinking level, inspect context &amp; quota telemetry, and
+              Configure live model &amp; thinking level, inspect context &amp; execution mode, and
               manage session lifecycle.
             </p>
           </div>
@@ -513,30 +568,63 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             </div>
           </div>
 
-          {showQuota && quotaUsage && (
-            <div
-              data-testid="agent-settings-quota-summary"
+          <div
+            data-testid="agent-settings-execution-mode"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              paddingTop: "4px",
+              borderTop: "1px solid var(--border-subtle)",
+            }}
+          >
+            <span
               style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "6px",
-                paddingTop: "4px",
-                borderTop: "1px solid var(--border-subtle)",
+                fontSize: "11px",
+                fontWeight: 600,
+                textTransform: "uppercase",
+                color: "var(--text-muted)",
               }}
             >
-              <span
-                style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  textTransform: "uppercase",
-                  color: "var(--text-muted)",
-                }}
-              >
-                Vendor Account Quota
-              </span>
-              <QuotaUsageBadge quota={quotaUsage} />
-            </div>
-          )}
+              Execution Mode
+            </span>
+            <span
+              data-testid="execution-mode-badge"
+              data-mode={executionModeKey || "unknown"}
+              data-warning={executionModeIsYolo ? "true" : undefined}
+              className="fd-badge"
+              title={
+                executionModeIsYolo
+                  ? "Yolo: this session runs tools without asking for approval"
+                  : "Reported by the agent runtime"
+              }
+              style={{
+                alignSelf: "flex-start",
+                padding: "4px 8px",
+                fontWeight: 600,
+                borderColor: executionModeIsYolo
+                  ? "var(--status-stale, #F59E0B)"
+                  : "var(--border-subtle)",
+                backgroundColor: executionModeIsYolo
+                  ? "rgba(245, 158, 11, 0.14)"
+                  : "var(--bg-surface)",
+                color: executionModeIsYolo
+                  ? "var(--status-stale, #F59E0B)"
+                  : executionModeKey
+                    ? "var(--text-secondary)"
+                    : "var(--text-muted)",
+              }}
+            >
+              {formatExecutionMode(effectiveExecutionMode)}
+            </span>
+            <span
+              data-testid="execution-mode-note"
+              style={{ fontSize: "11px", color: "var(--text-muted)" }}
+            >
+              Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
+              CLI.
+            </span>
+          </div>
         </div>
 
         {/* Session Lifecycle Actions */}

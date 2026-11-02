@@ -408,6 +408,13 @@ export interface DiscoveredSessionSummary {
   context_usage?: SessionContextUsage | null;
   execution_mode?: string | null;
   quota_usage?: SessionQuotaUsage | null;
+  /** Server-measured context window usage; present only when the runtime reports one. */
+  context_usage?: SessionContextUsage | null;
+  /**
+   * Effective execution (permission) mode: `auto`, `yolo`, `plan`, `default`, `accept-edits`,
+   * or a lower-cased vendor value. Absent when the runtime states none.
+   */
+  execution_mode?: string | null;
 }
 
 export type DiscoveredSession = DiscoveredSessionSummary;

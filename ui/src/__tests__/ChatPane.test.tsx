@@ -974,121 +974,48 @@ describe("ChatPane draft persistence", () => {
   });
 });
 
-describe("ChatPane vendor account quota allowance badge in AgentSettingsModal", () => {
-  it("keeps top toolbar compact without quota-usage-badge and renders Codex plus tier with 5h session and 7d weekly allowance windows in AgentSettingsModal", () => {
-    const now = Date.now();
-    const { rerender } = render(
-      <ChatPane
-        agentName="ferris"
-        agentDisplayName="Ferris"
-        adapter="codex"
-        sessionId="sess-codex-01"
-        turns={[]}
-        quotaUsage={{
-          tier: "plus",
-          primary_window: {
-            used_percent: 2,
-            window_minutes: 300,
-            resets_at_ms: now + (3 * 60 + 14) * 60_000,
-          },
-          secondary_window: {
-            used_percent: 1,
-            window_minutes: 10_080,
-            resets_at_ms: now + (6 * 24 * 60 + 22 * 60) * 60_000,
-          },
-        }}
-        onSendPrompt={vi.fn()}
-      />,
-    );
-
-    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
-    expect(screen.queryByTestId("quota-exhausted-toolbar-pill")).toBeNull();
-
-    rerender(
-      <ChatPane
-        agentName="ferris"
-        agentDisplayName="Ferris"
-        adapter="codex"
-        sessionId="sess-codex-01"
-        turns={[]}
-        agentSettingsOpen={true}
-        quotaUsage={{
-          tier: "plus",
-          primary_window: {
-            used_percent: 2,
-            window_minutes: 300,
-            resets_at_ms: now + (3 * 60 + 14) * 60_000,
-          },
-          secondary_window: {
-            used_percent: 1,
-            window_minutes: 10_080,
-            resets_at_ms: now + (6 * 24 * 60 + 22 * 60) * 60_000,
-          },
-        }}
-        onSendPrompt={vi.fn()}
-      />,
-    );
-
-    const badge = screen.getByTestId("quota-usage-badge");
-    expect(badge).not.toHaveAttribute("data-exhausted", "true");
-    expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("PLUS");
-    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("5h: 98% left");
-    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("renews in 3h 14m");
-    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("7d: 99% left");
-    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 6d 22h");
+describe("ChatPane AgentSettingsModal shows Execution Mode instead of vendor account quota", () => {
+  const codexQuota = () => ({
+    tier: "plus",
+    primary_window: {
+      used_percent: 2,
+      window_minutes: 300,
+      resets_at_ms: Date.now() + (3 * 60 + 14) * 60_000,
+    },
+    secondary_window: {
+      used_percent: 1,
+      window_minutes: 10_080,
+      resets_at_ms: Date.now() + (6 * 24 * 60 + 22 * 60) * 60_000,
+    },
   });
 
-  it("renders Grok SuperGrok tier with weekly allowance window in AgentSettingsModal", () => {
-    const now = Date.now();
-    const { rerender } = render(
+  it("keeps the toolbar free of the quota badge and omits the quota summary from the modal, which shows the Execution Mode block", () => {
+    render(
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
-        adapter="grok"
-        sessionId="sess-grok-01"
-        turns={[]}
-        quotaUsage={{
-          tier: "SuperGrok",
-          secondary_window: {
-            used_percent: 15,
-            window_minutes: 10_080,
-            resets_at_ms: now + (4 * 24 * 60 + 5 * 60) * 60_000,
-          },
-        }}
-        onSendPrompt={vi.fn()}
-      />,
-    );
-
-    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
-    rerender(
-      <ChatPane
-        agentName="ferris"
-        agentDisplayName="Ferris"
-        adapter="grok"
-        sessionId="sess-grok-01"
+        adapter="codex"
+        sessionId="sess-codex-01"
         turns={[]}
         agentSettingsOpen={true}
-        quotaUsage={{
-          tier: "SuperGrok",
-          secondary_window: {
-            used_percent: 15,
-            window_minutes: 10_080,
-            resets_at_ms: now + (4 * 24 * 60 + 5 * 60) * 60_000,
-          },
-        }}
+        quotaUsage={codexQuota()}
         onSendPrompt={vi.fn()}
       />,
     );
 
-    const badge = screen.getByTestId("quota-usage-badge");
-    expect(badge).not.toHaveAttribute("data-exhausted", "true");
-    expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("SUPERGROK");
+    expect(screen.getByTestId("agent-settings-execution-mode")).toHaveTextContent(
+      "Execution Mode",
+    );
+    expect(screen.getByTestId("execution-mode-badge")).toHaveTextContent("Unknown");
+    expect(screen.queryByTestId("agent-settings-quota-summary")).toBeNull();
+    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
+    expect(screen.queryByTestId("quota-tier-chip")).toBeNull();
     expect(screen.queryByTestId("quota-primary-window")).toBeNull();
-    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("7d: 85% left");
-    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 4d 5h");
+    expect(screen.queryByTestId("quota-secondary-window")).toBeNull();
+    expect(screen.queryByText("Vendor Account Quota")).toBeNull();
   });
 
-  it("shows compact quota-exhausted-toolbar-pill in toolbar when exhausted and highlights full Muse 429 quota details in AgentSettingsModal", () => {
+  it("shows the exhausted-quota toolbar pill, and opening the modal from it shows no quota details there", () => {
     const now = Date.now();
     render(
       <ChatPane
@@ -1112,22 +1039,13 @@ describe("ChatPane vendor account quota allowance badge in AgentSettingsModal", 
 
     const toolbarPill = screen.getByTestId("quota-exhausted-toolbar-pill");
     expect(toolbarPill).toHaveTextContent("HTTP 429: quota exhausted, resets at 03:15 UTC");
-    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
 
     fireEvent.click(toolbarPill);
 
-    const badge = screen.getByTestId("quota-usage-badge");
-    expect(badge).toHaveAttribute("data-exhausted", "true");
-    expect(badge).toHaveClass("is-exhausted");
-    expect(badge).toHaveAttribute(
-      "title",
-      "HTTP 429: quota exhausted, resets at 03:15 UTC",
-    );
-    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("5h: 0% left");
-    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("renews in 42m");
-    expect(screen.getByTestId("quota-exhausted-alert")).toHaveTextContent(
-      "HTTP 429: quota exhausted, resets at 03:15 UTC",
-    );
+    expect(screen.getByTestId("agent-settings-execution-mode")).toBeInTheDocument();
+    expect(screen.queryByTestId("quota-usage-badge")).toBeNull();
+    expect(screen.queryByTestId("quota-exhausted-alert")).toBeNull();
+    expect(screen.queryByTestId("quota-primary-window")).toBeNull();
   });
 });
 
