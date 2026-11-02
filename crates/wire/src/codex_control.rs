@@ -21,7 +21,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{Value, json};
 
-use crate::ws::{compute_accept_key, read_http_headers};
+use crate::ws::{WsError, compute_accept_key, read_http_headers};
 
 /// Overall budget for one compaction request (connect through the `thread/compact/start` reply).
 pub(crate) const COMPACT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,7 +60,15 @@ pub(crate) fn resolve_control_socket(
         return Ok(None);
     }
     if let Some(dir) = non_empty(codex_home) {
-        return Ok(Some(PathBuf::from(dir).join(SOCKET_REL)));
+        let dir = Path::new(dir);
+        // A relative path would resolve against the daemon's working directory, not Codex's.
+        if !dir.is_absolute() {
+            return Err(format!(
+                "CODEX_HOME must be an absolute path, got `{}`",
+                dir.display()
+            ));
+        }
+        return Ok(Some(dir.join(SOCKET_REL)));
     }
     if let Some(dir) = non_empty(home) {
         return Ok(Some(PathBuf::from(dir).join(".codex").join(SOCKET_REL)));
@@ -78,6 +86,7 @@ pub(crate) fn compact_thread(
     timeout: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
+    // Known limit: a Unix-socket `connect` has no timeout (it blocks only on a full backlog).
     let stream = UnixStream::connect(sock).map_err(|e| {
         format!(
             "cannot connect to the Codex app-server control socket {}: {e}",
@@ -108,6 +117,24 @@ pub(crate) fn compact_thread(
     // Best effort: the outcome is already decided.
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
     outcome
+}
+
+/// Reads from a socket under an overall deadline: before every read it re-arms the socket read
+/// timeout to the time left (at most `IO_TIMEOUT`) and fails with `TimedOut` once none is left.
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left.min(IO_TIMEOUT)))?;
+        self.stream.read(buf)
+    }
 }
 
 struct Conn {
@@ -144,11 +171,16 @@ impl Conn {
         self.stream
             .write_all(request.as_bytes())
             .map_err(|e| io_failure("sending the WebSocket handshake", &e))?;
-        self.stream
-            .set_read_timeout(Some(self.io_budget()?))
-            .map_err(io_err)?;
-        let headers = read_http_headers(&mut self.stream)
-            .map_err(|e| format!("Codex app-server WebSocket handshake failed: {e}"))?;
+        // `read_http_headers` reads one byte at a time; the reader re-arms the socket timeout
+        // before every read so a slow drip cannot outlast the overall deadline.
+        let mut reader = DeadlineReader {
+            stream: &self.stream,
+            deadline: self.deadline,
+        };
+        let headers = read_http_headers(&mut reader).map_err(|e| match e {
+            WsError::Io(e) => io_failure("reading the WebSocket handshake reply", &e),
+            e => format!("Codex app-server WebSocket handshake failed: {e}"),
+        })?;
 
         let mut lines = headers.split("\r\n");
         let status_line = lines.next().unwrap_or_default();
@@ -275,25 +307,38 @@ impl Conn {
             {
                 continue;
             }
-            return match message.get("error") {
-                Some(error) => Err(format!(
+            // A null `error` is no error; success needs a present `result` (`{}` is one).
+            return match (
+                message.get("error").filter(|e| !e.is_null()),
+                message.get("result"),
+            ) {
+                (Some(error), _) => Err(format!(
                     "Codex app-server rejected `{method}`: {}",
                     describe_rpc_error(error)
                 )),
-                None => Ok(message),
+                (None, Some(_)) => Ok(message),
+                (None, None) => Err(format!(
+                    "Codex app-server sent a malformed response to `{method}`: \
+                     neither `result` nor `error`"
+                )),
             };
         }
     }
 }
 
+/// Error text built only from the server's `message` (string) and `code` (number); `data` and
+/// anything else is dropped, control characters are stripped, and the length is bounded.
 fn describe_rpc_error(error: &Value) -> String {
-    let text = match (
-        error.get("message").and_then(Value::as_str),
-        error.get("code"),
-    ) {
+    let message: Option<String> = error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|m| m.chars().filter(|c| !c.is_control()).collect());
+    let code = error.get("code").and_then(Value::as_i64);
+    let text = match (message.filter(|m| !m.is_empty()), code) {
         (Some(message), Some(code)) => format!("{message} (code {code})"),
-        (Some(message), None) => message.to_string(),
-        (None, _) => error.to_string(),
+        (Some(message), None) => message,
+        (None, Some(code)) => format!("(code {code})"),
+        (None, None) => "no message".to_string(),
     };
     truncate(&text, MAX_ERROR_TEXT)
 }
@@ -825,6 +870,17 @@ mod tests {
         assert_eq!(r(None, None, None, Some(&home)), expected);
         assert_eq!(r(None, None, Some(&os("")), Some(&home)), expected);
         assert_eq!(r(Some(&os("")), None, None, Some(&home)), expected);
+        // A relative CODEX_HOME is refused, not resolved against the daemon's cwd.
+        let err = r(None, None, Some(&os("rel/codex")), Some(&home)).unwrap_err();
+        assert!(
+            err.contains("CODEX_HOME") && err.contains("absolute"),
+            "{err}"
+        );
+        // ... but an override still wins over it.
+        assert_eq!(
+            r(Some(&sock), None, Some(&os("rel")), Some(&home)),
+            Ok(Some(PathBuf::from("/run/x.sock")))
+        );
         // Nothing to go on.
         assert!(r(None, None, None, None).unwrap_err().contains("HOME"));
         assert!(r(None, None, Some(&os("")), Some(&os(""))).is_err());
@@ -979,6 +1035,158 @@ mod tests {
             err.len()
         );
         assert!(err.ends_with("..."));
+    }
+
+    /// Run a client against a server that, after the handshake and `initialize` request, runs
+    /// `script`; returns the client's error text.
+    fn error_after_initialize(script: impl FnOnce(&mut ServerConn) + Send + 'static) -> String {
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), move |c| {
+            c.handshake();
+            c.expect_json();
+            script(c);
+            c.drain_until_eof();
+        });
+        let err = compact_thread(&sock, "t", SHORT).unwrap_err();
+        let _ = server.join();
+        err
+    }
+
+    #[test]
+    fn rpc_error_text_is_only_message_and_code_without_control_characters() {
+        let data = "D".repeat(100_000);
+        let err = describe_rpc_error(&json!({
+            "code": -32000,
+            "message": "bad\nthing\x1b[31m\r\t\u{7f}\u{85}",
+            "data": {"secret": "token-abc", "pad": data},
+        }));
+        assert_eq!(err, "badthing[31m (code -32000)");
+        assert!(!err.contains("token-abc") && !err.chars().any(char::is_control));
+
+        // No message: the code alone, never the raw JSON.
+        let err = describe_rpc_error(&json!({"code": 7, "data": "token-abc\n"}));
+        assert_eq!(err, "(code 7)");
+        let err = describe_rpc_error(&json!({"data": "token-abc"}));
+        assert_eq!(err, "no message");
+        // A non-string message and a non-number code are ignored.
+        let err = describe_rpc_error(&json!({"message": {"x": "token-abc"}, "code": "c"}));
+        assert_eq!(err, "no message");
+        assert!(
+            describe_rpc_error(&json!({"message": "m".repeat(9000)}))
+                .chars()
+                .count()
+                < 400
+        );
+    }
+
+    #[test]
+    fn null_error_with_a_result_is_success() {
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(r#"{"id":1,"result":{},"error":null}"#);
+            c.expect_json();
+            c.expect_json();
+            c.send_text(r#"{"id":2,"error":null,"result":{"started":true}}"#);
+            c.drain_until_eof();
+        });
+        compact_thread(&sock, "t", SHORT).expect("null error is no error");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn response_with_neither_result_nor_error_is_malformed() {
+        for reply in [r#"{"id":1}"#, r#"{"id":1,"error":null}"#] {
+            let err = error_after_initialize(move |c| c.send_text(reply));
+            assert!(
+                err.contains("malformed response") && err.contains("initialize"),
+                "{reply}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_text_on_the_wire_is_sanitised_end_to_end() {
+        let err = error_after_initialize(|c| {
+            let data = "D".repeat(50_000);
+            c.send_text(
+                &json!({"id":1,"error":{"code":5,"message":"line1\nline2\u{1b}[0m","data":data}})
+                    .to_string(),
+            );
+        });
+        assert!(err.contains("line1line2[0m (code 5)"), "{err}");
+        assert!(
+            !err.chars().any(char::is_control) && err.len() < 500,
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn slow_handshake_reply_cannot_outlast_the_deadline() {
+        let dir = TempDir::new().unwrap();
+        let (sock, _server) = spawn(dir.path(), |c| {
+            c.read_upgrade_request();
+            // One byte per 100 ms, never finishing the headers: each read succeeds, so only an
+            // overall deadline (not a per-read timeout) can stop the client. Not joined.
+            for byte in b"HTTP/1.1 101 Switching".iter().take(20) {
+                c.write_raw(&[*byte]);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let started = Instant::now();
+        let err = compact_thread(&sock, "t", Duration::from_millis(300)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_reassembled_message_is_an_error() {
+        let err = error_after_initialize(|c| {
+            c.send_frame(false, OP_TEXT, &[b'{', 0xC3]);
+            c.send_frame(true, OP_CONTINUATION, &[0x28, b'}']); // 0xC3 0x28 is invalid
+        });
+        assert!(err.contains("not UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn stray_continuation_frame_is_an_error() {
+        let err = error_after_initialize(|c| c.send_frame(true, OP_CONTINUATION, b"x"));
+        assert!(err.contains("stray continuation"), "{err}");
+    }
+
+    #[test]
+    fn new_data_frame_inside_a_fragmented_message_is_an_error() {
+        for second in [OP_TEXT, OP_BINARY] {
+            let err = error_after_initialize(move |c| {
+                c.send_frame(false, OP_TEXT, b"{\"id\":");
+                c.send_frame(true, second, b"1}");
+            });
+            assert!(err.contains("inside a fragmented"), "{err}");
+        }
+    }
+
+    #[test]
+    fn fragmented_message_over_the_bound_is_an_error() {
+        let err = error_after_initialize(|c| {
+            let part = vec![b'x'; MAX_MESSAGE / 2 + 1];
+            c.send_frame(false, OP_TEXT, &part);
+            c.send_frame(false, OP_CONTINUATION, &part);
+            c.send_frame(true, OP_CONTINUATION, b"y");
+        });
+        assert!(err.contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn masked_server_frame_is_an_error_through_the_client() {
+        let err = error_after_initialize(|c| {
+            c.write_raw(&[0x81, 0x82, 1, 2, 3, 4, b'{' ^ 1, b'}' ^ 2]);
+        });
+        assert!(err.contains("masked"), "{err}");
     }
 
     #[test]
