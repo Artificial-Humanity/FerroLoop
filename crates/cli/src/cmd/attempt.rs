@@ -109,7 +109,11 @@ impl Target {
             return Ok(Self::Kind(kind));
         }
         if let Some(vendor) = fl_core::lookup_vendor(name) {
-            return Ok(Self::Vendor(vendor.id));
+            // `Claude` is `claude`: the registry compares without case.
+            return Ok(match AdapterKind::from_wire(&vendor.id) {
+                Some(kind) => Self::Kind(kind),
+                None => Self::Vendor(vendor.id),
+            });
         }
         let known = fl_core::VendorRegistry::global()
             .list()
@@ -155,14 +159,22 @@ pub(crate) fn build_adapter(
                 id,
                 AdapterBuild {
                     binary_override: binary,
-                    rate_card: cfg.rate_card(),
-                    model: cfg.default_model.clone(),
-                    base_url: cfg.base_url.clone(),
-                    api_key: Some(crate::vendor_keys::vault_key_resolver(cfg.base_url)),
                     liveness: Some(liveness),
+                    ..vendor_build(&cfg)
                 },
             )
         }
+    }
+}
+
+/// The `[vendors.<id>]` overrides and the key source of a vendor that is not one of the five CLIs.
+pub(crate) fn vendor_build(cfg: &VendorConfig) -> AdapterBuild {
+    AdapterBuild {
+        rate_card: cfg.rate_card(),
+        model: cfg.default_model.clone(),
+        base_url: cfg.base_url.clone(),
+        api_key: Some(crate::vendor_keys::vault_key_resolver(cfg.base_url.clone())),
+        ..AdapterBuild::default()
     }
 }
 

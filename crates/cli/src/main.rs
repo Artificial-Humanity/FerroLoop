@@ -1324,7 +1324,7 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
             let ws_store = separate_ws_store.as_ref().unwrap_or(&store);
-            cmd::flow::run(&ctx, &cfg.adapters, ws_store, &cwd, c)
+            cmd::flow::run(&ctx, &cfg.adapters, &cfg.vendors, ws_store, &cwd, c)
         }
         Command::Mcp(_)
         | Command::Agent { .. }

@@ -780,7 +780,8 @@ are the direct APIs (`anthropic-api`, `openai-api`, `gemini-api`, `xai-api`, `op
 `kimi-api`) and the local engines (`ollama`, `lemonade`). An API attempt is one request: it sends
 the instruction and records the reply, the tokens and the cost. It runs no tools. The attempt is
 recorded under the vendor id. A name that is not registered is refused with the list of ids that
-are. A workflow step (`fl flow`) still names one of the five CLI adapters.
+are. A workflow step (`fl flow step --adapter <id>`, or a step's `adapter`) takes the same ids,
+settings and key lookup, and records the id as the step's adapter.
 
 `[vendors.<id>]` in `config.toml` sets a vendor up. The id is compared without case.
 
