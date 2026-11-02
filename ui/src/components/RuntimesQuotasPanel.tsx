@@ -35,9 +35,22 @@ const ROW_STYLE: React.CSSProperties = {
   borderTop: "1px solid var(--border-subtle)",
 };
 
+const RESULT_LABELS: Partial<Record<RuntimeUpdateResult["status"], string>> = {
+  unknown_version: "Updated (version unreadable)",
+};
+
+function resultLabel(status: RuntimeUpdateResult["status"]): string {
+  return RESULT_LABELS[status] ?? status.replace("_", " ");
+}
+
 function resultTone(status: RuntimeUpdateResult["status"]): string {
   if (status === "updated") return "var(--status-alive)";
-  if (status === "unchanged" || status === "unsupported" || status === "not_installed") {
+  if (
+    status === "unchanged" ||
+    status === "unknown_version" ||
+    status === "unsupported" ||
+    status === "not_installed"
+  ) {
     return "var(--text-muted)";
   }
   return "var(--status-danger)";
@@ -236,7 +249,7 @@ export const RuntimesQuotasPanel: React.FC<RuntimesQuotasPanelProps> = ({ apiCli
         {result && (
           <div data-testid={`runtime-update-result-${row.name}`} style={{ fontSize: "12px" }}>
             <span style={{ color: resultTone(result.status), fontWeight: 600 }}>
-              {result.status.replace("_", " ")}
+              {resultLabel(result.status)}
             </span>
             {(result.version_before || result.version_after) && (
               <span>

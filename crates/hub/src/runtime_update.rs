@@ -9,17 +9,33 @@
 //! Each command has a hard deadline ([`UPDATE_TIMEOUT`]); on expiry its whole process group is
 //! killed. Output is captured without limit on the child but kept only as the last
 //! [`MAX_UPDATE_OUTPUT`] bytes, stripped of terminal escapes, and is returned to the caller and
-//! never logged. One update runs at a time per hub ([`UpdateGate`]): a second request is `409`.
-//! After a run the probe cache is dropped, so the next matrix read reports the new version.
+//! never logged. The output is kept as it is read, so an updater that exits while a detached
+//! grandchild still holds its pipe open returns what it printed after [`OUTPUT_GRACE`]. One update
+//! runs at a time per hub ([`UpdateGate`]): a second request is `409`. After a run the probe cache
+//! is dropped (again when the whole request ends), so the next matrix read reports the new version.
+//!
+//! # The child's environment and directory
+//!
+//! An updater runs npm or curl installers and its output goes back to the UI, so it never gets the
+//! hub's environment. [`child_env`] clears it and copies only these variables from the hub:
+//! `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `USER`, `LOGNAME`, `TMPDIR`, `SHELL`, `XDG_CONFIG_HOME`,
+//! `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_RUNTIME_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`
+//! (and the lower-case forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`,
+//! `NPM_CONFIG_PREFIX`, `NPM_CONFIG_CACHE`, `CARGO_HOME` and `RUSTUP_HOME`. `PATH` is the directories
+//! the binary was resolved with (absolute ones only) and `HOME` is the hub's effective home. A
+//! variable whose name starts with `FL_` or ends with `_TOKEN`, `_KEY`, `_SECRET` or `_PASSWORD`
+//! never passes, listed or not. The working directory is the effective home (`/` when there is
+//! none), never the hub's own.
 //!
 //! One runtime answers with one result object; `all` runs every runtime in order and answers with
 //! an array of them.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -97,9 +113,17 @@ pub enum CommandRun {
     SpawnFailed(String),
 }
 
+/// Where the hub looks for CLIs, as the child of an update sees it: the `PATH` directories the
+/// binary was resolved with, and the hub's effective home.
+#[derive(Debug, Clone, Copy)]
+pub struct UpdateEnv<'a> {
+    pub path_env: &'a str,
+    pub home: Option<&'a Path>,
+}
+
 /// What an update needs from the host: run a command, read a version. A test supplies its own.
 pub trait UpdateExec: Sync {
-    fn run(&self, program: &Path, argv: &[&str]) -> CommandRun;
+    fn run(&self, program: &Path, argv: &[&str], env: &UpdateEnv<'_>) -> CommandRun;
     fn version(&self, program: &Path) -> Result<String, String>;
 }
 
@@ -107,8 +131,8 @@ pub trait UpdateExec: Sync {
 pub struct HostExec;
 
 impl UpdateExec for HostExec {
-    fn run(&self, program: &Path, argv: &[&str]) -> CommandRun {
-        run_command(program, argv, UPDATE_TIMEOUT)
+    fn run(&self, program: &Path, argv: &[&str], env: &UpdateEnv<'_>) -> CommandRun {
+        run_command(program, argv, UPDATE_TIMEOUT, env)
     }
 
     fn version(&self, program: &Path) -> Result<String, String> {
@@ -123,7 +147,8 @@ pub struct RuntimeUpdateResult {
     pub ok: bool,
     pub version_before: Option<String>,
     pub version_after: Option<String>,
-    /// `updated`, `unchanged`, `failed`, `unsupported`, `not_installed` or `timeout`.
+    /// `updated`, `unchanged`, `unknown_version` (the command succeeded but the version after it
+    /// cannot be read), `failed`, `unsupported`, `not_installed` or `timeout`.
     pub status: String,
     pub output_tail: String,
 }
@@ -164,7 +189,7 @@ pub fn update_runtime(
         );
     };
     let version_before = exec.version(&program).ok();
-    let run = exec.run(&program, spec.argv);
+    let run = exec.run(&program, spec.argv, &UpdateEnv { path_env, home });
     let version_after = exec.version(&program).ok();
     let mut result = RuntimeUpdateResult {
         runtime: runtime.to_string(),
@@ -180,10 +205,14 @@ pub fn update_runtime(
             output,
             ..
         } => {
-            let changed =
-                result.version_after.is_some() && result.version_after != result.version_before;
             result.ok = true;
-            result.status = if changed { "updated" } else { "unchanged" }.to_string();
+            result.status = match (&result.version_before, &result.version_after) {
+                // Nothing to compare with: the command succeeded, and that is all that is known.
+                (_, None) => "unknown_version",
+                (Some(before), Some(after)) if before == after => "unchanged",
+                _ => "updated",
+            }
+            .to_string();
             result.output_tail = output;
         }
         CommandRun::Exited { code, output, .. } => {
@@ -209,12 +238,93 @@ pub fn update_runtime(
     (result, true)
 }
 
+/// Environment variables copied from the hub to an updater (see the module doc). `LC_*` is also
+/// copied.
+const ENV_ALLOW: &[&str] = &[
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "NPM_CONFIG_PREFIX",
+    "NPM_CONFIG_CACHE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
+/// A name that never reaches an updater, whatever else says.
+fn is_secret_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("FL_")
+        || ["_TOKEN", "_KEY", "_SECRET", "_PASSWORD"]
+            .iter()
+            .any(|suffix| upper.ends_with(suffix))
+}
+
+/// The whole environment of an updater: the allowed variables of `host`, `PATH` (the absolute
+/// directories of `path_env`; unset when there are none, so the shell's own default applies) and
+/// `HOME`.
+pub fn child_env(
+    path_env: &str,
+    home: Option<&Path>,
+    host: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = host
+        .into_iter()
+        .filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                !is_secret_name(name) && (ENV_ALLOW.contains(&name) || name.starts_with("LC_"))
+            })
+        })
+        .collect();
+    let path = path_env
+        .split(':')
+        .filter(|dir| Path::new(dir).is_absolute())
+        .collect::<Vec<_>>()
+        .join(":");
+    if !path.is_empty() {
+        env.push(("PATH".into(), path.into()));
+    }
+    if let Some(home) = home {
+        env.push(("HOME".into(), home.as_os_str().to_owned()));
+    }
+    env
+}
+
 /// Run `program argv` with no shell and no stdin, killing its process group at `timeout`. The
-/// child leads its own group. Both pipes are read to the end whatever their size, so a chatty
-/// updater never blocks on a full pipe; only the end of each is kept.
-pub fn run_command(program: &Path, argv: &[&str], timeout: Duration) -> CommandRun {
+/// child leads its own group, runs in the effective home (`/` when there is none) and sees only
+/// [`child_env`]. Both pipes are read to the end whatever their size, so a chatty updater never
+/// blocks on a full pipe; only the end of each is kept.
+pub fn run_command(
+    program: &Path,
+    argv: &[&str],
+    timeout: Duration,
+    env: &UpdateEnv<'_>,
+) -> CommandRun {
     let mut cmd = Command::new(program);
     cmd.args(argv)
+        .env_clear()
+        .envs(child_env(env.path_env, env.home, std::env::vars_os()))
+        .current_dir(
+            env.home
+                .filter(|h| h.is_absolute() && h.is_dir())
+                .unwrap_or(Path::new("/")),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -228,8 +338,8 @@ pub fn run_command(program: &Path, argv: &[&str], timeout: Duration) -> CommandR
         Err(e) => return CommandRun::SpawnFailed(format!("spawn failed: {e}")),
     };
     let pid = child.id();
-    let out_rx = drain_tail(child.stdout.take(), MAX_UPDATE_OUTPUT);
-    let err_rx = drain_tail(child.stderr.take(), MAX_UPDATE_OUTPUT);
+    let out = drain_tail(child.stdout.take(), MAX_UPDATE_OUTPUT);
+    let err = drain_tail(child.stderr.take(), MAX_UPDATE_OUTPUT);
 
     let deadline = Instant::now() + timeout;
     let exited = loop {
@@ -250,10 +360,12 @@ pub fn run_command(program: &Path, argv: &[&str], timeout: Duration) -> CommandR
     } else {
         kill_group(pid, &mut child)
     };
-    let output = combine_output(
-        out_rx.recv_timeout(OUTPUT_GRACE).unwrap_or_default(),
-        err_rx.recv_timeout(OUTPUT_GRACE).unwrap_or_default(),
-    );
+    // One grace period for both pipes. A grandchild that keeps one open does not hold the reply:
+    // what was read by then is the output.
+    let grace = Instant::now() + OUTPUT_GRACE;
+    out.wait_until(grace);
+    err.wait_until(grace);
+    let output = combine_output(out.snapshot(), err.snapshot());
     if !exited {
         return CommandRun::TimedOut { output };
     }
@@ -267,31 +379,55 @@ pub fn run_command(program: &Path, argv: &[&str], timeout: Duration) -> CommandR
     }
 }
 
-/// Read `pipe` to the end, keeping the last `cap` bytes.
-fn drain_tail<R: Read + Send + 'static>(pipe: Option<R>, cap: usize) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
+/// The last bytes a reader thread has read from a pipe, readable while it still reads.
+struct Tail {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    cap: usize,
+    /// Disconnects when the reader reaches the end of the pipe.
+    ended: mpsc::Receiver<()>,
+}
+
+impl Tail {
+    /// Wait for the end of the pipe, no later than `deadline`.
+    fn wait_until(&self, deadline: Instant) {
+        let _ = self
+            .ended
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    }
+
+    /// The last `cap` bytes read so far.
+    fn snapshot(&self) -> Vec<u8> {
+        let bytes = self.bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        bytes[bytes.len().saturating_sub(self.cap)..].to_vec()
+    }
+}
+
+/// Read `pipe` on a thread that is never joined, keeping the last `cap` bytes where [`Tail`] can
+/// see them as they arrive.
+fn drain_tail<R: Read + Send + 'static>(pipe: Option<R>, cap: usize) -> Tail {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let (done, ended) = mpsc::channel::<()>();
+    let shared = Arc::clone(&bytes);
     std::thread::spawn(move || {
-        let mut tail: Vec<u8> = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        tail.extend_from_slice(&chunk[..n]);
-                        if tail.len() > cap * 2 {
-                            tail.drain(..tail.len() - cap);
-                        }
+        // Dropped on return, which ends the wait.
+        let _done = done;
+        let Some(mut pipe) = pipe else { return };
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut tail = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > cap * 2 {
+                        let excess = tail.len() - cap;
+                        tail.drain(..excess);
                     }
                 }
             }
         }
-        if tail.len() > cap {
-            tail.drain(..tail.len() - cap);
-        }
-        let _ = tx.send(tail);
     });
-    rx
+    Tail { bytes, cap, ended }
 }
 
 /// Stdout then stderr, as text for a person: terminal escapes and control characters removed
@@ -387,7 +523,8 @@ fn parse_runtime(req: &HttpRequest) -> Result<String, HttpResponse> {
     }
 }
 
-/// `POST /api/v1/runtimes/update`. Owner only.
+/// `POST /api/v1/runtimes/update`. Owner only. `all` runs every CLI's update in turn, so the
+/// request can be held for several minutes (each command may take [`UPDATE_TIMEOUT`]).
 pub fn handle_post_update(
     state: &HubState,
     authority: &HubAuthority,
@@ -430,6 +567,8 @@ pub(crate) fn post_update_with(
         }
         results.push(result);
     }
+    // A probe that began before the first update ended may have cached pre-update versions.
+    state.probe_gate.invalidate();
     let body = if runtime == "all" {
         serde_json::to_value(&results)
     } else {

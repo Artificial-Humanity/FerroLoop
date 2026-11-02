@@ -57,10 +57,22 @@ The command is fixed in the hub and runs without a shell and without caller argu
 
 Each command is stopped after 300 seconds (its process group is killed) and its output is kept
 as the last 4 KiB without terminal escapes. One update runs at a time: a second request gets
-`409`. One runtime answers with one object, `all` with an array in the order above:
+`409`. One runtime answers with one object, `all` with an array in the order above (`all` holds
+the request for as long as the updates take, up to several minutes):
 `{runtime, ok, version_before, version_after, status, output_tail}`, where `status` is
-`updated`, `unchanged`, `failed`, `unsupported`, `not_installed` or `timeout`. After a run the
-cached probe is dropped, so the next matrix read shows the new version.
+`updated`, `unchanged` (both versions known and equal), `unknown_version` (the command succeeded
+but the version after it cannot be read; `ok` is true), `failed`, `unsupported`, `not_installed`
+or `timeout`. After a run the cached probe is dropped, so the next matrix read shows the new
+version.
+
+An update command runs in the hub's effective home with a cleared environment: only `PATH` (the
+absolute directories the binary was found in), `HOME`, locale, terminal, user, temp and XDG
+directory variables, proxy and CA-certificate variables, `NPM_CONFIG_PREFIX`, `NPM_CONFIG_CACHE`,
+`CARGO_HOME` and `RUSTUP_HOME` are passed on. A variable starting with `FL_` or ending in
+`_TOKEN`, `_KEY`, `_SECRET` or `_PASSWORD` is never passed. A relative `PATH` entry is not searched.
+
+The matrix reads the vendor quotas within 4 seconds in all; a vendor not read by then has no entry
+in `vendor_quotas`. Each reading is kept for 30 seconds.
 
 ## Antigravity
 

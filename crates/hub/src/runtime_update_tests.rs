@@ -11,8 +11,8 @@ use tempfile::TempDir;
 use crate::auth::HubAuthority;
 use crate::runtime_matrix::{CLI_RUNTIMES, run_version};
 use crate::runtime_update::{
-    CommandRun, HostExec, MAX_UPDATE_OUTPUT, UPDATE_COMMANDS, UpdateExec, UpdateGate,
-    post_update_with, run_command, update_command, update_runtime,
+    CommandRun, HostExec, MAX_UPDATE_OUTPUT, UPDATE_COMMANDS, UpdateEnv, UpdateExec, UpdateGate,
+    child_env, post_update_with, run_command, update_command, update_runtime,
 };
 use crate::{HttpRequest, HttpResponse, HubServerConfig, HubState, handle_http_request};
 
@@ -120,9 +120,9 @@ fn busy(err: &str) -> bool {
 }
 
 impl UpdateExec for FixtureExec {
-    fn run(&self, program: &Path, argv: &[&str]) -> CommandRun {
+    fn run(&self, program: &Path, argv: &[&str], env: &UpdateEnv<'_>) -> CommandRun {
         for _ in 0..200 {
-            match run_command(program, argv, self.timeout) {
+            match run_command(program, argv, self.timeout, env) {
                 CommandRun::SpawnFailed(e) if busy(&e) => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -330,6 +330,10 @@ fn a_command_that_cannot_be_spawned_is_reported_not_panicked() {
         Path::new("/nonexistent/updater"),
         &["update"],
         Duration::from_secs(1),
+        &UpdateEnv {
+            path_env: "",
+            home: None,
+        },
     );
     assert!(matches!(run, CommandRun::SpawnFailed(e) if e.starts_with("spawn failed:")));
 }
@@ -630,4 +634,314 @@ fn the_real_executor_runs_the_resolved_binary_with_its_own_timeout() {
         })
     });
     assert_eq!(version.as_deref(), Some("4.5.6"));
+}
+
+// ---------------------------------------------------------------- environment, output, status
+
+use std::ffi::OsString;
+use std::sync::Mutex;
+
+/// Serializes the tests that change this process's environment.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets variables for the life of the guard, under [`ENV_LOCK`].
+struct EnvVars<'a> {
+    names: Vec<&'a str>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl<'a> EnvVars<'a> {
+    fn set(vars: &[(&'a str, &str)]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, value) in vars {
+            // SAFETY: ENV_LOCK serializes these tests, and the names are unique to them.
+            unsafe { std::env::set_var(name, value) };
+        }
+        Self {
+            names: vars.iter().map(|(n, _)| *n).collect(),
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVars<'_> {
+    fn drop(&mut self) {
+        for name in &self.names {
+            // SAFETY: as in `set`.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
+}
+
+fn os_pairs(vars: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    vars.iter()
+        .map(|(k, v)| ((*k).into(), (*v).into()))
+        .collect()
+}
+
+#[test]
+fn the_child_env_is_the_allowlist_plus_path_and_home_and_never_a_secret_name() {
+    let host = os_pairs(&[
+        ("LANG", "C.UTF-8"),
+        ("LC_ALL", "C"),
+        ("TERM", "xterm"),
+        ("HTTPS_proxy", "dropped: not an allowed spelling"),
+        ("https_proxy", "http://proxy:3128"),
+        ("NPM_CONFIG_PREFIX", "/npm"),
+        ("NPM_CONFIG_CACHE", "/npm-cache"),
+        ("NPM_CONFIG__AUTH", "secret"),
+        ("CARGO_HOME", "/cargo"),
+        ("PATH", "/hub/path/is/not/copied"),
+        ("HOME", "/hub/home/is/not/copied"),
+        ("FL_HUB_OWNER_TOKEN", "owner"),
+        ("FL_WIRE_TOKEN", "wire"),
+        ("FL_ANYTHING", "x"),
+        ("fl_lower", "x"),
+        ("GITHUB_TOKEN", "t"),
+        ("OPENAI_API_KEY", "k"),
+        ("SSL_CERT_FILE_KEY", "k"),
+        ("MY_SECRET", "s"),
+        ("DB_PASSWORD", "p"),
+        ("AWS_SESSION_TOKEN", "t"),
+        ("RANDOM_OTHER", "x"),
+    ]);
+    let env = child_env(
+        "/usr/bin:rel/dir::/opt/bin",
+        Some(Path::new("/home/x")),
+        host,
+    );
+    let names: Vec<_> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "https_proxy",
+            "NPM_CONFIG_PREFIX",
+            "NPM_CONFIG_CACHE",
+            "CARGO_HOME",
+            "PATH",
+            "HOME"
+        ]
+    );
+    let get = |n: &str| {
+        env.iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| v.to_str().unwrap().to_string())
+    };
+    // Only the absolute directories of the search path, and the hub's effective home.
+    assert_eq!(get("PATH").as_deref(), Some("/usr/bin:/opt/bin"));
+    assert_eq!(get("HOME").as_deref(), Some("/home/x"));
+    // No usable directory: PATH is left unset for the shell's own default.
+    assert!(
+        child_env("rel", None, os_pairs(&[]))
+            .iter()
+            .all(|(k, _)| k != "PATH" && k != "HOME")
+    );
+}
+
+#[test]
+fn an_updater_never_sees_the_hubs_secrets_and_runs_in_the_home() {
+    let tmp = TempDir::new().unwrap();
+    let h = tmp.path().display();
+    // The only search directory holds just `env`, so no real CLI can be found or run.
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", bin.join("env")).unwrap();
+    let path_env = format!("{}:relative/dir", bin.display());
+    cli(
+        tmp.path(),
+        "claude",
+        "1.0.0",
+        &format!("env > {h}/env.out; pwd > {h}/pwd.out"),
+    );
+    let _env = EnvVars::set(&[
+        ("FL_HUB_OWNER_TOKEN", "owner-secret-value"),
+        ("FL_WIRE_TOKEN", "wire-secret-value"),
+        ("FEIRA_RTQ_FAKE_TOKEN", "token-secret-value"),
+        ("FEIRA_RTQ_FAKE_API_KEY", "key-secret-value"),
+        ("FEIRA_RTQ_FAKE_SECRET", "secret-secret-value"),
+        ("NPM_CONFIG_CACHE", "/feira-rtq/npm-cache"),
+    ]);
+    let (result, ran) = update_runtime("claude", &path_env, Some(tmp.path()), &FixtureExec::new());
+    assert!(ran);
+    assert_eq!(result.status, "unchanged", "{}", result.output_tail);
+    let env = std::fs::read_to_string(tmp.path().join("env.out")).unwrap();
+    for secret in [
+        "FL_HUB_OWNER_TOKEN",
+        "FL_WIRE_TOKEN",
+        "FEIRA_RTQ_FAKE_TOKEN",
+        "FEIRA_RTQ_FAKE_API_KEY",
+        "FEIRA_RTQ_FAKE_SECRET",
+        "secret-value",
+    ] {
+        assert!(
+            !env.contains(secret),
+            "{secret} reached the updater:\n{env}"
+        );
+    }
+    assert!(!env.lines().any(|l| l.starts_with("FL_")), "{env}");
+    let lines: Vec<&str> = env.lines().collect();
+    assert!(
+        lines.contains(&format!("PATH={}", bin.display()).as_str()),
+        "{env}"
+    );
+    assert!(lines.contains(&format!("HOME={h}").as_str()), "{env}");
+    assert!(
+        lines.contains(&"NPM_CONFIG_CACHE=/feira-rtq/npm-cache"),
+        "{env}"
+    );
+    // Not the hub's working directory.
+    let pwd = std::fs::read_to_string(tmp.path().join("pwd.out")).unwrap();
+    assert_eq!(
+        Path::new(pwd.trim()).canonicalize().unwrap(),
+        tmp.path().canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn an_updater_that_exits_with_a_detached_child_on_its_pipe_still_returns_its_output() {
+    let tmp = TempDir::new().unwrap();
+    cli(
+        tmp.path(),
+        "claude",
+        "1.0.0",
+        "echo first; echo second >&2; sleep 5 & exit 0",
+    );
+    let began = Instant::now();
+    let result = update_one(tmp.path(), "claude", &FixtureExec::new());
+    let took = began.elapsed();
+    assert!(
+        took < Duration::from_secs(3),
+        "the reply waited {took:?} for the grandchild's pipe"
+    );
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["status"], "unchanged");
+    assert_eq!(result["output_tail"], "first\nsecond");
+}
+
+/// Reports fixed versions and a fixed run result for whatever binary `update_runtime` resolves.
+struct StubExec {
+    versions: Mutex<std::collections::VecDeque<Result<String, String>>>,
+}
+
+impl StubExec {
+    fn new(before: Option<&str>, after: Option<&str>) -> Self {
+        let v = |v: Option<&str>| {
+            v.map(str::to_string)
+                .ok_or_else(|| "unreadable".to_string())
+        };
+        Self {
+            versions: Mutex::new([v(before), v(after)].into()),
+        }
+    }
+}
+
+impl UpdateExec for StubExec {
+    fn run(&self, _: &Path, _: &[&str], _: &UpdateEnv<'_>) -> CommandRun {
+        CommandRun::Exited {
+            success: true,
+            code: Some(0),
+            output: "ok".into(),
+        }
+    }
+
+    fn version(&self, _: &Path) -> Result<String, String> {
+        self.versions.lock().unwrap().pop_front().unwrap()
+    }
+}
+
+#[test]
+fn a_successful_update_is_unchanged_only_when_both_versions_are_known_and_equal() {
+    let tmp = TempDir::new().unwrap();
+    script(tmp.path(), "claude", "exit 0");
+    let status = |before: Option<&str>, after: Option<&str>| {
+        let (r, ran) = update_runtime(
+            "claude",
+            "",
+            Some(tmp.path()),
+            &StubExec::new(before, after),
+        );
+        assert!(ran);
+        assert!(r.ok, "a successful exit is ok whatever the versions");
+        r.status
+    };
+    assert_eq!(status(Some("1"), Some("1")), "unchanged");
+    assert_eq!(status(Some("1"), Some("2")), "updated");
+    assert_eq!(status(None, Some("2")), "updated");
+    assert_eq!(status(Some("1"), None), "unknown_version");
+    assert_eq!(status(None, None), "unknown_version");
+}
+
+#[test]
+fn a_relative_path_entry_is_never_searched_for_an_updater() {
+    // A directory under the working directory, named by a relative path.
+    let rel = TempDir::new_in(std::env::current_dir().unwrap()).unwrap();
+    let rel_name = rel
+        .path()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let h = rel.path().display();
+    script_in(rel.path(), "claude", &format!("touch {h}/ran"));
+    let home = TempDir::new().unwrap();
+    let (result, ran) = update_runtime("claude", &rel_name, Some(home.path()), &FixtureExec::new());
+    assert!(!ran);
+    assert_eq!(result.status, "not_installed");
+    assert!(!rel.path().join("ran").exists(), "the relative binary ran");
+}
+
+/// An executable `/bin/sh` script directly in `dir`.
+fn script_in(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn the_probe_cache_is_dropped_when_the_request_ends_even_if_no_command_ran() {
+    let tmp = TempDir::new().unwrap();
+    cli(tmp.path(), "claude", "1.0.0", "true");
+    let state = hub(&tmp);
+    let matrix_version = |state: &HubState| -> Option<String> {
+        let req = HttpRequest::new("GET", "/api/v1/runtimes/matrix")
+            .with_header("Authorization", format!("Bearer {OWNER}"));
+        let matrix = json_of(&handle_http_request(state, &req));
+        matrix["cli_runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "claude")
+            .and_then(|c| c["version"].as_str().map(str::to_string))
+    };
+    let mut seen = None;
+    for _ in 0..100 {
+        state.probe_gate.invalidate();
+        seen = matrix_version(&state);
+        if seen.is_some() {
+            break;
+        }
+    }
+    assert_eq!(seen.as_deref(), Some("1.0.0"));
+    std::fs::write(tmp.path().join("claude.ver"), "9.9.9").unwrap();
+    // Served from the cache: still the old version.
+    assert_eq!(matrix_version(&state).as_deref(), Some("1.0.0"));
+    // `muse` has no command, so nothing ran: the end of the request still drops the cache.
+    let resp = post_update_with(
+        &state,
+        &owner(),
+        &post(
+            "/api/v1/runtimes/update",
+            None,
+            Some(&json!({ "runtime": "muse" })),
+        ),
+        &FixtureExec::new(),
+    );
+    assert_eq!(json_of(&resp)["status"], "unsupported");
+    assert_eq!(matrix_version(&state).as_deref(), Some("9.9.9"));
 }

@@ -186,6 +186,8 @@ pub struct HubState {
     probe_gate: Arc<runtime_matrix::ProbeGate>,
     /// One CLI update at a time (see [`runtime_update::UpdateGate`]).
     update_gate: Arc<runtime_update::UpdateGate>,
+    /// Recent vendor quota readings (see [`runtime_matrix::QuotaCache`]).
+    quota_cache: Arc<runtime_matrix::QuotaCache>,
     /// The engine every store this hub opens uses. `None` (always, outside tests) lets the path and
     /// `FL_STORE_BACKEND` choose; a test sets it instead of changing the process environment.
     pub(crate) store_backend: Option<fl_store::BackendKind>,
@@ -313,6 +315,7 @@ impl HubState {
             login_guard: Arc::new(operators::LoginGuard::default()),
             probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
             update_gate: Arc::new(runtime_update::UpdateGate::default()),
+            quota_cache: Arc::default(),
             store_backend: None,
             code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
             attachment_sweep_running: Arc::new(AtomicBool::new(false)),

@@ -303,7 +303,7 @@ describe("Settings: Runtimes & Quotas tab", () => {
       updateRuntime: vi.fn().mockResolvedValue([
         result({}),
         result({ runtime: "codex", ok: false, status: "not_installed", version_before: null, version_after: null, output_tail: "`codex` not found" }),
-        result({ runtime: "grok", status: "unchanged", version_before: "1.0.70", version_after: "1.0.70", output_tail: "" }),
+        result({ runtime: "grok", status: "unknown_version", version_before: "1.0.70", version_after: null, output_tail: "" }),
         result({ runtime: "agy", ok: false, status: "timeout", version_before: "0.9.0", version_after: "0.9.0", output_tail: "update timed out" }),
         result({ runtime: "muse", ok: false, status: "unsupported", version_before: null, version_after: null, output_tail: "no self-update command" }),
       ]),
@@ -323,7 +323,7 @@ describe("Settings: Runtimes & Quotas tab", () => {
     await screen.findByTestId("runtime-update-result-claude");
     expect(screen.getByTestId("runtime-update-result-claude")).toHaveTextContent("updated");
     expect(screen.getByTestId("runtime-update-result-codex")).toHaveTextContent("not installed");
-    expect(screen.getByTestId("runtime-update-result-grok")).toHaveTextContent("unchanged");
+    expect(screen.getByTestId("runtime-update-result-grok")).toHaveTextContent("Updated (version unreadable)");
     expect(screen.getByTestId("runtime-update-result-agy")).toHaveTextContent("timeout");
     expect(screen.getByTestId("runtime-update-output-agy")).toHaveTextContent("update timed out");
     expect(screen.getByTestId("runtime-update-result-muse")).toHaveTextContent("unsupported");

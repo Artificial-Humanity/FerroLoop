@@ -15,13 +15,17 @@
 //! Every probe is bounded. The three tiers and every item inside them run concurrently, so the
 //! worst case is one probe timeout, not the sum of all of them. Probing is owner only and goes
 //! through a [`ProbeGate`]: one probe at a time, and a fresh result is served again.
+//!
+//! The quota reads are the slow part (each cold read may run a CLI or a network call), so they have
+//! a wall-clock budget of their own ([`QUOTA_BUDGET`]): a vendor that is not read in time is left
+//! out of `vendor_quotas`, and every reading is kept for 30 s ([`QuotaCache`]).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport};
@@ -61,6 +65,11 @@ const MAX_TARGET_LEN: usize = 64;
 /// A probe result younger than this is served again for the same target, so a burst of requests
 /// spawns each CLI once.
 const PROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// The most wall-clock time one matrix build spends waiting for vendor quota reads. A vendor whose
+/// read is not done by then is left out of `vendor_quotas` (its read finishes in the background).
+pub(crate) const QUOTA_BUDGET: Duration = Duration::from_secs(4);
+/// How long a vendor's quota reading is served again by [`QuotaCache`].
+const QUOTA_CACHE_TTL_MS: u64 = 30_000;
 
 /// Loopback inference engine to probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +235,60 @@ pub struct ProbeInputs {
     /// `None` lets them read the real home.
     pub home_override: Option<PathBuf>,
     pub quota_source: QuotaSource,
+    /// Wall-clock budget for the whole quota phase (see [`QUOTA_BUDGET`]).
+    pub quota_budget: Duration,
+    /// Recent vendor readings, so repeated reads do not repeat the quota sources.
+    pub quota_cache: Arc<QuotaCache>,
+}
+
+/// Vendor quota readings by `(home_override, adapter)`, each served for
+/// [`QUOTA_CACHE_TTL_MS`] after it was read (by `ProbeInputs::now_ms`, so a test sets the clock).
+/// A reading that found nothing is cached too: the cold read is the expensive part. A reading that
+/// misses the quota budget is stored when it finishes.
+#[derive(Debug, Default)]
+pub struct QuotaCache {
+    entries: Mutex<QuotaEntries>,
+}
+
+/// `(home_override, adapter)` to `(read at ms, reading)`.
+type QuotaEntries = BTreeMap<(Option<PathBuf>, String), (u64, Option<SessionQuotaUsage>)>;
+
+impl QuotaCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QuotaEntries> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `Some(reading)` while the entry is fresh at `now_ms`.
+    fn get(
+        &self,
+        home: &Option<PathBuf>,
+        adapter: &str,
+        now_ms: u64,
+    ) -> Option<Option<SessionQuotaUsage>> {
+        let entries = self.lock();
+        let (at, reading) = entries.get(&(home.clone(), adapter.to_string()))?;
+        (now_ms.saturating_sub(*at) < QUOTA_CACHE_TTL_MS).then(|| reading.clone())
+    }
+
+    fn put(
+        &self,
+        home: &Option<PathBuf>,
+        adapter: &str,
+        now_ms: u64,
+        reading: Option<SessionQuotaUsage>,
+    ) {
+        self.lock()
+            .insert((home.clone(), adapter.to_string()), (now_ms, reading));
+    }
+}
+
+/// What one vendor's quota read needs, owned so the read can outlive the matrix build that
+/// started it.
+struct QuotaInputs {
+    sessions: Vec<DiscoveredSessionSummary>,
+    home_override: Option<PathBuf>,
+    quota_source: QuotaSource,
+    now_ms: u64,
 }
 
 /// How the matrix reads a vendor's account allowance. The readers are plain functions so a test
@@ -278,24 +341,32 @@ fn quota_adapter(cli: &str) -> &str {
     if cli == "agy" { "antigravity" } else { cli }
 }
 
-/// How many facts a quota reading holds; the reading with the most is the most useful.
-fn quota_richness(q: &SessionQuotaUsage) -> usize {
+/// How many facts a quota reading holds; the reading with the most is the most useful. A window
+/// that reset before `now_ms` describes an allowance that no longer applies, so it counts for
+/// nothing.
+fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
     let text = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let live = |w: &Option<crate::discovery::QuotaWindowUsage>| {
+        w.as_ref()
+            .is_some_and(|w| w.resets_at_ms.is_none_or(|reset| reset >= now_ms))
+    };
     usize::from(text(&q.tier))
-        + usize::from(q.primary_window.is_some())
-        + usize::from(q.secondary_window.is_some())
+        + usize::from(live(&q.primary_window))
+        + usize::from(live(&q.secondary_window))
         + usize::from(text(&q.exhausted_reason))
 }
 
-/// The allowance of one vendor: the richest reading among its sessions (the newest session wins
-/// a tie), else the account probe.
-fn vendor_quota(adapter: &str, inputs: &ProbeInputs) -> Option<SessionQuotaUsage> {
+/// The allowance of one vendor: the richest live reading among its sessions (the newest session
+/// wins a tie), else the account probe.
+fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
     let home = inputs.home_override.as_deref();
+    let now_ms = inputs.now_ms;
     let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
         .sessions
         .iter()
         .filter(|s| s.adapter == adapter)
         .collect();
+    // Newest first, and the sort is stable: among equally rich readings the first (newest) stays.
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
     let mut best: Option<(usize, SessionQuotaUsage)> = None;
@@ -309,13 +380,106 @@ fn vendor_quota(adapter: &str, inputs: &ProbeInputs) -> Option<SessionQuotaUsage
             None => None,
         };
         let Some(reading) = reading else { continue };
-        let richness = quota_richness(&reading);
+        let richness = quota_richness(&reading, now_ms);
         if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
             best = Some((richness, reading));
         }
     }
-    best.map(|(_, q)| q)
-        .or_else(|| (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q) > 0))
+    best.map(|(_, q)| q).or_else(|| {
+        (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q, now_ms) > 0)
+    })
+}
+
+/// Vendor quota reads in flight: [`start_vendor_quotas`] starts them, [`PendingQuotas::collect`]
+/// waits for them.
+struct PendingQuotas {
+    /// Readings already known (fresh in the cache).
+    quotas: BTreeMap<String, SessionQuotaUsage>,
+    rx: mpsc::Receiver<(String, Option<SessionQuotaUsage>)>,
+    pending: usize,
+    deadline: Instant,
+}
+
+impl PendingQuotas {
+    /// The readings that arrive before the deadline, with the cached ones. A vendor that misses the
+    /// deadline is omitted.
+    fn collect(mut self) -> BTreeMap<String, SessionQuotaUsage> {
+        for _ in 0..self.pending {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok((adapter, Some(q))) => {
+                    self.quotas.insert(adapter, q);
+                }
+                Ok((_, None)) => {}
+                Err(_) => break,
+            }
+        }
+        self.quotas
+    }
+}
+
+/// Start every selected vendor's quota read, to be collected within `inputs.quota_budget` of
+/// wall-clock time from now. A fresh cached reading is used without a read. Each other vendor is
+/// read on its own thread, not scoped to the matrix build: one that misses the deadline is omitted,
+/// and its thread finishes later on its own (storing its reading in the cache) without holding the
+/// response.
+fn start_vendor_quotas(clis: &[&'static str], inputs: &ProbeInputs) -> PendingQuotas {
+    let deadline = Instant::now() + inputs.quota_budget;
+    let mut quotas: BTreeMap<String, SessionQuotaUsage> = BTreeMap::new();
+    let (tx, rx) = mpsc::channel::<(String, Option<SessionQuotaUsage>)>();
+    let mut pending = 0usize;
+    for cli in clis {
+        let adapter = quota_adapter(cli);
+        if let Some(cached) = inputs
+            .quota_cache
+            .get(&inputs.home_override, adapter, inputs.now_ms)
+        {
+            if let Some(q) = cached {
+                quotas.insert(adapter.to_string(), q);
+            }
+            continue;
+        }
+        let read_inputs = QuotaInputs {
+            sessions: inputs
+                .sessions
+                .iter()
+                .filter(|s| s.adapter == adapter)
+                .cloned()
+                .collect(),
+            home_override: inputs.home_override.clone(),
+            quota_source: inputs.quota_source,
+            now_ms: inputs.now_ms,
+        };
+        let cache = Arc::clone(&inputs.quota_cache);
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("quota-{adapter}"))
+            .spawn(move || {
+                let reading = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    vendor_quota(adapter, &read_inputs)
+                }))
+                .ok();
+                if let Some(reading) = &reading {
+                    cache.put(
+                        &read_inputs.home_override,
+                        adapter,
+                        read_inputs.now_ms,
+                        reading.clone(),
+                    );
+                }
+                // The receiver is gone once the budget ran out: a late reading has nowhere to go.
+                let _ = tx.send((adapter.to_string(), reading.flatten()));
+            });
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    PendingQuotas {
+        quotas,
+        rx,
+        pending,
+        deadline,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,7 +607,10 @@ fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection
 /// Run the selected probes. Unknown `target` is an error; no target selects everything.
 pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<RuntimeMatrix, String> {
     let sel = select(target, &inputs.local_engines)?;
-    let (cli_runtimes, local_engines, vendor_quotas) = std::thread::scope(|scope| {
+    // Started first and collected last, so the reads run beside the CLI and engine probes and the
+    // whole build waits for them no longer than the quota budget.
+    let pending_quotas = start_vendor_quotas(&sel.cli, inputs);
+    let (cli_runtimes, local_engines) = std::thread::scope(|scope| {
         let cli_handles: Vec<_> = sel
             .cli
             .iter()
@@ -454,30 +621,19 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
             .iter()
             .map(|spec| scope.spawn(move || probe_local_engine(spec, LOCAL_TIMEOUT)))
             .collect();
-        let quota_handles: Vec<_> = sel
-            .cli
-            .iter()
-            .map(|name| {
-                let adapter = quota_adapter(name);
-                (adapter, scope.spawn(move || vendor_quota(adapter, inputs)))
-            })
-            .collect();
         let cli: Vec<CliRuntimeStatus> = cli_handles
             .into_iter()
             .zip(sel.cli.iter())
             .map(|(h, name)| h.join().unwrap_or_else(|_| panicked_cli(name)))
-            .collect();
-        let quotas: BTreeMap<String, SessionQuotaUsage> = quota_handles
-            .into_iter()
-            .filter_map(|(adapter, h)| Some((adapter.to_string(), h.join().ok()??)))
             .collect();
         let local: Vec<LocalEngineStatus> = local_handles
             .into_iter()
             .zip(sel.local.iter())
             .map(|(h, spec)| h.join().unwrap_or_else(|_| panicked_local(spec)))
             .collect();
-        (cli, local, quotas)
+        (cli, local)
     });
+    let vendor_quotas = pending_quotas.collect();
     let (vault_providers, vault_error) = match &inputs.vault {
         Ok(meta) => (vault_statuses(&sel.vault, meta, inputs.now_ms), None),
         Err(err) => (
@@ -524,14 +680,18 @@ fn panicked_local(spec: &LocalEngineSpec) -> LocalEngineStatus {
 
 // ---------------------------------------------------------------- tier 1: CLI runtimes
 
-/// First executable `name` in `path_env` directories, then `<home>/.local/bin`.
+/// First executable `name` in `path_env` directories, then `<home>/.local/bin`. A relative
+/// directory is skipped (it would resolve against whatever the hub's working directory is), and
+/// so is a relative home.
 pub fn find_binary(name: &str, path_env: &str, home: Option<&Path>) -> Option<PathBuf> {
     let from_path = path_env
         .split(':')
         .filter(|dir| !dir.is_empty())
         .map(|dir| Path::new(dir).join(name));
     let from_home = home.map(|h| h.join(".local").join("bin").join(name));
-    from_path.chain(from_home).find(|p| is_executable_file(p))
+    from_path
+        .chain(from_home)
+        .find(|p| p.is_absolute() && is_executable_file(p))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -1010,6 +1170,8 @@ pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpRespons
         now_ms: stamp::now().unix_millis(),
         home_override: state.config.home_override.clone(),
         quota_source: QuotaSource::HOST,
+        quota_budget: QUOTA_BUDGET,
+        quota_cache: Arc::clone(&state.quota_cache),
     })
 }
 
@@ -1142,6 +1304,8 @@ mod tests {
             now_ms: 1_800_000_000_000,
             home_override: None,
             quota_source: QuotaSource::NONE,
+            quota_budget: QUOTA_BUDGET,
+            quota_cache: Arc::default(),
         }
     }
 
@@ -1898,6 +2062,8 @@ mod tests {
         assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
 
         READS.store(0, Ordering::SeqCst);
+        // The first result is cached: this is a different set of sessions.
+        inp.quota_cache = Arc::default();
         inp.sessions
             .retain(|s| s.id != "route-7" && s.id != "route-6");
         let m = only_cli(&inp, "grok");
@@ -2028,5 +2194,112 @@ mod tests {
         let muse = cli("muse");
         assert_eq!(muse["update_supported"], false);
         assert_eq!(muse["update_command"], serde_json::Value::Null);
+    }
+
+    fn window_resetting(used: f64, resets_at_ms: u64) -> QuotaWindowUsage {
+        QuotaWindowUsage {
+            used_percent: used,
+            window_minutes: Some(300),
+            resets_at_ms: Some(resets_at_ms),
+        }
+    }
+
+    #[test]
+    fn a_window_that_already_reset_does_not_make_an_old_reading_richer() {
+        let mut inp = inputs("", None);
+        let past = inp.now_ms - 1;
+        let stale_but_rich = SessionQuotaUsage {
+            tier: None,
+            primary_window: Some(window_resetting(95.0, past)),
+            secondary_window: Some(window_resetting(80.0, past)),
+            exhausted_reason: None,
+        };
+        inp.sessions = vec![
+            quota_session("codex", "old", "2026-10-01T10:00:00Z", Some(stale_but_rich)),
+            quota_session(
+                "codex",
+                "new",
+                "2026-11-02T10:00:00Z",
+                Some(quota(None, Some(12.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "codex");
+        let codex = &m.vendor_quotas["codex"];
+        assert_eq!(codex.primary_window.as_ref().unwrap().used_percent, 12.0);
+
+        // A reading that is stale all through is not a quota: the account probe is asked instead.
+        inp.sessions.truncate(1);
+        inp.quota_cache = Arc::default();
+        let m = only_cli(&inp, "codex");
+        assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
+    }
+
+    #[test]
+    fn a_slow_quota_source_is_left_out_and_does_not_hold_the_matrix() {
+        let mut inp = inputs("", None);
+        inp.quota_budget = Duration::from_millis(300);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |adapter, _| {
+                if adapter == "codex" {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                Some(quota(Some("pro"), Some(1.0), None))
+            },
+        };
+        let began = Instant::now();
+        let m = build_matrix(&inp, Some("cli")).unwrap();
+        let took = began.elapsed();
+        assert!(
+            took < Duration::from_millis(1200),
+            "the matrix waited {took:?} for a slow quota read"
+        );
+        assert_eq!(
+            m.vendor_quotas.keys().collect::<Vec<_>>(),
+            ["antigravity", "claude", "grok", "muse"]
+        );
+        assert_eq!(m.cli_runtimes.len(), CLI_RUNTIMES.len());
+        // The slow read finishes on its own and is kept for the next request.
+        let late = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            inp.quota_cache
+                .get(&inp.home_override, "codex", inp.now_ms)
+                .is_some()
+        });
+        assert!(late, "the late reading never reached the cache");
+        let began = Instant::now();
+        let again = build_matrix(&inp, Some("cli")).unwrap();
+        assert!(began.elapsed() < Duration::from_millis(1000));
+        assert!(again.vendor_quotas.contains_key("codex"));
+    }
+
+    #[test]
+    fn a_reading_is_served_from_the_cache_for_thirty_seconds_per_home_and_adapter() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("max"), Some(3.0), None))
+            },
+        };
+        let first = only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+        inp.now_ms += QUOTA_CACHE_TTL_MS - 1;
+        let second = only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "served from the cache");
+        assert_eq!(first.vendor_quotas, second.vendor_quotas);
+
+        // Another home is another entry.
+        inp.home_override = Some(PathBuf::from("/sandbox/other"));
+        only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
+
+        // Past the TTL the source is read again.
+        inp.home_override = None;
+        inp.now_ms += 2;
+        only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 3);
     }
 }

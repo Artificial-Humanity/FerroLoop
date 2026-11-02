@@ -1333,6 +1333,7 @@ export interface RuntimeMatrix {
 export type RuntimeUpdateStatus =
   | "updated"
   | "unchanged"
+  | "unknown_version"
   | "failed"
   | "unsupported"
   | "not_installed"
