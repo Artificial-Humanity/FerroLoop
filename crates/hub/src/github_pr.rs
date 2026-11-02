@@ -589,6 +589,9 @@ fn verdict_of(payload: &ReviewPayload) -> ReviewVerdict {
     }
 }
 
+/// Said in every dry-run response: the policy there is the caller's claim, not GitHub's record.
+const DRY_RUN_NOTE: &str = "nothing was posted to GitHub; the policy was computed from the commits and files the caller sent, not read from GitHub";
+
 /// No repository is bound to the project: format the review from what the caller sent, post
 /// nothing. A formatted body counts for nothing on GitHub unless the Reviewer App posts it.
 #[allow(clippy::too_many_arguments)]
@@ -626,6 +629,8 @@ fn dry_run_review(
                 "head_sha": head_sha,
                 "body": payload.body,
                 "submitted": false,
+                "dry_run": true,
+                "note": DRY_RUN_NOTE,
                 "policy": eval,
             }),
         );
@@ -658,6 +663,8 @@ fn dry_run_review(
             "head_sha": head_sha,
             "body": format_review_body(&payload.body, &marker),
             "submitted": false,
+            "dry_run": true,
+            "note": DRY_RUN_NOTE,
             "policy": eval,
         }),
     )
@@ -1118,8 +1125,37 @@ mod tests {
             }),
         );
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
-        assert_eq!(json_of(&resp)["submitted"], false);
+        let body = json_of(&resp);
+        assert_eq!(body["submitted"], false);
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["note"], DRY_RUN_NOTE);
+        assert!(
+            body["note"]
+                .as_str()
+                .unwrap()
+                .contains("not read from GitHub")
+        );
         assert!(f.fake.pull(1).reviews.is_empty());
+
+        // The owner's dry-run response says the same.
+        let resp = f.post(
+            OWNER,
+            None,
+            "/api/v1/prs/1/review",
+            &json!({
+                "project": "ferroloop", "approve": true, "head_sha": "abc",
+                "files": ["crates/core/src/lib.rs"], "commits": [co_authored("abc")],
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = json_of(&resp);
+        assert_eq!(body["dry_run"], true);
+        assert!(
+            body["note"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was posted")
+        );
     }
 
     #[test]

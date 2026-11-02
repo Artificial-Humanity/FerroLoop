@@ -274,10 +274,35 @@ fn hub_github(
             Some(url)
         }
     };
-    let mut repos = std::collections::BTreeMap::new();
+    // A peer picks the slug and the slug sets the required tier, so one slug must map to one
+    // repository and one repository to one slug.
+    let mut repos = std::collections::BTreeMap::<String, String>::new();
+    let mut owners = std::collections::BTreeMap::<String, String>::new();
     for entry in &cfg.projects {
         if let (Some(slug), Some(binding)) = (entry.inferred_slug(), entry.tracker.as_ref()) {
-            repos.insert(slug.to_ascii_lowercase(), binding.github.clone());
+            let slug = slug.to_ascii_lowercase();
+            let repo = binding.github.clone();
+            if let Some(prev) = repos.get(&slug) {
+                if !prev.eq_ignore_ascii_case(&repo) {
+                    return Err((
+                        2,
+                        format!(
+                            "project slug `{slug}` is bound to two GitHub repositories (`{prev}` and `{repo}`)"
+                        ),
+                    ));
+                }
+                continue;
+            }
+            if let Some(other) = owners.get(&repo.to_ascii_lowercase()) {
+                return Err((
+                    2,
+                    format!(
+                        "GitHub repository `{repo}` is bound to two project slugs (`{other}` and `{slug}`)"
+                    ),
+                ));
+            }
+            owners.insert(repo.to_ascii_lowercase(), slug.clone());
+            repos.insert(slug, repo);
         }
     }
     let token = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
@@ -1347,6 +1372,54 @@ mod tests {
         assert_eq!(g.app_id, Some(9));
         assert_eq!(g.private_key, Some(PathBuf::from("/env/key.pem")));
         assert_eq!(g.token.as_deref(), Some("tok"));
+    }
+
+    fn cfg_with(bindings: &[(&str, &str)]) -> crate::config::Config {
+        let mut cfg = github_cfg();
+        let template = cfg.projects[0].clone();
+        cfg.projects = bindings
+            .iter()
+            .map(|(name, repo)| {
+                let mut e = template.clone();
+                e.name = Some((*name).to_string());
+                e.root = PathBuf::from(format!("/work/{name}"));
+                e.store = PathBuf::from(format!("/work/{name}.redb"));
+                e.tracker.as_mut().unwrap().github = (*repo).to_string();
+                e
+            })
+            .collect();
+        cfg
+    }
+
+    #[test]
+    fn hub_github_refuses_one_slug_bound_to_two_repositories() {
+        let cfg = cfg_with(&[("alpha", "o/one"), ("alpha", "o/two")]);
+        let (code, msg) = hub_github(&cfg, |_| None).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(
+            msg.contains("alpha") && msg.contains("o/one") && msg.contains("o/two"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn hub_github_refuses_one_repository_bound_to_two_slugs() {
+        let cfg = cfg_with(&[("alpha", "Org/Repo"), ("beta", "org/repo")]);
+        let (code, msg) = hub_github(&cfg, |_| None).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("alpha") && msg.contains("beta"), "{msg}");
+    }
+
+    #[test]
+    fn hub_github_accepts_the_same_slug_repeated_with_the_same_repository() {
+        let cfg = cfg_with(&[
+            ("alpha", "Org/Repo"),
+            ("alpha", "org/repo"),
+            ("beta", "o/b"),
+        ]);
+        let g = hub_github(&cfg, |_| None).unwrap();
+        assert_eq!(g.repos.len(), 2);
+        assert_eq!(g.repos.get("alpha").map(String::as_str), Some("Org/Repo"));
     }
 
     #[test]

@@ -130,8 +130,8 @@ pub struct HubServerConfig {
     pub ui_dir: Option<PathBuf>,
     pub owner_login: String,
     /// The GitHub accounts whose reviews may carry an agent marker when
-    /// `POST /api/v1/prs/:n/merge` checks the approvals it is sent (`[github] reviewer_ids` and
-    /// `reviewer_logins`; the Reviewer App's user id by default).
+    /// `POST /api/v1/prs/:n/merge` checks the reviews it reads from GitHub (`[github] reviewer_ids`
+    /// and `reviewer_logins`; the Reviewer App's user id by default).
     pub reviewer_apps: ReviewerApps,
     /// The GitHub repositories and credentials the Hub reads pull requests from and merges
     /// through. Empty: the Hub refuses to merge (see [`github_pr`]).
