@@ -786,7 +786,10 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 ///
 /// ⚠ Nothing is registered unless every entry is valid, and registering is idempotent
 /// ([`fl_core::ensure_vendor_registered`]): a process may load the config more than once. A
-/// different definition of an id already registered is an error naming the id, never a panic.
+/// different definition of an id already registered is an error naming the id, never a panic;
+/// it is found while the entries are checked, so no vendor of the file is registered before it.
+/// (Only a vendor another thread registers between that check and the registration can still
+/// fail after earlier vendors of the file are in.)
 fn load_vendors(
     path: &Path,
     raw: BTreeMap<String, VendorConfig>,
@@ -807,7 +810,20 @@ fn load_vendors(
         {
             check_builtin_override(&cfg, &builtin).map_err(&at)?;
         } else {
-            new_vendors.push(new_vendor_descriptor(&id, &cfg).map_err(&at)?);
+            let descriptor = new_vendor_descriptor(&id, &cfg).map_err(&at)?;
+            // A conflict with a vendor registered earlier in this process is found here, before
+            // the first vendor of this file is registered.
+            if VendorRegistry::global()
+                .get(&id)
+                .is_some_and(|existing| existing != descriptor)
+            {
+                return Err(at(
+                    "is already registered in this process with a different definition; an id \
+                     cannot be redefined"
+                        .into(),
+                ));
+            }
+            new_vendors.push(descriptor);
         }
         vendors.insert(id, cfg);
     }
@@ -2138,6 +2154,36 @@ mod tests {
             fl_core::lookup_vendor("cfg-vllm").unwrap().default_model,
             "qwen"
         );
+    }
+
+    #[test]
+    fn a_conflict_with_a_registered_vendor_registers_none_of_the_files_vendors() {
+        let first = "[vendors.cfg-pre-first]\ntransport = \"http_api\"\n\
+                     dialect = \"openai_chat_completions\"\nbase_url = \"http://127.0.0.1:8003/v1\"\n\
+                     default_model = \"m\"\n";
+        let taken = "[vendors.cfg-pre-taken]\ntransport = \"http_api\"\n\
+                     dialect = \"openai_chat_completions\"\nbase_url = \"http://127.0.0.1:8004/v1\"\n\
+                     default_model = \"one\"\n";
+        load_text(taken).unwrap();
+        // `cfg-pre-first` sorts before `cfg-pre-taken`: it would be registered first.
+        let msg = err_of(&format!("{first}{}", taken.replace("one", "two")));
+        assert!(
+            msg.contains("[vendors.cfg-pre-taken]") && msg.contains("already registered"),
+            "{msg}"
+        );
+        assert!(
+            fl_core::lookup_vendor("cfg-pre-first").is_none(),
+            "an earlier vendor of the failed file must not be registered"
+        );
+        assert_eq!(
+            fl_core::lookup_vendor("cfg-pre-taken")
+                .unwrap()
+                .default_model,
+            "one"
+        );
+        // The same two, now consistent, load.
+        load_text(&format!("{first}{taken}")).unwrap();
+        assert!(fl_core::lookup_vendor("cfg-pre-first").is_some());
     }
 
     #[test]
