@@ -539,6 +539,24 @@ fn deliver_to_codex_route(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    // `codex queue --message` bypasses the TUI slash-command parser and would send the literal
+    // text as a chat turn, so `/compact` goes through the app-server RPC instead. A failure is
+    // returned as is: falling back to `codex queue` would be the bug.
+    if text.trim().eq_ignore_ascii_case("/compact")
+        && let Some(sock) = crate::codex_control::resolve_control_socket(
+            std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").as_deref(),
+            std::env::var_os("FL_WIRE_CODEX_BIN").as_deref(),
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?
+    {
+        return crate::codex_control::compact_thread(
+            &sock,
+            thread_id,
+            crate::codex_control::COMPACT_TIMEOUT,
+        );
+    }
+
     let mut bins = Vec::new();
     if let Some(custom) = std::env::var_os("FL_WIRE_CODEX_BIN") {
         bins.push(PathBuf::from(custom));
@@ -3168,6 +3186,136 @@ mod tests {
         assert_eq!(lines[4], "/new");
         assert_eq!(lines[5], "queue");
         assert_eq!(lines[9], "reforge codex");
+    }
+
+    /// A fake `codex` that records its arguments, so a test can tell whether `codex queue` ran.
+    fn fake_codex_queue_bin(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let out = dir.join("codex.out");
+        let bin = dir.join("fake-codex.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, out)
+    }
+
+    fn codex_route(thread_id: &str) -> VendorRoute {
+        VendorRoute::Codex {
+            thread_id: thread_id.into(),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn operator_compact_for_codex_uses_the_app_server_rpc_not_codex_queue() {
+        use crate::codex_control::fake_server;
+
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let (sock, server) = fake_server::spawn(tmp.path(), |c| {
+            c.handshake();
+            c.expect_json();
+            c.send_text(r#"{"id":1,"result":{}}"#);
+            c.expect_json();
+            c.expect_json();
+            c.send_text(r#"{"id":2,"result":{}}"#);
+            c.drain_until_eof();
+        });
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
+
+        // Case and surrounding whitespace do not matter.
+        dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", " /Compact\n")
+            .expect("compact succeeds over the control socket");
+
+        let log = server.join().unwrap();
+        assert!(log.iter().all(|f| f.masked));
+        let methods: Vec<String> = log
+            .iter()
+            .filter(|f| f.opcode == 1)
+            .map(|f| f.json()["method"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            methods,
+            ["initialize", "initialized", "thread/compact/start"]
+        );
+        assert_eq!(log[2].json()["params"]["threadId"], "thread-9");
+        assert!(!out.exists(), "`codex queue` must not run for /compact");
+    }
+
+    #[test]
+    fn operator_compact_failure_is_an_error_and_never_falls_back_to_codex_queue() {
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _sock_env = EnvGuard::set(
+            "FL_WIRE_CODEX_CONTROL_SOCK",
+            &tmp.path().join("no-such.sock"),
+        );
+
+        let err = dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "/compact")
+            .unwrap_err();
+        assert!(err.contains("no-such.sock"), "{err}");
+        assert!(
+            !out.exists(),
+            "a failed /compact must not become a chat turn"
+        );
+    }
+
+    #[test]
+    fn other_codex_prompts_still_use_codex_queue() {
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        // A socket override that would fail loudly if it were used.
+        let _sock_env = EnvGuard::set(
+            "FL_WIRE_CODEX_CONTROL_SOCK",
+            &tmp.path().join("no-such.sock"),
+        );
+
+        dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "hello there")
+            .unwrap();
+        dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "/compact now")
+            .unwrap();
+        let log = fs::read_to_string(&out).unwrap();
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            [
+                "queue",
+                "--thread",
+                "thread-9",
+                "--message",
+                "hello there", //
+                "queue",
+                "--thread",
+                "thread-9",
+                "--message",
+                "/compact now",
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_with_only_the_fake_binary_override_keeps_the_queue_path() {
+        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (bin, out) = fake_codex_queue_bin(tmp.path());
+        let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        let _no_sock = EnvGuard::remove("FL_WIRE_CODEX_CONTROL_SOCK");
+
+        dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "/compact").unwrap();
+        let log = fs::read_to_string(&out).unwrap();
+        assert!(log.contains("/compact"), "{log}");
     }
 
     #[test]

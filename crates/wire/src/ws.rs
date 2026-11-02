@@ -474,7 +474,7 @@ fn split_host_port(host_port: &str, default_port: u16) -> Option<(&str, u16)> {
     }
 }
 
-fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, WsError> {
+pub(crate) fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, WsError> {
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
     while buf.len() < 16_384 {
@@ -497,7 +497,7 @@ fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, WsError> {
     Err(WsError::Handshake("HTTP headers exceeded 16 KB".into()))
 }
 
-fn compute_accept_key(sec_key: &str) -> String {
+pub(crate) fn compute_accept_key(sec_key: &str) -> String {
     let mut input = Vec::with_capacity(sec_key.len() + WS_GUID.len());
     input.extend_from_slice(sec_key.trim().as_bytes());
     input.extend_from_slice(WS_GUID.as_bytes());
