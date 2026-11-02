@@ -4,7 +4,7 @@ import { HubApiClient, HubApiError } from "./api/client";
 import { HubWsClient } from "./api/ws";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
-import { COCKPIT_TABS, ContextHeader } from "./components/ContextHeader";
+import { COCKPIT_TABS, ContextHeader, RightPanelHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import {
   HelpDrawer,
@@ -69,6 +69,7 @@ import {
 export interface AppProps {
   apiClient?: HubApiClient;
   wsClient?: HubWsClient;
+  initialSelectedAgentName?: string | null;
 }
 
 export type ThemeMode = "dark" | "light";
@@ -314,7 +315,11 @@ function readInitialLastSeenAssistantTurn(): Record<string, number> {
   return {};
 }
 
-export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: propWsClient }) => {
+export const App: React.FC<AppProps> = ({
+  apiClient: propApiClient,
+  wsClient: propWsClient,
+  initialSelectedAgentName,
+}) => {
   const apiClient = useMemo(() => propApiClient ?? new HubApiClient(), [propApiClient]);
   const wsClientRef = useRef<HubWsClient | null>(null);
   if (!wsClientRef.current) {
@@ -410,7 +415,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [routes, setRoutes] = useState<DiscoveredSessionSummary[]>([]);
   const [liveness, setLiveness] = useState<AgentLivenessItem[]>([]);
   const [sessions, setSessions] = useState<DiscoveredSessionSummary[]>([]);
-  const [selectedAgentName, setSelectedAgentName] = useState<string>("ferris");
+  const [selectedAgentName, setSelectedAgentName] = useState<string>(
+    initialSelectedAgentName === undefined ? "ferris" : (initialSelectedAgentName ?? ""),
+  );
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const selectedAgentNameRef = useRef<string>(selectedAgentName);
   selectedAgentNameRef.current = selectedAgentName;
@@ -957,6 +964,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   // Compute active agent and session
   const selectedAgent = useMemo(() => {
     const key = selectedAgentName.trim().toLowerCase();
+    if (!key) {
+      return null;
+    }
     return (
       agents.find((a) => a.name_key.toLowerCase() === key) ??
       DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key.toLowerCase() === key) ??
@@ -1577,8 +1587,21 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     }
   };
 
-  const rightSplitTab: Exclude<CockpitTab, "chat"> =
+  const rawRightSplitTab: Exclude<CockpitTab, "chat"> =
     activeTab === "chat" ? secondaryTab : activeTab;
+  const rightSplitTab: Exclude<CockpitTab, "chat"> =
+    !selectedAgent && rawRightSplitTab === "mail" ? "artifacts" : rawRightSplitTab;
+
+  useEffect(() => {
+    if (!selectedAgent) {
+      if (secondaryTab === "mail") {
+        setSecondaryTab("artifacts");
+      }
+      if (activeTab === "mail") {
+        setActiveTab("artifacts");
+      }
+    }
+  }, [selectedAgent, secondaryTab, activeTab]);
 
   const onlineNodesCount = useMemo(
     () => nodes.filter((n) => n.status === "online").length,
@@ -1642,10 +1665,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const handleToggleSplitView = useCallback(() => {
     setSplitView((prev) => {
       const next = !prev;
-      setActiveTab(next ? secondaryTab : "chat");
+      const targetTab =
+        !selectedAgent && secondaryTab === "mail" ? "artifacts" : secondaryTab;
+      setActiveTab(next ? targetTab : "chat");
       return next;
     });
-  }, [secondaryTab]);
+  }, [secondaryTab, selectedAgent]);
 
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
@@ -1763,6 +1788,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             agentSettingsOpen={agentSettingsOpen}
             onOpenAgentSettings={() => setAgentSettingsOpen(true)}
             onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+            splitView={splitView}
+            onToggleSplitView={handleToggleSplitView}
+            onOpenMobileRoster={() => {
+              setMobileRosterOpen((prev) => !prev);
+              setDesktopSidebarCollapsed((prev) => !prev);
+            }}
+            mobileSidebarOpen={mobileRosterOpen}
             onRefresh={() => {
               void refreshSessionsAndTranscript();
               void refreshWireAndRoster();
@@ -1781,7 +1813,22 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             }}
             apiClient={apiClient}
           />
-          {splitView && renderSecondaryPane(rightSplitTab)}
+          {splitView && (
+            <div className="fd-pane" data-testid="right-split-panel">
+              <RightPanelHeader
+                selectedAgent={selectedAgent}
+                rightSplitTab={rightSplitTab}
+                onSelectTab={(tab) => {
+                  setSecondaryTab(tab);
+                  setActiveTab(tab);
+                  setSplitView(true);
+                  void refreshSessionsAndTranscriptRef.current();
+                }}
+                onClose={handleToggleSplitView}
+              />
+              {renderSecondaryPane(rightSplitTab)}
+            </div>
+          )}
         </main>
 
         {/* Mobile Bottom Navigation Bar */}

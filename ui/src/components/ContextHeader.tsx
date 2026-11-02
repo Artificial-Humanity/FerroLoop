@@ -68,6 +68,269 @@ export const AGENT_TABS = AGENT_TIER_TABS;
 export const PROJECT_TABS = PROJECT_TIER_TABS;
 export const SYSTEM_TABS = SYSTEM_TIER_TABS;
 
+export const RIGHT_PANEL_TABS: Array<{
+  id: Exclude<CockpitTab, "chat">;
+  label: string;
+  requiresAgent?: boolean;
+}> = [
+  { id: "mail", label: "Wire Mail", requiresAgent: true },
+  { id: "artifacts", label: "Artifacts" },
+  { id: "git", label: "Git & PRs" },
+  { id: "board", label: "Records & Board" },
+];
+
+function renderRightPanelTabIcon(tabId: Exclude<CockpitTab, "chat">): React.ReactNode {
+  switch (tabId) {
+    case "mail":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect
+            x="1.5"
+            y="3"
+            width="13"
+            height="10"
+            rx="1.8"
+            stroke="currentColor"
+            strokeWidth="1.4"
+          />
+          <path
+            d="M2.2 4L8 8.2L13.8 4"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
+    case "artifacts":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M4 1.75H9.5L12.5 4.75V13.25C12.5 13.8 12.05 14.25 11.5 14.25H4C3.45 14.25 3 13.8 3 13.25V2.75C3 2.2 3.45 1.75 4 1.75Z"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M9.25 1.75V5H12.5"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinejoin="round"
+          />
+          <line
+            x1="5.25"
+            y1="8"
+            x2="10.25"
+            y2="8"
+            stroke="currentColor"
+            strokeWidth="1.3"
+            strokeLinecap="round"
+          />
+          <line
+            x1="5.25"
+            y1="10.75"
+            x2="8.75"
+            y2="10.75"
+            stroke="currentColor"
+            strokeWidth="1.3"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
+    case "git":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="4.25" cy="3.75" r="1.75" stroke="currentColor" strokeWidth="1.4" />
+          <circle cx="4.25" cy="12.25" r="1.75" stroke="currentColor" strokeWidth="1.4" />
+          <circle cx="11.75" cy="12.25" r="1.75" stroke="currentColor" strokeWidth="1.4" />
+          <line x1="4.25" y1="5.5" x2="4.25" y2="10.5" stroke="currentColor" strokeWidth="1.4" />
+          <path
+            d="M8.5 3.75H10.25C11.08 3.75 11.75 4.42 11.75 5.25V10.5"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          />
+          <path
+            d="M9.75 2.25L8.25 3.75L9.75 5.25"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
+    case "board":
+    default:
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect
+            x="2"
+            y="2.25"
+            width="3.2"
+            height="11.5"
+            rx="1"
+            stroke="currentColor"
+            strokeWidth="1.35"
+          />
+          <rect
+            x="6.4"
+            y="2.25"
+            width="3.2"
+            height="7.5"
+            rx="1"
+            stroke="currentColor"
+            strokeWidth="1.35"
+          />
+          <rect
+            x="10.8"
+            y="2.25"
+            width="3.2"
+            height="9.5"
+            rx="1"
+            stroke="currentColor"
+            strokeWidth="1.35"
+          />
+        </svg>
+      );
+  }
+}
+
+export interface RightPanelHeaderProps {
+  selectedAgent: AgentRecord | null;
+  rightSplitTab: Exclude<CockpitTab, "chat">;
+  onSelectTab: (tab: Exclude<CockpitTab, "chat">) => void;
+  onClose?: () => void;
+}
+
+export const RightPanelHeader: React.FC<RightPanelHeaderProps> = ({
+  selectedAgent,
+  rightSplitTab,
+  onSelectTab,
+  onClose,
+}) => {
+  const effectiveTab: Exclude<CockpitTab, "chat"> =
+    !selectedAgent && rightSplitTab === "mail" ? "artifacts" : rightSplitTab;
+  const visibleTabs = React.useMemo(
+    () => RIGHT_PANEL_TABS.filter((tab) => !tab.requiresAgent || Boolean(selectedAgent)),
+    [selectedAgent],
+  );
+  const activeLabel =
+    COCKPIT_TABS.find((t) => t.id === effectiveTab)?.label ?? effectiveTab;
+  const contextSubtitle =
+    effectiveTab === "mail"
+      ? (selectedAgent?.display_name ?? "Agent")
+      : getTabContextTier(effectiveTab) === "project"
+        ? (selectedAgent?.project ?? "Workspace")
+        : "AI-Lab-0";
+
+  return (
+    <div
+      data-testid="right-panel-header"
+      role="tablist"
+      aria-label="Right Panel Views"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        gap: "8px",
+        padding: "6px 12px",
+        borderBottom: "1px solid var(--border-subtle)",
+        backgroundColor: "var(--bg-surface)",
+        flexShrink: 0,
+        minHeight: "40px",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          minWidth: 0,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            flexShrink: 0,
+          }}
+        >
+          {visibleTabs.map((tab) => {
+            const isActive = effectiveTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                aria-label={tab.label}
+                title={tab.label}
+                data-testid={`right-panel-tab-${tab.id}`}
+                className={`fd-btn${isActive ? " fd-btn-active" : ""}`}
+                style={{ padding: "5px 7px", lineHeight: 1 }}
+                onClick={() => onSelectTab(tab.id)}
+              >
+                {renderRightPanelTabIcon(tab.id)}
+              </button>
+            );
+          })}
+        </div>
+
+        <span className="fd-tier-divider" style={{ height: "18px" }} aria-hidden="true" />
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            minWidth: 0,
+            overflow: "hidden",
+          }}
+        >
+          <span
+            data-testid="right-panel-active-title"
+            style={{
+              fontWeight: 600,
+              fontSize: "12.5px",
+              color: "var(--text-primary)",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            {activeLabel}
+          </span>
+          <span
+            className="fd-badge"
+            style={{
+              fontSize: "10.5px",
+              whiteSpace: "nowrap",
+              flexShrink: 0,
+            }}
+          >
+            {contextSubtitle}
+          </span>
+        </div>
+      </div>
+
+      {onClose && (
+        <button
+          type="button"
+          className="fd-btn"
+          data-testid="right-panel-close-btn"
+          aria-label="Close right split panel"
+          title="Close right split panel"
+          style={{ padding: "4px 7px", fontSize: "12px", lineHeight: 1, flexShrink: 0 }}
+          onClick={onClose}
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  );
+};
+
 export function getTabContextTier(tab: CockpitTab): ContextTier {
   switch (tab) {
     case "chat":
@@ -167,19 +430,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
         data-testid="cockpit-tab-bar"
         className="fd-tab-bar fd-three-tier-bar"
       >
-        {onOpenMobileRoster && (
-          <button
-            type="button"
-            className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
-            onClick={onOpenMobileRoster}
-            aria-label="Toggle Agent Roster"
-            aria-expanded={mobileSidebarOpen}
-            data-testid="mobile-sidebar-toggle-btn"
-          >
-            ☰ Roster
-          </button>
-        )}
-
         <span
           className={`fd-badge fd-scope-pill fd-scope-pill-${activeTier}`}
           data-testid="active-context-tier-badge"
@@ -201,21 +451,30 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
 
         {/* Tier 1: Agent Context */}
         <div
-          className={`fd-tier-group fd-tier-agent${activeTier === "agent" ? " is-active-tier" : ""}`}
+          className={`fd-tier-group fd-tier-agent${activeTier === "agent" || activeTier === "project" ? " is-active-tier" : ""}`}
           data-testid="tier-agent-nav"
-          data-active-tier={activeTier === "agent" ? "true" : undefined}
+          data-active-tier={activeTier === "agent" || activeTier === "project" ? "true" : undefined}
         >
-          <span className="fd-tier-label">Agent</span>
+          <span className="fd-tier-label" title="Active Agent">
+            Agent
+          </span>
 
           {selectedAgent ? (
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ fontWeight: 700, fontSize: "14px" }}>
+              <span style={{ fontWeight: 700, fontSize: "14px" }} title="Active Agent Name">
                 {selectedAgent.display_name}
               </span>
-              <span className="fd-badge">{formatRoleLabel(selectedAgent.role)}</span>
+              <span className="fd-badge" title="Agent Role">
+                {formatRoleLabel(selectedAgent.role)}
+              </span>
             </div>
           ) : (
-            <span style={{ fontWeight: 600, color: "var(--text-muted)" }}>No Agent Selected</span>
+            <span
+              style={{ fontWeight: 600, color: "var(--text-muted)" }}
+              title="Active Agent Name"
+            >
+              No Agent Selected
+            </span>
           )}
 
           {agentSessions.length > 0 && (
@@ -223,6 +482,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               {agentSessions.length > 1 && (
                 <select
                   aria-label="Active Session"
+                  title="Switch Active Session"
                   data-testid="session-selector"
                   className="fd-select fd-mono"
                   style={{ fontSize: "11px", padding: "4px 8px" }}
@@ -238,12 +498,23 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               )}
 
               {activeSession?.adapter && (
-                <span className={getAdapterBadgeClass(activeSession.adapter)}>
+                <span
+                  className={getAdapterBadgeClass(activeSession.adapter)}
+                  title="Agent Harness / Adapter"
+                >
                   {activeSession.adapter}
                 </span>
               )}
             </div>
           )}
+
+          <span
+            className="fd-badge"
+            data-testid="active-project-badge"
+            title="Current Project"
+          >
+            {selectedAgent?.project ?? "Workspace"}
+          </span>
 
           <div
             style={{
@@ -259,48 +530,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             }}
           >
             {renderTabButton({ id: "chat", label: "Chat" })}
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            {renderTabButton({ id: "mail", label: "Wire Mail" })}
-          </div>
-        </div>
-
-        <span className="fd-tier-divider" aria-hidden="true" />
-
-        {/* Tier 2: Project Context */}
-        <div
-          className={`fd-tier-group fd-tier-project${activeTier === "project" ? " is-active-tier" : ""}`}
-          data-testid="tier-project-nav"
-          data-active-tier={activeTier === "project" ? "true" : undefined}
-        >
-          <span className="fd-tier-label">Project</span>
-
-          <span
-            className="fd-badge"
-            data-testid="active-project-badge"
-            title={selectedAgent?.project ? `Project: ${selectedAgent.project}` : "Workspace"}
-          >
-            {selectedAgent?.project ?? "Workspace"}
-          </span>
-
-          <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-            {PROJECT_TIER_TABS.map(renderTabButton)}
-            <button
-              type="button"
-              data-testid="split-view-toggle"
-              className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
-              onClick={() => onToggleSplitView?.()}
-              title="Toggle Desktop Split-View (Chat + Secondary Pane)"
-              aria-label={splitView ? "Close right split panel" : "Open right split panel"}
-              aria-pressed={splitView}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
-                <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
-                <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
-              </svg>
-            </button>
           </div>
         </div>
 

@@ -115,9 +115,10 @@ describe("Wave A UI — Records 10, 4 & 29", () => {
 
       const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
 
-      // Switch to Git & PRs tab and click context-help-btn
+      // Open right split panel and switch to Git & PRs tab, then click context-help-btn
       const tabBar = await screen.findByTestId("cockpit-tab-bar");
-      fireEvent.click(within(tabBar).getByRole("tab", { name: /^Git & PRs$/i }));
+      fireEvent.click(screen.getByTestId("split-view-toggle"));
+      fireEvent.click(screen.getByTestId("right-panel-tab-git"));
       fireEvent.click(screen.getByTestId("context-help-btn"));
 
       const drawer = await screen.findByTestId("contextual-help-drawer");

@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
-import { ContextHeader } from "../components/ContextHeader";
+import { ContextHeader, RightPanelHeader } from "../components/ContextHeader";
+import { ChatPane } from "../components/ChatPane";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import { PairingModal } from "../components/PairingModal";
 import {
@@ -513,29 +514,42 @@ describe("ContextHeader", () => {
     const onOpenMobileRoster = vi.fn();
 
     render(
-      <ContextHeader
-        selectedAgent={ferris}
-        sessions={sessions}
-        selectedSessionId="sess-1"
-        onSelectSession={onSelectSession}
-        activeTab="chat"
-        onSelectTab={onSelectTab}
-        authority={{ tier: "owner", login: "lmcfarlin" }}
-        wsConnected={true}
-        onOpenPairingModal={onOpenPairingModal}
-        onOpenMobileRoster={onOpenMobileRoster}
-      />,
+      <>
+        <ContextHeader
+          selectedAgent={ferris}
+          sessions={sessions}
+          selectedSessionId="sess-1"
+          onSelectSession={onSelectSession}
+          activeTab="chat"
+          onSelectTab={onSelectTab}
+          authority={{ tier: "owner", login: "lmcfarlin" }}
+          wsConnected={true}
+          onOpenPairingModal={onOpenPairingModal}
+        />
+        <ChatPane
+          agentName={ferris.name_key}
+          agentDisplayName={ferris.display_name}
+          sessionId="sess-1"
+          turns={[]}
+          onOpenMobileRoster={onOpenMobileRoster}
+        />
+        <RightPanelHeader
+          selectedAgent={ferris}
+          rightSplitTab="artifacts"
+          onSelectTab={onSelectTab}
+        />
+      </>,
     );
 
     expect(screen.getByText("Ferris")).toBeInTheDocument();
-    expect(screen.getByText("FerroLoop")).toBeInTheDocument();
+    expect(screen.getAllByText("FerroLoop").length).toBeGreaterThan(0);
     expect(screen.getByText(/Owner:\s*lmcfarlin/i)).toBeInTheDocument();
 
-    // Switch tab to Git & PRs
-    fireEvent.click(screen.getByRole("tab", { name: /Git & PRs/i }));
+    // Switch tab to Git & PRs via RightPanelHeader
+    fireEvent.click(screen.getByTestId("right-panel-tab-git"));
     expect(onSelectTab).toHaveBeenCalledWith("git");
 
-    // Inline mobile roster toggle
+    // Inline mobile roster toggle inside ChatPane toolbar
     fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));
     expect(onOpenMobileRoster).toHaveBeenCalledTimes(1);
 

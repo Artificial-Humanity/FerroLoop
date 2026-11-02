@@ -6,6 +6,7 @@ import type { HubWsClient } from "../api/ws";
 import {
   COCKPIT_TABS,
   ContextHeader,
+  RightPanelHeader,
   getTabContextTier,
 } from "../components/ContextHeader";
 import {
@@ -69,30 +70,28 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     );
 
     const tabBar = screen.getByTestId("cockpit-tab-bar");
-    expect(within(tabBar).getAllByRole("tab")).toHaveLength(9);
+    expect(within(tabBar).getAllByRole("tab")).toHaveLength(5);
 
-    // Tier 1: Agent Context (header-agent-settings-btn removed; per-agent settings lives in RosterSidebar & SettingsModal)
+    // Tier 1: Agent Context (includes active-project-badge; Wire Mail, Artifacts, Git & PRs, and Records & Board moved to RightPanelHeader)
     const agentNav = within(tabBar).getByTestId("tier-agent-nav");
-    expect(within(agentNav).getByText("Ferris")).toBeInTheDocument();
-    expect(within(agentNav).getByRole("tab", { name: /^Chat$/i })).toBeInTheDocument();
-    expect(within(agentNav).getByRole("tab", { name: /^Wire Mail$/i })).toBeInTheDocument();
-    expect(within(agentNav).queryByTestId("header-agent-settings-btn")).toBeNull();
-
-    // Tier 2: Project Context (session-cwd-badge moved into Project Settings summary card)
-    const projectNav = within(tabBar).getByTestId("tier-project-nav");
-    expect(within(projectNav).getByTestId("active-project-badge")).toHaveTextContent(
-      "FerroLoop",
+    expect(within(agentNav).getByText("Ferris")).toHaveAttribute(
+      "title",
+      "Active Agent Name",
     );
-    expect(within(projectNav).queryByTestId("session-cwd-badge")).toBeNull();
-    expect(within(projectNav).getByRole("tab", { name: /^Artifacts$/i })).toBeInTheDocument();
-    expect(within(projectNav).getByRole("tab", { name: /^Git & PRs$/i })).toBeInTheDocument();
-    const recordsTabBtn = within(projectNav).getByRole("tab", {
-      name: /^Records & Board$/i,
-    });
-    expect(recordsTabBtn).toBeInTheDocument();
-    const splitToggleBtn = within(projectNav).getByTestId("split-view-toggle");
-    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
-    expect(recordsTabBtn.nextElementSibling).toBe(splitToggleBtn);
+    expect(within(agentNav).getByRole("tab", { name: /^Chat$/i })).toBeInTheDocument();
+    expect(within(agentNav).queryByRole("tab", { name: /^Wire Mail$/i })).toBeNull();
+    expect(within(agentNav).queryByTestId("header-agent-settings-btn")).toBeNull();
+    const projectBadge = within(agentNav).getByTestId("active-project-badge");
+    expect(projectBadge).toHaveTextContent("FerroLoop");
+    expect(projectBadge).toHaveAttribute("title", "Current Project");
+    expect(within(tabBar).queryByTestId("tier-project-nav")).toBeNull();
+    expect(within(agentNav).queryByTestId("session-cwd-badge")).toBeNull();
+    expect(within(agentNav).queryByRole("tab", { name: /^Artifacts$/i })).toBeNull();
+    expect(within(agentNav).queryByRole("tab", { name: /^Git & PRs$/i })).toBeNull();
+    expect(
+      within(agentNav).queryByRole("tab", { name: /^Records & Board$/i }),
+    ).toBeNull();
+    expect(within(agentNav).queryByTestId("split-view-toggle")).toBeNull();
 
     // Tier 3: System Context (inline inside tier-system-nav)
     const systemNav = within(tabBar).getByTestId("tier-system-nav");
@@ -107,7 +106,58 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(systemNav).queryByTestId("system-utility-bar")).toBeNull();
   });
 
-  it("updates active-context-tier-badge when switching between Agent, Project, and System tabs and opens AgentSettingsModal via header-agent-settings-btn", async () => {
+  it("renders RightPanelHeader icon tabs with tooltips and hides Wire Mail when selectedAgent is null", () => {
+    const ferris = DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key === "ferris")!;
+    const onSelectTab = vi.fn();
+
+    const { rerender } = render(
+      <RightPanelHeader
+        selectedAgent={ferris}
+        rightSplitTab="git"
+        onSelectTab={onSelectTab}
+      />,
+    );
+
+    const header = screen.getByTestId("right-panel-header");
+    expect(within(header).getByTestId("right-panel-tab-mail")).toHaveAttribute(
+      "title",
+      "Wire Mail",
+    );
+    expect(within(header).getByTestId("right-panel-tab-artifacts")).toHaveAttribute(
+      "title",
+      "Artifacts",
+    );
+    expect(within(header).getByTestId("right-panel-tab-git")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(header).getByTestId("right-panel-tab-board")).toHaveAttribute(
+      "title",
+      "Records & Board",
+    );
+    expect(within(header).getByTestId("right-panel-active-title")).toHaveTextContent(
+      "Git & PRs",
+    );
+
+    // When selectedAgent is null, Wire Mail is hidden and 'mail' falls back to 'artifacts'
+    rerender(
+      <RightPanelHeader
+        selectedAgent={null}
+        rightSplitTab="mail"
+        onSelectTab={onSelectTab}
+      />,
+    );
+    expect(within(header).queryByTestId("right-panel-tab-mail")).toBeNull();
+    expect(within(header).getByTestId("right-panel-tab-artifacts")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(header).getByTestId("right-panel-active-title")).toHaveTextContent(
+      "Artifacts",
+    );
+  });
+
+  it("updates active-context-tier-badge when opening right split panel via split-view-toggle and switching views in right-panel-header", async () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       const json = (body: unknown) =>
@@ -156,15 +206,50 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(scopeBadge).toHaveAttribute("data-tier", "agent");
     expect(scopeBadge).toHaveTextContent("Scope: Agent · Ferris");
     expect(screen.queryByTestId("chat-artifacts-toggle-btn")).toBeNull();
-    expect(within(screen.getByTestId("chat-pane")).queryByTestId("split-view-toggle")).toBeNull();
-    expect(
-      within(screen.getByTestId("tier-project-nav")).getByTestId("split-view-toggle"),
-    ).toHaveAttribute("aria-pressed", "false");
+    const chatPane = screen.getByTestId("chat-pane");
+    const splitToggleBtn = within(chatPane).getByTestId("split-view-toggle");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
+    const rosterToggleBtn = within(chatPane).getByTestId("mobile-sidebar-toggle-btn");
+    const filterInput = within(chatPane).getByPlaceholderText(
+      /Filter transcript turns, tools, or reasoning/i,
+    );
+    expect(rosterToggleBtn.nextElementSibling).toBe(filterInput);
 
-    // Switch to Git & PRs (Project tier) -> opens right split panel while keeping ChatPane mounted
-    const tabBar = screen.getByTestId("cockpit-tab-bar");
-    const gitTabBtn = within(tabBar).getByRole("tab", { name: /^Git & PRs$/i });
-    fireEvent.click(gitTabBtn);
+    // Open right split panel via split-view-toggle -> mounts right-panel-header
+    fireEvent.click(splitToggleBtn);
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "true");
+    const rightHeader = screen.getByTestId("right-panel-header");
+    expect(rightHeader).toBeInTheDocument();
+
+    // Select Artifacts, Wire Mail, Records & Board, and Git & PRs from right-panel-header
+    fireEvent.click(within(rightHeader).getByTestId("right-panel-tab-artifacts"));
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
+      "data-tier",
+      "project",
+    );
+    expect(within(rightHeader).getByTestId("right-panel-active-title")).toHaveTextContent(
+      "Artifacts",
+    );
+
+    fireEvent.click(within(rightHeader).getByTestId("right-panel-tab-mail"));
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
+      "data-tier",
+      "agent",
+    );
+    expect(within(rightHeader).getByTestId("right-panel-active-title")).toHaveTextContent(
+      "Wire Mail",
+    );
+
+    fireEvent.click(within(rightHeader).getByTestId("right-panel-tab-board"));
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
+      "data-tier",
+      "project",
+    );
+    expect(within(rightHeader).getByTestId("right-panel-active-title")).toHaveTextContent(
+      "Records & Board",
+    );
+
+    fireEvent.click(within(rightHeader).getByTestId("right-panel-tab-git"));
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
       "project",
@@ -172,18 +257,19 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: Project · FerroLoop",
     );
-    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
-    // Clicking the same right-panel tab again closes the right split panel and returns to Chat
-    fireEvent.click(gitTabBtn);
-    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "false");
+    // Clicking split-view-toggle closes the right split panel and returns to Chat
+    fireEvent.click(splitToggleBtn);
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(screen.queryByTestId("right-panel-header")).toBeNull();
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
       "agent",
     );
 
     // Switch to Hub & Arch (System tier) -> opens right split panel on Hub & Arch
+    const tabBar = screen.getByTestId("cockpit-tab-bar");
     fireEvent.click(within(tabBar).getByRole("tab", { name: /^Hub & Arch$/i }));
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
@@ -192,7 +278,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: System · AI-Lab-0",
     );
-    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "true");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
     unmount();
