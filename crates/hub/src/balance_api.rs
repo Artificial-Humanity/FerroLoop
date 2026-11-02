@@ -73,9 +73,10 @@ use crate::api::{
     RemodelRun, load_discovery_snapshot, resolve_session_target_in, run_remodel, store_open_failure,
 };
 use crate::auth::HubAuthority;
+use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
     DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
-    quota_for_resolved_route,
+    quota_for_resolved_route_at,
 };
 use crate::lifecycle::{
     self, Caller, HostedSessionRecord, LifecycleEnv, RemodelRequest, STATUS_DECOMMISSIONED,
@@ -219,9 +220,11 @@ fn caller_of(authority: &HubAuthority) -> Caller {
 }
 
 /// The one account-quota probe a balance plan makes for a vendor no discovered session reports.
-/// Every account probe goes through here.
+/// Every account probe goes through here. There is no session, so the Antigravity probe gets no
+/// route, model or conversation id: it reads the account the environment's language server
+/// serves, and only when the host may be probed (no `home_override`).
 fn account_quota(vendor: &str, home: Option<&Path>) -> Option<SessionQuotaUsage> {
-    quota_for_resolved_route(vendor, None, home)
+    quota_for_resolved_route_at(vendor, None, home, &AgyQuotaTarget::default())
 }
 
 /// The live quota readings: every discovered route session's, then an account probe for each

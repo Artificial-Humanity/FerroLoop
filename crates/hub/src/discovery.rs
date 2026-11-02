@@ -689,6 +689,14 @@ fn discover_sessions_impl(
                 csrf_token,
                 ..
             } => {
+                // Remember the endpoint whatever the caller reads now: the watch and
+                // transcript quota reads never run a model-info pass, yet need it.
+                crate::direct_quota::remember_agy_endpoint(
+                    home_override,
+                    conversation_id,
+                    ls_address.as_deref(),
+                    csrf_token.as_deref(),
+                );
                 agy_endpoints.insert(
                     conversation_id.clone(),
                     (ls_address.clone(), csrf_token.clone()),
@@ -797,20 +805,29 @@ fn discover_sessions_impl(
         if session.source == "route" && with_model_info {
             // `home` is for transcript lookup only. Production passes `None`
             // so probes may use `PATH`; `Some($HOME)` would skip them.
-            session.quota_usage = quota_for_resolved_route(
-                &session.adapter,
-                session.transcript_path.as_deref(),
-                home_override,
-            );
             let endpoint = agy_endpoints.get(&session.id);
+            let agy_address = endpoint.and_then(|(addr, _)| addr.as_deref());
+            let agy_csrf = endpoint.and_then(|(_, csrf)| csrf.as_deref());
             let info = session_model_info(
                 &session.adapter,
                 &session.id,
                 session.transcript_path.as_deref(),
                 home.as_deref(),
-                endpoint.and_then(|(addr, _)| addr.as_deref()),
-                endpoint.and_then(|(_, csrf)| csrf.as_deref()),
+                agy_address,
+                agy_csrf,
                 agy_env_fallback_allowed(home_override),
+            );
+            // The quota read needs the model: Antigravity keeps separate buckets per model family.
+            session.quota_usage = quota_for_resolved_route_at(
+                &session.adapter,
+                session.transcript_path.as_deref(),
+                home_override,
+                &crate::direct_quota::AgyQuotaTarget {
+                    address: agy_address,
+                    csrf: agy_csrf,
+                    model: info.model.as_deref(),
+                    session: Some(&session.id),
+                },
             );
             session.model = info.model;
             session.thinking_level = info.thinking_level;
@@ -874,7 +891,7 @@ fn owned_strings(list: &[&str]) -> Vec<String> {
 /// Whether `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` may supply a missing route
 /// value. Never with a home override (tests, hermetic runs) or with host discovery disabled,
 /// so those runs cannot reach the host's language server.
-fn agy_env_fallback_allowed(home_override: Option<&Path>) -> bool {
+pub(crate) fn agy_env_fallback_allowed(home_override: Option<&Path>) -> bool {
     home_override.is_none() && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
 }
 
@@ -1133,7 +1150,13 @@ fn agy_cache_put<K: Ord, V>(cache: &AgyCache<K, V>, key: K, value: Option<V>) {
     guard.insert(key, (Instant::now(), value));
 }
 
-fn agy_rpc(port: u16, csrf: &str, method: &str, body: &str, max_bytes: usize) -> Option<String> {
+pub(crate) fn agy_rpc(
+    port: u16,
+    csrf: &str,
+    method: &str,
+    body: &str,
+    max_bytes: usize,
+) -> Option<String> {
     let procedure = format!("{AGY_LS_SERVICE}/{method}");
     let (code, _, resp) = fl_wire::dispatcher::post_agy_connect_rpc_limited(
         port,
@@ -2245,16 +2268,82 @@ fn quota_usage_with_reads_locked(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
     let tpath = find_transcript_file_in_home(&home, trimmed)?;
     let adapter = adapter_for_transcript(Path::new(&tpath))?;
-    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override, files)
+    // An Antigravity session's language server comes from its route; a restarted one has a new
+    // address and token, so the route wins over what an earlier read stored. The model is not
+    // known here, so the stored hint (or the `gemini-*` default) supplies it.
+    let (address, csrf) = if adapter == "antigravity" {
+        agy_route_endpoint(home_override, trimmed)
+    } else {
+        (None, None)
+    };
+    quota_for_resolved_route_locked(
+        &adapter,
+        Some(&tpath),
+        home_override,
+        files,
+        &crate::direct_quota::AgyQuotaTarget {
+            address: address.as_deref(),
+            csrf: csrf.as_deref(),
+            model: None,
+            session: Some(trimmed),
+        },
+    )
+}
+
+/// The language-server address and token the saved route table names for Antigravity conversation
+/// `conversation_id`, or `(None, None)` when no route matches.
+fn agy_route_endpoint(
+    home_override: Option<&Path>,
+    conversation_id: &str,
+) -> (Option<String>, Option<String>) {
+    // The host's shared scan is cached; a home override has no cache, so read its saved table
+    // (one file) rather than scan it again. The by-id endpoints budget one scan per request.
+    let routes = match route_table_path(home_override) {
+        Some(path) => RouteTable::load(Some(&path)),
+        None => discovered_route_table(None),
+    };
+    routes
+        .entries
+        .values()
+        .find_map(|entry| match &entry.route {
+            VendorRoute::Agy {
+                conversation_id: id,
+                ls_address,
+                csrf_token,
+                ..
+            } if id == conversation_id => Some((ls_address.clone(), csrf_token.clone())),
+            _ => None,
+        })
+        .unwrap_or((None, None))
 }
 
 /// Quota for a route row whose transcript path is already known.
 ///
-/// This does not search the home directory again.
+/// This does not search the home directory again. `session_id` lets the Antigravity read reuse
+/// the language-server route and model an earlier discovery pass remembered for that session.
 pub(crate) fn quota_for_resolved_route(
     adapter: &str,
     transcript_path: Option<&str>,
     home_override: Option<&Path>,
+    session_id: &str,
+) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route_at(
+        adapter,
+        transcript_path,
+        home_override,
+        &crate::direct_quota::AgyQuotaTarget {
+            session: Some(session_id),
+            ..Default::default()
+        },
+    )
+}
+
+/// [`quota_for_resolved_route`] for a session whose Antigravity endpoint and model are known.
+pub(crate) fn quota_for_resolved_route_at(
+    adapter: &str,
+    transcript_path: Option<&str>,
+    home_override: Option<&Path>,
+    agy: &crate::direct_quota::AgyQuotaTarget<'_>,
 ) -> Option<SessionQuotaUsage> {
     crate::direct_quota::with_probe_lock(|| {
         quota_for_resolved_route_locked(
@@ -2262,6 +2351,7 @@ pub(crate) fn quota_for_resolved_route(
             transcript_path,
             home_override,
             &mut TranscriptReads::default(),
+            agy,
         )
     })
 }
@@ -2271,6 +2361,7 @@ fn quota_for_resolved_route_locked(
     transcript_path: Option<&str>,
     home_override: Option<&Path>,
     files: &mut TranscriptReads,
+    agy: &crate::direct_quota::AgyQuotaTarget<'_>,
 ) -> Option<SessionQuotaUsage> {
     let home = home_override
         .map(Path::to_path_buf)
@@ -2313,7 +2404,7 @@ fn quota_for_resolved_route_locked(
                     exhausted_reason: Some(reason),
                 })
             });
-            let account = crate::direct_quota::agy_account_quota(home_override);
+            let account = crate::direct_quota::agy_account_quota(home_override, agy);
             crate::direct_quota::merge_account_quota(account, disk)
         }
         _ => None,
@@ -5013,7 +5104,12 @@ mod tests {
         let agy = session_for(&sessions, "ferris");
         assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
         assert_eq!(agy.thinking_level.as_deref(), Some("high"));
-        assert_eq!(seen.lock().unwrap().len(), 2, "discovery reused the cache");
+        // Discovery reused the model cache. It also asked for the account quota, once per call.
+        let calls = seen.lock().unwrap().clone();
+        let quota_calls = |method: &str| calls.iter().filter(|(p, _)| p.ends_with(method)).count();
+        assert_eq!(calls.len(), 4, "discovery reused the cache: {calls:?}");
+        assert_eq!(quota_calls("/RetrieveUserQuotaSummary"), 1);
+        assert_eq!(quota_calls("/GetUserStatus"), 1);
 
         stub.shutdown();
     }
@@ -7651,9 +7747,9 @@ mod tests {
             }
         });
         fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
-        assert!(quota_for_resolved_route("grok", None, Some(home)).is_none());
+        assert!(quota_for_resolved_route("grok", None, Some(home), "s").is_none());
 
-        let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home))
+        let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home), "s")
             .expect("resolved grok path");
         assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
 
@@ -7670,11 +7766,11 @@ mod tests {
             }
         });
         fs::write(&rollout, format!("{event}\n")).unwrap();
-        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None)
+        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None, "s")
             .expect("resolved codex path");
         assert_eq!(codex.tier.as_deref(), Some("plus"));
         assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
-        assert!(quota_for_resolved_route("codex", None, Some(home)).is_none());
+        assert!(quota_for_resolved_route("codex", None, Some(home), "s").is_none());
     }
 
     #[test]
