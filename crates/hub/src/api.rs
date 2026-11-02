@@ -560,6 +560,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/runtimes/probe") => {
             crate::runtime_matrix::handle_post_probe(state, &authority, req)
         }
+        ("POST", "/api/v1/runtimes/update") => {
+            crate::runtime_update::handle_post_update(state, &authority, req)
+        }
         ("GET", "/api/v1/nodes") => handle_get_nodes(state),
         ("POST", "/api/v1/nodes/enroll-token") => handle_post_enroll_token(state, &authority, req),
         _ => handle_dynamic_api_routes(state, &authority, req),

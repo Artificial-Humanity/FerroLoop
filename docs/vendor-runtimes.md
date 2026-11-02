@@ -33,6 +33,35 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+## Runtime matrix: quotas and CLI updates
+
+`GET /api/v1/runtimes/matrix` and `POST /api/v1/runtimes/probe` (owner only) list the CLI
+runtimes `claude`, `codex`, `grok`, `agy` and `muse`. Each row carries `update_supported` and
+`update_command` (for example `claude update`). The matrix also carries `vendor_quotas`, a map
+from adapter id (`claude`, `codex`, `grok`, `antigravity`, `muse`) to a `SessionQuotaUsage`.
+For each selected vendor the reading is the one with the most data among its newest route
+sessions (four at most are read from disk), else the account probe above. A vendor whose
+allowance is unknown has no entry. A hub with a home override never reads the real home.
+
+`POST /api/v1/runtimes/update` (owner only) runs a CLI's own update command. The body is
+`{"runtime": "claude" | "codex" | "grok" | "agy" | "muse" | "all"}`; any other body is `400`.
+The command is fixed in the hub and runs without a shell and without caller arguments:
+
+| Runtime | Command | Source |
+| --- | --- | --- |
+| `claude` | `claude update` | `claude --help` lists `update\|upgrade` |
+| `codex` | `codex update` | `codex --help` lists `update` |
+| `grok` | `grok update` | `grok --help` lists `update` (no flag installs the latest) |
+| `agy` | `agy update` | `agy --help` lists `update` ("Update CLI") |
+| `muse` | none | no update subcommand; its launcher updates itself in the background |
+
+Each command is stopped after 300 seconds (its process group is killed) and its output is kept
+as the last 4 KiB without terminal escapes. One update runs at a time: a second request gets
+`409`. One runtime answers with one object, `all` with an array in the order above:
+`{runtime, ok, version_before, version_after, status, output_tail}`, where `status` is
+`updated`, `unchanged`, `failed`, `unsupported`, `not_installed` or `timeout`. After a run the
+cached probe is dropped, so the next matrix read shows the new version.
+
 ## Antigravity
 
 Home: `~/.gemini/antigravity-cli/`.

@@ -8,10 +8,15 @@
 //!    provisioned and unexpired. Secret values are never read, only metadata;
 //! 3. local inference engines (Ollama, Lemonade) on loopback: reachability, latency and models.
 //!
+//! The matrix also carries `vendor_quotas`: the account allowance of each vendor (see
+//! [`QuotaSource`]), and every CLI row says whether it can update itself (`update_supported`,
+//! `update_command`; see [`crate::runtime_update`], which serves `POST /api/v1/runtimes/update`).
+//!
 //! Every probe is bounded. The three tiers and every item inside them run concurrently, so the
 //! worst case is one probe timeout, not the sum of all of them. Probing is owner only and goes
 //! through a [`ProbeGate`]: one probe at a time, and a fresh result is served again.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -28,9 +33,12 @@ use serde_json::{Value, json};
 use crate::HubState;
 use crate::api::{HttpRequest, HttpResponse};
 use crate::auth::HubAuthority;
+use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
-    DiscoveredSessionSummary, discover_route_sessions_without_model_info, snapshot_discovery_store,
+    DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
+    quota_for_resolved_route, quota_for_resolved_route_at, snapshot_discovery_store,
 };
+use crate::runtime_update::update_command;
 
 /// Subscription CLI runtimes, in display order.
 pub const CLI_RUNTIMES: [&str; 5] = ["claude", "codex", "grok", "agy", "muse"];
@@ -44,7 +52,7 @@ pub const VAULT_PROVIDERS: [(&str, &str); 6] = [
     ("kimi", "MOONSHOT_API_KEY"),
 ];
 
-const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PROBE_OUTPUT: usize = 4096;
 const MAX_LOCAL_BODY: usize = 256 * 1024;
@@ -105,6 +113,12 @@ pub struct CliRuntimeStatus {
     pub active_routes: usize,
     pub live_sessions: usize,
     pub probe_ms: u64,
+    /// Whether the CLI has a self-update command `POST /api/v1/runtimes/update` can run. Fixed
+    /// per runtime, whether or not the binary is installed.
+    pub update_supported: bool,
+    /// The update command as shown to a person (for example `claude update`); `None` when
+    /// `update_supported` is false.
+    pub update_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,6 +206,9 @@ pub struct RuntimeMatrix {
     /// The registered vendor catalog, sorted by id. Descriptor data only: no key value, and no
     /// probe result.
     pub vendors: Vec<VendorCatalogEntry>,
+    /// Account allowance per vendor adapter (`claude`, `codex`, `grok`, `antigravity`, `muse`),
+    /// for the CLI runtimes the probe selected. A vendor whose allowance is unknown has no entry.
+    pub vendor_quotas: BTreeMap<String, SessionQuotaUsage>,
     /// Vault failure (for example an unreadable vault file). The tier is then empty of
     /// `provisioned` secrets rather than the whole matrix failing.
     pub vault_error: Option<String>,
@@ -205,6 +222,100 @@ pub struct ProbeInputs {
     pub vault: Result<Vec<VaultSecretMetadata>, String>,
     pub local_engines: Vec<LocalEngineSpec>,
     pub now_ms: u64,
+    /// The hub's `home_override` (a sandboxed hub, such as a test's), as the quota readers need it:
+    /// `None` lets them read the real home.
+    pub home_override: Option<PathBuf>,
+    pub quota_source: QuotaSource,
+}
+
+/// How the matrix reads a vendor's account allowance. The readers are plain functions so a test
+/// can supply its own and never reach the host.
+#[derive(Clone, Copy)]
+pub struct QuotaSource {
+    /// The allowance a discovered route session reports (its transcript, and the account).
+    pub session: fn(&DiscoveredSessionSummary, Option<&Path>) -> Option<SessionQuotaUsage>,
+    /// The account allowance of an adapter that no session reports.
+    pub account: fn(&str, Option<&Path>) -> Option<SessionQuotaUsage>,
+}
+
+impl QuotaSource {
+    /// The host's readers, which the direct-quota caches bound (60 s, 3 s per cold probe).
+    pub const HOST: Self = Self {
+        session: host_session_quota,
+        account: host_account_quota,
+    };
+    /// Reads nothing.
+    pub const NONE: Self = Self {
+        session: |_, _| None,
+        account: |_, _| None,
+    };
+}
+
+fn host_session_quota(
+    session: &DiscoveredSessionSummary,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route(
+        &session.adapter,
+        session.transcript_path.as_deref(),
+        home_override,
+        &session.id,
+    )
+}
+
+/// The account probe `GET /api/v1/watch/balance` uses: no session, so no route, model or
+/// conversation id.
+fn host_account_quota(adapter: &str, home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+}
+
+/// Route sessions per adapter whose allowance is read from disk, newest first. Bounds the cost
+/// of a probe on a host with many sessions.
+const MAX_QUOTA_SESSIONS_PER_ADAPTER: usize = 4;
+
+/// The adapter id discovery gives a session of the CLI runtime `cli`.
+fn quota_adapter(cli: &str) -> &str {
+    if cli == "agy" { "antigravity" } else { cli }
+}
+
+/// How many facts a quota reading holds; the reading with the most is the most useful.
+fn quota_richness(q: &SessionQuotaUsage) -> usize {
+    let text = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
+    usize::from(text(&q.tier))
+        + usize::from(q.primary_window.is_some())
+        + usize::from(q.secondary_window.is_some())
+        + usize::from(text(&q.exhausted_reason))
+}
+
+/// The allowance of one vendor: the richest reading among its sessions (the newest session wins
+/// a tie), else the account probe.
+fn vendor_quota(adapter: &str, inputs: &ProbeInputs) -> Option<SessionQuotaUsage> {
+    let home = inputs.home_override.as_deref();
+    let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
+        .sessions
+        .iter()
+        .filter(|s| s.adapter == adapter)
+        .collect();
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
+    let mut best: Option<(usize, SessionQuotaUsage)> = None;
+    for session in sessions {
+        let reading = match &session.quota_usage {
+            Some(q) => Some(q.clone()),
+            None if session.source == "route" && reads_left > 0 => {
+                reads_left -= 1;
+                (inputs.quota_source.session)(session, home)
+            }
+            None => None,
+        };
+        let Some(reading) = reading else { continue };
+        let richness = quota_richness(&reading);
+        if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
+            best = Some((richness, reading));
+        }
+    }
+    best.map(|(_, q)| q)
+        .or_else(|| (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q) > 0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +443,7 @@ fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection
 /// Run the selected probes. Unknown `target` is an error; no target selects everything.
 pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<RuntimeMatrix, String> {
     let sel = select(target, &inputs.local_engines)?;
-    let (cli_runtimes, local_engines) = std::thread::scope(|scope| {
+    let (cli_runtimes, local_engines, vendor_quotas) = std::thread::scope(|scope| {
         let cli_handles: Vec<_> = sel
             .cli
             .iter()
@@ -343,17 +454,29 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
             .iter()
             .map(|spec| scope.spawn(move || probe_local_engine(spec, LOCAL_TIMEOUT)))
             .collect();
+        let quota_handles: Vec<_> = sel
+            .cli
+            .iter()
+            .map(|name| {
+                let adapter = quota_adapter(name);
+                (adapter, scope.spawn(move || vendor_quota(adapter, inputs)))
+            })
+            .collect();
         let cli: Vec<CliRuntimeStatus> = cli_handles
             .into_iter()
             .zip(sel.cli.iter())
             .map(|(h, name)| h.join().unwrap_or_else(|_| panicked_cli(name)))
+            .collect();
+        let quotas: BTreeMap<String, SessionQuotaUsage> = quota_handles
+            .into_iter()
+            .filter_map(|(adapter, h)| Some((adapter.to_string(), h.join().ok()??)))
             .collect();
         let local: Vec<LocalEngineStatus> = local_handles
             .into_iter()
             .zip(sel.local.iter())
             .map(|(h, spec)| h.join().unwrap_or_else(|_| panicked_local(spec)))
             .collect();
-        (cli, local)
+        (cli, local, quotas)
     });
     let (vault_providers, vault_error) = match &inputs.vault {
         Ok(meta) => (vault_statuses(&sel.vault, meta, inputs.now_ms), None),
@@ -368,6 +491,7 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
         vault_providers,
         local_engines,
         vendors: sel.vendors.iter().map(VendorCatalogEntry::of).collect(),
+        vendor_quotas,
         vault_error,
     })
 }
@@ -382,6 +506,8 @@ fn panicked_cli(name: &str) -> CliRuntimeStatus {
         active_routes: 0,
         live_sessions: 0,
         probe_ms: 0,
+        update_command: update_command(name),
+        update_supported: update_command(name).is_some(),
     }
 }
 
@@ -447,6 +573,8 @@ fn probe_cli(name: &str, inputs: &ProbeInputs, timeout: Duration) -> CliRuntimeS
         active_routes,
         live_sessions,
         probe_ms: 0,
+        update_command: update_command(name),
+        update_supported: update_command(name).is_some(),
     };
     match find_binary(name, &inputs.path_env, inputs.home.as_deref()) {
         None => status.error = Some(format!("`{name}` not found in PATH or ~/.local/bin")),
@@ -543,7 +671,7 @@ fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Strin
 /// that still owns its pid, so `kill_group` can signal `-pid` knowing no other process holds that
 /// id; once a leader is reaped (`try_wait`, `wait`) and its group is empty, the id can be reused.
 #[cfg(unix)]
-fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+pub(crate) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
     // SAFETY: `waitid` with `WNOHANG | WNOWAIT` only fills `info` and leaves the child waitable;
     // an all-zero `siginfo_t` is a valid value to pass in. `si_pid` stays 0 while the child runs.
     unsafe {
@@ -562,13 +690,13 @@ fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+pub(crate) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
     child.try_wait().map(|status| status.is_some())
 }
 
 /// SIGKILL the child's process group, then reap the child. Call it only while the leader is
 /// unreaped, so `-pid` still names the child's own group.
-fn kill_group(
+pub(crate) fn kill_group(
     pid: u32,
     child: &mut std::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
@@ -735,7 +863,7 @@ fn parse_model_ids(kind: LocalEngineKind, body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn elapsed_ms(since: Instant) -> u64 {
+pub(crate) fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -774,6 +902,12 @@ impl Drop for Running<'_> {
 impl ProbeGate {
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forget the last result, so the next probe runs again. A CLI update calls this: the
+    /// versions the last result holds are out of date.
+    pub(crate) fn invalidate(&self) {
+        self.lock().last = None;
     }
 
     /// Serve `target` from the last result, refuse while another probe runs, or run `probe` and
@@ -830,6 +964,26 @@ pub(crate) fn vault_metadata(
         .map_err(|e| e.to_string())
 }
 
+/// Where this hub looks for the vendor CLIs: the `PATH` directories, and the home whose
+/// `.local/bin` is searched after them.
+///
+/// A hub with a `home_override` is sandboxed (its tests): it looks only under that home's
+/// `.local/bin`, never on the host's PATH, so a probe cannot run (and write the state of) the
+/// real `claude`, `codex`, `grok`, `agy` or `muse` of whoever runs it.
+pub(crate) fn cli_search_paths(state: &HubState) -> (String, Option<PathBuf>) {
+    let home = state
+        .config
+        .home_override
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let path_env = if state.config.home_override.is_some() {
+        String::new()
+    } else {
+        std::env::var("PATH").unwrap_or_default()
+    };
+    (path_env, home)
+}
+
 pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
     // Snapshot under the store guard, then drop it before any filesystem or network probing.
     let snapshot = match state.open_store() {
@@ -841,24 +995,12 @@ pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpRespons
             ));
         }
     };
-    let home = state
-        .config
-        .home_override
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let (path_env, home) = cli_search_paths(state);
     let sessions = discover_route_sessions_without_model_info(
         &snapshot,
         state.config.home_override.as_deref(),
     );
     let vault = vault_metadata(state.config.home_override.as_deref());
-    // A hub with a `home_override` is sandboxed (its tests): it looks for the vendor CLIs only
-    // under that home's `.local/bin`, never on the host's PATH, so a probe cannot run (and
-    // write the state of) the real `claude`, `codex`, `grok`, `agy` or `muse` of whoever runs it.
-    let path_env = if state.config.home_override.is_some() {
-        String::new()
-    } else {
-        std::env::var("PATH").unwrap_or_default()
-    };
     Ok(ProbeInputs {
         path_env,
         home,
@@ -866,6 +1008,8 @@ pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpRespons
         vault,
         local_engines: default_local_engines(),
         now_ms: stamp::now().unix_millis(),
+        home_override: state.config.home_override.clone(),
+        quota_source: QuotaSource::HOST,
     })
 }
 
@@ -996,6 +1140,8 @@ mod tests {
             vault: Ok(Vec::new()),
             local_engines: Vec::new(),
             now_ms: 1_800_000_000_000,
+            home_override: None,
+            quota_source: QuotaSource::NONE,
         }
     }
 
@@ -1607,5 +1753,280 @@ mod tests {
                 .to_string()
                 .contains("MOONSHOT_API_KEY")
         );
+    }
+
+    // ------------------------------------------------------------ vendor quotas
+
+    use crate::discovery::QuotaWindowUsage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn window(used: f64, minutes: u64) -> QuotaWindowUsage {
+        QuotaWindowUsage {
+            used_percent: used,
+            window_minutes: Some(minutes),
+            resets_at_ms: Some(1_800_000_600_000),
+        }
+    }
+
+    fn quota(
+        tier: Option<&str>,
+        primary: Option<f64>,
+        secondary: Option<f64>,
+    ) -> SessionQuotaUsage {
+        SessionQuotaUsage {
+            tier: tier.map(str::to_string),
+            primary_window: primary.map(|u| window(u, 300)),
+            secondary_window: secondary.map(|u| window(u, 10_080)),
+            exhausted_reason: None,
+        }
+    }
+
+    fn quota_session(
+        adapter: &str,
+        id: &str,
+        updated_at: &str,
+        q: Option<SessionQuotaUsage>,
+    ) -> DiscoveredSessionSummary {
+        let mut s = session(adapter, "route", "active");
+        s.id = id.to_string();
+        s.updated_at = Some(updated_at.to_string());
+        s.quota_usage = q;
+        s
+    }
+
+    fn only_cli(inp: &ProbeInputs, target: &str) -> RuntimeMatrix {
+        build_matrix(inp, Some(target)).unwrap()
+    }
+
+    #[test]
+    fn a_vendor_quota_is_the_richest_session_reading_and_the_account_is_not_probed() {
+        static ACCOUNT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                ACCOUNT_CALLS.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        };
+        inp.sessions = vec![
+            // Newest, but it knows only the tier.
+            quota_session(
+                "claude",
+                "c-new",
+                "2026-11-02T10:00:00Z",
+                Some(quota(Some("max"), None, None)),
+            ),
+            // Older, with both windows: the most data wins.
+            quota_session(
+                "claude",
+                "c-old",
+                "2026-11-01T10:00:00Z",
+                Some(quota(Some("max"), Some(40.0), Some(10.0))),
+            ),
+            quota_session(
+                "codex",
+                "x1",
+                "2026-11-01T10:00:00Z",
+                Some(quota(None, Some(5.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "claude");
+        let claude = &m.vendor_quotas["claude"];
+        assert_eq!(claude.primary_window.as_ref().unwrap().used_percent, 40.0);
+        assert_eq!(claude.secondary_window.as_ref().unwrap().used_percent, 10.0);
+        // A target selects its own vendor only.
+        assert_eq!(m.vendor_quotas.keys().collect::<Vec<_>>(), ["claude"]);
+        assert_eq!(ACCOUNT_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn equally_rich_readings_resolve_to_the_newest_session() {
+        let mut inp = inputs("", None);
+        inp.sessions = vec![
+            quota_session(
+                "codex",
+                "older",
+                "2026-11-01T10:00:00Z",
+                Some(quota(None, Some(90.0), None)),
+            ),
+            quota_session(
+                "codex",
+                "newer",
+                "2026-11-02T10:00:00Z",
+                Some(quota(None, Some(12.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "codex");
+        assert_eq!(
+            m.vendor_quotas["codex"]
+                .primary_window
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            12.0
+        );
+    }
+
+    #[test]
+    fn a_route_session_with_no_reading_is_read_from_disk_but_only_a_route_and_only_a_few() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |s, _| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                (s.id == "route-3").then(|| quota(Some("pro"), Some(7.0), Some(1.0)))
+            },
+            account: |_, _| None,
+        };
+        inp.sessions = (0..8)
+            .map(|i| {
+                quota_session(
+                    "grok",
+                    &format!("route-{i}"),
+                    &format!("2026-11-0{}T00:00:00Z", i + 1),
+                    None,
+                )
+            })
+            .collect();
+        let mut attempt = session("grok", "attempt", "running");
+        attempt.updated_at = Some("2026-12-01T00:00:00Z".into());
+        inp.sessions.push(attempt);
+        let m = only_cli(&inp, "grok");
+        // Newest first: route-7, 6, 5, 4 are read and hold nothing, so route-3 is out of reach.
+        assert_eq!(READS.load(Ordering::SeqCst), MAX_QUOTA_SESSIONS_PER_ADAPTER);
+        assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
+
+        READS.store(0, Ordering::SeqCst);
+        inp.sessions
+            .retain(|s| s.id != "route-7" && s.id != "route-6");
+        let m = only_cli(&inp, "grok");
+        assert_eq!(m.vendor_quotas["grok"].tier.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn the_account_probe_fills_in_a_vendor_no_session_reports() {
+        static HOME_SEEN: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
+        static ADAPTERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let mut inp = inputs("", None);
+        inp.home_override = Some(PathBuf::from("/sandbox/home"));
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |adapter, home| {
+                ADAPTERS.lock().unwrap().push(adapter.to_string());
+                *HOME_SEEN.lock().unwrap() = Some(home.map(Path::to_path_buf));
+                (adapter == "antigravity").then(|| quota(Some("ultra"), Some(20.0), None))
+            },
+        };
+        // A claude session that reports nothing does not stop the account probe either.
+        inp.sessions = vec![quota_session("claude", "c", "2026-11-02T00:00:00Z", None)];
+        let m = build_matrix(&inp, Some("cli")).unwrap();
+        assert_eq!(m.vendor_quotas.keys().collect::<Vec<_>>(), ["antigravity"]);
+        assert_eq!(
+            m.vendor_quotas["antigravity"].tier.as_deref(),
+            Some("ultra")
+        );
+        let mut adapters = ADAPTERS.lock().unwrap().clone();
+        adapters.sort();
+        // `agy` is probed under its adapter id, once per selected vendor.
+        assert_eq!(adapters, ["antigravity", "claude", "codex", "grok", "muse"]);
+        // The sandboxed home reaches the reader: the real HOME is never consulted.
+        assert_eq!(
+            HOME_SEEN.lock().unwrap().clone(),
+            Some(Some(PathBuf::from("/sandbox/home")))
+        );
+    }
+
+    #[test]
+    fn a_reading_with_no_data_is_not_a_quota() {
+        static ACCOUNT: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                ACCOUNT.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("  "), None, None))
+            },
+        };
+        inp.sessions = vec![quota_session(
+            "muse",
+            "m",
+            "2026-11-02T00:00:00Z",
+            Some(quota(None, None, None)),
+        )];
+        let m = only_cli(&inp, "muse");
+        assert!(m.vendor_quotas.is_empty());
+        assert_eq!(
+            ACCOUNT.load(Ordering::SeqCst),
+            1,
+            "the empty session reading fell through"
+        );
+    }
+
+    #[test]
+    fn no_sessions_and_no_account_data_is_an_empty_map_that_still_serializes() {
+        let m = build_matrix(&inputs("", None), None).unwrap();
+        assert!(m.vendor_quotas.is_empty());
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["vendor_quotas"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_tier_that_selects_no_cli_runtime_reads_no_quota() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            account: |_, _| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("x"), Some(1.0), None))
+            },
+        };
+        inp.sessions = vec![quota_session("claude", "c", "2026-11-02T00:00:00Z", None)];
+        for target in ["vault", "local", "vendors", "openai"] {
+            let m = build_matrix(&inp, Some(target)).unwrap();
+            assert!(m.vendor_quotas.is_empty(), "{target}");
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_matrix_json_carries_vendor_quotas_and_update_capability() {
+        let mut inp = inputs("", None);
+        inp.sessions = vec![quota_session(
+            "claude",
+            "c",
+            "2026-11-02T00:00:00Z",
+            Some(quota(Some("max"), Some(40.0), Some(10.0))),
+        )];
+        let json = serde_json::to_value(build_matrix(&inp, None).unwrap()).unwrap();
+        let claude_quota = &json["vendor_quotas"]["claude"];
+        assert_eq!(claude_quota["tier"], "max");
+        assert_eq!(claude_quota["primary_window"]["used_percent"], 40.0);
+        assert_eq!(claude_quota["secondary_window"]["window_minutes"], 10_080);
+        assert!(claude_quota.get("exhausted_reason").is_none());
+
+        let cli = |name: &str| {
+            json["cli_runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        for name in ["claude", "codex", "grok", "agy"] {
+            let row = cli(name);
+            assert_eq!(row["update_supported"], true, "{name}");
+            assert_eq!(row["update_command"], format!("{name} update"), "{name}");
+        }
+        // Whether the binary is installed does not change what the CLI can do.
+        assert_eq!(cli("claude")["installed"], false);
+        let muse = cli("muse");
+        assert_eq!(muse["update_supported"], false);
+        assert_eq!(muse["update_command"], serde_json::Value::Null);
     }
 }
