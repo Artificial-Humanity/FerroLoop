@@ -36,6 +36,11 @@ pub enum AnyAdapter {
 }
 
 /// Everything [`AnyAdapter::from_vendor_id`] can set on an adapter it builds.
+///
+/// Not every field applies to every vendor. `model`, `base_url` and `api_key` apply to the
+/// direct-API vendors (the built-in `HttpApi` adapter) and are passed to a plugin's
+/// [`ExecVendorAdapter::build`]; a built-in subscription CLI (`claude`, `codex`, ...) ignores
+/// them without an error. `binary_override` applies to the built-in CLIs only.
 #[derive(Default, Clone)]
 pub struct AdapterBuild {
     /// A subscription CLI's binary, instead of the vendor's default.
@@ -44,7 +49,8 @@ pub struct AdapterBuild {
     /// An API vendor's model, instead of the vendor's default.
     pub model: Option<String>,
     /// An API vendor's base URL (a proxy), instead of the vendor's default. It must be a place a
-    /// key may be sent.
+    /// key may be sent. The built-in `HttpApi` adapter checks it; a plugin receives it
+    /// **unvalidated**.
     pub base_url: Option<String>,
     /// Where an API vendor's key comes from. `None`: the vendor's environment variable.
     pub api_key: Option<ApiKeyResolver>,
@@ -58,6 +64,9 @@ pub struct AdapterBuild {
 pub trait ExecVendorAdapter: Send + Sync {
     /// The vendor id this adapter runs.
     fn vendor_id(&self) -> &str;
+    /// Builds the runner. `build.base_url` reaches the plugin **unvalidated**: a plugin that
+    /// sends an API key to it must call [`fl_core::validate_api_base_url`] on it first, or the
+    /// key can go to a plain-`http` remote host.
     fn build(&self, build: &AdapterBuild) -> Result<Box<dyn DynamicRunner>, AttemptError>;
 }
 
@@ -121,6 +130,10 @@ impl AnyAdapter {
     /// local-engine vendor (all registered `HttpApi` vendors), or a plugin vendor with an adapter
     /// from [`register_exec_adapter`]. A subscription-CLI vendor with no adapter is
     /// `UnknownAdapter`: fl cannot guess how to drive a CLI it has not been told about.
+    ///
+    /// Of `build`, a built-in CLI vendor uses only `binary_override`, `rate_card` and `liveness`:
+    /// its `model`, `base_url` and `api_key` are ignored without an error. A plugin's
+    /// [`ExecVendorAdapter::build`] gets all of it, with `base_url` unvalidated (see there).
     pub fn from_vendor_id(vendor_id: &str, build: AdapterBuild) -> Result<Self, AttemptError> {
         let id = vendor_id.trim().to_ascii_lowercase();
         let mut adapter = if let Some(kind) = AdapterKind::from_wire(&id) {

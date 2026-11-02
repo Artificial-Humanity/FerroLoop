@@ -16,6 +16,13 @@
 //!   attempt is refused. The reply's length is capped from the ceiling before the request
 //!   (`max_tokens`), so a priced attempt cannot overshoot by more than the prompt estimate.
 //! - Cached input tokens are counted in `tokens_in`, as the CLI adapters count them.
+//!
+//! Known limits:
+//! - The call carries its own timeout (ureq's timer starts when the blocking closure runs), while
+//!   the 2 s backstop on top of it is measured from before `spawn_blocking`. If the blocking pool
+//!   is saturated, the attempt can report `Timeout` and the request can still be sent afterwards.
+//! - A timed-out call and a non-2xx answer are recorded at cost 0 (no usage is read from them),
+//!   though a hosted vendor may have billed them. The adapter cannot know.
 
 use crate::adapters::harness::{
     EXCERPT_LIMIT, GitSnapshot, LivenessSink, detect_host, now_at, truncate_utf8, usd_f64_to_micros,
@@ -102,6 +109,12 @@ impl HttpApiAdapter {
                 descriptor.id
             )));
         };
+        validate_api_base_url(&default_base_url).map_err(|e| {
+            AttemptError::UnknownAdapter(format!(
+                "{}: default base URL refused: {e}",
+                descriptor.id
+            ))
+        })?;
         let model = descriptor.default_model.clone();
         Ok(Self {
             dialect: api_dialect,
@@ -259,6 +272,17 @@ impl HttpApiAdapter {
                 ),
             );
         }
+        if needs_key && card.output_usd_micros_per_mtok == 0 {
+            return refuse(
+                &mut hb,
+                format!(
+                    "`{}` is a paid API and its rate card has no output price \
+                     (`output_usd_micros_per_mtok` is 0), so its spend ceiling cannot cap the \
+                     reply: set a non-zero `output_usd_micros_per_mtok` for it in config.toml",
+                    self.descriptor.id
+                ),
+            );
+        }
         let max_tokens = match output_cap(&card, &spec, self.max_output_tokens) {
             Ok(n) => n,
             Err(why) => return refuse(&mut hb, why),
@@ -342,11 +366,15 @@ impl HttpApiAdapter {
                 format!(
                     "`{}` answered {status}: {}",
                     self.descriptor.id,
-                    error_message(&text)
+                    // Redact before the message is cut to length, so a key cannot survive as
+                    // two halves.
+                    error_message(&redact(&text, api_key.as_deref()))
                 ),
                 Parsed::default(),
             ),
         };
+        // A server may echo the key it was sent; no path may carry it into the outcome.
+        let excerpt = redact(&excerpt, api_key.as_deref());
 
         let cost_usd_micros = card.resolve_cost(
             parsed.tokens_in,
@@ -394,9 +422,6 @@ fn key_hint(d: &VendorDescriptor) -> String {
             vault_secret_name,
             ..
         } => match (env_key_name, vault_secret_name) {
-            (Some(env), Some(vault)) if env == vault => {
-                format!("set ${env}, or store it in the Vault as `{vault}`")
-            }
             (Some(env), Some(vault)) => {
                 format!("set ${env}, or store it in the Vault as `{vault}`")
             }
@@ -416,10 +441,8 @@ fn output_cap(card: &RateCard, spec: &AttemptSpec, cap: u64) -> Result<u64, Stri
     }
     let est_in =
         (spec.instruction.len() as u64).div_ceil(BYTES_PER_PROMPT_TOKEN) + PROMPT_OVERHEAD_TOKENS;
-    let in_cost = ceil_div_u128(
-        u128::from(est_in) * u128::from(card.input_usd_micros_per_mtok),
-        1_000_000,
-    );
+    let in_cost =
+        (u128::from(est_in) * u128::from(card.input_usd_micros_per_mtok)).div_ceil(1_000_000);
     let budget = u128::from(spec.budget_usd_micros);
     if in_cost >= budget {
         return Err(format!(
@@ -440,10 +463,6 @@ fn output_cap(card: &RateCard, spec: &AttemptSpec, cap: u64) -> Result<u64, Stri
         ));
     }
     Ok(room)
-}
-
-fn ceil_div_u128(n: u128, d: u128) -> u128 {
-    n.div_ceil(d)
 }
 
 type Headers = Vec<(&'static str, String)>;
@@ -517,6 +536,25 @@ enum CallError {
     Failed(String),
 }
 
+/// The client's settings. No proxy: ureq reads `HTTP_PROXY`/`HTTPS_PROXY` from the environment by
+/// default, which would send a loopback engine call (and the key header) through a proxy.
+fn agent_config(limit: Duration) -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .timeout_global(Some(limit))
+        .build()
+}
+
+/// `text` with every occurrence of the (trimmed, non-empty) key replaced by `[redacted]`.
+fn redact(text: &str, key: Option<&str>) -> String {
+    match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => text.replace(k, "[redacted]"),
+        None => text.to_string(),
+    }
+}
+
 /// One blocking request. Redirects are never followed (the key would go with them), and an
 /// error status is an answer, not an error.
 fn call_api(
@@ -525,12 +563,7 @@ fn call_api(
     body: &Value,
     limit: Duration,
 ) -> Result<(u16, String), CallError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .timeout_global(Some(limit))
-        .build()
-        .into();
+    let agent: ureq::Agent = agent_config(limit).into();
     let mut request = agent.post(url);
     for (name, value) in headers {
         request = request.header(*name, value);
@@ -584,28 +617,40 @@ fn u64_at(v: &Value, path: &[&str]) -> Option<u64> {
     cur.as_u64()
 }
 
-/// The reply's text and usage, or `None` when the body is not a reply of this dialect.
+/// The reply's text and usage, or `None` when the body is not JSON or has no usage block of
+/// this dialect. A reply with usage but no text (cut off by the length limit, a tool call, a
+/// refusal) is still a billed reply: its text is empty and its usage is real.
 /// Cached input tokens are inside `tokens_in`.
 fn parse_reply(dialect: ApiDialect, body: &str) -> Option<Parsed> {
     let v: Value = serde_json::from_str(body).ok()?;
-    match dialect {
-        ApiDialect::OpenAiChatCompletions => {
-            let content = v.pointer("/choices/0/message/content")?;
-            let text = match content {
-                Value::String(s) => s.clone(),
-                Value::Array(parts) => parts
+    if !v.is_object() {
+        return None;
+    }
+    let join_text = |parts: Option<&Vec<Value>>| -> String {
+        parts
+            .map(|parts| {
+                parts
                     .iter()
                     .filter_map(|p| p.get("text").and_then(Value::as_str))
                     .collect::<Vec<_>>()
-                    .join(""),
-                Value::Null => String::new(),
-                _ => return None,
-            };
+                    .join("")
+            })
+            .unwrap_or_default()
+    };
+    match dialect {
+        ApiDialect::OpenAiChatCompletions => {
+            v.get("usage").filter(|u| u.is_object())?;
             // OpenRouter reports what it charged, in USD.
             let vendor_cost = v
                 .pointer("/usage/cost")
                 .and_then(Value::as_f64)
                 .and_then(usd_f64_to_micros);
+            let text = match v.pointer("/choices/0/message/content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(parts)) => join_text(Some(parts)),
+                // Null, absent (a tool call, a refusal) or of another shape: no text.
+                _ => String::new(),
+            };
             Some(Parsed {
                 text,
                 // `prompt_tokens` already includes `prompt_tokens_details.cached_tokens`.
@@ -615,12 +660,8 @@ fn parse_reply(dialect: ApiDialect, body: &str) -> Option<Parsed> {
             })
         }
         ApiDialect::AnthropicMessages => {
-            let parts = v.get("content")?.as_array()?;
-            let text = parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
+            v.get("usage").filter(|u| u.is_object())?;
+            let text = join_text(v.get("content").and_then(Value::as_array));
             let uncached = u64_at(&v, &["usage", "input_tokens"]).unwrap_or(0);
             let created = u64_at(&v, &["usage", "cache_creation_input_tokens"]).unwrap_or(0);
             let read = u64_at(&v, &["usage", "cache_read_input_tokens"]).unwrap_or(0);
@@ -632,12 +673,13 @@ fn parse_reply(dialect: ApiDialect, body: &str) -> Option<Parsed> {
             })
         }
         ApiDialect::GeminiGenerateContent => {
-            let parts = v.pointer("/candidates/0/content/parts")?.as_array()?;
-            let text = parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("");
+            v.get("usageMetadata").filter(|u| u.is_object())?;
+            // Gemini 2.5 returns a `content` with no `parts` when thinking uses up
+            // `maxOutputTokens`.
+            let text = join_text(
+                v.pointer("/candidates/0/content/parts")
+                    .and_then(Value::as_array),
+            );
             // `promptTokenCount` already includes `cachedContentTokenCount`; thinking tokens
             // are billed as output.
             let out = u64_at(&v, &["usageMetadata", "candidatesTokenCount"])
@@ -1092,6 +1134,15 @@ mod tests {
             &a.attempt(spec(dir.path(), 1_000_000)).await.unwrap(),
             "no rate card",
         );
+        // A paid API whose card has no output price cannot cap the reply.
+        let a = adapter("kimi-api", &mock).with_rate_card(Some(RateCard {
+            input_usd_micros_per_mtok: 2_000_000,
+            output_usd_micros_per_mtok: 0,
+        }));
+        refused(
+            &a.attempt(spec(dir.path(), 1_000_000)).await.unwrap(),
+            "output_usd_micros_per_mtok",
+        );
         // A zero ceiling starts nothing.
         let a = adapter("kimi-api", &mock);
         refused(
@@ -1118,6 +1169,19 @@ mod tests {
             .unwrap()
             .with_key_resolver(Arc::new(|_| Some("super-secret-key".into())));
         assert!(!format!("{a:?}").contains("super-secret"));
+        // A hand-built descriptor with a remote plain-http default is refused by `new` itself.
+        let mut remote = lookup_vendor("kimi-api").unwrap();
+        let VendorTransport::HttpApi {
+            default_base_url, ..
+        } = &mut remote.transport
+        else {
+            panic!("kimi is an HTTP API vendor");
+        };
+        *default_base_url = "http://remote.example/v1".into();
+        assert!(matches!(
+            HttpApiAdapter::new(remote),
+            Err(AttemptError::UnknownAdapter(_))
+        ));
         // A CLI vendor is not an API vendor.
         let cli = lookup_vendor("claude").unwrap();
         assert!(matches!(
@@ -1247,5 +1311,153 @@ mod tests {
             out.output_excerpt
         );
         assert_eq!(mock.requests()[0].body["model"], "qwen-local");
+    }
+
+    #[tokio::test]
+    async fn a_billed_reply_with_no_text_is_a_completion_with_its_usage_counted_and_priced() {
+        let dir = repo();
+        // Gemini 2.5: thinking used up `maxOutputTokens`, so `content` has no `parts`.
+        let mock = Mock::start(|_| {
+            ok(json!({
+                "candidates": [{ "content": { "role": "model" }, "finishReason": "MAX_TOKENS" }],
+                "usageMetadata": { "promptTokenCount": 500, "thoughtsTokenCount": 300,
+                                   "totalTokenCount": 800 },
+            }))
+        });
+        let out = adapter("gemini-api", &mock)
+            .attempt(spec(dir.path(), 1_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status,
+            AttemptStatus::Completed,
+            "{}",
+            out.output_excerpt
+        );
+        assert_eq!(out.output_excerpt, "");
+        assert_eq!((out.tokens_in, out.tokens_out), (500, 300));
+        // 500 in * 2.0 + 300 out * 10.0 = 4000 micro-USD.
+        assert_eq!(out.cost_usd_micros, 4_000);
+
+        // OpenAI dialect: a tool call has `content: null`.
+        let mock = Mock::start(|_| {
+            ok(json!({
+                "choices": [{ "message": { "role": "assistant", "content": null,
+                    "tool_calls": [{ "id": "c1", "type": "function",
+                        "function": { "name": "f", "arguments": "{}" } }] } }],
+                "usage": { "prompt_tokens": 1000, "completion_tokens": 200 },
+            }))
+        });
+        let out = adapter("kimi-api", &mock)
+            .attempt(spec(dir.path(), 1_000_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status,
+            AttemptStatus::Completed,
+            "{}",
+            out.output_excerpt
+        );
+        assert_eq!(out.output_excerpt, "");
+        assert_eq!((out.tokens_in, out.tokens_out), (1000, 200));
+        assert_eq!(out.cost_usd_micros, 4_000);
+
+        // No `message` at all, and an Anthropic reply with no `content`, are billed the same way.
+        assert_eq!(
+            parse_reply(
+                ApiDialect::OpenAiChatCompletions,
+                r#"{"choices":[{}],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#
+            )
+            .map(|p| (p.text, p.tokens_in, p.tokens_out)),
+            Some((String::new(), 3, 4))
+        );
+        assert_eq!(
+            parse_reply(
+                ApiDialect::AnthropicMessages,
+                r#"{"usage":{"input_tokens":3,"output_tokens":4}}"#
+            )
+            .map(|p| (p.text, p.tokens_in, p.tokens_out)),
+            Some((String::new(), 3, 4))
+        );
+        // Without a usage block, or without JSON, there is nothing to count: unreadable.
+        for dialect in [
+            ApiDialect::OpenAiChatCompletions,
+            ApiDialect::AnthropicMessages,
+            ApiDialect::GeminiGenerateContent,
+        ] {
+            assert!(parse_reply(dialect, "not json").is_none());
+            assert!(parse_reply(dialect, "[]").is_none());
+            assert!(parse_reply(dialect, r#"{"unexpected":true}"#).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_200_stays_a_crash_with_no_tokens() {
+        let dir = repo();
+        let mock = Mock::start(|_| Reply {
+            status: 200,
+            body: "<html>gateway page</html>".into(),
+            delay: Duration::ZERO,
+            location: None,
+        });
+        let out = adapter("kimi-api", &mock)
+            .attempt(spec(dir.path(), 1_000_000))
+            .await
+            .unwrap();
+        assert_eq!(out.status, AttemptStatus::Crashed, "{}", out.output_excerpt);
+        assert_eq!(
+            (out.tokens_in, out.tokens_out, out.cost_usd_micros),
+            (0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_the_server_echoes_in_an_error_body_is_redacted() {
+        let dir = repo();
+        let mock = Mock::start(|seen| {
+            let sent = seen.header("authorization").unwrap_or("").to_string();
+            Reply {
+                status: 401,
+                body: json!({ "error": { "message": format!("bad credential {sent}") } })
+                    .to_string(),
+                delay: Duration::ZERO,
+                location: None,
+            }
+        });
+        let out = adapter("kimi-api", &mock)
+            .attempt(spec(dir.path(), 1_000_000))
+            .await
+            .unwrap();
+        assert_eq!(out.status, AttemptStatus::Crashed);
+        assert!(
+            out.output_excerpt.contains("[redacted]"),
+            "{}",
+            out.output_excerpt
+        );
+        assert!(!out.output_excerpt.contains(KEY), "{}", out.output_excerpt);
+        // An unparseable body that carries the key is redacted too.
+        let mock = Mock::start(|seen| Reply {
+            status: 500,
+            body: format!("oops {}", seen.header("authorization").unwrap_or("")),
+            delay: Duration::ZERO,
+            location: None,
+        });
+        let out = adapter("kimi-api", &mock)
+            .attempt(spec(dir.path(), 1_000_000))
+            .await
+            .unwrap();
+        assert!(out.output_excerpt.contains("[redacted]"));
+        assert!(!out.output_excerpt.contains(KEY));
+        // A blank key redacts nothing; a padded one is matched trimmed.
+        assert_eq!(redact("abc", Some("  ")), "abc");
+        assert_eq!(redact("a k b k", Some(" k ")), "a [redacted] b [redacted]");
+        assert_eq!(redact("abc", None), "abc");
+    }
+
+    #[test]
+    fn the_client_never_uses_a_proxy_from_the_environment() {
+        // ureq's default reads HTTP_PROXY/HTTPS_PROXY; the adapter's config must not. (Not
+        // checked by setting the variables: tests do not mutate the process environment.)
+        assert!(agent_config(Duration::from_secs(1)).proxy().is_none());
     }
 }
