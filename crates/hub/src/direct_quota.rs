@@ -95,7 +95,8 @@ pub(crate) fn with_probe_lock<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
-/// Mark every cached probe stale so the next read runs the command again.
+/// Mark every cached probe stale (and drop the live Antigravity answers) so the next read
+/// runs the command again.
 #[cfg(test)]
 pub(crate) fn expire_direct_quota_cache() {
     let mut cache = cache_lock();
@@ -109,13 +110,10 @@ pub(crate) fn expire_direct_quota_cache() {
         slot.stale = true;
     }
     drop(cache);
-    for entry in AGY_LIVE_CACHE
+    AGY_LIVE_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .values_mut()
-    {
-        entry.1 = true;
-    }
+        .clear();
 }
 
 pub(crate) fn merge_account_quota(
@@ -264,12 +262,60 @@ fn resolve_claude_tier(
 
 /// Where to find the Antigravity language server for a quota read, and which model the
 /// session runs. The route's address and token win; the environment fills a gap only when
-/// the host may be probed (no `home_override`, host discovery on).
+/// the host may be probed (no `home_override`, host discovery on). `session` (the
+/// conversation id) lets a later read that lacks the route reuse what an earlier one saw.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AgyQuotaTarget<'a> {
     pub address: Option<&'a str>,
     pub csrf: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub session: Option<&'a str>,
+}
+
+/// What an earlier read learned about one session's language server and model.
+#[derive(Debug, Clone, Default)]
+struct AgyHint {
+    address: Option<String>,
+    csrf: Option<String>,
+    model: Option<String>,
+}
+
+const AGY_HINT_MAX: usize = 256;
+
+type AgyHintMap = std::collections::BTreeMap<(String, String), AgyHint>;
+static AGY_HINTS: Mutex<AgyHintMap> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Fill the fields `target` lacks from the hint stored for its session and store the merge
+/// back. A field `target` has replaces the stored one; a missing field never erases it.
+/// Hints are scoped to `home_override`, so another home never inherits them.
+fn agy_resolve_hint(home_override: Option<&Path>, target: &AgyQuotaTarget<'_>) -> AgyHint {
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let mut merged = AgyHint {
+        address: clean(target.address),
+        csrf: clean(target.csrf),
+        model: clean(target.model),
+    };
+    let Some(session) = target.session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return merged;
+    };
+    let key = (home_key(home_override), session.to_string());
+    let mut hints = AGY_HINTS.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(stored) = hints.get(&key) {
+        merged.address = merged.address.or_else(|| stored.address.clone());
+        merged.csrf = merged.csrf.or_else(|| stored.csrf.clone());
+        merged.model = merged.model.or_else(|| stored.model.clone());
+    }
+    if merged.address.is_some() || merged.csrf.is_some() || merged.model.is_some() {
+        if hints.len() >= AGY_HINT_MAX && !hints.contains_key(&key) {
+            hints.clear();
+        }
+        hints.insert(key, merged.clone());
+    }
+    merged
 }
 
 pub(crate) fn agy_account_quota(
@@ -288,7 +334,14 @@ pub(crate) fn agy_account_quota(
             });
         }
     }
-    let (port, csrf) = agy_live_endpoint(home_override, target)?;
+    let hint = agy_resolve_hint(home_override, target);
+    let target = AgyQuotaTarget {
+        address: hint.address.as_deref(),
+        csrf: hint.csrf.as_deref(),
+        model: hint.model.as_deref(),
+        session: target.session,
+    };
+    let (port, csrf) = agy_live_endpoint(home_override, &target)?;
     let live = agy_live_snapshot(port, &csrf)?;
     agy_live_usage(&live, target.model)
 }
@@ -320,7 +373,7 @@ fn agy_live_endpoint(
     let port = addresses.into_iter().flatten().find_map(|addr| {
         let port = fl_wire::identity::agy_ls_port(&addr)?;
         // A cached answer (hit or miss) means the port was just tried; skip the connect probe.
-        (agy_live_cache_has(port) || fl_wire::identity::agy_ls_address_listening(&addr))
+        (agy_live_cache_has(port, &csrf) || fl_wire::identity::agy_ls_address_listening(&addr))
             .then_some(port)
     })?;
     Some((port, csrf))
@@ -354,15 +407,15 @@ struct AgyLive {
 const AGY_LIVE_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 const AGY_LIVE_MAX_BYTES: usize = 1024 * 1024;
 
-type AgyLiveCache = std::collections::BTreeMap<u16, (Instant, bool, Option<AgyLive>)>;
+type AgyLiveCache = std::collections::BTreeMap<(u16, String), (Instant, Option<AgyLive>)>;
 static AGY_LIVE_CACHE: Mutex<AgyLiveCache> = Mutex::new(std::collections::BTreeMap::new());
 
-fn agy_live_cache_has(port: u16) -> bool {
+fn agy_live_cache_has(port: u16, csrf: &str) -> bool {
     AGY_LIVE_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner())
-        .get(&port)
-        .is_some_and(|(at, stale, value)| !stale && at.elapsed() < agy_live_ttl(value.is_some()))
+        .get(&(port, csrf.to_string()))
+        .is_some_and(|(at, value)| at.elapsed() < agy_live_ttl(value.is_some()))
 }
 
 fn agy_live_ttl(hit: bool) -> Duration {
@@ -373,13 +426,13 @@ fn agy_live_ttl(hit: bool) -> Duration {
     }
 }
 
-/// Both language-server answers for `port`, cached for [`CACHE_TTL`] (a miss for a shorter
+/// Both language-server answers for `port` and `csrf`, cached for [`CACHE_TTL`] (a miss for a shorter
 /// time), so discovery and `/api/v1/watch` polls cost one pair of calls a minute.
 fn agy_live_snapshot(port: u16, csrf: &str) -> Option<AgyLive> {
+    let key = (port, csrf.to_string());
     {
         let cache = AGY_LIVE_CACHE.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some((at, stale, value)) = cache.get(&port)
-            && !stale
+        if let Some((at, value)) = cache.get(&key)
             && at.elapsed() < agy_live_ttl(value.is_some())
         {
             return value.clone();
@@ -390,7 +443,7 @@ fn agy_live_snapshot(port: u16, csrf: &str) -> Option<AgyLive> {
     if cache.len() >= 64 {
         cache.clear();
     }
-    cache.insert(port, (Instant::now(), false, live.clone()));
+    cache.insert(key, (Instant::now(), live.clone()));
     live
 }
 
@@ -1915,7 +1968,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        AGY_LIVE_CACHE.lock().unwrap().remove(&port);
+        AGY_LIVE_CACHE
+            .lock()
+            .unwrap()
+            .retain(|(p, _), _| *p != port);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (seen_t, stop_t) = (Arc::clone(&seen), Arc::clone(&stop));
@@ -1997,6 +2053,7 @@ mod tests {
                 address: Some(&addr),
                 csrf: Some("stub-csrf"),
                 model: Some("claude-opus-5-5"),
+                session: None,
             };
             expire_direct_quota_cache();
             let first = agy_account_quota(home, &target).expect("live quota");
@@ -2046,6 +2103,7 @@ mod tests {
                 address: Some(&addr),
                 csrf: Some("c"),
                 model: None,
+                session: None,
             };
 
             // SAFETY: this test holds PROBE_LOCK until `_clear` drops and removes the vars.
@@ -2103,6 +2161,7 @@ mod tests {
                 address: Some("127.0.0.1:1"),
                 csrf: Some("c"),
                 model: None,
+                session: None,
             };
             assert_eq!(agy_account_quota(Some(tmp.path()), &dead), None);
             let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
@@ -2112,6 +2171,7 @@ mod tests {
                     address: Some(&addr),
                     csrf: Some(csrf),
                     model: None,
+                    session: None,
                 };
                 assert_eq!(agy_account_quota(Some(tmp.path()), &bad), None, "{csrf:?}");
             }
@@ -2153,7 +2213,98 @@ mod tests {
                 q.primary_window.as_ref().unwrap().resets_at_ms,
                 Some(ms("2026-11-01T07:10:39Z"))
             );
+
+            // The watch entry knows only the session id: the route and the model come from
+            // what discovery remembered, and the cached answer costs no request.
+            let before = stub.calls().len();
+            let watched = crate::discovery::quota_for_resolved_route(
+                "antigravity",
+                None,
+                Some(home),
+                "agy-q-1",
+            )
+            .expect("remembered route serves the watch path");
+            assert_eq!(
+                &watched, q,
+                "claude-opus-5-5 comes from the remembered hint"
+            );
+            assert_eq!(stub.calls().len(), before, "no extra request while cached");
+
+            // Another home never inherits the hint.
+            let other = tempfile::tempdir().unwrap();
+            assert_eq!(
+                crate::discovery::quota_for_resolved_route(
+                    "antigravity",
+                    None,
+                    Some(other.path()),
+                    "agy-q-1",
+                ),
+                None
+            );
             stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn agy_hint_fills_gaps_and_a_missing_model_never_erases_the_remembered_one() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = Some(tmp.path());
+            let session_only = AgyQuotaTarget {
+                session: Some("hint-s1"),
+                ..Default::default()
+            };
+            // Nothing is remembered yet.
+            assert_eq!(agy_account_quota(home, &session_only), None);
+            let full = AgyQuotaTarget {
+                address: Some(&addr),
+                csrf: Some("stub-csrf"),
+                model: Some("claude-opus-5-5"),
+                session: Some("hint-s1"),
+            };
+            let claude = agy_account_quota(home, &full).expect("live quota");
+            // A later read with no model keeps the remembered one (and the route).
+            let no_model = AgyQuotaTarget {
+                model: None,
+                ..full
+            };
+            assert_eq!(agy_account_quota(home, &no_model), Some(claude.clone()));
+            assert_eq!(agy_account_quota(home, &session_only), Some(claude.clone()));
+            // A model the target names replaces the remembered one.
+            let gemini = AgyQuotaTarget {
+                model: Some("gemini-4-argon"),
+                ..session_only
+            };
+            let gemini_usage = agy_account_quota(home, &gemini).expect("gemini quota");
+            assert_ne!(gemini_usage, claude);
+            assert_eq!(agy_account_quota(home, &session_only), Some(gemini_usage));
+            // The same session id under another home has no hint.
+            let other = tempfile::tempdir().unwrap();
+            assert_eq!(agy_account_quota(Some(other.path()), &session_only), None);
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn agy_hint_map_is_bounded() {
+        with_probe_lock(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            for i in 0..(AGY_HINT_MAX + 5) {
+                let id = format!("bound-{i}");
+                agy_resolve_hint(
+                    Some(tmp.path()),
+                    &AgyQuotaTarget {
+                        model: Some("m"),
+                        session: Some(&id),
+                        ..Default::default()
+                    },
+                );
+            }
+            let len = AGY_HINTS.lock().unwrap().len();
+            assert!(len <= AGY_HINT_MAX, "{len}");
         });
     }
 
@@ -2166,20 +2317,23 @@ mod tests {
                 AGY_LIVE_CACHE
                     .lock()
                     .unwrap()
-                    .insert(port, (at, false, value));
+                    .insert((port, "c".to_string()), (at, value));
             };
             aged(11, None);
             assert!(
-                !agy_live_cache_has(port),
+                !agy_live_cache_has(port, "c"),
                 "a miss older than 10s is retried"
             );
             aged(5, None);
-            assert!(agy_live_cache_has(port), "a young miss is served");
+            assert!(agy_live_cache_has(port, "c"), "a young miss is served");
             aged(11, Some(AgyLive::default()));
-            assert!(agy_live_cache_has(port), "a hit lives 60s");
+            assert!(agy_live_cache_has(port, "c"), "a hit lives 60s");
             aged(61, Some(AgyLive::default()));
-            assert!(!agy_live_cache_has(port));
-            AGY_LIVE_CACHE.lock().unwrap().remove(&port);
+            assert!(!agy_live_cache_has(port, "c"));
+            // The token is part of the key: a rejected token does not poison the port.
+            aged(5, None);
+            assert!(!agy_live_cache_has(port, "other-csrf"));
+            AGY_LIVE_CACHE.lock().unwrap().clear();
         });
     }
 }

@@ -818,6 +818,7 @@ fn discover_sessions_impl(
                     address: agy_address,
                     csrf: agy_csrf,
                     model: info.model.as_deref(),
+                    session: Some(&session.id),
                 },
             );
             session.model = info.model;
@@ -2264,23 +2265,31 @@ fn quota_usage_with_reads_locked(
         Some(&tpath),
         home_override,
         files,
-        &crate::direct_quota::AgyQuotaTarget::default(),
+        &crate::direct_quota::AgyQuotaTarget {
+            session: Some(trimmed),
+            ..Default::default()
+        },
     )
 }
 
 /// Quota for a route row whose transcript path is already known.
 ///
-/// This does not search the home directory again.
+/// This does not search the home directory again. `session_id` lets the Antigravity read reuse
+/// the language-server route and model an earlier discovery pass remembered for that session.
 pub(crate) fn quota_for_resolved_route(
     adapter: &str,
     transcript_path: Option<&str>,
     home_override: Option<&Path>,
+    session_id: &str,
 ) -> Option<SessionQuotaUsage> {
     quota_for_resolved_route_at(
         adapter,
         transcript_path,
         home_override,
-        &crate::direct_quota::AgyQuotaTarget::default(),
+        &crate::direct_quota::AgyQuotaTarget {
+            session: Some(session_id),
+            ..Default::default()
+        },
     )
 }
 
@@ -7693,9 +7702,9 @@ mod tests {
             }
         });
         fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
-        assert!(quota_for_resolved_route("grok", None, Some(home)).is_none());
+        assert!(quota_for_resolved_route("grok", None, Some(home), "s").is_none());
 
-        let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home))
+        let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home), "s")
             .expect("resolved grok path");
         assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
 
@@ -7712,11 +7721,11 @@ mod tests {
             }
         });
         fs::write(&rollout, format!("{event}\n")).unwrap();
-        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None)
+        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None, "s")
             .expect("resolved codex path");
         assert_eq!(codex.tier.as_deref(), Some("plus"));
         assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
-        assert!(quota_for_resolved_route("codex", None, Some(home)).is_none());
+        assert!(quota_for_resolved_route("codex", None, Some(home), "s").is_none());
     }
 
     #[test]

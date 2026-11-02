@@ -287,7 +287,9 @@ fn discovered_quotas(state: &HubState) -> Vec<WatchQuotaWindow> {
         if s.source != "route" {
             continue;
         }
-        if let Some(q) = quota_for_resolved_route(&s.adapter, s.transcript_path.as_deref(), home) {
+        if let Some(q) =
+            quota_for_resolved_route(&s.adapter, s.transcript_path.as_deref(), home, &s.id)
+        {
             out.extend(quota_windows(&s.adapter, &s.id, &q));
         }
     }
