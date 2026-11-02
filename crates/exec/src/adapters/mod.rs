@@ -29,7 +29,7 @@ pub enum AnyAdapter {
     Muse(MuseAdapter),
     Grok(GrokAdapter),
     /// A direct-API or local-engine vendor.
-    HttpApi(HttpApiAdapter),
+    HttpApi(Box<HttpApiAdapter>),
     /// An adapter a plugin supplied through [`register_exec_adapter`]. It is configured when it
     /// is built (see [`AdapterBuild::liveness`]); [`AnyAdapter::with_liveness`] leaves it as it is.
     Boxed(Box<dyn DynamicRunner>),
@@ -155,7 +155,7 @@ impl AnyAdapter {
             if let Some(resolver) = &build.api_key {
                 api = api.with_key_resolver(Arc::clone(resolver));
             }
-            Self::HttpApi(api)
+            Self::HttpApi(Box::new(api))
         };
         if let Some((attempt_id, project, agent, sink)) = build.liveness {
             adapter = adapter.with_liveness(attempt_id, project, agent, sink);
@@ -178,7 +178,9 @@ impl AnyAdapter {
             }
             Self::Muse(a) => Self::Muse(a.with_liveness(attempt_id, project, agent, sink)),
             Self::Grok(a) => Self::Grok(a.with_liveness(attempt_id, project, agent, sink)),
-            Self::HttpApi(a) => Self::HttpApi(a.with_liveness(attempt_id, project, agent, sink)),
+            Self::HttpApi(a) => {
+                Self::HttpApi(Box::new(a.with_liveness(attempt_id, project, agent, sink)))
+            }
             boxed @ Self::Boxed(_) => boxed,
         }
     }

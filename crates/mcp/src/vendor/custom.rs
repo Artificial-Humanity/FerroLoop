@@ -13,8 +13,7 @@
 
 use super::Kind;
 use super::{Fields, FileRefusal, Rendered, VendorFile, args, command, env, headers, json, url};
-use crate::catalog::{EnvValue, HeaderValue, Server, Transport};
-use fl_core::vendor::VendorRegistry;
+use crate::catalog::{EnvValue, HeaderValue, Server, Transport, VendorName};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -36,10 +35,6 @@ pub enum TargetError {
     BuiltIn(String),
     #[error("an MCP target for `{0}` is already registered")]
     Duplicate(String),
-    #[error("vendor `{0}` is not in the vendor registry; register it with `register_vendor` first")]
-    UnknownVendor(String),
-    #[error("vendor `{0}` declares no `mcp_config_rel_path`, so it has no MCP file")]
-    NoMcpPath(String),
     #[error("MCP target `{id}`: {problem}")]
     Invalid { id: String, problem: String },
 }
@@ -209,8 +204,12 @@ fn targets() -> &'static Targets {
 }
 
 /// Registers a target. Refused for a built-in vendor's id and for an id already registered.
+///
+/// `fl-mcp` does not depend on `fl-core`'s vendor registry (the architecture check forbids it), so
+/// the caller that holds both declares a registered vendor's target from its descriptor:
+/// `CustomTarget::new(&d.id, &d.display_name, d.mcp_config_rel_path.as_deref()?, "mcpServers", true)`.
 pub fn register_target(target: CustomTarget) -> Result<(), TargetError> {
-    if VendorRegistry::is_builtin(&target.id) {
+    if VendorName::ALL.iter().any(|v| v.as_str() == target.id) {
         return Err(TargetError::BuiltIn(target.id));
     }
     let mut map = targets().write().unwrap_or_else(|e| e.into_inner());
@@ -219,32 +218,6 @@ pub fn register_target(target: CustomTarget) -> Result<(), TargetError> {
     }
     map.insert(target.id.clone(), Arc::new(target));
     Ok(())
-}
-
-/// Registers the MCP target of a vendor already in the vendor registry, taking its name and its
-/// file (`mcp_config_rel_path`) from the descriptor, so the vendor is declared in one place.
-pub fn register_target_for_vendor(
-    vendor_id: &str,
-    servers_key: &str,
-    expands_env_refs: bool,
-) -> Result<(), TargetError> {
-    if VendorRegistry::is_builtin(vendor_id) {
-        return Err(TargetError::BuiltIn(vendor_id.trim().to_ascii_lowercase()));
-    }
-    let descriptor = VendorRegistry::global()
-        .get(vendor_id)
-        .ok_or_else(|| TargetError::UnknownVendor(vendor_id.to_string()))?;
-    let path = descriptor
-        .mcp_config_rel_path
-        .as_deref()
-        .ok_or_else(|| TargetError::NoMcpPath(descriptor.id.clone()))?;
-    register_target(CustomTarget::new(
-        &descriptor.id,
-        &descriptor.display_name,
-        path,
-        servers_key,
-        expands_env_refs,
-    )?)
 }
 
 /// The registered target with this id.
@@ -271,7 +244,6 @@ mod tests {
     use super::*;
     use crate::vendor::Claude;
     use crate::vendor::fixtures::*;
-    use fl_core::vendor::{VendorDescriptor, VendorTransport, lookup_vendor, register_vendor};
 
     fn claude_shaped(id: &str, expands: bool) -> CustomTarget {
         CustomTarget::new(id, "Plugin", ".plugin/mcp.json", "mcpServers", expands).unwrap()
@@ -364,51 +336,32 @@ mod tests {
     }
 
     #[test]
-    fn a_vendor_declares_its_mcp_target_once_through_the_vendor_registry() {
+    fn a_registered_target_is_found_by_id_and_never_twice() {
         let id = "mcp-test-plugin";
-        let mut d: VendorDescriptor = lookup_vendor("ollama").unwrap();
-        d.id = id.into();
-        d.display_name = "Plugin Agent".into();
-        d.transport = VendorTransport::SubscriptionCli {
-            default_binary: "plugin-agent".into(),
-        };
-        d.mcp_config_rel_path = Some(".plugin/mcp.json".into());
-        register_vendor(d).unwrap();
-        register_target_for_vendor(id, "mcpServers", true).unwrap();
-        let t = custom_target(id).expect("registered");
+        register_target(
+            CustomTarget::new(id, "Plugin Agent", ".plugin/mcp.json", "mcpServers", true).unwrap(),
+        )
+        .unwrap();
+        let t = custom_target(" MCP-Test-Plugin ").expect("registered");
         assert_eq!(
             (t.title(), t.target()),
             ("Plugin Agent", ".plugin/mcp.json")
         );
         assert!(custom_targets().iter().any(|t| t.id() == id));
         assert_eq!(
-            register_target_for_vendor(id, "mcpServers", true),
+            register_target(claude_shaped(id, true)),
             Err(TargetError::Duplicate(id.into()))
         );
     }
 
     #[test]
-    fn a_built_in_unknown_or_pathless_vendor_gets_no_target() {
-        assert_eq!(
-            register_target(claude_shaped("claude", true)),
-            Err(TargetError::BuiltIn("claude".into()))
-        );
-        assert_eq!(
-            register_target_for_vendor("kimi-api", "mcpServers", true),
-            Err(TargetError::BuiltIn("kimi-api".into()))
-        );
-        assert_eq!(
-            register_target_for_vendor("nobody-registered-this", "mcpServers", true),
-            Err(TargetError::UnknownVendor("nobody-registered-this".into()))
-        );
-        let mut d = lookup_vendor("ollama").unwrap();
-        d.id = "mcp-test-pathless".into();
-        register_vendor(d).unwrap();
-        assert_eq!(
-            register_target_for_vendor("mcp-test-pathless", "mcpServers", true),
-            Err(TargetError::NoMcpPath("mcp-test-pathless".into()))
-        );
-        // The built-in writers are untouched.
-        assert!(custom_target("claude").is_none());
+    fn a_built_in_vendor_gets_no_custom_target() {
+        for v in VendorName::ALL {
+            assert_eq!(
+                register_target(claude_shaped(v.as_str(), true)),
+                Err(TargetError::BuiltIn(v.as_str().into()))
+            );
+            assert!(custom_target(v.as_str()).is_none());
+        }
     }
 }
