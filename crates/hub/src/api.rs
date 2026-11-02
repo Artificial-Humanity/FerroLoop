@@ -1555,9 +1555,10 @@ fn handle_get_wire_messages(store: &AnyStore, req: &HttpRequest) -> HttpResponse
 
     match store.wire_messages_after(0) {
         Ok(seq_msgs) => {
+            let mut receipts_by_message = all_wire_receipts_by_message(store);
             let mut out = Vec::with_capacity(seq_msgs.len());
             for (_seq, msg) in seq_msgs {
-                let receipts = store.list_wire_receipts(&msg.id).unwrap_or_default();
+                let receipts = receipts_by_message.remove(&msg.id).unwrap_or_default();
                 if unread_only && receipts.iter().all(|r| r.status == DeliveryStatus::Acked) {
                     continue;
                 }
@@ -1570,6 +1571,28 @@ fn handle_get_wire_messages(store: &AnyStore, req: &HttpRequest) -> HttpResponse
         }
         Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
     }
+}
+
+/// Every delivery receipt in one store read, grouped by message, each group in the order
+/// [`MessageStore::list_wire_receipts`] returns it (by `recipient_id`, ties as stored).
+///
+/// An unfiltered `list_wire_inbox` returns every receipt: no status, `limit`, recipient or
+/// thread filter applies, and every backend (mem, redb, ferro local and remote) drops only a
+/// receipt whose message is gone, which no listed message can own. It sorts by message id, then
+/// `recipient_id`, stably, so each message's receipts keep their per-message order. A failed
+/// read lists no receipts, as a failed per-message read did.
+fn all_wire_receipts_by_message(store: &AnyStore) -> BTreeMap<MessageId, Vec<DeliveryReceipt>> {
+    let mut grouped: BTreeMap<MessageId, Vec<DeliveryReceipt>> = BTreeMap::new();
+    for item in store
+        .list_wire_inbox(&WireFilter::default())
+        .unwrap_or_default()
+    {
+        grouped
+            .entry(item.message.id)
+            .or_default()
+            .push(item.receipt);
+    }
+    grouped
 }
 
 fn handle_post_wire_send(

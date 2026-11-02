@@ -749,3 +749,159 @@ mod wire_send {
         );
     }
 }
+
+// ---- item 4: one bulk receipt read for the wire message list ----
+
+mod wire_messages {
+    use fl_core::agent::{AgentRole, RegisterAgentArgs};
+    use fl_core::at::At;
+    use fl_core::ferrowire::{
+        DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress,
+    };
+    use fl_core::store::{AgentRegistry, MessageStore};
+    use fl_store::{AnyStore, BackendKind};
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{get, hub_with_ferris};
+    use crate::{HttpResponse, HubState};
+
+    /// The list as the handler built it before: one `list_wire_receipts` per message.
+    fn per_message_reference(store: &AnyStore, unread_only: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (_seq, msg) in store.wire_messages_after(0).unwrap() {
+            let receipts = store.list_wire_receipts(&msg.id).unwrap_or_default();
+            if unread_only && receipts.iter().all(|r| r.status == DeliveryStatus::Acked) {
+                continue;
+            }
+            out.push(json!({ "message": msg, "receipts": receipts }));
+        }
+        HttpResponse::json(200, json!({ "messages": out })).body
+    }
+
+    fn send(store: &AnyStore, to: WireAddress, subject: &str, at: u64) -> fl_core::ids::MessageId {
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to,
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: subject.into(),
+                body: format!("body of {subject}"),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(at),
+            })
+            .unwrap()
+            .0
+            .id
+    }
+
+    fn seed(state: &HubState) -> usize {
+        let store = state.open_store().unwrap();
+        // Registered in an order unlike their ids, so receipts sort by `recipient_id`.
+        for name in ["Cy", "Ada", "Bob"] {
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: "FerroLoop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: Vec::new(),
+                    create_area: true,
+                    replace: false,
+                    at: At::from_unix_millis(1),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let all = send(&store, WireAddress::All, "to everyone", 10);
+        let one = send(&store, WireAddress::AgentName("ada".into()), "to ada", 20);
+        let unregistered = send(&store, WireAddress::AgentName("zed".into()), "to zed", 30);
+        let nobody = send(
+            &store,
+            WireAddress::Area("no-such-area".into()),
+            "to nobody",
+            40,
+        );
+        assert!(
+            store.list_wire_receipts(&nobody).unwrap().is_empty(),
+            "a message with no receipts"
+        );
+        let acked = DeliveryStatus::Acked;
+        store
+            .update_wire_receipt(&all, "ada", acked, false, At::from_unix_millis(50))
+            .unwrap();
+        store
+            .update_wire_receipt(
+                &all,
+                "bob",
+                DeliveryStatus::Expired,
+                true,
+                At::from_unix_millis(51),
+            )
+            .unwrap();
+        store
+            .update_wire_receipt(
+                &all,
+                "cy",
+                DeliveryStatus::Delivered,
+                true,
+                At::from_unix_millis(52),
+            )
+            .unwrap();
+        store
+            .update_wire_receipt(&one, "ada", acked, false, At::from_unix_millis(53))
+            .unwrap();
+        assert_eq!(store.list_wire_receipts(&unregistered).unwrap().len(), 1);
+        assert!(
+            store.list_wire_receipts(&all).unwrap().len() >= 3,
+            "several recipients"
+        );
+        store.wire_messages_after(0).unwrap().len()
+    }
+
+    #[test]
+    fn the_bulk_join_answers_exactly_as_the_per_message_reads_on_every_engine() {
+        for (kind, file) in [
+            (BackendKind::Redb, "hub.redb"),
+            (BackendKind::Ferro, "hub.fls"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut state = hub_with_ferris(&tmp, 1);
+            state.store_backend = Some(kind);
+            state.config.store_path = tmp.path().join(file);
+            let messages = seed(&state);
+            assert_eq!(messages, 4, "{kind:?}");
+            for (query, unread) in [("", false), ("?unread=true", true)] {
+                let (resp, _) = get(&state, &format!("/api/v1/wire/messages{query}"));
+                assert_eq!(resp.status, 200);
+                let expected = per_message_reference(&state.open_store().unwrap(), unread);
+                assert_eq!(
+                    String::from_utf8_lossy(&resp.body),
+                    String::from_utf8_lossy(&expected),
+                    "{kind:?} {query}"
+                );
+                let listed: Value = resp.json_value().unwrap();
+                let subjects: Vec<_> = listed["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| m["message"]["subject"].as_str().unwrap().to_string())
+                    .collect();
+                let want: &[&str] = if unread {
+                    // A message whose receipts are all acked, or that has none, is read.
+                    &["to everyone", "to zed"]
+                } else {
+                    &["to everyone", "to ada", "to zed", "to nobody"]
+                };
+                assert_eq!(subjects, want, "{kind:?} {query}");
+            }
+        }
+    }
+}
