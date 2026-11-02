@@ -3021,6 +3021,47 @@ mod tests {
     }
 
     #[test]
+    fn each_snapshot_rule_holds_on_its_own() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let e = seed_test_entry(&root, &orig, "a.md", "markdown", "live", 1, 3);
+        let real = snaps_of(&e);
+        let dir = real[0].parent().unwrap().to_path_buf();
+        let version = |n: u32, path: String| ArtifactVersion {
+            version: n,
+            sha256: "s".into(),
+            size_bytes: 8,
+            recorded_at_ms: 1,
+            source_mtime_ms: 0,
+            snapshot_path: Some(path),
+        };
+        // The real files, spelled with a `..`, and spelled through an alias of the root: both
+        // resolve inside versions/, but neither is the plain path the registry must hold.
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let dotted = format!(
+            "{}/../{}/v1",
+            dir.display(),
+            dir.file_name().unwrap().to_str().unwrap()
+        );
+        let aliased = real[1]
+            .display()
+            .to_string()
+            .replace(&root.display().to_string(), &alias.display().to_string());
+        assert_ne!(aliased, real[1].display().to_string());
+        for (n, path) in [(1, dotted), (2, aliased)] {
+            let v = version(n, path);
+            assert!(snapshot_target(&root, &v).is_none(), "{v:?}");
+            remove_snapshot(&managed_dir(&root), &v);
+        }
+        assert!(real.iter().all(|p| p.exists()));
+        // The plain path is accepted.
+        let plain = version(3, real[2].display().to_string());
+        assert_eq!(snapshot_target(&root, &plain), Some((real[2].clone(), 30)));
+    }
+
+    #[test]
     fn bytes_freed_counts_only_files_that_were_removed() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
