@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import {
+  isOperatorUserTurn,
   stripAgyUserRequestWrapper,
   stripSubagentHandbackWrapper,
   TurnCard,
@@ -426,6 +427,166 @@ describe("TurnCard directed assistant highlight", () => {
       fireEvent.click(sysToggle);
       expect(sysToggle).toHaveAttribute("aria-expanded", "true");
       expect(within(card).getByText(item.expectedText)).toBeInTheDocument();
+    }
+  });
+
+  it("strips <USER_SETTINGS_CHANGE> and <CONTEXT_SUMMARY> from operator turns", () => {
+    const withWrapperAndSettings = [
+      "<USER_REQUEST>",
+      "Please review the latest PR.",
+      "</USER_REQUEST>",
+      "<USER_SETTINGS_CHANGE>",
+      "The user changed setting Model Selection to Gemini 2.5 Pro.",
+      "</USER_SETTINGS_CHANGE>",
+      "<ADDITIONAL_METADATA>",
+      "The current local time is: 2026-11-02T16:00:00Z.",
+      "</ADDITIONAL_METADATA>",
+    ].join("\n");
+
+    const postBackendUnwrappedWithSettings = [
+      "Please review the latest PR.",
+      "<USER_SETTINGS_CHANGE>",
+      "The user changed setting Model Selection to Gemini 2.5 Pro.",
+      "</USER_SETTINGS_CHANGE>",
+    ].join("\n");
+
+    const withContextSummaryAndRequest = [
+      "<CONTEXT_SUMMARY>",
+      "Previous session summary details.",
+      "</CONTEXT_SUMMARY>",
+      "<USER_REQUEST>",
+      "You are Felix.",
+      "</USER_REQUEST>",
+    ].join("\n");
+
+    expect(stripAgyUserRequestWrapper(withWrapperAndSettings)).toBe(
+      "Please review the latest PR.",
+    );
+    expect(stripAgyUserRequestWrapper(postBackendUnwrappedWithSettings)).toBe(
+      "Please review the latest PR.",
+    );
+    expect(stripAgyUserRequestWrapper(withContextSummaryAndRequest)).toBe("You are Felix.");
+
+    render(
+      <>
+        <TurnCard
+          turn={turn({
+            index: 18,
+            role: "user",
+            content: withWrapperAndSettings,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 19,
+            role: "user",
+            content: postBackendUnwrappedWithSettings,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 20,
+            role: "user",
+            content: withContextSummaryAndRequest,
+          })}
+        />
+      </>,
+    );
+
+    for (const [idx, expected] of [
+      [18, /Please review the latest PR\./],
+      [19, /Please review the latest PR\./],
+      [20, /You are Felix\./],
+    ] as const) {
+      const card = screen.getByTestId(`turn-card-${idx}`);
+      expect(within(card).getByText("Operator")).toBeInTheDocument();
+      expect(within(card).getByText(expected)).toBeInTheDocument();
+      expect(within(card).queryByText(/USER_SETTINGS_CHANGE/)).toBeNull();
+      expect(within(card).queryByText(/Model Selection/)).toBeNull();
+      expect(within(card).queryByText(/CONTEXT_SUMMARY/)).toBeNull();
+      expect(within(card).queryByText(/Previous session summary/)).toBeNull();
+    }
+  });
+
+  it("classifies Grok <user_info>/<rules> turns and standalone <CONTEXT_SUMMARY>/<USER_SETTINGS_CHANGE> turns as collapsed System turns", () => {
+    const grokSystemTurn = [
+      "<user_info>",
+      "OS Version: linux",
+      "Workspace: /home/lmcfarlin/Projects/Artificial-Humanity",
+      "</user_info>",
+      "",
+      "<rules>",
+      "Follow workspace instructions in AGENTS.md.",
+      "</rules>",
+    ].join("\n");
+
+    const standaloneSettingsTurn = [
+      "<USER_SETTINGS_CHANGE>",
+      "The user changed setting Model Selection to Gemini 2.5 Pro.",
+      "</USER_SETTINGS_CHANGE>",
+    ].join("\n");
+
+    const standaloneContextSummaryTurn = [
+      "<CONTEXT_SUMMARY>",
+      "Compacted conversation summary.",
+      "</CONTEXT_SUMMARY>",
+    ].join("\n");
+
+    expect(
+      isOperatorUserTurn(turn({ index: 21, role: "user", content: grokSystemTurn })),
+    ).toBe(false);
+    expect(
+      isOperatorUserTurn(turn({ index: 22, role: "user", content: standaloneSettingsTurn })),
+    ).toBe(false);
+    expect(
+      isOperatorUserTurn(
+        turn({ index: 23, role: "user", content: standaloneContextSummaryTurn }),
+      ),
+    ).toBe(false);
+
+    render(
+      <>
+        <TurnCard
+          turn={turn({
+            index: 21,
+            role: "user",
+            content: grokSystemTurn,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 22,
+            role: "user",
+            content: standaloneSettingsTurn,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 23,
+            role: "user",
+            content: standaloneContextSummaryTurn,
+          })}
+        />
+      </>,
+    );
+
+    for (const [idx, expectedSnippet] of [
+      [21, /Follow workspace instructions in AGENTS\.md\./],
+      [22, /The user changed setting Model Selection/],
+      [23, /Compacted conversation summary\./],
+    ] as const) {
+      const card = screen.getByTestId(`turn-card-${idx}`);
+      expect(within(card).getByText("System")).toBeInTheDocument();
+      expect(within(card).queryByText("Operator")).toBeNull();
+      expect(card).not.toHaveAttribute("data-directed-assistant", "true");
+
+      const sysToggle = within(card).getByTestId(`turn-system-output-toggle-${idx}`);
+      expect(sysToggle).toHaveAttribute("aria-expanded", "false");
+      expect(within(card).queryByText(expectedSnippet)).toBeNull();
+
+      fireEvent.click(sysToggle);
+      expect(sysToggle).toHaveAttribute("aria-expanded", "true");
+      expect(within(card).getByText(expectedSnippet)).toBeInTheDocument();
     }
   });
 });
