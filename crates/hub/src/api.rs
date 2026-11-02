@@ -5445,9 +5445,12 @@ fn compact_session(
 }
 
 /// `GET /api/v1/commands` (Record 30): built-in slash commands plus the workspace's skills
-/// and workflows. The workspace is the hub's `repo_root`.
+/// and workflows. The workspace is the hub's `repo_root`; skills also come from the workspace
+/// parent and the user's home (`home_override`, else `HOME`).
 fn handle_get_commands(state: &HubState) -> HttpResponse {
-    let commands = crate::commands::list_commands(&state.config.repo_root);
+    let home = crate::commands::resolve_home(state.config.home_override.as_deref());
+    let commands =
+        crate::commands::list_commands_with_home(&state.config.repo_root, home.as_deref());
     HttpResponse::json(200, json!({ "commands": commands }))
 }
 

@@ -737,6 +737,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_hub_state(tmp: &TempDir) -> HubState {
+        test_hub_state_at(tmp, tmp.path(), tmp.path())
+    }
+
+    fn test_hub_state_at(
+        tmp: &TempDir,
+        repo_root: &std::path::Path,
+        home: &std::path::Path,
+    ) -> HubState {
         let ui_dir = tmp.path().join("ui_dist");
         fs::create_dir_all(&ui_dir).unwrap();
         fs::write(
@@ -749,7 +757,7 @@ mod tests {
         HubState::new(HubServerConfig {
             listen: "127.0.0.1:0".into(),
             store_path: tmp.path().join("store.redb"),
-            repo_root: tmp.path().to_path_buf(),
+            repo_root: repo_root.to_path_buf(),
             ui_dir: Some(ui_dir),
             owner_login: "lmcfarlin".into(),
             reviewer_apps: ReviewerApps::default(),
@@ -759,7 +767,7 @@ mod tests {
             trust_tailscale_headers: true,
             enable_terminal: true,
             session_ttl_secs: 3600,
-            home_override: Some(tmp.path().to_path_buf()),
+            home_override: Some(home.to_path_buf()),
         })
     }
 
@@ -5767,8 +5775,19 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
-        let state = test_hub_state(&tmp);
-        let root = tmp.path();
+        // Nested, so the workspace-parent scan stays inside the tempdir and never reaches the
+        // shared temp dir. The home is a separate dir with its own skill.
+        let root = tmp.path().join("ws/root");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(home.join(".claude/skills/homeskill")).unwrap();
+        fs::write(
+            home.join(".claude/skills/homeskill/SKILL.md"),
+            "---\nname: homeskill\ndescription: From the home dir\n---\n",
+        )
+        .unwrap();
+        let state = test_hub_state_at(&tmp, &root, &home);
+        let root = root.as_path();
         let skills = root.join(".agents/skills");
         fs::create_dir_all(skills.join("alpha")).unwrap();
         fs::write(
@@ -5835,6 +5854,10 @@ mod tests {
             assert_eq!(
                 find("workflow", "ship").unwrap(),
                 json!({ "name": "ship", "kind": "workflow", "description": "Ship a change" })
+            );
+            assert_eq!(
+                find("skill", "homeskill").unwrap(),
+                json!({ "name": "homeskill", "kind": "skill", "description": "From the home dir" })
             );
             assert!(find("skill", "broken").is_none());
             assert!(find("skill", "unfenced").is_none());

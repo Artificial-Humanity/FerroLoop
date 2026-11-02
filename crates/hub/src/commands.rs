@@ -1,9 +1,16 @@
-//! Slash-command catalog for `GET /api/v1/commands`: built-in commands, workspace skills
-//! (`.agents/skills/*/SKILL.md`) and workflows (`.fl/flows/*.toml`).
+//! Slash-command catalog for `GET /api/v1/commands`: built-in commands, skills
+//! (`<skills dir>/*/SKILL.md`) and workflows (`.fl/flows/*.toml`).
+//!
+//! Skills come from the workspace root, from the workspace parent (the checkout that holds
+//! the sub-repos) and, when a home directory is given, from the user's agent skill dirs; see
+//! [`skill_roots`] for the scan order, which is also the precedence for a duplicate name.
 //!
 //! Discovery is read-only and bounded: a directory yields at most [`MAX_ENTRIES_PER_KIND`]
-//! entries, a file is read up to [`MAX_FILE_BYTES`] bytes, and nothing a symlink points to
-//! outside the directory being scanned is read.
+//! entries, one response lists at most [`MAX_TOTAL_SKILLS`] skills, and a file is read up to
+//! [`MAX_FILE_BYTES`] bytes. Only `SKILL.md` frontmatter (name and description) is read from a
+//! skill; nothing in a skill dir is ever executed. A symlink is followed only when its target
+//! stays inside the scanned directory or inside a trusted root (the workspace parent, and the
+//! home directory when one is given).
 
 use std::fs;
 use std::io::Read;
@@ -15,10 +22,25 @@ use serde::{Deserialize, Serialize};
 pub const SKILLS_DIR: &str = ".agents/skills";
 /// Workflow manifests dir, relative to the workspace root.
 pub const FLOWS_DIR: &str = ".fl/flows";
-/// Most skills, and most workflows, one response lists.
+/// Most skills one scanned directory yields, and most workflows one response lists.
 pub const MAX_ENTRIES_PER_KIND: usize = 200;
+/// Most skills one response lists across all scanned directories.
+pub const MAX_TOTAL_SKILLS: usize = 500;
+/// Skills dir, relative to the workspace parent, that holds the lab-wide skills.
+pub const LAB_SKILLS_DIR: &str = "AI-Lab-AMD/skills";
+/// Skill dirs, relative to the user's home directory, in precedence order.
+pub const HOME_SKILLS_DIRS: [&str; 4] = [
+    ".agents/skills",
+    ".claude/skills",
+    ".codex/skills",
+    ".gemini/config/skills",
+];
 /// Most directory entries examined per scan, so a huge directory cannot stall the request.
+/// The first this many names in sorted order are examined.
 const MAX_DIR_ENTRIES_SCANNED: usize = 1000;
+/// Most names read from a directory before sorting, so memory stays bounded. A directory with
+/// more entries than this is cut in filesystem order before the sort.
+const MAX_DIR_NAMES_READ: usize = 10_000;
 /// Most bytes read from one `SKILL.md` or flow file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_NAME_CHARS: usize = 64;
@@ -98,12 +120,82 @@ pub fn builtin_commands() -> Vec<CommandEntry> {
     ]
 }
 
+/// The home directory to scan: `home_override` when set (tests, a hub with its own home),
+/// else the `HOME` environment variable. An empty or relative `HOME` means no home.
+pub fn resolve_home(home_override: Option<&Path>) -> Option<PathBuf> {
+    home_from(home_override, std::env::var_os("HOME"))
+}
+
+fn home_from(
+    home_override: Option<&Path>,
+    env_home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(home) = home_override {
+        return Some(home.to_path_buf());
+    }
+    let home = PathBuf::from(env_home.filter(|h| !h.is_empty())?);
+    home.is_absolute().then_some(home)
+}
+
+/// A directory to scan for skills, with the roots a symlink in it may point into.
+struct SkillRoots {
+    /// Directories in scan order; the first one that lists a name wins.
+    dirs: Vec<PathBuf>,
+    /// Canonical roots, besides the scanned directory, that a symlink target may lie in.
+    trusted: Vec<PathBuf>,
+}
+
+/// A canonical directory worth trusting: it exists and is not the filesystem root.
+fn trusted_root(dir: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(dir).ok()?;
+    (canonical.is_dir() && canonical.parent().is_some()).then_some(canonical)
+}
+
+/// Skill dirs for the workspace at `root`, in precedence order: `<root>/.agents/skills`, then
+/// `<parent>/.agents/skills` and `<parent>/AI-Lab-AMD/skills` (the parent holds the sub-repos
+/// the hub can run in), then, with a home, [`HOME_SKILLS_DIRS`] under it. A parent or home that
+/// is the filesystem root is neither scanned nor trusted.
+fn skill_roots(root: &Path, home: Option<&Path>) -> SkillRoots {
+    let mut dirs = vec![root.join(SKILLS_DIR)];
+    let mut trusted = Vec::new();
+    let parent = fs::canonicalize(root)
+        .ok()
+        .and_then(|r| r.parent().map(Path::to_path_buf))
+        .and_then(|p| trusted_root(&p));
+    if let Some(parent) = parent {
+        dirs.push(parent.join(SKILLS_DIR));
+        dirs.push(parent.join(LAB_SKILLS_DIR));
+        trusted.push(parent);
+    }
+    if let Some(home) = home.and_then(trusted_root) {
+        dirs.extend(HOME_SKILLS_DIRS.iter().map(|d| home.join(d)));
+        trusted.push(home);
+    }
+    SkillRoots { dirs, trusted }
+}
+
+/// The catalog for the workspace at `root`, without a home directory: built-ins, skills from
+/// the workspace and its parent, and workflows. See [`list_commands_with_home`].
+pub fn list_commands(root: &Path) -> Vec<CommandEntry> {
+    list_commands_with_home(root, None)
+}
+
 /// The full catalog for the workspace at `root`: built-ins, skills and workflows, sorted by
 /// `kind` then `name`, one entry per `(kind, name)`. A built-in wins over a discovered entry
-/// of the same kind and name.
-pub fn list_commands(root: &Path) -> Vec<CommandEntry> {
+/// of the same kind and name, and an earlier skill dir (see [`skill_roots`]) over a later one.
+/// With `home`, the user's agent skill dirs are scanned too. Workflows come from `root` only.
+pub fn list_commands_with_home(root: &Path, home: Option<&Path>) -> Vec<CommandEntry> {
     let mut all = builtin_commands();
-    all.extend(discover_skills(&root.join(SKILLS_DIR)));
+    let roots = skill_roots(root, home);
+    let mut skills = Vec::new();
+    let mut seen = Vec::new();
+    for dir in &roots.dirs {
+        if skills.len() >= MAX_TOTAL_SKILLS {
+            break;
+        }
+        scan_skills(dir, &roots.trusted, &mut seen, &mut skills);
+    }
+    all.extend(skills);
     all.extend(discover_flows(&root.join(FLOWS_DIR)));
     // Stable sort keeps the built-in ahead of a discovered duplicate, so dedup keeps it.
     all.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
@@ -111,9 +203,22 @@ pub fn list_commands(root: &Path) -> Vec<CommandEntry> {
     all
 }
 
-/// Canonical paths of the entries of `dir` in name order. An entry that is a symlink leaving
-/// `dir` is dropped, and so is a second entry that resolves to an already listed path.
-fn contained_entries(dir: &Path) -> Vec<PathBuf> {
+/// Canonical paths of the entries of `dir` in name order, at most [`MAX_DIR_ENTRIES_SCANNED`]
+/// examined. An entry that is a symlink leaving `dir` and every root in `trusted` is dropped,
+/// and so is a second entry that resolves to an already listed path.
+fn contained_entries(dir: &Path, trusted: &[PathBuf]) -> Vec<PathBuf> {
+    contained_entries_capped(dir, trusted, MAX_DIR_ENTRIES_SCANNED, MAX_DIR_NAMES_READ)
+}
+
+/// [`contained_entries`] with explicit bounds: up to `read_bound` names are read, sorted, and
+/// the first `cap` are examined. The cap applies after the sort, so a directory of up to
+/// `read_bound` entries yields the same entries on every run.
+fn contained_entries_capped(
+    dir: &Path,
+    trusted: &[PathBuf],
+    cap: usize,
+    read_bound: usize,
+) -> Vec<PathBuf> {
     let Ok(root) = fs::canonicalize(dir) else {
         return Vec::new();
     };
@@ -125,13 +230,16 @@ fn contained_entries(dir: &Path) -> Vec<PathBuf> {
     };
     let mut paths: Vec<PathBuf> = read
         .filter_map(Result::ok)
-        .take(MAX_DIR_ENTRIES_SCANNED)
+        .take(read_bound)
         .map(|e| e.path())
         .collect();
     paths.sort();
+    paths.truncate(cap);
     let mut seen = Vec::new();
     for canonical in paths.into_iter().filter_map(|p| fs::canonicalize(p).ok()) {
-        if canonical.starts_with(&root) && !seen.contains(&canonical) {
+        let allowed =
+            canonical.starts_with(&root) || trusted.iter().any(|t| canonical.starts_with(t));
+        if allowed && !seen.contains(&canonical) {
             seen.push(canonical);
         }
     }
@@ -241,23 +349,44 @@ fn parse_frontmatter(text: &str) -> Option<(Option<String>, Option<String>)> {
 
 /// Skills under `dir`: one per `<dir>/<skill>/SKILL.md` whose frontmatter names it.
 /// A `SKILL.md` that is unreadable, not UTF-8, without frontmatter, without a valid `name`,
-/// or that resolves outside `dir` is skipped.
+/// or that resolves outside `dir` is skipped. Symlinks must stay inside `dir`.
 pub fn discover_skills(dir: &Path) -> Vec<CommandEntry> {
-    let Ok(root) = fs::canonicalize(dir) else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for skill_dir in contained_entries(dir) {
-        if out.len() >= MAX_ENTRIES_PER_KIND {
+    scan_skills(dir, &[], &mut Vec::new(), &mut out);
+    out
+}
+
+/// Append the skills under `dir` to `out`. A skill whose canonical dir is in `seen`, or whose
+/// name `out` already lists, is skipped; this makes the first dir that lists a skill win and
+/// collapses symlinked copies. Stops at [`MAX_ENTRIES_PER_KIND`] additions from this dir or
+/// when `out` holds [`MAX_TOTAL_SKILLS`].
+///
+/// A skill dir may be a link into any trusted root, but a `SKILL.md` that is itself a symlink
+/// is accepted only when it resolves inside its own skill dir or inside the scanned `dir`.
+/// That is stricter than the rule for the skill dir, and it fails closed: a `SKILL.md` link
+/// into another trusted root is skipped.
+fn scan_skills(
+    dir: &Path,
+    trusted: &[PathBuf],
+    seen: &mut Vec<PathBuf>,
+    out: &mut Vec<CommandEntry>,
+) {
+    let Ok(root) = fs::canonicalize(dir) else {
+        return;
+    };
+    let mut added = 0;
+    for skill_dir in contained_entries(dir, trusted) {
+        if added >= MAX_ENTRIES_PER_KIND || out.len() >= MAX_TOTAL_SKILLS {
             break;
         }
-        if !skill_dir.is_dir() {
+        if !skill_dir.is_dir() || seen.contains(&skill_dir) {
             continue;
         }
         let Ok(skill_md) = fs::canonicalize(skill_dir.join("SKILL.md")) else {
             continue;
         };
-        if !skill_md.starts_with(&root) || !skill_md.is_file() {
+        if !(skill_md.starts_with(&skill_dir) || skill_md.starts_with(&root)) || !skill_md.is_file()
+        {
             continue;
         }
         let Some(text) = read_capped(&skill_md) else {
@@ -270,13 +399,17 @@ pub fn discover_skills(dir: &Path) -> Vec<CommandEntry> {
         if !valid_name(&name) {
             continue;
         }
+        seen.push(skill_dir);
+        if out.iter().any(|e| e.name == name) {
+            continue;
+        }
         out.push(CommandEntry {
             name,
             kind: "skill".to_string(),
             description: one_line(&description.unwrap_or_default()),
         });
+        added += 1;
     }
-    out
 }
 
 /// Workflows under `dir`: one per `*.toml` file. The name is the file stem; the description is
@@ -287,7 +420,7 @@ pub fn discover_flows(dir: &Path) -> Vec<CommandEntry> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for path in contained_entries(dir) {
+    for path in contained_entries(dir, &[]) {
         if out.len() >= MAX_ENTRIES_PER_KIND {
             break;
         }
@@ -517,7 +650,9 @@ mod tests {
     #[test]
     fn catalog_is_sorted_deduped_and_builtins_win() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
+        // Nested, so the workspace-parent scan stays inside the tempdir and never reaches the
+        // shared temp dir.
+        let root = &tmp.path().join("ws/root");
         write(
             &root.join(".agents/skills/code-review/SKILL.md"),
             "---\nname: code-review\ndescription: workspace override\n---\n",
@@ -555,7 +690,9 @@ mod tests {
         assert!(all.iter().any(|c| c.name == "zeta" && c.kind == "skill"));
         // Missing directories are fine.
         let empty = TempDir::new().unwrap();
-        assert_eq!(list_commands(empty.path()), {
+        let empty_root = empty.path().join("ws/root");
+        fs::create_dir_all(&empty_root).unwrap();
+        assert_eq!(list_commands(&empty_root), {
             let mut b = builtin_commands();
             b.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
             b
@@ -615,5 +752,395 @@ mod tests {
         let d = &skills[0].description;
         assert!(d.chars().count() <= MAX_DESCRIPTION_CHARS);
         assert!(!d.contains('\n') && !d.contains("  "));
+    }
+
+    fn skill(path: &Path, name: &str, description: &str) {
+        write(
+            &path.join("SKILL.md"),
+            &format!("---\nname: {name}\ndescription: {description}\n---\n"),
+        );
+    }
+
+    /// `ws/FerroLoop` (the root), workspace skills, and a separate home with its own skills.
+    struct Layout {
+        _tmp: TempDir,
+        ws: PathBuf,
+        root: PathBuf,
+        home: PathBuf,
+    }
+
+    fn layout() -> Layout {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let root = ws.join("FerroLoop");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&root).unwrap();
+        skill(
+            &ws.join(".agents/skills/brandkit"),
+            "brandkit",
+            "Brand kits",
+        );
+        skill(
+            &ws.join(".agents/skills/code-review"),
+            "code-review",
+            "ws review",
+        );
+        skill(&ws.join("AI-Lab-AMD/skills/ste"), "ste", "ws ste");
+        skill(
+            &ws.join("AI-Lab-AMD/skills/training-hygiene"),
+            "training-hygiene",
+            "Training box facts",
+        );
+        skill(
+            &home.join(".agents/skills/lucida"),
+            "lucida",
+            "Media generation",
+        );
+        skill(
+            &home.join(".agents/skills/find-skills"),
+            "find-skills",
+            "Find skills",
+        );
+        for (dir, target) in [
+            (
+                ".claude/skills/brandkit",
+                ws.join(".agents/skills/brandkit"),
+            ),
+            (
+                ".claude/skills/code-review",
+                ws.join(".agents/skills/code-review"),
+            ),
+            (".claude/skills/ste", ws.join("AI-Lab-AMD/skills/ste")),
+            (
+                ".claude/skills/training-hygiene",
+                ws.join("AI-Lab-AMD/skills/training-hygiene"),
+            ),
+            (".claude/skills/lucida", home.join(".agents/skills/lucida")),
+            (".codex/skills/lucida", home.join(".agents/skills/lucida")),
+            (
+                ".gemini/config/skills/lucida",
+                home.join(".agents/skills/lucida"),
+            ),
+        ] {
+            fs::create_dir_all(home.join(dir).parent().unwrap()).unwrap();
+            symlink(target, home.join(dir)).unwrap();
+        }
+        // Skills that live outside every scanned dir and are reachable only through a link:
+        // one from the home into the workspace, one from the workspace into the home.
+        skill(
+            &ws.join("extras/ws-only"),
+            "ws-only",
+            "Only via a home link",
+        );
+        skill(
+            &home.join("stash/home-only"),
+            "home-only",
+            "Only via a workspace link",
+        );
+        symlink(
+            ws.join("extras/ws-only"),
+            home.join(".claude/skills/ws-only"),
+        )
+        .unwrap();
+        symlink(
+            home.join("stash/home-only"),
+            ws.join(".agents/skills/home-only"),
+        )
+        .unwrap();
+        Layout {
+            _tmp: tmp,
+            ws,
+            root,
+            home,
+        }
+    }
+
+    fn skill_names(all: &[CommandEntry]) -> Vec<&str> {
+        all.iter()
+            .filter(|c| c.kind == "skill")
+            .map(|c| c.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn workspace_parent_and_home_skills_are_listed_once_through_symlinks() {
+        let l = layout();
+        let all = list_commands_with_home(&l.root, Some(&l.home));
+        let names = skill_names(&all);
+        for want in [
+            "brandkit",
+            "training-hygiene",
+            "lucida",
+            "find-skills",
+            "code-review",
+            "ste",
+        ] {
+            assert_eq!(
+                names.iter().filter(|n| **n == want).count(),
+                1,
+                "{want}: {names:?}"
+            );
+        }
+        // Built-ins still there, and nothing extra: 4 built-in skills + 6 discovered.
+        assert_eq!(names.len(), 10, "{names:?}");
+        let described = |n: &str| {
+            all.iter()
+                .find(|c| c.name == n && c.kind == "skill")
+                .unwrap()
+        };
+        assert_eq!(described("lucida").description, "Media generation");
+        assert_eq!(
+            described("training-hygiene").description,
+            "Training box facts"
+        );
+        // Built-ins win over the workspace copies of the same name.
+        assert_ne!(described("ste").description, "ws ste");
+        assert_ne!(described("code-review").description, "ws review");
+
+        // Without a home only the workspace-parent roots count.
+        let no_home = list_commands(&l.root);
+        let names = skill_names(&no_home);
+        assert!(names.contains(&"brandkit") && names.contains(&"training-hygiene"));
+        assert!(
+            !names.contains(&"lucida") && !names.contains(&"find-skills"),
+            "{names:?}"
+        );
+        assert_eq!(list_commands_with_home(&l.root, None), no_home);
+    }
+
+    #[test]
+    fn home_dirs_alone_still_follow_links_into_the_workspace() {
+        let l = layout();
+        // A root whose parent is unrelated to the workspace: only the home is trusted.
+        let other = l.home.join("elsewhere/proj");
+        fs::create_dir_all(&other).unwrap();
+        let all = list_commands_with_home(&other, Some(&l.home));
+        let names = skill_names(&all);
+        // The home root is trusted, so `~/.claude/skills/lucida` (a link into `~/.agents`) works.
+        assert!(
+            names.contains(&"lucida") && names.contains(&"find-skills"),
+            "{names:?}"
+        );
+        // Links into the workspace are outside the trusted roots here and are rejected.
+        assert!(
+            !names.contains(&"brandkit") && !names.contains(&"training-hygiene"),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn symlinks_leaving_the_trusted_roots_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let l = layout();
+        let outside = TempDir::new().unwrap();
+        skill(&outside.path().join("evil"), "evil", "escaped");
+        symlink(
+            outside.path().join("evil"),
+            l.home.join(".claude/skills/evil"),
+        )
+        .unwrap();
+        // A `..` path that leaves both roots. It climbs one `..` per component of the link's
+        // parent, so it lands at the real `evil` dir, not on a dangling path.
+        let dots = l.home.join(".codex/skills/dots");
+        let ups = dots.parent().unwrap().components().count() - 1;
+        let mut rel = PathBuf::new();
+        for _ in 0..ups {
+            rel.push("..");
+        }
+        symlink(
+            rel.join(outside.path().strip_prefix("/").unwrap())
+                .join("evil"),
+            &dots,
+        )
+        .unwrap();
+        // Sanity: each escape resolves to a real, valid skill outside both trusted roots, so
+        // only containment can reject it.
+        let real_evil = fs::canonicalize(outside.path().join("evil")).unwrap();
+        assert!(real_evil.join("SKILL.md").is_file());
+        assert_eq!(fs::canonicalize(&dots).unwrap(), real_evil);
+        assert_eq!(
+            discover_skills(outside.path()),
+            vec![entry("evil", "skill", "escaped")]
+        );
+        // A SKILL.md link out of its skill dir (a containment case), and a skill dir without a
+        // SKILL.md (skipped for that reason, not containment).
+        fs::create_dir_all(l.home.join(".claude/skills/linkmd")).unwrap();
+        symlink(
+            outside.path().join("evil/SKILL.md"),
+            l.home.join(".claude/skills/linkmd/SKILL.md"),
+        )
+        .unwrap();
+        fs::create_dir_all(l.home.join(".claude/skills/nomd")).unwrap();
+        // Skipped for other reasons, not containment: a loop and a dangling link do not resolve.
+        symlink(
+            l.home.join(".claude/skills/loop-b"),
+            l.home.join(".claude/skills/loop-a"),
+        )
+        .unwrap();
+        symlink(
+            l.home.join(".claude/skills/loop-a"),
+            l.home.join(".claude/skills/loop-b"),
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("missing"),
+            l.home.join(".claude/skills/dangling"),
+        )
+        .unwrap();
+        // A link to /etc: outside the roots, but it holds no SKILL.md, so it would be skipped
+        // anyway. It adds nothing beyond the `evil` cases above for containment.
+        symlink("/etc", l.home.join(".claude/skills/etc")).unwrap();
+
+        let all = list_commands_with_home(&l.root, Some(&l.home));
+        let names = skill_names(&all);
+        assert_eq!(names.len(), 10, "{names:?}");
+        assert!(!names.contains(&"evil"), "{names:?}");
+        // The escape also fails when the link is the only route to the skill.
+        let alone = discover_skills(&l.home.join(".claude/skills"));
+        assert!(alone.iter().all(|e| e.name != "evil"));
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_a_root_name_prefix_is_not_trusted() {
+        use std::os::unix::fs::symlink;
+        let l = layout();
+        // `<tmp>/home2` starts with the string `<tmp>/home` but is not inside it.
+        let tmp = l.home.parent().unwrap();
+        skill(&tmp.join("home2/skill"), "sibling", "next door");
+        skill(&l.home.join("real/skill"), "inhome", "inside the home");
+        let skills_dir = l.ws.join(".agents/skills");
+        symlink(tmp.join("home2/skill"), skills_dir.join("sibling")).unwrap();
+        symlink(l.home.join("real/skill"), skills_dir.join("inhome")).unwrap();
+        // Sanity: both targets are real, valid skills and neither is under the workspace.
+        for target in [tmp.join("home2/skill"), l.home.join("real/skill")] {
+            assert!(target.join("SKILL.md").is_file());
+            assert!(!target.starts_with(&l.ws));
+        }
+        assert!(
+            tmp.join("home2")
+                .to_string_lossy()
+                .starts_with(&*l.home.to_string_lossy())
+        );
+
+        let all = list_commands_with_home(&l.root, Some(&l.home));
+        let names = skill_names(&all);
+        assert!(names.contains(&"inhome"), "{names:?}");
+        assert!(!names.contains(&"sibling"), "{names:?}");
+    }
+
+    #[test]
+    fn a_directory_over_the_cap_lists_its_first_names_in_sorted_order() {
+        let tmp = TempDir::new().unwrap();
+        // One directory is filled in ascending name order and one in descending order, so a
+        // filesystem that lists by creation order (either way) cuts one of them wrongly.
+        let names: Vec<String> = (0..30).map(|i| format!("e{i:02}")).collect();
+        for (dir, order) in [
+            ("up", names.clone()),
+            ("down", {
+                let mut rev = names.clone();
+                rev.reverse();
+                rev
+            }),
+        ] {
+            for name in order {
+                write(&tmp.path().join(dir).join(&name), "x");
+            }
+            let listed = contained_entries_capped(&tmp.path().join(dir), &[], 5, 100);
+            let got: Vec<_> = listed
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, names[..5], "{dir}");
+        }
+        // Without a cap in play, every entry is listed.
+        assert_eq!(
+            contained_entries_capped(&tmp.path().join("up"), &[], 100, 100).len(),
+            30
+        );
+    }
+
+    #[test]
+    fn earlier_roots_win_a_duplicate_name_and_builtins_win_over_all() {
+        let l = layout();
+        skill(&l.root.join(".agents/skills/lucida"), "lucida", "from root");
+        skill(&l.ws.join(".agents/skills/dup"), "dup", "from parent");
+        skill(&l.ws.join("AI-Lab-AMD/skills/dup2"), "dup", "from lab");
+        skill(&l.home.join(".agents/skills/dup3"), "dup", "from home");
+        skill(&l.home.join(".claude/skills/ste"), "ste", "home ste");
+        let all = list_commands_with_home(&l.root, Some(&l.home));
+        let get = |n: &str| {
+            let hits: Vec<_> = all
+                .iter()
+                .filter(|c| c.name == n && c.kind == "skill")
+                .collect();
+            assert_eq!(hits.len(), 1, "{n}");
+            hits[0].description.clone()
+        };
+        assert_eq!(get("lucida"), "from root");
+        assert_eq!(get("dup"), "from parent");
+        assert_ne!(get("ste"), "home ste");
+        assert_eq!(
+            get("ste"),
+            "Rewrite text in ASD-STE100 Simplified Technical English"
+        );
+    }
+
+    #[test]
+    fn skills_listed_in_total_are_capped_in_scan_order() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let root = ws.join("root");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&root).unwrap();
+        // 3 dirs of 200 skills exceed the total cap; the root dir is scanned first.
+        for (dir, tag) in [
+            (root.join(".agents/skills"), "x"),
+            (ws.join(".agents/skills"), "y"),
+            (home.join(".agents/skills"), "z"),
+        ] {
+            for i in 0..MAX_ENTRIES_PER_KIND {
+                let name = format!("{tag}{i:04}");
+                skill(&dir.join(&name), &name, "d");
+            }
+        }
+        let all = list_commands_with_home(&root, Some(&home));
+        let count = |tag: char| {
+            all.iter()
+                .filter(|c| c.kind == "skill" && c.name.starts_with(tag))
+                .count()
+        };
+        assert_eq!(count('x'), MAX_ENTRIES_PER_KIND);
+        assert_eq!(count('y'), MAX_ENTRIES_PER_KIND);
+        assert_eq!(count('z'), MAX_TOTAL_SKILLS - 2 * MAX_ENTRIES_PER_KIND);
+        // Deterministic: the first names of the last dir are the ones kept.
+        assert!(all.iter().any(|c| c.name == "z0099"));
+        assert!(!all.iter().any(|c| c.name == "z0100"));
+        assert_eq!(all, list_commands_with_home(&root, Some(&home)));
+    }
+
+    #[test]
+    fn a_filesystem_root_parent_is_not_scanned_or_trusted() {
+        assert!(trusted_root(Path::new("/")).is_none());
+        let roots = skill_roots(Path::new("/"), None);
+        assert_eq!(roots.dirs, vec![Path::new("/").join(SKILLS_DIR)]);
+        assert!(roots.trusted.is_empty());
+    }
+
+    #[test]
+    fn home_comes_from_the_override_else_a_nonempty_absolute_env_home() {
+        use std::ffi::OsString;
+        let over = Path::new("/some/override");
+        assert_eq!(
+            home_from(Some(over), Some(OsString::from("/env/home"))),
+            Some(over.to_path_buf())
+        );
+        assert_eq!(
+            home_from(None, Some(OsString::from("/env/home"))),
+            Some(PathBuf::from("/env/home"))
+        );
+        assert_eq!(home_from(None, Some(OsString::new())), None);
+        assert_eq!(home_from(None, Some(OsString::from("relative/home"))), None);
+        assert_eq!(home_from(None, None), None);
     }
 }
