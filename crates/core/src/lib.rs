@@ -33,6 +33,7 @@ pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod tiered;
+pub mod vendor;
 pub mod verdict;
 pub mod workflow;
 
@@ -110,6 +111,10 @@ pub use store::{
     node_id_shape,
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
+pub use vendor::{
+    ApiDialect, VendorDescriptor, VendorError, VendorRegistry, VendorTransport, lookup_vendor,
+    register_vendor, validate_api_base_url,
+};
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{
     ApprovalTier, AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
