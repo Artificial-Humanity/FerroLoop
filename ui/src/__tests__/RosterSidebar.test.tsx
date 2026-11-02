@@ -4,6 +4,7 @@ import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { ContextHeader } from "../components/ContextHeader";
+import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import { PairingModal } from "../components/PairingModal";
 import {
   COLLAPSED_PROJECTS_STORAGE_KEY,
@@ -594,21 +595,51 @@ describe("ContextHeader session pill and header controls", () => {
     },
   ];
 
-  it("shows a session id pill instead of the selector for a single session", () => {
+  it("omits the session id pill from ContextHeader for a single session and renders it inside AgentSettingsModal", () => {
     render(
-      <ContextHeader
-        selectedAgent={ferrisAgent}
-        sessions={oneSession}
-        selectedSessionId="sess-only-1234abcd"
-        onSelectSession={() => {}}
-        activeTab="chat"
-        onSelectTab={() => {}}
-        onOpenPairingModal={() => {}}
-      />,
+      <>
+        <ContextHeader
+          selectedAgent={ferrisAgent}
+          sessions={oneSession}
+          selectedSessionId="sess-only-1234abcd"
+          onSelectSession={() => {}}
+          activeTab="chat"
+          onSelectTab={() => {}}
+          onOpenPairingModal={() => {}}
+        />
+        <AgentSettingsModal
+          isOpen={true}
+          onClose={() => {}}
+          agentName="ferris"
+          agentDisplayName="Ferris"
+          sessionId="sess-only-1234abcd"
+          adapter="claude"
+          selectedModel="claude-opus-5-5"
+          selectedThinkingLevel="high"
+          onChangeModelAndThinking={() => {}}
+          contextEstimate={{
+            usedTokens: 1000,
+            maxTokens: 200000,
+            percent: 1,
+          }}
+          canCompact={false}
+          compacting={false}
+          onCompactContext={() => {}}
+          canClear={true}
+          clearing={false}
+          onOpenClearModal={() => {}}
+          canDecommission={true}
+          decommissioning={false}
+          onOpenDecommissionModal={() => {}}
+        />
+      </>,
     );
 
     expect(screen.queryByTestId("session-selector")).toBeNull();
     expect(screen.getByTestId("session-id-pill")).toHaveTextContent("#1234abcd");
+    expect(screen.getByTestId("agent-settings-identity")).toContainElement(
+      screen.getByTestId("session-id-pill"),
+    );
     expect(screen.queryByTestId("system-utility-bar")).toBeNull();
   });
 

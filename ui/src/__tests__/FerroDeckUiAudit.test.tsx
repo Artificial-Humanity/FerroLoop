@@ -378,13 +378,16 @@ describe("App", () => {
 
     await screen.findByText("confidential transcript from ferris");
     expect(screen.getByTestId("nodes-modal-btn")).toHaveTextContent("Nodes (1)");
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     expect(screen.getByTestId("session-id-pill")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
 
     fireEvent.click(screen.getByRole("button", { name: /Sign Out/i }));
 
     await waitFor(() =>
       expect(screen.queryByText("confidential transcript from ferris")).toBeNull(),
     );
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     expect(screen.queryByTestId("session-id-pill")).toBeNull();
     expect(screen.getByTestId("nodes-modal-btn")).toHaveTextContent(/^Nodes$/);
     expect(ws.setToken).toHaveBeenLastCalledWith(null);
