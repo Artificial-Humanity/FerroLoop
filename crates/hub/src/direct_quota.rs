@@ -205,7 +205,22 @@ fn claude_quota_uncached(
         secondary_window: None,
         exhausted_reason: None,
     });
-    if let Some(tier) = auth_tier {
+    // `subscriptionType` is written once at `claude auth login`, so the
+    // credentials file and `claude auth status` stay on the old plan after an
+    // upgrade. `~/.claude.json` and the live profile track the account.
+    let fresh_tier = resolve_claude_tier(
+        claude_json_plan(home_override),
+        home_override.is_none(),
+        || {
+            creds
+                .as_ref()
+                .and_then(|creds| creds.token.as_deref())
+                .and_then(fetch_claude_oauth_profile)
+                .and_then(|profile| plan_from_profile(&profile))
+        },
+        auth_tier,
+    );
+    if let Some(tier) = fresh_tier {
         quota.tier = Some(tier);
     } else if quota.tier.is_none()
         && let Some(creds) = creds.as_ref()
@@ -217,6 +232,26 @@ fn claude_quota_uncached(
     } else {
         Some(quota)
     }
+}
+
+/// Picks the Claude plan tier. `~/.claude.json` wins when it names a plan
+/// above `pro`; otherwise the live profile (fetched lazily, only when
+/// `query_profile` is set and the json plan is missing or `pro`) may upgrade
+/// it; `auth_tier` is the last resort.
+fn resolve_claude_tier(
+    json_plan: Option<String>,
+    query_profile: bool,
+    live_profile: impl FnOnce() -> Option<String>,
+    auth_tier: Option<String>,
+) -> Option<String> {
+    let mut fresh_tier = json_plan;
+    if query_profile
+        && matches!(fresh_tier.as_deref(), None | Some("pro"))
+        && let Some(live) = live_profile()
+    {
+        fresh_tier = Some(live);
+    }
+    fresh_tier.or(auth_tier)
 }
 
 pub(crate) fn agy_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
@@ -571,6 +606,80 @@ fn subscription_type(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Plan name for an Anthropic `organization_type` such as `claude_max`.
+fn plan_from_org_type(text: &str) -> Option<String> {
+    let plan = text.trim().to_ascii_lowercase();
+    let plan = plan.strip_prefix("claude_").unwrap_or(&plan);
+    matches!(plan, "max" | "pro" | "team" | "enterprise").then(|| plan.to_owned())
+}
+
+/// Plan name for a rate-limit tier such as `default_claude_max_5x`. Only the
+/// paid consumer plans are named. Other tiers are not plan names.
+fn plan_from_rate_tier(text: &str) -> Option<String> {
+    let text = text.to_ascii_lowercase();
+    if text.contains("claude_max") {
+        Some("max".to_owned())
+    } else if text.contains("claude_pro") {
+        Some("pro".to_owned())
+    } else {
+        None
+    }
+}
+
+fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+/// The plan from `<home>/.claude.json` `oauthAccount`. Claude Code refreshes it
+/// after an account change.
+fn claude_json_plan(home_override: Option<&Path>) -> Option<String> {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    let raw = fs::read_to_string(home.join(".claude.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let account = value.get("oauthAccount")?;
+    string_field(account, "organizationType")
+        .and_then(plan_from_org_type)
+        .or_else(|| {
+            ["organizationRateLimitTier", "userRateLimitTier"]
+                .into_iter()
+                .filter_map(|key| string_field(account, key))
+                .find_map(plan_from_rate_tier)
+        })
+}
+
+/// The plan from the `/api/oauth/profile` response.
+fn plan_from_profile(profile: &Value) -> Option<String> {
+    let account = profile.get("account");
+    let organization = profile.get("organization");
+    if account
+        .and_then(|a| a.get("has_claude_max"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Some("max".to_owned());
+    }
+    organization
+        .and_then(|o| string_field(o, "organization_type"))
+        .and_then(plan_from_org_type)
+        .or_else(|| {
+            organization
+                .and_then(|o| string_field(o, "rate_limit_tier"))
+                .and_then(plan_from_rate_tier)
+        })
+        .or_else(|| {
+            (account
+                .and_then(|a| a.get("has_claude_pro"))
+                .and_then(Value::as_bool)
+                == Some(true))
+            .then(|| "pro".to_owned())
+        })
+}
+
 struct ClaudeCredentials {
     tier: Option<String>,
     rate_limit_tier: Option<String>,
@@ -610,6 +719,14 @@ fn read_claude_credentials(path: &Path) -> Option<ClaudeCredentials> {
 }
 
 fn fetch_claude_oauth_usage(token: &str) -> Option<Value> {
+    fetch_claude_oauth_json(token, "usage")
+}
+
+fn fetch_claude_oauth_profile(token: &str) -> Option<Value> {
+    fetch_claude_oauth_json(token, "profile")
+}
+
+fn fetch_claude_oauth_json(token: &str, endpoint: &str) -> Option<Value> {
     if token.is_empty()
         || token
             .chars()
@@ -619,16 +736,17 @@ fn fetch_claude_oauth_usage(token: &str) -> Option<Value> {
     }
     #[cfg(unix)]
     {
-        fetch_claude_oauth_usage_unix(token)
+        fetch_claude_oauth_unix(token, endpoint)
     }
     #[cfg(not(unix))]
     {
+        let _ = endpoint;
         None
     }
 }
 
 #[cfg(unix)]
-fn fetch_claude_oauth_usage_unix(token: &str) -> Option<Value> {
+fn fetch_claude_oauth_unix(token: &str, endpoint: &str) -> Option<Value> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -641,7 +759,7 @@ fn fetch_claude_oauth_usage_unix(token: &str) -> Option<Value> {
     let path = std::env::temp_dir().join(name);
     let _cleanup = TempSecret(&path);
     let body = format!(
-        "silent\nmax-time = 3\nurl = \"https://api.anthropic.com/api/oauth/usage\"\nheader = \"Accept: application/json\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"User-Agent: claude-code/2.1.312\"\nheader = \"Authorization: Bearer {token}\"\n"
+        "silent\nmax-time = 3\nurl = \"https://api.anthropic.com/api/oauth/{endpoint}\"\nheader = \"Accept: application/json\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"User-Agent: claude-code/2.1.312\"\nheader = \"Authorization: Bearer {token}\"\n"
     );
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -747,6 +865,48 @@ mod tests {
     use crate::discovery::read_session_quota_usage_locked;
     use fl_core::At;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn resolve_claude_tier_prefers_json_and_fetches_profile_lazily() {
+        let s = |v: &str| Some(v.to_string());
+        let calls = Cell::new(0);
+        let live = |value: Option<String>| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                value
+            }
+        };
+        assert_eq!(
+            resolve_claude_tier(s("pro"), true, live(s("max")), None),
+            s("max")
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            resolve_claude_tier(s("pro"), true, live(None), None),
+            s("pro")
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            resolve_claude_tier(s("max"), true, live(s("pro")), s("pro")),
+            s("max")
+        );
+        assert_eq!(calls.get(), 2, "json max must not fetch the profile");
+        assert_eq!(
+            resolve_claude_tier(None, false, live(s("max")), s("pro")),
+            s("pro")
+        );
+        assert_eq!(calls.get(), 2, "query_profile=false must not fetch");
+        assert_eq!(
+            resolve_claude_tier(None, true, live(None), s("pro")),
+            s("pro")
+        );
+        assert_eq!(
+            resolve_claude_tier(None, true, live(s("max")), s("pro")),
+            s("max")
+        );
+        assert_eq!(calls.get(), 4);
+    }
 
     fn write_script(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
@@ -983,6 +1143,87 @@ mod tests {
             let raw = fs::read_to_string(claude_dir.join(".credentials.json")).unwrap();
             assert!(!raw.contains("sk-ant"));
         });
+    }
+
+    #[test]
+    fn claude_json_oauth_account_overrides_a_stale_pro_subscription() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let claude_dir = home.join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            fs::write(
+                claude_dir.join(".credentials.json"),
+                r#"{"claudeAiOauth":{"subscriptionType":"pro","accessToken":"not-a-real-token","five_hour":{"utilization":5,"resets_at":"2026-11-05T01:11:25.780Z"}}}"#,
+            )
+            .unwrap();
+            fs::write(
+                home.join(".claude.json"),
+                r#"{"oauthAccount":{"organizationType":"claude_max","organizationRateLimitTier":"default_claude_max_5x"}}"#,
+            )
+            .unwrap();
+            let bin = home.join("claude-stub");
+            write_script(
+                &bin,
+                "#!/bin/sh\nprintf '%s\\n' '{\"subscriptionType\":\"pro\"}'\n",
+            );
+            // SAFETY: this test holds PROBE_LOCK until `_clear` drops and removes the vars.
+            unsafe {
+                std::env::set_var("FL_HUB_CLAUDE_BIN", &bin);
+                std::env::remove_var("FL_CLAUDE_USAGE_JSON");
+            }
+            expire_direct_quota_cache();
+            let quota = claude_account_quota(Some(home)).expect("quota");
+            assert_eq!(quota.tier.as_deref(), Some("max"));
+            assert_eq!(quota.primary_window.as_ref().unwrap().used_percent, 5.0);
+        });
+    }
+
+    #[test]
+    fn claude_json_rate_tier_names_the_plan_when_the_org_type_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |json: &str| fs::write(tmp.path().join(".claude.json"), json).unwrap();
+        write(r#"{"oauthAccount":{"organizationRateLimitTier":"default_claude_max_20x"}}"#);
+        assert_eq!(claude_json_plan(Some(tmp.path())).as_deref(), Some("max"));
+        write(r#"{"oauthAccount":{"userRateLimitTier":"default_claude_max_5x"}}"#);
+        assert_eq!(claude_json_plan(Some(tmp.path())).as_deref(), Some("max"));
+        write(r#"{"oauthAccount":{"organizationType":"claude_pro"}}"#);
+        assert_eq!(claude_json_plan(Some(tmp.path())).as_deref(), Some("pro"));
+        write(r#"{"oauthAccount":{"organizationType":"claude_team"}}"#);
+        assert_eq!(claude_json_plan(Some(tmp.path())).as_deref(), Some("team"));
+        write(
+            r#"{"oauthAccount":{"organizationType":"mystery","organizationRateLimitTier":"default"}}"#,
+        );
+        assert_eq!(claude_json_plan(Some(tmp.path())), None);
+        write(r#"{"no":"account"}"#);
+        assert_eq!(claude_json_plan(Some(tmp.path())), None);
+        write("not json");
+        assert_eq!(claude_json_plan(Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn oauth_profile_names_the_live_plan() {
+        let max_flag: Value =
+            serde_json::from_str(r#"{"account":{"has_claude_max":true,"has_claude_pro":false}}"#)
+                .unwrap();
+        assert_eq!(plan_from_profile(&max_flag).as_deref(), Some("max"));
+        let org: Value = serde_json::from_str(
+            r#"{"account":{"has_claude_max":false},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(plan_from_profile(&org).as_deref(), Some("max"));
+        let tier_only: Value = serde_json::from_str(
+            r#"{"organization":{"rate_limit_tier":"default_claude_max_20x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(plan_from_profile(&tier_only).as_deref(), Some("max"));
+        let pro: Value = serde_json::from_str(
+            r#"{"account":{"has_claude_max":false,"has_claude_pro":true},"organization":{"organization_type":"claude_pro"}}"#,
+        )
+        .unwrap();
+        assert_eq!(plan_from_profile(&pro).as_deref(), Some("pro"));
+        assert_eq!(plan_from_profile(&serde_json::json!({})), None);
     }
 
     #[test]
