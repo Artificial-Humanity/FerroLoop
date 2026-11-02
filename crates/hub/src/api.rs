@@ -417,6 +417,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     if let Some(resp) = crate::watch_api::route(state, &authority, req) {
         return resp;
     }
+    if let Some(resp) = crate::balance_api::route(state, &authority, req) {
+        return resp;
+    }
 
     match (method, path) {
         ("GET", "/api/v1/auth/session") => HttpResponse::json(
@@ -563,7 +566,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     }
 }
 
-fn store_open_failure() -> HttpResponse {
+pub(crate) fn store_open_failure() -> HttpResponse {
     HttpResponse::json(
         500,
         json!({ "error": "failed to open store: store unavailable" }),
@@ -1265,7 +1268,7 @@ fn handle_auth_logout(state: &HubState, req: &HttpRequest) -> HttpResponse {
         .with_header("Set-Cookie", format_logout_set_cookie())
 }
 
-fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
+pub(crate) fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
     match state.open_store() {
         Ok(store) => snapshot_discovery_store(&store),
         Err(_) => DiscoveryStoreSnapshot::default(),
@@ -4351,7 +4354,7 @@ fn resolve_session_target_from_snapshot(
 }
 
 /// The canonical session id and persona for `raw_session_id` among `sessions`.
-fn resolve_session_target_in(
+pub(crate) fn resolve_session_target_in(
     sessions: &[DiscoveredSessionSummary],
     raw_session_id: &str,
 ) -> (String, Option<String>) {
@@ -5340,7 +5343,7 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
     HttpResponse::json(err.status(), json!({ "error": err.to_string() }))
 }
 
-fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
+pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     LifecycleEnv::new(state.config.home_override.as_deref())
 }
 
@@ -5484,7 +5487,7 @@ fn handle_post_session_decommission(
 ///
 /// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
 /// (`restored` or `down`). When the old session was restored, the operator's model override
-/// (and thinking level) the teardown cleared is put back as it was.
+/// (and thinking level) the teardown cleared is put back as it was (see [`run_remodel`]).
 fn handle_post_session_remodel(
     state: &HubState,
     authority: &HubAuthority,
@@ -5498,7 +5501,6 @@ fn handle_post_session_remodel(
     // Resolve before taking the store guard: discovery opens the store itself.
     let discovered = resolve_session_target(state, session_id);
     let by = authority.actor_name();
-    let env = lifecycle_env(state);
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
@@ -5506,27 +5508,62 @@ fn handle_post_session_remodel(
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
+    let resp = match run_remodel(state, &store, &target, &payload, by, caller_of(authority)) {
+        RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
+        RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
+        RemodelRun::Refused(e) => lifecycle_error_response(&e),
+    };
+    // Released only now: every write [`run_remodel`] made belongs to this remodel.
+    drop(store);
+    resp
+}
+
+/// How [`run_remodel`] ended.
+pub(crate) enum RemodelRun {
+    /// The remodel ran; `data` is its response, broadcast as `session.remodeled`.
+    Done {
+        out: Box<lifecycle::RemodelResponse>,
+        data: Value,
+    },
+    /// It failed after touching the session (502); `data` was broadcast as
+    /// `session.remodel_failed`. `restored_session_id` is `None` when the persona is down.
+    Failed {
+        data: Value,
+        message: String,
+        restored_session_id: Option<String>,
+    },
+    /// Refused before touching anything.
+    Refused(LifecycleError),
+}
+
+/// Run one remodel of `target` with every hub-side effect the remodel endpoint has: the
+/// teardown's queue and model-override clearing (and putting the overrides back when a failed
+/// remodel restored the old session), the route-scan drop, the new model override, the
+/// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
+/// broadcast. `store` is the caller's [`HubStoreGuard`]: hold it from target resolution until
+/// after this returns (see [`lifecycle::remodel_session`] on concurrency).
+pub(crate) fn run_remodel(
+    state: &HubState,
+    store: &AnyStore,
+    target: &SessionTarget,
+    payload: &RemodelRequest,
+    by: &str,
+    caller: lifecycle::Caller,
+) -> RemodelRun {
+    let env = lifecycle_env(state);
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(
-        &*store,
-        &env,
-        &target,
-        &payload,
-        by,
-        caller_of(authority),
-        |key| {
-            for k in [key.to_string(), key.to_ascii_lowercase()] {
-                if let Some(o) = state.session_model_override(&k)
-                    && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
-                {
-                    cleared_overrides.push((k, o));
-                }
+    let result = lifecycle::remodel_session(store, &env, target, payload, by, caller, |key| {
+        for k in [key.to_string(), key.to_ascii_lowercase()] {
+            if let Some(o) = state.session_model_override(&k)
+                && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+            {
+                cleared_overrides.push((k, o));
             }
-            state.clear_session_prompt_queue(key);
-            state.clear_session_model_override(key);
-        },
-    );
+        }
+        state.clear_session_prompt_queue(key);
+        state.clear_session_model_override(key);
+    });
     // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
     // write request. Drop the scan here too, so a failed remodel's restore shows at once.
     crate::discovery::invalidate_route_discovery_cache();
@@ -5550,10 +5587,13 @@ fn handle_post_session_remodel(
                 "error": message,
             });
             state.broadcast("sessions", "session.remodel_failed", data.clone());
-            drop(store);
-            return HttpResponse::json(502, data);
+            return RemodelRun::Failed {
+                data,
+                message,
+                restored_session_id,
+            };
         }
-        Err(e) => return lifecycle_error_response(&e),
+        Err(e) => return RemodelRun::Refused(e),
     };
     match out.mode {
         RemodelMode::Prepare => {
@@ -5603,9 +5643,10 @@ fn handle_post_session_remodel(
     }
     let data = serde_json::to_value(&out).unwrap_or_default();
     state.broadcast("sessions", "session.remodeled", data.clone());
-    // Released only now: every write above belongs to this remodel.
-    drop(store);
-    HttpResponse::json(200, data)
+    RemodelRun::Done {
+        out: Box::new(out),
+        data,
+    }
 }
 
 fn handle_get_hosted_sessions(state: &HubState) -> HttpResponse {

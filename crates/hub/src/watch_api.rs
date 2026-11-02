@@ -277,7 +277,7 @@ pub(crate) fn quota_windows(
 
 /// The quota of every discovered route session, through the cached discovery path. Must run
 /// with no store guard held: a snapshot miss opens the store itself.
-fn discovered_quotas(state: &HubState) -> Vec<WatchQuotaWindow> {
+pub(crate) fn discovered_quotas(state: &HubState) -> Vec<WatchQuotaWindow> {
     let Ok(snap) = state.cached_discovery_snapshot() else {
         return Vec::new();
     };
