@@ -359,6 +359,7 @@ dependencies = [
  "fl-hub",
  "fl-mcp",
  "fl-store",
+ "fl-watch",
  "fl-wire",
  "predicates",
  "serde",
@@ -445,6 +446,7 @@ dependencies = [
  "fl-gate",
  "fl-github",
  "fl-store",
+ "fl-watch",
  "fl-wire",
  "flate2",
  "globset",
@@ -497,6 +499,18 @@ dependencies = [
  "uuid",
  "webpki-roots",
  "zeroize",
+]
+
+[[package]]
+name = "fl-watch"
+version = "0.1.0"
+dependencies = [
+ "fl-core",
+ "fl-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

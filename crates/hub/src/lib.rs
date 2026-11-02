@@ -21,6 +21,7 @@ pub mod session_actions;
 mod settings;
 pub mod terminal;
 mod warrants;
+mod watch_api;
 pub mod ws;
 
 use std::collections::{BTreeMap, HashMap};
@@ -194,6 +195,9 @@ pub struct HubState {
     /// other than a `GET` or `HEAD` drops it (see [`api::handle_http_request`]).
     pub(crate) discovery_snapshots:
         Arc<discovery::TtlCache<PathBuf, discovery::DiscoveryStoreSnapshot>>,
+    /// The `/api/v1/watch/*` store reads, shared for [`watch_api::WATCH_SNAPSHOT_TTL`] and
+    /// dropped with [`HubState::discovery_snapshots`] (see [`watch_api`]).
+    pub(crate) watch_caches: Arc<watch_api::WatchCaches>,
 }
 
 /// How long the read-only discovery endpoints reuse one store snapshot. A snapshot costs
@@ -308,6 +312,7 @@ impl HubState {
             code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
             attachment_sweep_running: Arc::new(AtomicBool::new(false)),
             discovery_snapshots: Arc::new(discovery::TtlCache::new(DISCOVERY_SNAPSHOT_TTL)),
+            watch_caches: Arc::new(watch_api::WatchCaches::default()),
         }
     }
 

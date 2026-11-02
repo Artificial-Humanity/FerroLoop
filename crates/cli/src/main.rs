@@ -105,6 +105,11 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::auth::AuthCmd,
     },
+    /// FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store.
+    Watch {
+        #[command(subcommand)]
+        cmd: cmd::watch::WatchCmd,
+    },
 }
 
 impl Command {
@@ -132,7 +137,8 @@ impl Command {
             | Command::Hub { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
-            | Command::Auth { .. } => Vec::new(),
+            | Command::Auth { .. }
+            | Command::Watch { .. } => Vec::new(),
         }
     }
 
@@ -172,7 +178,8 @@ impl Command {
             | Command::Hub { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
-            | Command::Auth { .. } => false,
+            | Command::Auth { .. }
+            | Command::Watch { .. } => false,
         }
     }
 
@@ -206,7 +213,8 @@ impl Command {
             | Command::Hub { .. }
             | Command::Store { .. }
             | Command::Vault { .. }
-            | Command::Auth { .. } => false,
+            | Command::Auth { .. }
+            | Command::Watch { .. } => false,
         }
     }
 }
@@ -968,6 +976,35 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
         }
+        Cli {
+            db,
+            command: Command::Watch { cmd },
+        } => {
+            // `--db`/`$FL_DB`, else the workspace state store the hub serves. A missing store
+            // is refused rather than created, and the store is opened for a scan
+            // (`open_store_for_scan`): a lone `.redb` under the ferro engine is read with the
+            // redb engine, read-only, and never migrated or chmodded. (Only a `.redb` the
+            // read-only open cannot read, one that needs repair, falls back to a writable open.)
+            let path = match explicit_db(db) {
+                Some(p) => p,
+                None => cfg.workspace_state_store(&default_state_store_path()?),
+            };
+            if !fl_store::store_exists(&path) {
+                bail!(
+                    "there is no store at {}, so there is nothing to watch",
+                    path.display()
+                );
+            }
+            let store = fl_store::open_store_for_scan(&path)
+                .with_context(|| format!("could not open the store at {}", path.display()))?;
+            return match cmd::watch::run(&store, cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
         cli => cli,
     };
     let entries = &cfg.projects;
@@ -1334,7 +1371,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Hub { .. }
         | Command::Store { .. }
         | Command::Vault { .. }
-        | Command::Auth { .. } => {
+        | Command::Auth { .. }
+        | Command::Watch { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

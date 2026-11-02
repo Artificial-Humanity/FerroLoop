@@ -77,6 +77,7 @@ Commands:
   store       Look at, and tend, the engine file behind the bound store
   vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   auth        Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`, `list`, `revoke`)
+  watch       FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store
   help        Print this message or the help of the given subcommand(s)
 
 Options:
