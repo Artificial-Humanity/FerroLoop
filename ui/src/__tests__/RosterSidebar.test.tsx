@@ -736,6 +736,29 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal
     fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
+
+    // On narrow mobile viewports (<= 768px), toggling left sidebar closes right split panel and vice versa
+    const prevInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: 390,
+    });
+    const splitToggleBtn = screen.getByTestId("split-view-toggle");
+    fireEvent.click(toggleBtn);
+    expect(sidebar).toHaveAttribute("data-mobile-open", "true");
+    fireEvent.click(splitToggleBtn);
+    expect(sidebar).toHaveAttribute("data-mobile-open", "false");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(toggleBtn);
+    expect(sidebar).toHaveAttribute("data-mobile-open", "true");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
+    Object.defineProperty(window, "innerWidth", {
+      writable: true,
+      configurable: true,
+      value: prevInnerWidth,
+    });
 
     unmount();
   });
