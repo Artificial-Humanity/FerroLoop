@@ -315,7 +315,8 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                   display: "flex",
                   flexDirection: "column",
                   gap: "4px",
-                  flex: "1 1 160px",
+                  flex: "1 1 100%",
+                  width: "100%",
                   minWidth: 0,
                   maxWidth: "100%",
                 }}
@@ -356,7 +357,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                   display: "flex",
                   flexDirection: "column",
                   gap: "4px",
-                  flex: "1 1 160px",
+                  flex: "1 1 180px",
                   minWidth: 0,
                   maxWidth: "100%",
                 }}
@@ -375,7 +376,12 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                 />
               </label>
 
-              <button type="submit" className="fd-btn fd-btn-primary" disabled={submitting}>
+              <button
+                type="submit"
+                className="fd-btn fd-btn-primary"
+                disabled={submitting}
+                style={{ flex: "0 0 auto" }}
+              >
                 Start Workflow Run
               </button>
             </form>

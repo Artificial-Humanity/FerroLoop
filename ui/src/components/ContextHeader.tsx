@@ -18,7 +18,7 @@ export interface ContextHeaderProps {
   onSelectTab: (tab: CockpitTab) => void;
   splitView?: boolean;
   onToggleSplitView?: () => void;
-  themeMode?: "dark" | "light";
+  themeMode?: "dark" | "light" | "system";
   onToggleTheme?: () => void;
   authority?: HubAuthority | null;
   wsConnected?: boolean;
@@ -429,6 +429,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
         aria-label="Cockpit Modes"
         data-testid="cockpit-tab-bar"
         className="fd-tab-bar fd-three-tier-bar"
+        style={{ width: "100%", minWidth: 0, flexWrap: "nowrap" }}
       >
         <span
           className={`fd-badge fd-scope-pill fd-scope-pill-${activeTier}`}
@@ -497,6 +498,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           className={`fd-tier-group fd-tier-agent${activeTier === "agent" || activeTier === "project" ? " is-active-tier" : ""}`}
           data-testid="tier-agent-nav"
           data-active-tier={activeTier === "agent" || activeTier === "project" ? "true" : undefined}
+          style={{ flexWrap: "wrap", minWidth: 0, flex: "0 1 auto" }}
         >
           <span className="fd-tier-label" title="Active Agent">
             Agent

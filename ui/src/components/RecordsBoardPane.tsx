@@ -459,30 +459,41 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
             style={{
               fontSize: "12px",
               padding: "5px 10px",
-              flex: "1 1 150px",
+              flex: "1 1 220px",
               minWidth: 0,
               maxWidth: "100%",
             }}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-          <button
-            type="button"
-            data-testid="board-new-record-btn"
-            className={`fd-btn${showCreateForm ? " fd-btn-active" : " fd-btn-primary"}`}
-            onClick={() => setShowCreateForm((prev) => !prev)}
+          <div
+            data-testid="board-actions-group"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flexWrap: "wrap",
+              flexShrink: 0,
+            }}
           >
-            + New Record
-          </button>
-          <button
-            type="button"
-            data-testid="board-refresh-btn"
-            className="fd-btn"
-            onClick={() => void loadRecords(project)}
-            disabled={loading}
-          >
-            {loading ? "Refreshing..." : "Refresh"}
-          </button>
+            <button
+              type="button"
+              data-testid="board-new-record-btn"
+              className={`fd-btn${showCreateForm ? " fd-btn-active" : " fd-btn-primary"}`}
+              onClick={() => setShowCreateForm((prev) => !prev)}
+            >
+              + New Record
+            </button>
+            <button
+              type="button"
+              data-testid="board-refresh-btn"
+              className="fd-btn"
+              onClick={() => void loadRecords(project)}
+              disabled={loading}
+            >
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
         </div>
       </div>
 

@@ -521,61 +521,82 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                     }}
                   >
                     <span
-                      aria-hidden="true"
                       style={{
-                        fontSize: "11px",
-                        color: "var(--text-muted)",
-                        width: "12px",
-                        display: "inline-block",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexShrink: 0,
                       }}
                     >
-                      {isExpanded ? "▾" : "▸"}
+                      <span
+                        aria-hidden="true"
+                        style={{
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          width: "12px",
+                          display: "inline-block",
+                        }}
+                      >
+                        {isExpanded ? "▾" : "▸"}
+                      </span>
+
+                      <span
+                        data-testid={`mail-status-${msg.id}`}
+                        className="fd-badge"
+                        title={
+                          item.receipt?.acked_at
+                            ? `Acked at ${formatTimestamp(item.receipt.acked_at, activeTimeZone)}`
+                            : undefined
+                        }
+                        style={
+                          isAcked
+                            ? {
+                                color: "var(--status-alive)",
+                                borderColor: "rgba(16, 185, 129, 0.35)",
+                                backgroundColor: "rgba(16, 185, 129, 0.1)",
+                              }
+                            : {
+                                color: "var(--accent-hover)",
+                                borderColor: "var(--border-accent)",
+                                backgroundColor: "var(--accent-subtle)",
+                              }
+                        }
+                      >
+                        {status}
+                      </span>
                     </span>
-                    <span className="fd-badge fd-mono" style={{ fontWeight: 700 }}>
-                      {msg.sender_name}
-                    </span>
-                    <span style={{ color: "var(--text-dim)", fontSize: "12px" }}>→</span>
-                    <span className="fd-badge fd-mono">{msg.to}</span>
 
                     <span
-                      data-testid={`mail-urgency-${msg.id}`}
-                      className="fd-badge"
-                      style={
-                        isUrgent
-                          ? {
-                              backgroundColor: "rgba(239, 68, 68, 0.16)",
-                              borderColor: "rgba(239, 68, 68, 0.45)",
-                              color: "#FCA5A5",
-                            }
-                          : undefined
-                      }
+                      data-testid={`mail-route-${msg.id}`}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                        minWidth: 0,
+                      }}
                     >
-                      {msg.urgency}
-                    </span>
+                      <span className="fd-badge fd-mono" style={{ fontWeight: 700 }}>
+                        {msg.sender_name}
+                      </span>
+                      <span style={{ color: "var(--text-dim)", fontSize: "12px" }}>→</span>
+                      <span className="fd-badge fd-mono">{msg.to}</span>
 
-                    <span
-                      data-testid={`mail-status-${msg.id}`}
-                      className="fd-badge"
-                      title={
-                        item.receipt?.acked_at
-                          ? `Acked at ${formatTimestamp(item.receipt.acked_at, activeTimeZone)}`
-                          : undefined
-                      }
-                      style={
-                        isAcked
-                          ? {
-                              color: "var(--status-alive)",
-                              borderColor: "rgba(16, 185, 129, 0.35)",
-                              backgroundColor: "rgba(16, 185, 129, 0.1)",
-                            }
-                          : {
-                              color: "var(--accent-hover)",
-                              borderColor: "var(--border-accent)",
-                              backgroundColor: "var(--accent-subtle)",
-                            }
-                      }
-                    >
-                      {status}
+                      <span
+                        data-testid={`mail-urgency-${msg.id}`}
+                        className="fd-badge"
+                        style={
+                          isUrgent
+                            ? {
+                                backgroundColor: "rgba(239, 68, 68, 0.16)",
+                                borderColor: "rgba(239, 68, 68, 0.45)",
+                                color: "#FCA5A5",
+                              }
+                            : undefined
+                        }
+                      >
+                        {msg.urgency}
+                      </span>
                     </span>
                   </div>
 

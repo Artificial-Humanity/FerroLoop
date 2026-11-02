@@ -270,11 +270,7 @@ describe("RosterSidebar", () => {
     fireEvent.click(screen.getByTestId("context-help-btn"));
     expect(onOpenHelpModal).toHaveBeenCalledTimes(1);
 
-    const themeBtn = screen.getByTestId("theme-toggle-btn");
-    expect(themeBtn).toHaveTextContent("☀");
-    expect(themeBtn).not.toHaveTextContent(/Light/i);
-    fireEvent.click(themeBtn);
-    expect(onToggleTheme).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("theme-toggle-btn")).toBeNull();
 
     // Pin Website and Sonora -> both pinned projects move to top in alphabetical order (Sonora, Website)
     act(() => {

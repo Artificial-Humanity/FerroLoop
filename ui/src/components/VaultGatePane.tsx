@@ -451,7 +451,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
+                  gridTemplateColumns: "minmax(0, 1fr)",
                   gap: "12px",
                   minWidth: 0,
                 }}

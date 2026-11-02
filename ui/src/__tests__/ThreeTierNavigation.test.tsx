@@ -277,7 +277,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     // Bottom text mobile-bottom-nav is removed
     expect(screen.queryByTestId("mobile-bottom-nav")).toBeNull();
 
-    // Left panel header defaults to Agent Roster (280px width)
+    // Left panel header defaults to Agent Roster (326px minimum width)
     const sidebar = screen.getByTestId("roster-sidebar");
     const leftHeader = within(sidebar).getByTestId("left-panel-header");
     expect(within(leftHeader).getByTestId("left-panel-tab-roster")).toHaveAttribute(
@@ -287,14 +287,14 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
       "Agent Roster",
     );
-    expect(sidebar.style.width).toBe("280px");
+    expect(sidebar.style.width).toBe("326px");
 
-    // Drag left-panel-resize-handle to 320px on roster
+    // Drag left-panel-resize-handle to 360px on roster
     const leftResizeHandle = within(sidebar).getByTestId("left-panel-resize-handle");
-    fireEvent.mouseDown(leftResizeHandle, { clientX: 280 });
-    fireEvent.mouseMove(window, { clientX: 320 });
+    fireEvent.mouseDown(leftResizeHandle, { clientX: 326 });
+    fireEvent.mouseMove(window, { clientX: 360 });
     fireEvent.mouseUp(window);
-    expect(sidebar.style.width).toBe("320px");
+    expect(sidebar.style.width).toBe("360px");
 
     // Switch to Hub & Arch (System tier) -> opens in Left Panel (440px width) without hijacking Right Panel
     fireEvent.click(within(tabBar).getByRole("tab", { name: /^Hub & Arch$/i }));
@@ -317,7 +317,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(sidebar).getByTestId("roster-global-controls")).toBeInTheDocument();
     expect(sidebar.style.width).toBe("440px");
 
-    // Switch Left Panel to Vault & Gate, FerroState, and back to Agent Roster (returns to 320px roster width)
+    // Switch Left Panel to Vault & Gate, FerroState, and back to Agent Roster (returns to 360px roster width)
     fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-gate"));
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
       "Vault & Gate",
@@ -330,7 +330,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
       "Agent Roster",
     );
-    expect(sidebar.style.width).toBe("320px");
+    expect(sidebar.style.width).toBe("360px");
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
       "agent",

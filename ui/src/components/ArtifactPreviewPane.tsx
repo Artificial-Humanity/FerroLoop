@@ -1624,18 +1624,6 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                 </a>
               </>
             )}
-            {onClose && (
-              <button
-                type="button"
-                data-testid="artifact-close-panel-btn"
-                className="fd-btn"
-                onClick={onClose}
-                title="Close side panel"
-                aria-label="Close side panel"
-              >
-                ✕
-              </button>
-            )}
           </div>
         </div>
 

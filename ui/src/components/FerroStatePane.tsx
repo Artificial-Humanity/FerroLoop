@@ -654,12 +654,19 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
   return (
     <section className="fd-pane" data-testid="ferrostate-pane" aria-label="FerroState">
       <div className="fd-scroll" style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-            <h2 style={{ margin: 0, fontSize: "16px" }}>FerroState</h2>
-            <span className="fd-badge" data-testid="ferrostate-badge">
-              Durable Memory, Handoffs &amp; Structural Code Index
-            </span>
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: "8px",
+          }}
+        >
+          <h2 style={{ margin: 0, fontSize: "16px" }}>FerroState</h2>
+          <span className="fd-badge" data-testid="ferrostate-badge">
+            Durable Memory, Handoffs &amp; Structural Code Index
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
             <span className="fd-badge" data-testid="memory-count">
               Memory {memoryCount}
             </span>
@@ -667,7 +674,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               Handoffs {handoffCount}
             </span>
           </div>
-          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
             <button
               type="button"
               className="fd-btn"
@@ -805,7 +812,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 maxWidth: "100%",
               }}
             >
-              <label style={{ ...labelStyle, flex: "1 1 200px", minWidth: 0, maxWidth: "100%" }}>
+              <label style={{ ...labelStyle, flex: "1 1 100%", width: "100%", minWidth: 0, maxWidth: "100%" }}>
                 Search Memory and Handoffs
                 <input
                   type="search"
@@ -848,17 +855,26 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                   <option value="runtime">runtime</option>
                 </select>
               </label>
-              <button type="submit" className="fd-btn fd-btn-primary" style={{ minHeight: "40px" }} disabled={effectiveLoading}>
-                Search
-              </button>
-              <button
-                type="button"
-                className="fd-btn"
-                style={{ minHeight: "40px" }}
-                onClick={handleClearSearch}
+              <div
+                style={{
+                  flex: "1 1 100%",
+                  display: "flex",
+                  gap: "8px",
+                  alignItems: "center",
+                }}
               >
-                Clear
-              </button>
+                <button type="submit" className="fd-btn fd-btn-primary" style={{ minHeight: "40px" }} disabled={effectiveLoading}>
+                  Search
+                </button>
+                <button
+                  type="button"
+                  className="fd-btn"
+                  style={{ minHeight: "40px" }}
+                  onClick={handleClearSearch}
+                >
+                  Clear
+                </button>
+              </div>
             </form>
 
             <div data-testid="state-entries-section" style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
@@ -892,7 +908,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))",
+                  gridTemplateColumns: "minmax(0, 1fr)",
                   gap: "12px",
                   minWidth: 0,
                 }}
@@ -1101,13 +1117,19 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             <form
               data-testid="code-search-form"
               onSubmit={(event) => void handleCodeSearch(event)}
-              style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "end" }}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "minmax(0, 1fr)",
+                gap: "10px",
+                minWidth: 0,
+                maxWidth: "100%",
+              }}
             >
               <label style={labelStyle}>
                 Code Search Mode
                 <select
                   className="fd-select"
-                  style={{ ...inputStyle, width: "auto", minWidth: "200px" }}
+                  style={{ ...inputStyle, width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                   value={codeKind}
                   onChange={(e) => setCodeKind(e.target.value as CodeSearchKind)}
                 >
@@ -1116,7 +1138,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                   <option value="outline">File Outline (outline)</option>
                 </select>
               </label>
-              <label style={{ ...labelStyle, flex: "1 1 240px" }}>
+              <label style={labelStyle}>
                 Code Query
                 <input
                   className="fd-input fd-mono"
@@ -1128,9 +1150,11 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                   onChange={(e) => setCodeQuery(e.target.value)}
                 />
               </label>
-              <button type="submit" className="fd-btn fd-btn-primary" style={{ minHeight: "40px" }} disabled={codeLoading}>
-                {codeLoading ? "Searching…" : "Search Code"}
-              </button>
+              <div>
+                <button type="submit" className="fd-btn fd-btn-primary" style={{ minHeight: "40px" }} disabled={codeLoading}>
+                  {codeLoading ? "Searching…" : "Search Code"}
+                </button>
+              </div>
             </form>
 
             {tokensSavedThisQuery !== null && (

@@ -1,5 +1,20 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
+import {
+  FONT_SCALE_MAX_PCT,
+  FONT_SCALE_MIN_PCT,
+  FONT_SCALE_PRESETS,
+  FONT_SCALE_STEP_PCT,
+  applyFontScalePct,
+  applyThemeMode,
+  clampFontScalePct,
+  getInitialFontScalePct,
+  getInitialThemeMode,
+  persistFontScalePct,
+  persistThemeMode,
+  resolveSystemTheme,
+  type ThemeMode,
+} from "../lib/accessibility";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import {
@@ -19,7 +34,7 @@ import {
   type TotpEnrollmentResponse,
 } from "../types/api";
 
-export type SettingsTabId = "agents" | "system" | "auth";
+export type SettingsTabId = "agents" | "system" | "accessibility" | "auth";
 
 export interface SettingsModalProps {
   isOpen: boolean;
@@ -46,6 +61,10 @@ export interface SettingsModalProps {
     action: BulkSessionAction,
     selectedAgentKeys?: string[],
   ) => Promise<BulkSessionActionResponse>;
+  themeMode?: ThemeMode;
+  onChangeThemeMode?: (mode: ThemeMode) => void;
+  fontScalePct?: number;
+  onChangeFontScalePct?: (pct: number) => void;
   onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
 }
@@ -258,10 +277,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onAgentsUpdated,
   onDecommissionAgent,
   onBulkSessionAction,
+  themeMode: propThemeMode,
+  onChangeThemeMode,
+  fontScalePct: propFontScalePct,
+  onChangeFontScalePct,
   onSettingsUpdated,
   apiClient,
 }) => {
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
+    () => propThemeMode ?? getInitialThemeMode(),
+  );
+  const [resolvedOsTheme, setResolvedOsTheme] = useState<"dark" | "light">(
+    resolveSystemTheme,
+  );
+  const [localFontScalePct, setLocalFontScalePct] = useState<number>(
+    () => propFontScalePct ?? getInitialFontScalePct(),
+  );
   const { pinnedProjects } = usePinnedState();
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
     () => resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
@@ -336,6 +368,71 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     setActiveTab(initialTab);
   }, [initialTab]);
+
+  useEffect(() => {
+    if (propThemeMode) {
+      setLocalThemeMode(propThemeMode);
+    }
+  }, [propThemeMode]);
+
+  useEffect(() => {
+    if (typeof propFontScalePct === "number") {
+      setLocalFontScalePct(clampFontScalePct(propFontScalePct));
+    }
+  }, [propFontScalePct]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setLocalThemeMode(propThemeMode ?? getInitialThemeMode());
+    setLocalFontScalePct(propFontScalePct ?? getInitialFontScalePct());
+    setResolvedOsTheme(resolveSystemTheme());
+  }, [isOpen, propThemeMode, propFontScalePct]);
+
+  useEffect(() => {
+    if (
+      localThemeMode !== "system" ||
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return;
+    }
+    const mql = window.matchMedia("(prefers-color-scheme: light)");
+    setResolvedOsTheme(mql.matches ? "light" : "dark");
+    const handleChange = (event?: MediaQueryListEvent) => {
+      const isLight =
+        typeof event?.matches === "boolean" ? event.matches : mql.matches;
+      const nextTheme: "dark" | "light" = isLight ? "light" : "dark";
+      setResolvedOsTheme(nextTheme);
+      if (typeof document !== "undefined") {
+        document.documentElement.setAttribute("data-theme", nextTheme);
+      }
+    };
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", handleChange);
+      return () => mql.removeEventListener("change", handleChange);
+    }
+    if (typeof mql.addListener === "function") {
+      mql.addListener(handleChange);
+      return () => mql.removeListener(handleChange);
+    }
+  }, [localThemeMode, isOpen]);
+
+  const handleSelectThemeMode = (nextMode: ThemeMode) => {
+    setLocalThemeMode(nextMode);
+    setResolvedOsTheme(resolveSystemTheme());
+    persistThemeMode(nextMode);
+    applyThemeMode(nextMode);
+    setSettings((prev) => ({ ...prev, theme_preference: nextMode }));
+    onChangeThemeMode?.(nextMode);
+  };
+
+  const handleSelectFontScalePct = (nextPct: number) => {
+    const clamped = clampFontScalePct(nextPct);
+    setLocalFontScalePct(clamped);
+    persistFontScalePct(clamped);
+    applyFontScalePct(clamped);
+    onChangeFontScalePct?.(clamped);
+  };
 
   useEffect(() => {
     setSelectedProjectFilter(
@@ -940,6 +1037,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 onClick={() => setActiveTab("system")}
               >
                 System
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "accessibility"}
+                data-testid="settings-tab-accessibility"
+                className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("accessibility")}
+              >
+                Accessibility
               </button>
               <button
                 type="button"
@@ -2915,6 +3022,188 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         )}
 
         {/* Re-Cast Modal Dialog */}
+        {activeTab === "accessibility" && !initialProject && (
+          <div
+            data-testid="settings-accessibility-panel"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            {/* Section a: Color Theme / Appearance */}
+            <div
+              className="fd-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: "12.5px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Color Theme &amp; Appearance
+                </h3>
+                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                  Select Dark, Light, or System color scheme across FerroDeck.
+                </span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Color Theme Mode"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                {(
+                  [
+                    { id: "dark", label: "Dark" },
+                    { id: "light", label: "Light" },
+                    { id: "system", label: "System" },
+                  ] as const
+                ).map((opt) => {
+                  const isSelected = localThemeMode === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      data-testid={`theme-mode-${opt.id}`}
+                      aria-pressed={isSelected}
+                      className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                      onClick={() => handleSelectThemeMode(opt.id)}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {localThemeMode === "system" && (
+                <div
+                  data-testid="theme-system-status"
+                  className="fd-mono"
+                  style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}
+                >
+                  Follows OS preference via prefers-color-scheme (currently{" "}
+                  <strong>{resolvedOsTheme}</strong>)
+                </div>
+              )}
+            </div>
+
+            {/* Section b: System-Wide Font Size Increase */}
+            <div
+              className="fd-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    System-Wide Font Size Scale
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Scale typography from {FONT_SCALE_MIN_PCT}% to {FONT_SCALE_MAX_PCT}% while preserving panel layout integrity.
+                  </span>
+                </div>
+                <span
+                  data-testid="font-scale-current-badge"
+                  className="fd-badge fd-mono"
+                >
+                  {localFontScalePct}%
+                </span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Font Size Presets"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                {FONT_SCALE_PRESETS.map((pct) => {
+                  const isSelected = localFontScalePct === pct;
+                  return (
+                    <button
+                      key={pct}
+                      type="button"
+                      data-testid={`font-scale-preset-${pct}`}
+                      aria-pressed={isSelected}
+                      className={`fd-btn fd-mono${isSelected ? " fd-btn-active" : ""}`}
+                      onClick={() => handleSelectFontScalePct(pct)}
+                    >
+                      {pct}%
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <input
+                  type="range"
+                  aria-label="Font Size Scale Percentage"
+                  data-testid="font-scale-slider"
+                  min={FONT_SCALE_MIN_PCT}
+                  max={FONT_SCALE_MAX_PCT}
+                  step={FONT_SCALE_STEP_PCT}
+                  value={localFontScalePct}
+                  onChange={(e) => handleSelectFontScalePct(Number(e.target.value))}
+                  style={{ flex: "1 1 180px", minWidth: 0 }}
+                />
+                <button
+                  type="button"
+                  data-testid="font-scale-reset"
+                  className="fd-btn"
+                  disabled={localFontScalePct === 100}
+                  onClick={() => handleSelectFontScalePct(100)}
+                >
+                  Reset (100%)
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {recastModalAgentKey && (() => {
           const modalAgent = effectiveAgents.find(
             (a) => a.name_key.toLowerCase() === recastModalAgentKey,
