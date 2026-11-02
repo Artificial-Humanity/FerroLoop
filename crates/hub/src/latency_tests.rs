@@ -700,6 +700,66 @@ mod route_lookup {
             .collect();
         assert!(leftovers.is_empty(), "no temp files left");
     }
+
+    #[test]
+    fn a_route_a_teardown_removed_during_the_scan_stays_removed() {
+        let home = TempDir::new().unwrap();
+        let path = routes_file(home.path());
+        save_route(home.path(), "ada", agy("conv-ada"));
+        save_route(home.path(), "bob", agy("conv-bob"));
+        let base = RouteTable::load(Some(&path));
+        // The scan left `ada` as it was and learned `found`.
+        let mut scanned = base.clone();
+        scanned.upsert("found", agy("conv-found"), At::from_unix_millis(5));
+        // A teardown removes `ada` while the scan runs.
+        assert_eq!(
+            crate::lifecycle::remove_routes(Some(home.path()), &["ada"], &[]),
+            1
+        );
+        crate::discovery::save_route_scan(Some(home.path()), &base, &scanned);
+        let saved = RouteTable::load(Some(&path));
+        assert!(saved.get("ada").is_none(), "the removal is not undone");
+        assert!(saved.get("bob").is_some() && saved.get("found").is_some());
+    }
+
+    #[test]
+    fn a_route_the_scan_changed_is_saved_even_when_removed_meanwhile() {
+        let home = TempDir::new().unwrap();
+        let path = routes_file(home.path());
+        save_route(home.path(), "ada", agy("conv-old"));
+        let base = RouteTable::load(Some(&path));
+        let mut scanned = base.clone();
+        // The scan found ada's new conversation: that is news, not a stale copy.
+        scanned.upsert("ada", agy("conv-new"), At::from_unix_millis(9));
+        crate::lifecycle::remove_routes(Some(home.path()), &["ada"], &[]);
+        crate::discovery::save_route_scan(Some(home.path()), &base, &scanned);
+        let saved = RouteTable::load(Some(&path));
+        assert_eq!(saved.get("ada").map(|e| &e.route), Some(&agy("conv-new")));
+    }
+
+    #[test]
+    fn a_teardown_waits_for_a_hub_save_in_progress() {
+        let home = TempDir::new().unwrap();
+        let path = routes_file(home.path());
+        save_route(home.path(), "ada", agy("conv-ada"));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let remover = crate::discovery::with_route_file_lock(|| {
+            let home = home.path().to_path_buf();
+            let remover = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                crate::lifecycle::remove_routes(Some(&home), &["ada"], &[])
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                RouteTable::load(Some(&path)).get("ada").is_some(),
+                "the removal waits while another hub writer holds the file"
+            );
+            remover
+        });
+        assert_eq!(remover.join().unwrap(), 1);
+        assert!(RouteTable::load(Some(&path)).get("ada").is_none());
+    }
 }
 
 mod wire_send {

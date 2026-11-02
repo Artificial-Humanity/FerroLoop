@@ -375,9 +375,10 @@ pub(crate) fn invalidate_route_discovery_cache() {
 /// private temp file and renaming it over the target ([`RouteTable::save`]); the CLI fallback
 /// does load, change, save. The hub writes the same way and merges as the daemon merges a
 /// dispatch's scan into its live table ([`RouteTable::merge_dispatch_result`]): it reads the file
-/// again just before saving, so a route the daemon registered during the scan is kept, and a
-/// route is dropped only when the scan pruned it and nobody changed it meanwhile. Like the
-/// daemon, it writes only when the scan changed a route.
+/// again just before saving, so a route the daemon registered during the scan is kept, a route
+/// is dropped only when the scan pruned it and nobody changed it meanwhile, and a route removed
+/// during the scan stays removed ([`merge_route_scan`]). Like the daemon, it writes only when
+/// the scan changed a route. Hub writers are serialized ([`with_route_file_lock`]).
 pub(crate) fn scan_and_save_route_table(home_override: Option<&Path>) -> RouteTable {
     let saved = RouteTable::load(route_table_path(home_override).as_deref());
     let mut scanned = saved.clone();
@@ -404,11 +405,55 @@ pub(crate) fn save_route_scan(
         return;
     }
     let path = route_table_path(home_override);
-    let mut live = RouteTable::load(path.as_deref());
-    live.merge_dispatch_result(base, scanned.clone());
-    let _ = live.save(path.as_deref());
+    with_route_file_lock(|| {
+        let mut live = RouteTable::load(path.as_deref());
+        merge_route_scan(&mut live, base, scanned);
+        let _ = live.save(path.as_deref());
+    });
     // The hub wrote the route table: the shared scan must not hide it.
     invalidate_route_discovery_cache();
+}
+
+/// Fold what a scan learned into `live`, the route table file as it is now. `scanned` started
+/// as a copy of `base` and went through discovery:
+///
+/// - a route the scan pruned (in `base`, gone from `scanned`) is dropped from `live`, unless
+///   another writer changed it meanwhile;
+/// - a route the scan found or changed merges as [`RouteTable::merge_newer`] does;
+/// - a route the scan left as `base` had it is only restamped in `live`, never written back:
+///   when `live` no longer holds it, another writer removed it during the scan (a teardown's
+///   `remove_routes`, the daemon), and it stays removed.
+pub(crate) fn merge_route_scan(live: &mut RouteTable, base: &RouteTable, scanned: &RouteTable) {
+    let mut learned = scanned.clone();
+    learned.entries.retain(|key, entry| {
+        let unchanged = base
+            .entries
+            .get(key)
+            .is_some_and(|before| before.route == entry.route);
+        !unchanged || live.entries.contains_key(key)
+    });
+    live.merge_dispatch_result(base, learned);
+}
+
+/// Serializes every hub writer of the route table file: [`save_route_scan`] and the teardown's
+/// route removal (`lifecycle::remove_routes`). Each does load, change, save; without the lock a
+/// removal saved between another writer's load and its save is overwritten and the route comes
+/// back.
+///
+/// The lock is held in this process only. The `fl wire daemon` and the `fl wire` CLI fallback
+/// write the same file from other processes, and nothing serializes them with the hub. Every
+/// write is a whole-file rename ([`RouteTable::save`]), so no reader sees a torn file, but a
+/// change one process saves between another's load and its rename is lost. The daemon is the
+/// wider window: it keeps its table in memory, never re-reads the file, and saves that whole
+/// table only on a `RegisterRoute` request or a dispatch whose scan changed a route. Such a save
+/// drops any route the hub saved that the daemon does not hold, and brings back a route a
+/// teardown removed while the daemon still holds it, until the next scan learns or prunes it again.
+static ROUTE_FILE_WRITE: Mutex<()> = Mutex::new(());
+
+/// Run `write` (a load, change and save of the route table file) holding [`ROUTE_FILE_WRITE`].
+pub(crate) fn with_route_file_lock<T>(write: impl FnOnce() -> T) -> T {
+    let _one_writer = ROUTE_FILE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    write()
 }
 
 /// Read agent names and attempt rows. Does not walk the filesystem.

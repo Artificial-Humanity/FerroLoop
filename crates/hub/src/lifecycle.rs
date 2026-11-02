@@ -673,7 +673,24 @@ fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
 }
 
 /// Drop every route keyed by one of `personas` or matching one of `session_ids`; returns the count.
-fn remove_routes(home_override: Option<&Path>, personas: &[&str], session_ids: &[&str]) -> usize {
+/// Holds the hub's route-file lock, so a scan the hub saves at the same time cannot put a removed
+/// route back (see [`crate::discovery::with_route_file_lock`] for the window left with the
+/// `fl wire daemon`).
+pub(crate) fn remove_routes(
+    home_override: Option<&Path>,
+    personas: &[&str],
+    session_ids: &[&str],
+) -> usize {
+    crate::discovery::with_route_file_lock(|| {
+        remove_routes_locked(home_override, personas, session_ids)
+    })
+}
+
+fn remove_routes_locked(
+    home_override: Option<&Path>,
+    personas: &[&str],
+    session_ids: &[&str],
+) -> usize {
     let mut removed = 0;
     for path in route_table_paths(home_override) {
         if !path.is_file() {
