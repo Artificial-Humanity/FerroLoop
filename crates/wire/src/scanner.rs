@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use fl_core::vendor::VendorRegistry;
 
@@ -29,6 +29,21 @@ const WIRE_BUILTIN_IDS: &[&str] = &[
 ];
 
 /// A vendor plugin's source of routes.
+///
+/// Trust model:
+/// - Registering a scanner needs code running in this process, so a scanner is trusted code. It
+///   is trusted not to forge routes for other vendors' agents; wire cannot tell whose agent a
+///   name belongs to.
+/// - Discovery calls [`discover`](Self::discover) synchronously, one scanner after another, while
+///   the caller holds the route table. A scanner must return quickly and must not block on the
+///   network or on a lock the caller may hold.
+/// - A scanner only ever ADDS routes for names the table does not hold, and refreshes a route it
+///   produced itself (the entry must still equal what this scanner last produced for the name).
+///   It never replaces a route that an agent registered, a built-in scan found, or another scanner
+///   produced.
+/// - A route a scanner produced stays in the table when the scanner stops returning it: stale
+///   routes are not pruned. Which routes a scanner produced is remembered for the life of the
+///   process only (it is not written to disk).
 pub trait WireVendorScanner: Send + Sync {
     /// The vendor id this scanner serves. Read once, at registration.
     fn vendor_id(&self) -> &str;
@@ -90,6 +105,50 @@ pub(crate) fn registered_scanners() -> Vec<(String, Arc<dyn WireVendorScanner>)>
         .iter()
         .map(|r| (r.id.clone(), Arc::clone(&r.scanner)))
         .collect()
+}
+
+/// How many recent routes are remembered per agent name.
+const PRODUCED_PER_NAME: usize = 8;
+
+/// The routes scanners recently put in a route table: agent name to (scanner vendor id, route),
+/// oldest first. Process-global and never persisted; only [`scanner_may_write`] and
+/// [`record_produced`] use it. It holds a few routes per name, not one, because a process can
+/// hold several route tables (every table's discovery records here) and a scanner's route in one
+/// of them may be older than its latest route in another.
+fn produced() -> &'static Mutex<BTreeMap<String, Vec<(String, VendorRoute)>>> {
+    static PRODUCED: OnceLock<Mutex<BTreeMap<String, Vec<(String, VendorRoute)>>>> =
+        OnceLock::new();
+    PRODUCED.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Whether scanner `vendor_id` may write a route for `name`, given the route `existing` that the
+/// table holds for it: only when the table holds none, or holds exactly a route this same
+/// scanner produced for the name (see [`record_produced`]). A route that an agent, a built-in
+/// scan or another scanner put there is never replaced.
+pub(crate) fn scanner_may_write(
+    vendor_id: &str,
+    name: &str,
+    existing: Option<&VendorRoute>,
+) -> bool {
+    let Some(existing) = existing else {
+        return true;
+    };
+    produced()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .is_some_and(|list| list.iter().any(|(id, r)| id == vendor_id && r == existing))
+}
+
+/// Remember that scanner `vendor_id` put `route` in a table for `name`.
+pub(crate) fn record_produced(vendor_id: &str, name: &str, route: &VendorRoute) {
+    let mut map = produced().lock().unwrap_or_else(|e| e.into_inner());
+    let list = map.entry(name.to_string()).or_default();
+    list.retain(|(id, r)| !(id == vendor_id && r == route));
+    list.push((vendor_id.to_string(), route.clone()));
+    if list.len() > PRODUCED_PER_NAME {
+        list.remove(0);
+    }
 }
 
 /// Accept a scanner's route only when it is a webhook route with a plain absolute socket path.
@@ -239,27 +298,179 @@ mod tests {
         );
     }
 
+    /// A scanner whose routes a test changes between passes.
+    struct Switch {
+        id: String,
+        routes: Mutex<BTreeMap<String, VendorRoute>>,
+    }
+
+    impl Switch {
+        fn new(id: &str, routes: &[(&str, VendorRoute)]) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                routes: Mutex::new(
+                    routes
+                        .iter()
+                        .map(|(n, r)| (n.to_string(), r.clone()))
+                        .collect(),
+                ),
+            })
+        }
+        fn set(&self, name: &str, route: VendorRoute) {
+            self.routes.lock().unwrap().insert(name.to_string(), route);
+        }
+    }
+
+    impl WireVendorScanner for Switch {
+        fn vendor_id(&self) -> &str {
+            &self.id
+        }
+        fn discover(&self, _home: &Path) -> BTreeMap<String, VendorRoute> {
+            self.routes.lock().unwrap().clone()
+        }
+    }
+
+    fn pass(table: &mut RouteTable, home: &Path, ms: u64) {
+        table.discover_routes(Some(home), At::from_unix_millis(ms));
+    }
+
     #[test]
     fn a_scanner_can_refresh_its_own_webhook_route() {
         let home = tempfile::TempDir::new().unwrap();
-        register_wire_scanner(Fixed::new(
+        let scanner = Switch::new(
             "wscan-refresh",
             &[(
                 "wscan-refresh-agent",
-                webhook("/run/wscan-refresh-new.sock"),
+                webhook("/run/wscan-refresh-old.sock"),
             )],
-        ))
-        .unwrap();
-        let mut table = RouteTable::default();
-        table.upsert(
-            "wscan-refresh-agent",
-            webhook("/run/wscan-refresh-old.sock"),
-            At::from_unix_millis(1),
         );
-        table.discover_routes(Some(home.path()), At::from_unix_millis(2));
+        register_wire_scanner(scanner.clone()).unwrap();
+        let mut table = RouteTable::default();
+        pass(&mut table, home.path(), 1);
+        assert_eq!(
+            route_of(&table, "wscan-refresh-agent"),
+            Some(&webhook("/run/wscan-refresh-old.sock"))
+        );
+        // The scanner now reports another socket: it replaces the route it produced.
+        scanner.set(
+            "wscan-refresh-agent",
+            webhook("/run/wscan-refresh-new.sock"),
+        );
+        pass(&mut table, home.path(), 2);
         assert_eq!(
             route_of(&table, "wscan-refresh-agent"),
             Some(&webhook("/run/wscan-refresh-new.sock"))
+        );
+    }
+
+    #[test]
+    fn a_scanner_cannot_replace_a_webhook_route_from_another_source() {
+        let home = tempfile::TempDir::new().unwrap();
+        register_wire_scanner(Fixed::new(
+            "wscan-forge",
+            &[("wscan-forge-agent", webhook("/run/wscan-forge.sock"))],
+        ))
+        .unwrap();
+        // An agent registered its own webhook route before the scan.
+        let mut table = RouteTable::default();
+        table.upsert(
+            "wscan-forge-agent",
+            webhook("/run/wscan-forge-own.sock"),
+            At::from_unix_millis(1),
+        );
+        pass(&mut table, home.path(), 2);
+        assert_eq!(
+            route_of(&table, "wscan-forge-agent"),
+            Some(&webhook("/run/wscan-forge-own.sock"))
+        );
+        // Nor does it take the name on a later pass.
+        pass(&mut table, home.path(), 3);
+        assert_eq!(
+            route_of(&table, "wscan-forge-agent"),
+            Some(&webhook("/run/wscan-forge-own.sock"))
+        );
+    }
+
+    #[test]
+    fn a_route_the_scanner_did_not_produce_is_not_its_own_even_when_it_was_replaced() {
+        let home = tempfile::TempDir::new().unwrap();
+        let scanner = Switch::new(
+            "wscan-swap",
+            &[("wscan-swap-agent", webhook("/run/wscan-swap-a.sock"))],
+        );
+        register_wire_scanner(scanner.clone()).unwrap();
+        let mut table = RouteTable::default();
+        pass(&mut table, home.path(), 1);
+        // The agent registers itself over the scanner's route; the scanner then changes its own.
+        table.upsert(
+            "wscan-swap-agent",
+            webhook("/run/wscan-swap-agent.sock"),
+            At::from_unix_millis(2),
+        );
+        scanner.set("wscan-swap-agent", webhook("/run/wscan-swap-b.sock"));
+        pass(&mut table, home.path(), 3);
+        assert_eq!(
+            route_of(&table, "wscan-swap-agent"),
+            Some(&webhook("/run/wscan-swap-agent.sock"))
+        );
+    }
+
+    #[test]
+    fn two_scanners_cannot_take_each_others_names() {
+        let home = tempfile::TempDir::new().unwrap();
+        let first = Switch::new(
+            "wscan-take-first",
+            &[("wscan-take-agent", webhook("/run/wscan-take-first.sock"))],
+        );
+        let second = Switch::new("wscan-take-second", &[]);
+        register_wire_scanner(first.clone()).unwrap();
+        register_wire_scanner(second.clone()).unwrap();
+        let mut table = RouteTable::default();
+        pass(&mut table, home.path(), 1);
+        // The second scanner starts reporting the first one's name, on later passes too.
+        second.set("wscan-take-agent", webhook("/run/wscan-take-second.sock"));
+        pass(&mut table, home.path(), 2);
+        pass(&mut table, home.path(), 3);
+        assert_eq!(
+            route_of(&table, "wscan-take-agent"),
+            Some(&webhook("/run/wscan-take-first.sock"))
+        );
+        // The first one still refreshes it.
+        first.set("wscan-take-agent", webhook("/run/wscan-take-first-2.sock"));
+        pass(&mut table, home.path(), 4);
+        assert_eq!(
+            route_of(&table, "wscan-take-agent"),
+            Some(&webhook("/run/wscan-take-first-2.sock"))
+        );
+        // And the second one cannot take it after that either.
+        pass(&mut table, home.path(), 5);
+        assert_eq!(
+            route_of(&table, "wscan-take-agent"),
+            Some(&webhook("/run/wscan-take-first-2.sock"))
+        );
+    }
+
+    #[test]
+    fn a_scanner_does_not_replace_a_newer_route_in_the_table() {
+        let home = tempfile::TempDir::new().unwrap();
+        let scanner = Switch::new(
+            "wscan-fresh",
+            &[("wscan-fresh-agent", webhook("/run/wscan-fresh-a.sock"))],
+        );
+        register_wire_scanner(scanner.clone()).unwrap();
+        let mut table = RouteTable::default();
+        pass(&mut table, home.path(), 1_000);
+        scanner.set("wscan-fresh-agent", webhook("/run/wscan-fresh-b.sock"));
+        // A pass stamped before the route's own time keeps the route the table has.
+        pass(&mut table, home.path(), 500);
+        assert_eq!(
+            route_of(&table, "wscan-fresh-agent"),
+            Some(&webhook("/run/wscan-fresh-a.sock"))
+        );
+        pass(&mut table, home.path(), 2_000);
+        assert_eq!(
+            route_of(&table, "wscan-fresh-agent"),
+            Some(&webhook("/run/wscan-fresh-b.sock"))
         );
     }
 

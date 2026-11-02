@@ -520,10 +520,13 @@ impl RouteTable {
     /// Merge the routes of every scanner registered with
     /// [`register_wire_scanner`](crate::scanner::register_wire_scanner), after the built-in scans.
     ///
-    /// A scanner never shadows a route a built-in scan or an earlier scanner produced for the
-    /// same agent name. The one entry it may replace is a [`VendorRoute::Webhook`] route left in
-    /// the table by an earlier pass (the only kind a scanner can produce), so a scanner can
-    /// refresh its own route. A scanner that panics is skipped for this pass.
+    /// A scanner writes a route only for a name the table does not hold, or to replace the very
+    /// route that same scanner last produced for the name (see
+    /// [`scanner_may_write`](crate::scanner::scanner_may_write)). It never replaces a route an
+    /// agent registered, a built-in scan found or another scanner produced, and an earlier
+    /// scanner's route wins over a later scanner's for the same name. A route already in the
+    /// table that is newer than this pass is kept, as for the built-in scans. A scanner that
+    /// panics is skipped for this pass.
     fn discover_scanner_routes(&mut self, home: &Path, at: &At) {
         let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for (vendor_id, scanner) in crate::scanner::registered_scanners() {
@@ -540,15 +543,18 @@ impl RouteTable {
                 if !crate::scanner::scanner_route_is_valid(&route) || claimed.contains(&name) {
                     continue;
                 }
-                match self.entries.get(&name).map(|e| &e.route) {
-                    None | Some(VendorRoute::Webhook { .. }) => {}
-                    Some(_) => continue,
-                }
-                claimed.insert(name.clone());
-                if self.entries.get(&name).is_some_and(|e| e.route == route) {
+                let existing = self.entries.get(&name).map(|e| e.route.clone());
+                if !crate::scanner::scanner_may_write(&vendor_id, &name, existing.as_ref()) {
                     continue;
                 }
-                self.upsert(&name, route, at.clone());
+                claimed.insert(name.clone());
+                if existing.as_ref() == Some(&route) {
+                    continue;
+                }
+                self.upsert_discovered(&name, route.clone(), 0, at);
+                if self.entries.get(&name).is_some_and(|e| e.route == route) {
+                    crate::scanner::record_produced(&vendor_id, &name, &route);
+                }
             }
         }
     }
