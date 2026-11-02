@@ -359,6 +359,7 @@ dependencies = [
  "fl-hub",
  "fl-mcp",
  "fl-store",
+ "fl-watch",
  "fl-wire",
  "predicates",
  "serde",

@@ -22,4 +22,5 @@ pub mod stats;
 pub mod store;
 pub mod transition;
 pub mod vault;
+pub mod watch;
 pub mod wire;

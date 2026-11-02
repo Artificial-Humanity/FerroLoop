@@ -18,6 +18,7 @@ fl-mcp = { path = "../mcp" }
 fl-wire = { path = "../wire" }
 fl-hub = { path = "../hub" }
 fl-gate = { path = "../gate" }
+fl-watch = { path = "../watch" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
