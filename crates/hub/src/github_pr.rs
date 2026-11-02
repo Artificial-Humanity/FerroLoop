@@ -733,6 +733,7 @@ mod tests {
                 for (name, role) in [
                     ("Felicia", AgentRole::Assistant),
                     ("Ferris", AgentRole::Lead),
+                    ("Alex", AgentRole::Assistant),
                 ] {
                     store
                         .register_agent(RegisterAgentArgs {
@@ -886,6 +887,22 @@ mod tests {
         // It is merged now: asking again is a conflict, not a second "merged: true".
         let again = f.merge(&json!({ "by": "felicia", "project": "ferroloop" }));
         assert_eq!(again.status, 409);
+    }
+
+    #[test]
+    fn an_agent_who_did_not_author_the_pull_request_cannot_merge_it() {
+        let f = Fixture::new();
+        f.approve_as_app("fake-app[bot]", Some(APP_BOT_ID));
+        // `alex` is an active assistant, but not a co-author of pull request #1.
+        let resp = f.merge(&json!({ "by": "alex", "project": "ferroloop" }));
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        assert!(!f.fake.pull(1).merged);
+        // Nor can a name that is no agent at all.
+        assert_eq!(
+            f.merge(&json!({ "by": "nobody", "project": "ferroloop" }))
+                .status,
+            403
+        );
     }
 
     #[test]
