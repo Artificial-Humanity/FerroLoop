@@ -6,6 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [dependencies]
+fl-core = { path = "../core" }
 thiserror.workspace = true
 serde.workspace = true
 # `raw_value` keeps a foreign entry in a vendor's JSON file byte for byte.

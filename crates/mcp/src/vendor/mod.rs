@@ -7,6 +7,7 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod custom;
 mod grok;
 mod json;
 mod muse;
@@ -14,6 +15,10 @@ mod muse;
 pub use antigravity::Antigravity;
 pub use claude::Claude;
 pub use codex::Codex;
+pub use custom::{
+    CustomRefusal, CustomTarget, TargetError, custom_target, custom_targets, register_target,
+    register_target_for_vendor,
+};
 pub use grok::Grok;
 pub use muse::Muse;
 
