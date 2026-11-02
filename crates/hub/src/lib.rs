@@ -7,6 +7,7 @@ pub mod api;
 mod artifacts;
 mod attachments;
 pub mod auth;
+mod balance_api;
 pub mod cloud_adapters;
 pub mod commands;
 mod direct_quota;
@@ -703,6 +704,9 @@ impl HubState {
 
 #[cfg(test)]
 mod latency_tests;
+
+#[cfg(test)]
+mod balance_api_tests;
 
 #[cfg(test)]
 mod remodel_api_tests;

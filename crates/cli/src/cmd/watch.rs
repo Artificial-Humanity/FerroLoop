@@ -82,6 +82,9 @@ pub enum WatchCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Subscription usage balancing: plan, apply, and the policy. A client of the hub, which
+    /// holds the live quota and runs the remodels.
+    Balance(crate::cmd::watch_balance::BalanceArgs),
 }
 
 /// The thresholds `fl watch alerts` runs with: the defaults, with each flag given replacing one.
@@ -423,6 +426,11 @@ pub fn run_at(
                 0
             })
         }
+        // A hub client that needs no store: `main` runs `fl watch balance` (with the configured
+        // `[hub].listen`) before it opens one, so it never reaches here.
+        WatchCmd::Balance(_) => {
+            unreachable!("`fl watch balance` is dispatched by main before a store is opened")
+        }
     }
 }
 
@@ -511,5 +519,29 @@ mod tests {
         assert_eq!(usd(0), "$0.00");
         assert_eq!(usd(1_234_567), "$1.23");
         assert_eq!(usd(600_000_000), "$600.00");
+    }
+
+    /// `fl watch balance` has one path, main's (which passes `[hub].listen`): the store path
+    /// refuses it loudly instead of running it without the configured listen address.
+    #[test]
+    #[should_panic(expected = "dispatched by main")]
+    fn balance_never_runs_on_the_store_path() {
+        let args = crate::cmd::watch_balance::BalanceArgs {
+            cmd: None,
+            dry_run: true,
+            apply: false,
+            warrant: None,
+            hub: Some("127.0.0.1:1".into()),
+            token_file: None,
+            agent: None,
+            json: false,
+        };
+        let _ = run_at(
+            &AnyStore::in_memory(),
+            WatchCmd::Balance(args),
+            0,
+            "host",
+            &|_| true,
+        );
     }
 }

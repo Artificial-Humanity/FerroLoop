@@ -2,7 +2,8 @@
 //! FerroLoop store.
 //!
 //! The crate is usable on its own: it depends only on `fl-core` and `fl-store`. It reads the
-//! store, and never writes it.
+//! store; the only entries it writes are the balancing policy, history and audits
+//! ([`balance_store`]).
 //!
 //! - [`rollups`]: attempt and gate-run telemetry ([`WatchTelemetryReport`]): totals summed from
 //!   the ledger rows, breakdowns by project, adapter (vendor) and agent, failure streaks,
@@ -12,11 +13,15 @@
 //! - [`alerts`]: thresholds ([`WatchThresholds`]) and the pure alert evaluation
 //!   ([`evaluate_watch_alerts`]).
 //! - [`runtime`]: the workspace runtime entries the other modules read, decoded in one pass.
+//! - [`balance`]: the pure subscription usage balancing planner ([`plan_balance`]).
+//! - [`balance_store`]: the balancing policy, history and audit entries in the store.
 //!
 //! [`build_summary`] runs all of them over one store: [`read_store_snapshot`] reads it once and
 //! [`summarize`] evaluates health and alerts from that read, so a caller can cache the read.
 
 pub mod alerts;
+pub mod balance;
+pub mod balance_store;
 pub mod liveness;
 pub mod rollups;
 pub mod runtime;
@@ -32,6 +37,12 @@ pub use alerts::{
     QuotaWindowKind, Severity, WatchAlert, WatchAlertRule, WatchEntity, WatchEntityKind,
     WatchQuotaWindow, WatchThresholds, evaluate_watch_alerts,
 };
+pub use balance::{
+    BalanceAgent, BalanceError, BalanceHistory, BalanceInputs, BalancePlan, BalancePolicy,
+    BalanceTrigger, PlannedSwitch, Remodelable, SkipReason, SkippedAgent, VendorHealth,
+    VendorStatus, plan_balance, plan_balance_checked,
+};
+pub use balance_store::{BalanceAudit, SwitchResult, SwitchStatus};
 pub use liveness::{
     LivenessOptions, WatchAgentHealth, WatchGroupHealth, WatchHealthReport, WatchLiveness,
     WatchLivenessCounts, build_health, classify_liveness, evaluate_health,

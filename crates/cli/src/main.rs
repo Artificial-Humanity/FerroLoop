@@ -977,6 +977,23 @@ fn run(cli: Cli) -> Result<i32> {
             };
         }
         Cli {
+            db: _,
+            command:
+                Command::Watch {
+                    cmd: cmd::watch::WatchCmd::Balance(args),
+                },
+        } => {
+            // A client of the hub, which holds the live quota and runs the remodels: no store.
+            let listen = cfg.hub.as_ref().and_then(|h| h.listen.clone());
+            return match cmd::watch_balance::run(args, listen.as_deref()) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
+        Cli {
             db,
             command: Command::Watch { cmd },
         } => {
