@@ -1460,7 +1460,7 @@ mod tests {
         assert_eq!(kimi.default_context_window, 256_000);
         assert!(kimi.needs_api_key && kimi.builtin);
         assert_eq!(kimi.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
-        assert_eq!(kimi.dialect.as_deref(), Some("open_ai_chat_completions"));
+        assert_eq!(kimi.dialect.as_deref(), Some("openai_chat_completions"));
         assert_eq!(kimi.mcp_config_rel_path, None);
 
         let claude = by("claude");

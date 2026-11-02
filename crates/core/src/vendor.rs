@@ -27,6 +27,7 @@ use std::sync::{OnceLock, RwLock};
 #[serde(rename_all = "snake_case")]
 pub enum ApiDialect {
     /// `POST {base}/chat/completions`: OpenAI, xAI, OpenRouter, Kimi, Ollama, Lemonade.
+    #[serde(rename = "openai_chat_completions", alias = "open_ai_chat_completions")]
     OpenAiChatCompletions,
     /// `POST {base}/v1/messages`: Anthropic.
     AnthropicMessages,
@@ -286,7 +287,9 @@ fn validate(d: &VendorDescriptor) -> Result<(), VendorError> {
     if let Some(path) = &d.mcp_config_rel_path {
         let escapes = path.starts_with('/')
             || path.starts_with('\\')
-            || path.split(['/', '\\']).any(|part| part == "..")
+            || path
+                .split(['/', '\\'])
+                .any(|part| part.is_empty() || part == "." || part == "..")
             || path.trim().is_empty();
         if escapes {
             return Err(bad(
@@ -560,9 +563,14 @@ mod tests {
         let mut d = custom("ok", "https://e.com");
         d.mcp_config_rel_path = Some("../../etc/x".into());
         assert!(matches!(reg.register(d), Err(VendorError::Invalid { .. })));
-        let mut d = custom("ok", "https://e.com");
-        d.mcp_config_rel_path = Some("/etc/x".into());
-        assert!(matches!(reg.register(d), Err(VendorError::Invalid { .. })));
+        for bad in ["/etc/x", "a//b", "./x", "a/./b", "a/", "a\\..\\b"] {
+            let mut d = custom("ok", "https://e.com");
+            d.mcp_config_rel_path = Some(bad.into());
+            assert!(
+                matches!(reg.register(d), Err(VendorError::Invalid { .. })),
+                "{bad:?}"
+            );
+        }
         assert!(reg.get("ok").is_none());
     }
 
@@ -603,10 +611,13 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         assert!(json.contains("\"kind\":\"http_api\""), "{json}");
         assert!(
-            json.contains("\"api_dialect\":\"open_ai_chat_completions\""),
+            json.contains("\"api_dialect\":\"openai_chat_completions\""),
             "{json}"
         );
         let back: VendorDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(back, d);
+        // The spelling the first draft emitted still reads back.
+        let old = json.replace("openai_chat_completions", "open_ai_chat_completions");
+        assert_eq!(serde_json::from_str::<VendorDescriptor>(&old).unwrap(), d);
     }
 }
