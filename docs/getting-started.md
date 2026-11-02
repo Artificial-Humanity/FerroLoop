@@ -773,6 +773,67 @@ A store configured inside a repository's `.fl/` directory makes a `.fl` that `fl
 the MCP catalog). Git does not track directory modes, so a checkout elsewhere is unaffected; to
 share the directory on this machine, `chmod 755 .fl` yourself.
 
+## Vendors: API models and local engines
+
+`fl attempt <record> --adapter <id>` runs an attempt through any registered vendor, not only the
+five subscription CLIs (`claude`, `codex`, `antigravity`, `muse`, `grok`). The other built-in ids
+are the direct APIs (`anthropic-api`, `openai-api`, `gemini-api`, `xai-api`, `openrouter-api`,
+`kimi-api`) and the local engines (`ollama`, `lemonade`). An API attempt is one request: it sends
+the instruction and records the reply, the tokens and the cost. It runs no tools. The attempt is
+recorded under the vendor id. A name that is not registered is refused with the list of ids that
+are. A workflow step (`fl flow step --adapter <id>`, or a step's `adapter`) takes the same ids,
+settings and key lookup, and records the id as the step's adapter.
+
+`[vendors.<id>]` in `config.toml` sets a vendor up. The id is compared without case.
+
+```
+# $XDG_CONFIG_HOME/fl/config.toml
+
+# A built-in API vendor: overrides only. They apply when fl builds that vendor's adapter.
+[vendors.kimi-api]
+base_url = "https://proxy.example.com/v1"   # https, or http to this machine
+default_model = "kimi-k2.5"
+input_usd_micros_per_mtok = 600000          # also spelled input_usd_micros_per_m
+output_usd_micros_per_mtok = 2500000        # also spelled output_usd_micros_per_m
+
+# A new vendor: no recompile.
+[vendors.my-vllm]
+transport = "http_api"                      # required; "subscription_cli" cannot be added here
+dialect = "openai_chat_completions"         # or anthropic_messages, gemini_generate_content
+base_url = "http://127.0.0.1:8001/v1"
+default_model = "qwen3"
+display_name = "Local vLLM"                 # default: the id
+env_key = "VLLM_API_KEY"                    # the variable that holds the key
+vault_secret = "VLLM_API_KEY"               # the Vault secret; default: env_key
+context_window = 32000                      # default 0 (unknown)
+mcp_config_rel_path = ".vllm/mcp.json"      # optional; the project MCP file for this vendor
+```
+
+* Built-in vendors take `base_url`, `default_model` and the rate card only. They never change
+  in the registry. `mcp_config_rel_path`, `dialect`, `env_key`, `vault_secret`,
+  `display_name` and `context_window` on a built-in id are errors. A subscription CLI takes
+  none of these; its binary and rate card go in `[adapters.<name>]`.
+* A new vendor needs `transport`, `dialect`, `base_url` and `default_model`. With neither
+  `env_key` nor `vault_secret` it is a keyless local engine.
+* `base_url` must be `https://`, or `http://` to `127.0.0.1`, `localhost` or `[::1]`, with no
+  user name, query or fragment. fl sends the key there.
+* A paid API (a vendor with a key name) needs a rate card, and `output_usd_micros_per_mtok` must
+  not be 0: the spend ceiling of an attempt depends on it. fl ships none. A vendor with no key
+  name may run with no rate card.
+* A config error in `[vendors]` stops every `fl` command, and names the file and the id.
+
+The key is the vendor's environment variable if it is set and not blank. Otherwise fl reads the
+vendor's secret from the FerroGate Vault (`fl vault set`), as the agent `fl-exec`, under the
+secret's own policy. The secret must list the vendor's host in `--host`, and for a loopback or
+LAN engine it needs `--allow-private-network`. If the secret names `--agent` values, `fl-exec`
+must be one of them (or `*`). `--method` must allow `POST` if it is set. A secret that is
+missing, expired, denied or unreadable, or a Vault that does not exist, gives no key, and the
+attempt is refused (exit 1) without a reason that could reveal the secret. fl never creates a
+Vault when it looks for a key. Each read is written to `gate-audit.jsonl` beside the Vault.
+
+For the `my-vllm` example, `fl vault set VLLM_API_KEY --stdin --host 127.0.0.1
+--allow-private-network` stores a key that only that address can receive.
+
 ## Submodules
 
 Six repositories hold standalone extractions of parts of FerroLoop: FerroDeck, FerroStore,

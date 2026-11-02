@@ -4,6 +4,7 @@
 //! person's comments and layout survive every change fl makes to it.
 
 use crate::McpError;
+use crate::vendor::{self, CustomId, custom_name};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,17 +75,22 @@ fn on() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// A vendor fl writes an MCP file for: one of the five built in, or a target registered with
+/// [`register_target`](crate::vendor::register_target). [`VendorName::ALL`] is the built-ins only;
+/// [`vendor::all`](crate::vendor::all) adds the registered targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VendorName {
     Claude,
     Codex,
     Antigravity,
     Muse,
     Grok,
+    /// A registered target.
+    Custom(CustomId),
 }
 
 impl VendorName {
+    /// The built-in vendors.
     pub const ALL: [VendorName; 5] = [
         VendorName::Claude,
         VendorName::Codex,
@@ -100,7 +106,33 @@ impl VendorName {
             VendorName::Antigravity => "antigravity",
             VendorName::Muse => "muse",
             VendorName::Grok => "grok",
+            VendorName::Custom(id) => id.as_str(),
         }
+    }
+
+    /// The vendor with exactly this id: a built-in, or a registered target.
+    pub fn parse(id: &str) -> Option<VendorName> {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.as_str() == id)
+            .or_else(|| custom_name(id))
+    }
+}
+
+/// A vendor id as the catalog's `vendors` list gives it: a built-in's, or a registered target's.
+/// A target registered after the catalog is read is unknown to it.
+impl<'de> Deserialize<'de> for VendorName {
+    fn deserialize<D: de::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(d)?;
+        VendorName::parse(&id).ok_or_else(|| {
+            let known: Vec<String> = (vendor::all().into_iter())
+                .map(|v| format!("`{}`", v.as_str()))
+                .collect();
+            de::Error::custom(format!(
+                "unknown variant `{id}`, expected one of {}",
+                known.join(", ")
+            ))
+        })
     }
 }
 
@@ -1080,6 +1112,38 @@ env.LOG_LEVEL = "info"
             VendorName::ALL.map(VendorName::as_str),
             ["claude", "codex", "antigravity", "muse", "grok"]
         );
+    }
+
+    #[test]
+    fn a_vendors_list_accepts_a_registered_custom_target_and_refuses_any_other_id() {
+        use crate::vendor::{CustomTarget, register_target};
+        let id = "catalog-test-agent";
+        let text = |ids: &str| stdio("gh", &format!("vendors = [{ids}]\n"));
+        // Unknown until registered; refused the way a built-in typo is.
+        let before = unparsed(&text(&format!("\"{id}\"")));
+        assert!(before.contains("line 4, column 11: unknown variant <value>, expected one of `claude`, `codex`, `antigravity`, `muse`, `grok`"), "{before}");
+        assert!(!before.contains(id), "{before}");
+        let target = CustomTarget::new(id, "Agent", ".c/agent.json", "mcpServers", false);
+        register_target(target.unwrap()).unwrap();
+        let c = parse(&text(&format!("\"claude\", \"{id}\""))).unwrap();
+        let listed = c.servers["gh"].vendors.clone().unwrap();
+        assert_eq!(
+            listed.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+            ["claude", id]
+        );
+        assert!(c.servers["gh"].is_for(listed[1]) && !c.servers["gh"].is_for(VendorName::Codex));
+        // Another id is still refused, now with the registered ids in the list, and a
+        // different case of a registered id is another id.
+        for bad in ["gemini", "Catalog-Test-Agent", "other-agent"] {
+            let after = unparsed(&text(&format!("\"{bad}\"")));
+            assert!(after.contains("unknown variant <value>, expected one of `claude`, `codex`, `antigravity`, `muse`, `grok`"), "{after}");
+            assert!(after.contains(&format!("`{id}`")), "{after}");
+            assert!(!after.contains(bad), "{after}");
+        }
+        // The editor writes it back as it reads it.
+        assert_eq!(VendorName::parse(id).unwrap().as_str(), id);
+        assert_eq!(VendorName::parse("codex"), Some(VendorName::Codex));
+        assert_eq!(VendorName::parse("gemini"), None);
     }
 
     #[test]

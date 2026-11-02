@@ -15,10 +15,11 @@ use fl_core::telemetry::AdapterKind;
 use fl_core::workflow::{
     StepCompletion, StepOutcome, WorkflowDef, WorkflowError, WorkflowRun, WorkflowRunStatus,
 };
+use fl_exec::adapters::AdapterBuild;
 use fl_exec::stamp;
 use fl_exec::workflow::{
     FLOWS_DIR, StepExecutionAction, StepExecutionOptions, WorkflowEnv, WorkflowExecError,
-    abort_workflow_run, approve_workflow_step, assign_workflow_step, execute_workflow_step,
+    abort_workflow_run, approve_workflow_step, assign_workflow_step, execute_workflow_step_with,
     export_workflow_toml, import_workflow_manifest, list_workflow_facts, list_workflow_handoffs,
     parse_workflow_file, record_step_handoff, reject_workflow_step, start_workflow_run,
     write_workflow_fact,
@@ -27,7 +28,7 @@ use fl_store::AnyStore;
 use serde_json::{Value, json};
 
 use crate::cmd::agent::write_atomic_non_symlink;
-use crate::config::AdapterConfig;
+use crate::config::{AdapterConfig, VendorConfig};
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 
@@ -472,16 +473,24 @@ fn build_step_options(
     by: String,
     adapters: &BTreeMap<AdapterKind, AdapterConfig>,
 ) -> StepExecutionOptions {
-    let resolved_kind = adapter
-        .as_deref()
-        .and_then(AdapterKind::from_wire)
-        .unwrap_or(AdapterKind::Claude);
+    // No `--adapter` runs the step's own (default Claude). A name that is not one of the five
+    // CLIs is a vendor, and `[adapters.*]` (the CLIs' binary and rate card) is not lent to it.
+    // The registry compares ids without case, so `Claude` is the CLI `claude` here as it is for
+    // the executor (see `Target::resolve`).
+    let resolved_kind = match adapter.as_deref() {
+        None => Some(AdapterKind::Claude),
+        Some(name) => AdapterKind::from_wire(name).or_else(|| {
+            fl_core::lookup_vendor(name).and_then(|vendor| AdapterKind::from_wire(&vendor.id))
+        }),
+    };
     let binary_override = binary.or_else(|| {
         adapters
-            .get(&resolved_kind)
+            .get(&resolved_kind?)
             .and_then(|cfg| cfg.binary.clone())
     });
-    let rate_card = adapters.get(&resolved_kind).and_then(|cfg| cfg.rate_card());
+    let rate_card = resolved_kind
+        .and_then(|kind| adapters.get(&kind))
+        .and_then(|cfg| cfg.rate_card());
 
     StepExecutionOptions {
         step_id: step,
@@ -530,9 +539,18 @@ fn print_runs_list(
     Ok(0)
 }
 
+/// The build of a step's vendor that is not one of the five CLIs: its `[vendors.<id>]`
+/// overrides, and its key from the environment or the FerroGate Vault.
+fn vendor_hook(
+    vendors: &BTreeMap<String, VendorConfig>,
+) -> impl Fn(&str) -> AdapterBuild + Send + Sync + '_ {
+    move |id| crate::cmd::attempt::vendor_build(&vendors.get(id).cloned().unwrap_or_default())
+}
+
 pub fn run(
     ctx: &Ctx<'_>,
     adapters: &BTreeMap<AdapterKind, AdapterConfig>,
+    vendors: &BTreeMap<String, VendorConfig>,
     ws_store: &AnyStore,
     cwd: &Path,
     cmd: FlowCmd,
@@ -899,7 +917,12 @@ pub fn run(
                     by.clone(),
                     adapters,
                 );
-                let mut rep = match execute_workflow_step(wf_env, &run_obj.id, &opts) {
+                let mut rep = match execute_workflow_step_with(
+                    wf_env,
+                    &run_obj.id,
+                    &opts,
+                    Some(&vendor_hook(vendors)),
+                ) {
                     Ok(r) => r,
                     Err(e) => return emit_exec_err(e, json),
                 };
@@ -1020,7 +1043,12 @@ pub fn run(
                     by.clone(),
                     adapters,
                 );
-                let rep = match execute_workflow_step(wf_env, &current_run.id, &opts) {
+                let rep = match execute_workflow_step_with(
+                    wf_env,
+                    &current_run.id,
+                    &opts,
+                    Some(&vendor_hook(vendors)),
+                ) {
                     Ok(r) => r,
                     Err(e) => return emit_exec_err(e, json),
                 };
@@ -1243,5 +1271,56 @@ pub fn run(
             }
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(adapter: Option<&str>) -> StepExecutionOptions {
+        let cfg = AdapterConfig {
+            binary: Some("/opt/claude-bin".into()),
+            input_usd_micros_per_mtok: Some(3),
+            output_usd_micros_per_mtok: Some(15),
+        };
+        let adapters = BTreeMap::from([(AdapterKind::Claude, cfg)]);
+        build_step_options(
+            None,
+            adapter.map(str::to_string),
+            None,
+            false,
+            60,
+            "owner".into(),
+            &adapters,
+        )
+    }
+
+    #[test]
+    fn an_adapter_name_in_any_case_gets_the_clis_binary_and_rate_card() {
+        for name in [None, Some("claude"), Some("Claude"), Some("CLAUDE")] {
+            let opts = options(name);
+            assert_eq!(
+                opts.binary_override.as_deref(),
+                Some("/opt/claude-bin"),
+                "{name:?}"
+            );
+            let card = opts.rate_card.expect("the rate card");
+            assert_eq!(
+                (
+                    card.input_usd_micros_per_mtok,
+                    card.output_usd_micros_per_mtok
+                ),
+                (3, 15),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vendor_that_is_not_one_of_the_five_clis_is_not_lent_their_settings() {
+        let opts = options(Some("kimi-api"));
+        assert_eq!(opts.binary_override, None);
+        assert!(opts.rate_card.is_none());
     }
 }

@@ -2344,6 +2344,25 @@ fn adapter_for_transcript(path: &Path) -> Option<String> {
     None
 }
 
+/// The context window, in tokens, that a transcript with none of its own is assumed to have.
+const GENERIC_CONTEXT_WINDOW: u64 = 500_000;
+
+/// The context window the vendor registry declares for `adapter`'s vendor (the adapter name is
+/// the vendor id), when it declares one: a built-in API vendor, a local engine or a registered
+/// custom vendor. `None` for an unknown adapter and for a vendor whose window is `0` (unknown,
+/// or the CLI decides).
+pub(crate) fn registered_context_window(adapter: &str) -> Option<u64> {
+    fl_core::lookup_vendor(adapter)
+        .map(|d| d.default_context_window)
+        .filter(|&n| n > 0)
+}
+
+/// Where a transcript names no window: the vendor's registered default, else the generic one.
+/// Every answer the transcript itself gives wins over both.
+pub(crate) fn fallback_context_window(adapter: &str) -> u64 {
+    registered_context_window(adapter).unwrap_or(GENERIC_CONTEXT_WINDOW)
+}
+
 /// Read server-measured context window token usage for `session_id` when vendor session
 /// metadata (such as Grok `signals.json`/`summary.json`, Claude `message.usage`, Codex `token_count`,
 /// Antigravity `PLANNER_RESPONSE`, or Muse `model_completed`) is available.
@@ -2438,7 +2457,7 @@ pub(crate) fn context_usage_from_sessions(
                     .and_then(|v| v.get("context_window").and_then(Value::as_u64))
                     .filter(|&n| n > 0)
             })
-            .unwrap_or(500_000);
+            .unwrap_or_else(|| fallback_context_window("grok"));
 
         if let Some(used_tokens) = used_tokens {
             return Some(SessionContextUsage {
@@ -2480,7 +2499,7 @@ pub(crate) fn context_usage_from_sessions(
                         .and_then(Value::as_u64)
                         .filter(|&n| n > 0)
                 })
-                .unwrap_or(500_000);
+                .unwrap_or_else(|| fallback_context_window("codex"));
             if let Some(used_tokens) = used_tokens {
                 return Some(SessionContextUsage {
                     used_tokens,
@@ -8204,5 +8223,104 @@ mod tests {
         fs::write(&log, body).unwrap();
         let quota = grok_quota_from_home(home.path()).unwrap();
         assert_eq!(quota.tier.as_deref(), Some("fresh-tier"));
+    }
+
+    fn register_context_vendor(id: &str, context_window: u64) {
+        fl_core::ensure_vendor_registered(fl_core::VendorDescriptor {
+            id: id.to_string(),
+            display_name: format!("Custom {id}"),
+            transport: fl_core::VendorTransport::HttpApi {
+                default_base_url: "https://example.org/v1".to_string(),
+                api_dialect: fl_core::ApiDialect::OpenAiChatCompletions,
+                vault_secret_name: None,
+                env_key_name: None,
+            },
+            default_model: "m".to_string(),
+            default_context_window: context_window,
+            default_rate_card: fl_core::telemetry::RateCard::default(),
+            mcp_config_rel_path: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn registered_vendor_context_windows_are_the_fallback_before_the_generic_one() {
+        register_context_vendor("disc-ctx-custom", 77_000);
+        register_context_vendor("disc-ctx-zero", 0);
+        // Built-in API vendors and local engines answer with their registered default.
+        for (adapter, window) in [
+            ("kimi-api", 256_000),
+            ("openrouter-api", 128_000),
+            ("openai-api", 400_000),
+            ("ollama", 128_000),
+            ("lemonade", 128_000),
+            ("disc-ctx-custom", 77_000),
+        ] {
+            assert_eq!(
+                registered_context_window(adapter),
+                Some(window),
+                "{adapter}"
+            );
+            assert_eq!(fallback_context_window(adapter), window, "{adapter}");
+        }
+        // No window registered (a CLI the CLI decides for, a window of 0) or no such vendor:
+        // the generic default stays.
+        for adapter in [
+            "claude",
+            "grok",
+            "codex",
+            "disc-ctx-zero",
+            "no-such-adapter",
+            "",
+        ] {
+            assert_eq!(registered_context_window(adapter), None, "{adapter}");
+            assert_eq!(fallback_context_window(adapter), 500_000, "{adapter}");
+        }
+    }
+
+    #[test]
+    fn a_transcript_that_names_its_window_keeps_it_and_one_that_does_not_gets_the_fallback() {
+        let home = TempDir::new().unwrap();
+        let session_dir = home.path().join("grok-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let chat = session_dir.join("chat_history.jsonl");
+        fs::write(&chat, "{}\n").unwrap();
+        let summary = DiscoveredSessionSummary {
+            id: "grok-session".into(),
+            source: "route".into(),
+            adapter: "grok".into(),
+            persona: None,
+            status: "active".into(),
+            updated_at: None,
+            cwd: None,
+            record_id: None,
+            transcript_path: Some(chat.display().to_string()),
+            quota_usage: None,
+            model: None,
+            thinking_level: None,
+            available_models: Vec::new(),
+        };
+        let usage = |signals: serde_json::Value| {
+            fs::write(session_dir.join("signals.json"), signals.to_string()).unwrap();
+            context_usage_from_sessions(
+                "grok-session",
+                std::slice::from_ref(&summary),
+                Some(home.path()),
+                &mut TranscriptReads::default(),
+            )
+            .unwrap()
+        };
+        // The window the session reports always wins.
+        let reported = usage(serde_json::json!({
+            "contextTokensUsed": 10,
+            "contextWindowTokens": 123_456
+        }));
+        assert_eq!((reported.used_tokens, reported.max_tokens), (10, 123_456));
+        // Without one, the answer is unchanged for a vendor that registers no window.
+        let unreported = usage(serde_json::json!({ "contextTokensUsed": 10 }));
+        assert_eq!(
+            (unreported.used_tokens, unreported.max_tokens),
+            (10, 500_000)
+        );
     }
 }

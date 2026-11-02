@@ -63,7 +63,7 @@ server's table holds:
 | `from` | The registry's name for the server, such as `io.example/notes`. Absent for a server added by hand. |
 | `version` | The exact registry version the launch was frozen from. Present exactly when `from` is. |
 | `enabled` | The team default: `true` or `false`. Default `true`. |
-| `vendors` | The agent CLIs that get the server: any of `claude`, `codex`, `antigravity`, `muse` and `grok`. Default: all five. |
+| `vendors` | The agent CLIs that get the server: any of `claude`, `codex`, `antigravity`, `muse` and `grok`, or the id of a registered vendor (see [Other agent CLIs](#other-agent-clis)). Default: all of them. |
 | `transport` | `stdio` (fl's vendor files start the server), `http` (streamable HTTP) or `sse` (the older HTTP with server-sent events). |
 | `command` | The program a `stdio` server runs. Required for `stdio`, refused otherwise. |
 | `args` | Its arguments, a list of strings. `stdio` only. |
@@ -161,6 +161,24 @@ cannot reach the server. Antigravity has no SSE, so an `sse` server is left out 
 **Grok** gets the same `[mcp_servers.<name>]` table as Codex (`command`, `args`, `env` and
 `env_vars` for `stdio`; `url`, `bearer_token_env_var`, `http_headers` and `env_http_headers` for
 `http`; no `sse`), in `.grok/config.toml`.
+
+### Other agent CLIs
+
+A vendor in fl's vendor registry (a plugin vendor declared in the config) that is not one of the five
+above and names an `mcp_config_rel_path` gets a file too, written and checked exactly like the
+others: the same ownership records, the same refusal to overwrite an entry fl did not write or a
+person changed, the same `.gitignore` rule. Its title is the vendor's display name, and its file is
+`mcp_config_rel_path`, relative to the project. Its entries are shaped like Claude Code's, under
+`mcpServers`, in a JSON file fl can rewrite faithfully (no comments); a file it cannot is refused
+and left alone.
+
+Such a vendor is taken **not** to expand `${NAME}` in its entries. A server with a secret (an
+`env` or a header value fl would write as a reference) is therefore left out of that vendor's
+file, with a message naming the secret, rather than written as a reference the agent CLI may pass
+on as literal text; the other agent CLIs still get it. A server that carries no secret is written.
+A server's `vendors` list may name the vendor by its id. The ids are known to `fl mcp` when it
+starts, so a catalog that names a vendor the config does not register is refused like any other
+unknown name.
 
 ### What fl keeps
 

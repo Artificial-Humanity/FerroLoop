@@ -428,3 +428,353 @@ fn stats_reports_partial_cost_floor_and_regret_audit_challenge() {
                 .and(contains("\"regret_audit\"")),
         );
 }
+
+// ---- Vendor-aware attempts: `[vendors.<id>]` and the Vault-backed key ----
+
+mod vendors {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A loopback server that records each request's path, `Authorization` header and body, and
+    /// answers every one with an OpenAI-shaped reply that used 1000 + 200 tokens.
+    struct Mock {
+        base: String,
+        seen: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Mock {
+        fn start() -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (seen2, stop2) = (Arc::clone(&seen), Arc::clone(&stop));
+            let thread = std::thread::spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else {
+                        continue;
+                    };
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(req.as_reader(), &mut text).unwrap();
+                    let auth = req
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("authorization"))
+                        .map(|h| h.value.to_string())
+                        .unwrap_or_default();
+                    seen2.lock().unwrap().push((
+                        req.url().to_string(),
+                        auth,
+                        serde_json::from_str(&text).unwrap_or_default(),
+                    ));
+                    let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello from the mock"}}],"usage":{"prompt_tokens":1000,"completion_tokens":200}}"#;
+                    let response = tiny_http::Response::from_string(body).with_header(
+                        tiny_http::Header::from_bytes("content-type", "application/json").unwrap(),
+                    );
+                    let _ = req.respond(response);
+                }
+            });
+            Self {
+                base,
+                seen,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn requests(&self) -> Vec<(String, String, serde_json::Value)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// A scratch workspace: a store with one record, a config home and an empty Vault home.
+    struct Ws {
+        dir: tempfile::TempDir,
+        db: String,
+        _repo: tempfile::TempDir,
+    }
+
+    impl Ws {
+        fn new(config: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("t.redb").display().to_string();
+            let repo = project(&db);
+            std::fs::create_dir_all(dir.path().join("fl")).unwrap();
+            std::fs::write(dir.path().join("fl/config.toml"), config).unwrap();
+            let ws = Self {
+                dir,
+                db,
+                _repo: repo,
+            };
+            ws.fl()
+                .args(["record", "add", "--project", "1", "--title", "say hello"])
+                .assert()
+                .success();
+            ws
+        }
+
+        /// `fl`, with the Vault confined to this workspace and no ambient key.
+        fn fl(&self) -> Command {
+            let mut c = cli(&self.db);
+            c.env("XDG_DATA_HOME", self.dir.path().join("data"))
+                .env_remove("FL_VAULT_PATH")
+                .env_remove("FL_VAULT_KEY_PATH")
+                .env_remove("FL_VAULT_MASTER_KEY")
+                .env_remove("AGENT_PERSONA")
+                .env_remove("CFG_ATT_KEY")
+                .env_remove("MOONSHOT_API_KEY");
+            c
+        }
+
+        /// A Vault where `fl` looks for one, holding `name` for `host`.
+        fn vault_secret(&self, name: &str, value: &str, host: &str, private: bool) {
+            let data = self.dir.path().join("data/fl");
+            std::fs::create_dir_all(&data).unwrap();
+            let key_path = self.dir.path().join("fl/vault.key");
+            let master = fl_gate::load_or_init_master_key(&key_path).unwrap();
+            let mut vault = fl_gate::Vault::open(data.join("vault.enc"), master).unwrap();
+            vault
+                .set(fl_gate::SetSecretArgs {
+                    name: name.into(),
+                    value: value.into(),
+                    allowed_hosts: vec![host.into()],
+                    allow_private_network: private,
+                    ..fl_gate::SetSecretArgs::default()
+                })
+                .unwrap();
+        }
+
+        fn attempts(&self) -> Vec<fl_core::log::Attempt> {
+            use fl_core::ids::ProjectId;
+            use fl_core::store::{Catalog, Ledger};
+            let store = fl_store::open_store(Path::new(&self.db)).unwrap();
+            let projects = store.list_projects().unwrap();
+            store
+                .attempts(&ProjectId(projects[0].id.iri().clone()))
+                .unwrap()
+        }
+    }
+
+    fn custom_vendor(id: &str, base: &str, key: &str) -> String {
+        format!(
+            "[vendors.{id}]\n\
+             transport = \"http_api\"\n\
+             dialect = \"openai_chat_completions\"\n\
+             base_url = \"{base}/v1\"\n\
+             default_model = \"served-model\"\n\
+             {key}\n\
+             input_usd_micros_per_mtok = 2000000\n\
+             output_usd_micros_per_mtok = 10000000\n"
+        )
+    }
+
+    #[test]
+    fn a_custom_vendor_attempt_completes_with_tokens_and_cost_recorded_under_its_id() {
+        let mock = Mock::start();
+        let ws = Ws::new(&custom_vendor(
+            "att-custom-env",
+            &mock.base,
+            "env_key = \"CFG_ATT_KEY\"",
+        ));
+        ws.fl()
+            .env("CFG_ATT_KEY", "env-secret")
+            .args(["attempt", "1", "--adapter", "att-custom-env"])
+            .assert()
+            .success()
+            .stdout(contains("completed").and(contains("hello from the mock")));
+        let seen = mock.requests();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, "/v1/chat/completions");
+        assert_eq!(seen[0].1, "Bearer env-secret");
+        assert_eq!(seen[0].2["model"], "served-model");
+        let attempts = ws.attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].adapter, "att-custom-env");
+        assert_eq!(attempts[0].tokens_in, 1000);
+        assert_eq!(attempts[0].tokens_out, 200);
+        // 1000 x $2/Mtok + 200 x $10/Mtok.
+        assert_eq!(attempts[0].cost_usd_micros, 4000);
+        ws.fl()
+            .args(["stats", "--project", "1"])
+            .assert()
+            .success()
+            .stdout(contains("  att-custom-env: 1 attempts (1 completed), "));
+    }
+
+    #[test]
+    fn a_custom_vendor_attempt_without_its_key_is_refused_and_still_recorded() {
+        let mock = Mock::start();
+        let ws = Ws::new(&custom_vendor(
+            "att-custom-nokey",
+            &mock.base,
+            "env_key = \"CFG_ATT_KEY\"",
+        ));
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "att-custom-nokey"])
+            .assert()
+            .code(1)
+            .stdout(contains("refused").and(contains("no API key for `att-custom-nokey`")));
+        assert!(mock.requests().is_empty(), "nothing was sent");
+        let attempts = ws.attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].adapter, "att-custom-nokey");
+    }
+
+    #[test]
+    fn a_custom_vendor_without_a_rate_card_is_refused_not_run() {
+        let mock = Mock::start();
+        let ws = Ws::new(&format!(
+            "[vendors.att-custom-free-card]\ntransport = \"http_api\"\n\
+             dialect = \"openai_chat_completions\"\nbase_url = \"{}/v1\"\n\
+             default_model = \"m\"\nenv_key = \"CFG_ATT_KEY\"\n",
+            mock.base
+        ));
+        ws.fl()
+            .env("CFG_ATT_KEY", "env-secret")
+            .args(["attempt", "1", "--adapter", "att-custom-free-card"])
+            .assert()
+            .code(1)
+            .stdout(contains("refused").and(contains("no rate card")));
+        assert!(mock.requests().is_empty());
+    }
+
+    #[test]
+    fn a_keyless_local_vendor_runs_with_no_key_at_all() {
+        let mock = Mock::start();
+        let ws = Ws::new(&custom_vendor("att-custom-local", &mock.base, ""));
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "ATT-custom-local"])
+            .assert()
+            .success()
+            .stdout(contains("completed"));
+        assert_eq!(mock.requests()[0].1, "", "no Authorization header");
+        assert_eq!(ws.attempts()[0].adapter, "att-custom-local");
+    }
+
+    #[test]
+    fn the_key_comes_from_the_vault_when_the_environment_has_none() {
+        let mock = Mock::start();
+        let ws = Ws::new(&custom_vendor(
+            "att-custom-vault",
+            &mock.base,
+            "vault_secret = \"att_vault_key\"",
+        ));
+        // Without the secret: refused.
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "att-custom-vault"])
+            .assert()
+            .code(1)
+            .stdout(contains("refused"));
+        // A secret that is not open to this host: refused, and the key is never sent.
+        ws.vault_secret(
+            "ATT_VAULT_KEY",
+            "vault-secret-1",
+            "api.elsewhere.example",
+            true,
+        );
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "att-custom-vault"])
+            .assert()
+            .code(1)
+            .stdout(contains("refused"));
+        assert!(mock.requests().is_empty());
+        // Open to the loopback host: read as `fl-exec` and sent.
+        ws.vault_secret("ATT_VAULT_KEY", "vault-secret-2", "127.0.0.1", true);
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "att-custom-vault"])
+            .assert()
+            .success()
+            .stdout(contains("completed"));
+        let seen = mock.requests();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1, "Bearer vault-secret-2");
+        let audit =
+            std::fs::read_to_string(ws.dir.path().join("data/fl/gate-audit.jsonl")).unwrap();
+        assert!(audit.contains("\"caller\":\"fl-exec\""), "{audit}");
+        assert!(
+            !audit.contains("vault-secret"),
+            "the audit log holds no key"
+        );
+    }
+
+    #[test]
+    fn a_built_in_api_vendor_takes_its_base_url_model_and_rate_card_from_config() {
+        let mock = Mock::start();
+        let ws = Ws::new(&format!(
+            "[vendors.kimi-api]\nbase_url = \"{}/v1\"\ndefault_model = \"kimi-override\"\n\
+             input_usd_micros_per_m = 1000000\noutput_usd_micros_per_m = 3000000\n",
+            mock.base
+        ));
+        ws.fl()
+            .env("MOONSHOT_API_KEY", "moon-key")
+            .args(["attempt", "1", "--adapter", "kimi-api"])
+            .assert()
+            .success()
+            .stdout(contains("completed"));
+        let seen = mock.requests();
+        assert_eq!(seen[0].1, "Bearer moon-key");
+        assert_eq!(seen[0].2["model"], "kimi-override");
+        let attempts = ws.attempts();
+        assert_eq!(attempts[0].adapter, "kimi-api");
+        // 1000 x $1/Mtok + 200 x $3/Mtok.
+        assert_eq!(attempts[0].cost_usd_micros, 1600);
+    }
+
+    #[test]
+    fn the_five_cli_names_still_win_and_an_unknown_name_lists_the_registered_ids() {
+        let mock = Mock::start();
+        let ws = Ws::new(&custom_vendor("att-custom-listed", &mock.base, ""));
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "telepathy"])
+            .assert()
+            .failure()
+            .stderr(
+                contains("telepathy")
+                    .and(contains("claude"))
+                    .and(contains("kimi-api"))
+                    .and(contains("att-custom-listed")),
+            );
+        // `claude` is still the CLI adapter: it spawns the named binary.
+        ws.fl()
+            .args([
+                "attempt",
+                "1",
+                "--adapter",
+                "claude",
+                "--binary",
+                "/nonexistent/claude-binary",
+            ])
+            .assert()
+            .code(1);
+        assert!(mock.requests().is_empty());
+        assert_eq!(ws.attempts()[0].adapter, "claude");
+    }
+
+    #[test]
+    fn a_bad_vendor_entry_refuses_every_command_naming_the_file_and_key() {
+        let ws = Ws::new("");
+        std::fs::write(
+            ws.dir.path().join("fl/config.toml"),
+            "[vendors.att-bad]\ntransport = \"http_api\"\n",
+        )
+        .unwrap();
+        ws.fl()
+            .args(["attempt", "1", "--adapter", "claude"])
+            .assert()
+            .failure()
+            .stderr(contains("config.toml").and(contains("[vendors.att-bad]")));
+    }
+}

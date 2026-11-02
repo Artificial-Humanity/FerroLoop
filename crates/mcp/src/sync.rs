@@ -276,8 +276,10 @@ impl fmt::Display for Plan {
 }
 
 /// Plans every vendor file under `root` against the catalog and this
-/// machine's switches. `records` is the directory of ownership records;
-/// `replace` names the refused entries to overwrite. Reads, never writes.
+/// machine's switches: the five built-in vendors' and every registered
+/// custom target's, which are written like the built-ins'. `records` is the
+/// directory of ownership records; `replace` names the refused entries to
+/// overwrite. Reads, never writes.
 pub fn plan(
     root: &Path,
     catalog: &Catalog,
@@ -285,11 +287,24 @@ pub fn plan(
     records: &Path,
     replace: &[String],
 ) -> Result<Plan, McpError> {
-    let (desired, skipped, warnings) = desired(root, catalog, switches);
+    plan_for(&vendor::all(), root, catalog, switches, records, replace)
+}
+
+/// [`plan`] for these vendors only.
+fn plan_for(
+    vendors: &[VendorName],
+    root: &Path,
+    catalog: &Catalog,
+    switches: &Switches,
+    records: &Path,
+    replace: &[String],
+) -> Result<Plan, McpError> {
+    shared_files(root, vendors)?;
+    let (desired, skipped, warnings) = desired(vendors, root, catalog, switches);
     let owner = canonical(root)?;
-    let targets: Vec<Target> = VendorName::ALL
-        .into_iter()
-        .map(|v| plan_target(root, &owner, v, &desired[&v], records, replace))
+    let targets: Vec<Target> = vendors
+        .iter()
+        .map(|&v| plan_target(root, &owner, v, &desired[&v], records, replace))
         .collect::<Result<_, _>>()?;
     unmatched_replaces(&targets, replace)?;
     Ok(Plan {
@@ -298,6 +313,41 @@ pub fn plan(
         skipped,
         warnings,
     })
+}
+
+/// Two of these vendors that write one file, as (first id, second id, the file).
+fn first_shared_file<'a>(files: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str, &'a str)> {
+    let mut seen: BTreeMap<String, (&str, &str)> = BTreeMap::new();
+    for &(id, file) in files {
+        let key = vendor::target_file_key(file);
+        if let Some(&(first, first_file)) = seen.get(&key) {
+            return Some((first, id, first_file));
+        }
+        seen.insert(key, (id, file));
+    }
+    None
+}
+
+/// Refuses two targets that write one file. They would share one canonical path and one ownership
+/// record (keyed by that path), each planned from the same bytes; the second write would replace
+/// the first's, and the records would overwrite each other. `target_file_key` folds case, `./`
+/// and repeated separators, so `./.MCP.json` is `.mcp.json`.
+fn shared_files(root: &Path, vendors: &[VendorName]) -> Result<(), McpError> {
+    let files: Vec<(&str, &str)> = vendors
+        .iter()
+        .map(|&v| (v.as_str(), vendor::vendor(v).target()))
+        .collect();
+    let Some((first, second, file)) = first_shared_file(&files) else {
+        return Ok(());
+    };
+    Err(McpError::VendorFile(vendor::FileRefusal {
+        path: root.join(file),
+        problem: format!("vendors `{first}` and `{second}` are both set to write this file"),
+        next: format!(
+            "Give `{second}` or `{first}` its own MCP file (a vendor's `mcp_config_rel_path`), \
+             then run `fl mcp sync` again"
+        ),
+    }))
 }
 
 /// MCP spec §4.3: a `--replace` name that overwrote an entry in no target
@@ -604,6 +654,7 @@ type Desired = BTreeMap<VendorName, BTreeMap<String, Rendered>>;
 /// warning for each machine switch naming a server the catalog does not
 /// have, which is ignored (MCP spec §2.2).
 fn desired(
+    vendors: &[VendorName],
     root: &Path,
     catalog: &Catalog,
     switches: &Switches,
@@ -619,7 +670,7 @@ fn desired(
             ));
         }
     }
-    let mut desired: Desired = VendorName::ALL.map(|v| (v, BTreeMap::new())).into();
+    let mut desired: Desired = vendors.iter().map(|&v| (v, BTreeMap::new())).collect();
     let mut skipped = Vec::new();
     for (name, server) in &catalog.servers {
         let on = if switches.disable.contains(name) {
@@ -632,7 +683,7 @@ fn desired(
         if !on {
             continue;
         }
-        for v in VendorName::ALL {
+        for &v in vendors {
             if !server.is_for(v) {
                 continue;
             }
@@ -701,7 +752,8 @@ fn value(vendor: VendorName, name: &str, bytes: &[u8]) -> Option<serde_json::Val
             let entry = doc.get("mcp_servers")?.get(name)?;
             serde_json::to_value(entry).ok()
         }
-        VendorName::Claude | VendorName::Antigravity | VendorName::Muse => {
+        // A custom target's entries are JSON, shaped like Claude Code's.
+        VendorName::Claude | VendorName::Antigravity | VendorName::Muse | VendorName::Custom(_) => {
             serde_json::from_slice(bytes).ok()
         }
     }
@@ -899,6 +951,18 @@ env.NOTES_TOKEN = { secret = true }
 
     fn catalog(text: &str) -> Catalog {
         Catalog::parse(text, Path::new(".fl/mcp.toml")).unwrap()
+    }
+
+    /// The five built-in vendors' plan. Shadows [`super::plan`], which also plans every target
+    /// registered in the process: other tests register some, so these would otherwise see them.
+    fn plan(
+        root: &Path,
+        catalog: &Catalog,
+        switches: &Switches,
+        records: &Path,
+        replace: &[String],
+    ) -> Result<Plan, McpError> {
+        plan_for(&VendorName::ALL, root, catalog, switches, records, replace)
     }
 
     fn off(names: &[&str]) -> Switches {
@@ -2059,5 +2123,350 @@ command = "local-mcp"
         drop(held);
         waiting.join().unwrap().unwrap();
         assert!(f.read(VendorName::Claude).is_some());
+    }
+
+    // MCP spec §4: a registered custom target is planned and written like the built-ins.
+
+    /// Registers a Claude-shaped target for this test, under an id no other test uses.
+    fn custom(id: &str, file: &str, expands: bool) -> VendorName {
+        let target = vendor::CustomTarget::new(id, "Sync Agent", file, "mcpServers", expands);
+        vendor::register_target(target.unwrap()).unwrap();
+        VendorName::parse(id).expect("registered")
+    }
+
+    impl Fixture {
+        /// The built-in vendors and `extra`.
+        fn plan_plus(&self, extra: VendorName, text: &str, replace: &[&str]) -> Plan {
+            let mut vendors = VendorName::ALL.to_vec();
+            vendors.push(extra);
+            let replace: Vec<String> = replace.iter().map(|n| n.to_string()).collect();
+            let catalog = catalog(text);
+            let (root, records) = (&self.root, &self.records);
+            plan_for(
+                &vendors,
+                root,
+                &catalog,
+                &Switches::default(),
+                records,
+                &replace,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn a_custom_target_gets_the_entries_and_a_second_sync_changes_nothing() {
+        let f = fixture();
+        let v = custom("sync-test-adds", ".sync-test/adds.json", true);
+        let plan = f.plan_plus(v, CATALOG, &[]);
+        assert_eq!(actions(&plan, v), each(Action::Add));
+        assert!(plan.to_string().contains(&format!(
+            "Sync Agent, {}:\n  add docs\n  add notes",
+            f.path(v).display()
+        )));
+        apply(&plan).unwrap();
+        assert_eq!(
+            f.entry(v, "notes"),
+            Some(rendered(v, CATALOG, "notes")),
+            "{:?}",
+            f.read(v)
+        );
+        assert!(f.read(v).unwrap().contains("${NOTES_TOKEN}"));
+        // Its ownership record is kept like a built-in's.
+        let record = f.record(v).unwrap();
+        let hash = |name| sha(&rendered(v, CATALOG, name));
+        assert_eq!(record["entries"]["docs"]["sha256"], hash("docs"));
+        assert_eq!(record["entries"]["notes"]["sha256"], hash("notes"));
+        let again = f.plan_plus(v, CATALOG, &[]);
+        assert_eq!(actions(&again, v), each(Action::Unchanged));
+        assert!(again.targets().iter().all(|t| !t.changes()));
+        assert_eq!(again.check(), Check::Matches);
+        // A change in the catalog is drift `check` reports, and sync writes it.
+        let upgraded = CATALOG.replace(PINNED, UPGRADED);
+        let drift = f.plan_plus(v, &upgraded, &[]);
+        assert_eq!(drift.check(), Check::Changes);
+        assert_eq!(
+            actions(&drift, v),
+            vec![
+                ("docs".to_string(), Action::Unchanged),
+                ("notes".to_string(), Action::Update)
+            ]
+        );
+        apply(&drift).unwrap();
+        assert!(f.read(v).unwrap().contains(UPGRADED));
+    }
+
+    #[test]
+    fn a_hand_edited_custom_entry_is_refused_not_overwritten_and_replace_overwrites_it() {
+        let f = fixture();
+        let v = custom("sync-test-edits", ".sync-test/edits.json", true);
+        apply(&f.plan_plus(v, CATALOG, &[])).unwrap();
+        f.edit(v, PINNED, "@example/notes-mcp@1.2.1");
+        let edited = f.entry(v, "notes");
+        let plan = f.plan_plus(v, CATALOG, &[]);
+        let notes = &actions(&plan, v)[1];
+        assert_eq!(notes.0, "notes");
+        let said = refusal(&notes.1);
+        assert!(
+            said.contains("was changed by hand since fl wrote it"),
+            "{said}"
+        );
+        assert!(said.contains(&f.path(v).display().to_string()), "{said}");
+        assert!(said.contains("`args` differs"), "{said}");
+        assert_eq!(plan.check(), Check::Refused);
+        assert!(matches!(apply(&plan), Err(McpError::Refused { .. })));
+        assert_eq!(f.entry(v, "notes"), edited);
+        // `--replace` shows the difference and overwrites.
+        let replace = f.plan_plus(v, CATALOG, &["notes"]);
+        assert!(matches!(actions(&replace, v)[1].1, Action::Replace { .. }));
+        apply(&replace).unwrap();
+        assert_eq!(f.entry(v, "notes"), Some(rendered(v, CATALOG, "notes")));
+    }
+
+    #[test]
+    fn a_foreign_entry_in_a_custom_file_is_kept_and_one_in_the_way_is_refused() {
+        let f = fixture();
+        let v = custom("sync-test-foreign", ".sync-test/foreign.json", true);
+        let theirs = "{\"theme\": \"dark\", \"mcpServers\": {\"theirs\": {\"command\": \"x\"}, \
+                      \"docs\": {\"command\": \"mine\"}}}\n";
+        f.write(v, theirs);
+        let plan = f.plan_plus(v, CATALOG, &[]);
+        let target = actions(&plan, v);
+        assert_eq!(target[0], ("theirs".to_string(), Action::Untouched));
+        let said = refusal(&target[1].1);
+        assert!(
+            said.contains("`docs` is an entry fl did not write"),
+            "{said}"
+        );
+        assert_eq!(plan.check(), Check::Refused);
+        assert!(apply(&plan).is_err());
+        assert_eq!(f.read(v).unwrap(), theirs);
+        // Without the clash, the foreign entry and the other keys survive a write.
+        let only_notes = CATALOG.replace("[server.docs]", "[server.docs]\nenabled = false");
+        apply(&f.plan_plus(v, &only_notes, &[])).unwrap();
+        let text = f.read(v).unwrap();
+        assert!(text.contains("\"theme\": \"dark\""), "{text}");
+        assert!(text.contains("\"command\": \"x\""), "{text}");
+        assert!(text.contains("\"command\": \"mine\""), "{text}");
+        assert!(text.contains("notes"), "{text}");
+    }
+
+    #[test]
+    fn a_secret_server_is_refused_for_a_target_that_does_not_expand_references_only() {
+        let f = fixture();
+        let v = custom("sync-test-norefs", ".sync-test/norefs.json", false);
+        let plan = f.plan_plus(v, CATALOG, &[]);
+        // Left out of this file, reported, and not a refusal: the others still get it.
+        assert_eq!(actions(&plan, v), vec![("docs".to_string(), Action::Add)]);
+        let skipped: Vec<_> = plan.skipped().iter().filter(|r| r.vendor == v).collect();
+        assert_eq!(skipped.len(), 1);
+        let said = skipped[0].to_string();
+        assert!(
+            said.starts_with("Sync Agent cannot run server `notes`"),
+            "{said}"
+        );
+        assert!(said.contains("`NOTES_TOKEN` is a secret"), "{said}");
+        assert!(
+            said.contains(&format!(
+                "It is left out of .sync-test/norefs.json; the other vendors still get it. To say \
+                 so in the catalog, give the server a `vendors` list without `{}`",
+                v.as_str()
+            )),
+            "{said}"
+        );
+        assert!(plan.to_string().contains(&said));
+        assert_eq!(plan.check(), Check::Changes);
+        apply(&plan).unwrap();
+        assert!(f.entry(v, "notes").is_none());
+        for b in VendorName::ALL {
+            assert!(f.entry(b, "notes").is_some(), "{b:?}");
+        }
+        assert!(!f.read(v).unwrap().contains("NOTES_TOKEN"));
+    }
+
+    #[test]
+    fn a_servers_vendors_list_may_name_a_custom_target() {
+        let f = fixture();
+        let v = custom("sync-test-listed", ".sync-test/listed.json", true);
+        let other = custom("sync-test-unlisted", ".sync-test/unlisted.json", true);
+        let text = format!(
+            "{CATALOG}\n[server.only]\ntransport = \"http\"\nurl = \"https://only.example.com/mcp\"\n\
+             vendors = [\"claude\", \"{}\"]\n",
+            v.as_str()
+        );
+        let mut vendors = VendorName::ALL.to_vec();
+        vendors.extend([v, other]);
+        let catalog = catalog(&text);
+        let (root, records) = (&f.root, &f.records);
+        let plan = plan_for(&vendors, root, &catalog, &Switches::default(), records, &[]).unwrap();
+        let names = |v| {
+            actions(&plan, v)
+                .into_iter()
+                .map(|a| a.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(v), ["docs", "notes", "only"]);
+        assert_eq!(names(other), ["docs", "notes"]);
+        assert_eq!(names(VendorName::Claude), ["docs", "notes", "only"]);
+        assert_eq!(names(VendorName::Codex), ["docs", "notes"]);
+    }
+
+    #[test]
+    fn two_targets_that_write_one_file_are_refused_before_anything_is_planned() {
+        // Every spelling of one file, and the vendor pairs that share it.
+        let key = vendor::target_file_key;
+        assert_eq!(key("./.MCP.json"), ".mcp.json");
+        assert_eq!(
+            key(".agents/mcp_config.json"),
+            key(".AGENTS\\.\\MCP_config.JSON")
+        );
+        assert_eq!(key("a/./b//c.json"), "a/b/c.json");
+        assert_ne!(key("a/b.json"), key("a/c.json"));
+        assert_eq!(
+            first_shared_file(&[("a", ".x/y.json"), ("b", "z.json"), ("c", "./.X/Y.JSON")]),
+            Some(("a", "c", ".x/y.json"))
+        );
+        assert_eq!(first_shared_file(&[("a", "x.json"), ("b", "y.json")]), None);
+
+        // A custom target on a built-in's file, spelled differently.
+        let f = fixture();
+        let clash = custom("sync-test-clash-claude", "./.MCP.json", false);
+        let (root, records) = (&f.root, &f.records);
+        let err = plan_for(
+            &[VendorName::Claude, clash],
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        )
+        .unwrap_err();
+        let McpError::VendorFile(refusal) = &err else {
+            panic!("not a file refusal: {err}")
+        };
+        assert!(
+            refusal.problem.contains("`claude`")
+                && refusal.problem.contains("`sync-test-clash-claude`"),
+            "{refusal:?}"
+        );
+        // Two custom targets on one file.
+        let first = custom("sync-test-clash-a", ".sync-test/clash.json", true);
+        let second = custom("sync-test-clash-b", ".sync-test/./CLASH.json", false);
+        let err = plan_for(
+            &[first, second],
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        )
+        .unwrap_err();
+        let McpError::VendorFile(refusal) = &err else {
+            panic!("not a file refusal: {err}")
+        };
+        assert!(
+            refusal.problem.contains("`sync-test-clash-a`")
+                && refusal.problem.contains("`sync-test-clash-b`"),
+            "{refusal:?}"
+        );
+        // The same vendor named twice is the same file twice.
+        assert!(
+            plan_for(
+                &[VendorName::Claude, VendorName::Claude],
+                root,
+                &catalog(CATALOG),
+                &Switches::default(),
+                records,
+                &[],
+            )
+            .is_err()
+        );
+        // Nothing was read, written or recorded.
+        assert!(!f.records.exists());
+        assert!(!root.join(".mcp.json").exists());
+        assert!(!root.join(".sync-test").exists());
+    }
+
+    #[test]
+    fn a_custom_file_that_is_not_strict_json_is_refused_and_left_alone() {
+        let f = fixture();
+        let v = custom("sync-test-strict", ".sync-test/strict.json", true);
+        let mine = "{ // mine\n}\n";
+        f.write(v, mine);
+        let mut vendors = VendorName::ALL.to_vec();
+        vendors.push(v);
+        let (root, records) = (&f.root, &f.records);
+        let err = plan_for(
+            &vendors,
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        );
+        let McpError::VendorFile(refusal) = err.unwrap_err() else {
+            panic!("not a file refusal")
+        };
+        assert_eq!(refusal.path, f.path(v));
+        assert_eq!(f.read(v).unwrap(), mine);
+        assert_eq!(f.read(VendorName::Claude), None);
+    }
+
+    #[test]
+    fn a_custom_file_changed_between_the_plan_and_the_write_is_not_written() {
+        let f = fixture();
+        let v = custom("sync-test-race", ".sync-test/race.json", true);
+        let plan = f.plan_plus(v, CATALOG, &[]);
+        let theirs = "{\"mcpServers\": {\"theirs\": {\"command\": \"x\"}}}\n";
+        f.write(v, theirs);
+        match apply(&plan) {
+            Err(McpError::Changed { path }) => assert_eq!(path, f.path(v)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.read(v).unwrap(), theirs);
+        assert_eq!(f.read(VendorName::Claude), None);
+    }
+
+    #[test]
+    fn a_custom_file_behind_a_link_is_refused_and_nothing_is_written() {
+        let f = fixture();
+        let v = custom("sync-test-link", ".sync-test-link/cfg.json", true);
+        let outside = f.dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, f.root.join(".sync-test-link")).unwrap();
+        let mut vendors = VendorName::ALL.to_vec();
+        vendors.push(v);
+        let (root, records) = (&f.root, &f.records);
+        let err = plan_for(
+            &vendors,
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        );
+        let said = err.unwrap_err().to_string();
+        assert!(said.contains("is a symbolic link"), "{said}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(f.read(VendorName::Claude), None);
+    }
+
+    #[test]
+    fn plan_writes_every_registered_target_and_a_built_in_alone_is_unchanged() {
+        let f = fixture();
+        let v = custom("sync-test-global", ".sync-test/global.json", true);
+        // The public `plan` plans what is registered, built-ins first.
+        let plan = super::plan(
+            &f.root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            &f.records,
+            &[],
+        )
+        .unwrap();
+        let ids: Vec<_> = plan.targets().iter().map(|t| t.vendor).collect();
+        assert_eq!(ids[..5], VendorName::ALL);
+        assert!(ids[5..].contains(&v));
+        assert!(ids[5..].iter().all(|v| matches!(v, VendorName::Custom(_))));
     }
 }

@@ -7,6 +7,7 @@ mod refs;
 #[cfg(test)]
 mod testing;
 mod tiers;
+mod vendor_keys;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -1303,7 +1304,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Record(c) => cmd::record::run(&ctx, c),
         Command::Check(c) => cmd::check::run(&ctx, c),
         Command::Finding(c) => cmd::finding::run(&ctx, c),
-        Command::Attempt(c) => cmd::attempt::run(&ctx, &cfg.adapters, c),
+        Command::Attempt(c) => cmd::attempt::run(&ctx, &cfg.adapters, &cfg.vendors, c),
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => {
@@ -1360,7 +1361,7 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
             let ws_store = separate_ws_store.as_ref().unwrap_or(&store);
-            cmd::flow::run(&ctx, &cfg.adapters, ws_store, &cwd, c)
+            cmd::flow::run(&ctx, &cfg.adapters, &cfg.vendors, ws_store, &cwd, c)
         }
         Command::Mcp(_)
         | Command::Agent { .. }
