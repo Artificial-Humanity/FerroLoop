@@ -888,8 +888,10 @@ env.NOTES_TOKEN = { secret = true }
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("app");
             fs::create_dir_all(root.join(".fl")).unwrap();
-            let ignored = "/.mcp.json\n/.codex/config.toml\n/.agents/mcp_config.json\n\
-                           /.muse/settings.json\n/.grok/config.toml\n/.vsdk2-test/\n";
+            // Everything is ignored: the vendor registry is process-global, so another test in this
+            // binary may have registered a vendor whose file this project would also write. The
+            // guard itself is tested with a `.gitignore` of its own.
+            let ignored = "*\n";
             fs::write(root.join(".gitignore"), ignored).unwrap();
             fs::write(root.join(".fl/mcp.toml"), catalog).unwrap();
             let git = Command::new("git")
@@ -1100,12 +1102,7 @@ env.NOTES_TOKEN = { secret = true }
         let project = Project::new(CATALOG);
         // Everything else ignored; this vendor's directory is not.
         let ignore = project.root().join(".gitignore");
-        let kept: String = (fs::read_to_string(&ignore).unwrap())
-            .lines()
-            .filter(|l| !l.contains(DIR))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        fs::write(&ignore, kept).unwrap();
+        fs::write(&ignore, format!("/*\n!/{DIR}/\n")).unwrap();
         let err = project.plan(&[]).unwrap_err().to_string();
         assert!(
             err.contains(&format!("{file} is not ignored by git")),
