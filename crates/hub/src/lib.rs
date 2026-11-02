@@ -19,6 +19,7 @@ pub mod runtime_matrix;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
+mod warrants;
 pub mod ws;
 
 use std::collections::{BTreeMap, HashMap};

@@ -98,6 +98,12 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::vault::VaultCmd,
     },
+    /// Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`,
+    /// `list`, `revoke`).
+    Auth {
+        #[command(subcommand)]
+        cmd: cmd::auth::AuthCmd,
+    },
 }
 
 impl Command {
@@ -124,7 +130,8 @@ impl Command {
             | Command::Arch { .. }
             | Command::Hub { .. }
             | Command::Store { .. }
-            | Command::Vault { .. } => Vec::new(),
+            | Command::Vault { .. }
+            | Command::Auth { .. } => Vec::new(),
         }
     }
 
@@ -163,7 +170,8 @@ impl Command {
             | Command::Arch { .. }
             | Command::Hub { .. }
             | Command::Store { .. }
-            | Command::Vault { .. } => false,
+            | Command::Vault { .. }
+            | Command::Auth { .. } => false,
         }
     }
 
@@ -196,7 +204,8 @@ impl Command {
             | Command::Arch { .. }
             | Command::Hub { .. }
             | Command::Store { .. }
-            | Command::Vault { .. } => false,
+            | Command::Vault { .. }
+            | Command::Auth { .. } => false,
         }
     }
 }
@@ -946,6 +955,18 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
         }
+        Cli {
+            db: _,
+            command: Command::Auth { cmd },
+        } => {
+            return match cmd::auth::run(cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
         cli => cli,
     };
     let entries = &cfg.projects;
@@ -1311,7 +1332,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Arch { .. }
         | Command::Hub { .. }
         | Command::Store { .. }
-        | Command::Vault { .. } => {
+        | Command::Vault { .. }
+        | Command::Auth { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

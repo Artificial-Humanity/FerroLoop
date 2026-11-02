@@ -164,6 +164,21 @@ impl Vault {
 
     /// Encrypt and persist a secret in `vault.enc` with AEAD AAD policy binding.
     pub fn set(&mut self, args: SetSecretArgs) -> Result<VaultSecretMetadata, GateError> {
+        self.set_inner(args, false).map(|(metadata, _)| metadata)
+    }
+
+    /// Like [`Vault::set`], but only when the name is absent from the disk copy, decided under
+    /// the vault lock. Returns whether it inserted; an existing secret is never overwritten.
+    /// Either way this handle is refreshed from disk.
+    pub(crate) fn set_if_absent(&mut self, args: SetSecretArgs) -> Result<bool, GateError> {
+        self.set_inner(args, true).map(|(_, inserted)| inserted)
+    }
+
+    fn set_inner(
+        &mut self,
+        args: SetSecretArgs,
+        only_if_absent: bool,
+    ) -> Result<(VaultSecretMetadata, bool), GateError> {
         let name = normalize_secret_name(&args.name)?;
         if args.value.is_empty() {
             return Err(GateError::InvalidSecret {
@@ -200,6 +215,11 @@ impl Vault {
         // secret is applied to it: a stale in-memory map is never written back over it.
         let _lock = VaultLock::acquire(&self.path)?;
         let mut next = read_vault_file(&self.path)?;
+        if only_if_absent && let Some(existing) = next.secrets.get(&name) {
+            let metadata = existing.metadata.clone();
+            self.file = next;
+            return Ok((metadata, false));
+        }
 
         let now_ms = now_unix_millis();
         let now_str = At::from_unix_millis(now_ms).to_string();
@@ -259,7 +279,7 @@ impl Vault {
         next.secrets.insert(name, record);
         self.write_file(&next)?;
         self.file = next;
-        Ok(metadata)
+        Ok((metadata, true))
     }
 
     /// Remove a secret from `vault.enc` and persist.
@@ -503,7 +523,7 @@ fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
 
 /// The lock file beside the vault. Not `vault.enc` itself: that file is replaced by a rename on
 /// every save, so a lock on its inode would not exclude the next writer.
-const LOCK_FILE_NAME: &str = ".vault.lock";
+pub(crate) const LOCK_FILE_NAME: &str = ".vault.lock";
 
 /// Lock directories held by this process. `flock` locks belong to an open file description, so
 /// two threads that each open the lock file would conflict anyway; this set makes the wait
@@ -587,14 +607,14 @@ mod flock {
 /// this process. Waiting is unbounded; the lock is held for one small read and one rename.
 ///
 /// Field order matters: `file` drops (and unlocks) before `slot` frees the in-process entry.
-struct VaultLock {
+pub(crate) struct VaultLock {
     #[cfg_attr(not(unix), allow(dead_code))]
     file: fs::File,
     _slot: ProcessSlot,
 }
 
 impl VaultLock {
-    fn acquire(vault_path: &Path) -> Result<Self, GateError> {
+    pub(crate) fn acquire(vault_path: &Path) -> Result<Self, GateError> {
         let parent = match vault_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
@@ -988,7 +1008,7 @@ pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateErr
     })
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -1016,6 +1036,26 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp."))
             .collect()
+    }
+
+    #[test]
+    fn set_if_absent_inserts_once_and_never_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        // Two handles opened before either writes: the second one's view is stale.
+        let mut first = Vault::open(&path, [3u8; 32]).unwrap();
+        let mut second = Vault::open(&path, [3u8; 32]).unwrap();
+        assert!(first.set_if_absent(args("ONCE", "first-value")).unwrap());
+        assert!(!second.set_if_absent(args("ONCE", "second-value")).unwrap());
+
+        let reopened = Vault::open(&path, [3u8; 32]).unwrap();
+        assert_eq!(reopened.decrypt_raw("ONCE").unwrap().1, "first-value");
+        // The refused handle was refreshed from disk.
+        assert_eq!(second.decrypt_raw("ONCE").unwrap().1, "first-value");
+        // Plain `set` still overwrites.
+        first.set(args("ONCE", "third-value")).unwrap();
+        let reopened = Vault::open(&path, [3u8; 32]).unwrap();
+        assert_eq!(reopened.decrypt_raw("ONCE").unwrap().1, "third-value");
     }
 
     #[test]
