@@ -4797,6 +4797,10 @@ mod tests {
             r#"{"model":"sonnet"}"#,
         )
         .unwrap();
+        // settings.json wins only when strictly newer than the transcript. Pin both times so
+        // the result does not depend on which filesystem tick each write landed in.
+        set_mtime_secs(&project.join(format!("{session_id}.jsonl")), 2_000_000_000);
+        set_mtime_secs(&home.join(".claude").join("settings.json"), 1_900_000_000);
         let stub = spawn_agy_stub_with_steps(
             AGY_CONFIG_FIXTURE,
             AGY_TRAJECTORY_FIXTURE,
