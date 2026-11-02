@@ -24,8 +24,8 @@ use fl_core::ferrostate::{
     resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
 };
 use fl_core::ferrowire::{
-    DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
-    validate_sender_name,
+    DeliveryReceipt, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId,
+    WireAddress, WireFilter, validate_sender_name,
 };
 use fl_core::ids::{GateId, Kind, MessageId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
@@ -64,6 +64,7 @@ use fl_wire::dispatcher::{
     MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
     dispatch_to_route,
 };
+use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1658,18 +1659,47 @@ fn handle_post_wire_send(
     };
     drop(store);
 
-    let routes = crate::discovery::scan_route_table(state.config.home_override.as_deref());
+    // The saved route table first, as fl-wire's dispatcher does: the host is scanned only when a
+    // recipient still to deliver has no route there, or a saved route refuses the push. At most
+    // one scan per send, and it is saved so the next send finds the route without one.
+    let home = state.config.home_override.as_deref();
+    let saved = RouteTable::load(crate::discovery::route_table_path(home).as_deref());
+    let mut routes = saved.clone();
+    let mut scanned = false;
+    let deliverable = |rcpt: &DeliveryReceipt| {
+        !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+            && rcpt.attempts < MAX_DELIVER
+    };
+    let missing_route = receipts.iter().any(|rcpt| {
+        deliverable(rcpt)
+            && normalize_persona(&rcpt.recipient_name).is_some()
+            && routes.get(&rcpt.recipient_name).is_none()
+    });
+    if missing_route {
+        crate::discovery::discover_routes_into(&mut routes, home);
+        scanned = true;
+    }
     let mut any_updated = false;
     for rcpt in &receipts {
-        if matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
-            || rcpt.attempts >= MAX_DELIVER
-        {
+        if !deliverable(rcpt) {
             continue;
         }
         let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
-        let target_status = match dispatch_to_route(&entry.route, &msg) {
+        let mut pushed = dispatch_to_route(&entry.route, &msg);
+        if pushed.is_err() && !scanned {
+            // The session may have restarted since its route was saved: scan once, and push
+            // again only when its route changed.
+            crate::discovery::discover_routes_into(&mut routes, home);
+            scanned = true;
+            if let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
+                && fresh.route != entry.route
+            {
+                pushed = dispatch_to_route(&fresh.route, &msg);
+            }
+        }
+        let target_status = match pushed {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
@@ -1688,6 +1718,9 @@ fn handle_post_wire_send(
         {
             any_updated = true;
         }
+    }
+    if scanned {
+        crate::discovery::save_route_scan(home, &saved, &routes);
     }
     if any_updated
         && let Ok(store) = state.open_store()
@@ -4285,12 +4318,31 @@ fn vendor_route_for_session(
         persona,
         fallback_session_id,
     )
-    .ok_or_else(|| {
-        format!(
-            "no active vendor route for `{}`",
-            persona.unwrap_or(fallback_session_id)
-        )
-    })
+    .ok_or_else(|| no_route_error(persona, fallback_session_id))
+}
+
+fn no_route_error(persona: Option<&str>, fallback_session_id: &str) -> String {
+    format!(
+        "no active vendor route for `{}`",
+        persona.unwrap_or(fallback_session_id)
+    )
+}
+
+/// Run `send` on the session's route, rescanning and retrying once when a saved route refuses
+/// (see [`crate::lifecycle::dispatch_with_rediscovery`]). The outer `Err` is the no-route error.
+fn dispatch_to_session_route<T>(
+    state: &HubState,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+    send: impl FnMut(&fl_wire::identity::VendorRoute) -> Result<T, String>,
+) -> Result<Result<T, String>, String> {
+    crate::lifecycle::dispatch_with_rediscovery(
+        state.config.home_override.as_deref(),
+        persona,
+        fallback_session_id,
+        send,
+    )
+    .ok_or_else(|| no_route_error(persona, fallback_session_id))
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -4300,8 +4352,9 @@ fn dispatch_operator_prompt_for_session(
     sender_name: &str,
     effective_body: &str,
 ) -> Result<(), String> {
-    let route = vendor_route_for_session(state, persona, fallback_session_id)?;
-    dispatch_operator_prompt_to_route(&route, sender_name, effective_body)
+    dispatch_to_session_route(state, persona, fallback_session_id, |route| {
+        dispatch_operator_prompt_to_route(route, sender_name, effective_body)
+    })?
 }
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
@@ -4857,13 +4910,15 @@ fn reset_session(
         None
     };
 
-    let route = vendor_route_for_session(state, persona, canonical_id).map_err(|e| (404, e))?;
     let reset_mode = if mode == "reforge" {
         SessionResetMode::Reforge
     } else {
         SessionResetMode::Clear
     };
-    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
+    let reset = dispatch_to_session_route(state, persona, canonical_id, |route| {
+        clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref())
+    })
+    .map_err(|e| (404, e))?;
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();
     reset.map_err(|e| (502, e))?;
@@ -4914,22 +4969,23 @@ fn handle_post_session_interrupt(
         Err(resp) => return resp,
     };
     let (canonical_id, persona) = resolve_session_target(state, session_id);
-    let route = match vendor_route_for_session(state, persona.as_deref(), &canonical_id) {
-        Ok(route) => route,
-        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
-    };
     // Claude and Codex routes carry no tmux target; a hosted session's record names its pane.
     // A Claude session the hub does not host falls back to the live pane its key file names.
-    let hosted_tmux = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
-        .and_then(|record| record.tmux_target)
-        .or_else(|| fl_wire::dispatcher::claude_route_live_pane(&route));
-    let method = match session_actions::interrupt_route(
-        &lifecycle_env(state),
-        &route,
-        hosted_tmux.as_deref(),
-    ) {
-        Ok(method) => method,
-        Err(e) => return HttpResponse::json(502, json!({ "error": e })),
+    let hosted_pane = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
+        .and_then(|record| record.tmux_target);
+    let env = lifecycle_env(state);
+    let interrupted =
+        dispatch_to_session_route(state, persona.as_deref(), &canonical_id, |route| {
+            let pane = hosted_pane
+                .clone()
+                .or_else(|| fl_wire::dispatcher::claude_route_live_pane(route));
+            session_actions::interrupt_route(&env, route, pane.as_deref())
+                .map(|method| (method, route_vendor(route)))
+        });
+    let (method, vendor) = match interrupted {
+        Ok(Ok(done)) => done,
+        Ok(Err(e)) => return HttpResponse::json(502, json!({ "error": e })),
+        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
     };
     // Whatever prompt was in flight is no longer running, so the session stops reading as busy.
     // Queued prompts stay queued and drain as usual once the session is idle.
@@ -4937,7 +4993,6 @@ fn handle_post_session_interrupt(
     if session_id != canonical_id {
         state.clear_session_in_flight(session_id);
     }
-    let vendor = route_vendor(&route);
     let data = json!({
         "session_id": canonical_id,
         "interrupted": true,

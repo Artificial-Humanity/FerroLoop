@@ -149,7 +149,7 @@ pub(crate) mod cost_counters {
     use std::thread::LocalKey;
 
     thread_local! {
-        /// Host route scans ([`super::scan_route_table`]): one `RouteTable::discover_routes` each.
+        /// Host route scans ([`super::discover_routes_into`]): one `RouteTable::discover_routes` each.
         pub(crate) static ROUTE_SCANS: Cell<u64> = const { Cell::new(0) };
         /// Transcript files read in full ([`super::read_transcript`]).
         pub(crate) static TRANSCRIPT_READS: Cell<u64> = const { Cell::new(0) };
@@ -213,10 +213,8 @@ pub(crate) fn route_table_path(home_override: Option<&Path>) -> Option<PathBuf> 
 /// costly step (every vendor directory, transcript heads and `/proc`), so callers that only read
 /// go through [`discovered_route_table`].
 pub(crate) fn scan_route_table(home_override: Option<&Path>) -> RouteTable {
-    #[cfg(test)]
-    cost_counters::bump(&cost_counters::ROUTE_SCANS);
     let mut routes = RouteTable::load(route_table_path(home_override).as_deref());
-    routes.discover_routes(home_override, stamp::now());
+    discover_routes_into(&mut routes, home_override);
     routes
 }
 
@@ -362,6 +360,49 @@ pub(crate) fn invalidate_route_discovery_cache() {
     #[cfg(test)]
     cost_counters::bump(&cost_counters::ROUTE_CACHE_INVALIDATIONS);
     ROUTE_DISCOVERY_CACHE.invalidate();
+}
+
+/// Scan the host like [`scan_route_table`] and save what the scan learned to the route table
+/// file, so the next lookup finds it without a scan. Returns the scanned table.
+///
+/// The file is shared with the live `fl wire daemon`, which saves its whole table by writing a
+/// private temp file and renaming it over the target ([`RouteTable::save`]); the CLI fallback
+/// does load, change, save. The hub writes the same way and merges as the daemon merges a
+/// dispatch's scan into its live table ([`RouteTable::merge_dispatch_result`]): it reads the file
+/// again just before saving, so a route the daemon registered during the scan is kept, and a
+/// route is dropped only when the scan pruned it and nobody changed it meanwhile. Like the
+/// daemon, it writes only when the scan changed a route.
+pub(crate) fn scan_and_save_route_table(home_override: Option<&Path>) -> RouteTable {
+    let saved = RouteTable::load(route_table_path(home_override).as_deref());
+    let mut scanned = saved.clone();
+    discover_routes_into(&mut scanned, home_override);
+    save_route_scan(home_override, &saved, &scanned);
+    scanned
+}
+
+/// Scan the host's vendor session files into `routes` (one [`RouteTable::discover_routes`]).
+pub(crate) fn discover_routes_into(routes: &mut RouteTable, home_override: Option<&Path>) {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::ROUTE_SCANS);
+    routes.discover_routes(home_override, stamp::now());
+}
+
+/// Save the routes `scanned` learned over `base` (the table the scan started from) to the route
+/// table file. See [`scan_and_save_route_table`] for how this shares the file with the daemon.
+pub(crate) fn save_route_scan(
+    home_override: Option<&Path>,
+    base: &RouteTable,
+    scanned: &RouteTable,
+) {
+    if scanned.same_routes(base) {
+        return;
+    }
+    let path = route_table_path(home_override);
+    let mut live = RouteTable::load(path.as_deref());
+    live.merge_dispatch_result(base, scanned.clone());
+    let _ = live.save(path.as_deref());
+    // The hub wrote the route table: the shared scan must not hide it.
+    invalidate_route_discovery_cache();
 }
 
 /// Read agent names and attempt rows. Does not walk the filesystem.

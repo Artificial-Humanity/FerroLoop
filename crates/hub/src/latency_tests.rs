@@ -451,3 +451,301 @@ fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
     let (queued, _) = post_prompt(&state, false);
     assert_eq!(queued.json_value().unwrap()["status"], "queued");
 }
+
+// ---- item 3: lazy route lookup ----
+
+mod route_lookup {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    use tempfile::TempDir;
+
+    use crate::discovery::cost_counters::measure;
+    use crate::discovery::route_table_path;
+    use crate::lifecycle::{RouteLookup, dispatch_with_rediscovery, lookup_route};
+
+    fn routes_file(home: &Path) -> PathBuf {
+        route_table_path(Some(home)).unwrap()
+    }
+
+    fn save_route(home: &Path, persona: &str, route: VendorRoute) {
+        let path = routes_file(home);
+        let mut routes = RouteTable::load(Some(&path));
+        routes.upsert(persona, route, At::from_unix_millis(1));
+        routes.save(Some(&path)).unwrap();
+    }
+
+    fn webhook(home: &Path, name: &str, live: bool) -> VendorRoute {
+        let socket_path = home.join(name);
+        if live {
+            std::fs::write(&socket_path, b"").unwrap();
+        }
+        VendorRoute::Webhook { socket_path }
+    }
+
+    fn agy(conversation_id: &str) -> VendorRoute {
+        VendorRoute::Agy {
+            conversation_id: conversation_id.into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        }
+    }
+
+    #[test]
+    fn a_live_saved_route_is_used_without_a_scan() {
+        let home = TempDir::new().unwrap();
+        let route = webhook(home.path(), "ada.sock", true);
+        save_route(home.path(), "ada", route.clone());
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), Some("ada"), "ada"));
+        assert_eq!(found, Some(RouteLookup::Saved(route.clone())));
+        assert_eq!(costs.route_scans, 0);
+        // By session id too, when the persona has no entry.
+        let (by_id, costs) = measure(|| lookup_route(Some(home.path()), None, "conv-x"));
+        assert_eq!(by_id, None, "no route matches: scanned");
+        assert_eq!(costs.route_scans, 1);
+    }
+
+    fn conversation(found: &Option<RouteLookup>) -> Option<(bool, String)> {
+        match found {
+            Some(RouteLookup::Saved(VendorRoute::Agy {
+                conversation_id, ..
+            })) => Some((false, conversation_id.clone())),
+            Some(RouteLookup::Scanned(VendorRoute::Agy {
+                conversation_id, ..
+            })) => Some((true, conversation_id.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_miss_scans_once_and_saves_so_the_next_lookup_needs_no_scan() {
+        let home = TempDir::new().unwrap();
+        super::write_ferris_transcript(home.path(), 2);
+        let (first, cold) = measure(|| lookup_route(Some(home.path()), Some("ferris"), "ferris"));
+        assert_eq!(conversation(&first), Some((true, "conv-ferris-1".into())));
+        assert_eq!(cold.route_scans, 1);
+        let saved = RouteTable::load(Some(&routes_file(home.path())));
+        assert!(saved.get("ferris").is_some(), "the scan was saved");
+        let (second, warm) = measure(|| lookup_route(Some(home.path()), Some("ferris"), "ferris"));
+        assert_eq!(conversation(&second), Some((false, "conv-ferris-1".into())));
+        assert_eq!(warm.route_scans, 0);
+    }
+
+    #[test]
+    fn a_dead_saved_route_is_rescanned() {
+        let home = TempDir::new().unwrap();
+        let dead = webhook(home.path(), "gone.sock", false);
+        save_route(home.path(), "ada", dead.clone());
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), Some("ada"), "ada"));
+        // Discovery keeps a webhook route, so the scan finds the same one.
+        assert_eq!(found, Some(RouteLookup::Scanned(dead)));
+        assert_eq!(costs.route_scans, 1);
+    }
+
+    fn claude_session_id(route: &VendorRoute) -> &str {
+        match route {
+            VendorRoute::Claude { session_id, .. } => session_id,
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn a_saved_route_that_refuses_is_rescanned_and_retried_once_on_the_new_route() {
+        let home = TempDir::new().unwrap();
+        // The session restarted: the host now runs `new-sid`, the saved route names `old-sid`.
+        let sessions = home.path().join(".claude").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("4242.json"),
+            serde_json::json!({
+                "name": "ada",
+                "sessionId": "new-sid",
+                "messagingSocketPath": home.path().join("new.sock"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        save_route(
+            home.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 7,
+                session_id: "old-sid".into(),
+                socket_path: home.path().join("old.sock"),
+                key_path: None,
+            },
+        );
+        let tried = RefCell::new(Vec::new());
+        let (outcome, costs) = measure(|| {
+            dispatch_with_rediscovery(Some(home.path()), Some("ada"), "ada", |route| {
+                let sid = claude_session_id(route).to_string();
+                tried.borrow_mut().push(sid.clone());
+                if sid == "old-sid" {
+                    Err("stale".to_string())
+                } else {
+                    Ok("delivered")
+                }
+            })
+        });
+        assert_eq!(outcome, Some(Ok("delivered")));
+        assert_eq!(
+            *tried.borrow(),
+            vec!["old-sid".to_string(), "new-sid".to_string()]
+        );
+        assert_eq!(costs.route_scans, 1);
+        let saved = RouteTable::load(Some(&routes_file(home.path())));
+        assert_eq!(
+            saved.get("ada").map(|e| claude_session_id(&e.route)),
+            Some("new-sid")
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_retried_at_most_once_and_never_on_the_same_route() {
+        let home = TempDir::new().unwrap();
+        let route = webhook(home.path(), "ada.sock", true);
+        save_route(home.path(), "ada", route.clone());
+        let sends = RefCell::new(0);
+        let (outcome, costs) = measure(|| {
+            dispatch_with_rediscovery(Some(home.path()), Some("ada"), "ada", |_| {
+                *sends.borrow_mut() += 1;
+                Err::<(), _>("refused".to_string())
+            })
+        });
+        assert_eq!(outcome, Some(Err("refused".to_string())));
+        assert_eq!(
+            *sends.borrow(),
+            1,
+            "the scan found the same route: no second push"
+        );
+        assert_eq!(costs.route_scans, 1);
+
+        // A route that a scan just found is not rescanned when it refuses.
+        let fresh = TempDir::new().unwrap();
+        super::write_ferris_transcript(fresh.path(), 2);
+        let sends = RefCell::new(0);
+        let (_, costs) = measure(|| {
+            dispatch_with_rediscovery(Some(fresh.path()), Some("ferris"), "ferris", |_| {
+                *sends.borrow_mut() += 1;
+                Err::<(), _>("refused".to_string())
+            })
+        });
+        assert_eq!((*sends.borrow(), costs.route_scans), (1, 1));
+    }
+
+    #[test]
+    fn saving_a_scan_keeps_a_route_registered_while_it_ran() {
+        let home = TempDir::new().unwrap();
+        let path = routes_file(home.path());
+        save_route(home.path(), "old", webhook(home.path(), "old.sock", true));
+        let base = RouteTable::load(Some(&path));
+        let mut scanned = base.clone();
+        scanned.upsert("found", agy("conv-found"), At::from_unix_millis(5));
+        // The daemon registers a route after the scan started.
+        save_route(
+            home.path(),
+            "registered",
+            webhook(home.path(), "reg.sock", true),
+        );
+        crate::discovery::save_route_scan(Some(home.path()), &base, &scanned);
+        let saved = RouteTable::load(Some(&path));
+        for persona in ["old", "found", "registered"] {
+            assert!(saved.get(persona).is_some(), "{persona} kept");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp files left");
+    }
+}
+
+mod wire_send {
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
+
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{OWNER, hub_with_ferris};
+    use crate::discovery::cost_counters::{Costs, measure};
+    use crate::discovery::route_table_path;
+    use crate::{HttpRequest, HubState, handle_http_request};
+
+    fn save_webhook(state: &HubState, persona: &str, socket: &std::path::Path) {
+        let path = route_table_path(state.config.home_override.as_deref()).unwrap();
+        let mut routes = RouteTable::load(Some(&path));
+        routes.upsert(
+            persona,
+            VendorRoute::Webhook {
+                socket_path: socket.to_path_buf(),
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+    }
+
+    fn send(state: &HubState, to: &str) -> (Value, Costs) {
+        let (resp, costs) = measure(|| {
+            handle_http_request(
+                state,
+                &HttpRequest::new("POST", "/api/v1/wire/send")
+                    .with_header("Authorization", OWNER)
+                    .with_json_body(&json!({ "to": to, "subject": "s", "body": "b" })),
+            )
+        });
+        assert_eq!(resp.status, 200);
+        (resp.json_value().unwrap(), costs)
+    }
+
+    #[test]
+    fn a_saved_route_delivers_without_a_scan() {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 1);
+        let socket = tmp.path().join("ada.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .read_line(&mut line)
+                .unwrap();
+            line
+        });
+        save_webhook(&state, "ada", &socket);
+        let (body, costs) = send(&state, "ada");
+        assert!(reader.join().unwrap().contains("\"b\""));
+        assert_eq!(body["receipts"][0]["status"], "acked");
+        assert_eq!(costs.route_scans, 0);
+    }
+
+    #[test]
+    fn a_recipient_with_no_saved_route_scans_once() {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 1);
+        let (body, costs) = send(&state, "nobody");
+        assert_eq!(body["receipts"][0]["status"], "pending");
+        assert_eq!(costs.route_scans, 1);
+    }
+
+    #[test]
+    fn a_saved_route_that_refuses_scans_once_and_stays_pending() {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 1);
+        save_webhook(&state, "ada", &tmp.path().join("gone.sock"));
+        let (body, costs) = send(&state, "ada");
+        assert_eq!(body["receipts"][0]["status"], "pending");
+        assert_eq!(body["receipts"][0]["attempts"], 1);
+        assert_eq!(
+            costs.route_scans, 1,
+            "one rescan, no retry on the same route"
+        );
+    }
+}

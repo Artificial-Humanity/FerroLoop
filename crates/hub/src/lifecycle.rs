@@ -537,13 +537,12 @@ fn kill_tmux_runtime(session: &str) -> bool {
     tmux_ok(&["kill-session", "-t", &target]) || !tmux_ok(&["has-session", "-t", &target])
 }
 
-/// The live route for `persona`, else any route that matches `fallback_session_id`.
-pub(crate) fn find_route(
-    home_override: Option<&Path>,
+/// The route for `persona`, else any route that matches `fallback_session_id`, in `routes`.
+fn route_in(
+    routes: &RouteTable,
     persona: Option<&str>,
     fallback_session_id: &str,
 ) -> Option<VendorRoute> {
-    let routes = crate::discovery::scan_route_table(home_override);
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
         return Some(entry.route.clone());
@@ -555,6 +554,100 @@ pub(crate) fn find_route(
         .map(|e| e.route.clone())
 }
 
+/// The cheap liveness checks discovery itself uses, nothing heavier: a Claude route's process
+/// must exist (only where discovery checks `/proc`: no home override, host discovery on) and a
+/// webhook route's socket must exist. Other routes have no cheap check; a dead one shows when
+/// the dispatch fails (see [`dispatch_with_rediscovery`]).
+fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
+    let check_proc = home_override.is_none()
+        && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1");
+    match route {
+        VendorRoute::Claude { pid, .. } if check_proc && *pid > 0 => {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        VendorRoute::Webhook { socket_path } => socket_path.exists(),
+        _ => true,
+    }
+}
+
+/// Where [`lookup_route`] found a route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouteLookup {
+    /// From the saved route table, without a host scan. It may be stale.
+    Saved(VendorRoute),
+    /// From a host scan made for this lookup.
+    Scanned(VendorRoute),
+}
+
+impl RouteLookup {
+    pub(crate) fn into_route(self) -> VendorRoute {
+        match self {
+            Self::Saved(route) | Self::Scanned(route) => route,
+        }
+    }
+}
+
+/// The route for `persona`, else any route that matches `fallback_session_id`. A live route in
+/// the saved table is used as it is; the host is scanned only when the table has no route for
+/// the session or the route is dead, and the scan is then saved so the next lookup is fast.
+pub(crate) fn lookup_route(
+    home_override: Option<&Path>,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+) -> Option<RouteLookup> {
+    let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
+    if let Some(route) = route_in(&saved, persona, fallback_session_id)
+        .filter(|route| route_looks_live(route, home_override))
+    {
+        return Some(RouteLookup::Saved(route));
+    }
+    rescan_route(home_override, persona, fallback_session_id).map(RouteLookup::Scanned)
+}
+
+/// Scan the host for the session's route (never from the shared scan cache), save what the scan
+/// learned, and look the route up in it.
+pub(crate) fn rescan_route(
+    home_override: Option<&Path>,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+) -> Option<VendorRoute> {
+    let scanned = crate::discovery::scan_and_save_route_table(home_override);
+    route_in(&scanned, persona, fallback_session_id)
+}
+
+/// The live route for `persona`, else any route that matches `fallback_session_id`.
+pub(crate) fn find_route(
+    home_override: Option<&Path>,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+) -> Option<VendorRoute> {
+    lookup_route(home_override, persona, fallback_session_id).map(RouteLookup::into_route)
+}
+
+/// Run `send` against the session's route. `None` when the session has no route. A saved route
+/// that refuses may be stale (the session restarted since it was saved): the host is scanned
+/// once, the scan saved, and `send` retried once on the route the scan found, when that differs
+/// from the one that refused. A route that came from a scan is not retried.
+pub(crate) fn dispatch_with_rediscovery<T>(
+    home_override: Option<&Path>,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+    mut send: impl FnMut(&VendorRoute) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    let lookup = lookup_route(home_override, persona, fallback_session_id)?;
+    let RouteLookup::Saved(saved) = lookup else {
+        return Some(send(&lookup.into_route()));
+    };
+    let first = send(&saved);
+    if first.is_ok() {
+        return Some(first);
+    }
+    match rescan_route(home_override, persona, fallback_session_id) {
+        Some(fresh) if fresh != saved => Some(send(&fresh)),
+        _ => Some(first),
+    }
+}
+
 /// Best-effort delivery of `prompt` to a live route for the session; `true` when delivered.
 fn deliver_prompt(
     env: &LifecycleEnv<'_>,
@@ -563,8 +656,10 @@ fn deliver_prompt(
     by: &str,
     prompt: &str,
 ) -> bool {
-    find_route(env.home_override, Some(persona), session_id)
-        .is_some_and(|route| dispatch_operator_prompt_to_route(&route, by, prompt).is_ok())
+    dispatch_with_rediscovery(env.home_override, Some(persona), session_id, |route| {
+        dispatch_operator_prompt_to_route(route, by, prompt)
+    })
+    .is_some_and(|delivered| delivered.is_ok())
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
