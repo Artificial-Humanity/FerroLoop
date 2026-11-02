@@ -587,14 +587,14 @@ mod flock {
 /// this process. Waiting is unbounded; the lock is held for one small read and one rename.
 ///
 /// Field order matters: `file` drops (and unlocks) before `slot` frees the in-process entry.
-struct VaultLock {
+pub(crate) struct VaultLock {
     #[cfg_attr(not(unix), allow(dead_code))]
     file: fs::File,
     _slot: ProcessSlot,
 }
 
 impl VaultLock {
-    fn acquire(vault_path: &Path) -> Result<Self, GateError> {
+    pub(crate) fn acquire(vault_path: &Path) -> Result<Self, GateError> {
         let parent = match vault_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
@@ -988,7 +988,7 @@ pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateErr
     })
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))

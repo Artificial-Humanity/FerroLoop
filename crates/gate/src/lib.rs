@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod proxy;
 pub mod registry;
 pub mod vault;
+pub mod warrant;
 
 pub use adapter::{
     EdgeGuardAdapter, ExternalSecret, GuardStage, GuardVerdict, IamDecision, McpRegistryAdapter,
@@ -42,6 +43,13 @@ pub use vault::{
     EncryptedSecretRecord, MASTER_KEY_LEN, NONCE_LEN, SetSecretArgs, VAULT_SCHEMA_VERSION, Vault,
     VaultSecretMetadata, canonical_aad, load_or_init_master_key, normalize_secret_name,
     resolve_master_key_path, resolve_vault_path,
+};
+
+pub use warrant::{
+    DEFAULT_ISSUER, DEFAULT_TTL_SECS, IssueGrantArgs, MAX_TTL_SECS, OwnerGrant, OwnerWarrantLedger,
+    StoredOwnerGrant, TOKEN_PREFIX, VerifiedGrant, WARRANT_KEY_SECRET, issue_owner_grant,
+    list_owner_grants, owner_warrant_public_key, resolve_warrant_ledger_path, revoke_owner_grant,
+    verify_owner_grant,
 };
 
 /// Errors produced by [`Vault`], [`proxy`], [`connector`], and [`bridge`].
@@ -91,6 +99,10 @@ pub enum GateError {
     },
     #[error("bridge `{bridge_id}` error: {reason}")]
     BridgeError { bridge_id: String, reason: String },
+    #[error("invalid Owner warrant request: {reason}")]
+    WarrantInput { reason: String },
+    #[error("Owner warrant rejected: {reason}")]
+    WarrantRejected { reason: String },
 }
 
 #[cfg(test)]

@@ -34,9 +34,9 @@ ledger are options you turn on per project.
 * **Architecture conformance (`fl arch`).** Validates `.fl/architecture.toml`, checks Cargo
   workspace dependencies and source imports against it, and exports LikeC4 DSL.
 * **And more.** `fl wire` (agent messaging), `fl state` (agent memory), `fl github` (issue
-  tracker, ledger and pull-request policy), `fl vault` (secrets vault and MCP gateway), `fl hub`
-  (HTTP/WebSocket daemon behind the FerroDeck web app), `fl agent`, `fl routing` and
-  `fl manifest`. `fl --help` lists every command.
+  tracker, ledger and pull-request policy), `fl vault` (secrets vault and MCP gateway), `fl auth`
+  (signed, scoped, expiring Owner warrants), `fl hub` (HTTP/WebSocket daemon behind the FerroDeck
+  web app), `fl agent`, `fl routing` and `fl manifest`. `fl --help` lists every command.
 
 ---
 

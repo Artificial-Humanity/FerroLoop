@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod arch;
 pub mod attempt;
+pub mod auth;
 pub mod check;
 pub mod escalate;
 pub mod finding;
