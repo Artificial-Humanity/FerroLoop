@@ -145,10 +145,18 @@ impl VendorRegistry {
     /// `Ok`: loading the same configuration twice in one process must not fail. A different
     /// descriptor under a registered id is still [`VendorError::Duplicate`].
     pub fn ensure_registered(&self, descriptor: VendorDescriptor) -> Result<(), VendorError> {
-        if self.get(&descriptor.id).as_ref() == Some(&descriptor) {
-            return Ok(());
+        validate(&descriptor)?;
+        // The comparison and the insert share one write lock: two threads loading the same
+        // descriptor must not see "absent" together and have the second fail as a duplicate.
+        let mut vendors = self.vendors.write().unwrap_or_else(|e| e.into_inner());
+        match vendors.get(&descriptor.id) {
+            Some(existing) if *existing == descriptor => Ok(()),
+            Some(_) => Err(VendorError::Duplicate(descriptor.id)),
+            None => {
+                vendors.insert(descriptor.id.clone(), descriptor);
+                Ok(())
+            }
         }
-        self.register(descriptor)
     }
 
     /// The vendor with this id (compared without case).
@@ -536,6 +544,33 @@ mod tests {
                 .is_err()
         );
         assert_eq!(reg.list().len(), 14);
+    }
+
+    #[test]
+    fn threads_loading_the_same_descriptor_all_succeed() {
+        // Round after round on a fresh registry, so every round has a first registration to race
+        // for; with a separate read and insert, a loser of the race got a spurious `Duplicate`.
+        for round in 0..200 {
+            let reg = VendorRegistry::with_builtins();
+            let d = custom("raced", "https://e.example/v1");
+            let gate = std::sync::Barrier::new(8);
+            let results: Vec<Result<(), VendorError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            gate.wait();
+                            reg.ensure_registered(d.clone())
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert!(
+                results.iter().all(Result::is_ok),
+                "round {round}: {results:?}"
+            );
+            assert_eq!(reg.list().len(), 14);
+        }
     }
 
     #[test]
