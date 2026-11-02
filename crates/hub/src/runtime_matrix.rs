@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport};
 use fl_exec::stamp;
 use fl_gate::{MASTER_KEY_LEN, Vault, VaultSecretMetadata, resolve_vault_path};
 use serde::Serialize;
@@ -34,12 +35,13 @@ use crate::discovery::{
 /// Subscription CLI runtimes, in display order.
 pub const CLI_RUNTIMES: [&str; 5] = ["claude", "codex", "grok", "agy", "muse"];
 /// `(provider, vault secret name)` pairs.
-pub const VAULT_PROVIDERS: [(&str, &str); 5] = [
+pub const VAULT_PROVIDERS: [(&str, &str); 6] = [
     ("anthropic", "ANTHROPIC_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("xai", "XAI_API_KEY"),
     ("gemini", "GEMINI_API_KEY"),
     ("openrouter", "OPENROUTER_API_KEY"),
+    ("kimi", "MOONSHOT_API_KEY"),
 ];
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -126,12 +128,70 @@ pub struct LocalEngineStatus {
     pub error: Option<String>,
 }
 
+/// One registered vendor, as `GET /api/v1/runtimes/matrix` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VendorCatalogEntry {
+    pub id: String,
+    pub display_name: String,
+    /// `subscription_cli` or `http_api`.
+    pub transport: String,
+    pub default_model: String,
+    pub default_context_window: u64,
+    /// Whether an attempt through this vendor needs an API key (the key itself is never listed).
+    pub needs_api_key: bool,
+    /// `http_api` only.
+    pub base_url: Option<String>,
+    /// `http_api` only: `openai_chat_completions`, `anthropic_messages` or
+    /// `gemini_generate_content`.
+    pub dialect: Option<String>,
+    pub mcp_config_rel_path: Option<String>,
+    /// Whether the vendor ships with fl, as opposed to being registered at run time.
+    pub builtin: bool,
+}
+
+impl VendorCatalogEntry {
+    fn of(d: &VendorDescriptor) -> Self {
+        let (base_url, dialect) = match &d.transport {
+            VendorTransport::HttpApi {
+                default_base_url,
+                api_dialect,
+                ..
+            } => (
+                Some(default_base_url.clone()),
+                serde_json::to_value(api_dialect)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string)),
+            ),
+            VendorTransport::SubscriptionCli { .. } => (None, None),
+        };
+        Self {
+            id: d.id.clone(),
+            display_name: d.display_name.clone(),
+            transport: match d.transport {
+                VendorTransport::SubscriptionCli { .. } => "subscription_cli",
+                VendorTransport::HttpApi { .. } => "http_api",
+            }
+            .to_string(),
+            default_model: d.default_model.clone(),
+            default_context_window: d.default_context_window,
+            needs_api_key: d.transport.needs_api_key(),
+            base_url,
+            dialect,
+            mcp_config_rel_path: d.mcp_config_rel_path.clone(),
+            builtin: VendorRegistry::is_builtin(&d.id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeMatrix {
     pub generated_at_ms: u64,
     pub cli_runtimes: Vec<CliRuntimeStatus>,
     pub vault_providers: Vec<VaultProviderStatus>,
     pub local_engines: Vec<LocalEngineStatus>,
+    /// The registered vendor catalog, sorted by id. Descriptor data only: no key value, and no
+    /// probe result.
+    pub vendors: Vec<VendorCatalogEntry>,
     /// Vault failure (for example an unreadable vault file). The tier is then empty of
     /// `provisioned` secrets rather than the whole matrix failing.
     pub vault_error: Option<String>,
@@ -159,6 +219,8 @@ struct Selection {
     cli: Vec<&'static str>,
     vault: Vec<(&'static str, &'static str)>,
     local: Vec<LocalEngineSpec>,
+    /// Registered vendors, by id.
+    vendors: Vec<VendorDescriptor>,
 }
 
 fn tier_for(target: &str) -> Option<Tier> {
@@ -170,11 +232,29 @@ fn tier_for(target: &str) -> Option<Tier> {
     }
 }
 
+/// The key names (environment variable, Vault secret) of a vendor; empty for a CLI or a keyless
+/// engine.
+fn key_names(d: &VendorDescriptor) -> Vec<&str> {
+    match &d.transport {
+        VendorTransport::HttpApi {
+            vault_secret_name,
+            env_key_name,
+            ..
+        } => [vault_secret_name, env_key_name]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect(),
+        VendorTransport::SubscriptionCli { .. } => Vec::new(),
+    }
+}
+
 fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection, String> {
     let all = Selection {
         cli: CLI_RUNTIMES.to_vec(),
         vault: VAULT_PROVIDERS.to_vec(),
         local: engines.to_vec(),
+        vendors: VendorRegistry::global().list(),
     };
     let Some(raw) = target else {
         return Ok(all);
@@ -190,8 +270,22 @@ fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection
         cli: Vec::new(),
         vault: Vec::new(),
         local: Vec::new(),
+        vendors: Vec::new(),
     };
+    if target == "vendors" {
+        sel.vendors = all.vendors;
+        return Ok(sel);
+    }
     if let Some(tier) = tier_for(&target) {
+        // A tier selects the vendors that reach it the way the tier does: a CLI vendor runs as
+        // a process, a vault vendor is an API that needs a key, a local one needs none.
+        let in_tier = |d: &VendorDescriptor| match (tier, &d.transport) {
+            (Tier::Cli, VendorTransport::SubscriptionCli { .. }) => true,
+            (Tier::Vault, t @ VendorTransport::HttpApi { .. }) => t.needs_api_key(),
+            (Tier::Local, t @ VendorTransport::HttpApi { .. }) => !t.needs_api_key(),
+            _ => false,
+        };
+        sel.vendors = all.vendors.iter().filter(|d| in_tier(d)).cloned().collect();
         match tier {
             Tier::Cli => sel.cli = all.cli,
             Tier::Vault => sel.vault = all.vault,
@@ -200,13 +294,36 @@ fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection
         return Ok(sel);
     }
     sel.cli = all.cli.into_iter().filter(|n| *n == target).collect();
+    // The vendor id `kimi-api` also selects the Vault entry that holds its key.
+    let by_id = all.vendors.iter().find(|d| d.id == target);
     sel.vault = all
         .vault
         .into_iter()
-        .filter(|(p, s)| *p == target || s.eq_ignore_ascii_case(&target))
+        .filter(|(p, s)| {
+            *p == target
+                || s.eq_ignore_ascii_case(&target)
+                || by_id.is_some_and(|d| key_names(d).iter().any(|n| n.eq_ignore_ascii_case(s)))
+        })
         .collect();
     sel.local = all.local.into_iter().filter(|e| e.name == target).collect();
-    if sel.cli.is_empty() && sel.vault.is_empty() && sel.local.is_empty() {
+    // A vendor is selected by its id, by the CLI binary it runs (`agy` for `antigravity`), or by
+    // the key it uses (`kimi` and `MOONSHOT_API_KEY` for `kimi-api`).
+    sel.vendors = all
+        .vendors
+        .into_iter()
+        .filter(|d| {
+            d.id == target
+                || matches!(&d.transport, VendorTransport::SubscriptionCli { default_binary }
+                    if sel.cli.iter().any(|c| c == default_binary))
+                || key_names(d).iter().any(|name| {
+                    sel.vault
+                        .iter()
+                        .any(|(_, secret)| name.eq_ignore_ascii_case(secret))
+                })
+        })
+        .collect();
+    if sel.cli.is_empty() && sel.vault.is_empty() && sel.local.is_empty() && sel.vendors.is_empty()
+    {
         return Err(format!("unknown probe target `{target}`"));
     }
     Ok(sel)
@@ -250,6 +367,7 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
         cli_runtimes,
         vault_providers,
         local_engines,
+        vendors: sel.vendors.iter().map(VendorCatalogEntry::of).collect(),
         vault_error,
     })
 }
@@ -704,7 +822,9 @@ impl ProbeGate {
 /// Metadata of the vault's secrets, read without the master key: nothing is decrypted, so the
 /// key file is neither read nor created, and a missing vault file reads as empty. (`Vault::open`
 /// only needs a key to seal and open secret values.)
-fn vault_metadata(home_override: Option<&Path>) -> Result<Vec<VaultSecretMetadata>, String> {
+pub(crate) fn vault_metadata(
+    home_override: Option<&Path>,
+) -> Result<Vec<VaultSecretMetadata>, String> {
     Vault::open(resolve_vault_path(home_override), [0u8; MASTER_KEY_LEN])
         .map(|v| v.list())
         .map_err(|e| e.to_string())
@@ -913,7 +1033,8 @@ mod tests {
                 "OPENAI_API_KEY",
                 "XAI_API_KEY",
                 "GEMINI_API_KEY",
-                "OPENROUTER_API_KEY"
+                "OPENROUTER_API_KEY",
+                "MOONSHOT_API_KEY"
             ]
         );
         let engines = default_local_engines();
@@ -1238,7 +1359,7 @@ mod tests {
         let sel = select(Some("lemonade-8097"), &engines).unwrap();
         assert_eq!(sel.local.len(), 1);
         let sel = select(Some(""), &engines).unwrap();
-        assert_eq!((sel.cli.len(), sel.vault.len(), sel.local.len()), (5, 5, 3));
+        assert_eq!((sel.cli.len(), sel.vault.len(), sel.local.len()), (5, 6, 3));
         assert!(select(Some("nope"), &engines).is_err());
         assert!(select(Some(&"x".repeat(200)), &engines).is_err());
     }
@@ -1249,7 +1370,7 @@ mod tests {
         inp.vault = Err("vault unreadable".into());
         let m = build_matrix(&inp, Some("vault")).unwrap();
         assert!(m.cli_runtimes.is_empty() && m.local_engines.is_empty());
-        assert_eq!(m.vault_providers.len(), 5);
+        assert_eq!(m.vault_providers.len(), 6);
         assert!(m.vault_providers.iter().all(|p| !p.provisioned));
         assert_eq!(m.vault_error.as_deref(), Some("vault unreadable"));
 
@@ -1262,6 +1383,229 @@ mod tests {
 
         let full = build_matrix(&inputs("", None), None).unwrap();
         assert_eq!(full.cli_runtimes.len(), 5);
-        assert_eq!(full.vault_providers.len(), 5);
+        assert_eq!(full.vault_providers.len(), 6);
+    }
+
+    fn custom_vendor(id: &str, key: Option<&str>) {
+        fl_core::ensure_vendor_registered(VendorDescriptor {
+            id: id.to_string(),
+            display_name: format!("Custom {id}"),
+            transport: VendorTransport::HttpApi {
+                default_base_url: "https://example.org/v1".to_string(),
+                api_dialect: fl_core::ApiDialect::AnthropicMessages,
+                vault_secret_name: key.map(str::to_string),
+                env_key_name: key.map(str::to_string),
+            },
+            default_model: "custom-model".to_string(),
+            default_context_window: 54_321,
+            default_rate_card: fl_core::telemetry::RateCard::default(),
+            mcp_config_rel_path: Some(".custom/mcp.json".to_string()),
+        })
+        .unwrap();
+    }
+
+    fn vendor_ids(m: &RuntimeMatrix) -> Vec<&str> {
+        m.vendors.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    #[test]
+    fn kimi_is_a_vault_provider_and_target_filters_select_it() {
+        let engines = default_local_engines();
+        for target in ["kimi", "MOONSHOT_API_KEY", "moonshot_api_key", "kimi-api"] {
+            let sel = select(Some(target), &engines).unwrap();
+            assert_eq!(sel.vault, [("kimi", "MOONSHOT_API_KEY")], "{target}");
+            assert!(sel.cli.is_empty() && sel.local.is_empty(), "{target}");
+            let ids: Vec<_> = sel.vendors.iter().map(|d| d.id.as_str()).collect();
+            assert_eq!(ids, ["kimi-api"], "{target}");
+        }
+        let metas = vec![meta("MOONSHOT_API_KEY", None)];
+        let out = vault_statuses(&VAULT_PROVIDERS, &metas, 1_800_000_000_000);
+        let kimi = out.iter().find(|s| s.provider == "kimi").unwrap();
+        assert_eq!((kimi.status.as_str(), kimi.provisioned), ("ready", true));
+        let m = build_matrix(&inputs("", None), Some("kimi")).unwrap();
+        assert_eq!(m.vault_providers.len(), 1);
+        assert_eq!(m.vault_providers[0].secret_name, "MOONSHOT_API_KEY");
+    }
+
+    #[test]
+    fn the_matrix_lists_the_registered_vendor_catalog_sorted_by_id() {
+        let m = build_matrix(&inputs("", None), None).unwrap();
+        let ids = vendor_ids(&m);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        for builtin in [
+            "anthropic-api",
+            "antigravity",
+            "claude",
+            "codex",
+            "gemini-api",
+            "grok",
+            "kimi-api",
+            "lemonade",
+            "muse",
+            "ollama",
+            "openai-api",
+            "openrouter-api",
+            "xai-api",
+        ] {
+            assert!(ids.contains(&builtin), "{builtin} in {ids:?}");
+        }
+        let by = |id: &str| m.vendors.iter().find(|v| v.id == id).unwrap();
+
+        let kimi = by("kimi-api");
+        assert_eq!(kimi.display_name, "Kimi (Moonshot) API");
+        assert_eq!(kimi.transport, "http_api");
+        assert_eq!(kimi.default_model, "kimi-k2.5");
+        assert_eq!(kimi.default_context_window, 256_000);
+        assert!(kimi.needs_api_key && kimi.builtin);
+        assert_eq!(kimi.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
+        assert_eq!(kimi.dialect.as_deref(), Some("open_ai_chat_completions"));
+        assert_eq!(kimi.mcp_config_rel_path, None);
+
+        let claude = by("claude");
+        assert_eq!(claude.transport, "subscription_cli");
+        assert!(!claude.needs_api_key && claude.builtin);
+        assert_eq!(
+            (claude.base_url.as_deref(), claude.dialect.as_deref()),
+            (None, None)
+        );
+        assert_eq!(claude.mcp_config_rel_path.as_deref(), Some(".mcp.json"));
+
+        let ollama = by("ollama");
+        assert!(
+            !ollama.needs_api_key && ollama.transport == "http_api" && ollama.base_url.is_some()
+        );
+        assert_eq!(
+            by("anthropic-api").dialect.as_deref(),
+            Some("anthropic_messages")
+        );
+        assert_eq!(
+            by("gemini-api").dialect.as_deref(),
+            Some("gemini_generate_content")
+        );
+    }
+
+    #[test]
+    fn a_custom_registered_vendor_appears_in_the_catalog() {
+        custom_vendor("rtm-custom-keyed", Some("RTM_CUSTOM_KEY"));
+        let m = build_matrix(&inputs("", None), None).unwrap();
+        let entry = m
+            .vendors
+            .iter()
+            .find(|v| v.id == "rtm-custom-keyed")
+            .unwrap();
+        assert_eq!(entry.display_name, "Custom rtm-custom-keyed");
+        assert_eq!(entry.transport, "http_api");
+        assert_eq!(entry.default_model, "custom-model");
+        assert_eq!(entry.default_context_window, 54_321);
+        assert!(entry.needs_api_key && !entry.builtin);
+        assert_eq!(entry.base_url.as_deref(), Some("https://example.org/v1"));
+        assert_eq!(entry.dialect.as_deref(), Some("anthropic_messages"));
+        assert_eq!(
+            entry.mcp_config_rel_path.as_deref(),
+            Some(".custom/mcp.json")
+        );
+        // It is selected by its id, and its key name selects it with the Vault entry it shares.
+        let m = build_matrix(&inputs("", None), Some("rtm-custom-keyed")).unwrap();
+        assert_eq!(vendor_ids(&m), ["rtm-custom-keyed"]);
+        assert!(
+            m.cli_runtimes.is_empty() && m.vault_providers.is_empty() && m.local_engines.is_empty()
+        );
+    }
+
+    #[test]
+    fn the_target_filter_applies_to_the_vendor_catalog() {
+        custom_vendor("rtm-custom-keyless", None);
+        let by_target = |t: &str| {
+            let m = build_matrix(&inputs("", None), Some(t)).unwrap();
+            m.vendors.into_iter().map(|v| v.id).collect::<Vec<_>>()
+        };
+        let has = |ids: &[String], id: &str| ids.iter().any(|i| i == id);
+        let cli = by_target("cli");
+        assert!(has(&cli, "claude") && has(&cli, "antigravity") && !has(&cli, "kimi-api"));
+        let vault = by_target("vault");
+        assert!(has(&vault, "kimi-api") && has(&vault, "openai-api"));
+        assert!(
+            !has(&vault, "ollama") && !has(&vault, "claude") && !has(&vault, "rtm-custom-keyless")
+        );
+        let local = by_target("local");
+        assert!(
+            has(&local, "ollama") && has(&local, "lemonade") && has(&local, "rtm-custom-keyless")
+        );
+        assert!(!has(&local, "kimi-api"));
+        assert_eq!(by_target("agy"), ["antigravity"]);
+        assert_eq!(by_target("codex"), ["codex"]);
+        assert_eq!(by_target("openai"), ["openai-api"]);
+        assert_eq!(by_target("ollama"), ["ollama"]);
+        assert_eq!(by_target("OPENROUTER-API"), ["openrouter-api"]);
+        assert!(by_target("vendors").len() >= 13);
+        // `vendors` is the catalog alone: no probe ran.
+        let m = build_matrix(&inputs("", None), Some("vendors")).unwrap();
+        assert!(
+            m.cli_runtimes.is_empty() && m.vault_providers.is_empty() && m.local_engines.is_empty()
+        );
+        assert!(build_matrix(&inputs("", None), Some("no-such-vendor")).is_err());
+    }
+
+    #[test]
+    fn the_matrix_json_keeps_its_fields_and_carries_no_secret_material() {
+        custom_vendor("rtm-custom-json", Some("RTM_JSON_KEY"));
+        let mut inp = inputs("", None);
+        // A vault holding a key: only its metadata may surface.
+        inp.vault = Ok(vec![meta("MOONSHOT_API_KEY", None)]);
+        let m = build_matrix(&inp, None).unwrap();
+        let json = serde_json::to_value(&m).unwrap();
+        for field in [
+            "generated_at_ms",
+            "cli_runtimes",
+            "vault_providers",
+            "local_engines",
+            "vault_error",
+            "vendors",
+        ] {
+            assert!(json.get(field).is_some(), "{field}");
+        }
+        let vendors = json["vendors"].as_array().unwrap();
+        let kimi = vendors.iter().find(|v| v["id"] == "kimi-api").unwrap();
+        let mut keys: Vec<&str> = kimi
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "base_url",
+                "builtin",
+                "default_context_window",
+                "default_model",
+                "dialect",
+                "display_name",
+                "id",
+                "mcp_config_rel_path",
+                "needs_api_key",
+                "transport",
+            ]
+        );
+        let text = json["vendors"].to_string();
+        for needle in [
+            "MOONSHOT_API_KEY",
+            "RTM_JSON_KEY",
+            "secret",
+            "value",
+            "nonce",
+            "ciphertext",
+            "key_name",
+        ] {
+            assert!(!text.contains(needle), "{needle} in vendors JSON: {text}");
+        }
+        assert!(
+            json["vault_providers"]
+                .to_string()
+                .contains("MOONSHOT_API_KEY")
+        );
     }
 }

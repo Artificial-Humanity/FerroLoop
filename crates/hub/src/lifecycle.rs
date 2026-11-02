@@ -17,6 +17,7 @@ use fl_core::state::{
     StateScope, UpsertStateArgs, validate_slug,
 };
 use fl_core::store::{AgentRegistry, StateStore, StoreError};
+use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
 use fl_wire::identity::{RouteTable, VendorRoute, default_routes_path, legacy_routes_path};
@@ -29,15 +30,41 @@ use crate::api::{
 
 /// Roles `spin-up` accepts (the FerroDeck role list).
 pub const SPIN_UP_ROLES: [&str; 4] = ["lead", "assistant", "ui-developer", "lab-manager"];
-/// Vendors `spin-up` accepts; the first segment of a hosted `session_id`.
+/// The five subscription-CLI vendors. Not the list `spin-up` accepts: every decision about a
+/// vendor goes through the vendor registry ([`spin_up_vendor_ids`]), which also holds the
+/// direct-API vendors and any vendor registered at run time.
 pub const SPIN_UP_VENDORS: [&str; 5] = ["claude", "antigravity", "codex", "grok", "muse"];
+
+/// Every vendor id `spin-up` and `remodel` accept: the ids in the vendor registry, sorted.
+pub fn spin_up_vendor_ids() -> Vec<String> {
+    VendorRegistry::global()
+        .list()
+        .into_iter()
+        .map(|v| v.id)
+        .collect()
+}
+
+/// Whether a vendor runs as an interactive process in a `tmux` window. An HTTP API vendor has no
+/// CLI to host; an id the registry does not know is treated as a CLI (a legacy record).
+fn vendor_has_runtime(vendor: &str) -> bool {
+    !matches!(
+        lookup_vendor(vendor),
+        Some(VendorDescriptor {
+            transport: VendorTransport::HttpApi { .. },
+            ..
+        })
+    )
+}
 /// Node a session lands on when the request names none.
 pub const DEFAULT_NODE_ID: &str = "ai-lab-0";
 
 /// `session_id` prefix of every hosted-session runtime entry.
 const HOSTED_SLUG_PREFIX: &str = "hosted-session-";
-/// Longest persona that still fits `hosted-session-<vendor>-<persona>` in the 64-char state slug.
+/// Upper cap on a persona. Whether it fits `hosted-session-<vendor>-<persona>` in the 64-char
+/// state slug also depends on the vendor's id length ([`max_persona_len`]).
 const MAX_PERSONA_LEN: usize = 36;
+/// Longest state slug (`fl_core::state::validate_slug`).
+const MAX_STATE_SLUG_LEN: usize = 64;
 const MAX_FIELD_LEN: usize = 128;
 
 pub const STATUS_RUNNING: &str = "running";
@@ -114,6 +141,8 @@ pub struct LifecycleEnv<'a> {
     pub spawn_runtime: bool,
     /// The runtime calls when `spawn_runtime` is on: [`TmuxRuntime`], or a fake in tests.
     pub runtime: &'a dyn SessionRuntime,
+    /// Tells whether an API vendor's key is provisioned: [`HostKeyProbe`], or a fake in tests.
+    pub key_probe: &'a dyn ApiKeyProbe,
 }
 
 impl<'a> LifecycleEnv<'a> {
@@ -125,8 +154,94 @@ impl<'a> LifecycleEnv<'a> {
             home_override,
             spawn_runtime: !disabled,
             runtime: &TmuxRuntime,
+            key_probe: &HostKeyProbe,
         }
     }
+}
+
+/// Whether an API vendor's key is provisioned on this host. Only the presence is asked: no
+/// implementation returns, logs or decrypts a key value.
+pub trait ApiKeyProbe: std::fmt::Debug {
+    /// `true` when the environment variable `env_key_name` is set to a non-blank value, or the
+    /// Vault holds a usable secret named `vault_secret_name`.
+    fn key_provisioned(
+        &self,
+        home_override: Option<&Path>,
+        env_key_name: Option<&str>,
+        vault_secret_name: Option<&str>,
+    ) -> bool;
+}
+
+/// The real probe: the process environment, and the Vault's metadata (never its values, and no
+/// master key is read or created).
+#[derive(Debug, Clone, Copy)]
+pub struct HostKeyProbe;
+
+impl ApiKeyProbe for HostKeyProbe {
+    fn key_provisioned(
+        &self,
+        home_override: Option<&Path>,
+        env_key_name: Option<&str>,
+        vault_secret_name: Option<&str>,
+    ) -> bool {
+        if let Some(name) = env_key_name
+            && std::env::var_os(name).is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+        {
+            return true;
+        }
+        let Some(secret) = vault_secret_name else {
+            return false;
+        };
+        // A missing, unreadable or expired secret is not usable, so it does not count.
+        crate::runtime_matrix::vault_metadata(home_override).is_ok_and(|meta| {
+            crate::runtime_matrix::vault_statuses(&[("", secret)], &meta, now_ms())
+                .iter()
+                .any(|s| s.status == "ready")
+        })
+    }
+}
+
+/// Refuse (409) a spin-up on an API vendor whose key is not provisioned, naming the vendor, the
+/// environment variable and the Vault secret. A vendor that needs no key (a local engine), and a
+/// vendor with a CLI, pass. Runs before a spin-up's first side effect.
+fn check_api_key(env: &LifecycleEnv<'_>, vendor: &str) -> Result<(), LifecycleError> {
+    let Some(VendorDescriptor {
+        transport:
+            VendorTransport::HttpApi {
+                vault_secret_name,
+                env_key_name,
+                ..
+            },
+        ..
+    }) = lookup_vendor(vendor)
+    else {
+        return Ok(());
+    };
+    if vault_secret_name.is_none() && env_key_name.is_none() {
+        return Ok(());
+    }
+    if env.key_probe.key_provisioned(
+        env.home_override,
+        env_key_name.as_deref(),
+        vault_secret_name.as_deref(),
+    ) {
+        return Ok(());
+    }
+    let remedies: Vec<String> = [
+        env_key_name
+            .as_ref()
+            .map(|n| format!("set the environment variable `{n}`")),
+        vault_secret_name
+            .as_ref()
+            .map(|n| format!("store a Vault secret named `{n}`")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Err(LifecycleError::Conflict(format!(
+        "vendor `{vendor}` needs an API key and none is provisioned: {}",
+        remedies.join(" or ")
+    )))
 }
 
 /// The runtime calls a lifecycle makes on a session's `tmux` session (named by the capitalised
@@ -183,11 +298,50 @@ impl FakeRuntime {
             home_override: Some(home),
             spawn_runtime: true,
             runtime: self,
+            key_probe: &ProvisionedKeys,
         }
     }
 
     pub(crate) fn is_live(&self, session: &str) -> bool {
         self.live.borrow().contains(session)
+    }
+}
+
+/// A key probe that finds every key provisioned.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProvisionedKeys;
+
+#[cfg(test)]
+impl ApiKeyProbe for ProvisionedKeys {
+    fn key_provisioned(&self, _: Option<&Path>, _: Option<&str>, _: Option<&str>) -> bool {
+        true
+    }
+}
+
+/// A key probe that finds only the named keys (an environment variable or a Vault secret name).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FakeKeys {
+    pub(crate) have: Vec<String>,
+    pub(crate) asked: std::cell::RefCell<Vec<String>>,
+}
+
+#[cfg(test)]
+impl ApiKeyProbe for FakeKeys {
+    fn key_provisioned(
+        &self,
+        _: Option<&Path>,
+        env_key_name: Option<&str>,
+        vault_secret_name: Option<&str>,
+    ) -> bool {
+        self.asked
+            .borrow_mut()
+            .push(format!("{env_key_name:?}/{vault_secret_name:?}"));
+        [env_key_name, vault_secret_name]
+            .into_iter()
+            .flatten()
+            .any(|n| self.have.iter().any(|h| h == n))
     }
 }
 
@@ -270,6 +424,46 @@ fn check_text(name: &str, value: &str) -> Result<(), LifecycleError> {
     Ok(())
 }
 
+/// Longest persona the hosted-session state slug `hosted-session-<vendor>-<persona>` can hold for
+/// `vendor`, capped at [`MAX_PERSONA_LEN`]. `0`: the vendor id alone leaves no room.
+fn max_persona_len(vendor: &str) -> usize {
+    MAX_STATE_SLUG_LEN
+        .saturating_sub(HOSTED_SLUG_PREFIX.len() + vendor.len() + 1)
+        .min(MAX_PERSONA_LEN)
+}
+
+/// Refuse (400) a persona whose hosted-session slug would not fit this vendor, or a vendor id
+/// that cannot appear in a state slug at all, before the record is written.
+fn check_persona_fits_slug(vendor: &str, persona: &str) -> Result<(), LifecycleError> {
+    let max = max_persona_len(vendor);
+    if max == 0 {
+        return Err(invalid_field(
+            "vendor",
+            &format!(
+                "`{vendor}` is too long to host a session: its state slug cannot fit 64 characters"
+            ),
+        ));
+    }
+    if persona.len() > max {
+        return Err(invalid_field(
+            "persona",
+            &format!(
+                "must be at most {max} characters with vendor `{vendor}` (the state slug \
+                 `{HOSTED_SLUG_PREFIX}{vendor}-<persona>` holds at most {MAX_STATE_SLUG_LEN})"
+            ),
+        ));
+    }
+    if validate_slug(&hosted_session_slug(&format!("{vendor}:{persona}"))).is_err() {
+        return Err(invalid_field(
+            "vendor",
+            &format!(
+                "`{vendor}` cannot host a session: its id is not usable in a state slug (a-z, 0-9, '-', '_')"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl SpinUpRequest {
     fn validate(&self) -> Result<ValidSpinUp, LifecycleError> {
         let persona = self.persona.trim().to_string();
@@ -306,12 +500,13 @@ impl SpinUpRequest {
             )));
         }
         let vendor = self.vendor.trim().to_ascii_lowercase();
-        if !SPIN_UP_VENDORS.contains(&vendor.as_str()) {
+        if lookup_vendor(&vendor).is_none() {
             return Err(LifecycleError::Invalid(format!(
                 "vendor must be one of: {}",
-                SPIN_UP_VENDORS.join(", ")
+                spin_up_vendor_ids().join(", ")
             )));
         }
+        check_persona_fits_slug(&vendor, &persona)?;
         let model = trimmed_opt(&self.model);
         if let Some(model) = &model {
             check_text("model", model)?;
@@ -438,8 +633,8 @@ pub fn list_hosted_sessions<S: StateStore>(
 fn split_vendor_id(id: &str) -> Option<(String, &str)> {
     let (vendor, persona) = id.trim().split_once(':')?;
     let vendor = vendor.to_ascii_lowercase();
-    SPIN_UP_VENDORS
-        .contains(&vendor.as_str())
+    lookup_vendor(&vendor)
+        .is_some()
         .then_some((vendor, persona))
 }
 
@@ -1025,6 +1220,11 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let v = req.validate()?;
+    // Before any side effect: an API vendor whose key is missing would register an agent that
+    // can never run.
+    check_api_key(env, &v.vendor)?;
+    // An HTTP API vendor has no CLI to host, so no tmux window is ever opened for it.
+    let has_runtime = vendor_has_runtime(&v.vendor);
     let session_id = format!("{}:{}", v.vendor, v.persona);
     // The unfiltered record carries `created_at_ms`, `restart_count` and `runtime_spawned` over;
     // the gate below looks only at whether it is LIVE.
@@ -1043,7 +1243,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     register_spun_up_agent(store, &v, by)?;
 
     let display = capitalize(&v.persona);
-    let tmux_target = format!("{display}:{}", v.vendor);
+    let tmux_target = has_runtime.then(|| format!("{display}:{}", v.vendor));
     let prompt = prompt_for(&display, &v.project, &v.role);
 
     let now = now_ms();
@@ -1059,22 +1259,25 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         status: STATUS_RUNNING.to_string(),
         restart_policy: "on-failure".to_string(),
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
-        tmux_target: Some(tmux_target.clone()),
+        tmux_target: tmux_target.clone(),
         cwd: v.cwd.clone(),
         hydration_dispatched: false,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
-        runtime_spawned: previous
-            .as_ref()
-            .is_some_and(|r| r.runtime_spawned && is_live_hosted(r)),
+        runtime_spawned: has_runtime
+            && previous
+                .as_ref()
+                .is_some_and(|r| r.runtime_spawned && is_live_hosted(r)),
         created_at_ms: previous.as_ref().map_or(now, |r| r.created_at_ms),
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
     };
     persist_hosted_session(store, &record, by)?;
 
-    let spawned =
-        v.hosted && env.spawn_runtime && env.runtime.spawn(&display, &v.vendor, v.cwd.as_deref());
+    let spawned = has_runtime
+        && v.hosted
+        && env.spawn_runtime
+        && env.runtime.spawn(&display, &v.vendor, v.cwd.as_deref());
     let hydration_dispatched = deliver_prompt(env, &v.persona, &session_id, by, &prompt);
     record.runtime_spawned |= spawned;
     record.hydration_dispatched = hydration_dispatched;
@@ -1100,7 +1303,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         node_id: v.node_id,
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
-        tmux_target: Some(tmux_target),
+        tmux_target,
         hydration_dispatched,
         prompt: Some(prompt),
     })
@@ -1215,10 +1418,24 @@ impl SessionTarget {
     }
 }
 
-/// Vendor named by the leading segment of a session id (`claude:ada`, `muse-<uuid>`), if known.
-fn vendor_of_session_id(session_id: &str) -> Option<&'static str> {
-    let head = session_id.split([':', '-']).next().unwrap_or_default();
-    SPIN_UP_VENDORS.iter().copied().find(|v| *v == head)
+/// Vendor named by the start of a session id (`claude:ada`, `muse-<uuid>`, `kimi-api:ada`), if
+/// registered: the LONGEST registered id that the session id begins with and that is followed by
+/// `:` or `-` (or ends the id), so a hyphenated id and an id that is a prefix of another both
+/// resolve to the right vendor.
+fn vendor_of_session_id(session_id: &str) -> Option<String> {
+    longest_vendor_prefix(&spin_up_vendor_ids(), session_id)
+}
+
+fn longest_vendor_prefix(vendors: &[String], session_id: &str) -> Option<String> {
+    vendors
+        .iter()
+        .filter(|v| {
+            session_id
+                .strip_prefix(v.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '-']))
+        })
+        .max_by_key(|v| v.len())
+        .cloned()
 }
 
 /// Project and role for a session: its hosted record, else its agent registration.
@@ -1250,9 +1467,7 @@ fn record_for_target<S: AgentRegistry>(
         persona: target.persona.clone(),
         project,
         role,
-        vendor: vendor_of_session_id(&target.session_id)
-            .unwrap_or("unknown")
-            .to_string(),
+        vendor: vendor_of_session_id(&target.session_id).unwrap_or_else(|| "unknown".to_string()),
         model: None,
         node_id: DEFAULT_NODE_ID.to_string(),
         hosted: false,
@@ -1545,6 +1760,7 @@ pub fn restart_hosted_session<S: StateStore>(
     }
     let display = capitalize(&record.persona);
     if record.hosted
+        && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
         && env
             .runtime
@@ -1594,7 +1810,7 @@ impl RemodelMode {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemodelRequest {
-    /// One of [`SPIN_UP_VENDORS`].
+    /// A vendor in the vendor registry ([`spin_up_vendor_ids`]).
     #[serde(default)]
     pub vendor: String,
     #[serde(default)]
@@ -1699,7 +1915,12 @@ fn check_old_runtime_stoppable<S: StateStore>(
     to: &ValidSpinUp,
 ) -> Result<(), LifecycleError> {
     let name = capitalize(&target.persona);
-    if !to.hosted || !env.spawn_runtime || !env.runtime.exists(&name) {
+    // An API vendor opens no tmux window, so the old name being taken costs it nothing.
+    if !to.hosted
+        || !vendor_has_runtime(&to.vendor)
+        || !env.spawn_runtime
+        || !env.runtime.exists(&name)
+    {
         return Ok(());
     }
     let why = match target.hosted.as_ref() {
@@ -1749,11 +1970,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
     };
     let old = target.hosted.as_ref();
     let from_vendor = old.map_or_else(
-        || {
-            vendor_of_session_id(&target.session_id)
-                .unwrap_or("unknown")
-                .to_string()
-        },
+        || vendor_of_session_id(&target.session_id).unwrap_or_else(|| "unknown".to_string()),
         |r| r.vendor.clone(),
     );
     let old_node = old.map_or_else(|| DEFAULT_NODE_ID.to_string(), |r| r.node_id.clone());
@@ -1771,12 +1988,15 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         cwd: req.cwd.clone().or_else(|| old_cwd.clone()),
     }
     .validate()?;
+    // Before the teardown: a remodel onto an API vendor with no key would retire the old
+    // session for nothing.
+    check_api_key(env, &to.vendor)?;
     check_runtime_cwd(&to)?;
     check_registration(store, &to, OwnAgent::Retiring)?;
     // The restore puts back what was there: a session with no record was not hosted, and a
     // restore must not turn it into a managed one.
-    let restore = SPIN_UP_VENDORS
-        .contains(&from_vendor.as_str())
+    let restore = lookup_vendor(&from_vendor)
+        .is_some()
         .then(|| SpinUpRequest {
             persona: target.persona.clone(),
             project,
@@ -2191,7 +2411,7 @@ fn require_runtime(
     env: &LifecycleEnv<'_>,
     out: SpinUpResponse,
 ) -> Result<SpinUpResponse, LifecycleError> {
-    if env.spawn_runtime && out.hosted && !out.runtime_spawned {
+    if env.spawn_runtime && out.hosted && vendor_has_runtime(&out.vendor) && !out.runtime_spawned {
         let session = out
             .tmux_target
             .as_deref()
@@ -2232,6 +2452,9 @@ fn undo_new_record<S: StateStore>(
 mod remodel_tests;
 
 #[cfg(test)]
+mod vendor_registry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use fl_core::MemStore;
@@ -2253,6 +2476,7 @@ mod tests {
             home_override: Some(home.path()),
             spawn_runtime: false,
             runtime: &TmuxRuntime,
+            key_probe: &ProvisionedKeys,
         }
     }
 
