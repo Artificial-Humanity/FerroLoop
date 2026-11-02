@@ -529,7 +529,9 @@ mod route_lookup {
     use std::time::{Duration, Instant};
 
     use fl_core::at::At;
-    use fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL;
+    use fl_wire::dispatcher::{
+        PushError, ROUTE_REDISCOVERY_INTERVAL, push_operator_prompt_to_route,
+    };
     use fl_wire::identity::{RouteTable, VendorRoute};
     use tempfile::TempDir;
 
@@ -562,6 +564,26 @@ mod route_lookup {
         let socket_path = home.join(name);
         drop(UnixListener::bind(&socket_path).unwrap());
         VendorRoute::Webhook { socket_path }
+    }
+
+    /// What each connection made to `listener` so far carried, in order. Every send under test
+    /// has returned by then, so each of its connections waits in the listener's backlog.
+    pub(super) fn connections(listener: &UnixListener) -> Vec<String> {
+        use std::io::Read;
+        listener.set_nonblocking(true).unwrap();
+        let mut carried = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut text = String::new();
+                    stream.read_to_string(&mut text).unwrap();
+                    carried.push(text);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return carried,
+                Err(e) => panic!("accept: {e}"),
+            }
+        }
     }
 
     /// A webhook route with a listener; the listener must outlive the test's dispatch.
@@ -769,12 +791,18 @@ mod route_lookup {
             }),
             Some(Undeliverable::NoSocket)
         );
+        // The check never connects, so a socket file that refuses passes it: the push finds the
+        // refusal.
         assert_eq!(
             undeliverable(&refusing_webhook(home.path(), "dead.sock")),
-            Some(Undeliverable::ConnectionRefused)
+            None
         );
-        let (live, _listener) = listening_webhook(home.path(), "live.sock");
+        let (live, listener) = listening_webhook(home.path(), "live.sock");
         assert_eq!(undeliverable(&live), None);
+        assert!(
+            connections(&listener).is_empty(),
+            "the check opened a connection to the receiver"
+        );
         // No process can have this pid (it is above the kernel's pid limit).
         assert_eq!(
             undeliverable(&claude("sid", 4_000_000_000)),
@@ -786,12 +814,14 @@ mod route_lookup {
     }
 
     #[test]
-    fn a_prompt_whose_connect_is_refused_goes_once_to_the_new_route() {
+    fn a_prompt_to_a_missing_socket_goes_once_to_the_new_route() {
         let home = TempDir::new().unwrap();
         save_route(
             home.path(),
             "ada",
-            refusing_webhook(home.path(), "old.sock"),
+            VendorRoute::Webhook {
+                socket_path: home.path().join("gone.sock"),
+            },
         );
         host_runs_claude(home.path(), "ada", "new-sid");
         scanned_just_now(home.path());
@@ -804,7 +834,7 @@ mod route_lookup {
         });
         assert_eq!(outcome, Some(Ok("delivered")));
         let tried = tried.into_inner();
-        assert_eq!(tried.len(), 1, "one send, and none to the refusing socket");
+        assert_eq!(tried.len(), 1, "one send, and none to the missing socket");
         assert_eq!(claude_session_id(&tried[0]), "new-sid");
         assert_eq!(costs.route_scans, 1);
         let saved = RouteTable::load(Some(&routes_file(home.path())));
@@ -812,6 +842,50 @@ mod route_lookup {
             saved.get("ada").map(|e| claude_session_id(&e.route)),
             Some("new-sid")
         );
+    }
+
+    #[test]
+    fn a_prompt_whose_connect_is_refused_goes_to_the_new_route() {
+        let home = TempDir::new().unwrap();
+        let old = refusing_webhook(home.path(), "old.sock");
+        save_route(home.path(), "ada", old.clone());
+        host_runs_claude(home.path(), "ada", "new-sid");
+        scanned_just_now(home.path());
+        let tried = RefCell::new(Vec::new());
+        let (outcome, costs) = measure(|| {
+            dispatch_with_rediscovery(Some(home.path()), by_persona("ada"), |route| {
+                tried.borrow_mut().push(route.clone());
+                match route {
+                    // The real push: the refused connect delivered nothing.
+                    VendorRoute::Webhook { .. } => {
+                        push_operator_prompt_to_route(route, "owner", "hi").map(|()| "webhook")
+                    }
+                    _ => Ok("delivered"),
+                }
+            })
+        });
+        assert_eq!(outcome, Some(Ok("delivered")));
+        let tried = tried.into_inner();
+        assert_eq!(tried.len(), 2, "the refused push, then the new route");
+        assert_eq!(tried[0], old);
+        assert_eq!(claude_session_id(&tried[1]), "new-sid");
+        assert_eq!(costs.route_scans, 1);
+    }
+
+    #[test]
+    fn a_prompt_to_a_webhook_route_opens_exactly_one_connection() {
+        let home = TempDir::new().unwrap();
+        let (hook, listener) = listening_webhook(home.path(), "ada.sock");
+        save_route(home.path(), "ada", hook);
+        scanned_just_now(home.path());
+        let outcome = dispatch_with_rediscovery(Some(home.path()), by_persona("ada"), |route| {
+            push_operator_prompt_to_route(route, "owner", "hi")
+        });
+        assert_eq!(outcome, Some(Ok(())));
+        let carried = connections(&listener);
+        assert_eq!(carried.len(), 1, "one connection per push: {carried:?}");
+        assert_eq!(carried[0].lines().count(), 1);
+        assert!(carried[0].contains("\"operator_prompt\""));
     }
 
     #[test]
@@ -826,7 +900,9 @@ mod route_lookup {
         let (outcome, costs) = measure(|| {
             dispatch_with_rediscovery(Some(home.path()), by_persona("ada"), |route| {
                 tried.borrow_mut().push(route.clone());
-                Err::<(), _>("connection reset after the write".to_string())
+                Err::<(), _>(PushError::Failed(
+                    "connection reset after the write".to_string(),
+                ))
             })
         });
         assert_eq!(
@@ -847,14 +923,14 @@ mod route_lookup {
         let (outcome, costs) = measure(|| {
             dispatch_with_rediscovery(Some(home.path()), by_persona("ada"), |route| {
                 tried.borrow_mut().push(route.clone());
-                Err::<(), _>("refused".to_string())
+                Err::<(), _>(PushError::NotConnected("refused".to_string()))
             })
         });
         assert_eq!(outcome, Some(Err("refused".to_string())));
         assert_eq!(
             tried.into_inner(),
             vec![dead],
-            "fl-wire reports the refusal"
+            "the scan found the same route: fl-wire's refusal is returned"
         );
         assert_eq!(costs.route_scans, 1);
 
@@ -865,7 +941,7 @@ mod route_lookup {
         let (_, costs) = measure(|| {
             dispatch_with_rediscovery(Some(fresh.path()), by_persona("ferris"), |_| {
                 *sends.borrow_mut() += 1;
-                Err::<(), _>("refused".to_string())
+                Err::<(), _>(PushError::NotConnected("refused".to_string()))
             })
         });
         assert_eq!((*sends.borrow(), costs.route_scans), (1, 1));
@@ -1020,21 +1096,17 @@ mod wire_send {
         (resp.json_value().unwrap(), costs)
     }
 
-    /// The first non-empty line `listener` receives. The pre-delivery check connects and closes
-    /// once before the push, so empty connections are skipped.
+    /// The line the first connection to `listener` carries (fl-wire's webhook contract: one
+    /// connection per JSON line, so it must carry one).
     fn first_line(listener: UnixListener) -> std::thread::JoinHandle<String> {
         std::thread::spawn(move || {
-            loop {
-                let (stream, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                if std::io::BufReader::new(stream)
-                    .read_line(&mut line)
-                    .unwrap()
-                    > 0
-                {
-                    return line;
-                }
-            }
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .read_line(&mut line)
+                .unwrap();
+            assert!(!line.is_empty(), "the first connection carried no line");
+            line
         })
     }
 
@@ -1106,6 +1178,52 @@ mod wire_send {
             costs.route_scans, 1,
             "the pre-delivery check refused: one rescan"
         );
+
+        // A socket file that refuses: the push itself finds the refusal, scans once, and the
+        // scan finds the same route, so the receipt stays pending after one push.
+        let socket = tmp.path().join("dead.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        save_webhook(&state, "ada", &socket);
+        super::route_lookup::scanned_just_now(tmp.path());
+        let (body, costs) = send(&state, "ada");
+        assert_eq!(body["receipts"][0]["status"], "pending");
+        assert_eq!(body["receipts"][0]["attempts"], 1);
+        assert_eq!(costs.route_scans, 1, "the refused push: one rescan");
+    }
+
+    #[test]
+    fn a_push_to_a_webhook_route_opens_exactly_one_connection() {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 1);
+        let socket = tmp.path().join("ada.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        save_webhook(&state, "ada", &socket);
+        super::route_lookup::scanned_just_now(tmp.path());
+        let (body, costs) = send(&state, "ada");
+        assert_eq!(body["receipts"][0]["status"], "acked");
+        assert_eq!(costs.route_scans, 0);
+        let carried = super::route_lookup::connections(&listener);
+        assert_eq!(carried.len(), 1, "one connection per push: {carried:?}");
+        assert_eq!(carried[0].lines().count(), 1);
+        assert!(carried[0].contains("\"b\""));
+    }
+
+    #[test]
+    fn a_send_with_nothing_to_deliver_never_scans() {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 1);
+        // Never scanned in this process, so the saved table is not fresh: a send with a
+        // recipient to deliver would scan. A send with no receipt to deliver must not.
+        assert!(!crate::discovery::saved_routes_fresh(
+            Some(tmp.path()),
+            std::time::Instant::now()
+        ));
+        let (body, costs) = send(&state, "@area:no-such-area");
+        assert_eq!(body["receipts"], json!([]));
+        assert_eq!(costs.route_scans, 0);
+        // The same stale table, with a recipient to deliver: one scan.
+        let (_, costs) = send(&state, "nobody");
+        assert_eq!(costs.route_scans, 1);
     }
 }
 

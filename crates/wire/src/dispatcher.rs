@@ -120,23 +120,101 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             )
         }
         VendorRoute::Webhook { socket_path } => {
-            let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-                format!(
-                    "failed to connect to webhook socket {}: {e}",
-                    socket_path.display()
-                )
-            })?;
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            let mut line =
-                serde_json::to_string(msg).map_err(|e| format!("serialize message: {e}"))?;
-            line.push('\n');
-            stream
-                .write_all(line.as_bytes())
-                .and_then(|()| stream.flush())
-                .map_err(|e| format!("failed to write to webhook socket: {e}"))?;
-            Ok(())
+            push_webhook_message(socket_path, msg).map_err(String::from)
         }
     }
+}
+
+/// Why a push failed, for a caller that may send to another route instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    /// The receiver was never reached: the webhook socket does not exist or refuses
+    /// connections. Nothing was delivered, so the push can go to another route.
+    NotConnected(String),
+    /// Any other failure. Part of the delivery may have landed.
+    Failed(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected(e) | Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<PushError> for String {
+    fn from(e: PushError) -> Self {
+        match e {
+            PushError::NotConnected(e) | PushError::Failed(e) => e,
+        }
+    }
+}
+
+/// [`dispatch_to_route`], with a typed error: [`PushError::NotConnected`] when a webhook
+/// receiver could not be reached at all.
+pub fn push_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), PushError> {
+    match route {
+        VendorRoute::Webhook { socket_path } => push_webhook_message(socket_path, msg),
+        _ => dispatch_to_route(route, msg).map_err(PushError::Failed),
+    }
+}
+
+/// [`dispatch_operator_prompt_to_route`], with a typed error: [`PushError::NotConnected`] when a
+/// webhook receiver could not be reached at all.
+pub fn push_operator_prompt_to_route(
+    route: &VendorRoute,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), PushError> {
+    match route {
+        VendorRoute::Webhook { socket_path } => {
+            push_webhook_operator_prompt(socket_path, sender_name, body)
+        }
+        _ => dispatch_operator_prompt_to_route(route, sender_name, body).map_err(PushError::Failed),
+    }
+}
+
+fn push_webhook_message(socket_path: &Path, msg: &WireMessage) -> Result<(), PushError> {
+    let line = serde_json::to_string(msg)
+        .map_err(|e| PushError::Failed(format!("serialize message: {e}")))?;
+    push_webhook_line(socket_path, line)
+}
+
+fn push_webhook_operator_prompt(
+    socket_path: &Path,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), PushError> {
+    let line = serde_json::to_string(&serde_json::json!({
+        "kind": "operator_prompt",
+        "sender_name": sender_name,
+        "body": body,
+    }))
+    .map_err(|e| PushError::Failed(format!("serialize operator prompt: {e}")))?;
+    push_webhook_line(socket_path, line)
+}
+
+/// Write `line` and a newline on one new connection to the webhook socket.
+fn push_webhook_line(socket_path: &Path, mut line: String) -> Result<(), PushError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        let text = format!(
+            "failed to connect to webhook socket {}: {e}",
+            socket_path.display()
+        );
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                PushError::NotConnected(text)
+            }
+            _ => PushError::Failed(text),
+        }
+    })?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| PushError::Failed(format!("failed to write to webhook socket: {e}")))
 }
 
 /// Push `msg` to a live Claude Code session.
@@ -1756,25 +1834,7 @@ pub fn dispatch_operator_prompt_to_route(
             body,
         ),
         VendorRoute::Webhook { socket_path } => {
-            let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-                format!(
-                    "failed to connect to webhook socket {}: {e}",
-                    socket_path.display()
-                )
-            })?;
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            let mut line = serde_json::to_string(&serde_json::json!({
-                "kind": "operator_prompt",
-                "sender_name": sender_name,
-                "body": body,
-            }))
-            .map_err(|e| format!("serialize operator prompt: {e}"))?;
-            line.push('\n');
-            stream
-                .write_all(line.as_bytes())
-                .and_then(|()| stream.flush())
-                .map_err(|e| format!("failed to write to webhook socket: {e}"))?;
-            Ok(())
+            push_webhook_operator_prompt(socket_path, sender_name, body).map_err(String::from)
         }
     }
 }

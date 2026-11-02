@@ -2823,9 +2823,12 @@ mod tests {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 {
-                    continue;
-                }
+                // fl-wire's webhook contract: one connection per JSON line. An empty
+                // connection (a probe) would break a one-shot or per-connection receiver.
+                assert!(
+                    reader.read_line(&mut line).unwrap() > 0,
+                    "a webhook connection that carried no line"
+                );
                 lines.push(line);
             }
             lines

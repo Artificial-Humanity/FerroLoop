@@ -17,7 +17,7 @@ use fl_core::state::{
 };
 use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use fl_exec::stamp;
-use fl_wire::dispatcher::dispatch_operator_prompt_to_route;
+use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
 use fl_wire::identity::{RouteTable, VendorRoute, default_routes_path, legacy_routes_path};
 use serde::{Deserialize, Serialize};
 
@@ -682,8 +682,6 @@ pub(crate) enum Undeliverable {
     ProcessGone { pid: u32 },
     /// The webhook socket file does not exist.
     NoSocket,
-    /// The webhook socket refuses connections: nothing listens on it.
-    ConnectionRefused,
     /// No tmux pane or target the route names exists any more.
     PaneGone,
 }
@@ -693,8 +691,10 @@ pub(crate) enum Undeliverable {
 /// only that no cheap check proves it cannot.
 ///
 /// - Claude: the route's pid (when it names one) has no `/proc` entry.
-/// - Webhook: connecting to the socket fails with "not found" or "refused". A connection that
-///   succeeds is closed at once, so the receiver sees one empty connection before the delivery.
+/// - Webhook: the socket file does not exist. The check never connects: fl-wire's webhook
+///   contract is one connection per JSON line, so a probe connection would reach the receiver
+///   as a delivery. A socket that exists but refuses is found by the real push instead (see
+///   [`dispatch_with_rediscovery`]).
 /// - Muse, Grok: the route names tmux targets and none of them exists. fl-wire would then run
 ///   the vendor's headless CLI on the old session id instead.
 /// - Antigravity, Codex: no check; a stale route is bounded by [`lookup_route`] instead.
@@ -704,16 +704,10 @@ pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
             .exists())
         .then_some(Undeliverable::ProcessGone { pid: *pid }),
         VendorRoute::Claude { .. } | VendorRoute::Agy { .. } | VendorRoute::Codex { .. } => None,
-        VendorRoute::Webhook { socket_path } => {
-            match std::os::unix::net::UnixStream::connect(socket_path) {
-                Ok(_) => None,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Undeliverable::NoSocket),
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    Some(Undeliverable::ConnectionRefused)
-                }
-                Err(_) => None,
-            }
-        }
+        VendorRoute::Webhook { socket_path } => socket_path
+            .symlink_metadata()
+            .is_err()
+            .then_some(Undeliverable::NoSocket),
         VendorRoute::Muse {
             tmux_target,
             tmux_pane,
@@ -745,27 +739,39 @@ fn tmux_target_exists(target: &str) -> bool {
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
 }
 
-/// Run `send` once against the session's route; `None` when the session has no route.
+/// Send to the session's route; `None` when the session has no route.
 ///
-/// `send` runs at most once, so nothing it delivers is ever delivered again. A route from the
-/// saved table first passes the pre-delivery check ([`undeliverable`]). When the check refuses
-/// it, nothing has been sent: the host is scanned, the scan saved, and `send` runs on the route
-/// the scan found instead. When the scan finds the same route or none, `send` runs on the saved
-/// route, so the caller gets fl-wire's own refusal (or its headless fallback). A failure of
-/// `send` itself is returned as it is, never retried: by then part of the delivery may have
-/// landed.
+/// Nothing `send` delivers is ever delivered again. A route from the saved table first passes
+/// the pre-delivery check ([`undeliverable`]). When the check refuses it, nothing has been sent:
+/// the host is scanned, the scan saved, and `send` runs on the route the scan found instead.
+/// When the scan finds the same route or none, `send` runs on the saved route, so the caller
+/// gets fl-wire's own refusal (or its headless fallback).
+///
+/// `send` runs a second time only when its first run on a saved route failed with
+/// [`PushError::NotConnected`] (the receiver was never reached, so nothing was delivered) and a
+/// scan then finds a different route. Every other failure of `send` is returned as it is, never
+/// retried: by then part of the delivery may have landed.
 pub(crate) fn dispatch_with_rediscovery<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
-    send: impl FnOnce(&VendorRoute) -> Result<T, String>,
+    mut send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
 ) -> Option<Result<T, String>> {
-    let route = match lookup_route(home_override, query)? {
+    let (route, from_saved) = match lookup_route(home_override, query)? {
         RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
-            rescan_route(home_override, query).unwrap_or(saved)
+            (rescan_route(home_override, query).unwrap_or(saved), false)
         }
-        found => found.into_route(),
+        RouteLookup::Saved(saved) => (saved, true),
+        RouteLookup::Scanned(scanned) => (scanned, false),
     };
-    Some(send(&route))
+    Some(match send(&route) {
+        Err(PushError::NotConnected(refused)) if from_saved => {
+            match rescan_route(home_override, query).filter(|fresh| *fresh != route) {
+                Some(fresh) => send(&fresh).map_err(String::from),
+                None => Err(refused),
+            }
+        }
+        sent => sent.map_err(String::from),
+    })
 }
 
 /// Run `send` once on the route [`lookup_route`] finds, with no pre-delivery check and no second
@@ -791,7 +797,7 @@ fn deliver_prompt(
     dispatch_with_rediscovery(
         env.home_override,
         RouteQuery::persona(persona, session_id),
-        |route| dispatch_operator_prompt_to_route(route, by, prompt),
+        |route| push_operator_prompt_to_route(route, by, prompt),
     )
     .is_some_and(|delivered| delivered.is_ok())
 }

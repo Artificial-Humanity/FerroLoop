@@ -61,8 +61,8 @@ use fl_gate::{
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
-    MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
-    dispatch_to_route,
+    MAX_DELIVER, PushError, SessionResetMode, clear_or_reforge_session,
+    dispatch_operator_prompt_to_route, push_operator_prompt_to_route, push_to_route,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -1695,10 +1695,14 @@ fn handle_post_wire_send(
     drop(store);
 
     // The saved route table first, as fl-wire's dispatcher does. The host is scanned at most once
-    // per send, and the scan saved, when the saved table is older than fl-wire's
-    // `ROUTE_REDISCOVERY_INTERVAL`, when a recipient still to deliver has no route there, or when
-    // a saved route fails the pre-delivery check. Each recipient gets one push at most: a push
-    // that fails stays `Pending` and is never repeated here, since part of it may have landed.
+    // per send, and the scan saved, only when a recipient is still to deliver (fl-wire's rule:
+    // not acked or expired, under `MAX_DELIVER` attempts, a valid persona) and the saved table is
+    // older than fl-wire's `ROUTE_REDISCOVERY_INTERVAL`, a recipient has no route there, or a
+    // saved route fails the pre-delivery check or never reaches its receiver. Each recipient is
+    // delivered at most once: a push that fails stays `Pending` and is never repeated here,
+    // since part of it may have landed. The one exception is a push to a saved route that never
+    // reached its receiver (`PushError::NotConnected`): nothing was delivered, so it goes to the
+    // route a scan finds instead, when that route is different.
     let home = state.config.home_override.as_deref();
     let saved = RouteTable::load(crate::discovery::route_table_path(home).as_deref());
     let mut routes = saved.clone();
@@ -1707,12 +1711,16 @@ fn handle_post_wire_send(
         !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             && rcpt.attempts < MAX_DELIVER
     };
-    let missing_route = receipts.iter().any(|rcpt| {
-        deliverable(rcpt)
-            && normalize_persona(&rcpt.recipient_name).is_some()
-            && routes.get(&rcpt.recipient_name).is_none()
-    });
-    if missing_route || !crate::discovery::saved_routes_fresh(home, Instant::now()) {
+    let to_deliver: Vec<&DeliveryReceipt> = receipts
+        .iter()
+        .filter(|rcpt| deliverable(rcpt) && normalize_persona(&rcpt.recipient_name).is_some())
+        .collect();
+    let missing_route = to_deliver
+        .iter()
+        .any(|rcpt| routes.get(&rcpt.recipient_name).is_none());
+    if !to_deliver.is_empty()
+        && (missing_route || !crate::discovery::saved_routes_fresh(home, Instant::now()))
+    {
         scan_routes_once(&mut routes, home, &mut scan_started);
     }
     let mut any_updated = false;
@@ -1731,7 +1739,19 @@ fn handle_post_wire_send(
                 entry = fresh;
             }
         }
-        let target_status = match dispatch_to_route(&entry.route, &msg) {
+        let mut pushed = push_to_route(&entry.route, &msg);
+        if scan_started.is_none() && matches!(pushed, Err(PushError::NotConnected(_))) {
+            // The saved route's receiver was never reached, so nothing was delivered: scan once
+            // and push on the route the scan found, when it is a different one.
+            scan_routes_once(&mut routes, home, &mut scan_started);
+            if let Some(fresh) = routes
+                .get(&rcpt.recipient_name)
+                .filter(|fresh| fresh.route != entry.route)
+            {
+                pushed = push_to_route(&fresh.route, &msg);
+            }
+        }
+        let target_status = match pushed {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
@@ -4373,14 +4393,14 @@ fn no_route_error(persona: Option<&str>, fallback_session_id: &str) -> String {
     )
 }
 
-/// Run `send` once on the session's route; a saved route that fails the pre-delivery check is
-/// swapped for the one a rescan finds before anything is sent (see
+/// Send on the session's route; a saved route that fails the pre-delivery check, or whose
+/// receiver could not be reached at all, is swapped for the one a rescan finds (see
 /// [`crate::lifecycle::dispatch_with_rediscovery`]). The outer `Err` is the no-route error.
 fn dispatch_to_session_route<T>(
     state: &HubState,
     persona: Option<&str>,
     canonical_id: &str,
-    send: impl FnOnce(&fl_wire::identity::VendorRoute) -> Result<T, String>,
+    send: impl FnMut(&fl_wire::identity::VendorRoute) -> Result<T, PushError>,
 ) -> Result<Result<T, String>, String> {
     crate::lifecycle::dispatch_with_rediscovery(
         state.config.home_override.as_deref(),
@@ -4398,7 +4418,7 @@ fn dispatch_operator_prompt_for_session(
     effective_body: &str,
 ) -> Result<(), String> {
     dispatch_to_session_route(state, persona, fallback_session_id, |route| {
-        dispatch_operator_prompt_to_route(route, sender_name, effective_body)
+        push_operator_prompt_to_route(route, sender_name, effective_body)
     })?
 }
 
@@ -5031,6 +5051,7 @@ fn handle_post_session_interrupt(
                 .or_else(|| fl_wire::dispatcher::claude_route_live_pane(route));
             session_actions::interrupt_route(&env, route, pane.as_deref())
                 .map(|method| (method, route_vendor(route)))
+                .map_err(PushError::Failed)
         });
     let (method, vendor) = match interrupted {
         Ok(Ok(done)) => done,
