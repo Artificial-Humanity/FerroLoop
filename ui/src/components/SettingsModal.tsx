@@ -15,6 +15,13 @@ import {
   resolveSystemTheme,
   type ThemeMode,
 } from "../lib/accessibility";
+import {
+  CURRENCY_OPTIONS,
+  detectBrowserCurrency,
+  getActiveCurrency,
+  setActiveCurrency,
+  type CurrencyPreference,
+} from "../lib/currency";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
@@ -268,7 +275,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   authority,
   wsConnected = false,
   onlineNodesCount = 0,
-  activeCockpitTab,
   onSelectCockpitTab,
   onOpenNodesModal,
   onOpenSpinUpModal,
@@ -303,6 +309,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => new Set(),
   );
   const [settings, setSettings] = useState<HubSettings>(DEFAULT_HUB_SETTINGS);
+  const [currencyPref, setCurrencyPref] = useState<CurrencyPreference>(() =>
+    getActiveCurrency(),
+  );
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [pruningAttachments, setPruningAttachments] = useState(false);
@@ -449,6 +458,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setError(null);
     setLastResult(null);
     setSettingsSaved(false);
+    setCurrencyPref(getActiveCurrency());
     setPruneStatusMessage(null);
     setCloudAdaptersSaved(false);
     setRecastStatusBanner(null);
@@ -730,6 +740,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       const updated = await client.updateSettings(settings);
       setSettings(updated);
       setActiveTimeZone(updated.timezone);
+      setActiveCurrency(currencyPref);
       setSettingsSaved(true);
       onSettingsUpdated?.(updated);
     } catch (err) {
@@ -945,13 +956,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setSubmitting(false);
     }
   };
-
-  const systemViewTabs: Array<{ id: CockpitTab; label: string; testId: string }> = [
-    { id: "terminal", label: "Terminal", testId: "settings-open-terminal-btn" },
-    { id: "hub", label: "Hub & Arch", testId: "settings-open-hub-btn" },
-    { id: "gate", label: "Vault & Gate", testId: "settings-open-gate-btn" },
-    { id: "state", label: "FerroState", testId: "settings-open-state-btn" },
-  ];
 
   return (
     <div
@@ -1765,7 +1769,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 gap: "12px",
               }}
             >
-          {/* System Views & Fleet Nodes Launcher (moved from ContextHeader SYSTEM row) */}
+          {/* Fleet Nodes & Connectivity Launcher */}
           <div
             className="fd-card"
             data-testid="settings-system-views-bar"
@@ -1794,11 +1798,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     letterSpacing: "0.04em",
                   }}
                 >
-                  System Consoles &amp; Fleet Nodes
+                  Fleet Nodes &amp; Connectivity
                 </h3>
                 <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
-                  Open system-level FerroLoop consoles or inspect enrolled compute
-                  nodes.
+                  Inspect and enroll federated compute nodes and check live hub
+                  connectivity.
                 </span>
               </div>
               <span
@@ -1813,27 +1817,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-              {systemViewTabs.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  data-testid={item.testId}
-                  className={`fd-btn${activeCockpitTab === item.id ? " fd-btn-active" : ""}`}
-                  onClick={() => {
-                    onSelectCockpitTab?.(item.id);
-                    onClose();
-                  }}
-                >
-                  {item.label}
-                </button>
-              ))}
               <button
                 type="button"
                 data-testid="settings-open-nodes-btn"
                 className="fd-btn"
                 onClick={() => {
                   onOpenNodesModal?.();
-                  onClose();
                 }}
               >
                 <span
@@ -1954,6 +1943,57 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 {TIMEZONE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>
                     {opt.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Local Currency */}
+            <div
+              data-testid="settings-currency-row"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: "12.5px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Local Currency
+                </h3>
+                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                  Format spend and cost telemetry across Records &amp; Board,
+                  FerroWatch, and Hub consoles (auto-detected from browser
+                  locale and time zone by default).
+                </span>
+              </div>
+              <select
+                aria-label="Local Currency"
+                data-testid="settings-currency-select"
+                className="fd-select fd-mono"
+                value={currencyPref}
+                onChange={(e) => {
+                  const next = setActiveCurrency(e.target.value);
+                  setCurrencyPref(next);
+                  setSettingsSaved(false);
+                }}
+                style={{ fontSize: "12px", padding: "5px 10px" }}
+              >
+                {CURRENCY_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.value === "auto"
+                      ? `Auto-Detect (${detectBrowserCurrency()})`
+                      : opt.label}
                   </option>
                 ))}
               </select>

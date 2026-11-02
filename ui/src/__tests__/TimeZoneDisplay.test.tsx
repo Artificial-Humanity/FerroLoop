@@ -18,17 +18,29 @@ import {
   normalizeTimeZone,
   setActiveTimeZone,
 } from "../lib/datetime";
+import {
+  detectBrowserCurrency,
+  formatCurrencyFromMicros,
+  formatCurrencyFromUsd,
+  getActiveCurrency,
+  resolveCurrencyCode,
+  setActiveCurrency,
+} from "../lib/currency";
+import { formatUsdFromMicros as formatWatchMicros } from "../components/FerroWatchPane";
+import { formatUsdFromMicros as formatHubMicros } from "../components/HubDrawer";
 import { DEFAULT_HUB_SETTINGS, type HubSettings } from "../types/api";
 
 describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
   beforeEach(() => {
     window.localStorage.clear();
     setActiveTimeZone("UTC");
+    setActiveCurrency("auto");
   });
 
   afterEach(() => {
     window.localStorage.clear();
     setActiveTimeZone("UTC");
+    setActiveCurrency("auto");
   });
 
   it("normalizes timezones and formats UTC, IANA zones, local, and non-date strings cleanly", () => {
@@ -272,6 +284,21 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     const historyBtn = await screen.findByTestId("artifact-history-toggle");
     fireEvent.click(historyBtn);
 
+    // Persistent section titles remain visible alongside loaded artifact filename
+    expect(screen.getByTestId("artifact-pane-title")).toHaveTextContent(
+      "Artifacts & Documents",
+    );
+    expect(screen.getByTestId("artifact-filename")).toHaveTextContent("spec.md");
+    expect(screen.getByTestId("wire-mail-pane-title")).toHaveTextContent(
+      "FerroWire Mail",
+    );
+    expect(screen.getByTestId("wire-compose-form")).toHaveTextContent(
+      "Compose Message",
+    );
+    expect(screen.getByTestId("wire-compose-form")).not.toHaveTextContent(
+      "Compose FerroWire Message",
+    );
+
     // Initially in UTC
     expect(screen.getAllByText(isoUtc).length).toBeGreaterThanOrEqual(4);
     expect(await screen.findByText("2026-10-27 14:30:00 UTC")).toBeInTheDocument();
@@ -371,6 +398,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     const onSelectCockpitTab = vi.fn();
+    const onOpenNodesModal = vi.fn();
     const onClose = vi.fn();
 
     render(
@@ -397,6 +425,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
           },
         ]}
         onSelectCockpitTab={onSelectCockpitTab}
+        onOpenNodesModal={onOpenNodesModal}
       />,
     );
 
@@ -436,11 +465,15 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     fireEvent.click(screen.getByTestId("recast-cancel-btn-felix"));
     expect(screen.queryByTestId("recast-modal")).toBeNull();
 
-    // Switch to System tab and launch Vault & Gate console
+    // Switch to System tab and launch Nodes modal without closing SettingsModal
     fireEvent.click(screen.getByTestId("settings-tab-system"));
-    fireEvent.click(screen.getByTestId("settings-open-gate-btn"));
-    expect(onSelectCockpitTab).toHaveBeenCalledWith("gate");
-    expect(onClose).toHaveBeenCalled();
+    expect(screen.queryByTestId("settings-open-terminal-btn")).toBeNull();
+    expect(screen.queryByTestId("settings-open-hub-btn")).toBeNull();
+    expect(screen.queryByTestId("settings-open-gate-btn")).toBeNull();
+    expect(screen.queryByTestId("settings-open-state-btn")).toBeNull();
+    fireEvent.click(screen.getByTestId("settings-open-nodes-btn"));
+    expect(onOpenNodesModal).toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
 
     // Multi-select checkboxes and Select All / Clear Selection update bulk action labels
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
@@ -728,5 +761,85 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
       expect(recastRequests[1].body.replace_lead).toBe(false);
       expect(recastRequests[1].body.create_area).toBe(true);
     });
+  });
+
+  it("auto-detects local currency from browser locale and timeZone, formats currency conversions cleanly, and persists Local Currency in SettingsModal without mutating PUT /api/v1/settings payload", async () => {
+    expect(detectBrowserCurrency({ languages: ["en-GB"], timeZone: "UTC" })).toBe("GBP");
+    expect(detectBrowserCurrency({ languages: ["de-DE"], timeZone: "UTC" })).toBe("EUR");
+    expect(detectBrowserCurrency({ languages: ["ja-JP"], timeZone: "UTC" })).toBe("JPY");
+    expect(detectBrowserCurrency({ languages: ["fr-CA"], timeZone: "UTC" })).toBe("CAD");
+    expect(detectBrowserCurrency({ languages: ["en-AU"], timeZone: "UTC" })).toBe("AUD");
+    expect(detectBrowserCurrency({ languages: ["pt-BR"], timeZone: "UTC" })).toBe("BRL");
+    // When browser language is default en-US, non-US IANA timeZone fallback wins
+    expect(
+      detectBrowserCurrency({ languages: ["en-US"], timeZone: "Europe/London" }),
+    ).toBe("GBP");
+    expect(
+      detectBrowserCurrency({ languages: ["en-US"], timeZone: "Europe/Paris" }),
+    ).toBe("EUR");
+    expect(
+      detectBrowserCurrency({ languages: ["en-US"], timeZone: "Asia/Tokyo" }),
+    ).toBe("JPY");
+    expect(
+      detectBrowserCurrency({ languages: ["en-US"], timeZone: "America/New_York" }),
+    ).toBe("USD");
+
+    expect(formatCurrencyFromUsd(10, "USD")).toBe("$10.00");
+    expect(formatCurrencyFromUsd(10, "EUR")).toBe("€9.20");
+    expect(formatCurrencyFromUsd(10, "GBP")).toBe("£7.90");
+    expect(formatCurrencyFromUsd(10, "JPY")).toBe("¥1,520");
+    expect(formatCurrencyFromMicros(2_500_000, "USD")).toBe("$2.50");
+    expect(formatWatchMicros(2_500_000, "EUR")).toBe("€2.30");
+    expect(formatHubMicros(2_500_000, "USD")).toBe("$2.5000");
+
+    let savedPayload: Record<string, unknown> | null = null;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.endsWith("/api/v1/settings") && method === "GET") {
+        return json(DEFAULT_HUB_SETTINGS);
+      }
+      if (url.endsWith("/api/v1/settings") && method === "PUT") {
+        savedPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return json(savedPayload);
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        initialTab="system"
+        apiClient={apiClient}
+      />,
+    );
+
+    const currencyRow = await screen.findByTestId("settings-currency-row");
+    expect(currencyRow).toBeInTheDocument();
+    const currencySelect = screen.getByTestId(
+      "settings-currency-select",
+    ) as HTMLSelectElement;
+    expect(currencySelect.value).toBe("auto");
+
+    fireEvent.change(currencySelect, { target: { value: "GBP" } });
+    expect(getActiveCurrency()).toBe("GBP");
+    expect(resolveCurrencyCode()).toBe("GBP");
+
+    fireEvent.click(screen.getByTestId("save-settings-btn"));
+    expect(await screen.findByTestId("settings-saved-banner")).toHaveTextContent(
+      /Settings saved/i,
+    );
+    expect(savedPayload).not.toBeNull();
+    expect(savedPayload).not.toHaveProperty("currency");
   });
 });

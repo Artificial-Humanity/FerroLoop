@@ -709,6 +709,7 @@ export interface WorktreeSummary {
   path: string;
   head: string;
   branch?: string | null;
+  project?: string | null;
   dirty_files: string[];
   is_clean: boolean;
 }

@@ -1933,6 +1933,7 @@ export const App: React.FC<AppProps> = ({
       case "git":
         return (
           <GitPrPane
+            selectedProject={selectedAgent?.project ?? null}
             worktrees={worktrees}
             selectedWorktreeId={selectedWorktreeId}
             worktreeDiff={worktreeDiff}
@@ -2216,118 +2217,122 @@ export const App: React.FC<AppProps> = ({
 
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
-      <RosterSidebar
-        agents={agents}
-        routes={mergedRoutes}
-        sessions={sessions}
-        liveness={liveness}
-        unreadByAgent={unreadByAgent}
-        unreadSeverityByAgent={unreadSeverityByAgent}
-        busyByAgent={effectiveBusyByAgent}
-        contextUsageByAgent={effectiveContextUsageByAgent}
-        transcriptsByAgent={transcriptsByAgent}
-        selectedAgentName={selectedAgent?.name_key ?? null}
-        onSelectAgent={(nameKey) => {
-          const nextKey = nameKey.trim().toLowerCase();
-          if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
-            selectedAgentNameRef.current = nameKey;
-            selectedSessionIdRef.current = null;
-            setTranscriptTurns(
-              preserveOptimisticTurn(
-                backgroundTranscriptsRef.current[nextKey] ?? [],
-                optimisticPromptRef.current,
-                Date.now(),
-                nextKey,
-              ),
-            );
+      <ContextHeader
+        selectedAgent={selectedAgent}
+        sessions={mergedRoutes}
+        selectedSessionId={activeSession?.id ?? null}
+        onSelectSession={(sessionId) => {
+          if (sessionId !== selectedSessionIdRef.current) {
+            selectedSessionIdRef.current = sessionId;
+            setTranscriptTurns([]);
             setSessionQueue([]);
             setIsSessionBusy(false);
-            setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
+            setSessionContextUsage(null);
             setSessionQuotaUsage(null);
           }
-          setSelectedAgentName(nameKey);
-          setSelectedSessionId(null);
-          setMobileRosterOpen(false);
-          void refreshSessionsAndTranscript();
+          setSelectedSessionId(sessionId);
+          void refreshSessionsAndTranscript(sessionId);
         }}
-        onOpenAgentSettings={(nameKey) => handleOpenAgentSettingsFor(nameKey)}
-        onOpenProjectSettings={(project) => {
-          setSettingsInitialProject(project);
-          setSettingsModalOpen(true);
-        }}
+        activeTab={activeTab}
+        onSelectTab={handleSelectTab}
+        splitView={splitView}
+        onToggleSplitView={handleToggleSplitView}
+        themeMode={themeMode}
+        onToggleTheme={handleToggleTheme}
+        authority={authority}
+        wsConnected={wsConnected}
+        onlineNodesCount={onlineNodesCount}
+        onOpenNodesModal={() => setNodesModalOpen(true)}
         onOpenSettingsModal={() => {
           setSettingsInitialProject(null);
           setSettingsModalOpen(true);
         }}
-        onOpenHelpModal={() => {
-          setHelpTopic(activeTab);
+        onOpenHelpModal={(tab) => {
+          setHelpTopic(tab ?? activeTab);
           setHelpDrawerOpen(true);
         }}
-        themeMode={themeMode}
-        onToggleTheme={handleToggleTheme}
+        onOpenAgentSettings={() => handleOpenAgentSettingsFor()}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
-        isOpen={mobileRosterOpen}
-        isCollapsedDesktop={desktopSidebarCollapsed}
-        onClose={() => {
-          setMobileRosterOpen(false);
-          setDesktopSidebarCollapsed(true);
-        }}
-        leftPanelTab={leftPanelTab}
-        onSelectLeftPanelTab={handleSelectLeftPanelTab}
-        consoleContent={
-          leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
+        onOpenPairingModal={() => setPairingOpen(true)}
+        onLogout={handleLogout}
+        onOpenMobileRoster={handleToggleLeftSidebar}
+        mobileSidebarOpen={leftSidebarOpen}
+        leftPanelWidth={
+          leftSidebarOpen && !isMobileViewport ? effectiveLeftWidth : undefined
         }
-        width={effectiveLeftWidth}
-        onResizeStart={handleLeftResizeStart}
       />
 
-      <div className="fd-main">
-        <ContextHeader
-          selectedAgent={selectedAgent}
-          sessions={mergedRoutes}
-          selectedSessionId={activeSession?.id ?? null}
-          onSelectSession={(sessionId) => {
-            if (sessionId !== selectedSessionIdRef.current) {
-              selectedSessionIdRef.current = sessionId;
-              setTranscriptTurns([]);
+      <div className="fd-cockpit-body" data-testid="cockpit-body">
+        <RosterSidebar
+          agents={agents}
+          routes={mergedRoutes}
+          sessions={sessions}
+          liveness={liveness}
+          unreadByAgent={unreadByAgent}
+          unreadSeverityByAgent={unreadSeverityByAgent}
+          busyByAgent={effectiveBusyByAgent}
+          contextUsageByAgent={effectiveContextUsageByAgent}
+          transcriptsByAgent={transcriptsByAgent}
+          selectedAgentName={selectedAgent?.name_key ?? null}
+          onSelectAgent={(nameKey) => {
+            const nextKey = nameKey.trim().toLowerCase();
+            if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+              selectedAgentNameRef.current = nameKey;
+              selectedSessionIdRef.current = null;
+              setTranscriptTurns(
+                preserveOptimisticTurn(
+                  backgroundTranscriptsRef.current[nextKey] ?? [],
+                  optimisticPromptRef.current,
+                  Date.now(),
+                  nextKey,
+                ),
+              );
               setSessionQueue([]);
               setIsSessionBusy(false);
-              setSessionContextUsage(null);
+              setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
               setSessionQuotaUsage(null);
             }
-            setSelectedSessionId(sessionId);
-            void refreshSessionsAndTranscript(sessionId);
+            setSelectedAgentName(nameKey);
+            setSelectedSessionId(null);
+            setMobileRosterOpen(false);
+            void refreshSessionsAndTranscript();
           }}
-          activeTab={activeTab}
-          onSelectTab={handleSelectTab}
-          splitView={splitView}
-          onToggleSplitView={handleToggleSplitView}
-          themeMode={themeMode}
-          onToggleTheme={handleToggleTheme}
-          authority={authority}
-          wsConnected={wsConnected}
-          onlineNodesCount={onlineNodesCount}
-          onOpenNodesModal={() => setNodesModalOpen(true)}
+          onOpenAgentSettings={(nameKey) => handleOpenAgentSettingsFor(nameKey)}
+          onOpenProjectSettings={(project) => {
+            setSettingsInitialProject(project);
+            setSettingsModalOpen(true);
+          }}
           onOpenSettingsModal={() => {
             setSettingsInitialProject(null);
             setSettingsModalOpen(true);
           }}
-          onOpenHelpModal={(tab) => {
-            setHelpTopic(tab ?? activeTab);
+          onOpenHelpModal={() => {
+            setHelpTopic(activeTab);
             setHelpDrawerOpen(true);
           }}
-          onOpenAgentSettings={() => handleOpenAgentSettingsFor()}
+          themeMode={themeMode}
+          onToggleTheme={handleToggleTheme}
           onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
-          onOpenPairingModal={() => setPairingOpen(true)}
-          onLogout={handleLogout}
-          onOpenMobileRoster={handleToggleLeftSidebar}
-          mobileSidebarOpen={leftSidebarOpen}
+          isOpen={mobileRosterOpen}
+          isCollapsedDesktop={desktopSidebarCollapsed}
+          onClose={() => {
+            setMobileRosterOpen(false);
+            setDesktopSidebarCollapsed(true);
+          }}
+          leftPanelTab={leftPanelTab}
+          onSelectLeftPanelTab={handleSelectLeftPanelTab}
+          consoleContent={
+            leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
+          }
+          width={effectiveLeftWidth}
+          onResizeStart={handleLeftResizeStart}
         />
 
-        <main
-          className={`fd-workspace${splitView ? " is-split" : ""}`}
-          data-testid="cockpit-workspace"
-        >
+        <div className="fd-main">
+          <main
+            className={`fd-workspace${splitView ? " is-split" : ""}`}
+            data-testid="cockpit-workspace"
+          >
           <ChatPane
             agentName={selectedAgent?.name_key ?? null}
             agentDisplayName={selectedAgent?.display_name ?? null}
@@ -2418,7 +2423,8 @@ export const App: React.FC<AppProps> = ({
               </div>
             </>
           )}
-        </main>
+          </main>
+        </div>
       </div>
 
       <PairingModal
@@ -2437,22 +2443,6 @@ export const App: React.FC<AppProps> = ({
         }}
         apiClient={apiClient}
         error={pairingError}
-      />
-
-      <NodesModal
-        isOpen={nodesModalOpen}
-        onClose={() => setNodesModalOpen(false)}
-        nodes={nodes}
-        onRefreshNodes={refreshNodes}
-        onCreateEnrollToken={(label, ttlSecs) =>
-          apiClient.createNodeEnrollToken(label, ttlSecs)
-        }
-        onRevokeNode={async (nodeId) => {
-          await apiClient.revokeNode(nodeId);
-          setNodes((prev) => prev.filter((n) => n.node_id !== nodeId));
-          await refreshNodes();
-        }}
-        apiClient={apiClient}
       />
 
       <SpinUpAgentModal
@@ -2518,6 +2508,22 @@ export const App: React.FC<AppProps> = ({
           if (updated.timezone) {
             setActiveTimeZone(updated.timezone);
           }
+        }}
+        apiClient={apiClient}
+      />
+
+      <NodesModal
+        isOpen={nodesModalOpen}
+        onClose={() => setNodesModalOpen(false)}
+        nodes={nodes}
+        onRefreshNodes={refreshNodes}
+        onCreateEnrollToken={(label, ttlSecs) =>
+          apiClient.createNodeEnrollToken(label, ttlSecs)
+        }
+        onRevokeNode={async (nodeId) => {
+          await apiClient.revokeNode(nodeId);
+          setNodes((prev) => prev.filter((n) => n.node_id !== nodeId));
+          await refreshNodes();
         }}
         apiClient={apiClient}
       />

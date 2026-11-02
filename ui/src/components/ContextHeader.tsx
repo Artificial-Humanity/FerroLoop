@@ -32,6 +32,7 @@ export interface ContextHeaderProps {
   onLogout?: () => void;
   onOpenMobileRoster?: () => void;
   mobileSidebarOpen?: boolean;
+  leftPanelWidth?: number;
 }
 
 export const COCKPIT_TABS: Array<{ id: CockpitTab; label: string }> = [
@@ -216,12 +217,6 @@ export const RightPanelHeader: React.FC<RightPanelHeaderProps> = ({
   );
   const activeLabel =
     COCKPIT_TABS.find((t) => t.id === effectiveTab)?.label ?? effectiveTab;
-  const contextSubtitle =
-    effectiveTab === "mail"
-      ? (selectedAgent?.display_name ?? "Agent")
-      : getTabContextTier(effectiveTab) === "project"
-        ? (selectedAgent?.project ?? "Workspace")
-        : "AI-Lab-0";
 
   return (
     <div
@@ -277,41 +272,22 @@ export const RightPanelHeader: React.FC<RightPanelHeaderProps> = ({
           })}
         </div>
 
-        <span className="fd-tier-divider" style={{ height: "18px" }} aria-hidden="true" />
-
-        <div
+        <span
+          data-testid="right-panel-active-title"
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            minWidth: 0,
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
             overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
           }}
         >
-          <span
-            data-testid="right-panel-active-title"
-            style={{
-              fontWeight: 600,
-              fontSize: "12.5px",
-              color: "var(--text-primary)",
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
-          >
-            {activeLabel}
-          </span>
-          <span
-            className="fd-badge"
-            style={{
-              fontSize: "10.5px",
-              whiteSpace: "nowrap",
-              flexShrink: 0,
-            }}
-          >
-            {contextSubtitle}
-          </span>
-        </div>
+          {activeLabel}
+        </span>
       </div>
 
       {onClose && (
@@ -372,6 +348,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onLogout,
   onOpenMobileRoster,
   mobileSidebarOpen = false,
+  leftPanelWidth,
 }) => {
   const agentSessions = React.useMemo(() => {
     if (!selectedAgent) return sessions;
@@ -450,48 +427,108 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           {scopeBannerText}
         </span>
 
-        {onOpenMobileRoster && (
-          <button
-            type="button"
-            className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
-            onClick={onOpenMobileRoster}
-            aria-label="Toggle Agent Roster"
-            title="Toggle Agent Roster"
-            aria-expanded={Boolean(mobileSidebarOpen)}
-            aria-pressed={Boolean(mobileSidebarOpen)}
-            data-testid="mobile-sidebar-toggle-btn"
-            style={{ flexShrink: 0 }}
+        <div
+          data-testid="header-left-group"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+            flexShrink: 0,
+            ...(leftPanelWidth
+              ? { minWidth: `${Math.max(0, leftPanelWidth - 26)}px` }
+              : {}),
+          }}
+        >
+          {onOpenMobileRoster && (
+            <button
+              type="button"
+              className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
+              onClick={onOpenMobileRoster}
+              aria-label="Toggle Agent Roster"
+              title="Toggle Agent Roster"
+              aria-expanded={Boolean(mobileSidebarOpen)}
+              aria-pressed={Boolean(mobileSidebarOpen)}
+              data-testid="mobile-sidebar-toggle-btn"
+              style={{ flexShrink: 0 }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect
+                  x="1.5"
+                  y="2.5"
+                  width="13"
+                  height="11"
+                  rx="2"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <line
+                  x1="6.5"
+                  y1="2.5"
+                  x2="6.5"
+                  y2="13.5"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <rect
+                  x="2.2"
+                  y="3.2"
+                  width="3.6"
+                  height="9.6"
+                  rx="0.8"
+                  fill="currentColor"
+                  fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
+                />
+              </svg>
+            </button>
+          )}
+
+          <div
+            data-testid="ferrodeck-brand"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "7px",
+              flexShrink: 0,
+            }}
           >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect
-                x="1.5"
-                y="2.5"
-                width="13"
-                height="11"
-                rx="2"
-                stroke="currentColor"
-                strokeWidth="1.4"
+            <svg
+              data-testid="ferrodeck-brand-icon"
+              width="18"
+              height="18"
+              viewBox="0 0 20 20"
+              fill="none"
+              aria-hidden="true"
+              style={{ flexShrink: 0 }}
+            >
+              <polygon
+                points="10 1.8 17.6 6.2 17.6 13.8 10 18.2 2.4 13.8 2.4 6.2"
+                fill="var(--accent-subtle)"
+                stroke="var(--accent-primary)"
+                strokeWidth="1.5"
+                strokeLinejoin="round"
               />
-              <line
-                x1="6.5"
-                y1="2.5"
-                x2="6.5"
-                y2="13.5"
-                stroke="currentColor"
+              <path
+                d="M6.2 8.2L10 6L13.8 8.2M6.2 11.8L10 14L13.8 11.8M10 6V14"
+                stroke="var(--accent-hover)"
                 strokeWidth="1.4"
-              />
-              <rect
-                x="2.2"
-                y="3.2"
-                width="3.6"
-                height="9.6"
-                rx="0.8"
-                fill="currentColor"
-                fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
+                strokeLinecap="round"
+                strokeLinejoin="round"
               />
             </svg>
-          </button>
-        )}
+            <span
+              data-testid="ferrodeck-brand-title"
+              style={{
+                fontWeight: 700,
+                fontSize: "14px",
+                letterSpacing: "-0.01em",
+                color: "var(--text-primary)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              FerroDeck
+            </span>
+          </div>
+        </div>
 
         {/* Tier 1: Agent Context */}
         <div

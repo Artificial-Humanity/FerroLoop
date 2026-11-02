@@ -1512,9 +1512,18 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           backgroundColor: "var(--bg-surface)",
         }}
       >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+          <strong
+            data-testid="artifact-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            Artifacts &amp; Documents
+          </strong>
+        </div>
+
         <div
           style={{
-            display: "flex",
+            display: artifact ? "flex" : "none",
             alignItems: "center",
             justifyContent: "space-between",
             gap: "8px",
@@ -1524,9 +1533,9 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0, flexWrap: "wrap" }}>
             <span
               data-testid="artifact-filename"
-              style={{ fontWeight: 700, fontSize: "14px", color: "var(--text-primary)" }}
+              style={{ fontWeight: 700, fontSize: "13px", color: "var(--text-primary)" }}
             >
-              {artifact ? artifact.name : "Artifacts & Documents"}
+              {artifact ? artifact.name : ""}
             </span>
             {artifact && (
               <>

@@ -138,6 +138,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(header).getByTestId("right-panel-active-title")).toHaveTextContent(
       "Git & PRs",
     );
+    expect(within(header).queryByText("FerroLoop")).toBeNull();
 
     // When selectedAgent is null, Wire Mail is hidden and 'mail' falls back to 'artifacts'
     rerender(
@@ -208,9 +209,12 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.queryByTestId("chat-artifacts-toggle-btn")).toBeNull();
     const tabBar = screen.getByTestId("cockpit-tab-bar");
     const rosterToggleBtn = within(tabBar).getByTestId("mobile-sidebar-toggle-btn");
+    const brandEl = within(tabBar).getByTestId("ferrodeck-brand");
+    const leftGroup = within(tabBar).getByTestId("header-left-group");
     const agentNav = within(tabBar).getByTestId("tier-agent-nav");
     const splitToggleBtn = within(tabBar).getByTestId("split-view-toggle");
-    expect(rosterToggleBtn.nextElementSibling).toBe(agentNav);
+    expect(rosterToggleBtn.nextElementSibling).toBe(brandEl);
+    expect(leftGroup.nextElementSibling).toBe(agentNav);
     expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
 
     const chatPane = screen.getByTestId("chat-pane");
@@ -277,14 +281,23 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     // Bottom text mobile-bottom-nav is removed
     expect(screen.queryByTestId("mobile-bottom-nav")).toBeNull();
 
-    // Left panel header defaults to Agent Roster (326px minimum width)
-    const sidebar = screen.getByTestId("roster-sidebar");
+    // Left panel header defaults to Agent Roster (326px minimum width), stepped down inside cockpit-body below ContextHeader
+    expect(screen.getByTestId("ferrodeck-brand")).toBeInTheDocument();
+    expect(screen.getByTestId("ferrodeck-brand-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("ferrodeck-brand-title")).toHaveTextContent(
+      "FerroDeck",
+    );
+    const cockpitBody = screen.getByTestId("cockpit-body");
+    const sidebar = within(cockpitBody).getByTestId("roster-sidebar");
     const leftHeader = within(sidebar).getByTestId("left-panel-header");
     expect(within(leftHeader).getByTestId("left-panel-tab-roster")).toHaveAttribute(
       "aria-selected",
       "true",
     );
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Agent Roster",
+    );
+    expect(within(sidebar).getByTestId("left-panel-pane-title")).toHaveTextContent(
       "Agent Roster",
     );
     expect(sidebar.style.width).toBe("326px");
@@ -313,6 +326,9 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
       "Hub & Arch",
     );
+    expect(within(sidebar).getByTestId("hub-pane-title")).toHaveTextContent(
+      "Hub & Architecture",
+    );
     expect(within(sidebar).getByTestId("left-panel-console-body")).toBeInTheDocument();
     expect(within(sidebar).getByTestId("roster-global-controls")).toBeInTheDocument();
     expect(sidebar.style.width).toBe("440px");
@@ -322,8 +338,14 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
       "Vault & Gate",
     );
+    expect(within(sidebar).getByTestId("vault-gate-pane-title")).toHaveTextContent(
+      "Vault & Connectors",
+    );
     fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-state"));
     expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "FerroState",
+    );
+    expect(within(sidebar).getByTestId("ferrostate-pane-title")).toHaveTextContent(
       "FerroState",
     );
     fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-roster"));

@@ -1,9 +1,10 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { RecordsBoardPane } from "../components/RecordsBoardPane";
+import { setActiveCurrency } from "../lib/currency";
 import type {
   ProjectRecordItem,
   RecordState,
@@ -106,6 +107,54 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
     expect(metricsStrip).toHaveTextContent(/Completion:\s*33%/i);
     expect(metricsStrip).toHaveTextContent(/Open Findings:\s*2/i);
     expect(metricsStrip).toHaveTextContent(/Attempts:\s*14/i);
+    expect(metricsStrip).toHaveTextContent(/Cost:\s*\$1\.85/i);
+
+    const countsGroup = screen.getByTestId("board-metrics-counts-group");
+    expect(countsGroup).toHaveTextContent(/Todo:\s*1/i);
+    expect(countsGroup).toHaveTextContent(/Doing:\s*1/i);
+    expect(countsGroup).toHaveTextContent(/Done:\s*1/i);
+    expect(countsGroup).toHaveTextContent(/Total:\s*3/i);
+    expect(countsGroup.style.display).toBe("grid");
+    expect(countsGroup.style.gridTemplateColumns).toBe(
+      "repeat(4, minmax(0, 1fr))",
+    );
+    expect(countsGroup.style.gridColumn).toBe("1 / -1");
+
+    const completionFindingsGroup = screen.getByTestId(
+      "board-metrics-completion-findings-group",
+    );
+    expect(completionFindingsGroup).toHaveTextContent(/Completion:\s*33%/i);
+    expect(completionFindingsGroup).toHaveTextContent(/Open Findings:\s*2/i);
+    expect(completionFindingsGroup.style.display).toBe("grid");
+    expect(completionFindingsGroup.style.gridTemplateColumns).toBe(
+      "repeat(4, minmax(0, 1fr))",
+    );
+    expect(completionFindingsGroup.style.gridColumn).toBe("1 / -1");
+    Array.from(completionFindingsGroup.children).forEach((badge) => {
+      expect((badge as HTMLElement).style.gridColumn).toBe("span 2");
+    });
+
+    const attemptsCostGroup = screen.getByTestId(
+      "board-metrics-attempts-cost-group",
+    );
+    expect(attemptsCostGroup).toHaveTextContent(/Attempts:\s*14/i);
+    expect(attemptsCostGroup).toHaveTextContent(/Cost:\s*\$1\.85/i);
+    expect(attemptsCostGroup.style.display).toBe("grid");
+    expect(attemptsCostGroup.style.gridTemplateColumns).toBe(
+      "repeat(4, minmax(0, 1fr))",
+    );
+    expect(attemptsCostGroup.style.gridColumn).toBe("1 / -1");
+    Array.from(attemptsCostGroup.children).forEach((badge) => {
+      expect((badge as HTMLElement).style.gridColumn).toBe("span 2");
+    });
+
+    act(() => {
+      setActiveCurrency("EUR");
+    });
+    expect(attemptsCostGroup).toHaveTextContent(/Cost:\s*€1\.70/i);
+    act(() => {
+      setActiveCurrency("USD");
+    });
     expect(screen.getByTestId("board-completion-bar")).toHaveAttribute(
       "aria-valuenow",
       "33",

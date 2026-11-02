@@ -35,7 +35,7 @@ function QuotaWindowBar({ win, label, ariaLabel, testId }: QuotaWindowBarProps) 
       style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
     >
       <span>
-        {label}: {remaining}% left
+        {label}: {remaining}%
       </span>
       <span
         role="progressbar"
@@ -88,6 +88,7 @@ export function QuotaUsageBadge({ quota }: { quota: SessionQuotaUsage }) {
         gap: "8px",
         padding: "4px 8px",
         flexWrap: "wrap",
+        minWidth: 0,
         borderColor: exhausted
           ? "var(--diff-del-border, rgba(239, 68, 68, 0.45))"
           : "var(--border-subtle)",

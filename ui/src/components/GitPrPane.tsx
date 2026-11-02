@@ -16,6 +16,7 @@ export type GitSubView = "worktrees" | "prs";
 export type GovernanceFormVerdict = "approved" | "changes_requested" | "commented";
 
 export interface GitPrPaneProps {
+  selectedProject?: string | null;
   worktrees?: WorktreeSummary[];
   selectedWorktreeId?: string | null;
   worktreeDiff?: WorktreeDiff | null;
@@ -122,6 +123,7 @@ export function parsePrNumber(raw: string): number | null {
 }
 
 export const GitPrPane: React.FC<GitPrPaneProps> = ({
+  selectedProject,
   worktrees,
   selectedWorktreeId,
   worktreeDiff,
@@ -347,6 +349,10 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
   }, []);
 
   const isNarrow = paneWidth < 680;
+  const activeProjectLabel =
+    (selectedProject ?? "").trim() ||
+    effectiveWorktrees[0]?.project ||
+    "ferroloop";
 
   return (
     <section ref={paneRef} className="fd-pane" data-testid="git-pr-pane">
@@ -354,48 +360,72 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
       <div
         style={{
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: "8px",
+          flexDirection: "column",
+          gap: "6px",
           padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
           minWidth: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+          <strong
+            data-testid="git-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            {subView === "worktrees" ? "Worktrees & Diffs" : "Pull Requests & Governance"}
+          </strong>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
+            <select
+              aria-label="Git view mode"
+              data-testid="git-subview-select"
+              className="fd-select"
+              value={subView}
+              onChange={(e) => setSubView(e.target.value as GitSubView)}
+              style={{ fontSize: "12px", padding: "5px 10px", minWidth: 0, maxWidth: "100%" }}
+            >
+              <option value="worktrees">
+                Worktrees &amp; Diffs ({effectiveWorktrees.length})
+              </option>
+              <option value="prs">
+                Pull Requests &amp; Governance ({effectivePrs.length})
+              </option>
+            </select>
+          </div>
+
           <button
             type="button"
-            className={`fd-btn ${subView === "worktrees" ? "fd-btn-active" : ""}`}
-            aria-pressed={subView === "worktrees"}
-            onClick={() => setSubView("worktrees")}
+            className="fd-btn"
+            onClick={handleRefresh}
+            disabled={effectiveLoading}
           >
-            Worktrees & Diffs ({effectiveWorktrees.length})
-          </button>
-          <button
-            type="button"
-            className={`fd-btn ${subView === "prs" ? "fd-btn-active" : ""}`}
-            aria-pressed={subView === "prs"}
-            onClick={() => setSubView("prs")}
-            style={
-              effectivePrs.length === 0 && subView !== "prs"
-                ? { opacity: 0.65 }
-                : undefined
-            }
-          >
-            Pull Requests & Governance ({effectivePrs.length})
+            {effectiveLoading ? "Refreshing..." : "Refresh"}
           </button>
         </div>
 
-        <button
-          type="button"
-          className="fd-btn"
-          onClick={handleRefresh}
-          disabled={effectiveLoading}
-        >
-          {effectiveLoading ? "Refreshing..." : "Refresh"}
-        </button>
+        {subView === "worktrees" && (
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <span
+              className="fd-badge"
+              data-testid="git-worktrees-project-badge"
+              style={{ fontSize: "10.5px", whiteSpace: "nowrap" }}
+            >
+              {activeProjectLabel}
+            </span>
+          </div>
+        )}
       </div>
 
       {effectiveError && (

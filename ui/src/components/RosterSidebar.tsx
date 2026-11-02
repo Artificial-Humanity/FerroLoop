@@ -53,11 +53,11 @@ export function getUnreadBadgeClass(
 
 export function getUnreadBadgeStyle(
   severity: UnreadSeverity = "normal",
-  compact = false,
+  compact = true,
 ): React.CSSProperties {
   const base: React.CSSProperties = compact
     ? { fontWeight: 700, fontSize: "10px", padding: "1px 5px" }
-    : { fontWeight: 700 };
+    : { fontWeight: 700, fontSize: "10px", padding: "1px 5px" };
   if (severity === "important") {
     return {
       ...base,
@@ -862,18 +862,21 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
               })}
             </div>
 
-            <span className="fd-tier-divider" style={{ height: "18px" }} aria-hidden="true" />
-
             <span
               data-testid="left-panel-active-title"
               style={{
                 fontWeight: 600,
                 fontSize: "12px",
                 color: "var(--text-primary)",
-                whiteSpace: "nowrap",
+                position: "absolute",
+                width: "1px",
+                height: "1px",
+                padding: 0,
+                margin: "-1px",
                 overflow: "hidden",
-                textOverflow: "ellipsis",
-                minWidth: 0,
+                clip: "rect(0, 0, 0, 0)",
+                whiteSpace: "nowrap",
+                border: 0,
               }}
             >
               {activeLeftLabel}
@@ -894,7 +897,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 border: 0,
               }}
             >
-              <span>FerroDeck</span>
               <span className="fd-badge" title="Registered Workspace Agents">
                 {enrichedAgents.length} agents
               </span>
@@ -928,11 +930,21 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           <>
             <div
               style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
                 padding: "8px 12px",
                 borderBottom: "1px solid var(--border-subtle)",
+                backgroundColor: "var(--bg-surface)",
                 flexShrink: 0,
               }}
             >
+              <strong
+                data-testid="left-panel-pane-title"
+                style={{ fontSize: "14px", color: "var(--text-primary)" }}
+              >
+                Agent Roster
+              </strong>
               <input
                 type="search"
                 className="fd-input"

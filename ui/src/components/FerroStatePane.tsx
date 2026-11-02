@@ -653,38 +653,46 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
 
   return (
     <section className="fd-pane" data-testid="ferrostate-pane" aria-label="FerroState">
-      <div className="fd-scroll" style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "flex-start",
-            gap: "8px",
-          }}
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "flex-start",
+          gap: "8px",
+          padding: "10px 16px",
+          borderBottom: "1px solid var(--border-subtle)",
+          backgroundColor: "var(--bg-surface)",
+          flexShrink: 0,
+        }}
+      >
+        <strong
+          data-testid="ferrostate-pane-title"
+          style={{ fontSize: "14px", color: "var(--text-primary)" }}
         >
-          <h2 style={{ margin: 0, fontSize: "16px" }}>FerroState</h2>
-          <span className="fd-badge" data-testid="ferrostate-badge">
-            Durable Memory, Handoffs &amp; Structural Code Index
+          FerroState
+        </strong>
+        <span className="fd-badge" data-testid="ferrostate-badge">
+          Durable Memory, Handoffs &amp; Structural Code Index
+        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+          <span className="fd-badge" data-testid="memory-count">
+            Memory {memoryCount}
           </span>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-            <span className="fd-badge" data-testid="memory-count">
-              Memory {memoryCount}
-            </span>
-            <span className="fd-badge" data-testid="handoff-count">
-              Handoffs {handoffCount}
-            </span>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className="fd-btn"
-              style={{ minHeight: "36px" }}
-              data-testid="checkpoint-btn"
-              disabled={busyCheckpoint}
-              onClick={() => void handleCheckpoint()}
-            >
-              {busyCheckpoint ? "Saving…" : "Snapshot Checkpoint"}
-            </button>
+          <span className="fd-badge" data-testid="handoff-count">
+            Handoffs {handoffCount}
+          </span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="fd-btn"
+            style={{ minHeight: "36px" }}
+            data-testid="checkpoint-btn"
+            disabled={busyCheckpoint}
+            onClick={() => void handleCheckpoint()}
+          >
+            {busyCheckpoint ? "Saving…" : "Snapshot Checkpoint"}
+          </button>
             {isOwner &&
               (pendingImport ? (
                 <>
@@ -719,8 +727,9 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 </button>
               ))}
           </div>
-        </div>
+      </div>
 
+      <div className="fd-scroll" style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
         <div
           data-testid="token-gain-bar"
           className="fd-card"

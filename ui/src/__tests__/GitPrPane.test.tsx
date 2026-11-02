@@ -172,9 +172,15 @@ describe("GitPrPane", () => {
       />,
     );
 
-    // Switch sub-navigation to Pull Requests & Governance
-    const prTabBtn = screen.getByRole("button", { name: /Pull Requests & Governance/i });
-    fireEvent.click(prTabBtn);
+    // Switch sub-navigation to Pull Requests & Governance via dropdown selector
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent(
+      "Worktrees & Diffs",
+    );
+    const subviewSelect = screen.getByTestId("git-subview-select");
+    fireEvent.change(subviewSelect, { target: { value: "prs" } });
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent(
+      "Pull Requests & Governance",
+    );
 
     expect(
       screen.getByText(/feat\(hub\): ship FerroDeck UI worktree diff & PR governance/i),
@@ -279,16 +285,46 @@ describe("empty-state muting", () => {
       />,
     );
 
-    const prTab = screen.getByRole("button", {
-      name: /Pull Requests & Governance \(0\)/i,
-    });
-    expect(prTab.style.opacity).toBe("0.65");
-    fireEvent.click(prTab);
+    const subviewSelect = screen.getByTestId(
+      "git-subview-select",
+    ) as HTMLSelectElement;
+    expect(subviewSelect.value).toBe("worktrees");
+    fireEvent.change(subviewSelect, { target: { value: "prs" } });
 
     const form = screen.getByTestId("pr-governance-form");
     expect(form).toHaveAttribute("data-prs-empty", "true");
     expect(form.style.opacity).toBe("0.45");
     expect(screen.getByLabelText(/PR Number/i)).toBeDisabled();
     expect(screen.getByRole("button", { name: /Submit Review/i })).toBeDisabled();
+  });
+
+  it("renders git-worktrees-project-badge under Worktrees & Diffs and hides it in Pull Requests & Governance", () => {
+    render(
+      <GitPrPane
+        selectedProject="FerroLoop"
+        worktrees={SAMPLE_WORKTREES}
+        selectedWorktreeId="fl-ferrodeck-ui"
+        worktreeDiff={SAMPLE_WORKTREE_DIFF}
+        prs={[]}
+      />,
+    );
+
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent(
+      "Worktrees & Diffs",
+    );
+    const projectBadge = screen.getByTestId("git-worktrees-project-badge");
+    expect(projectBadge).toHaveTextContent("FerroLoop");
+
+    const subviewSelect = screen.getByTestId("git-subview-select");
+    fireEvent.change(subviewSelect, { target: { value: "prs" } });
+    expect(screen.queryByTestId("git-worktrees-project-badge")).toBeNull();
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent(
+      "Pull Requests & Governance",
+    );
+
+    fireEvent.change(subviewSelect, { target: { value: "worktrees" } });
+    expect(screen.getByTestId("git-worktrees-project-badge")).toHaveTextContent(
+      "FerroLoop",
+    );
   });
 });
