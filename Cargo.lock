@@ -445,6 +445,7 @@ dependencies = [
  "fl-gate",
  "fl-github",
  "fl-store",
+ "fl-watch",
  "fl-wire",
  "flate2",
  "globset",

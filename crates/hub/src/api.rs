@@ -413,6 +413,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     if let Some(resp) = crate::warrants::route(state, &authority, req) {
         return resp;
     }
+    if let Some(resp) = crate::watch_api::route(state, &authority, req) {
+        return resp;
+    }
 
     match (method, path) {
         ("GET", "/api/v1/auth/session") => HttpResponse::json(

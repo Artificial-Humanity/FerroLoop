@@ -21,6 +21,7 @@ pub mod session_actions;
 mod settings;
 pub mod terminal;
 mod warrants;
+mod watch_api;
 pub mod ws;
 
 use std::collections::{BTreeMap, HashMap};

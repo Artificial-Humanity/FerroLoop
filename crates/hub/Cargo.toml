@@ -13,6 +13,7 @@ fl-exec = { path = "../exec" }
 fl-gate = { path = "../gate" }
 fl-github = { path = "../github" }
 fl-store = { path = "../store" }
+fl-watch = { path = "../watch" }
 fl-wire = { path = "../wire" }
 flate2 = "1.1"
 globset.workspace = true
