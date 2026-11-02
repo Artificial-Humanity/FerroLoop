@@ -101,27 +101,40 @@ export interface ParsedTurnAttachment {
 }
 
 /**
- * Strip Antigravity web/mobile `<USER_REQUEST>` and `<ADDITIONAL_METADATA>` wrappers
- * (and `<EPHEMERAL_MESSAGE>` outer tags) so operator and notice turns render cleanly.
+ * Strip Antigravity web/mobile `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`,
+ * `<USER_SETTINGS_CHANGE>`, and `<CONTEXT_SUMMARY>` wrappers (and
+ * `<EPHEMERAL_MESSAGE>` outer tags) so operator and notice turns render cleanly.
  */
 export function stripAgyUserRequestWrapper(content: string): string {
   if (!content) {
     return "";
   }
-  if (!/^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE)>/i.test(content)) {
+  const startsWithWrapper =
+    /^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
+      content,
+    );
+  const hasSettingsOrSummaryBlock =
+    /<(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>[\s\S]*?<\/(?:USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>/i.test(
+      content,
+    );
+  if (!startsWithWrapper && !hasSettingsOrSummaryBlock) {
     return content;
   }
-  return content
+  let result = content
     .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
-    .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
-      inner.trim(),
-    )
-    .replace(
-      /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
-      (_full, inner: string) => inner.trim(),
-    )
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
+    .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "");
+  if (startsWithWrapper) {
+    result = result
+      .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
+        inner.trim(),
+      )
+      .replace(
+        /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
+        (_full, inner: string) => inner.trim(),
+      );
+  }
+  return result.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function isSubagentHandbackContent(content: string): boolean {
@@ -162,7 +175,7 @@ export function stripSubagentHandbackWrapper(content: string): string {
 }
 
 function hasSystemNoticePrefix(text: string): boolean {
-  return (
+  if (
     /^\[Notice\]\s/i.test(text) ||
     /^<EPHEMERAL_MESSAGE>/i.test(text) ||
     /^<task-notification[\s>]/i.test(text) ||
@@ -171,7 +184,18 @@ function hasSystemNoticePrefix(text: string): boolean {
     /^\[SYSTEM NOTIFICATION - NOT USER INPUT\]/i.test(text) ||
     (/^<SYSTEM_MESSAGE>/i.test(text) &&
       !text.includes("[Operator Prompt via FerroDeck"))
-  );
+  ) {
+    return true;
+  }
+  if (
+    /^<(?:user_info|rules|user_rules|system-reminder|CONTEXT_SUMMARY|USER_SETTINGS_CHANGE)(?:[\s>]|$)/i.test(
+      text,
+    ) &&
+    !/<(?:USER_REQUEST|user_query)[\s>]/i.test(text)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function extractTurnAttachments(
@@ -432,7 +456,12 @@ export const TurnCard: React.FC<TurnCardProps> = ({
             borderColor: "var(--border-subtle)",
             color: isSystem ? "var(--text-secondary)" : "var(--text-primary)",
           };
-  const segments = React.useMemo(() => splitTurnContent(cleanedContent), [cleanedContent]);
+  const effectiveContent =
+    cleanedContent || (isSystem ? turn.content.trim() : "");
+  const segments = React.useMemo(
+    () => splitTurnContent(effectiveContent),
+    [effectiveContent],
+  );
   const hasThinking = Boolean(turn.thinking && turn.thinking.trim().length > 0);
   const toolCalls = turn.tool_calls ?? [];
   const attachedOutputsCount = attachedToolOutputs?.length ?? 0;
