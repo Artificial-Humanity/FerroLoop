@@ -29,6 +29,7 @@ fn hub(tmp: &TempDir) -> HubState {
         enable_terminal: false,
         session_ttl_secs: 3600,
         home_override: Some(tmp.path().to_path_buf()),
+        github: crate::github_pr::HubGithub::default(),
     })
 }
 
