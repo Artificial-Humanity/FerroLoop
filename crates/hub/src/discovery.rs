@@ -3332,11 +3332,34 @@ pub(crate) fn strip_agy_user_request_wrapper(content: &str) -> String {
     collapse_blank_runs(&unwrapped).trim().to_string()
 }
 
+/// True when `text` starts with `prefix`, ASCII case-insensitively. Only the leading bytes are
+/// compared: no copy of the text is made.
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// True when `text` holds `needle` anywhere, ASCII case-insensitively, without a lowercase copy.
+fn contains_ignore_ascii_case(text: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && text
+            .as_bytes()
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 fn starts_with_agy_wrapper_tag(content: &str) -> bool {
-    let lowered = content.trim_start().to_ascii_lowercase();
-    AGY_WRAPPER_TAGS
-        .iter()
-        .any(|tag| lowered.starts_with(&format!("<{tag}>")))
+    let head = content.trim_start();
+    AGY_WRAPPER_TAGS.iter().any(|tag| {
+        let bytes = head.as_bytes();
+        // `<tag>`: the tag name sits between a `<` and a `>`.
+        bytes.len() >= tag.len() + 2
+            && bytes[0] == b'<'
+            && bytes[1..=tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+            && bytes[tag.len() + 1] == b'>'
+    })
 }
 
 /// True when the turn starts with an Antigravity wrapper tag and holds a complete
@@ -3512,9 +3535,9 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     // holds no operator text. A summary may quote `<USER_REQUEST>`, so a leading
     // `<CONTEXT_SUMMARY>` decides on its own unless the turn also has a closed request.
     if starts_with_agy_wrapper_tag(content) {
-        let lowered = content.trim_start().to_ascii_lowercase();
         let is_summary_only =
-            lowered.starts_with("<context_summary>") && !lowered.contains("<user_request>");
+            starts_with_ignore_ascii_case(content.trim_start(), "<context_summary>")
+                && !contains_ignore_ascii_case(content, "<user_request>");
         if unwrapped.trim().is_empty() || is_summary_only {
             return ("system".to_string(), unwrapped);
         }
@@ -4918,6 +4941,10 @@ mod tests {
         assert_eq!((role.as_str(), content.as_str()), ("system", ""));
         let (role, _) =
             normalize_system_turn("user", "<context_summary>\nlower\n</context_summary>");
+        assert_eq!(role, "system");
+        // A very large turn opening with a mixed-case summary tag is still system.
+        let big = format!("<Context_Summary>\n{}", "word ".repeat(400_000));
+        let (role, _) = normalize_system_turn("user", &big);
         assert_eq!(role, "system");
         // An unclosed summary is still a system turn.
         let (role, _) = normalize_system_turn("user", "<CONTEXT_SUMMARY>\ncut off, no close");

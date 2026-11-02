@@ -372,6 +372,61 @@ pub fn route_replacement_allowed(
         || existing.is_none_or(|old| std::mem::discriminant(old) == std::mem::discriminant(new))
 }
 
+/// True when the process behind `route` is demonstrably gone. Only what the route carries
+/// counts: a Claude `pid`, an Antigravity `ls_pid`. A route with no liveness signal is never
+/// dead, so it stays protected.
+pub fn route_is_dead(route: &VendorRoute, proc_exists: &dyn Fn(u32) -> bool) -> bool {
+    match route {
+        VendorRoute::Claude { pid, .. } => !proc_exists(*pid),
+        VendorRoute::Agy {
+            ls_pid: Some(pid), ..
+        } => !proc_exists(*pid),
+        _ => false,
+    }
+}
+
+fn route_vendor_name(route: &VendorRoute) -> &'static str {
+    match route {
+        VendorRoute::Claude { .. } => "Claude",
+        VendorRoute::Agy { .. } => "Antigravity",
+        VendorRoute::Codex { .. } => "Codex",
+        VendorRoute::Muse { .. } => "Muse",
+        VendorRoute::Grok { .. } => "Grok",
+        VendorRoute::Webhook { .. } => "Webhook",
+    }
+}
+
+/// [`route_replacement_allowed`] plus the dead-route escape: an inferred persona may replace a
+/// route of another vendor when the old route's process is gone. `Err` carries the one-line
+/// diagnostic to show when the replacement is refused.
+pub fn route_replacement_verdict(
+    persona: &str,
+    existing: Option<&VendorRoute>,
+    new: &VendorRoute,
+    source: PersonaSource,
+    proc_exists: &dyn Fn(u32) -> bool,
+) -> Result<(), String> {
+    if route_replacement_allowed(existing, new, source) {
+        return Ok(());
+    }
+    if let Some(old) = existing {
+        if route_is_dead(old, proc_exists) {
+            return Ok(());
+        }
+        return Err(format!(
+            "fl wire: not replacing {persona}'s {} route from an inferred {} session; \
+             set AGENT_PERSONA={persona} or run `agent-msg register` to switch",
+            route_vendor_name(old),
+            route_vendor_name(new),
+        ));
+    }
+    Ok(())
+}
+
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
 /// The route currently on file for `persona`: the daemon's table when it answers, else the
 /// routes file.
 fn existing_route_for(env: &StateEnv<'_>, persona: &str) -> Option<VendorRoute> {
@@ -402,7 +457,11 @@ pub fn record_caller_route_checked(
     // A trusted source replaces anything, so the table is read only for an inferred persona.
     if !source.is_trusted() {
         let existing = existing_route_for(env, persona);
-        if !route_replacement_allowed(existing.as_ref(), &route, source) {
+        if let Err(note) =
+            route_replacement_verdict(persona, existing.as_ref(), &route, source, &process_exists)
+        {
+            // stderr only: the hook's stdout must stay valid JSON.
+            eprintln!("{note}");
             return false;
         }
     }
@@ -1836,6 +1895,104 @@ mod tests {
             rig.route_of("jarvis"),
             Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
         ));
+    }
+
+    #[test]
+    fn dead_route_is_replaced_by_an_inferred_persona() {
+        let claude = |pid: u32| VendorRoute::Claude {
+            pid,
+            session_id: "s".into(),
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            key_path: None,
+        };
+        let new = grok_route("sid-new");
+        let src = PersonaSource::Inferred;
+        // Dead Claude pid: replaced.
+        let dead = |_: u32| false;
+        assert_eq!(
+            route_replacement_verdict("jarvis", Some(&claude(4242)), &new, src, &dead),
+            Ok(())
+        );
+        // Live pid (this test process): blocked, with the diagnostic.
+        let me = std::process::id();
+        let err =
+            route_replacement_verdict("jarvis", Some(&claude(me)), &new, src, &process_exists)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            "fl wire: not replacing jarvis's Claude route from an inferred Grok session; \
+             set AGENT_PERSONA=jarvis or run `agent-msg register` to switch"
+        );
+        // Agy: a dead ls_pid is replaced, a live one is not.
+        let agy_with = |ls_pid| VendorRoute::Agy {
+            conversation_id: "c".into(),
+            ls_pid,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert!(
+            route_replacement_verdict("j", Some(&agy_with(Some(4242))), &new, src, &dead).is_ok()
+        );
+        assert!(
+            route_replacement_verdict("j", Some(&agy_with(Some(me))), &new, src, &process_exists)
+                .is_err()
+        );
+        // No liveness signal: never dead, so blocked even when no pid exists.
+        assert!(route_replacement_verdict("j", Some(&agy_with(None)), &new, src, &dead).is_err());
+        let codex = VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        assert!(route_replacement_verdict("j", Some(&codex), &new, src, &dead).is_err());
+        assert!(!route_is_dead(&codex, &dead));
+        // A trusted source and the same vendor never produce a diagnostic.
+        assert!(
+            route_replacement_verdict("j", Some(&claude(me)), &new, PersonaSource::Env, &|_| true)
+                .is_ok()
+        );
+        assert!(
+            route_replacement_verdict("j", Some(&grok_route("a")), &new, src, &|_| true).is_ok()
+        );
+    }
+
+    #[test]
+    fn hook_replaces_a_dead_claude_route_from_an_inferred_grok_persona() {
+        let rig = HookRig::new(None);
+        rig.seed(
+            "jarvis",
+            VendorRoute::Claude {
+                // Far above any pid_max, so /proc/<pid> never exists.
+                pid: u32::MAX - 1,
+                session_id: "s".into(),
+                socket_path: PathBuf::from("/tmp/x.sock"),
+                key_path: None,
+            },
+        );
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        rig.run("grok", grok_hook_payload("sid-new"));
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn hook_keeps_a_live_claude_route_from_an_inferred_grok_persona() {
+        let rig = HookRig::new(None);
+        let live = VendorRoute::Claude {
+            pid: std::process::id(),
+            session_id: "s".into(),
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            key_path: None,
+        };
+        rig.seed("jarvis", live.clone());
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        let out = rig.run("grok", grok_hook_payload("sid-new"));
+        assert_eq!(out, json!({}));
+        assert_eq!(rig.route_of("jarvis"), Some(live));
     }
 
     #[test]

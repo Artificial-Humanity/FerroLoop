@@ -1285,6 +1285,9 @@ pub fn grok_summary_is_headless(summary_path: &Path) -> bool {
         .is_some_and(|val| grok_value_is_headless(&val))
 }
 
+/// Most bytes read from a flat-layout Grok session file per discovery pass.
+const GROK_FLAT_FILE_READ_CAP: u64 = 1 << 20;
+
 /// Flat-layout session file (`sessions/<id>.json` or `.jsonl`): the object itself, or the first
 /// line of a JSONL file, carries the metadata.
 fn grok_flat_file_is_headless(path: &Path) -> bool {
@@ -1293,7 +1296,7 @@ fn grok_flat_file_is_headless(path: &Path) -> bool {
         return false;
     };
     let mut head = String::new();
-    if BufReader::new(file.take(1 << 20))
+    if BufReader::new(file.take(GROK_FLAT_FILE_READ_CAP))
         .read_line(&mut head)
         .is_err()
     {
@@ -1304,8 +1307,17 @@ fn grok_flat_file_is_headless(path: &Path) -> bool {
     {
         return true;
     }
-    // A pretty-printed `.json` object spans many lines.
-    path.extension().and_then(|e| e.to_str()) == Some("json") && grok_summary_is_headless(path)
+    // A pretty-printed `.json` object spans many lines. The read is capped like the first line:
+    // a larger file is cut mid-object, fails to parse and counts as not headless.
+    path.extension().and_then(|e| e.to_str()) == Some("json")
+        && fs::File::open(path).is_ok_and(|file| {
+            let mut raw = String::new();
+            file.take(GROK_FLAT_FILE_READ_CAP)
+                .read_to_string(&mut raw)
+                .ok()
+                .and_then(|_| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|val| grok_value_is_headless(&val))
+        })
 }
 
 /// True when the Grok session `session_id` is headless. The summary is looked up next to
@@ -2008,6 +2020,22 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
     None
 }
 
+/// The Grok route for the environment's `GROK_SESSION_ID`, or `None` when that session is a
+/// headless `grok -p` one-shot (its id must never reach the route table).
+fn grok_env_route(home: Option<&Path>, session_id: String) -> Option<VendorRoute> {
+    if home.is_some_and(|h| grok_session_is_headless(h, &session_id, None)) {
+        return None;
+    }
+    Some(VendorRoute::Grok {
+        session_id,
+        cwd: std::env::current_dir().ok(),
+        tmux_target: None,
+        tmux_pane: std::env::var("TMUX_PANE")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    })
+}
+
 /// Capture the current process's vendor environment route so `fl wire` / `agent-msg`
 /// can register it in the route table automatically.
 pub fn capture_current_env_route() -> Option<VendorRoute> {
@@ -2063,14 +2091,11 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
     if let Ok(session_id) = std::env::var("GROK_SESSION_ID")
         && !session_id.trim().is_empty()
     {
-        return Some(VendorRoute::Grok {
-            session_id,
-            cwd: std::env::current_dir().ok(),
-            tmux_target: None,
-            tmux_pane: std::env::var("TMUX_PANE")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-        });
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // A headless `grok -p` session is not a route: fall through to the other probes.
+        if let Some(route) = grok_env_route(home.as_deref(), session_id) {
+            return Some(route);
+        }
     }
     if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
         && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -2421,6 +2446,9 @@ fn resolve_grok_pid_session(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())?
                     .to_string();
+                if grok_session_is_headless(home, &sid, None) {
+                    return None;
+                }
                 let cwd = item
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -3570,6 +3598,60 @@ mod tests {
             resolve_grok_pid_persona(home, std::process::id()).as_deref(),
             Some("wendy")
         );
+    }
+
+    #[test]
+    fn headless_grok_session_is_not_resolved_or_captured_as_a_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sid = "01a18599-c714-7700-85bb-e276825a98b3";
+        let session = home.join(".grok").join("sessions").join("proj").join(sid);
+        write_grok_summary(
+            &session,
+            sid,
+            serde_json::json!({"session_kind": "headless"}),
+        );
+        fs::write(
+            home.join(".grok").join("active_sessions.json"),
+            serde_json::json!([{"session_id": sid, "pid": std::process::id(), "cwd": "/tmp"}])
+                .to_string(),
+        )
+        .unwrap();
+        // Process-tree path.
+        assert!(resolve_grok_pid_session(home, std::process::id()).is_none());
+        // `GROK_SESSION_ID` path.
+        assert!(grok_env_route(Some(home), sid.to_string()).is_none());
+        // The same session without the marker still resolves and is captured.
+        write_grok_summary(&session, sid, serde_json::json!({}));
+        let (got, _, _) = resolve_grok_pid_session(home, std::process::id()).unwrap();
+        assert_eq!(got, sid);
+        assert!(matches!(
+            grok_env_route(Some(home), sid.to_string()),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == sid
+        ));
+        // Without a home there is nothing to consult: the session is kept.
+        assert!(grok_env_route(None, sid.to_string()).is_some());
+    }
+
+    #[test]
+    fn flat_json_headless_check_reads_at_most_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let small = tmp.path().join("small.json");
+        fs::write(
+            &small,
+            "{\n  \"id\": \"s\",\n  \"session_kind\": \"headless\"\n}\n",
+        )
+        .unwrap();
+        assert!(grok_flat_file_is_headless(&small));
+        // `session_kind` sits past the cap, so it is never seen.
+        let big = tmp.path().join("big.json");
+        let filler = "x".repeat((GROK_FLAT_FILE_READ_CAP as usize) + 1024);
+        fs::write(
+            &big,
+            format!("{{\n  \"pad\": \"{filler}\",\n  \"session_kind\": \"headless\"\n}}\n"),
+        )
+        .unwrap();
+        assert!(!grok_flat_file_is_headless(&big));
     }
 
     #[test]
