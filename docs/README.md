@@ -24,6 +24,9 @@ File naming in this directory follows
   Code's, Codex's, Antigravity's, Muse's and Grok's own files (plus `fl mcp serve` stdio MCP
   exposure): the catalog, secrets, each machine's switches, the commands, what fl refuses and
   why.
+* [hub-home-and-artifacts.md](hub-home-and-artifacts.md) — where the Hub keeps its data and
+  artifact registry, the per-project directories, and the Owner-only endpoints that relocate
+  them, with migration.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.
