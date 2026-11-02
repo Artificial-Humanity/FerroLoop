@@ -36,6 +36,10 @@ import {
   type PruneArtifactsResponse,
   type PruneAttachmentsRequest,
   type PruneAttachmentsResponse,
+  type ChangeArtifactsDirRequest,
+  type ChangeArtifactsDirResponse,
+  type ProjectArtifactsDirInfo,
+  type ProjectsListResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
   type RecastAgentRequest,
@@ -142,10 +146,60 @@ export function normalizeHubSettings(
       ? (obj.hub_connection as Record<string, unknown>)
       : {};
 
+  const home_dir =
+    typeof obj.home_dir === "string" && obj.home_dir.trim()
+      ? obj.home_dir.trim()
+      : fallback.home_dir;
+  const artifacts_dir =
+    obj.artifacts_dir === null
+      ? null
+      : typeof obj.artifacts_dir === "string" && obj.artifacts_dir.trim()
+        ? obj.artifacts_dir.trim()
+        : (fallback.artifacts_dir ?? null);
+  const default_artifacts_dir =
+    typeof obj.default_artifacts_dir === "string" &&
+    obj.default_artifacts_dir.trim()
+      ? obj.default_artifacts_dir.trim()
+      : fallback.default_artifacts_dir;
+  const effective_artifacts_dir =
+    typeof obj.effective_artifacts_dir === "string" &&
+    obj.effective_artifacts_dir.trim()
+      ? obj.effective_artifacts_dir.trim()
+      : (artifacts_dir ??
+        default_artifacts_dir ??
+        fallback.effective_artifacts_dir);
+
+  const projectDirsRaw =
+    obj.project_artifacts_dirs &&
+    typeof obj.project_artifacts_dirs === "object" &&
+    !Array.isArray(obj.project_artifacts_dirs)
+      ? (obj.project_artifacts_dirs as Record<string, unknown>)
+      : null;
+  let project_artifacts_dirs: Record<string, string> | undefined =
+    fallback.project_artifacts_dirs;
+  if (projectDirsRaw) {
+    const map: Record<string, string> = {};
+    for (const [k, v] of Object.entries(projectDirsRaw)) {
+      if (typeof v === "string" && v.trim()) {
+        map[k.trim().toLowerCase()] = v.trim();
+      }
+    }
+    project_artifacts_dirs = map;
+  }
+
   return {
     theme_preference,
     timezone,
     attachment_retention_days,
+    ...(home_dir !== undefined ? { home_dir } : {}),
+    ...(artifacts_dir !== undefined ? { artifacts_dir } : {}),
+    ...(default_artifacts_dir !== undefined ? { default_artifacts_dir } : {}),
+    ...(effective_artifacts_dir !== undefined
+      ? { effective_artifacts_dir }
+      : {}),
+    ...(project_artifacts_dirs !== undefined
+      ? { project_artifacts_dirs }
+      : {}),
     subsystems: {
       ferrogate_enabled:
         typeof subRaw.ferrogate_enabled === "boolean"
@@ -1359,11 +1413,93 @@ export class HubApiClient {
     patch: Partial<HubSettings>,
   ): Promise<HubSettings> {
     const mergedFallback = normalizeHubSettings(patch, DEFAULT_HUB_SETTINGS);
+    const {
+      home_dir: _homeDir,
+      artifacts_dir: _artifactsDir,
+      default_artifacts_dir: _defaultArtifactsDir,
+      effective_artifacts_dir: _effectiveArtifactsDir,
+      project_artifacts_dirs: _projectArtifactsDirs,
+      ...putPayload
+    } = patch;
+    void _homeDir;
+    void _artifactsDir;
+    void _defaultArtifactsDir;
+    void _effectiveArtifactsDir;
+    void _projectArtifactsDirs;
     const raw = await this.request<unknown>("/api/v1/settings", {
       method: "PUT",
-      body: JSON.stringify(patch),
+      body: JSON.stringify(putPayload),
     });
     return normalizeHubSettings(raw, mergedFallback);
+  }
+
+  public async changeSystemArtifactsDir(
+    input: ChangeArtifactsDirRequest,
+  ): Promise<ChangeArtifactsDirResponse> {
+    return this.request<ChangeArtifactsDirResponse>(
+      "/api/v1/settings/artifacts-dir",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          new_path:
+            typeof input.new_path === "string"
+              ? input.new_path.trim() || null
+              : null,
+          migrate: Boolean(input.migrate),
+        }),
+      },
+    );
+  }
+
+  public async listProjectsArtifactsDirs(): Promise<ProjectsListResponse> {
+    try {
+      const res = await this.request<ProjectsListResponse>("/api/v1/projects");
+      return {
+        projects: Array.isArray(res?.projects) ? res.projects : [],
+      };
+    } catch (err) {
+      if (err instanceof HubApiError && err.status === 404) {
+        return { projects: [] };
+      }
+      throw err;
+    }
+  }
+
+  public async getProjectArtifactsDir(
+    projectId: string,
+  ): Promise<ProjectArtifactsDirInfo | null> {
+    const slug = projectId.trim().toLowerCase();
+    if (!slug) return null;
+    try {
+      return await this.request<ProjectArtifactsDirInfo>(
+        `/api/v1/projects/${encodeURIComponent(slug)}/artifacts-dir`,
+      );
+    } catch (err) {
+      if (err instanceof HubApiError && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  public async changeProjectArtifactsDir(
+    projectId: string,
+    input: ChangeArtifactsDirRequest,
+  ): Promise<ChangeArtifactsDirResponse> {
+    const slug = projectId.trim().toLowerCase();
+    return this.request<ChangeArtifactsDirResponse>(
+      `/api/v1/projects/${encodeURIComponent(slug)}/artifacts-dir`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          new_path:
+            typeof input.new_path === "string"
+              ? input.new_path.trim() || null
+              : null,
+          migrate: Boolean(input.migrate),
+        }),
+      },
+    );
   }
 
   public getArtifactRawUrl(path: string, download = false): string {

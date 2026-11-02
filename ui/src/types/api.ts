@@ -219,6 +219,33 @@ export interface PruneAttachmentsResponse {
   retention_disabled?: boolean;
 }
 
+export interface ChangeArtifactsDirRequest {
+  new_path: string | null;
+  migrate: boolean;
+}
+
+export interface ChangeArtifactsDirResponse {
+  project?: string;
+  old_path: string;
+  new_path: string;
+  migrated_files: number;
+  migrated_bytes: number;
+  artifacts_dir: string | null;
+  default_artifacts_dir: string;
+  effective_artifacts_dir: string;
+}
+
+export interface ProjectArtifactsDirInfo {
+  id: string;
+  artifacts_dir: string | null;
+  default_artifacts_dir: string;
+  effective_artifacts_dir: string;
+}
+
+export interface ProjectsListResponse {
+  projects: ProjectArtifactsDirInfo[];
+}
+
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;
@@ -239,6 +266,16 @@ export interface HubSettings {
   };
   /** Days the hub keeps chat attachments (0..=365, default 7; 0 = never auto-delete). */
   attachment_retention_days?: number;
+  /** Hub home directory (read-only on GET /api/v1/settings). */
+  home_dir?: string;
+  /** Owner system artifacts directory override (null = none set). */
+  artifacts_dir?: string | null;
+  /** Default system artifacts directory (<home_dir>/artifacts). */
+  default_artifacts_dir?: string;
+  /** Effective system artifacts directory (artifacts_dir ?? default_artifacts_dir). */
+  effective_artifacts_dir?: string;
+  /** Per-project artifacts directory overrides keyed by lowercase project slug. */
+  project_artifacts_dirs?: Record<string, string>;
 }
 
 export type HubSettingsPatch = Partial<HubSettings>;

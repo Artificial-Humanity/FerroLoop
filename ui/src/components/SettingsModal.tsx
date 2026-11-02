@@ -39,6 +39,7 @@ import {
   type HubSettings,
   type OperatorAccount,
   type OperatorRole,
+  type ProjectArtifactsDirInfo,
   type TotpEnrollmentResponse,
 } from "../types/api";
 
@@ -320,6 +321,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     null,
   );
 
+  // Issue #207: System & Project Artifacts Directory Override Modals state
+  const [projectsArtifactsDirs, setProjectsArtifactsDirs] = useState<
+    Record<string, ProjectArtifactsDirInfo>
+  >({});
+  const [artifactsDirModalTarget, setArtifactsDirModalTarget] = useState<
+    { scope: "system" } | { scope: "project"; project: string } | null
+  >(null);
+  const [artifactsDirNewPath, setArtifactsDirNewPath] = useState("");
+  const [artifactsDirMigrate, setArtifactsDirMigrate] = useState(true);
+  const [changingArtifactsDir, setChangingArtifactsDir] = useState(false);
+  const [artifactsDirModalError, setArtifactsDirModalError] = useState<
+    string | null
+  >(null);
+  const [systemArtifactsDirStatus, setSystemArtifactsDirStatus] = useState<
+    string | null
+  >(null);
+  const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<
+    string | null
+  >(null);
+
   // Agents Fleet & Re-Cast state
   const [loadedAgents, setLoadedAgents] = useState<AgentRecord[]>(
     propAgents && propAgents.length > 0 ? propAgents : DEFAULT_WORKSPACE_AGENTS,
@@ -461,6 +482,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSettingsSaved(false);
     setCurrencyPref(getActiveCurrency());
     setPruneStatusMessage(null);
+    setArtifactsDirModalTarget(null);
+    setArtifactsDirModalError(null);
+    setSystemArtifactsDirStatus(null);
+    setProjectArtifactsDirStatus(null);
     setCloudAdaptersSaved(false);
     setRecastStatusBanner(null);
     setRecastReplaceLeadArmed({});
@@ -524,6 +549,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         // Keep DEFAULT_CLOUD_ADAPTERS_CONFIG if endpoint is unreachable
       });
 
+    client
+      .listProjectsArtifactsDirs()
+      .then((res) => {
+        if (!cancelled && Array.isArray(res?.projects)) {
+          const map: Record<string, ProjectArtifactsDirInfo> = {};
+          for (const item of res.projects) {
+            if (item && typeof item.id === "string" && item.id.trim()) {
+              map[item.id.trim().toLowerCase()] = item;
+            }
+          }
+          setProjectsArtifactsDirs(map);
+        }
+      })
+      .catch(() => {
+        // Ignore if /api/v1/projects is not yet available
+      });
+
     return () => {
       cancelled = true;
     };
@@ -533,6 +575,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (artifactsDirModalTarget) {
+        if (!changingArtifactsDir) {
+          setArtifactsDirModalTarget(null);
+          setArtifactsDirModalError(null);
+        }
+        return;
+      }
       if (recastModalAgentKey) {
         if (!recastingAgentKey) {
           setRecastModalAgentKey(null);
@@ -547,6 +596,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
   }, [
     isOpen,
+    artifactsDirModalTarget,
+    changingArtifactsDir,
     recastModalAgentKey,
     recastingAgentKey,
     submitting,
@@ -777,6 +828,174 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       );
     } finally {
       setPruningAttachments(false);
+    }
+  };
+
+  const systemDefaultArtifactsDir =
+    settings.default_artifacts_dir ||
+    (settings.home_dir
+      ? `${settings.home_dir.replace(/\/+$/, "")}/artifacts`
+      : "~/.local/share/fl/artifacts");
+  const systemEffectiveArtifactsDir =
+    settings.effective_artifacts_dir ||
+    settings.artifacts_dir ||
+    systemDefaultArtifactsDir;
+
+  const getProjectArtifactsDirState = (projectName: string) => {
+    const slug = projectName.trim().toLowerCase();
+    const record = projectsArtifactsDirs[slug];
+    const overrideFromSettings = settings.project_artifacts_dirs?.[slug] ?? null;
+    const artifactsDir =
+      record?.artifacts_dir !== undefined
+        ? record.artifacts_dir
+        : overrideFromSettings;
+    const defaultDir =
+      record?.default_artifacts_dir ||
+      `${systemEffectiveArtifactsDir.replace(/\/+$/, "")}/${slug}`;
+    const effectiveDir =
+      record?.effective_artifacts_dir || artifactsDir || defaultDir;
+    return {
+      slug,
+      artifactsDir,
+      defaultDir,
+      effectiveDir,
+    };
+  };
+
+  const openSystemArtifactsDirModal = () => {
+    setArtifactsDirModalError(null);
+    setSystemArtifactsDirStatus(null);
+    setArtifactsDirNewPath(systemEffectiveArtifactsDir);
+    setArtifactsDirMigrate(true);
+    setArtifactsDirModalTarget({ scope: "system" });
+  };
+
+  const openProjectArtifactsDirModal = (projectName: string) => {
+    const info = getProjectArtifactsDirState(projectName);
+    setArtifactsDirModalError(null);
+    setProjectArtifactsDirStatus(null);
+    setArtifactsDirNewPath(info.effectiveDir);
+    setArtifactsDirMigrate(true);
+    setArtifactsDirModalTarget({ scope: "project", project: projectName });
+  };
+
+  const handleConfirmChangeArtifactsDir = async (
+    explicitNewPath?: string | null,
+  ) => {
+    if (!artifactsDirModalTarget || changingArtifactsDir) return;
+    setChangingArtifactsDir(true);
+    setArtifactsDirModalError(null);
+    const rawPath =
+      explicitNewPath !== undefined ? explicitNewPath : artifactsDirNewPath;
+    const trimmed = typeof rawPath === "string" ? rawPath.trim() : "";
+    try {
+      const client = apiClient ?? new HubApiClient();
+      if (artifactsDirModalTarget.scope === "system") {
+        const nextPathPayload =
+          trimmed === "" || trimmed === systemDefaultArtifactsDir
+            ? null
+            : trimmed;
+        const res = await client.changeSystemArtifactsDir({
+          new_path: nextPathPayload,
+          migrate: artifactsDirMigrate,
+        });
+        const nextEffective =
+          res?.effective_artifacts_dir ||
+          res?.new_path ||
+          nextPathPayload ||
+          systemDefaultArtifactsDir;
+        const nextDefault =
+          res?.default_artifacts_dir || systemDefaultArtifactsDir;
+        const nextOverride =
+          res?.artifacts_dir !== undefined ? res.artifacts_dir : nextPathPayload;
+        setSettings((prev) => {
+          const updated: HubSettings = {
+            ...prev,
+            artifacts_dir: nextOverride,
+            default_artifacts_dir: nextDefault,
+            effective_artifacts_dir: nextEffective,
+          };
+          onSettingsUpdated?.(updated);
+          return updated;
+        });
+        setProjectsArtifactsDirs((prev) => {
+          const base = nextEffective.replace(/\/+$/, "");
+          const nextMap: Record<string, ProjectArtifactsDirInfo> = {};
+          for (const [slug, item] of Object.entries(prev)) {
+            const projDefault = `${base}/${slug}`;
+            nextMap[slug] = {
+              ...item,
+              default_artifacts_dir: projDefault,
+              effective_artifacts_dir: item.artifacts_dir || projDefault,
+            };
+          }
+          return nextMap;
+        });
+        const migratedFiles = res?.migrated_files ?? 0;
+        const migratedBytes = res?.migrated_bytes ?? 0;
+        setSystemArtifactsDirStatus(
+          artifactsDirMigrate
+            ? `Updated artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
+            : `Updated artifacts directory to ${nextEffective}.`,
+        );
+        setArtifactsDirModalTarget(null);
+      } else {
+        const projectName = artifactsDirModalTarget.project;
+        const info = getProjectArtifactsDirState(projectName);
+        const nextPathPayload =
+          trimmed === "" || trimmed === info.defaultDir ? null : trimmed;
+        const res = await client.changeProjectArtifactsDir(projectName, {
+          new_path: nextPathPayload,
+          migrate: artifactsDirMigrate,
+        });
+        const nextEffective =
+          res?.effective_artifacts_dir ||
+          res?.new_path ||
+          nextPathPayload ||
+          info.defaultDir;
+        const nextDefault = res?.default_artifacts_dir || info.defaultDir;
+        const nextOverride =
+          res?.artifacts_dir !== undefined ? res.artifacts_dir : nextPathPayload;
+        setProjectsArtifactsDirs((prev) => ({
+          ...prev,
+          [info.slug]: {
+            id: info.slug,
+            artifacts_dir: nextOverride,
+            default_artifacts_dir: nextDefault,
+            effective_artifacts_dir: nextEffective,
+          },
+        }));
+        setSettings((prev) => {
+          const nextMap = { ...(prev.project_artifacts_dirs ?? {}) };
+          if (nextOverride) {
+            nextMap[info.slug] = nextOverride;
+          } else {
+            delete nextMap[info.slug];
+          }
+          const updated: HubSettings = {
+            ...prev,
+            project_artifacts_dirs: nextMap,
+          };
+          onSettingsUpdated?.(updated);
+          return updated;
+        });
+        const migratedFiles = res?.migrated_files ?? 0;
+        const migratedBytes = res?.migrated_bytes ?? 0;
+        setProjectArtifactsDirStatus(
+          artifactsDirMigrate
+            ? `Updated ${projectName} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
+            : `Updated ${projectName} artifacts directory to ${nextEffective}.`,
+        );
+        setArtifactsDirModalTarget(null);
+      }
+    } catch (err) {
+      setArtifactsDirModalError(
+        err instanceof Error
+          ? err.message
+          : "Failed to change artifacts directory",
+      );
+    } finally {
+      setChangingArtifactsDir(false);
     }
   };
 
@@ -1278,7 +1497,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   className="fd-select fd-mono"
                   style={{ fontSize: "11.5px", padding: "3px 8px" }}
                   value={resolvedProjectFilter}
-                  onChange={(e) => setSelectedProjectFilter(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedProjectFilter(e.target.value);
+                    setProjectArtifactsDirStatus(null);
+                  }}
                 >
                   <option value="all">All Projects ({effectiveAgents.length})</option>
                   {projectOptions.map((proj) => (
@@ -1442,6 +1664,108 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </button>
                   </div>
                 </div>
+
+                {/* Project Artifacts Directory row (Issue #207) */}
+                {(() => {
+                  const projArtifactsInfo = getProjectArtifactsDirState(
+                    resolvedProjectFilter,
+                  );
+                  return (
+                    <div
+                      data-testid="settings-project-artifacts-dir-row"
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "6px",
+                        paddingTop: "8px",
+                        borderTop: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "8px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            flexWrap: "wrap",
+                            minWidth: 0,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: "11.5px",
+                              fontWeight: 600,
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            Artifacts Directory:
+                          </span>
+                          <code
+                            data-testid="settings-project-artifacts-dir-value"
+                            className="fd-badge fd-mono"
+                            title={projArtifactsInfo.effectiveDir}
+                            style={{
+                              fontSize: "11px",
+                              maxWidth: "100%",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {projArtifactsInfo.effectiveDir}
+                          </code>
+                          {projArtifactsInfo.artifactsDir && (
+                            <span
+                              data-testid="settings-project-artifacts-dir-override-badge"
+                              className="fd-badge fd-mono"
+                              style={{
+                                fontSize: "10px",
+                                color: "var(--accent-primary, #f59e0b)",
+                              }}
+                            >
+                              Override
+                            </span>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          data-testid="settings-project-change-artifacts-dir-btn"
+                          className="fd-btn"
+                          style={{ fontSize: "11px", padding: "3px 8px" }}
+                          onClick={() =>
+                            openProjectArtifactsDirModal(resolvedProjectFilter)
+                          }
+                        >
+                          Change Artifacts Directory
+                        </button>
+                      </div>
+
+                      {projectArtifactsDirStatus && (
+                        <div
+                          role="status"
+                          data-testid="project-artifacts-dir-status"
+                          className="fd-card"
+                          style={{
+                            borderColor: "var(--diff-add-border)",
+                            backgroundColor: "var(--diff-add-bg)",
+                            color: "var(--diff-add-text)",
+                            fontSize: "11.5px",
+                            padding: "6px 10px",
+                          }}
+                        >
+                          {projectArtifactsDirStatus}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
@@ -2103,6 +2427,107 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   }}
                 >
                   {pruneStatusMessage}
+                </div>
+              )}
+            </div>
+
+            {/* System Artifacts Directory (Issue #207) */}
+            <div
+              data-testid="settings-system-artifacts-dir-row"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Artifacts Directory
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Hub-wide artifacts storage root (defaults to{" "}
+                    <code className="fd-mono">{systemDefaultArtifactsDir}</code>
+                    ; each project defaults to{" "}
+                    <code className="fd-mono">
+                      [artifacts]/[project-name]
+                    </code>
+                    ).
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <code
+                    data-testid="settings-system-artifacts-dir-value"
+                    className="fd-badge fd-mono"
+                    title={systemEffectiveArtifactsDir}
+                    style={{
+                      fontSize: "11.5px",
+                      padding: "4px 8px",
+                    }}
+                  >
+                    {systemEffectiveArtifactsDir}
+                  </code>
+                  {settings.artifacts_dir && (
+                    <span
+                      data-testid="settings-system-artifacts-dir-override-badge"
+                      className="fd-badge fd-mono"
+                      style={{
+                        fontSize: "10.5px",
+                        color: "var(--accent-primary, #f59e0b)",
+                      }}
+                    >
+                      Override
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="settings-system-change-artifacts-dir-btn"
+                    className="fd-btn"
+                    style={{ fontSize: "11.5px", padding: "5px 10px" }}
+                    onClick={openSystemArtifactsDirModal}
+                  >
+                    Change Artifacts Directory
+                  </button>
+                </div>
+              </div>
+
+              {systemArtifactsDirStatus && (
+                <div
+                  role="status"
+                  data-testid="system-artifacts-dir-status"
+                  className="fd-card"
+                  style={{
+                    borderColor: "var(--diff-add-border)",
+                    backgroundColor: "var(--diff-add-bg)",
+                    color: "var(--diff-add-text)",
+                    fontSize: "11.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  {systemArtifactsDirStatus}
                 </div>
               )}
             </div>
@@ -3548,6 +3973,270 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onClick={() => void handleRecastAgent(modalAgent, false)}
                   >
                     {recastingAgentKey === key ? "Re-Casting..." : "Confirm Re-Cast"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* System / Project Change Artifacts Directory Sub-Modal (Issue #207) */}
+        {artifactsDirModalTarget && (() => {
+          const isSystem = artifactsDirModalTarget.scope === "system";
+          const projectName = !isSystem ? artifactsDirModalTarget.project : null;
+          const projectInfo = projectName
+            ? getProjectArtifactsDirState(projectName)
+            : null;
+          const oldPath = isSystem
+            ? systemEffectiveArtifactsDir
+            : (projectInfo?.effectiveDir ?? "");
+          const defaultPath = isSystem
+            ? systemDefaultArtifactsDir
+            : (projectInfo?.defaultDir ?? "");
+          const hasOverride = isSystem
+            ? Boolean(settings.artifacts_dir)
+            : Boolean(projectInfo?.artifactsDir);
+
+          return (
+            <div
+              data-testid="change-artifacts-dir-modal-backdrop"
+              onClick={() => {
+                if (!changingArtifactsDir) {
+                  setArtifactsDirModalTarget(null);
+                  setArtifactsDirModalError(null);
+                }
+              }}
+              style={{
+                position: "fixed",
+                inset: 0,
+                backgroundColor: "rgba(9, 13, 22, 0.72)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                zIndex: 1300,
+                padding: "16px",
+              }}
+            >
+              <div
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="change-artifacts-dir-modal-title"
+                data-testid="change-artifacts-dir-modal"
+                className="fd-card"
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  width: "min(520px, 100%)",
+                  backgroundColor: "var(--bg-surface, #0f172a)",
+                  border: "1px solid var(--border-accent)",
+                  borderRadius: "8px",
+                  padding: "16px",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "12px",
+                  boxShadow: "0 20px 44px rgba(0, 0, 0, 0.55)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                  }}
+                >
+                  <strong
+                    id="change-artifacts-dir-modal-title"
+                    data-testid="change-artifacts-dir-modal-title"
+                    style={{ fontSize: "14px" }}
+                  >
+                    {isSystem
+                      ? "Change System Artifacts Directory"
+                      : `Change ${projectName} Artifacts Directory`}
+                  </strong>
+                  <button
+                    type="button"
+                    data-testid="change-artifacts-dir-close-btn"
+                    className="fd-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    disabled={changingArtifactsDir}
+                    onClick={() => {
+                      setArtifactsDirModalTarget(null);
+                      setArtifactsDirModalError(null);
+                    }}
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  {isSystem
+                    ? "Override the hub-wide artifacts root directory, or reset to the default [home]/artifacts path."
+                    : `Override the artifacts directory for ${projectName}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
+                </p>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                  <div>
+                    <label
+                      htmlFor="change-artifacts-dir-old-path"
+                      style={{
+                        display: "block",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "4px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      Old Path
+                    </label>
+                    <input
+                      id="change-artifacts-dir-old-path"
+                      type="text"
+                      readOnly
+                      aria-label="Old Path"
+                      data-testid="change-artifacts-dir-old-path"
+                      className="fd-input fd-mono"
+                      style={{
+                        width: "100%",
+                        fontSize: "12px",
+                        padding: "6px 8px",
+                        opacity: 0.85,
+                      }}
+                      value={oldPath}
+                    />
+                  </div>
+
+                  <div>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        marginBottom: "4px",
+                      }}
+                    >
+                      <label
+                        htmlFor="change-artifacts-dir-new-path"
+                        style={{
+                          fontSize: "11px",
+                          fontWeight: 600,
+                          color: "var(--text-muted)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        New Path
+                      </label>
+                      <button
+                        type="button"
+                        data-testid="change-artifacts-dir-reset-default-btn"
+                        className="fd-btn"
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        disabled={changingArtifactsDir}
+                        onClick={() => setArtifactsDirNewPath(defaultPath)}
+                      >
+                        Use Default ({defaultPath})
+                      </button>
+                    </div>
+                    <input
+                      id="change-artifacts-dir-new-path"
+                      type="text"
+                      aria-label="New Path"
+                      data-testid="change-artifacts-dir-new-path"
+                      className="fd-input fd-mono"
+                      placeholder={defaultPath}
+                      style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
+                      value={artifactsDirNewPath}
+                      onChange={(e) => setArtifactsDirNewPath(e.target.value)}
+                    />
+                    <span
+                      style={{
+                        display: "block",
+                        marginTop: "4px",
+                        fontSize: "11px",
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      Leave blank or set to <code className="fd-mono">{defaultPath}</code>{" "}
+                      to use the default directory
+                      {hasOverride ? " (currently overridden)." : "."}
+                    </span>
+                  </div>
+
+                  <label
+                    htmlFor="change-artifacts-dir-migrate-checkbox"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      fontSize: "12px",
+                      cursor: "pointer",
+                      userSelect: "none",
+                    }}
+                  >
+                    <input
+                      id="change-artifacts-dir-migrate-checkbox"
+                      type="checkbox"
+                      data-testid="change-artifacts-dir-migrate-checkbox"
+                      checked={artifactsDirMigrate}
+                      disabled={changingArtifactsDir}
+                      onChange={(e) => setArtifactsDirMigrate(e.target.checked)}
+                    />
+                    <span>Migrate all existing artifacts</span>
+                  </label>
+                </div>
+
+                {artifactsDirModalError && (
+                  <div
+                    role="alert"
+                    data-testid="change-artifacts-dir-error"
+                    className="fd-card"
+                    style={{
+                      borderColor: "var(--diff-del-border)",
+                      backgroundColor: "var(--diff-del-bg)",
+                      color: "var(--diff-del-text)",
+                      fontSize: "11.5px",
+                      padding: "6px 10px",
+                    }}
+                  >
+                    {artifactsDirModalError}
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: "8px",
+                  }}
+                >
+                  <button
+                    type="button"
+                    data-testid="change-artifacts-dir-cancel-btn"
+                    className="fd-btn"
+                    disabled={changingArtifactsDir}
+                    onClick={() => {
+                      setArtifactsDirModalTarget(null);
+                      setArtifactsDirModalError(null);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="change-artifacts-dir-confirm-btn"
+                    className="fd-btn fd-btn-primary"
+                    disabled={changingArtifactsDir}
+                    onClick={() => void handleConfirmChangeArtifactsDir()}
+                  >
+                    {changingArtifactsDir ? "Applying..." : "Confirm"}
                   </button>
                 </div>
               </div>
