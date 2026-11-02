@@ -302,7 +302,7 @@ export const RuntimesQuotasPanel: React.FC<RuntimesQuotasPanelProps> = ({ apiCli
           <div style={{ flex: 1 }}>
             <h3 style={SECTION_TITLE_STYLE}>Vendor Account Quotas</h3>
             <span style={HINT_STYLE}>
-              The allowance each vendor reports for the account the hub runs as.
+              The remaining allowance each vendor reports for the registered account.
             </span>
           </div>
           <button
@@ -321,9 +321,17 @@ export const RuntimesQuotasPanel: React.FC<RuntimesQuotasPanelProps> = ({ apiCli
             <div
               key={adapter}
               data-testid={`vendor-quota-${adapter}`}
-              style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                flexWrap: "nowrap",
+                minWidth: 0,
+              }}
             >
-              <strong style={{ fontSize: "12.5px", minWidth: "84px" }}>{label}</strong>
+              <strong style={{ fontSize: "12.5px", minWidth: "84px", flexShrink: 0 }}>
+                {label}
+              </strong>
               {quota && hasQuotaUsageData(quota) ? (
                 <QuotaUsageBadge quota={quota} />
               ) : (

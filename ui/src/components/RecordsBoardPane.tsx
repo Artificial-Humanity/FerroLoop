@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
+import { formatCurrencyFromUsd, useActiveCurrency } from "../lib/currency";
 import type {
   ProjectRecordItem,
   RecordState,
@@ -81,6 +82,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
     () => providedClient ?? new HubApiClient(),
     [providedClient],
   );
+  const activeCurrency = useActiveCurrency();
 
   const [project, setProject] = useState<string>(() =>
     selectedProject && selectedProject.trim().length > 0
@@ -510,16 +512,43 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
         }}
       >
         <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "12px",
-            flexWrap: "wrap",
-            fontSize: "12px",
-          }}
+          data-testid="board-metrics-grid"
+          style={
+            isNarrow
+              ? {
+                  display: "grid",
+                  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                  gap: "8px",
+                  fontSize: "12px",
+                }
+              : {
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "flex-start",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  fontSize: "12px",
+                }
+          }
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+          <div
+            data-testid="board-metrics-counts-group"
+            style={
+              isNarrow
+                ? {
+                    gridColumn: "1 / -1",
+                    display: "grid",
+                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gap: "6px",
+                  }
+                : {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }
+            }
+          >
             <span className="fd-badge">
               Todo: <strong>{effectiveSummary.todo_count}</strong>
             </span>
@@ -532,20 +561,69 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
             <span className="fd-badge">
               Total: <strong>{effectiveSummary.total_count}</strong>
             </span>
-            <span className="fd-badge">
+          </div>
+
+          <div
+            data-testid="board-metrics-completion-findings-group"
+            style={
+              isNarrow
+                ? {
+                    gridColumn: "1 / -1",
+                    display: "grid",
+                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gap: "6px",
+                  }
+                : {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }
+            }
+          >
+            <span
+              className="fd-badge"
+              style={isNarrow ? { gridColumn: "span 2" } : undefined}
+            >
               Completion: <strong>{Math.round(effectiveSummary.completion_pct)}%</strong>
+            </span>
+            <span
+              className="fd-badge"
+              style={isNarrow ? { gridColumn: "span 2" } : undefined}
+            >
+              Open Findings: <strong>{effectiveSummary.open_findings_count}</strong>
             </span>
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
-            <span className="fd-badge">
-              Open Findings: <strong>{effectiveSummary.open_findings_count}</strong>
-            </span>
-            <span className="fd-badge">
+          <div
+            data-testid="board-metrics-attempts-cost-group"
+            style={
+              isNarrow
+                ? {
+                    gridColumn: "1 / -1",
+                    display: "grid",
+                    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                    gap: "6px",
+                  }
+                : {
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }
+            }
+          >
+            <span
+              className="fd-badge"
+              style={isNarrow ? { gridColumn: "span 2" } : undefined}
+            >
               Attempts: <strong>{effectiveSummary.attempts_count}</strong>
             </span>
-            <span className="fd-badge fd-mono">
-              Cost: <strong>${(effectiveSummary.total_cost_usd ?? 0).toFixed(2)}</strong>
+            <span
+              className="fd-badge fd-mono"
+              style={isNarrow ? { gridColumn: "span 2" } : undefined}
+            >
+              Cost: <strong>{formatCurrencyFromUsd(effectiveSummary.total_cost_usd ?? 0, activeCurrency)}</strong>
             </span>
           </div>
         </div>

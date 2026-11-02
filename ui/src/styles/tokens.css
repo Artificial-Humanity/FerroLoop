@@ -139,6 +139,7 @@ body,
 /* Cockpit Layout */
 .fd-cockpit {
   display: flex;
+  flex-direction: column;
   height: 100vh;
   height: 100dvh;
   width: 100vw;
@@ -146,6 +147,15 @@ body,
   background-color: var(--bg-canvas);
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.fd-cockpit-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
 }
 
 .fd-sidebar {
@@ -669,14 +679,14 @@ button.fd-badge:hover:not(:disabled) {
 @media (max-width: 1024px) {
   .fd-sidebar-backdrop {
     display: block;
-    position: fixed;
+    position: absolute;
     inset: 0;
     background-color: rgba(5, 7, 11, 0.68);
     z-index: 25;
   }
 
   .fd-sidebar {
-    position: fixed;
+    position: absolute;
     top: 0;
     bottom: 0;
     left: 0;

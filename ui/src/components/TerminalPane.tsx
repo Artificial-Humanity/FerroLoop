@@ -460,6 +460,21 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     return (
       <section className="fd-pane" data-testid="terminal-pane">
         <div
+          style={{
+            padding: "8px 12px",
+            borderBottom: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--bg-surface)",
+            flexShrink: 0,
+          }}
+        >
+          <strong
+            data-testid="terminal-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            Terminal
+          </strong>
+        </div>
+        <div
           className="fd-scroll"
           style={{
             display: "flex",
@@ -519,18 +534,35 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       <div
         style={{
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: "8px",
+          flexDirection: "column",
+          gap: "6px",
           padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
           minWidth: 0,
           maxWidth: "100%",
           boxSizing: "border-box",
         }}
       >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+          <strong
+            data-testid="terminal-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            Terminal
+          </strong>
+        </div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+            minWidth: 0,
+            maxWidth: "100%",
+          }}
+        >
         <div
           style={{
             display: "flex",
@@ -595,6 +627,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           >
             Reconnect / New Shell
           </button>
+        </div>
         </div>
       </div>
 

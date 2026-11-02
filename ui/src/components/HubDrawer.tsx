@@ -1,5 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import {
+  formatCurrencyFromMicros,
+  resolveCurrencyCode,
+  useActiveCurrency,
+} from "../lib/currency";
 import type {
   ArchitectureResponse,
   ArchViolation,
@@ -36,9 +41,16 @@ export interface HubDrawerProps {
   defaultSubTab?: HubSubTab;
 }
 
-export function formatUsdFromMicros(micros?: number | null): string {
-  const safe = typeof micros === "number" && Number.isFinite(micros) ? micros : 0;
-  return `$${(safe / 1_000_000).toFixed(4)}`;
+export function formatUsdFromMicros(
+  micros?: number | null,
+  currencyPref?: string,
+): string {
+  const code = resolveCurrencyCode(currencyPref);
+  const digits = code === "JPY" || code === "KRW" ? 0 : 4;
+  return formatCurrencyFromMicros(micros, currencyPref, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: code === "JPY" || code === "KRW" ? 2 : 4,
+  });
 }
 
 function renderViolationText(v: ArchViolation): string {
@@ -66,6 +78,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
   defaultSubTab = "workflows",
 }) => {
   const [subTab, setSubTab] = useState<HubSubTab>(defaultSubTab);
+  useActiveCurrency();
   const [selectedWorkflowSlug, setSelectedWorkflowSlug] = useState<string>(
     workflows[0]?.slug ?? workflows[0]?.id ?? "",
   );
@@ -188,15 +201,30 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
       <div
         style={{
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
+          flexDirection: "column",
           gap: "8px",
           padding: "8px 16px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
         }}
       >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+          <strong
+            data-testid="hub-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            Hub &amp; Architecture
+          </strong>
+        </div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
         <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
@@ -254,6 +282,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
             {loading ? "Refreshing..." : "Refresh"}
           </button>
         )}
+        </div>
       </div>
 
       <div

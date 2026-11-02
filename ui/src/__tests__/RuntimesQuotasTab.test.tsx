@@ -134,11 +134,13 @@ describe("Settings: Runtimes & Quotas tab", () => {
     const claude = await screen.findByTestId("vendor-quota-claude");
     expect(within(claude).getByTestId("quota-tier-chip")).toHaveTextContent("MAX");
     const primary = within(claude).getByTestId("quota-primary-window");
-    expect(primary).toHaveTextContent("5h: 60% left");
+    expect(primary).toHaveTextContent("5h: 60%");
+    expect(primary).not.toHaveTextContent("left");
     expect(primary).toHaveTextContent(/renews in 2h/);
     expect(within(primary).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "60");
     const secondary = within(claude).getByTestId("quota-secondary-window");
-    expect(secondary).toHaveTextContent("7d: 90% left");
+    expect(secondary).toHaveTextContent("7d: 90%");
+    expect(secondary).not.toHaveTextContent("left");
     expect(secondary).toHaveTextContent(/renews in 2d/);
     expect(within(secondary).getByRole("progressbar")).toHaveAttribute("aria-valuenow", "90");
     expect(within(claude).getByTestId("quota-usage-badge")).not.toHaveAttribute("data-exhausted");
@@ -147,7 +149,14 @@ describe("Settings: Runtimes & Quotas tab", () => {
     const codex = screen.getByTestId("vendor-quota-codex");
     expect(within(codex).getByTestId("quota-usage-badge")).toHaveAttribute("data-exhausted", "true");
     expect(within(codex).getByTestId("quota-exhausted-alert")).toHaveTextContent("Usage limit reached");
-    expect(within(codex).getByTestId("quota-primary-window")).toHaveTextContent("5h: 0% left");
+    expect(within(codex).getByTestId("quota-primary-window")).toHaveTextContent("5h: 0%");
+    expect(within(codex).getByTestId("quota-primary-window")).not.toHaveTextContent("left");
+    expect(codex.style.flexWrap).toBe("nowrap");
+    expect(
+      screen.getByText(
+        "The remaining allowance each vendor reports for the registered account.",
+      ),
+    ).toBeInTheDocument();
 
     // Vendors the hub has no reading for say so, in a fixed order.
     for (const adapter of ["grok", "antigravity", "muse"]) {

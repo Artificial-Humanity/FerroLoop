@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import type { HubApiClient } from "../api/client";
+import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WATCH_BALANCE_POLICY,
@@ -45,13 +46,11 @@ export type WatchSectionFilter =
   | "liveness"
   | "rollups";
 
-export function formatUsdFromMicros(micros: number | undefined | null): string {
-  const safe =
-    typeof micros === "number" && Number.isFinite(micros) && micros >= 0
-      ? micros
-      : 0;
-  const dollars = safe / 1_000_000;
-  return `$${dollars.toFixed(2)}`;
+export function formatUsdFromMicros(
+  micros: number | undefined | null,
+  currencyPref?: string,
+): string {
+  return formatCurrencyFromMicros(micros, currencyPref);
 }
 
 export function formatCompactNumber(value: number | undefined | null): string {
@@ -197,6 +196,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
 }) => {
   const isOwner = authority?.tier === "owner";
   const activeTimeZone = useActiveTimeZone();
+  useActiveCurrency();
 
   const [sectionFilter, setSectionFilter] = useState<WatchSectionFilter>("all");
   const [summary, setSummary] = useState<WatchSummaryResponse | null>(null);
@@ -732,15 +732,16 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             gap: "4px",
           }}
         >
-          <div
+          <strong
+            data-testid="ferrowatch-pane-title"
             style={{
-              fontSize: "13px",
+              fontSize: "14px",
               fontWeight: 700,
               color: "var(--text-primary)",
             }}
           >
             FerroWatch
-          </div>
+          </strong>
 
           <div
             style={{

@@ -268,35 +268,44 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   return (
     <section className="fd-pane" data-testid="vault-gate-pane" aria-label="Vault and Connectors">
       <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "10px",
+          padding: "10px 16px",
+          borderBottom: "1px solid var(--border-subtle)",
+          backgroundColor: "var(--bg-surface)",
+          flexWrap: "wrap",
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+          <strong
+            data-testid="vault-gate-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            Vault &amp; Connectors
+          </strong>
+          <span className="fd-badge" data-testid="vault-zk-badge">
+            AES-256-GCM Zero-Knowledge Vault — raw secret values are never returned after
+            saving
+          </span>
+        </div>
+        <button
+          type="button"
+          className="fd-btn"
+          style={{ minHeight: "36px" }}
+          onClick={handleRefresh}
+          disabled={effectiveLoading}
+        >
+          {effectiveLoading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+      <div
         className="fd-scroll"
         style={{ display: "flex", flexDirection: "column", gap: "20px" }}
       >
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "10px",
-            flexWrap: "wrap",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-            <h2 style={{ margin: 0, fontSize: "16px" }}>Vault &amp; Connectors</h2>
-            <span className="fd-badge" data-testid="vault-zk-badge">
-              AES-256-GCM Zero-Knowledge Vault — raw secret values are never returned after
-              saving
-            </span>
-          </div>
-          <button
-            type="button"
-            className="fd-btn"
-            style={{ minHeight: "36px" }}
-            onClick={handleRefresh}
-            disabled={effectiveLoading}
-          >
-            {effectiveLoading ? "Loading…" : "Refresh"}
-          </button>
-        </div>
 
         {effectiveError && (
           <div role="alert" className="fd-card" style={{ color: "var(--diff-del-text)" }}>

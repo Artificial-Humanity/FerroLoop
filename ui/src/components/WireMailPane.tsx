@@ -294,7 +294,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           color: "var(--text-secondary)",
         }}
       >
-        Compose FerroWire Message
+        Compose Message
       </div>
 
       <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
@@ -671,16 +671,33 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
       <div
         style={{
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
+          flexDirection: "column",
           gap: "8px",
           padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
           minWidth: 0,
         }}
       >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+          <strong
+            data-testid="wire-mail-pane-title"
+            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+          >
+            FerroWire Mail
+          </strong>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
         <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
@@ -756,6 +773,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           >
             {effectiveLoading ? "Syncing..." : "Refresh"}
           </button>
+        </div>
         </div>
       </div>
 

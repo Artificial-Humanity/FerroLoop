@@ -341,6 +341,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
       aria-modal="true"
       aria-label="Nodes & Enrollment"
       data-testid="nodes-modal"
+      style={{ zIndex: 110 }}
     >
       <div className="fd-modal" style={{ maxWidth: "680px", maxHeight: "88vh", display: "flex", flexDirection: "column" }}>
         <div
