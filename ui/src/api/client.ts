@@ -83,6 +83,17 @@ import {
   type ProjectRecordItem,
   type RecordState,
   type RecordsListResponse,
+  DEFAULT_WATCH_BALANCE_POLICY,
+  type RemodelSessionRequest,
+  type RemodelSessionResponse,
+  type WatchAlertsResponse,
+  type WatchBalanceApplyResponse,
+  type WatchBalancePlan,
+  type WatchBalancePolicy,
+  type WatchBalanceStatusResponse,
+  type WatchRollupsResponse,
+  type WatchSummaryResponse,
+  type WatchThresholdOverrides,
 } from "../types/api";
 import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
 import { getActiveTimeZone, normalizeTimeZone } from "../lib/datetime";
@@ -1824,6 +1835,144 @@ export class HubApiClient {
       body: JSON.stringify(cfg),
     });
     return normalizeCloudAdaptersConfig(raw, mergedFallback);
+  }
+
+  private buildWatchThresholdsQuery(overrides?: WatchThresholdOverrides): string {
+    if (!overrides) return "";
+    const qs = new URLSearchParams();
+    const keys: Array<keyof WatchThresholdOverrides> = [
+      "warn_quota_pct",
+      "critical_quota_pct",
+      "warn_cost_usd_micros",
+      "critical_cost_usd_micros",
+      "stale_after_ms",
+    ];
+    for (const key of keys) {
+      const val = overrides[key];
+      if (typeof val === "number" && Number.isFinite(val)) {
+        qs.set(key, String(val));
+      }
+    }
+    const serialized = qs.toString();
+    return serialized ? `?${serialized}` : "";
+  }
+
+  public async getWatchSummary(
+    overrides?: WatchThresholdOverrides,
+  ): Promise<WatchSummaryResponse> {
+    const suffix = this.buildWatchThresholdsQuery(overrides);
+    return this.request<WatchSummaryResponse>(`/api/v1/watch/summary${suffix}`);
+  }
+
+  public async getWatchAlerts(
+    overrides?: WatchThresholdOverrides,
+  ): Promise<WatchAlertsResponse> {
+    const suffix = this.buildWatchThresholdsQuery(overrides);
+    return this.request<WatchAlertsResponse>(`/api/v1/watch/alerts${suffix}`);
+  }
+
+  public async getWatchRollups(project?: string): Promise<WatchRollupsResponse> {
+    const clean = (project ?? "").trim();
+    const suffix = clean ? `?project=${encodeURIComponent(clean)}` : "";
+    return this.request<WatchRollupsResponse>(`/api/v1/watch/rollups${suffix}`);
+  }
+
+  public async remodelSession(
+    sessionIdOrPersona: string,
+    payload: RemodelSessionRequest,
+  ): Promise<RemodelSessionResponse> {
+    const body: Record<string, unknown> = {
+      vendor: payload.vendor.trim().toLowerCase(),
+    };
+    if (payload.model && payload.model.trim()) {
+      body.model = payload.model.trim();
+    }
+    if (payload.mode) {
+      body.mode = payload.mode;
+    }
+    if (payload.cwd && payload.cwd.trim()) {
+      body.cwd = payload.cwd.trim();
+    }
+    if (payload.node_id && payload.node_id.trim()) {
+      body.node_id = payload.node_id.trim();
+    }
+    if (payload.hosted !== undefined) {
+      body.hosted = payload.hosted;
+    }
+    return this.request<RemodelSessionResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionIdOrPersona)}/remodel`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
+  public async remodelAgent(
+    name: string,
+    payload: RemodelSessionRequest,
+  ): Promise<RemodelSessionResponse> {
+    return this.remodelSession(name, payload);
+  }
+
+  public async getWatchBalance(): Promise<WatchBalanceStatusResponse> {
+    const raw = await this.request<Record<string, unknown>>("/api/v1/watch/balance");
+    const policyRaw =
+      raw && typeof raw.policy === "object" && raw.policy !== null
+        ? (raw.policy as Partial<WatchBalancePolicy>)
+        : (raw as Partial<WatchBalancePolicy>);
+    const policy: WatchBalancePolicy = {
+      ...DEFAULT_WATCH_BALANCE_POLICY,
+      ...policyRaw,
+    };
+    const enabled =
+      typeof raw?.enabled === "boolean" ? raw.enabled : Boolean(policy.enabled);
+    return { policy, enabled };
+  }
+
+  public async updateWatchBalancePolicy(
+    patch: Partial<WatchBalancePolicy>,
+  ): Promise<WatchBalancePolicy> {
+    const raw = await this.request<Record<string, unknown>>(
+      "/api/v1/watch/balance/policy",
+      {
+        method: "POST",
+        body: JSON.stringify(patch),
+      },
+    );
+    const policyRaw =
+      raw && typeof raw.policy === "object" && raw.policy !== null
+        ? (raw.policy as Partial<WatchBalancePolicy>)
+        : (raw as Partial<WatchBalancePolicy>);
+    return {
+      ...DEFAULT_WATCH_BALANCE_POLICY,
+      ...patch,
+      ...policyRaw,
+    };
+  }
+
+  public async planWatchBalance(
+    overrides?: Partial<WatchBalancePolicy>,
+  ): Promise<WatchBalancePlan> {
+    const body =
+      overrides && Object.keys(overrides).length > 0 ? { policy: overrides } : {};
+    return this.request<WatchBalancePlan>("/api/v1/watch/balance/plan", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  public async applyWatchBalance(options?: {
+    warrant?: string;
+  }): Promise<WatchBalanceApplyResponse> {
+    const body: Record<string, unknown> = {};
+    if (options?.warrant && options.warrant.trim()) {
+      body.warrant = options.warrant.trim();
+    }
+    return this.request<WatchBalanceApplyResponse>("/api/v1/watch/balance/apply", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
   }
 }
 

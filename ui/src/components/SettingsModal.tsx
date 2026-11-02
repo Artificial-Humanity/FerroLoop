@@ -882,6 +882,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         }}
       >
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
@@ -889,12 +890,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
-          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
+          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}>
             Settings &amp; Fleet Operations
           </h2>
           <button
             type="button"
             className="fd-btn"
+            style={{ flexShrink: 0 }}
             onClick={onClose}
             disabled={submitting || savingSettings || savingCloudAdapters}
             aria-label="Close Settings Modal"
@@ -912,6 +914,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             display: "flex",
             alignItems: "center",
             gap: "6px",
+            flexWrap: "wrap",
             borderBottom: "1px solid var(--border-subtle)",
             paddingBottom: "8px",
           }}
@@ -1409,6 +1412,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           type="button"
                           data-testid={`recast-agent-btn-${key}`}
                           className="fd-btn fd-btn-primary"
+                          title="Reassign agent project or role in the registry without clearing the live session"
                           style={{ fontSize: "11px", padding: "3px 8px" }}
                           disabled={recastingAgentKey === key}
                           onClick={() => {
@@ -2951,6 +2955,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 }}
               >
                 <div
+                  className="fd-modal-header"
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -2958,12 +2963,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     gap: "8px",
                   }}
                 >
-                  <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 700 }}>
+                  <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 700, flex: 1, minWidth: 0 }}>
                     Re-Cast Agent — {modalAgent.display_name}
                   </h3>
                   <button
                     type="button"
                     className="fd-btn"
+                    style={{ flexShrink: 0 }}
                     aria-label="Close Re-Cast Modal"
                     disabled={Boolean(recastingAgentKey)}
                     onClick={() => setRecastModalAgentKey(null)}

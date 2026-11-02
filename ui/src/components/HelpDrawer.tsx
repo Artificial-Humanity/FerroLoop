@@ -239,6 +239,7 @@ export const HelpDrawer: React.FC<HelpDrawerProps> = ({
         }}
       >
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
@@ -246,7 +247,7 @@ export const HelpDrawer: React.FC<HelpDrawerProps> = ({
             gap: "8px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, minWidth: 0, flexWrap: "wrap" }}>
             <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
               FerroDeck Documentation &amp; Contextual Help
             </h2>
@@ -256,6 +257,7 @@ export const HelpDrawer: React.FC<HelpDrawerProps> = ({
             type="button"
             data-testid="close-help-drawer-btn"
             className="fd-btn"
+            style={{ flexShrink: 0 }}
             onClick={onClose}
             aria-label="Close Contextual Help"
           >
