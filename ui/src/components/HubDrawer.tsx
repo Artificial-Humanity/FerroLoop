@@ -197,9 +197,10 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
           flexWrap: "wrap",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
+            data-testid="subtab-workflows"
             className={`fd-btn ${subTab === "workflows" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "workflows"}
             onClick={() => setSubTab("workflows")}
@@ -208,19 +209,43 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
           </button>
           <button
             type="button"
+            data-testid="subtab-arch"
             className={`fd-btn ${subTab === "architecture" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "architecture"}
             onClick={() => setSubTab("architecture")}
+            style={{
+              display: "inline-flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              lineHeight: 1.2,
+              padding: "6px 10px",
+            }}
           >
-            Architecture Conformance (fl arch)
+            <span>Architecture Conformance</span>{" "}
+            <span className="fd-mono" style={{ fontSize: "10.5px", opacity: 0.8 }}>
+              (fl arch)
+            </span>
           </button>
           <button
             type="button"
+            data-testid="subtab-stats"
             className={`fd-btn ${subTab === "stats" ? "fd-btn-active" : ""}`}
             aria-pressed={subTab === "stats"}
             onClick={() => setSubTab("stats")}
+            style={{
+              display: "inline-flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              lineHeight: 1.2,
+              padding: "6px 10px",
+            }}
           >
-            Telemetry & Regret Audit (fl stats)
+            <span>Telemetry &amp; Regret Audit</span>{" "}
+            <span className="fd-mono" style={{ fontSize: "10.5px", opacity: 0.8 }}>
+              (fl stats)
+            </span>
           </button>
         </div>
 
@@ -280,9 +305,21 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                 alignItems: "flex-end",
                 gap: "10px",
                 flexWrap: "wrap",
+                minWidth: 0,
+                maxWidth: "100%",
+                boxSizing: "border-box",
               }}
             >
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px", flex: 1 }}>
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "4px",
+                  flex: "1 1 160px",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                }}
+              >
                 <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-muted)" }}>
                   Workflow Definition
                 </span>
@@ -292,6 +329,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                     className="fd-select"
                     value={selectedWorkflowSlug || workflows[0]?.slug || workflows[0]?.id || ""}
                     onChange={(e) => setSelectedWorkflowSlug(e.target.value)}
+                    style={{ width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                   >
                     {workflows.map((wf) => (
                       <option key={wf.id} value={wf.slug || wf.id}>
@@ -302,16 +340,27 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                 ) : (
                   <input
                     type="text"
+                    data-testid="workflow-slug-input"
                     aria-label="Workflow Definition"
                     className="fd-input fd-mono"
                     placeholder="Enter workflow slug (e.g. code-review)"
                     value={selectedWorkflowSlug}
                     onChange={(e) => setSelectedWorkflowSlug(e.target.value)}
+                    style={{ width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                   />
                 )}
               </label>
 
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px", flex: 1 }}>
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "4px",
+                  flex: "1 1 160px",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                }}
+              >
                 <span style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-muted)" }}>
                   Optional Run Title
                 </span>
@@ -322,6 +371,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                   placeholder="Custom run title"
                   value={runTitle}
                   onChange={(e) => setRunTitle(e.target.value)}
+                  style={{ width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                 />
               </label>
 

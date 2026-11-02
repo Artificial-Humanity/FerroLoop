@@ -21,6 +21,8 @@ const DEFAULT_PROJECTS = [
   "website",
 ];
 
+export const BOARD_BUCKET_STORAGE_KEY = "ferrodeck.records_board.selected_bucket";
+
 const SWIMLANES: Array<{
   state: RecordState;
   label: string;
@@ -30,6 +32,20 @@ const SWIMLANES: Array<{
   { state: "doing", label: "Doing", accentColor: "var(--accent, #38bdf8)" },
   { state: "done", label: "Done", accentColor: "var(--status-alive, #22c55e)" },
 ];
+
+function readInitialSelectedBucket(): string {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const saved = window.localStorage.getItem(BOARD_BUCKET_STORAGE_KEY)?.trim().toLowerCase();
+      if (saved) {
+        return saved;
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return "todo";
+}
 
 function computeSummaryFromRecords(
   records: ProjectRecordItem[],
@@ -90,6 +106,62 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const [draggedRecordId, setDraggedRecordId] = useState<string | null>(null);
   const [dragOverLane, setDragOverLane] = useState<RecordState | null>(null);
   const [movingId, setMovingId] = useState<string | null>(null);
+  const [selectedBucket, setSelectedBucket] = useState<string>(() =>
+    readInitialSelectedBucket(),
+  );
+  const paneRef = useRef<HTMLElement | null>(null);
+  const [paneWidth, setPaneWidth] = useState<number>(0);
+
+  useEffect(() => {
+    const el = paneRef.current;
+    if (!el) return;
+    const initialRect = el.getBoundingClientRect?.();
+    if (initialRect && initialRect.width > 0) {
+      setPaneWidth(initialRect.width);
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect?.width ?? el.getBoundingClientRect?.().width ?? 0;
+        setPaneWidth(w);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const isNarrow = paneWidth < 680;
+
+  const handleSelectBucket = useCallback((nextBucket: string) => {
+    const normalized = nextBucket.trim().toLowerCase() || "todo";
+    setSelectedBucket(normalized);
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem(BOARD_BUCKET_STORAGE_KEY, normalized);
+      }
+    } catch {
+      // Ignore storage write errors
+    }
+  }, []);
+
+  const dynamicBuckets = useMemo(() => {
+    const base: Array<{ state: string; label: string; accentColor: string }> = [
+      ...SWIMLANES,
+    ];
+    const seen = new Set<string>(base.map((b) => b.state));
+    for (const r of records) {
+      const s = (r.state ?? "").trim().toLowerCase();
+      if (s && !seen.has(s)) {
+        seen.add(s);
+        base.push({
+          state: s,
+          label: s.charAt(0).toUpperCase() + s.slice(1),
+          accentColor: "var(--text-muted, #94a3b8)",
+        });
+      }
+    }
+    return base;
+  }, [records]);
 
   const prevSelectedProjectRef = useRef<string | null | undefined>(
     selectedProject,
@@ -326,6 +398,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
 
   return (
     <section
+      ref={paneRef}
       className="fd-pane"
       data-testid="records-board-pane"
       style={{
@@ -333,6 +406,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
         flexDirection: "column",
         height: "100%",
         overflow: "hidden",
+        minWidth: 0,
       }}
     >
       {/* Header & Filter Controls */}
@@ -344,15 +418,16 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           justifyContent: "space-between",
           gap: "10px",
           flexWrap: "wrap",
+          minWidth: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
           <strong style={{ fontSize: "14px" }}>Project Records &amp; Kanban Board</strong>
           <select
             aria-label="Select Project"
             data-testid="board-project-select"
             className="fd-select fd-mono"
-            style={{ fontSize: "12px", padding: "4px 8px" }}
+            style={{ fontSize: "12px", padding: "4px 8px", minWidth: 0, maxWidth: "100%" }}
             value={project}
             onChange={(e) => setProject(e.target.value)}
           >
@@ -364,14 +439,30 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           </select>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+            flex: "1 1 200px",
+            justifyContent: "flex-end",
+            minWidth: 0,
+          }}
+        >
           <input
             type="search"
             aria-label="Filter records"
             data-testid="board-search-input"
             className="fd-input"
             placeholder="Filter by #id, title, or area..."
-            style={{ fontSize: "12px", padding: "5px 10px", minWidth: "210px" }}
+            style={{
+              fontSize: "12px",
+              padding: "5px 10px",
+              flex: "1 1 150px",
+              minWidth: 0,
+              maxWidth: "100%",
+            }}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
@@ -492,6 +583,44 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
         </div>
       </div>
 
+      {/* Unlabeled Bucket Filter Dropdown between completion progress bar and swimlanes */}
+      <div
+        data-testid="board-bucket-filter-row"
+        style={{
+          padding: "8px 14px",
+          borderBottom: "1px solid var(--border-subtle, #1e293b)",
+          background: "var(--bg-surface, rgba(15, 23, 42, 0.35))",
+          display: "flex",
+          alignItems: "center",
+          minWidth: 0,
+        }}
+      >
+        <select
+          aria-label="Filter work item bucket"
+          data-testid="board-bucket-select"
+          className="fd-select fd-mono"
+          value={selectedBucket}
+          onChange={(e) => handleSelectBucket(e.target.value)}
+          style={{
+            fontSize: "12px",
+            padding: "5px 10px",
+            width: "100%",
+            maxWidth: "260px",
+            minWidth: 0,
+          }}
+        >
+          {dynamicBuckets.map((b) => {
+            const count = filteredRecords.filter((r) => r.state === b.state).length;
+            return (
+              <option key={b.state} value={b.state}>
+                {b.label} ({count})
+              </option>
+            );
+          })}
+          <option value="all">All Buckets ({filteredRecords.length})</option>
+        </select>
+      </div>
+
       {/* Create Record Form */}
       {showCreateForm && (
         <form
@@ -569,42 +698,54 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
         </div>
       )}
 
-      {/* 3-Column Kanban Swimlanes */}
+      {/* Kanban Swimlanes (reactive to selected bucket & narrow right-panel width) */}
       <div
+        data-testid="board-swimlanes-grid"
+        data-layout={
+          selectedBucket !== "all" || isNarrow ? "single-column" : "multi-column"
+        }
         style={{
           flex: 1,
           display: "grid",
-          gridTemplateColumns: "repeat(3, minmax(240px, 1fr))",
+          gridTemplateColumns:
+            selectedBucket !== "all" || isNarrow
+              ? "minmax(0, 1fr)"
+              : "repeat(3, minmax(220px, 1fr))",
           gap: "12px",
           padding: "12px 14px",
           overflow: "auto",
           alignItems: "stretch",
+          minWidth: 0,
         }}
       >
-        {SWIMLANES.map((lane) => {
+        {dynamicBuckets.map((lane) => {
+          const laneState = lane.state as RecordState;
           const laneRecords = filteredRecords.filter(
             (r) => r.state === lane.state,
           );
-          const isDragOver = dragOverLane === lane.state;
+          const isDragOver = dragOverLane === laneState;
+          const isBucketVisible =
+            selectedBucket === "all" || selectedBucket === lane.state;
 
           return (
             <div
               key={lane.state}
               data-testid={`swimlane-${lane.state}`}
+              data-bucket-visible={isBucketVisible ? "true" : "false"}
               onDragOver={(e) => {
                 e.preventDefault();
-                if (dragOverLane !== lane.state) {
-                  setDragOverLane(lane.state);
+                if (dragOverLane !== laneState) {
+                  setDragOverLane(laneState);
                 }
               }}
               onDragLeave={() => {
-                if (dragOverLane === lane.state) {
+                if (dragOverLane === laneState) {
                   setDragOverLane(null);
                 }
               }}
-              onDrop={(e) => handleDropOnLane(e, lane.state)}
+              onDrop={(e) => handleDropOnLane(e, laneState)}
               style={{
-                display: "flex",
+                display: isBucketVisible ? "flex" : "none",
                 flexDirection: "column",
                 borderRadius: "8px",
                 border: isDragOver
@@ -615,6 +756,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
                   : "var(--bg-surface, rgba(15, 23, 42, 0.4))",
                 overflow: "hidden",
                 minHeight: "220px",
+                minWidth: 0,
               }}
             >
               {/* Swimlane Column Header */}

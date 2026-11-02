@@ -242,7 +242,17 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   );
 
   return (
-    <div data-testid="diff-viewer" style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+    <div
+      data-testid="diff-viewer"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "12px",
+        minWidth: 0,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+      }}
+    >
       {/* DiffViewer Header Bar */}
       <div
         style={{
@@ -255,9 +265,12 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           backgroundColor: "var(--bg-surface)",
           border: "1px solid var(--border-subtle)",
           borderRadius: "var(--radius-md)",
+          minWidth: 0,
+          maxWidth: "100%",
+          boxSizing: "border-box",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
           <span className="fd-badge">
             {visibleFiles.length} {visibleFiles.length === 1 ? "file" : "files"}
           </span>
@@ -300,13 +313,22 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           )}
         </div>
 
-        <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            flexWrap: "wrap",
+            minWidth: 0,
+          }}
+        >
           <button
             type="button"
             className={`fd-btn ${mode === "unified" ? "fd-btn-active" : ""}`}
             aria-pressed={mode === "unified"}
             onClick={() => setMode("unified")}
             disabled={visibleFiles.length === 0}
+            style={{ padding: "4px 8px", fontSize: "11px" }}
           >
             Unified
           </button>
@@ -316,6 +338,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             aria-pressed={mode === "split"}
             onClick={() => setMode("split")}
             disabled={visibleFiles.length === 0}
+            style={{ padding: "4px 8px", fontSize: "11px" }}
           >
             Side-by-Side
           </button>
@@ -329,8 +352,13 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           data-testid="diff-empty-state"
           style={{
             textAlign: "center",
-            padding: "28px 16px",
+            padding: "24px 12px",
             color: "var(--text-muted)",
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            whiteSpace: "normal",
+            overflowWrap: "anywhere",
           }}
         >
           {selectedFile

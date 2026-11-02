@@ -2128,7 +2128,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{ width: "100%", maxWidth: "420px", fontSize: "16px", padding: "5px 9px" }}
           />
           <span
-            className="fd-badge"
             data-testid="session-busy-badge"
             title={
               effectiveIsBusy
@@ -2136,15 +2135,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 : "Agent session is idle"
             }
             style={{
-              backgroundColor: effectiveIsBusy
-                ? "rgba(245, 158, 11, 0.16)"
-                : "rgba(16, 185, 129, 0.14)",
-              color: effectiveIsBusy ? "#FBBF24" : "#34D399",
-              borderColor: effectiveIsBusy
-                ? "rgba(245, 158, 11, 0.35)"
-                : "rgba(16, 185, 129, 0.3)",
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
               whiteSpace: "nowrap",
-              flexShrink: 0,
+              border: 0,
             }}
           >
             {effectiveIsBusy ? "Busy · Working" : "Idle"}
@@ -3273,6 +3272,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{ position: "relative", maxWidth: "420px" }}
           >
             <div
+              className="fd-modal-header"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -3288,20 +3288,35 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   fontSize: "15px",
                   fontWeight: 600,
                   color: "var(--text-primary)",
+                  flex: 1,
+                  minWidth: 0,
                 }}
               >
                 Clear Session Context
               </h3>
-              <button
-                type="button"
-                data-testid="clear-modal-help-btn"
-                aria-label="Help"
-                title="Explain Clear vs. Reforge"
-                className="fd-btn fd-help-icon-btn"
-                onClick={handleShowClearHelp}
-              >
-                ?
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                <button
+                  type="button"
+                  data-testid="clear-modal-help-btn"
+                  aria-label="Help"
+                  title="Explain Clear vs. Reforge"
+                  className="fd-btn fd-help-icon-btn"
+                  onClick={handleShowClearHelp}
+                >
+                  ?
+                </button>
+                <button
+                  type="button"
+                  data-testid="clear-modal-close-btn"
+                  aria-label="Close Clear Session Modal"
+                  className="fd-btn"
+                  style={{ flexShrink: 0 }}
+                  disabled={clearing}
+                  onClick={handleCloseClearModal}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {clearHelpVisible && (
@@ -3354,6 +3369,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 alignItems: "center",
                 justifyContent: "flex-end",
                 gap: "8px",
+                flexWrap: "wrap",
               }}
             >
               <button
@@ -3403,6 +3419,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{ position: "relative", maxWidth: "460px" }}
           >
             <div
+              className="fd-modal-header"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -3418,20 +3435,35 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   fontSize: "15px",
                   fontWeight: 600,
                   color: "var(--text-primary)",
+                  flex: 1,
+                  minWidth: 0,
                 }}
               >
                 Decommission Agent Session
               </h3>
-              <button
-                type="button"
-                data-testid="decommission-help-btn"
-                aria-label="Help"
-                title="Explain Prepare & Decommission vs. Tear Down"
-                className="fd-btn fd-help-icon-btn"
-                onClick={handleShowDecommissionHelp}
-              >
-                ?
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                <button
+                  type="button"
+                  data-testid="decommission-help-btn"
+                  aria-label="Help"
+                  title="Explain Prepare & Decommission vs. Tear Down"
+                  className="fd-btn fd-help-icon-btn"
+                  onClick={handleShowDecommissionHelp}
+                >
+                  ?
+                </button>
+                <button
+                  type="button"
+                  data-testid="decommission-modal-close-btn"
+                  aria-label="Close Decommission Modal"
+                  className="fd-btn"
+                  style={{ flexShrink: 0 }}
+                  disabled={decommissioning}
+                  onClick={handleCloseDecommissionModal}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {decommissionHelpVisible && (

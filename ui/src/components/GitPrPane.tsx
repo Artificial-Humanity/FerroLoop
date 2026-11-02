@@ -325,9 +325,31 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
   };
 
   const modifiedFiles: WorktreeFileStatus[] = effectiveDiff?.files ?? [];
+  const paneRef = React.useRef<HTMLElement | null>(null);
+  const [paneWidth, setPaneWidth] = React.useState<number>(0);
+
+  React.useEffect(() => {
+    const el = paneRef.current;
+    if (!el) return;
+    const initialRect = el.getBoundingClientRect?.();
+    if (initialRect && initialRect.width > 0) {
+      setPaneWidth(initialRect.width);
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect?.width ?? el.getBoundingClientRect?.().width ?? 0;
+        setPaneWidth(w);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const isNarrow = paneWidth < 680;
 
   return (
-    <section className="fd-pane" data-testid="git-pr-pane">
+    <section ref={paneRef} className="fd-pane" data-testid="git-pr-pane">
       {/* Top Sub-Navigation Toolbar */}
       <div
         style={{
@@ -335,13 +357,14 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
           alignItems: "center",
           justifyContent: "space-between",
           gap: "8px",
-          padding: "8px 16px",
+          padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           flexWrap: "wrap",
+          minWidth: 0,
         }}
       >
-        <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
             className={`fd-btn ${subView === "worktrees" ? "fd-btn-active" : ""}`}
@@ -394,15 +417,20 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
       {subView === "worktrees" ? (
         <div
           className="fd-scroll"
+          data-testid="git-worktrees-layout"
+          data-layout={isNarrow ? "stacked" : "split"}
           style={{
             display: "grid",
-            gridTemplateColumns: "minmax(260px, 320px) minmax(0, 1fr)",
+            gridTemplateColumns: isNarrow
+              ? "minmax(0, 1fr)"
+              : "minmax(260px, 320px) minmax(0, 1fr)",
             gap: "16px",
             alignItems: "start",
+            minWidth: 0,
           }}
         >
           {/* Left Column: Worktree List & Modified Files */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px", minWidth: 0 }}>
             <div className="fd-card" style={{ padding: "10px 12px" }}>
               <div
                 style={{
