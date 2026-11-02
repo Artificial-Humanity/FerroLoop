@@ -115,11 +115,12 @@ const PRODUCED_PER_NAME: usize = 8;
 /// [`record_produced`] use it. It holds a few routes per name, not one, because a process can
 /// hold several route tables (every table's discovery records here) and a scanner's route in one
 /// of them may be older than its latest route in another.
-fn produced() -> &'static Mutex<BTreeMap<String, Vec<(String, VendorRoute)>>> {
-    static PRODUCED: OnceLock<Mutex<BTreeMap<String, Vec<(String, VendorRoute)>>>> =
-        OnceLock::new();
+fn produced() -> &'static Produced {
+    static PRODUCED: OnceLock<Produced> = OnceLock::new();
     PRODUCED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
+
+type Produced = Mutex<BTreeMap<String, Vec<(String, VendorRoute)>>>;
 
 /// Whether scanner `vendor_id` may write a route for `name`, given the route `existing` that the
 /// table holds for it: only when the table holds none, or holds exactly a route this same
