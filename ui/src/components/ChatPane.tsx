@@ -396,6 +396,7 @@ export const EncapsulatedWorkBlock: React.FC<EncapsulatedWorkBlockProps> = ({
         flexDirection: "column",
         gap: expanded ? "8px" : "0",
         padding: expanded ? undefined : "6px 12px",
+        overflow: "hidden",
       }}
     >
       <button
@@ -480,11 +481,14 @@ export const EncapsulatedWorkBlock: React.FC<EncapsulatedWorkBlockProps> = ({
         </div>
 
         <div
+          data-testid="encapsulated-work-meta"
           style={{
             display: "flex",
             alignItems: "center",
             gap: "6px",
-            flexShrink: 0,
+            flexWrap: "wrap",
+            minWidth: 0,
+            maxWidth: "100%",
           }}
         >
           {thinkingCount > 0 && (
@@ -2093,10 +2097,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           alignItems: "center",
           justifyContent: "space-between",
           gap: "8px",
-          padding: "6px 16px",
+          padding: "6px clamp(8px, 1.4vw, 14px)",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "nowrap",
+          flexWrap: "wrap",
         }}
       >
         <div
@@ -2106,7 +2110,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             alignItems: "center",
             gap: "8px",
             flex: 1,
-            flexWrap: "nowrap",
+            flexWrap: "wrap",
             minWidth: 0,
           }}
         >
@@ -2125,7 +2129,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             aria-label="Filter transcript"
             value={filterQuery}
             onChange={(e) => setFilterQuery(e.target.value)}
-            style={{ width: "100%", maxWidth: "420px", fontSize: "16px", padding: "5px 9px" }}
+            style={{
+              width: "100%",
+              maxWidth: "420px",
+              flex: "1 1 180px",
+              minWidth: 0,
+              fontSize: "16px",
+              padding: "5px 9px",
+            }}
           />
           <span
             data-testid="session-busy-badge"
@@ -2254,7 +2265,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             flexDirection: "column",
             backgroundColor: "var(--bg-surface)",
             borderBottom: "1px solid var(--border-subtle)",
-            padding: "6px 16px",
+            padding: "6px clamp(8px, 1.4vw, 14px)",
             gap: "6px",
             flexShrink: 0,
             zIndex: 2,
@@ -2769,7 +2780,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          padding: "10px 16px calc(18px + env(safe-area-inset-bottom, 0px))",
+          padding: "10px clamp(8px, 1.4vw, 14px) calc(18px + env(safe-area-inset-bottom, 0px))",
           display: "flex",
           flexDirection: "column",
           gap: "8px",

@@ -702,7 +702,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
 
   return (
     <section
-      className="fd-pane"
+      className="fd-pane fd-watch-pane"
       data-testid="ferrowatch-pane"
       aria-label="FerroWatch Observability & Quota Balancing Console"
       style={{
@@ -728,54 +728,56 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         <div
           style={{
             display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "8px",
+            flexDirection: "column",
+            gap: "4px",
           }}
         >
-          <div>
-            <div
-              style={{
-                fontSize: "13px",
-                fontWeight: 700,
-                color: "var(--text-primary)",
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-              }}
-            >
-              <span>FerroWatch</span>
-              <span
-                className="fd-badge"
-                style={{ fontSize: "10px", fontWeight: 600 }}
-              >
-                {summary?.health?.local_host || "ai-lab-0"}
-              </span>
-            </div>
-            <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-              Live Alerts, Subscription Quotas, Liveness &amp; Spend Rollups
-            </div>
+          <div
+            style={{
+              fontSize: "13px",
+              fontWeight: 700,
+              color: "var(--text-primary)",
+            }}
+          >
+            FerroWatch
           </div>
 
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="watch-refresh-btn"
-            disabled={loading}
-            onClick={() => void loadSummary(appliedOverrides)}
-            style={{ fontSize: "11px", padding: "4px 10px" }}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+            }}
           >
-            {loading ? "Refreshing..." : "Refresh"}
-          </button>
+            <span
+              className="fd-badge"
+              style={{ fontSize: "10px", fontWeight: 600 }}
+            >
+              {summary?.health?.local_host || "ai-lab-0"}
+            </span>
+
+            <button
+              type="button"
+              className="fd-btn"
+              data-testid="watch-refresh-btn"
+              disabled={loading}
+              onClick={() => void loadSummary(appliedOverrides)}
+              style={{ fontSize: "11px", padding: "4px 10px" }}
+            >
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+
+          <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+            Live Alerts, Subscription Quotas, Liveness &amp; Spend Rollups
+          </div>
         </div>
 
         {/* Summary KPI Strip */}
         <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-            gap: "6px",
-          }}
+          className="fd-watch-kpi-grid"
+          data-testid="watch-kpi-grid"
         >
           <div
             data-testid="watch-kpi-alerts"
@@ -784,6 +786,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               borderRadius: "6px",
               backgroundColor: "var(--bg-elevated)",
               border: "1px solid var(--border-subtle)",
+              minWidth: 0,
+              overflow: "hidden",
             }}
           >
             <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
@@ -812,6 +816,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               borderRadius: "6px",
               backgroundColor: "var(--bg-elevated)",
               border: "1px solid var(--border-subtle)",
+              minWidth: 0,
+              overflow: "hidden",
             }}
           >
             <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
@@ -845,6 +851,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               borderRadius: "6px",
               backgroundColor: "var(--bg-elevated)",
               border: "1px solid var(--border-subtle)",
+              minWidth: 0,
+              overflow: "hidden",
             }}
           >
             <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
@@ -852,7 +860,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             </div>
             <div
               className="fd-mono"
-              style={{ fontSize: "13px", fontWeight: 700 }}
+              style={{
+                fontSize: "13px",
+                fontWeight: 700,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
             >
               {formatUsdFromMicros(summary?.telemetry?.totals?.cost_usd_micros)}
             </div>
@@ -865,6 +879,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               borderRadius: "6px",
               backgroundColor: "var(--bg-elevated)",
               border: "1px solid var(--border-subtle)",
+              minWidth: 0,
+              overflow: "hidden",
             }}
           >
             <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
@@ -872,7 +888,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             </div>
             <div
               className="fd-mono"
-              style={{ fontSize: "13px", fontWeight: 700 }}
+              style={{
+                fontSize: "13px",
+                fontWeight: 700,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
             >
               {formatCompactNumber(summary?.telemetry?.totals?.attempts)}
             </div>

@@ -333,7 +333,7 @@ export interface RosterSidebarProps {
   onOpenProjectSettings?: (project: string) => void;
   onOpenSettingsModal?: () => void;
   onOpenHelpModal?: () => void;
-  themeMode?: "dark" | "light";
+  themeMode?: "dark" | "light" | "system";
   onToggleTheme?: () => void;
   onOpenSpinUpModal?: () => void;
   isOpen?: boolean;
@@ -534,8 +534,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onOpenProjectSettings,
   onOpenSettingsModal,
   onOpenHelpModal,
-  themeMode = "dark",
-  onToggleTheme,
   onOpenSpinUpModal,
   isOpen = false,
   isCollapsedDesktop = false,
@@ -797,6 +795,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
               alignItems: "center",
               gap: "6px",
               minWidth: 0,
+              overflow: "hidden",
+              flex: "1 1 auto",
             }}
           >
             <div
@@ -839,6 +839,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 whiteSpace: "nowrap",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
+                minWidth: 0,
               }}
             >
               {activeLeftLabel}
@@ -1344,7 +1345,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             data-testid="settings-modal-btn"
             className="fd-btn"
             onClick={() => onOpenSettingsModal?.()}
-            title="Open Settings (Agents, System, Auth)"
+            title="Open Settings (Agents, System, Accessibility, Auth)"
             style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
           >
             <span className="fd-gear-icon" aria-hidden="true" style={{ fontSize: "15px", lineHeight: 1 }}>
@@ -1362,17 +1363,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             style={{ padding: "4px 8px", fontSize: "11.5px" }}
           >
             ?
-          </button>
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="theme-toggle-btn"
-            onClick={() => onToggleTheme?.()}
-            title={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-            aria-label={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-            style={{ padding: "4px 8px", fontSize: "12px" }}
-          >
-            {themeMode === "dark" ? "☀" : "☾"}
           </button>
         </div>
 

@@ -40,6 +40,25 @@ import {
   useActiveTimeZone,
 } from "./lib/datetime";
 import {
+  FONT_SCALE_MAX_PCT,
+  FONT_SCALE_MIN_PCT,
+  FONT_SCALE_PRESETS,
+  FONT_SCALE_STEP_PCT,
+  FONT_SCALE_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  applyFontScalePct,
+  applyFontScaleToElementTree,
+  applyThemeMode,
+  clampFontScalePct,
+  getInitialFontScalePct,
+  getInitialThemeMode,
+  persistFontScalePct,
+  persistThemeMode,
+  resolveEffectiveTheme,
+  resolveSystemTheme,
+  type ThemeMode,
+} from "./lib/accessibility";
+import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
   type AgentRecord,
@@ -75,50 +94,52 @@ export interface AppProps {
   initialSelectedAgentName?: string | null;
 }
 
-export type ThemeMode = "dark" | "light";
-
-export const THEME_STORAGE_KEY = "ferrodeck.theme";
-
-export function getInitialThemeMode(): ThemeMode {
+function readStoredPanelWidth(
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (typeof window === "undefined") return fallback;
   try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-      if (stored === "light" || stored === "dark") {
-        return stored;
-      }
-    }
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    return Math.round(Math.max(min, Math.min(max, parsed)));
   } catch {
-    // Ignore storage access errors in private/sandboxed contexts.
-  }
-  try {
-    if (
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-color-scheme: light)").matches
-    ) {
-      return "light";
-    }
-  } catch {
-    // Ignore matchMedia errors.
-  }
-  return "dark";
-}
-
-export function applyThemeMode(mode: ThemeMode): void {
-  if (typeof document !== "undefined") {
-    document.documentElement.setAttribute("data-theme", mode);
+    return fallback;
   }
 }
 
-export function persistThemeMode(mode: ThemeMode): void {
+function persistPanelWidth(key: string, width: number): void {
+  if (typeof window === "undefined") return;
   try {
-    if (typeof window !== "undefined" && window.localStorage) {
-      window.localStorage.setItem(THEME_STORAGE_KEY, mode);
-    }
+    window.localStorage.setItem(key, String(Math.round(width)));
   } catch {
-    // Ignore storage errors.
+    // Ignore storage write errors
   }
 }
+
+export {
+  FONT_SCALE_MAX_PCT,
+  FONT_SCALE_MIN_PCT,
+  FONT_SCALE_PRESETS,
+  FONT_SCALE_STEP_PCT,
+  FONT_SCALE_STORAGE_KEY,
+  THEME_STORAGE_KEY,
+  applyFontScalePct,
+  applyFontScaleToElementTree,
+  applyThemeMode,
+  clampFontScalePct,
+  getInitialFontScalePct,
+  getInitialThemeMode,
+  persistFontScalePct,
+  persistThemeMode,
+  resolveEffectiveTheme,
+  resolveSystemTheme,
+  type ThemeMode,
+};
 
 export interface OptimisticPrompt {
   content: string;
@@ -355,13 +376,20 @@ export const App: React.FC<AppProps> = ({
   const [secondaryTab, setSecondaryTab] = useState<Exclude<CockpitTab, "chat">>("git");
   const [splitView, setSplitView] = useState<boolean>(false);
   const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>("roster");
-  const [leftRosterWidth, setLeftRosterWidth] = useState<number>(280);
-  const [leftConsoleWidth, setLeftConsoleWidth] = useState<number>(440);
-  const [rightPanelWidth, setRightPanelWidth] = useState<number>(460);
+  const [leftRosterWidth, setLeftRosterWidth] = useState<number>(() =>
+    readStoredPanelWidth("fd_left_roster_width", 326, 326, 720),
+  );
+  const [leftConsoleWidth, setLeftConsoleWidth] = useState<number>(() =>
+    readStoredPanelWidth("fd_left_console_width", 440, 326, 720),
+  );
+  const [rightPanelWidth, setRightPanelWidth] = useState<number>(() =>
+    readStoredPanelWidth("fd_right_panel_width", 460, 326, 800),
+  );
   const panelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+  const [fontScalePct, setFontScalePct] = useState<number>(getInitialFontScalePct);
   useActiveTimeZone();
   const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
   const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
@@ -372,8 +400,10 @@ export const App: React.FC<AppProps> = ({
     };
   }, []);
 
-  const effectiveLeftWidth =
-    leftPanelTab === "roster" ? leftRosterWidth : leftConsoleWidth;
+  const effectiveLeftWidth = Math.max(
+    326,
+    leftPanelTab === "roster" ? leftRosterWidth : leftConsoleWidth,
+  );
 
   const handleLeftResizeStart = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
@@ -384,11 +414,20 @@ export const App: React.FC<AppProps> = ({
       const startWidth = isRoster ? leftRosterWidth : leftConsoleWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = moveEvent.clientX - startX;
-        const nextWidth = Math.max(220, Math.min(720, startWidth + delta));
+        const maxAllowed =
+          typeof window !== "undefined" && window.innerWidth > 1024
+            ? Math.max(
+                326,
+                Math.min(720, window.innerWidth - 360 - (splitView ? rightPanelWidth : 0)),
+              )
+            : 720;
+        const nextWidth = Math.round(Math.max(326, Math.min(maxAllowed, startWidth + delta)));
         if (isRoster) {
           setLeftRosterWidth(nextWidth);
+          persistPanelWidth("fd_left_roster_width", nextWidth);
         } else {
           setLeftConsoleWidth(nextWidth);
+          persistPanelWidth("fd_left_console_width", nextWidth);
         }
       };
       const handleMouseUp = () => {
@@ -400,7 +439,7 @@ export const App: React.FC<AppProps> = ({
       window.addEventListener("mouseup", handleMouseUp);
       panelResizeCleanupRef.current = handleMouseUp;
     },
-    [leftPanelTab, leftRosterWidth, leftConsoleWidth],
+    [leftPanelTab, leftRosterWidth, leftConsoleWidth, splitView, rightPanelWidth],
   );
 
   const handleRightResizeStart = useCallback(
@@ -411,8 +450,19 @@ export const App: React.FC<AppProps> = ({
       const startWidth = rightPanelWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = startX - moveEvent.clientX;
-        const nextWidth = Math.max(280, Math.min(800, startWidth + delta));
+        const maxAllowed =
+          typeof window !== "undefined" && window.innerWidth > 1024
+            ? Math.max(
+                326,
+                Math.min(
+                  800,
+                  window.innerWidth - 360 - (desktopSidebarCollapsed ? 0 : effectiveLeftWidth),
+                ),
+              )
+            : 800;
+        const nextWidth = Math.round(Math.max(326, Math.min(maxAllowed, startWidth + delta)));
         setRightPanelWidth(nextWidth);
+        persistPanelWidth("fd_right_panel_width", nextWidth);
       };
       const handleMouseUp = () => {
         window.removeEventListener("mousemove", handleMouseMove);
@@ -423,7 +473,7 @@ export const App: React.FC<AppProps> = ({
       window.addEventListener("mouseup", handleMouseUp);
       panelResizeCleanupRef.current = handleMouseUp;
     },
-    [rightPanelWidth],
+    [rightPanelWidth, desktopSidebarCollapsed, effectiveLeftWidth],
   );
 
   const handleOpenArtifact = useCallback((rawPathOrUrl: string) => {
@@ -470,13 +520,80 @@ export const App: React.FC<AppProps> = ({
 
   useEffect(() => {
     applyThemeMode(themeMode);
+    if (
+      themeMode !== "system" ||
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return;
+    }
+    const mql = window.matchMedia("(prefers-color-scheme: light)");
+    const handleChange = (event?: MediaQueryListEvent) => {
+      if (typeof document !== "undefined") {
+        const isLight =
+          typeof event?.matches === "boolean" ? event.matches : mql.matches;
+        document.documentElement.setAttribute(
+          "data-theme",
+          isLight ? "light" : "dark",
+        );
+      }
+    };
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", handleChange);
+      return () => mql.removeEventListener("change", handleChange);
+    }
+    if (typeof mql.addListener === "function") {
+      mql.addListener(handleChange);
+      return () => mql.removeListener(handleChange);
+    }
   }, [themeMode]);
 
+  useEffect(() => {
+    applyFontScalePct(fontScalePct);
+    if (
+      fontScalePct === 100 ||
+      typeof document === "undefined" ||
+      typeof MutationObserver === "undefined"
+    ) {
+      return;
+    }
+    const cockpit = document.querySelector(".fd-cockpit");
+    if (!cockpit) {
+      return;
+    }
+    let applying = false;
+    const observer = new MutationObserver(() => {
+      if (applying) return;
+      applying = true;
+      try {
+        applyFontScaleToElementTree(cockpit, fontScalePct);
+      } finally {
+        applying = false;
+      }
+    });
+    observer.observe(cockpit, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [fontScalePct]);
+
   const handleToggleTheme = useCallback(() => {
-    const next: ThemeMode = themeMode === "dark" ? "light" : "dark";
+    const effective = resolveEffectiveTheme(themeMode);
+    const next: ThemeMode = effective === "dark" ? "light" : "dark";
     persistThemeMode(next);
     setThemeMode(next);
   }, [themeMode]);
+
+  const handleChangeThemeMode = useCallback((next: ThemeMode) => {
+    persistThemeMode(next);
+    applyThemeMode(next);
+    setThemeMode(next);
+  }, []);
+
+  const handleChangeFontScalePct = useCallback((nextPct: number) => {
+    const clamped = clampFontScalePct(nextPct);
+    persistFontScalePct(clamped);
+    applyFontScalePct(clamped);
+    setFontScalePct(clamped);
+  }, []);
 
   // Data State
   const [agents, setAgents] = useState<AgentRecord[]>(DEFAULT_WORKSPACE_AGENTS);
@@ -1953,7 +2070,10 @@ export const App: React.FC<AppProps> = ({
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
         isCollapsedDesktop={desktopSidebarCollapsed}
-        onClose={() => setMobileRosterOpen(false)}
+        onClose={() => {
+          setMobileRosterOpen(false);
+          setDesktopSidebarCollapsed(true);
+        }}
         leftPanelTab={leftPanelTab}
         onSelectLeftPanelTab={handleSelectLeftPanelTab}
         consoleContent={
@@ -2183,10 +2303,15 @@ export const App: React.FC<AppProps> = ({
           return res;
         }}
         onBulkSessionAction={handleBulkSessionAction}
+        themeMode={themeMode}
+        onChangeThemeMode={handleChangeThemeMode}
+        fontScalePct={fontScalePct}
+        onChangeFontScalePct={handleChangeFontScalePct}
         onSettingsUpdated={(updated) => {
           if (
             updated.theme_preference === "dark" ||
-            updated.theme_preference === "light"
+            updated.theme_preference === "light" ||
+            updated.theme_preference === "system"
           ) {
             persistThemeMode(updated.theme_preference);
             setThemeMode(updated.theme_preference);

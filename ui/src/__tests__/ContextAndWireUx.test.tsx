@@ -668,8 +668,9 @@ describe("roster unread badges", () => {
 });
 
 describe("App theme toggle", () => {
-  it("switches document theme between dark and light and persists it", async () => {
+  it("switches document theme between dark and light via Settings Accessibility tab and persists it", async () => {
     window.localStorage.removeItem(THEME_STORAGE_KEY);
+    window.localStorage.removeItem("ferrodeck.theme");
     document.documentElement.removeAttribute("data-theme");
 
     const fetchImpl = vi.fn(async () =>
@@ -691,20 +692,19 @@ describe("App theme toggle", () => {
 
     const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
 
-    const toggle = await screen.findByTestId("theme-toggle-btn");
+    const settingsBtn = await screen.findByTestId("settings-modal-btn");
     expect(document.documentElement.dataset.theme).toBe("dark");
     // Applying the system-derived default must not persist it.
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
-    expect(toggle).toHaveTextContent("☀");
-    expect(toggle).toHaveAttribute("title", "Switch to light theme");
 
-    fireEvent.click(toggle);
+    fireEvent.click(settingsBtn);
+    fireEvent.click(screen.getByTestId("settings-tab-accessibility"));
+
+    fireEvent.click(screen.getByTestId("theme-mode-light"));
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
-    expect(toggle).toHaveTextContent("☾");
-    expect(toggle).toHaveAttribute("title", "Switch to dark theme");
 
-    fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("theme-mode-dark"));
     expect(document.documentElement.dataset.theme).toBe("dark");
     expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
 

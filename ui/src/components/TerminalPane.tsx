@@ -551,7 +551,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         style={{
           display: "flex",
           flexDirection: "column",
-          gap: "12px",
+          padding: "8px",
+          gap: "8px",
           backgroundColor: "#0A0D12",
           minWidth: 0,
           maxWidth: "100%",
@@ -570,7 +571,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             boxSizing: "border-box",
             borderRadius: "var(--radius-md)",
             border: "1px solid var(--border-subtle)",
-            padding: "6px",
+            padding: "6px 10px 6px 6px",
             backgroundColor: "#0A0D12",
             textAlign: "left",
           }}
@@ -610,10 +611,11 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          padding: "10px 16px",
+          padding: "8px",
           display: "flex",
+          flexDirection: "column",
           gap: "8px",
-          alignItems: "center",
+          alignItems: "flex-start",
         }}
       >
         <input
@@ -623,12 +625,13 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           className="fd-input fd-mono"
           value={commandInput}
           onChange={(e) => setCommandInput(e.target.value)}
-          style={{ flex: 1 }}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
         />
         <button
           type="submit"
           className="fd-btn fd-btn-primary"
           disabled={!commandInput.trim()}
+          style={{ alignSelf: "flex-start" }}
         >
           Send Command
         </button>
