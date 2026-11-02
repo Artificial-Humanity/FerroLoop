@@ -274,7 +274,29 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
       "agent",
     );
 
-    // Switch to Hub & Arch (System tier) -> opens right split panel on Hub & Arch
+    // Bottom text mobile-bottom-nav is removed
+    expect(screen.queryByTestId("mobile-bottom-nav")).toBeNull();
+
+    // Left panel header defaults to Agent Roster (280px width)
+    const sidebar = screen.getByTestId("roster-sidebar");
+    const leftHeader = within(sidebar).getByTestId("left-panel-header");
+    expect(within(leftHeader).getByTestId("left-panel-tab-roster")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Agent Roster",
+    );
+    expect(sidebar.style.width).toBe("280px");
+
+    // Drag left-panel-resize-handle to 320px on roster
+    const leftResizeHandle = within(sidebar).getByTestId("left-panel-resize-handle");
+    fireEvent.mouseDown(leftResizeHandle, { clientX: 280 });
+    fireEvent.mouseMove(window, { clientX: 320 });
+    fireEvent.mouseUp(window);
+    expect(sidebar.style.width).toBe("320px");
+
+    // Switch to Hub & Arch (System tier) -> opens in Left Panel (440px width) without hijacking Right Panel
     fireEvent.click(within(tabBar).getByRole("tab", { name: /^Hub & Arch$/i }));
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",
@@ -283,7 +305,48 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(screen.getByTestId("active-context-tier-badge")).toHaveTextContent(
       "Scope: System · AI-Lab-0",
     );
-    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "true");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(within(leftHeader).getByTestId("left-panel-tab-hub")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Hub & Arch",
+    );
+    expect(within(sidebar).getByTestId("left-panel-console-body")).toBeInTheDocument();
+    expect(within(sidebar).getByTestId("roster-global-controls")).toBeInTheDocument();
+    expect(sidebar.style.width).toBe("440px");
+
+    // Switch Left Panel to Vault & Gate, FerroState, and back to Agent Roster (returns to 320px roster width)
+    fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-gate"));
+    expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Vault & Gate",
+    );
+    fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-state"));
+    expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "FerroState",
+    );
+    fireEvent.click(within(leftHeader).getByTestId("left-panel-tab-roster"));
+    expect(within(leftHeader).getByTestId("left-panel-active-title")).toHaveTextContent(
+      "Agent Roster",
+    );
+    expect(sidebar.style.width).toBe("320px");
+    expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
+      "data-tier",
+      "agent",
+    );
+
+    // Open Right Panel and drag right-panel-resize-handle to widen from 460px to 520px
+    fireEvent.click(splitToggleBtn);
+    const rightSplitPanel = screen.getByTestId("right-split-panel");
+    expect(rightSplitPanel.style.width).toBe("460px");
+    const rightResizeHandle = within(rightSplitPanel).getByTestId(
+      "right-panel-resize-handle",
+    );
+    fireEvent.mouseDown(rightResizeHandle, { clientX: 800 });
+    fireEvent.mouseMove(window, { clientX: 740 });
+    fireEvent.mouseUp(window);
+    expect(rightSplitPanel.style.width).toBe("520px");
     expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
     unmount();

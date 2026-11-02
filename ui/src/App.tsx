@@ -4,7 +4,7 @@ import { HubApiClient, HubApiError } from "./api/client";
 import { HubWsClient } from "./api/ws";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
-import { COCKPIT_TABS, ContextHeader, RightPanelHeader } from "./components/ContextHeader";
+import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import {
   HelpDrawer,
@@ -21,6 +21,7 @@ import {
   classifyTurnUnreadSeverity,
   classifyWireUnreadSeverity,
   mergeUnreadSeverity,
+  type LeftPanelTab,
   type UnreadSeverity,
 } from "./components/RosterSidebar";
 import {
@@ -351,12 +352,77 @@ export const App: React.FC<AppProps> = ({
   const [activeTab, setActiveTab] = useState<CockpitTab>("chat");
   const [secondaryTab, setSecondaryTab] = useState<Exclude<CockpitTab, "chat">>("git");
   const [splitView, setSplitView] = useState<boolean>(false);
+  const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>("roster");
+  const [leftRosterWidth, setLeftRosterWidth] = useState<number>(280);
+  const [leftConsoleWidth, setLeftConsoleWidth] = useState<number>(440);
+  const [rightPanelWidth, setRightPanelWidth] = useState<number>(460);
+  const panelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
   useActiveTimeZone();
   const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
   const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
+
+  useEffect(() => {
+    return () => {
+      panelResizeCleanupRef.current?.();
+    };
+  }, []);
+
+  const effectiveLeftWidth =
+    leftPanelTab === "roster" ? leftRosterWidth : leftConsoleWidth;
+
+  const handleLeftResizeStart = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      panelResizeCleanupRef.current?.();
+      const startX = e.clientX;
+      const isRoster = leftPanelTab === "roster";
+      const startWidth = isRoster ? leftRosterWidth : leftConsoleWidth;
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        const delta = moveEvent.clientX - startX;
+        const nextWidth = Math.max(220, Math.min(720, startWidth + delta));
+        if (isRoster) {
+          setLeftRosterWidth(nextWidth);
+        } else {
+          setLeftConsoleWidth(nextWidth);
+        }
+      };
+      const handleMouseUp = () => {
+        window.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mouseup", handleMouseUp);
+        panelResizeCleanupRef.current = null;
+      };
+      window.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+      panelResizeCleanupRef.current = handleMouseUp;
+    },
+    [leftPanelTab, leftRosterWidth, leftConsoleWidth],
+  );
+
+  const handleRightResizeStart = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      panelResizeCleanupRef.current?.();
+      const startX = e.clientX;
+      const startWidth = rightPanelWidth;
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        const delta = startX - moveEvent.clientX;
+        const nextWidth = Math.max(280, Math.min(800, startWidth + delta));
+        setRightPanelWidth(nextWidth);
+      };
+      const handleMouseUp = () => {
+        window.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mouseup", handleMouseUp);
+        panelResizeCleanupRef.current = null;
+      };
+      window.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+      panelResizeCleanupRef.current = handleMouseUp;
+    },
+    [rightPanelWidth],
+  );
 
   const handleOpenArtifact = useCallback((rawPathOrUrl: string) => {
     const trimmed = (rawPathOrUrl || "").trim();
@@ -503,8 +569,20 @@ export const App: React.FC<AppProps> = ({
 
   const [loading, setLoading] = useState<boolean>(false);
 
-  // ChatPane always stays on the primary canvas; secondary tabs open/toggle the right split panel.
+  // ChatPane always stays on the primary canvas; system consoles open in the Left Panel;
+  // agent/project secondary tabs ("mail" | "artifacts" | "git" | "board") open in the Right Panel.
   const handleSelectTab = (tab: CockpitTab) => {
+    if (tab === "terminal" || tab === "hub" || tab === "gate" || tab === "state") {
+      setLeftPanelTab(tab);
+      setDesktopSidebarCollapsed(false);
+      setMobileRosterOpen(true);
+      if (typeof window !== "undefined" && window.innerWidth <= 768) {
+        setSplitView(false);
+      }
+      setActiveTab(tab);
+      void refreshSessionsAndTranscriptRef.current();
+      return;
+    }
     if (tab === "chat") {
       setSplitView(false);
       setActiveTab("chat");
@@ -513,14 +591,33 @@ export const App: React.FC<AppProps> = ({
     }
     if (splitView && secondaryTab === tab) {
       setSplitView(false);
-      setActiveTab("chat");
+      setActiveTab(leftPanelTab === "roster" ? "chat" : leftPanelTab);
     } else {
       setSecondaryTab(tab);
       setActiveTab(tab);
       setSplitView(true);
+      setMobileRosterOpen(false);
     }
     void refreshSessionsAndTranscriptRef.current();
   };
+
+  const handleSelectLeftPanelTab = useCallback(
+    (tab: LeftPanelTab) => {
+      setLeftPanelTab(tab);
+      if (tab === "roster") {
+        setActiveTab((prev) =>
+          prev === "terminal" || prev === "hub" || prev === "gate" || prev === "state"
+            ? splitView
+              ? secondaryTab
+              : "chat"
+            : prev,
+        );
+      } else {
+        setActiveTab(tab);
+      }
+    },
+    [splitView, secondaryTab],
+  );
 
   const refreshWireAndRoster = useCallback(async () => {
     try {
@@ -1587,8 +1684,15 @@ export const App: React.FC<AppProps> = ({
     }
   };
 
-  const rawRightSplitTab: Exclude<CockpitTab, "chat"> =
-    activeTab === "chat" ? secondaryTab : activeTab;
+  const isRightSplitTab = (
+    tab: CockpitTab,
+  ): tab is "mail" | "artifacts" | "git" | "board" =>
+    tab === "mail" || tab === "artifacts" || tab === "git" || tab === "board";
+  const rawRightSplitTab: Exclude<CockpitTab, "chat"> = isRightSplitTab(activeTab)
+    ? activeTab
+    : isRightSplitTab(secondaryTab)
+      ? secondaryTab
+      : "git";
   const rightSplitTab: Exclude<CockpitTab, "chat"> =
     !selectedAgent && rawRightSplitTab === "mail" ? "artifacts" : rawRightSplitTab;
 
@@ -1667,10 +1771,25 @@ export const App: React.FC<AppProps> = ({
       const next = !prev;
       const targetTab =
         !selectedAgent && secondaryTab === "mail" ? "artifacts" : secondaryTab;
-      setActiveTab(next ? targetTab : "chat");
+      setActiveTab(next ? targetTab : leftPanelTab === "roster" ? "chat" : leftPanelTab);
+      if (next) {
+        setMobileRosterOpen(false);
+      }
       return next;
     });
-  }, [secondaryTab, selectedAgent]);
+  }, [secondaryTab, selectedAgent, leftPanelTab]);
+
+  const handleToggleLeftSidebar = useCallback(() => {
+    setMobileRosterOpen((prev) => {
+      const next = !prev;
+      if (next && typeof window !== "undefined" && window.innerWidth <= 768) {
+        setSplitView(false);
+        setActiveTab(leftPanelTab === "roster" ? "chat" : leftPanelTab);
+      }
+      return next;
+    });
+    setDesktopSidebarCollapsed((prev) => !prev);
+  }, [leftPanelTab]);
 
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
@@ -1716,6 +1835,13 @@ export const App: React.FC<AppProps> = ({
         isOpen={mobileRosterOpen}
         isCollapsedDesktop={desktopSidebarCollapsed}
         onClose={() => setMobileRosterOpen(false)}
+        leftPanelTab={leftPanelTab}
+        onSelectLeftPanelTab={handleSelectLeftPanelTab}
+        consoleContent={
+          leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
+        }
+        width={effectiveLeftWidth}
+        onResizeStart={handleLeftResizeStart}
       />
 
       <div className="fd-main">
@@ -1757,10 +1883,7 @@ export const App: React.FC<AppProps> = ({
           onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
-          onOpenMobileRoster={() => {
-            setMobileRosterOpen((prev) => !prev);
-            setDesktopSidebarCollapsed((prev) => !prev);
-          }}
+          onOpenMobileRoster={handleToggleLeftSidebar}
           mobileSidebarOpen={mobileRosterOpen}
         />
 
@@ -1807,7 +1930,34 @@ export const App: React.FC<AppProps> = ({
             apiClient={apiClient}
           />
           {splitView && (
-            <div className="fd-pane" data-testid="right-split-panel">
+            <div
+              className="fd-pane fd-right-split-pane"
+              data-testid="right-split-panel"
+              style={{
+                width: `${rightPanelWidth}px`,
+                minWidth: `${rightPanelWidth}px`,
+                flex: `0 0 ${rightPanelWidth}px`,
+                position: "relative",
+              }}
+            >
+              <div
+                data-testid="right-panel-resize-handle"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize right panel"
+                title="Drag left or right to resize right panel"
+                onMouseDown={handleRightResizeStart}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: "-3px",
+                  bottom: 0,
+                  width: "6px",
+                  cursor: "col-resize",
+                  zIndex: 25,
+                  userSelect: "none",
+                }}
+              />
               <RightPanelHeader
                 selectedAgent={selectedAgent}
                 rightSplitTab={rightSplitTab}
@@ -1823,27 +1973,6 @@ export const App: React.FC<AppProps> = ({
             </div>
           )}
         </main>
-
-        {/* Mobile Bottom Navigation Bar */}
-        <nav
-          className="fd-mobile-nav"
-          aria-label="Mobile Cockpit Navigation"
-          data-testid="mobile-bottom-nav"
-        >
-          {COCKPIT_TABS.map((tab) => {
-            const isActive = activeTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                className={`fd-btn${isActive ? " fd-btn-active" : ""}`}
-                onClick={() => handleSelectTab(tab.id)}
-              >
-                {tab.label}
-              </button>
-            );
-          })}
-        </nav>
       </div>
 
       <PairingModal

@@ -313,6 +313,124 @@ export interface RosterSidebarProps {
   isOpen?: boolean;
   isCollapsedDesktop?: boolean;
   onClose?: () => void;
+  leftPanelTab?: LeftPanelTab;
+  onSelectLeftPanelTab?: (tab: LeftPanelTab) => void;
+  consoleContent?: React.ReactNode;
+  width?: number;
+  onResizeStart?: (e: React.MouseEvent<HTMLDivElement>) => void;
+}
+
+export type LeftPanelTab = "roster" | "terminal" | "hub" | "gate" | "state";
+
+export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
+  { id: "roster", label: "Agent Roster" },
+  { id: "terminal", label: "Terminal" },
+  { id: "hub", label: "Hub & Arch" },
+  { id: "gate", label: "Vault & Gate" },
+  { id: "state", label: "FerroState" },
+];
+
+function renderLeftPanelTabIcon(tabId: LeftPanelTab): React.ReactNode {
+  switch (tabId) {
+    case "roster":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="6" cy="5.25" r="2.25" stroke="currentColor" strokeWidth="1.4" />
+          <path
+            d="M2 13C2 10.9 3.79 9.25 6 9.25C8.21 9.25 10 10.9 10 13"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          />
+          <circle cx="11.5" cy="5.75" r="1.75" stroke="currentColor" strokeWidth="1.3" />
+          <path
+            d="M11.2 9.5C12.85 9.65 14.1 10.95 14.1 12.6"
+            stroke="currentColor"
+            strokeWidth="1.3"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
+    case "terminal":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect
+            x="1.75"
+            y="2.5"
+            width="12.5"
+            height="11"
+            rx="1.8"
+            stroke="currentColor"
+            strokeWidth="1.4"
+          />
+          <path
+            d="M4.5 6L6.75 8L4.5 10"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <line
+            x1="8"
+            y1="10"
+            x2="11"
+            y2="10"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
+    case "hub":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <polygon
+            points="8 1.75 13.5 4.9 13.5 11.1 8 14.25 2.5 11.1 2.5 4.9"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinejoin="round"
+          />
+          <circle cx="8" cy="8" r="1.8" stroke="currentColor" strokeWidth="1.3" />
+        </svg>
+      );
+    case "gate":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect
+            x="3.25"
+            y="7.25"
+            width="9.5"
+            height="6.5"
+            rx="1.5"
+            stroke="currentColor"
+            strokeWidth="1.4"
+          />
+          <path
+            d="M5.25 7.25V5.25C5.25 3.73 6.48 2.5 8 2.5C9.52 2.5 10.75 3.73 10.75 5.25V7.25"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
+    case "state":
+    default:
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <ellipse cx="8" cy="4" rx="5.25" ry="2" stroke="currentColor" strokeWidth="1.4" />
+          <path
+            d="M2.75 4V8C2.75 9.1 5.1 10 8 10C10.9 10 13.25 9.1 13.25 8V4"
+            stroke="currentColor"
+            strokeWidth="1.4"
+          />
+          <path
+            d="M2.75 8V12C2.75 13.1 5.1 14 8 14C10.9 14 13.25 13.1 13.25 12V8"
+            stroke="currentColor"
+            strokeWidth="1.4"
+          />
+        </svg>
+      );
+  }
 }
 
 const CANONICAL_PROJECTS = [
@@ -374,7 +492,20 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   isOpen = false,
   isCollapsedDesktop = false,
   onClose,
+  leftPanelTab,
+  onSelectLeftPanelTab,
+  consoleContent,
+  width,
+  onResizeStart,
 }) => {
+  const [internalLeftTab, setInternalLeftTab] = useState<LeftPanelTab>("roster");
+  const effectiveLeftTab: LeftPanelTab = leftPanelTab ?? internalLeftTab;
+  const handleSelectLeftTab = (tab: LeftPanelTab) => {
+    setInternalLeftTab(tab);
+    onSelectLeftPanelTab?.(tab);
+  };
+  const activeLeftLabel =
+    LEFT_PANEL_TABS.find((t) => t.id === effectiveLeftTab)?.label ?? "Agent Roster";
   const [searchQuery, setSearchQuery] = useState("");
   const { pinnedProjects, pinnedAgents } = usePinnedState();
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => {
@@ -564,45 +695,84 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         data-testid="roster-sidebar"
         data-mobile-open={isOpen ? "true" : "false"}
         data-desktop-collapsed={isCollapsedDesktop ? "true" : "false"}
-      >
-      <div
-        style={{
-          padding: "12px 14px",
-          borderBottom: "1px solid var(--border-subtle)",
-          display: "flex",
-          flexDirection: "column",
-          gap: "10px",
-        }}
+        data-left-panel-tab={effectiveLeftTab}
+        style={
+          width
+            ? { width: `${width}px`, minWidth: `${width}px`, position: "relative" }
+            : { position: "relative" }
+        }
       >
         <div
+          data-testid="left-panel-header"
+          role="tablist"
+          aria-label="Left Panel Views"
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
+            gap: "8px",
+            padding: "6px 10px",
+            borderBottom: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--bg-surface)",
+            flexShrink: 0,
+            minHeight: "40px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            <span
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              minWidth: 0,
+            }}
+          >
+            <div
               style={{
-                width: "10px",
-                height: "10px",
-                borderRadius: "2px",
-                backgroundColor: "var(--accent-primary)",
-                display: "inline-block",
-              }}
-            />
-            <span
-              style={{
-                fontWeight: 700,
-                fontSize: "13px",
-                letterSpacing: "0.06em",
-                textTransform: "uppercase",
+                display: "flex",
+                alignItems: "center",
+                gap: "3px",
+                flexShrink: 0,
               }}
             >
-              FerroDeck
+              {LEFT_PANEL_TABS.map((tab) => {
+                const isActive = effectiveLeftTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isActive}
+                    aria-label={tab.label}
+                    title={tab.label}
+                    data-testid={`left-panel-tab-${tab.id}`}
+                    className={`fd-btn${isActive ? " fd-btn-active" : ""}`}
+                    style={{ padding: "5px 6px", lineHeight: 1 }}
+                    onClick={() => handleSelectLeftTab(tab.id)}
+                  >
+                    {renderLeftPanelTabIcon(tab.id)}
+                  </button>
+                );
+              })}
+            </div>
+
+            <span className="fd-tier-divider" style={{ height: "18px" }} aria-hidden="true" />
+
+            <span
+              data-testid="left-panel-active-title"
+              style={{
+                fontWeight: 600,
+                fontSize: "12px",
+                color: "var(--text-primary)",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {activeLeftLabel}
             </span>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
             <div
               style={{
                 position: "absolute",
@@ -616,6 +786,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 border: 0,
               }}
             >
+              <span>FerroDeck</span>
               <span className="fd-badge" title="Registered Workspace Agents">
                 {enrichedAgents.length} agents
               </span>
@@ -645,62 +816,26 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           </div>
         </div>
 
-        <div
-          data-testid="roster-global-controls"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-          }}
-        >
-          <button
-            type="button"
-            data-testid="settings-modal-btn"
-            className="fd-btn"
-            onClick={() => onOpenSettingsModal?.()}
-            title="Open Settings (Agents, System, Auth)"
-            style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
-          >
-            <span className="fd-gear-icon" aria-hidden="true" style={{ fontSize: "15px", lineHeight: 1 }}>
-              ⚙
-            </span>{" "}
-            Settings
-          </button>
-          <button
-            type="button"
-            data-testid="context-help-btn"
-            aria-label="Open Contextual Help"
-            title="Contextual Help for current view"
-            className="fd-btn fd-help-icon-btn"
-            onClick={() => onOpenHelpModal?.()}
-            style={{ padding: "4px 8px", fontSize: "11.5px" }}
-          >
-            ?
-          </button>
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="theme-toggle-btn"
-            onClick={() => onToggleTheme?.()}
-            title={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-            aria-label={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-            style={{ padding: "4px 8px", fontSize: "12px" }}
-          >
-            {themeMode === "dark" ? "☀" : "☾"}
-          </button>
-        </div>
+        {effectiveLeftTab === "roster" ? (
+          <>
+            <div
+              style={{
+                padding: "8px 12px",
+                borderBottom: "1px solid var(--border-subtle)",
+                flexShrink: 0,
+              }}
+            >
+              <input
+                type="search"
+                className="fd-input"
+                placeholder="Search agents, projects, adapters..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                style={{ width: "100%" }}
+              />
+            </div>
 
-        <input
-          type="search"
-          className="fd-input"
-          placeholder="Search agents, projects, adapters..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          style={{ width: "100%" }}
-        />
-      </div>
-
-      <div className="fd-scroll" style={{ padding: "10px 8px" }}>
+            <div className="fd-scroll" style={{ padding: "10px 8px" }}>
         {groupedByProject.length === 0 ? (
           <div
             style={{
@@ -994,7 +1129,90 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             );
           })
         )}
-      </div>
+            </div>
+          </>
+        ) : (
+          <div
+            data-testid="left-panel-console-body"
+            style={{
+              flex: 1,
+              minHeight: 0,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+            }}
+          >
+            {consoleContent}
+          </div>
+        )}
+
+        <div
+          data-testid="roster-global-controls"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "8px 12px",
+            borderTop: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--bg-surface)",
+            flexShrink: 0,
+          }}
+        >
+          <button
+            type="button"
+            data-testid="settings-modal-btn"
+            className="fd-btn"
+            onClick={() => onOpenSettingsModal?.()}
+            title="Open Settings (Agents, System, Auth)"
+            style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
+          >
+            <span className="fd-gear-icon" aria-hidden="true" style={{ fontSize: "15px", lineHeight: 1 }}>
+              ⚙
+            </span>{" "}
+            Settings
+          </button>
+          <button
+            type="button"
+            data-testid="context-help-btn"
+            aria-label="Open Contextual Help"
+            title="Contextual Help for current view"
+            className="fd-btn fd-help-icon-btn"
+            onClick={() => onOpenHelpModal?.()}
+            style={{ padding: "4px 8px", fontSize: "11.5px" }}
+          >
+            ?
+          </button>
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="theme-toggle-btn"
+            onClick={() => onToggleTheme?.()}
+            title={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            aria-label={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            style={{ padding: "4px 8px", fontSize: "12px" }}
+          >
+            {themeMode === "dark" ? "☀" : "☾"}
+          </button>
+        </div>
+
+        <div
+          data-testid="left-panel-resize-handle"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize left panel"
+          title="Drag left or right to resize left panel"
+          onMouseDown={onResizeStart}
+          style={{
+            position: "absolute",
+            top: 0,
+            right: "-3px",
+            bottom: 0,
+            width: "6px",
+            cursor: "col-resize",
+            zIndex: 25,
+            userSelect: "none",
+          }}
+        />
       </aside>
     </>
   );
