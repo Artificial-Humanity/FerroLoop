@@ -847,6 +847,8 @@ export interface ChatPaneProps {
   model?: string | null;
   thinkingLevel?: string | null;
   availableModels?: string[] | null;
+  /** Effective execution mode reported for the session (`auto`, `yolo`, `plan`, `default`, `accept-edits`, or a vendor value). */
+  executionMode?: string | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -916,6 +918,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   model = null,
   thinkingLevel = null,
   availableModels = null,
+  executionMode,
   sessionId,
   turns,
   contextUsage = null,
@@ -3570,6 +3573,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         contextEstimate={contextEstimate}
         quotaUsage={effectiveQuotaUsage}
+        executionMode={executionMode}
         turnCount={filteredTurns.length}
         canCompact={canCompact}
         compacting={compacting}
