@@ -344,14 +344,16 @@ export const NodesModal: React.FC<NodesModalProps> = ({
     >
       <div className="fd-modal" style={{ maxWidth: "680px", maxHeight: "88vh", display: "flex", flexDirection: "column" }}>
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
+            gap: "8px",
             marginBottom: "14px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, minWidth: 0, flexWrap: "wrap" }}>
             <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
               Nodes &amp; Enrollment
             </h2>
@@ -362,6 +364,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
           <button
             type="button"
             className="fd-btn"
+            style={{ flexShrink: 0 }}
             onClick={onClose}
             aria-label="Close Nodes Modal"
           >
@@ -386,7 +389,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
           </div>
         )}
 
-        <div role="tablist" aria-label="Nodes sections" style={{ display: "flex", gap: "6px", marginBottom: "12px" }}>
+        <div role="tablist" aria-label="Nodes sections" style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "12px" }}>
           <button
             type="button"
             role="tab"

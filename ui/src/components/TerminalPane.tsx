@@ -444,7 +444,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             </h3>
             <p style={{ margin: 0, fontSize: "12px", color: "var(--text-secondary)" }}>
               Interactive PTY shell multiplexer sessions on AI-Lab-0 require authenticated Owner
-              authority. Pair with a 10-minute code from <code className="fd-mono">fl hub pair</code>{" "}
+              authority. Pair with a 1-hour code from <code className="fd-mono">fl hub pair</code>{" "}
               or enter your Owner bearer token.
             </p>
             {onOpenPairing && (

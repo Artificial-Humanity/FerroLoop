@@ -3,6 +3,7 @@ import type { HubApiClient } from "../api/client";
 import type {
   ArtifactKind,
   ArtifactPreviewResponse,
+  ArtifactStorageStats,
   ArtifactSummaryItem,
   ArtifactVersionInfo,
   DocxPreview,
@@ -855,6 +856,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [cleanupKind, setCleanupKind] = useState<"all" | "images" | "docs" | "code">("all");
   const [cleanupKeepVersions, setCleanupKeepVersions] = useState<number>(0);
   const [cleanupDryRunSummary, setCleanupDryRunSummary] = useState<string | null>(null);
+  const [storageStats, setStorageStats] = useState<ArtifactStorageStats | null>(null);
   const [locallyPrunedPaths, setLocallyPrunedPaths] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
@@ -896,6 +898,9 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
       if (Array.isArray(res?.artifacts)) {
         setSessionArtifacts(res.artifacts);
       }
+      if (res?.storage !== undefined) {
+        setStorageStats(res.storage ?? null);
+      }
     } catch {
       // Ignore optional discovery errors
     }
@@ -908,8 +913,13 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     apiClient
       .listSessionArtifacts(sessionId)
       .then((res) => {
-        if (!cancelled && Array.isArray(res?.artifacts)) {
-          setSessionArtifacts(res.artifacts);
+        if (!cancelled) {
+          if (Array.isArray(res?.artifacts)) {
+            setSessionArtifacts(res.artifacts);
+          }
+          if (res?.storage !== undefined) {
+            setStorageStats(res.storage ?? null);
+          }
         }
       })
       .catch(() => {
@@ -1056,7 +1066,6 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
       }
 
       const res = await apiClient.pruneArtifacts({
-        ...(sessionId ? { session_id: sessionId } : {}),
         dry_run: dryRun,
         status: statusFilter,
         ...(maxAgeDays !== undefined ? { max_age_days: maxAgeDays } : {}),
@@ -1065,6 +1074,10 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           ? { prune_versions_keep: cleanupKeepVersions }
           : {}),
       });
+
+      if (res?.storage !== undefined) {
+        setStorageStats(res.storage ?? null);
+      }
 
       const removedEntries =
         res?.removed_entries ??
@@ -1075,13 +1088,18 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           : cleanupMatchingPaths.length);
       const removedVersions = res?.removed_versions ?? 0;
       const bytesFreed = res?.bytes_freed ?? 0;
+      const failedDeletes = res?.failed_deletes ?? 0;
+      const failedSuffix =
+        failedDeletes > 0
+          ? ` · ${failedDeletes} ${failedDeletes === 1 ? "file delete failed" : "file deletes failed"}`
+          : "";
 
       if (dryRun) {
         setCleanupDryRunSummary(
-          `Dry run: ${removedEntries} ${removedEntries === 1 ? "entry" : "entries"}, ${removedVersions} ${removedVersions === 1 ? "version" : "versions"} (${formatByteSize(bytesFreed)}) eligible for cleanup.`,
+          `Dry run: ${removedEntries} ${removedEntries === 1 ? "entry" : "entries"}, ${removedVersions} ${removedVersions === 1 ? "version" : "versions"} (${formatByteSize(bytesFreed)}) eligible for cleanup.${failedSuffix}`,
         );
       } else {
-        if (cleanupMatchingPaths.length > 0) {
+        if (cleanupKeepVersions === 0 && cleanupMatchingPaths.length > 0) {
           setLocallyPrunedPaths((prev) => {
             const next = new Set(prev);
             cleanupMatchingPaths.forEach((p) => next.add(p));
@@ -1089,7 +1107,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           });
         }
         setPruneStatus(
-          `Cleaned up ${removedEntries} ${removedEntries === 1 ? "artifact" : "artifacts"}${bytesFreed > 0 ? ` (${formatByteSize(bytesFreed)} freed)` : ""}`,
+          `Cleaned up ${removedEntries} ${removedEntries === 1 ? "artifact" : "artifacts"}${removedVersions > 0 ? `, ${removedVersions} ${removedVersions === 1 ? "version" : "versions"}` : ""}${bytesFreed > 0 ? ` (${formatByteSize(bytesFreed)} freed)` : ""}${failedSuffix}`,
         );
         setCleanupModalOpen(false);
         await refreshSessionArtifacts();
@@ -2167,6 +2185,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           aria-modal="true"
           aria-label="Clean Up Artifacts"
           data-testid="artifact-cleanup-modal"
+          className="fd-modal-backdrop"
           style={{
             position: "fixed",
             inset: 0,
@@ -2180,7 +2199,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           onClick={() => setCleanupModalOpen(false)}
         >
           <div
-            className="fd-card"
+            className="fd-modal fd-card"
             style={{
               width: "100%",
               maxWidth: "440px",
@@ -2195,6 +2214,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             onClick={(e) => e.stopPropagation()}
           >
             <div
+              className="fd-modal-header"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -2202,13 +2222,14 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                 gap: "8px",
               }}
             >
-              <strong style={{ fontSize: "14px", color: "var(--text-primary)" }}>
+              <strong style={{ fontSize: "14px", color: "var(--text-primary)", flex: 1, minWidth: 0 }}>
                 Clean Up Artifacts
               </strong>
               <button
                 type="button"
                 data-testid="artifact-cleanup-close-btn"
                 className="fd-btn"
+                style={{ flexShrink: 0 }}
                 onClick={() => setCleanupModalOpen(false)}
                 aria-label="Close Clean Up Artifacts modal"
               >
@@ -2304,6 +2325,18 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
               }}
             >
               Matching tracked artifacts: {cleanupMatchingPaths.length}
+              {storageStats && (
+                <div
+                  data-testid="artifact-cleanup-storage-summary"
+                  style={{ marginTop: "4px", color: "var(--text-muted)" }}
+                >
+                  Managed: {storageStats.managed_files ?? 0} files (
+                  {formatByteSize(storageStats.managed_bytes ?? 0)}) · Versions:{" "}
+                  {storageStats.version_files ?? 0} snapshots (
+                  {formatByteSize(storageStats.version_bytes ?? 0)})
+                  {storageStats.truncated ? " (truncated)" : ""}
+                </div>
+              )}
               {cleanupDryRunSummary && (
                 <div
                   data-testid="artifact-cleanup-dryrun-summary"

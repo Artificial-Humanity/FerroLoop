@@ -190,11 +190,24 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
         const parsed = init?.body ? JSON.parse(String(init.body)) : {};
         pruneCalls.push(parsed);
         return json({
+          ok: true,
           dry_run: Boolean(parsed.dry_run),
           removed_entries: 3,
           removed_versions: 5,
           bytes_freed: 16384,
+          failed_deletes: 0,
           pruned_count: 3,
+          archived_count: 1,
+          active_count: 1,
+          storage: {
+            root_dir: "/tmp/artifacts",
+            managed_files: 2,
+            managed_bytes: 3072,
+            version_files: 4,
+            version_bytes: 8192,
+            registry_entries: 2,
+            truncated: false,
+          },
         });
       }
       if (url.startsWith("/api/v1/artifacts/list")) {
@@ -217,6 +230,16 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
               status: "live",
             },
           ],
+          pruned_count: 0,
+          storage: {
+            root_dir: "/tmp/artifacts",
+            managed_files: 5,
+            managed_bytes: 19456,
+            version_files: 9,
+            version_bytes: 24576,
+            registry_entries: 5,
+            truncated: false,
+          },
         });
       }
       return json({
@@ -250,6 +273,11 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
 
     const modal = await screen.findByTestId("artifact-cleanup-modal");
     expect(modal).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("artifact-cleanup-storage-summary"),
+      ).toHaveTextContent(/Managed: 5 files/i);
+    });
 
     fireEvent.change(screen.getByTestId("artifact-cleanup-scope"), {
       target: { value: "all" },
@@ -272,7 +300,6 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
       ).toHaveTextContent(/3 entries, 5 versions/i);
     });
     expect(pruneCalls[0]).toEqual({
-      session_id: "sess-ferris",
       dry_run: true,
       status: "all",
       max_age_days: 7,
@@ -286,7 +313,6 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
       expect(screen.queryByTestId("artifact-cleanup-modal")).toBeNull();
     });
     expect(pruneCalls[1]).toEqual({
-      session_id: "sess-ferris",
       dry_run: false,
       status: "all",
       max_age_days: 7,
@@ -294,7 +320,7 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
       prune_versions_keep: 3,
     });
     expect(screen.getByTestId("prune-artifacts-status")).toHaveTextContent(
-      /Cleaned up 3 artifacts/i,
+      /Cleaned up 3 artifacts, 5 versions/i,
     );
   });
 
@@ -519,5 +545,61 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
 
     fireEvent.click(screen.getByTestId("terminal-reconnect-btn"));
     expect(outputLog).toHaveTextContent("Ready for interactive PTY output...");
+  });
+
+  it("Phone modal close buttons & right-panel split backdrop: renders mobile-split-backdrop when right split panel opens and provides top-right close buttons in Clear & Decommission modals", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) {
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsClient = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    render(<App apiClient={apiClient} wsClient={wsClient} />);
+
+    const splitToggleBtn = await screen.findByTestId("split-view-toggle");
+    expect(screen.queryByTestId("mobile-split-backdrop")).toBeNull();
+
+    // Opening right split panel renders mobile-split-backdrop; clicking backdrop closes split view
+    fireEvent.click(splitToggleBtn);
+    const splitBackdrop = screen.getByTestId("mobile-split-backdrop");
+    expect(splitBackdrop).toBeInTheDocument();
+    fireEvent.click(splitBackdrop);
+    expect(screen.queryByTestId("mobile-split-backdrop")).toBeNull();
+
+    // Open AgentSettingsModal -> Clear / Reforge modal -> close via top-right ✕ button
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
+    expect(screen.getByTestId("clear-session-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("clear-modal-close-btn"));
+    expect(screen.queryByTestId("clear-session-modal")).toBeNull();
+
+    // Open AgentSettingsModal -> Decommission modal -> close via top-right ✕ button
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("decommission-modal-close-btn"));
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
   });
 });

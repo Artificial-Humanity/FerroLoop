@@ -209,6 +209,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       >
         {/* Header */}
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
@@ -216,7 +217,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             gap: "8px",
           }}
         >
-          <div>
+          <div style={{ flex: 1, minWidth: 0 }}>
             <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
               Agent Settings — {displayTarget}
             </h2>
@@ -231,7 +232,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               manage session lifecycle.
             </p>
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
             <button
               type="button"
               data-testid="agent-pin-toggle-btn"
@@ -833,6 +834,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                 }}
               >
                 <div
+                  className="fd-modal-header"
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -840,12 +842,13 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     gap: "8px",
                   }}
                 >
-                  <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 700 }}>
+                  <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 700, flex: 1, minWidth: 0 }}>
                     Re-Cast Agent — {displayTarget}
                   </h3>
                   <button
                     type="button"
                     className="fd-btn"
+                    style={{ flexShrink: 0 }}
                     aria-label="Close Re-Cast Modal"
                     disabled={recasting}
                     onClick={() => setRecastModalOpen(false)}

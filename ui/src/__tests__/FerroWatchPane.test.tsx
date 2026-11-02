@@ -314,14 +314,17 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
           results: [
             {
               persona: "ferris",
+              session_id: "claude:ferris",
               from_vendor: "claude",
               to_vendor: "codex",
-              ok: true,
-              session_id: "codex:ferris",
+              status: "ok",
+              new_session_id: "codex:ferris",
+              outcome: "remodeled",
               error: null,
             },
           ],
           audit_slug: "watch-balance-01",
+          warnings: [],
         });
       }
       if (url.includes("/api/v1/watch/balance")) {

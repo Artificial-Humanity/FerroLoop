@@ -630,13 +630,21 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         target_max_secondary_pct: balancePolicy.target_max_secondary_pct,
       });
       setBalancePlan(plan);
-      setBalanceMessage(
-        plan.switches.length > 0
-          ? `Dry-run plan ready: ${plan.switches.length} vendor switch(es) proposed.`
-          : plan.blocked
-            ? `Balance plan blocked: ${plan.blocked}`
-            : "Dry-run plan evaluated: all sessions within target quota thresholds.",
-      );
+      if (plan.blocked) {
+        setBalanceMessage(
+          plan.switches.length > 0
+            ? `Balance plan blocked (${plan.blocked}) — previewing ${plan.switches.length} switch(es).`
+            : `Balance plan blocked: ${plan.blocked}`,
+        );
+      } else if (plan.switches.length > 0) {
+        setBalanceMessage(
+          `Dry-run plan ready: ${plan.switches.length} vendor switch(es) proposed.`,
+        );
+      } else {
+        setBalanceMessage(
+          "Dry-run plan evaluated: all sessions within target quota thresholds.",
+        );
+      }
     } catch (err) {
       setBalanceError(
         err instanceof Error ? err.message : "Failed to evaluate balance plan.",
@@ -655,7 +663,9 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       const res = await apiClient.applyWatchBalance();
       setBalanceApplyRes(res);
       setBalancePlan(res.plan);
-      const okCount = res.results.filter((r) => r.ok).length;
+      const okCount = res.results.filter(
+        (r) => r.status === "ok" || r.ok === true,
+      ).length;
       setBalanceMessage(
         `Applied quota balance: ${okCount}/${res.results.length} switch(es) completed.`,
       );
@@ -1604,12 +1614,23 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                       gap: "4px",
                     }}
                   >
-                    {balanceApplyRes.results.map((r) => (
-                      <div key={r.persona} className="fd-mono">
-                        {r.persona}: {r.from_vendor} → {r.to_vendor} [
-                        {r.ok ? "OK" : r.error || "failed"}]
-                      </div>
-                    ))}
+                    {balanceApplyRes.results.map((r) => {
+                      const isOk = r.status === "ok" || r.ok === true;
+                      const statusLabel = isOk
+                        ? "OK"
+                        : r.error
+                          ? `${r.status ? `${r.status}: ` : ""}${r.error}`
+                          : r.status || "failed";
+                      return (
+                        <div
+                          key={`${r.persona}-${r.session_id ?? r.to_vendor}`}
+                          className="fd-mono"
+                        >
+                          {r.persona}: {r.from_vendor} → {r.to_vendor} [
+                          {statusLabel}]
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>

@@ -170,14 +170,17 @@ export interface ArtifactStorageStats {
   version_files?: number;
   version_bytes?: number;
   registry_entries?: number;
+  truncated?: boolean;
 }
 
 export interface ArtifactListResponse {
   artifacts: ArtifactSummaryItem[];
-  storage?: ArtifactStorageStats;
+  pruned_count?: number;
+  storage?: ArtifactStorageStats | null;
 }
 
 export interface PruneArtifactsRequest {
+  paths?: string[];
   session_id?: string;
   worktree_path?: string;
   dry_run?: boolean;
@@ -188,17 +191,20 @@ export interface PruneArtifactsRequest {
 }
 
 export interface PruneArtifactsResponse {
+  ok?: boolean;
   dry_run?: boolean;
   removed_entries?: number;
   removed_versions?: number;
   bytes_freed?: number;
+  failed_deletes?: number;
   pruned_count?: number;
   pruned?: number;
   archived_count?: number;
+  active_count?: number;
   live_count?: number;
   remaining_count?: number;
   pruned_paths?: string[];
-  storage?: ArtifactStorageStats;
+  storage?: ArtifactStorageStats | null;
 }
 
 export interface PruneAttachmentsRequest {
@@ -1668,20 +1674,47 @@ export interface WatchBalanceStatusResponse {
 export interface WatchBalanceSwitchItem {
   persona: string;
   session_id: string;
+  project?: string;
   from_vendor: string;
   to_vendor: string;
   reason: string;
-  trigger: string;
-  target_score: number;
+  trigger: "exhausted" | "primary" | "secondary" | string;
+  target_score?: number | null;
+  target_status?: "exhausted" | "known" | "unknown" | string;
 }
+
+export type WatchBalanceSkipReason =
+  | "pinned"
+  | "excluded"
+  | "healthy"
+  | "no_reading"
+  | "not_remodelable"
+  | "cooldown"
+  | "persona_switched"
+  | "no_eligible_target"
+  | "run_limit"
+  | string;
 
 export interface WatchBalanceSkippedItem {
   persona: string;
-  reason: string;
+  session_id?: string;
+  vendor?: string;
+  reason: WatchBalanceSkipReason;
+  detail?: string;
+}
+
+export interface WatchBalanceVendorWindow {
+  used_percent: number;
+  resets_at_ms?: number | null;
+  window_minutes?: number | null;
+  readings?: number;
 }
 
 export interface WatchBalanceVendorHealth {
   vendor: string;
+  status?: "exhausted" | "known" | "unknown" | string;
+  primary?: WatchBalanceVendorWindow | null;
+  secondary?: WatchBalanceVendorWindow | null;
   primary_window?: {
     used_percent: number;
     resets_at_ms?: number | null;
@@ -1692,31 +1725,42 @@ export interface WatchBalanceVendorHealth {
   } | null;
   exhausted?: boolean;
   exhausted_reason?: string | null;
+  score?: number | null;
+  candidate?: boolean;
+  eligible?: boolean;
+  ineligible_reason?: string | null;
   unknown?: boolean;
 }
 
 export interface WatchBalancePlan {
   evaluated_at_ms: number;
+  policy?: WatchBalancePolicy;
   blocked: string | null;
   switches: WatchBalanceSwitchItem[];
   skipped: WatchBalanceSkippedItem[];
   vendors: WatchBalanceVendorHealth[];
 }
 
+export type WatchBalanceSwitchStatus = "ok" | "failed" | "refused" | "not_run";
+
 export interface WatchBalanceApplyResultItem {
   persona: string;
+  session_id?: string | null;
   from_vendor: string;
   to_vendor: string;
-  ok: boolean;
-  session_id?: string | null;
+  status?: WatchBalanceSwitchStatus;
+  ok?: boolean;
+  new_session_id?: string | null;
+  outcome?: "remodeled" | "restored" | "down" | string | null;
+  restored_session_id?: string | null;
   error?: string | null;
-  outcome?: string | null;
 }
 
 export interface WatchBalanceApplyResponse {
   plan: WatchBalancePlan;
   results: WatchBalanceApplyResultItem[];
   audit_slug?: string | null;
+  warnings?: string[];
 }
 
 /**

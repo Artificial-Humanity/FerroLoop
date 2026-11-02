@@ -1964,14 +1964,10 @@ export class HubApiClient {
 
   public async applyWatchBalance(options?: {
     warrant?: string;
-    policy?: Partial<WatchBalancePolicy>;
   }): Promise<WatchBalanceApplyResponse> {
     const body: Record<string, unknown> = {};
     if (options?.warrant && options.warrant.trim()) {
       body.warrant = options.warrant.trim();
-    }
-    if (options?.policy && Object.keys(options.policy).length > 0) {
-      body.policy = options.policy;
     }
     return this.request<WatchBalanceApplyResponse>("/api/v1/watch/balance/apply", {
       method: "POST",

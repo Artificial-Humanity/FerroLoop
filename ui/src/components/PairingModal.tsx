@@ -184,19 +184,22 @@ export const PairingModal: React.FC<PairingModalProps> = ({
     >
       <div className="fd-modal">
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
+            gap: "8px",
             marginBottom: "12px",
           }}
         >
-          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
+          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}>
             Authenticate with FerroLoop Hub
           </h2>
           <button
             type="button"
             className="fd-btn"
+            style={{ flexShrink: 0 }}
             onClick={onClose}
             aria-label="Close Pairing Modal"
           >
@@ -211,6 +214,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
           style={{
             display: "flex",
             gap: "6px",
+            flexWrap: "wrap",
             marginBottom: "14px",
             borderBottom: "1px solid var(--border-subtle, #1e293b)",
             paddingBottom: "10px",
@@ -284,7 +288,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
               }}
             >
               Run <code className="fd-mono">fl hub pair</code> on the host to
-              generate a 10-minute pairing code, or paste an Owner/Peer bearer
+              generate a 1-hour pairing code, or paste an Owner/Peer bearer
               token directly.
             </p>
 
@@ -300,7 +304,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
                   textTransform: "uppercase",
                 }}
               >
-                10-Minute Pairing Code
+                1-Hour Pairing Code
               </label>
               <div style={{ display: "flex", gap: "8px" }}>
                 <input

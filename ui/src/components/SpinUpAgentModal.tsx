@@ -161,19 +161,22 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
         style={{ maxWidth: "480px" }}
       >
         <div
+          className="fd-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
+            gap: "8px",
             marginBottom: "14px",
           }}
         >
-          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
+          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}>
             New Agent Session
           </h2>
           <button
             type="button"
             className="fd-btn"
+            style={{ flexShrink: 0 }}
             onClick={onClose}
             disabled={submitting}
             aria-label="Close New Agent Modal"

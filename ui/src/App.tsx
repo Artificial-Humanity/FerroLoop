@@ -2049,9 +2049,16 @@ export const App: React.FC<AppProps> = ({
             apiClient={apiClient}
           />
           {splitView && (
-            <div
-              className="fd-pane fd-right-split-pane"
-              data-testid="right-split-panel"
+            <>
+              <div
+                className="fd-right-split-backdrop"
+                data-testid="mobile-split-backdrop"
+                aria-hidden="true"
+                onClick={handleToggleSplitView}
+              />
+              <div
+                className="fd-pane fd-right-split-pane"
+                data-testid="right-split-panel"
               style={{
                 width: `${rightPanelWidth}px`,
                 minWidth: `${rightPanelWidth}px`,
@@ -2089,7 +2096,8 @@ export const App: React.FC<AppProps> = ({
                 onClose={handleToggleSplitView}
               />
               {renderSecondaryPane(rightSplitTab)}
-            </div>
+              </div>
+            </>
           )}
         </main>
       </div>
