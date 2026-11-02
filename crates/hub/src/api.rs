@@ -3735,12 +3735,17 @@ fn resolve_prune_worktree(
 /// `dry_run`, `max_age_days`, `status` (`archived` | `live` | `all`), `kinds` and
 /// `prune_versions_keep`; their semantics are on [`artifacts::CleanupFilter`]. A filter that
 /// removes entries or version rows runs after the archive and reconcile steps, in the same
-/// registry transaction. `dry_run: true` changes nothing (no archiving, no deletion, no registry
-/// write) and answers with what the same call would remove.
+/// registry transaction. `dry_run: true` changes nothing (no deletion, no registry write) and
+/// answers with what the same call would remove. A real call archives `paths`, `worktree_path`
+/// and `session_id` artifacts first, which changes what the filter removes, so a dry run cannot
+/// be combined with any of them: that is a 400. `prune_versions_keep` must be at least 1 (0 is
+/// a 400), because an entry with no version row would number its next revision 1 again.
 ///
 /// Answers `ok`, `pruned_count` (entries reconcile dropped), `archived_count` and `active_count`
 /// (reconcile's counts, before any filter removal), plus `dry_run`, `removed_entries` (reconcile
-/// plus filter), `removed_versions`, `bytes_freed` (regular files removed) and `storage` (see
+/// plus filter), `removed_versions` (rows), `bytes_freed` (regular files removed),
+/// `failed_deletes` (files that could not be deleted: their rows are gone anyway, so each one
+/// is an orphan file left in `managed/` or `versions/`; 0 in a dry run) and `storage` (see
 /// [`artifacts::StorageSummary`], measured after the action).
 fn handle_post_artifacts_prune(
     state: &HubState,
@@ -3782,6 +3787,13 @@ fn handle_post_artifacts_prune(
         Ok(parsed) => parsed,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
+    if dry_run && (!paths.is_empty() || !worktree_raw.is_empty() || !session_raw.is_empty()) {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "a dry run cannot be combined with paths, worktree_path or \
+                session_id, because archiving them changes what a real run removes" }),
+        );
+    }
     let Some(root) = artifacts_root(state) else {
         return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
     };
@@ -3870,6 +3882,7 @@ fn handle_post_artifacts_prune(
             "removed_entries": report.totals.removed_entries,
             "removed_versions": report.totals.removed_versions,
             "bytes_freed": report.totals.bytes_freed,
+            "failed_deletes": report.totals.failed_deletes,
             "storage": storage,
         }),
     )
@@ -3923,9 +3936,15 @@ fn parse_cleanup_filter(body: &Value) -> Result<(artifacts::CleanupFilter, bool)
         Some(_) => return Err("`kinds` must be an array of strings".to_string()),
     };
     let prune_versions_keep = json_optional_u64(body, "prune_versions_keep")?
-        .map(|n| {
-            usize::try_from(n)
-                .map_err(|_| "`prune_versions_keep` must be a non-negative integer".to_string())
+        .map(|n| match usize::try_from(n) {
+            Ok(0) => Err(
+                "`prune_versions_keep` must be >= 1 (an entry that kept no version \
+                would renumber its next revision 1; remove entries with a status, kinds or \
+                max_age_days filter instead)"
+                    .to_string(),
+            ),
+            Ok(n) => Ok(n),
+            Err(_) => Err("`prune_versions_keep` must be a non-negative integer".to_string()),
         })
         .transpose()?;
     Ok((

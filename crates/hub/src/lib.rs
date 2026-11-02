@@ -6526,6 +6526,7 @@ default_target = "wire:felicity"
             json!({
                 "ok": true, "pruned_count": 0, "archived_count": 0, "active_count": 0,
                 "dry_run": false, "removed_entries": 0, "removed_versions": 0, "bytes_freed": 0,
+                "failed_deletes": 0,
                 "storage": {
                     "root_dir": artifacts_root_of(&tmp).display().to_string(),
                     "managed_files": 0, "managed_bytes": 0, "version_files": 0,
@@ -6713,15 +6714,114 @@ default_target = "wire:felicity"
         assert!((0..4).all(|v| snap(0, v).exists()));
         assert_eq!(registry_names_of(&tmp), ["a.md", "b.pdf"]);
 
-        // No other filter: every entry; 0 drops everything.
-        let out = prune_ok(&state, &json!({ "prune_versions_keep": 0 }));
-        assert_eq!(out["removed_versions"], 5);
+        // No other filter: every entry; 1 keeps each entry's newest row.
+        let out = prune_ok(&state, &json!({ "prune_versions_keep": 1 }));
+        assert_eq!(out["removed_versions"], 3);
         assert_eq!(out["removed_entries"], 0);
-        assert_eq!(out["storage"]["version_files"], 0);
+        assert_eq!(out["failed_deletes"], 0);
+        assert_eq!(out["storage"]["version_files"], 2);
         assert_eq!(out["storage"]["registry_entries"], 2);
         assert_eq!(out["storage"]["managed_files"], 2);
         let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
-        assert!(reg.entries.iter().all(|e| e.versions.is_empty()));
+        assert!(reg.entries.iter().all(|e| e.versions.len() == 1));
+    }
+
+    #[test]
+    fn artifact_prune_rejects_zero_versions_to_keep() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        seed_cleanup(&tmp, &[("a.md", "markdown", "live", 1, 3)]);
+        let before = fs::read(artifacts_root_of(&tmp).join("registry.json")).unwrap();
+        for body in [
+            json!({ "prune_versions_keep": 0 }),
+            json!({ "prune_versions_keep": 0, "status": "archived" }),
+            json!({ "prune_versions_keep": 0, "dry_run": true }),
+        ] {
+            let resp = prune(&state, OWNER, &body);
+            assert_eq!(resp.status, 400, "{body}");
+            let msg = error_text(&resp);
+            assert!(msg.contains(">= 1") && msg.contains("filter"), "{msg}");
+            assert_eq!(
+                fs::read(artifacts_root_of(&tmp).join("registry.json")).unwrap(),
+                before,
+                "{body}"
+            );
+        }
+        let versions = crate::artifacts::Registry::load(&artifacts_root_of(&tmp)).entries[0]
+            .versions
+            .len();
+        assert_eq!(versions, 3);
+        assert_eq!(
+            prune(&state, OWNER, &json!({ "prune_versions_keep": 1 })).status,
+            200
+        );
+    }
+
+    #[test]
+    fn artifact_prune_dry_run_cannot_be_combined_with_archiving_inputs() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        seed_cleanup(&tmp, &[("a.md", "markdown", "archived", 1, 2)]);
+        let root = artifacts_root_of(&tmp);
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("new.md"), "# new").unwrap();
+        let tree = |dir: &std::path::Path| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in fs::read_dir(d).unwrap().flatten() {
+                    if e.path().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.push(e.path().display().to_string());
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let files_before = tree(&root);
+        let registry_before = fs::read(root.join("registry.json")).unwrap();
+        for extra in [
+            json!({ "paths": [wt.join("new.md").display().to_string()] }),
+            json!({ "worktree_path": wt.display().to_string() }),
+            json!({ "session_id": "some-session" }),
+        ] {
+            let mut body = json!({ "dry_run": true, "status": "archived" });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let resp = prune(&state, OWNER, &body);
+            assert_eq!(resp.status, 400, "{body}");
+            let msg = error_text(&resp);
+            assert!(
+                msg.contains("dry run") && msg.contains("paths, worktree_path or session_id"),
+                "{msg}"
+            );
+            assert_eq!(tree(&root), files_before, "{body}");
+            assert_eq!(
+                fs::read(root.join("registry.json")).unwrap(),
+                registry_before
+            );
+            assert_eq!(registry_names_of(&tmp), ["a.md"], "{body}");
+        }
+        // Empty values do not count, and the same inputs are fine in a real run.
+        let out = prune_ok(
+            &state,
+            &json!({ "dry_run": true, "status": "archived", "paths": [], "worktree_path": "",
+                     "session_id": "  " }),
+        );
+        assert_eq!(out["removed_entries"], 1);
+        assert_eq!(
+            prune(
+                &state,
+                OWNER,
+                &json!({ "worktree_path": wt.display().to_string() })
+            )
+            .status,
+            200
+        );
     }
 
     #[test]
@@ -6798,14 +6898,7 @@ default_target = "wire:felicity"
             out
         };
         let files_before = tree(&root);
-        // A named file in a worktree would be archived by a real call; a dry one must not.
-        let wt = tmp.path().join("wt");
-        fs::create_dir_all(&wt).unwrap();
-        fs::write(wt.join("new.md"), "# new").unwrap();
-        let body = json!({
-            "status": "archived", "kinds": ["markdown"],
-            "worktree_path": wt.display().to_string(),
-        });
+        let body = json!({ "status": "archived", "kinds": ["markdown"] });
         let mut dry_body = body.clone();
         dry_body["dry_run"] = json!(true);
 

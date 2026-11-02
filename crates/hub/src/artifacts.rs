@@ -321,7 +321,8 @@ const MS_PER_DAY: u64 = 86_400_000;
 ///   touched.
 /// - `prune_versions_keep` set: TRIM mode. Of the selected entries (all, when no selection
 ///   filter is set) only the N newest version rows are kept and the dropped rows' snapshots are
-///   deleted. No entry is removed. With 0 the numbering of a later revision starts again at 1.
+///   deleted. No entry is removed. N is at least 1 (the API rejects 0): an entry that kept no
+///   row would number its next revision 1 again, and numbers are never reused.
 /// - Nothing set: no filtered action.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CleanupFilter {
@@ -363,6 +364,26 @@ pub(crate) struct CleanupTotals {
     pub removed_versions: usize,
     /// Sizes of the regular files removed: managed copies and snapshots.
     pub bytes_freed: u64,
+    /// Files the hub tried to delete and could not. The registry/version row is dropped anyway
+    /// (`removed_versions` counts rows), so each one is an orphan file left in `managed/` or
+    /// `versions/` with no row to retry from. Always 0 in a dry run.
+    pub failed_deletes: usize,
+}
+
+/// The one place a cleanup deletes a file. Under test a thread can name paths whose delete
+/// fails, so a failure is reproducible whatever the user (a root process ignores dir modes).
+fn remove_hub_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_DELETES.with(|set| set.borrow().contains(path)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_DELETES: std::cell::RefCell<HashSet<PathBuf>> =
+        std::cell::RefCell::new(HashSet::new());
 }
 
 /// Deletes (or, in a dry run, only counts) hub-managed files, each path once.
@@ -384,13 +405,20 @@ impl Sweeper {
     }
 
     /// Delete `path` (a regular file of `len` bytes) unless it was handled already; a failed
-    /// delete frees nothing.
+    /// delete frees nothing and is counted in `failed_deletes` (a file that is already gone is
+    /// neither).
     fn delete(&mut self, path: PathBuf, len: u64) {
         if !self.seen.insert(path.clone()) {
             return;
         }
-        if self.dry_run || fs::remove_file(&path).is_ok() {
+        if self.dry_run {
             self.totals.bytes_freed = self.totals.bytes_freed.saturating_add(len);
+            return;
+        }
+        match remove_hub_file(&path) {
+            Ok(()) => self.totals.bytes_freed = self.totals.bytes_freed.saturating_add(len),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => self.totals.failed_deletes += 1,
         }
     }
 
@@ -2791,9 +2819,9 @@ mod tests {
         assert_eq!(report.totals.removed_entries, 0);
         assert_eq!(report.totals.removed_versions, 3);
         assert_eq!(report.totals.bytes_freed, 10 + 20 + 30);
-        let reg = Registry::load(&root);
         let got = |name: &str| -> Vec<u32> {
-            reg.entries
+            Registry::load(&root)
+                .entries
                 .iter()
                 .find(|e| e.name == name)
                 .unwrap()
@@ -2810,21 +2838,17 @@ mod tests {
         assert!(snaps_of(&live).iter().all(|p| p.exists()));
         assert!(managed_of(&arch).exists());
 
-        // No other filter: every entry; N = 0 drops every row and the empty dir goes.
+        // No other filter: every entry; N = 1 keeps each entry's newest row.
         let f = CleanupFilter {
-            prune_versions_keep: Some(0),
+            prune_versions_keep: Some(1),
             ..filter()
         };
         let report = run_cleanup(&root, &f, false);
-        assert_eq!(report.totals.removed_versions, 5);
+        assert_eq!(report.totals.removed_versions, 1 + 2);
         assert_eq!(report.registry_entries, 2);
-        assert!(
-            Registry::load(&root)
-                .entries
-                .iter()
-                .all(|e| e.versions.is_empty())
-        );
-        assert!(!versions_dir(&root, Path::new(&live.canonical_path)).exists());
+        assert_eq!(got("arch.md"), [5]);
+        assert_eq!(got("live.md"), [3]);
+        assert!(versions_dir(&root, Path::new(&live.canonical_path)).exists());
 
         // N above the row count changes nothing.
         let f = CleanupFilter {
@@ -3061,27 +3085,81 @@ mod tests {
         assert_eq!(snapshot_target(&root, &plain), Some((real[2].clone(), 30)));
     }
 
+    /// Make the delete of every path in `paths` fail on this thread until dropped.
+    struct FailDeletes;
+
+    impl FailDeletes {
+        fn on(paths: &[PathBuf]) -> Self {
+            FAIL_DELETES.with(|set| set.borrow_mut().extend(paths.iter().cloned()));
+            Self
+        }
+    }
+
+    impl Drop for FailDeletes {
+        fn drop(&mut self) {
+            FAIL_DELETES.with(|set| set.borrow_mut().clear());
+        }
+    }
+
     #[test]
     fn bytes_freed_counts_only_files_that_were_removed() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
         let root = data_root(tmp.path());
         let orig = tmp.path().join("orig");
         let e = seed_test_entry(&root, &orig, "a.md", "markdown", "archived", 1, 2);
-        let dir = versions_dir(&root, Path::new(&e.canonical_path));
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let can_write = fs::write(dir.join("probe"), "x").is_ok();
+        let _fail = FailDeletes::on(&snaps_of(&e));
         let f = CleanupFilter {
             status: Some(StatusFilter::Archived),
             ..filter()
         };
+        let dry = run_cleanup(&root, &f, true);
         let real = run_cleanup(&root, &f, false);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        if !can_write {
-            // Snapshots could not be removed: only the managed copy counts.
-            assert_eq!(real.totals.bytes_freed, 100);
-            assert!(snaps_of(&e).iter().all(|p| p.exists()));
-        }
+        // Snapshots could not be removed: only the managed copy counts, and each failed file
+        // is counted as an orphan, though its row went.
+        assert_eq!(real.totals.bytes_freed, 100);
+        assert_eq!(real.totals.failed_deletes, 2);
+        assert_eq!(real.totals.removed_versions, 2);
+        assert_eq!(real.totals.removed_entries, 1);
+        assert!(registry_names(&root).is_empty());
+        assert!(!managed_of(&e).exists());
+        assert!(snaps_of(&e).iter().all(|p| p.exists()));
+        // A dry run deletes nothing, so it fails nothing and predicts the full size.
+        assert_eq!(dry.totals.failed_deletes, 0);
+        assert_eq!(dry.totals.bytes_freed, 100 + 10 + 20);
+    }
+
+    #[test]
+    fn failed_deletes_are_counted_on_every_removal_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let clean = run_cleanup(&root, &filter(), false);
+        assert_eq!(clean.totals.failed_deletes, 0);
+
+        // Trim: the dropped row's snapshot stays, and is counted.
+        let e = seed_test_entry(&root, &orig, "trim.md", "markdown", "live", 1, 3);
+        let snaps = snaps_of(&e);
+        let fail = FailDeletes::on(&snaps[..1]);
+        let f = CleanupFilter {
+            prune_versions_keep: Some(1),
+            ..filter()
+        };
+        let real = run_cleanup(&root, &f, false);
+        assert_eq!(real.totals.removed_versions, 2);
+        assert_eq!(real.totals.failed_deletes, 1);
+        assert_eq!(real.totals.bytes_freed, 20);
+        assert!(snaps[0].exists() && !snaps[1].exists() && snaps[2].exists());
+        drop(fail);
+
+        // Reconcile: the original and the copy are gone, so the row and its snapshots go.
+        let gone = seed_test_entry(&root, &orig, "gone.md", "markdown", "archived", 1, 2);
+        fs::remove_file(managed_of(&gone)).unwrap();
+        let _fail = FailDeletes::on(&snaps_of(&gone)[1..]);
+        let real = run_cleanup(&root, &filter(), false);
+        assert_eq!(real.totals.removed_entries, 1);
+        assert_eq!(real.totals.removed_versions, 2);
+        assert_eq!(real.totals.failed_deletes, 1);
+        assert!(snaps_of(&gone)[1].exists());
     }
 
     #[test]
