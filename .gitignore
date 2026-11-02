@@ -23,3 +23,22 @@ Thumbs.db
 /ui/.vite
 node_modules/
 dist/
+
+# Secrets: keys, certificates, keystores, env files and vault blobs are never committed.
+*.pem
+*.key
+*.p12
+*.pfx
+*.psk
+.env
+.env.*
+vault.enc
+# Env templates hold no secrets and stay tracked.
+!.env.example
+# Test-only TLS fixtures (throwaway keys for the store's TLS tests).
+!/crates/store/src/ferrostore/testdata/tls/ca.pem
+!/crates/store/src/ferrostore/testdata/tls/expired.pem
+!/crates/store/src/ferrostore/testdata/tls/other-ca.pem
+!/crates/store/src/ferrostore/testdata/tls/server.key
+!/crates/store/src/ferrostore/testdata/tls/server.pem
+!/crates/store/src/ferrostore/testdata/tls/wrong-host.pem
