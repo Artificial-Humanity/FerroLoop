@@ -1570,6 +1570,16 @@ fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindo
     })
 }
 
+/// Codex reports the ChatGPT Plus plan as `prolite`. Show it as `plus`.
+fn normalize_codex_plan(plan: &str) -> String {
+    let key = plan.trim().to_ascii_lowercase();
+    if matches!(key.as_str(), "prolite" | "pro_lite" | "pro-lite") {
+        "plus".to_owned()
+    } else {
+        plan.to_owned()
+    }
+}
+
 fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
     let mut latest = None;
     for line in raw.lines() {
@@ -1598,7 +1608,7 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
             .get("plan_type")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(str::to_string);
+            .map(normalize_codex_plan);
         let exhausted_reason = limits
             .get("rate_limit_reached_type")
             .and_then(Value::as_str)
@@ -6989,6 +6999,16 @@ mod tests {
         .unwrap();
         let blocked = read_session_quota_usage_with_home(thread, Some(home)).expect("exhausted");
         assert_eq!(blocked.exhausted_reason.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn codex_prolite_plan_is_shown_as_plus() {
+        for raw in ["prolite", "ProLite", "pro_lite", "PRO-LITE"] {
+            assert_eq!(normalize_codex_plan(raw), "plus", "{raw}");
+        }
+        for raw in ["pro", "plus", "free", "team"] {
+            assert_eq!(normalize_codex_plan(raw), raw);
+        }
     }
 
     #[test]
