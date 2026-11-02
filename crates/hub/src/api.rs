@@ -3274,6 +3274,7 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
         .collect();
 
     let mut pruned_count = 0;
+    let mut registry_entries = 0;
     if let Some(root) = artifacts_root(state) {
         let session_ids: Option<Vec<&str>> = session_id.map(|raw| {
             let mut ids = vec![raw];
@@ -3286,7 +3287,7 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
         });
         // Files in the shared attachments dir belong to no session.
         let attachments = fs::canonicalize(attachments_dir(state)).ok();
-        let outcome = artifacts::with_registry(&root, |registry| {
+        let (outcome, entry_count) = artifacts::with_registry(&root, |registry| {
             for (canon, size) in &live {
                 let shared = attachments.as_ref().is_some_and(|a| canon.starts_with(a));
                 let tag = if shared {
@@ -3296,8 +3297,11 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
                 };
                 registry.upsert(artifact_entry(canon, *size, tag));
             }
-            registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref())
+            let outcome =
+                registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref());
+            (outcome, registry.entries.len())
         });
+        registry_entries = entry_count;
         pruned_count = outcome.pruned;
         let live_paths: Vec<PathBuf> = live.iter().map(|(p, _)| p.clone()).collect();
         record_artifact_versions(state, &root, &live_paths);
@@ -3309,9 +3313,12 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
         }
     }
 
+    // Measured last, after the snapshots this call recorded. `null` without a home dir.
+    let storage =
+        artifacts_root(state).map(|root| artifacts::storage_summary(&root, registry_entries));
     HttpResponse::json(
         200,
-        json!({ "artifacts": items, "pruned_count": pruned_count }),
+        json!({ "artifacts": items, "pruned_count": pruned_count, "storage": storage }),
     )
 }
 
@@ -3727,7 +3734,22 @@ fn resolve_prune_worktree(
 
 /// `POST /api/v1/artifacts/prune` (Record 29): archive the user-facing artifacts of a worktree
 /// before it goes, then drop registry entries that have neither an original nor a copy. Owner
-/// only. Body (all optional): `paths`, `worktree_path`, `session_id`.
+/// only. Body (all optional): `paths`, `worktree_path`, `session_id`, and the cleanup filters
+/// `dry_run`, `max_age_days`, `status` (`archived` | `live` | `all`), `kinds` and
+/// `prune_versions_keep`; their semantics are on [`artifacts::CleanupFilter`]. A filter that
+/// removes entries or version rows runs after the archive and reconcile steps, in the same
+/// registry transaction. `dry_run: true` changes nothing (no deletion, no registry write) and
+/// answers with what the same call would remove. A real call archives `paths`, `worktree_path`
+/// and `session_id` artifacts first, which changes what the filter removes, so a dry run cannot
+/// be combined with any of them: that is a 400. `prune_versions_keep` must be at least 1 (0 is
+/// a 400), because an entry with no version row would number its next revision 1 again.
+///
+/// Answers `ok`, `pruned_count` (entries reconcile dropped), `archived_count` and `active_count`
+/// (reconcile's counts, before any filter removal), plus `dry_run`, `removed_entries` (reconcile
+/// plus filter), `removed_versions` (rows), `bytes_freed` (regular files removed),
+/// `failed_deletes` (files that could not be deleted: their rows are gone anyway, so each one
+/// is an orphan file left in `managed/` or `versions/`; 0 in a dry run) and `storage` (see
+/// [`artifacts::StorageSummary`], measured after the action).
 fn handle_post_artifacts_prune(
     state: &HubState,
     authority: &HubAuthority,
@@ -3764,6 +3786,17 @@ fn handle_post_artifacts_prune(
         Ok(v) => v.trim().to_string(),
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
+    let (filter, dry_run) = match parse_cleanup_filter(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    if dry_run && (!paths.is_empty() || !worktree_raw.is_empty() || !session_raw.is_empty()) {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "a dry run cannot be combined with paths, worktree_path or \
+                session_id, because archiving them changes what a real run removes" }),
+        );
+    }
     let Some(root) = artifacts_root(state) else {
         return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
     };
@@ -3826,7 +3859,7 @@ fn handle_post_artifacts_prune(
         session_tag = Some(canonical);
     }
 
-    if !worktree_missing {
+    if !worktree_missing && !dry_run {
         preserve_artifacts(
             state,
             &root,
@@ -3838,9 +3871,9 @@ fn handle_post_artifacts_prune(
             },
         );
     }
-    let outcome = artifacts::with_registry(&root, |registry| {
-        registry.reconcile(&artifacts::managed_dir(&root), None)
-    });
+    let report = artifacts::run_cleanup(&root, &filter, dry_run);
+    let outcome = &report.reconciled;
+    let storage = artifacts::storage_summary(&root, report.registry_entries);
     HttpResponse::json(
         200,
         json!({
@@ -3848,8 +3881,84 @@ fn handle_post_artifacts_prune(
             "pruned_count": outcome.pruned,
             "archived_count": outcome.archived.len(),
             "active_count": outcome.live,
+            "dry_run": dry_run,
+            "removed_entries": report.totals.removed_entries,
+            "removed_versions": report.totals.removed_versions,
+            "bytes_freed": report.totals.bytes_freed,
+            "failed_deletes": report.totals.failed_deletes,
+            "storage": storage,
         }),
     )
+}
+
+/// An optional non-negative integer field; `null` is the same as absent.
+fn json_optional_u64(body: &Value, key: &str) -> Result<Option<u64>, String> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("`{key}` must be a non-negative integer")),
+    }
+}
+
+/// The cleanup filters of a prune body, and `dry_run`. Any wrong type or unknown value is an
+/// error message for a 400.
+fn parse_cleanup_filter(body: &Value) -> Result<(artifacts::CleanupFilter, bool), String> {
+    let dry_run = match body.get("dry_run") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("`dry_run` must be a boolean".to_string()),
+    };
+    let status = match body.get("status") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(match s.as_str() {
+            "archived" => artifacts::StatusFilter::Archived,
+            "live" => artifacts::StatusFilter::Live,
+            "all" => artifacts::StatusFilter::All,
+            _ => return Err("`status` must be one of: archived, live, all".to_string()),
+        }),
+        Some(_) => return Err("`status` must be a string".to_string()),
+    };
+    let kinds = match body.get("kinds") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut kinds = Vec::with_capacity(items.len());
+            for kind in json_string_items("kinds", items)? {
+                let kind = kind.to_lowercase();
+                if !artifacts::ARTIFACT_KINDS.contains(&kind.as_str()) {
+                    return Err(format!(
+                        "unknown kind `{kind}`; valid kinds: {}",
+                        artifacts::ARTIFACT_KINDS.join(", ")
+                    ));
+                }
+                kinds.push(kind);
+            }
+            kinds
+        }
+        Some(_) => return Err("`kinds` must be an array of strings".to_string()),
+    };
+    let prune_versions_keep = json_optional_u64(body, "prune_versions_keep")?
+        .map(|n| match usize::try_from(n) {
+            Ok(0) => Err(
+                "`prune_versions_keep` must be >= 1 (an entry that kept no version \
+                would renumber its next revision 1; remove entries with a status, kinds or \
+                max_age_days filter instead)"
+                    .to_string(),
+            ),
+            Ok(n) => Ok(n),
+            Err(_) => Err("`prune_versions_keep` must be a non-negative integer".to_string()),
+        })
+        .transpose()?;
+    Ok((
+        artifacts::CleanupFilter {
+            max_age_days: json_optional_u64(body, "max_age_days")?,
+            status,
+            kinds,
+            prune_versions_keep,
+        },
+        dry_run,
+    ))
 }
 
 /// `GET /api/v1/settings` (Record 4): the saved settings, or the defaults.
