@@ -1263,6 +1263,8 @@ mod tests {
             model: None,
             thinking_level: None,
             available_models: Vec::new(),
+            context_usage: None,
+            execution_mode: None,
         }
     }
 

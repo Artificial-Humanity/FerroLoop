@@ -152,6 +152,8 @@ mod tests {
             model: Some("discovered-model".to_string()),
             thinking_level: Some("low".to_string()),
             available_models: Vec::new(),
+            context_usage: None,
+            execution_mode: None,
         }
     }
 

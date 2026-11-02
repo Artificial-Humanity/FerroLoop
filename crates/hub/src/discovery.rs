@@ -51,6 +51,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use walkdir::WalkDir;
 
+mod execution_mode;
+
 /// Summary of an active or historical agent session on the host or in the store (spec §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredSessionSummary {
@@ -83,6 +85,17 @@ pub struct DiscoveredSessionSummary {
     /// with no model choice.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<String>,
+    /// Server-measured context window usage of the live vendor session. Set only by the
+    /// model-info pass (`GET /api/v1/sessions`); omitted for attempt rows, lookup-only
+    /// discovery, and sessions whose transcript reports no usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<SessionContextUsage>,
+    /// Effective execution (permission) mode the vendor session runs in, read-only from the
+    /// vendor's own transcript or config: `auto`, `yolo`, `plan`, `default`, `accept-edits`,
+    /// or a lower-cased vendor value this crate has no name for. Omitted when no source
+    /// states one. Set only by the model-info pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -777,6 +790,8 @@ fn discover_sessions_impl(
                 model: None,
                 thinking_level: None,
                 available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
             });
         }
     }
@@ -797,6 +812,8 @@ fn discover_sessions_impl(
                 model: None,
                 thinking_level: None,
                 available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
             });
         }
     }
@@ -817,17 +834,30 @@ fn discover_sessions_impl(
                 agy_csrf,
                 agy_env_fallback_allowed(home_override),
             );
+            // One read per transcript file serves the quota, context and mode reads below.
+            let mut files = TranscriptReads::default();
             // The quota read needs the model: Antigravity keeps separate buckets per model family.
-            session.quota_usage = quota_for_resolved_route_at(
+            session.quota_usage = quota_for_resolved_route_with_reads(
                 &session.adapter,
                 session.transcript_path.as_deref(),
                 home_override,
+                &mut files,
                 &crate::direct_quota::AgyQuotaTarget {
                     address: agy_address,
                     csrf: agy_csrf,
                     model: info.model.as_deref(),
                     session: Some(&session.id),
                 },
+            );
+            session.context_usage = session
+                .transcript_path
+                .as_deref()
+                .and_then(|path| context_usage_for_transcript(path, &mut files));
+            session.execution_mode = execution_mode::session_execution_mode(
+                &session.adapter,
+                session.transcript_path.as_deref(),
+                home.as_deref(),
+                &mut files,
             );
             session.model = info.model;
             session.thinking_level = info.thinking_level;
@@ -2345,14 +2375,26 @@ pub(crate) fn quota_for_resolved_route_at(
     home_override: Option<&Path>,
     agy: &crate::direct_quota::AgyQuotaTarget<'_>,
 ) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route_with_reads(
+        adapter,
+        transcript_path,
+        home_override,
+        &mut TranscriptReads::default(),
+        agy,
+    )
+}
+
+/// [`quota_for_resolved_route_at`] that reads the transcript through `files`, so a caller that
+/// also reads the context window or execution mode reads the file once.
+fn quota_for_resolved_route_with_reads(
+    adapter: &str,
+    transcript_path: Option<&str>,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+    agy: &crate::direct_quota::AgyQuotaTarget<'_>,
+) -> Option<SessionQuotaUsage> {
     crate::direct_quota::with_probe_lock(|| {
-        quota_for_resolved_route_locked(
-            adapter,
-            transcript_path,
-            home_override,
-            &mut TranscriptReads::default(),
-            agy,
-        )
+        quota_for_resolved_route_locked(adapter, transcript_path, home_override, files, agy)
     })
 }
 
@@ -2512,8 +2554,16 @@ pub(crate) fn context_usage_from_sessions(
         }
     }
 
-    let tpath_str = tpath_opt?;
-    let tpath = PathBuf::from(&tpath_str);
+    context_usage_for_transcript(&tpath_opt?, files)
+}
+
+/// The context-window read for a session whose transcript path is known, choosing the vendor
+/// parser from the path and reading the file through `files`.
+fn context_usage_for_transcript(
+    tpath_str: &str,
+    files: &mut TranscriptReads,
+) -> Option<SessionContextUsage> {
+    let tpath = PathBuf::from(tpath_str);
     if tpath.file_name().and_then(|s| s.to_str()) == Some("chat_history.jsonl")
         && let Some(dir) = tpath.parent()
     {
@@ -2559,7 +2609,7 @@ pub(crate) fn context_usage_from_sessions(
     }
 
     if tpath.to_string_lossy().contains(".codex")
-        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(raw) = files.raw(tpath_str)
     {
         let configured_max = read_codex_configured_context_window(&tpath);
         for line in raw.lines().rev() {
@@ -2607,7 +2657,7 @@ pub(crate) fn context_usage_from_sessions(
     }
 
     if tpath.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
-        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(raw) = files.raw(tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2647,7 +2697,7 @@ pub(crate) fn context_usage_from_sessions(
     }
 
     if tpath.to_string_lossy().contains(".claude")
-        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(raw) = files.raw(tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2692,7 +2742,7 @@ pub(crate) fn context_usage_from_sessions(
     }
 
     if is_antigravity_transcript(&tpath)
-        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(raw) = files.raw(tpath_str)
         && let Some(usage) = antigravity_context_from_transcript(raw)
     {
         return Some(usage);
@@ -8670,6 +8720,8 @@ mod tests {
             model: None,
             thinking_level: None,
             available_models: Vec::new(),
+            context_usage: None,
+            execution_mode: None,
         };
         let usage = |signals: serde_json::Value| {
             fs::write(session_dir.join("signals.json"), signals.to_string()).unwrap();
