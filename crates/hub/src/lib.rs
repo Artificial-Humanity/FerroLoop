@@ -4,6 +4,7 @@
 
 mod agents;
 pub mod api;
+mod artifact_dirs;
 mod artifacts;
 mod attachments;
 pub mod auth;
@@ -717,6 +718,9 @@ mod balance_api_tests;
 
 #[cfg(test)]
 mod runtime_update_tests;
+
+#[cfg(test)]
+mod artifact_dirs_tests;
 
 #[cfg(test)]
 mod remodel_api_tests;
@@ -6352,12 +6356,14 @@ default_target = "wire:felicity"
 
     // --- Record 29: artifact registry, archived copies, pruning -------------------------------
 
+    /// The system artifacts directory: `artifacts/` beside the store file, which every test hub
+    /// here puts directly under the temp dir (or the `home` given to `artifacts_root_of_home`).
     fn artifacts_root_of(tmp: &TempDir) -> std::path::PathBuf {
-        crate::artifacts::data_root(tmp.path())
+        tmp.path().join("artifacts")
     }
 
     fn artifacts_root_of_home(home: &std::path::Path) -> std::path::PathBuf {
-        crate::artifacts::data_root(home)
+        home.join("artifacts")
     }
 
     fn managed_files(tmp: &TempDir) -> Vec<String> {
@@ -6474,7 +6480,12 @@ default_target = "wire:felicity"
         let item = &listed["artifacts"][0];
         assert_eq!(item["status"], "archived", "{listed}");
         let served = item["path"].as_str().unwrap().to_string();
-        assert!(served.contains("/fl/artifacts/managed/"), "{served}");
+        let managed = crate::artifacts::managed_dir(&artifacts_root_of_home(&home));
+        assert!(
+            std::path::Path::new(&served).starts_with(&managed),
+            "{served} is not under {}",
+            managed.display()
+        );
         let preview = call(
             &state,
             "GET",
@@ -7498,7 +7509,9 @@ default_target = "wire:felicity"
 
     // --- Record 4: unified settings ----------------------------------------------------------
 
-    fn default_settings_json() -> Value {
+    /// What `GET /api/v1/settings` returns with nothing saved, for a hub whose store is
+    /// `<tmp>/store.redb` (so `[home]` is the temp dir).
+    fn default_settings_json(tmp: &TempDir) -> Value {
         json!({
             "theme_preference": "dark",
             "timezone": "UTC",
@@ -7515,6 +7528,11 @@ default_target = "wire:felicity"
             },
             "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
             "attachment_retention_days": 7,
+            "artifacts_dir": null,
+            "project_artifacts_dirs": {},
+            "home_dir": tmp.path().display().to_string(),
+            "default_artifacts_dir": tmp.path().join("artifacts").display().to_string(),
+            "effective_artifacts_dir": tmp.path().join("artifacts").display().to_string(),
         })
     }
 
@@ -7527,7 +7545,7 @@ default_target = "wire:felicity"
         for token in [OWNER, PEER] {
             let resp = call(&state, "GET", "/api/v1/settings", token, &json!({}));
             assert_eq!(resp.status, 200, "{}", error_text(&resp));
-            assert_eq!(resp.json_value().unwrap(), default_settings_json());
+            assert_eq!(resp.json_value().unwrap(), default_settings_json(&tmp));
         }
         // Reading never writes the file.
         assert!(
@@ -7554,7 +7572,7 @@ default_target = "wire:felicity"
             call(&state, "GET", url, PEER, &json!({}))
                 .json_value()
                 .unwrap(),
-            default_settings_json()
+            default_settings_json(&tmp)
         );
 
         let resp = call(
@@ -7569,7 +7587,7 @@ default_target = "wire:felicity"
             }),
         );
         assert_eq!(resp.status, 200, "{}", error_text(&resp));
-        let mut expected = default_settings_json();
+        let mut expected = default_settings_json(&tmp);
         expected["theme_preference"] = json!("system");
         expected["notifications"]["sound_enabled"] = json!(true);
         expected["hub_connection"]["poll_interval_secs"] = json!(30);
@@ -7595,7 +7613,16 @@ default_target = "wire:felicity"
             &fs::read(tmp.path().join(".config/fl/ferrodeck-settings.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(on_disk, expected);
+        // The file holds the stored settings only; the directories are computed on the way out.
+        let mut stored = expected.clone();
+        for computed in [
+            "home_dir",
+            "default_artifacts_dir",
+            "effective_artifacts_dir",
+        ] {
+            stored.as_object_mut().unwrap().remove(computed);
+        }
+        assert_eq!(on_disk, stored);
     }
 
     #[test]
@@ -7643,7 +7670,7 @@ default_target = "wire:felicity"
         );
         assert_eq!(bad_json.status, 400);
         // Nothing but the two valid interval changes ever reached the file.
-        let mut expected = default_settings_json();
+        let mut expected = default_settings_json(&tmp);
         expected["hub_connection"]["poll_interval_secs"] = json!(300);
         assert_eq!(
             call(&state, "GET", url, OWNER, &json!({}))
@@ -7666,12 +7693,12 @@ default_target = "wire:felicity"
         .unwrap();
         let resp = call(&state, "GET", "/api/v1/settings", OWNER, &json!({}));
         assert_eq!(resp.status, 200);
-        let mut expected = default_settings_json();
+        let mut expected = default_settings_json(&tmp);
         expected["theme_preference"] = json!("light");
         assert_eq!(resp.json_value().unwrap(), expected);
         fs::write(&path, "\u{0}garbage").unwrap();
         let resp = call(&state, "GET", "/api/v1/settings", OWNER, &json!({}));
-        assert_eq!(resp.json_value().unwrap(), default_settings_json());
+        assert_eq!(resp.json_value().unwrap(), default_settings_json(&tmp));
     }
 
     #[test]

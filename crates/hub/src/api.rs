@@ -547,6 +547,10 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
+        ("POST", "/api/v1/settings/artifacts-dir") => {
+            crate::artifact_dirs::handle_post_system_dir(state, &authority, req)
+        }
+        ("GET", "/api/v1/projects") => crate::artifact_dirs::handle_get_projects(state),
         ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
         ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
@@ -595,7 +599,7 @@ fn hub_url_for_request(state: &HubState, req: &HttpRequest) -> String {
     format!("http://{listen}")
 }
 
-fn json_object_body(req: &HttpRequest) -> Result<Value, HttpResponse> {
+pub(crate) fn json_object_body(req: &HttpRequest) -> Result<Value, HttpResponse> {
     if req.body.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Ok(json!({}));
     }
@@ -2767,7 +2771,7 @@ fn attachments_dir(state: &HubState) -> PathBuf {
 
 const MAX_ARTIFACT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 
-fn percent_encode_query_value(input: &str) -> String {
+pub(crate) fn percent_encode_query_value(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 16);
     for b in input.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
@@ -2801,7 +2805,7 @@ fn classify_artifact_kind(path: &Path) -> &'static str {
     }
 }
 
-fn is_forbidden_artifact_path(path: &Path) -> bool {
+pub(crate) fn is_forbidden_artifact_path(path: &Path) -> bool {
     let comps: Vec<std::path::Component<'_>> = path.components().collect();
     if comps
         .iter()
@@ -2872,12 +2876,14 @@ fn allowed_artifact_roots(state: &HubState) -> Vec<PathBuf> {
     if let Some(home) = hub_home_dir(state) {
         candidates.push(home.join(".gemini/antigravity-cli/brain"));
         candidates.push(home.join(".local/share/fl/attachments"));
-        // Archived artifact copies, so previews of files whose worktree is gone still work.
-        candidates.push(artifacts::managed_dir(&artifacts::data_root(&home)));
         if state.config.home_override.is_none() {
             candidates.push(home.join("Projects/Artificial-Humanity"));
         }
     }
+
+    // Archived artifact copies, so previews of files whose worktree is gone still work, and the
+    // artifact directories the settings name.
+    candidates.extend(crate::artifact_dirs::serving_roots(state));
 
     let mut canonical_roots = Vec::new();
     for root in candidates {
@@ -3077,9 +3083,9 @@ pub(crate) fn hub_home_dir(state: &HubState) -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
 }
 
-/// Data root of the artifact registry and its managed copies.
-fn artifacts_root(state: &HubState) -> Option<PathBuf> {
-    hub_home_dir(state).map(|home| artifacts::data_root(&home))
+/// Data root of the artifact registry and its managed copies: the system artifacts directory.
+fn artifacts_root(state: &HubState) -> PathBuf {
+    crate::artifact_dirs::effective_system_dir(state)
 }
 
 /// Files a session's brain dir and transcript point at. Not yet vetted against the allowed roots.
@@ -3276,49 +3282,43 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
         .map(|(canon, size)| live_artifact_item(canon, *size))
         .collect();
 
-    let mut pruned_count = 0;
-    let mut registry_entries = 0;
-    if let Some(root) = artifacts_root(state) {
-        let session_ids: Option<Vec<&str>> = session_id.map(|raw| {
-            let mut ids = vec![raw];
-            if let Some(canonical) = canonical_session_id.as_deref()
-                && canonical != raw
-            {
-                ids.push(canonical);
-            }
-            ids
-        });
-        // Files in the shared attachments dir belong to no session.
-        let attachments = fs::canonicalize(attachments_dir(state)).ok();
-        let (outcome, entry_count) = artifacts::with_registry(&root, |registry| {
-            for (canon, size) in &live {
-                let shared = attachments.as_ref().is_some_and(|a| canon.starts_with(a));
-                let tag = if shared {
-                    None
-                } else {
-                    canonical_session_id.as_deref()
-                };
-                registry.upsert(artifact_entry(canon, *size, tag));
-            }
-            let outcome =
-                registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref());
-            (outcome, registry.entries.len())
-        });
-        registry_entries = entry_count;
-        pruned_count = outcome.pruned;
-        let live_paths: Vec<PathBuf> = live.iter().map(|(p, _)| p.clone()).collect();
-        record_artifact_versions(state, &root, &live_paths);
-        for entry in &outcome.archived {
-            if items.len() >= MAX_ARTIFACT_LIST_ITEMS {
-                break;
-            }
-            items.extend(archived_artifact_item(entry));
+    let root = artifacts_root(state);
+    let session_ids: Option<Vec<&str>> = session_id.map(|raw| {
+        let mut ids = vec![raw];
+        if let Some(canonical) = canonical_session_id.as_deref()
+            && canonical != raw
+        {
+            ids.push(canonical);
         }
+        ids
+    });
+    // Files in the shared attachments dir belong to no session.
+    let attachments = fs::canonicalize(attachments_dir(state)).ok();
+    let (outcome, registry_entries) = artifacts::with_registry(&root, |registry| {
+        for (canon, size) in &live {
+            let shared = attachments.as_ref().is_some_and(|a| canon.starts_with(a));
+            let tag = if shared {
+                None
+            } else {
+                canonical_session_id.as_deref()
+            };
+            registry.upsert(artifact_entry(canon, *size, tag));
+        }
+        let outcome = registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref());
+        (outcome, registry.entries.len())
+    });
+    let live_paths: Vec<PathBuf> = live.iter().map(|(p, _)| p.clone()).collect();
+    let pruned_count = outcome.pruned;
+    record_artifact_versions(state, &root, &live_paths);
+    for entry in &outcome.archived {
+        if items.len() >= MAX_ARTIFACT_LIST_ITEMS {
+            break;
+        }
+        items.extend(archived_artifact_item(entry));
     }
 
-    // Measured last, after the snapshots this call recorded. `null` without a home dir.
-    let storage =
-        artifacts_root(state).map(|root| artifacts::storage_summary(&root, registry_entries));
+    // Measured last, after the snapshots this call recorded.
+    let storage = artifacts::storage_summary(&artifacts_root(state), registry_entries);
     HttpResponse::json(
         200,
         json!({ "artifacts": items, "pruned_count": pruned_count, "storage": storage }),
@@ -3358,12 +3358,7 @@ fn handle_get_artifact_versions(state: &HubState, req: &HttpRequest) -> HttpResp
         Ok(m) if m.is_file() => m,
         _ => return HttpResponse::json(404, json!({ "error": "artifact file not found" })),
     };
-    let Some(root) = artifacts_root(state) else {
-        return HttpResponse::json(
-            200,
-            json!({ "ok": true, "path": canonical.display().to_string(), "versions": [] }),
-        );
-    };
+    let root = artifacts_root(state);
     let canon_str = canonical.display().to_string();
     let managed_copy =
         fs::canonicalize(artifacts::managed_dir(&root)).is_ok_and(|dir| canonical.starts_with(dir));
@@ -3437,9 +3432,7 @@ fn handle_get_artifact_version_raw(state: &HubState, req: &HttpRequest) -> HttpR
             );
         }
     };
-    let Some(root) = artifacts_root(state) else {
-        return HttpResponse::json(404, json!({ "error": "version not found" }));
-    };
+    let root = artifacts_root(state);
     let entry = artifacts::with_registry(&root, |reg| reg.find_for_path(&canonical).cloned());
     let Some(entry) = entry else {
         return HttpResponse::json(404, json!({ "error": "version not found" }));
@@ -3664,9 +3657,7 @@ fn archive_session_artifacts(
     discovered_id: &str,
     candidates: Vec<PathBuf>,
 ) {
-    let Some(root) = artifacts_root(state) else {
-        return;
-    };
+    let root = artifacts_root(state);
     let scope =
         session_worktree_scope(state, target.hosted.as_ref().and_then(|h| h.cwd.as_deref()));
     if scope.is_empty() {
@@ -3800,9 +3791,7 @@ fn handle_post_artifacts_prune(
                 session_id, because archiving them changes what a real run removes" }),
         );
     }
-    let Some(root) = artifacts_root(state) else {
-        return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
-    };
+    let root = artifacts_root(state);
 
     let allowed_roots = allowed_artifact_roots(state);
     let mut scope: Vec<PathBuf> = Vec::new();
@@ -3966,10 +3955,9 @@ fn parse_cleanup_filter(body: &Value) -> Result<(artifacts::CleanupFilter, bool)
 
 /// `GET /api/v1/settings` (Record 4): the saved settings, or the defaults.
 fn handle_get_settings(state: &HubState) -> HttpResponse {
-    let Some(home) = hub_home_dir(state) else {
-        return HttpResponse::json(200, json!(settings::Settings::default()));
-    };
-    HttpResponse::json(200, json!(settings::load(&home)))
+    let stored =
+        hub_home_dir(state).map_or_else(settings::Settings::default, |home| settings::load(&home));
+    HttpResponse::json(200, crate::artifact_dirs::settings_view(state, &stored))
 }
 
 /// `PUT /api/v1/settings` (Record 4): merge a full or partial body into the saved settings.
@@ -4000,7 +3988,7 @@ fn handle_put_settings(
     };
     match settings::update(&home, patch) {
         Ok(updated) => {
-            let data = json!(updated);
+            let data = crate::artifact_dirs::settings_view(state, &updated);
             state.broadcast("settings", "settings.updated", data.clone());
             HttpResponse::json(200, data)
         }
@@ -4323,6 +4311,26 @@ fn handle_dynamic_api_routes(
                     authority,
                     Some(number),
                     None,
+                    req,
+                );
+            }
+            _ => {}
+        }
+    }
+    // /api/v1/projects/:id/artifacts-dir. The merge routes below have six or more segments.
+    if segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "projects"
+        && segments[4] == "artifacts-dir"
+    {
+        match method {
+            "GET" => return crate::artifact_dirs::handle_get_project_dir(state, segments[3]),
+            "POST" => {
+                return crate::artifact_dirs::handle_post_project_dir(
+                    state,
+                    authority,
+                    segments[3],
                     req,
                 );
             }
@@ -7101,7 +7109,7 @@ mod tests {
             );
             handle_http_request(&state, &req)
         };
-        let root = artifacts_root(&state).unwrap();
+        let root = artifacts_root(&state);
         let entries = || artifacts::with_registry(&root, |reg| reg.entries.len());
 
         // A type the store does not keep is refused and leaves no registry entry.

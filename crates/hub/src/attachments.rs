@@ -53,12 +53,7 @@ pub(crate) struct PrunedAttachmentsReport {
 /// A relative store path is resolved against the process's working directory, the same base
 /// the store itself is opened against (`fl hub serve` passes an absolute path already).
 pub(crate) fn attachments_dir(state: &HubState) -> PathBuf {
-    let store = &state.config.store_path;
-    let store = std::path::absolute(store).unwrap_or_else(|_| store.clone());
-    store
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join("attachments")
+    crate::artifact_dirs::hub_data_home(state).join("attachments")
 }
 
 /// Whether `name` has the shape the hub gives an upload: `<epoch_ms>-<n>-<name>`, both numbers
