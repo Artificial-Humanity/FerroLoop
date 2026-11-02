@@ -636,7 +636,28 @@ fn register_vendor_targets() -> Result<()> {
 }
 
 /// [`register_vendor_targets`] for these vendors.
+///
+/// Every file is checked before any target is declared. A vendor's file must not be `.fl/...`
+/// (fl's own state), the file of a built-in vendor, or the file of another vendor, however it is
+/// spelled (case, `./`, repeated separators): two vendors on one file would plan from the same
+/// bytes and overwrite each other's write and ownership record.
 fn declare_targets(vendors: &[VendorDescriptor]) -> Result<()> {
+    // File key to the vendor that holds it: the built-ins, the targets declared earlier, and the
+    // ones declared in this call.
+    let mut claimed: BTreeMap<String, String> = BTreeMap::new();
+    for b in VendorName::ALL {
+        claimed.insert(
+            vendor::target_file_key(vendor::vendor(b).target()),
+            format!("built-in vendor `{}`", b.as_str()),
+        );
+    }
+    for t in vendor::custom_targets() {
+        claimed.insert(
+            vendor::target_file_key(t.target()),
+            format!("vendor `{}`", t.id()),
+        );
+    }
+    let mut targets = Vec::new();
     for d in vendors {
         let Some(file) = d.mcp_config_rel_path.as_deref() else {
             continue;
@@ -646,9 +667,32 @@ fn declare_targets(vendors: &[VendorDescriptor]) -> Result<()> {
         }
         let target = vendor::CustomTarget::new(&d.id, &d.display_name, file, "mcpServers", false);
         let target = target.map_err(|e| anyhow!("vendor `{}`: {e}", d.id))?;
+        let key = vendor::target_file_key(file);
+        if key == ".fl" || key.starts_with(".fl/") {
+            bail!(
+                "vendor `{}`: its MCP file `{file}` is under `.fl/`, which holds fl's own state;                  choose a file outside it",
+                d.id
+            );
+        }
+        match claimed.get(&key) {
+            // Declared again: the same target, not a clash.
+            Some(holder) if holder == &format!("vendor `{}`", target.id()) => {}
+            Some(holder) => bail!(
+                "vendor `{}`: its MCP file `{file}` is also the file of {holder}; two vendors \
+                 cannot share one file. Give one of them another `mcp_config_rel_path`",
+                d.id
+            ),
+            None => {
+                claimed.insert(key, format!("vendor `{}`", target.id()));
+            }
+        }
+        targets.push(target);
+    }
+    for target in targets {
+        let id = target.id().to_string();
         match vendor::register_target(target) {
             Ok(()) | Err(vendor::TargetError::Duplicate(_)) => {}
-            Err(e) => bail!("vendor `{}`: {e}", d.id),
+            Err(e) => bail!("vendor `{id}`: {e}"),
         }
     }
     Ok(())
@@ -1146,6 +1190,70 @@ env.NOTES_TOKEN = { secret = true }
             (t.title(), t.target()),
             ("Agent vsdk2-twice", ".vsdk2-test/twice.json")
         );
+    }
+
+    #[test]
+    fn a_vendor_cannot_take_a_built_in_vendors_file_or_another_vendors_or_fls_own() {
+        // Every built-in file, in the spellings that name the same file.
+        for (builtin, file) in [
+            ("claude", ".mcp.json"),
+            ("claude", "./.mcp.json"),
+            ("claude", ".MCP.JSON"),
+            ("antigravity", ".agents/mcp_config.json"),
+            ("antigravity", "./.Agents/./MCP_Config.json"),
+            ("muse", ".muse/settings.json"),
+            ("codex", ".codex/config.toml"),
+            ("codex", ".\\.codex\\config.toml"),
+            ("grok", ".grok/config.toml"),
+        ] {
+            let d = descriptor("vsdk2-clash-builtin", Some(file));
+            let err = declare_targets(&[d]).unwrap_err().to_string();
+            assert!(
+                err.starts_with("vendor `vsdk2-clash-builtin`: ")
+                    && err.contains(&format!("built-in vendor `{builtin}`"))
+                    && err.contains(file),
+                "{file}: {err}"
+            );
+            assert!(vendor::custom_target("vsdk2-clash-builtin").is_none());
+        }
+        // Another custom vendor's file, whether declared earlier or in the same call.
+        declare_targets(&[descriptor("vsdk2-clash-a", Some(".vsdk2-test/clash.json"))]).unwrap();
+        for file in [".vsdk2-test/clash.json", "./.VSDK2-test/./Clash.JSON"] {
+            let err = declare_targets(&[descriptor("vsdk2-clash-b", Some(file))])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("`vsdk2-clash-b`") && err.contains("vendor `vsdk2-clash-a`"),
+                "{file}: {err}"
+            );
+        }
+        // The same vendor declared again is no clash.
+        declare_targets(&[descriptor("vsdk2-clash-a", Some(".vsdk2-test/clash.json"))]).unwrap();
+        let (c, d) = (
+            descriptor("vsdk2-clash-c", Some(".vsdk2-test/pair.json")),
+            descriptor("vsdk2-clash-d", Some("./.vsdk2-test/PAIR.json")),
+        );
+        let err = declare_targets(&[c, d]).unwrap_err().to_string();
+        assert!(
+            err.contains("`vsdk2-clash-d`") && err.contains("`vsdk2-clash-c`"),
+            "{err}"
+        );
+        // Nothing of a refused call is declared, not even the vendor listed first.
+        assert!(vendor::custom_target("vsdk2-clash-c").is_none());
+        assert!(vendor::custom_target("vsdk2-clash-d").is_none());
+        // fl's own state.
+        for file in [".fl/mcp.toml", "./.FL/state.json", ".fl/sub/x.json"] {
+            let err = declare_targets(&[descriptor("vsdk2-clash-fl", Some(file))])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("`.fl/`") && err.contains("vsdk2-clash-fl"),
+                "{file}: {err}"
+            );
+        }
+        assert!(vendor::custom_target("vsdk2-clash-fl").is_none());
+        // A file that merely starts like `.fl` is fine.
+        declare_targets(&[descriptor("vsdk2-clash-flx", Some(".flx/mcp.json"))]).unwrap();
     }
 
     #[test]

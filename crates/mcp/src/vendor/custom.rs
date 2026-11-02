@@ -76,6 +76,17 @@ fn intern(key: &str) -> &'static str {
     leaked
 }
 
+/// A project-relative file as a key for "is this the same file": `\` read as `/`, `.` and empty
+/// parts dropped (`./a//b` is `a/b`), and the case folded, since the file system may not tell
+/// `.MCP.json` from `.mcp.json`. Two targets whose keys are equal are taken to write one file.
+pub fn target_file_key(rel: &str) -> String {
+    rel.split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 impl CustomTarget {
     /// `target` is the file relative to the project root, `servers_key` the JSON object that holds
     /// the servers, and `expands_env_refs` whether the vendor expands `${VAR}` (a secret can only
@@ -260,9 +271,18 @@ fn targets() -> &'static Targets {
 
 /// Registers a target. Refused for a built-in vendor's id and for an id already registered.
 ///
+/// `expands_env_refs` is the caller's choice: whether the vendor's CLI expands `${VAR}`, which
+/// decides whether a secret server can be written to its file at all (as a reference). `fl`
+/// itself declares the targets of config-defined vendors with `false`, so a secret server is
+/// left out of such files; pass `true` only for a CLI known to expand references.
+///
+/// This does not check that the file is not another target's. The planner (`sync::plan`) refuses
+/// two targets that resolve to one file, and a caller that declares targets checks first with
+/// [`target_file_key`].
+///
 /// `fl-mcp` does not depend on `fl-core`'s vendor registry (the architecture check forbids it), so
-/// the caller that holds both declares a registered vendor's target from its descriptor:
-/// `CustomTarget::new(&d.id, &d.display_name, d.mcp_config_rel_path.as_deref()?, "mcpServers", true)`.
+/// the caller that holds both declares a registered vendor's target from its descriptor, e.g.
+/// `CustomTarget::new(&d.id, &d.display_name, d.mcp_config_rel_path.as_deref()?, "mcpServers", false)`.
 pub fn register_target(target: CustomTarget) -> Result<(), TargetError> {
     if VendorName::ALL.iter().any(|v| v.as_str() == target.id) {
         return Err(TargetError::BuiltIn(target.id));

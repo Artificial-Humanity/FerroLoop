@@ -299,6 +299,7 @@ fn plan_for(
     records: &Path,
     replace: &[String],
 ) -> Result<Plan, McpError> {
+    shared_files(root, vendors)?;
     let (desired, skipped, warnings) = desired(vendors, root, catalog, switches);
     let owner = canonical(root)?;
     let targets: Vec<Target> = vendors
@@ -312,6 +313,41 @@ fn plan_for(
         skipped,
         warnings,
     })
+}
+
+/// Two of these vendors that write one file, as (first id, second id, the file).
+fn first_shared_file<'a>(files: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str, &'a str)> {
+    let mut seen: BTreeMap<String, (&str, &str)> = BTreeMap::new();
+    for &(id, file) in files {
+        let key = vendor::target_file_key(file);
+        if let Some(&(first, first_file)) = seen.get(&key) {
+            return Some((first, id, first_file));
+        }
+        seen.insert(key, (id, file));
+    }
+    None
+}
+
+/// Refuses two targets that write one file. They would share one canonical path and one ownership
+/// record (keyed by that path), each planned from the same bytes; the second write would replace
+/// the first's, and the records would overwrite each other. `target_file_key` folds case, `./`
+/// and repeated separators, so `./.MCP.json` is `.mcp.json`.
+fn shared_files(root: &Path, vendors: &[VendorName]) -> Result<(), McpError> {
+    let files: Vec<(&str, &str)> = vendors
+        .iter()
+        .map(|&v| (v.as_str(), vendor::vendor(v).target()))
+        .collect();
+    let Some((first, second, file)) = first_shared_file(&files) else {
+        return Ok(());
+    };
+    Err(McpError::VendorFile(vendor::FileRefusal {
+        path: root.join(file),
+        problem: format!("vendors `{first}` and `{second}` are both set to write this file"),
+        next: format!(
+            "Give `{second}` or `{first}` its own MCP file (a vendor's `mcp_config_rel_path`), \
+             then run `fl mcp sync` again"
+        ),
+    }))
 }
 
 /// MCP spec §4.3: a `--replace` name that overwrote an entry in no target
@@ -2273,6 +2309,82 @@ command = "local-mcp"
         assert_eq!(names(other), ["docs", "notes"]);
         assert_eq!(names(VendorName::Claude), ["docs", "notes", "only"]);
         assert_eq!(names(VendorName::Codex), ["docs", "notes"]);
+    }
+
+    #[test]
+    fn two_targets_that_write_one_file_are_refused_before_anything_is_planned() {
+        // Every spelling of one file, and the vendor pairs that share it.
+        let key = vendor::target_file_key;
+        assert_eq!(key("./.MCP.json"), ".mcp.json");
+        assert_eq!(
+            key(".agents/mcp_config.json"),
+            key(".AGENTS\\.\\MCP_config.JSON")
+        );
+        assert_eq!(key("a/./b//c.json"), "a/b/c.json");
+        assert_ne!(key("a/b.json"), key("a/c.json"));
+        assert_eq!(
+            first_shared_file(&[("a", ".x/y.json"), ("b", "z.json"), ("c", "./.X/Y.JSON")]),
+            Some(("a", "c", ".x/y.json"))
+        );
+        assert_eq!(first_shared_file(&[("a", "x.json"), ("b", "y.json")]), None);
+
+        // A custom target on a built-in's file, spelled differently.
+        let f = fixture();
+        let clash = custom("sync-test-clash-claude", "./.MCP.json", false);
+        let (root, records) = (&f.root, &f.records);
+        let err = plan_for(
+            &[VendorName::Claude, clash],
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        )
+        .unwrap_err();
+        let McpError::VendorFile(refusal) = &err else {
+            panic!("not a file refusal: {err}")
+        };
+        assert!(
+            refusal.problem.contains("`claude`")
+                && refusal.problem.contains("`sync-test-clash-claude`"),
+            "{refusal:?}"
+        );
+        // Two custom targets on one file.
+        let first = custom("sync-test-clash-a", ".sync-test/clash.json", true);
+        let second = custom("sync-test-clash-b", ".sync-test/./CLASH.json", false);
+        let err = plan_for(
+            &[first, second],
+            root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            records,
+            &[],
+        )
+        .unwrap_err();
+        let McpError::VendorFile(refusal) = &err else {
+            panic!("not a file refusal: {err}")
+        };
+        assert!(
+            refusal.problem.contains("`sync-test-clash-a`")
+                && refusal.problem.contains("`sync-test-clash-b`"),
+            "{refusal:?}"
+        );
+        // The same vendor named twice is the same file twice.
+        assert!(
+            plan_for(
+                &[VendorName::Claude, VendorName::Claude],
+                root,
+                &catalog(CATALOG),
+                &Switches::default(),
+                records,
+                &[],
+            )
+            .is_err()
+        );
+        // Nothing was read, written or recorded.
+        assert!(!f.records.exists());
+        assert!(!root.join(".mcp.json").exists());
+        assert!(!root.join(".sync-test").exists());
     }
 
     #[test]

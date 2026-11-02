@@ -17,7 +17,7 @@ pub use claude::Claude;
 pub use codex::Codex;
 pub use custom::{
     CustomId, CustomRefusal, CustomTarget, TargetError, custom_target, custom_targets,
-    register_target,
+    register_target, target_file_key,
 };
 pub(crate) use custom::{custom_name, custom_names, custom_vendor};
 pub use grok::Grok;
