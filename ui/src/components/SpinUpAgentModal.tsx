@@ -20,6 +20,7 @@ export const SPIN_UP_PROJECTS = [
 export const SPIN_UP_ROLES = [
   { value: "assistant", label: "assistant (Assisting Engineer)" },
   { value: "ui-developer", label: "ui-developer (UI & Full-Stack)" },
+  { value: "strategist", label: "strategist (Research & Architecture Strategist)" },
   { value: "lead", label: "lead (Project Lead)" },
   { value: "lab-manager", label: "lab-manager (Lab Manager)" },
 ] as const;

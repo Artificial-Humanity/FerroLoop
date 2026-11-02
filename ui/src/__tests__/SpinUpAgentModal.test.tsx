@@ -39,6 +39,9 @@ describe("SpinUpAgentModal", () => {
 
     expect(projectSelect.value).toBe("ferroloop");
     expect(roleSelect.value).toBe("assistant");
+    expect(
+      Array.from(roleSelect.options).map((o) => o.value),
+    ).toContain("strategist");
     expect(vendorSelect.value).toBe("claude");
     expect(nodeSelect.value).toBe("ai-lab-0");
     expect(hostedCheckbox.checked).toBe(true);

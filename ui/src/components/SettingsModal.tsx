@@ -118,6 +118,7 @@ export const RECAST_ROLE_OPTIONS = [
   { value: "assistant", label: "assistant" },
   { value: "lab_manager", label: "lab_manager" },
   { value: "custom:ui-developer", label: "custom:ui-developer" },
+  { value: "custom:strategist", label: "custom:strategist" },
   { value: "custom:scribe", label: "custom:scribe" },
 ];
 
