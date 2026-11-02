@@ -220,7 +220,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
 
           {agentSessions.length > 0 && (
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              {agentSessions.length > 1 ? (
+              {agentSessions.length > 1 && (
                 <select
                   aria-label="Active Session"
                   data-testid="session-selector"
@@ -235,16 +235,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
                     </option>
                   ))}
                 </select>
-              ) : (
-                activeSession && (
-                  <span
-                    className="fd-badge fd-mono"
-                    data-testid="session-id-pill"
-                    title={activeSession.id}
-                  >
-                    #{activeSession.id.slice(-8)}
-                  </span>
-                )
               )}
 
               {activeSession?.adapter && (

@@ -322,15 +322,34 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               Session ID
             </div>
             <div
-              className="fd-mono"
-              title={sessionId || targetSessionOrAgent || "none"}
               style={{
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
+                display: "flex",
+                alignItems: "center",
+                gap: "6px",
+                minWidth: 0,
               }}
             >
-              {sessionId || targetSessionOrAgent || "unrouted"}
+              {sessionId && (
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="session-id-pill"
+                  title={sessionId}
+                  style={{ flexShrink: 0 }}
+                >
+                  #{sessionId.slice(-8)}
+                </span>
+              )}
+              <span
+                className="fd-mono"
+                title={sessionId || targetSessionOrAgent || "none"}
+                style={{
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {sessionId || targetSessionOrAgent || "unrouted"}
+              </span>
             </div>
           </div>
           <div>

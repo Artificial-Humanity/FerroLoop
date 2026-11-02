@@ -426,6 +426,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
   const tornDownTargetsRef = useRef<Set<string>>(new Set());
+  const loggedOutRef = useRef<boolean>(false);
   const pairInFlightRef = useRef<Promise<AuthSessionResponse> | null>(null);
   const [lastSeenAssistantTurnIndex, setLastSeenAssistantTurnIndex] =
     useState<Record<string, number>>(readInitialLastSeenAssistantTurn);
@@ -581,6 +582,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const refreshSessionsAndTranscript = useCallback(
     async (sessionOverride?: string | null) => {
+      if (loggedOutRef.current) {
+        return;
+      }
       if (refreshInFlightRef.current) {
         refreshQueuedRef.current = { override: sessionOverride };
         return;
@@ -591,6 +595,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const requestedAgentKey = requestedAgentName.trim().toLowerCase();
         const requestedSessionId = selectedSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
+        if (loggedOutRef.current) {
+          return;
+        }
         const rawList = sessRes?.sessions ?? [];
         const list = rawList.filter(
           (s) =>
@@ -613,6 +620,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             : null;
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
+          if (loggedOutRef.current) {
+            return;
+          }
           if (trRes) {
             const targetPersona =
               list.find((session) => session.id === targetId)?.persona ??
@@ -693,6 +703,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   }, [apiClient]);
 
   const loadAllInitialState = useCallback(async () => {
+    loggedOutRef.current = false;
     setLoading(true);
     try {
       const [
@@ -786,6 +797,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const trRes = await apiClient.getSessionTranscript(matchedSessionId).catch(() => null);
         if (
           trRes &&
+          !loggedOutRef.current &&
           !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
           !tornDownTargetsRef.current.has(initialKey)
         ) {
@@ -976,6 +988,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     const nextAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (
+      loggedOutRef.current ||
       !targetId ||
       tornDownTargetsRef.current.has(targetId.trim().toLowerCase()) ||
       (nextAgentKey && tornDownTargetsRef.current.has(nextAgentKey))
@@ -1008,7 +1021,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     apiClient
       .getSessionTranscript(targetId)
       .then((res) => {
-        if (!cancelled) {
+        if (!cancelled && !loggedOutRef.current) {
           applyTranscriptTurns(res.turns ?? []);
           recordTranscript(selectedAgent?.name_key, res.turns ?? []);
           setSessionQueue(res.queue ?? []);
@@ -1145,6 +1158,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   };
 
   const handleLogout = async () => {
+    loggedOutRef.current = true;
     await apiClient.logout().catch(() => {});
     setAuthority(null);
     wsClient.setToken(null);
@@ -1172,6 +1186,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     setArchitecture(null);
     setStats(null);
     setNodes([]);
+    setAgentSettingsOpen(false);
     setPairingOpen(true);
   };
 
