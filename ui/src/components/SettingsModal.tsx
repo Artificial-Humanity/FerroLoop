@@ -549,22 +549,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         // Keep DEFAULT_CLOUD_ADAPTERS_CONFIG if endpoint is unreachable
       });
 
-    client
-      .listProjectsArtifactsDirs()
-      .then((res) => {
-        if (!cancelled && Array.isArray(res?.projects)) {
-          const map: Record<string, ProjectArtifactsDirInfo> = {};
-          for (const item of res.projects) {
-            if (item && typeof item.id === "string" && item.id.trim()) {
-              map[item.id.trim().toLowerCase()] = item;
+    if (typeof client.listProjectsArtifactsDirs === "function") {
+      client
+        .listProjectsArtifactsDirs()
+        .then((res) => {
+          if (!cancelled && Array.isArray(res?.projects)) {
+            const map: Record<string, ProjectArtifactsDirInfo> = {};
+            for (const item of res.projects) {
+              if (item && typeof item.id === "string" && item.id.trim()) {
+                map[item.id.trim().toLowerCase()] = item;
+              }
             }
+            setProjectsArtifactsDirs(map);
           }
-          setProjectsArtifactsDirs(map);
-        }
-      })
-      .catch(() => {
-        // Ignore if /api/v1/projects is not yet available
-      });
+        })
+        .catch(() => {
+          // Ignore if /api/v1/projects is not yet available
+        });
+    }
 
     return () => {
       cancelled = true;
@@ -2541,7 +2543,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
 
             {/* Subsystem Toggles */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               <h3
                 style={{
                   margin: 0,
@@ -2549,8 +2551,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   fontWeight: 700,
                   textTransform: "uppercase",
                   letterSpacing: "0.04em",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
                 }}
               >
+                <img
+                  src="/brand/ferroloop-icon.jpg"
+                  alt=""
+                  width="16"
+                  height="16"
+                  aria-hidden="true"
+                  style={{ borderRadius: "3px", objectFit: "cover" }}
+                />
                 FerroLoop Installed Products &amp; Subsystem Toggles
               </h3>
               <div
@@ -2584,6 +2597,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }));
                     }}
                   />
+                  <img
+                    src="/brand/ferrogate-icon.jpg"
+                    alt=""
+                    width="15"
+                    height="15"
+                    aria-hidden="true"
+                    style={{ borderRadius: "3px", objectFit: "cover" }}
+                  />
                   <span>FerroGate Vault &amp; Proxy</span>
                 </label>
 
@@ -2609,6 +2630,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         },
                       }));
                     }}
+                  />
+                  <img
+                    src="/brand/ferrostate-icon.jpg"
+                    alt=""
+                    width="15"
+                    height="15"
+                    aria-hidden="true"
+                    style={{ borderRadius: "3px", objectFit: "cover" }}
                   />
                   <span>FerroState Memory &amp; Index</span>
                 </label>
@@ -2636,8 +2665,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }));
                     }}
                   />
+                  <img
+                    src="/brand/ferroloop-icon.jpg"
+                    alt=""
+                    width="15"
+                    height="15"
+                    aria-hidden="true"
+                    style={{ borderRadius: "3px", objectFit: "cover" }}
+                  />
                   <span>FerroStep Workflows</span>
                 </label>
+              </div>
+              <div
+                data-testid="ferrosuite-product-badges"
+                style={{
+                  display: "flex",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  marginTop: "2px",
+                }}
+              >
+                {[
+                  { id: "ferrodeck", label: "FerroDeck", icon: "/brand/ferrodeck-icon.jpg" },
+                  { id: "ferrowire", label: "FerroWire", icon: "/brand/ferrowire-icon.jpg" },
+                  { id: "ferrotrack", label: "FerroTrack", icon: "/brand/ferrotrack-icon.jpg" },
+                  { id: "ferrostore", label: "FerroStore", icon: "/brand/ferrostore-icon.jpg" },
+                  { id: "ferrowatch", label: "FerroWatch", icon: "/brand/ferrowatch-icon.jpg" },
+                ].map((mod) => (
+                  <span
+                    key={mod.id}
+                    className="fd-badge"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px",
+                      fontSize: "11px",
+                      padding: "2px 7px",
+                    }}
+                  >
+                    <img
+                      src={mod.icon}
+                      alt=""
+                      width="13"
+                      height="13"
+                      aria-hidden="true"
+                      style={{ borderRadius: "2px", objectFit: "cover" }}
+                    />
+                    {mod.label}
+                  </span>
+                ))}
               </div>
             </div>
 
