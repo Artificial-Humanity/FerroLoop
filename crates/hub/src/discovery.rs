@@ -1,5 +1,36 @@
 //! Host session & transcript discovery, git worktree & diff inspection, and Cargo
 //! workspace architecture conformance scanning (spec §1.3, §3.2, §3.3).
+//!
+//! # How stale discovery can be
+//!
+//! The hub caches the costly discovery reads. These are all the windows in which an answer can
+//! lag the host or the store. A `Some(home)` override (tests, hermetic runs) bypasses the route
+//! cache and keeps its own saved-route clock, so none of them crosses between two homes.
+//!
+//! - **Route cache, 2.5 s** (`ROUTE_DISCOVERY_TTL`). `discovered_route_table` serves one host
+//!   scan (route files, vendor session files, `/proc`) for 2.5 s after the scan ends. The hub
+//!   drops it when it spawns, restarts, resets or tears down a session and whenever it saves the
+//!   route table file (`invalidate_route_discovery_cache`), so its own changes show at once.
+//! - **External writers, up to 2.5 s.** A change the hub did not make (the `fl wire daemon` or
+//!   the `fl wire` CLI saving the route table, a vendor CLI starting or replacing a session) is
+//!   not an invalidation: it shows when the cached scan expires.
+//! - **Store snapshot, 2 s** (`DISCOVERY_SNAPSHOT_TTL`). The read-only endpoints share
+//!   one `DiscoveryStoreSnapshot` (agent names and attempt rows) through
+//!   `HubState::cached_discovery_snapshot`. Any request other than a `GET` or `HEAD` drops it
+//!   (`api::handle_http_request`); a store write from outside the hub (the CLI) shows within 2 s.
+//!   Requests that act on a session (prompt, queue drain) take a fresh snapshot.
+//! - **Saved routes, 60 s** (fl-wire's `ROUTE_REDISCOVERY_INTERVAL`). Dispatches read routes
+//!   from the saved route table file, not from a scan (`lifecycle::lookup_route`, `/wire/send`).
+//!   A saved route is used only when the hub saved a host scan to that file within the
+//!   interval (`saved_routes_fresh`) and, when the request resolved a vendor session, the
+//!   route names that session. A lookup with no session id (lifecycle hydration, a wire push
+//!   by name) can therefore reach a replaced Antigravity, Codex, Muse or Grok conversation that
+//!   still accepts input for up to 60 s. The daemon can also overwrite the file with its own
+//!   older view (see `with_route_file_lock`).
+//! - **`/agents` mixes ages.** It reads agents and areas from the store live, but its `routes`
+//!   come from the cached store snapshot (2 s) and the cached route scan (2.5 s), so an agent
+//!   registered or retired within those windows can be listed with a route list that does not
+//!   reflect it yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
