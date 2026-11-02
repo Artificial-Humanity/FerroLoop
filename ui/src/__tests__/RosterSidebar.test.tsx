@@ -430,8 +430,10 @@ describe("RosterSidebar", () => {
 
   it("classifies text, transcript turns, and wire messages into normal, question, and important severities", () => {
     expect(classifyTextUnreadSeverity("Completed build and 280 tests passing with zero errors.")).toBe("normal");
+    expect(classifyTextUnreadSeverity("Fixed the panic and error handling when a request failed or was blocked by CORS.")).toBe("normal");
     expect(classifyTextUnreadSeverity("Should we target main or uat for this PR?")).toBe("question");
     expect(classifyTextUnreadSeverity("BLOCKER: Database migration failed with exit code 1.")).toBe("important");
+    expect(classifyTextUnreadSeverity("We cannot proceed without credentials and need owner approval.")).toBe("important");
 
     expect(
       classifyTurnUnreadSeverity({
@@ -472,7 +474,7 @@ describe("RosterSidebar", () => {
         ],
         felix: [
           { index: 0, role: "assistant", content: "Initial turn", tool_calls: [] },
-          { index: 1, role: "assistant", content: "FATAL: build failed on missing import.", tool_calls: [] },
+          { index: 1, role: "assistant", content: "BLOCKER: cannot proceed without owner approval.", tool_calls: [] },
         ],
       },
       { ferris: 0, felix: 0 },

@@ -84,7 +84,10 @@ export function classifyTextUnreadSeverity(text: string): UnreadSeverity {
     "",
   );
   if (
-    /\b(blocker|blocked|urgent|error|failed|failure|fatal|panic)\b/i.test(
+    /(?:^|\n)\s*(?:\[blocked\]|blocker\s*:|status\s*:\s*blocked|urgent\s*:|action required\s*:)/i.test(
+      withoutNegated,
+    ) ||
+    /\b(?:needs?\s+(?:owner|operator|your)\s+(?:approval|decision|action|input)|cannot\s+proceed\s+without|blocked\s+on\s+(?:owner|operator|approval))\b/i.test(
       withoutNegated,
     )
   ) {

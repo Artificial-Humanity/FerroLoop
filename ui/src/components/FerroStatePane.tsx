@@ -49,6 +49,9 @@ const noAutofill = {
 
 const inputStyle: React.CSSProperties = {
   width: "100%",
+  minWidth: 0,
+  maxWidth: "100%",
+  boxSizing: "border-box",
   // 16px stops iPadOS Safari from zooming the viewport on focus.
   fontSize: "16px",
   minHeight: "40px",
@@ -61,6 +64,8 @@ const labelStyle: React.CSSProperties = {
   fontSize: "12px",
   fontWeight: 600,
   color: "var(--text-secondary)",
+  minWidth: 0,
+  maxWidth: "100%",
 };
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -791,9 +796,16 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             <form
               data-testid="state-search-form"
               onSubmit={handleExplorerSubmit}
-              style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "end" }}
+              style={{
+                display: "flex",
+                gap: "10px",
+                flexWrap: "wrap",
+                alignItems: "end",
+                minWidth: 0,
+                maxWidth: "100%",
+              }}
             >
-              <label style={{ ...labelStyle, flex: "1 1 240px" }}>
+              <label style={{ ...labelStyle, flex: "1 1 200px", minWidth: 0, maxWidth: "100%" }}>
                 Search Memory and Handoffs
                 <input
                   type="search"
@@ -806,11 +818,11 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                   onChange={(e) => setQuery(e.target.value)}
                 />
               </label>
-              <label style={labelStyle}>
+              <label style={{ ...labelStyle, flex: "1 1 140px", minWidth: 0, maxWidth: "100%" }}>
                 Scope Filter
                 <select
                   className="fd-select"
-                  style={{ ...inputStyle, width: "auto", minWidth: "160px" }}
+                  style={{ ...inputStyle, width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                   value={scopeFilter}
                   onChange={(e) => handleFilterChange(e.target.value, concernFilter)}
                 >
@@ -822,11 +834,11 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                   ))}
                 </select>
               </label>
-              <label style={labelStyle}>
+              <label style={{ ...labelStyle, flex: "1 1 140px", minWidth: 0, maxWidth: "100%" }}>
                 Concern Filter
                 <select
                   className="fd-select"
-                  style={{ ...inputStyle, width: "auto", minWidth: "140px" }}
+                  style={{ ...inputStyle, width: "100%", minWidth: 0, maxWidth: "100%", boxSizing: "border-box" }}
                   value={concernFilter}
                   onChange={(e) => handleFilterChange(scopeFilter, e.target.value)}
                 >
@@ -880,8 +892,9 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 200px), 1fr))",
                   gap: "12px",
+                  minWidth: 0,
                 }}
               >
                 <label style={labelStyle}>

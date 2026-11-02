@@ -163,11 +163,14 @@ export const OfficeDocxView: React.FC<{ preview: DocxPreview }> = ({ preview }) 
       fontFamily: 'Georgia, "Times New Roman", serif',
       fontSize: "14px",
       lineHeight: 1.65,
-      padding: "40px 52px",
+      padding: "24px 20px",
       borderRadius: "var(--radius-md)",
       boxShadow: "0 2px 14px rgba(0,0,0,0.35)",
       maxWidth: "820px",
       width: "100%",
+      minWidth: 0,
+      boxSizing: "border-box",
+      overflowWrap: "anywhere",
       margin: "0 auto",
     }}
   >
@@ -392,7 +395,16 @@ export const OfficePptxView: React.FC<{ preview: PptxPreview }> = ({ preview }) 
           </button>
         ))}
       </div>
-      <div style={{ flex: 1, minWidth: "260px", display: "flex", flexDirection: "column", gap: "8px" }}>
+      <div
+        style={{
+          flex: "1 1 200px",
+          minWidth: 0,
+          maxWidth: "100%",
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+        }}
+      >
         <div
           data-testid="artifact-pptx-slide"
           style={{
@@ -835,6 +847,15 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [artifactFilter, setArtifactFilter] = useState<ArtifactFilterMode>("user-docs");
   const [pruning, setPruning] = useState<boolean>(false);
   const [pruneStatus, setPruneStatus] = useState<string | null>(null);
+  const [cleanupModalOpen, setCleanupModalOpen] = useState<boolean>(false);
+  const [cleanupScope, setCleanupScope] = useState<
+    "archived" | "live" | "scratch" | "attachments" | "all"
+  >("archived");
+  const [cleanupAge, setCleanupAge] = useState<"all" | "1d" | "7d" | "30d">("all");
+  const [cleanupKind, setCleanupKind] = useState<"all" | "images" | "docs" | "code">("all");
+  const [cleanupKeepVersions, setCleanupKeepVersions] = useState<number>(0);
+  const [cleanupDryRunSummary, setCleanupDryRunSummary] = useState<string | null>(null);
+  const [locallyPrunedPaths, setLocallyPrunedPaths] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     if (activePath !== undefined && activePath !== null) {
@@ -941,7 +962,12 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     const seen = new Set<string>();
     const add = (p: string) => {
       const clean = p.trim();
-      if (clean && !clean.startsWith("mermaid://") && !seen.has(clean)) {
+      if (
+        clean &&
+        !clean.startsWith("mermaid://") &&
+        !seen.has(clean) &&
+        !locallyPrunedPaths.has(clean)
+      ) {
         seen.add(clean);
         all.push(clean);
       }
@@ -951,7 +977,135 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     turnPaths.forEach(add);
     sessionArtifacts.forEach((item) => add(item.path));
     return all;
-  }, [selectedPath, recentPaths, turnPaths, sessionArtifacts]);
+  }, [selectedPath, recentPaths, turnPaths, sessionArtifacts, locallyPrunedPaths]);
+
+  const cleanupMatchingPaths = useMemo(() => {
+    return allDiscoveredPaths.filter((p) => {
+      const lower = p.toLowerCase();
+      if (cleanupScope === "archived" && !archivedPathSet.has(p)) {
+        return false;
+      }
+      if (cleanupScope === "live" && archivedPathSet.has(p)) {
+        return false;
+      }
+      if (cleanupScope === "scratch" && isUserFacingArtifactPath(p)) {
+        return false;
+      }
+      if (
+        cleanupScope === "attachments" &&
+        !lower.includes("attachment") &&
+        !lower.includes("/uploads/")
+      ) {
+        return false;
+      }
+      if (cleanupKind === "images") {
+        return /\.(png|jpe?g|gif|webp|svg|mmd|mermaid)$/i.test(lower);
+      }
+      if (cleanupKind === "docs") {
+        return /\.(md|markdown|pdf|docx|xlsx|pptx|txt)$/i.test(lower);
+      }
+      if (cleanupKind === "code") {
+        return !isUserFacingArtifactPath(p);
+      }
+      return true;
+    });
+  }, [allDiscoveredPaths, archivedPathSet, cleanupScope, cleanupKind]);
+
+  const handleRunCleanup = async (dryRun: boolean) => {
+    if (pruning) return;
+    setPruning(true);
+    setPruneStatus(null);
+    if (!dryRun) {
+      setCleanupDryRunSummary(null);
+    }
+    const maxAgeDays =
+      cleanupAge === "1d"
+        ? 1
+        : cleanupAge === "7d"
+          ? 7
+          : cleanupAge === "30d"
+            ? 30
+            : undefined;
+    const kinds =
+      cleanupKind === "images"
+        ? ["image", "svg", "mermaid"]
+        : cleanupKind === "docs"
+          ? ["markdown", "pdf"]
+          : cleanupKind === "code"
+            ? ["code", "binary"]
+            : undefined;
+    const statusFilter: "archived" | "live" | "all" =
+      cleanupScope === "archived"
+        ? "archived"
+        : cleanupScope === "live"
+          ? "live"
+          : "all";
+    try {
+      if (
+        !dryRun &&
+        cleanupScope === "attachments" &&
+        typeof apiClient.pruneAttachments === "function"
+      ) {
+        const attachRes = await apiClient.pruneAttachments(maxAgeDays);
+        const delCount = attachRes?.deleted_count ?? 0;
+        setPruneStatus(
+          `Cleaned up ${delCount} ${delCount === 1 ? "attachment" : "attachments"}`,
+        );
+        setCleanupModalOpen(false);
+        return;
+      }
+
+      const res = await apiClient.pruneArtifacts({
+        ...(sessionId ? { session_id: sessionId } : {}),
+        dry_run: dryRun,
+        status: statusFilter,
+        ...(maxAgeDays !== undefined ? { max_age_days: maxAgeDays } : {}),
+        ...(kinds ? { kinds } : {}),
+        ...(cleanupKeepVersions > 0
+          ? { prune_versions_keep: cleanupKeepVersions }
+          : {}),
+      });
+
+      const removedEntries =
+        res?.removed_entries ??
+        res?.pruned_count ??
+        res?.pruned ??
+        (Array.isArray(res?.pruned_paths)
+          ? res.pruned_paths.length
+          : cleanupMatchingPaths.length);
+      const removedVersions = res?.removed_versions ?? 0;
+      const bytesFreed = res?.bytes_freed ?? 0;
+
+      if (dryRun) {
+        setCleanupDryRunSummary(
+          `Dry run: ${removedEntries} ${removedEntries === 1 ? "entry" : "entries"}, ${removedVersions} ${removedVersions === 1 ? "version" : "versions"} (${formatByteSize(bytesFreed)}) eligible for cleanup.`,
+        );
+      } else {
+        if (cleanupMatchingPaths.length > 0) {
+          setLocallyPrunedPaths((prev) => {
+            const next = new Set(prev);
+            cleanupMatchingPaths.forEach((p) => next.add(p));
+            return next;
+          });
+        }
+        setPruneStatus(
+          `Cleaned up ${removedEntries} ${removedEntries === 1 ? "artifact" : "artifacts"}${bytesFreed > 0 ? ` (${formatByteSize(bytesFreed)} freed)` : ""}`,
+        );
+        setCleanupModalOpen(false);
+        await refreshSessionArtifacts();
+      }
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to clean up artifacts";
+      if (dryRun) {
+        setCleanupDryRunSummary(msg);
+      } else {
+        setPruneStatus(msg);
+      }
+    } finally {
+      setPruning(false);
+    }
+  };
 
   const quickSwitchPaths = useMemo(() => {
     if (artifactFilter === "all") {
@@ -1378,7 +1532,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   title={artifact.path}
                   style={{
                     color: "var(--text-muted)",
-                    maxWidth: "340px",
+                    maxWidth: "min(300px, 100%)",
+                    minWidth: 0,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
                     whiteSpace: "nowrap",
@@ -1473,6 +1628,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             alignItems: "center",
             gap: "6px",
             flexWrap: "wrap",
+            minWidth: 0,
+            maxWidth: "100%",
           }}
         >
           <input
@@ -1483,7 +1640,14 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             className="fd-input fd-mono"
             value={pathInput}
             onChange={(e) => setPathInput(e.target.value)}
-            style={{ flex: 1, minWidth: "200px", fontSize: "12px", padding: "5px 9px" }}
+            style={{
+              flex: "1 1 140px",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12px",
+              padding: "5px 9px",
+            }}
           />
           <button
             type="submit"
@@ -1500,11 +1664,25 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             className="fd-select fd-mono"
             value={artifactFilter}
             onChange={(e) => setArtifactFilter(e.target.value as ArtifactFilterMode)}
-            style={{ fontSize: "11px", padding: "5px 8px" }}
+            style={{ fontSize: "11px", padding: "5px 8px", minWidth: 0, maxWidth: "100%" }}
           >
             <option value="user-docs">User Documents &amp; Media</option>
             <option value="all">All Files</option>
           </select>
+
+          <button
+            type="button"
+            data-testid="artifact-cleanup-btn"
+            className="fd-btn"
+            disabled={pruning}
+            onClick={() => {
+              setCleanupDryRunSummary(null);
+              setCleanupModalOpen(true);
+            }}
+            title="Open artifact cleanup options by status, retention age, file kind, and revision count"
+          >
+            Clean Up
+          </button>
 
           <button
             type="button"
@@ -1544,7 +1722,13 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   handleSelectPath(e.target.value);
                 }
               }}
-              style={{ maxWidth: "260px", fontSize: "11px", padding: "5px 8px" }}
+              style={{
+                flex: "1 1 160px",
+                minWidth: 0,
+                maxWidth: "100%",
+                fontSize: "11px",
+                padding: "5px 8px",
+              }}
             >
               <option value="" disabled>
                 Switch artifact ({quickSwitchPaths.length})...
@@ -1842,6 +2026,10 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                     padding: "16px 20px",
                     fontSize: "13.5px",
                     lineHeight: 1.6,
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                    overflowWrap: "anywhere",
                   }}
                 >
                   <RichMarkdown
@@ -1972,6 +2160,191 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           </>
         )}
       </div>
+
+      {cleanupModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Clean Up Artifacts"
+          data-testid="artifact-cleanup-modal"
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 1200,
+            backgroundColor: "rgba(2, 6, 23, 0.72)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "16px",
+          }}
+          onClick={() => setCleanupModalOpen(false)}
+        >
+          <div
+            className="fd-card"
+            style={{
+              width: "100%",
+              maxWidth: "440px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+              padding: "16px 18px",
+              backgroundColor: "var(--bg-surface)",
+              border: "1px solid var(--border-subtle)",
+              boxSizing: "border-box",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+              }}
+            >
+              <strong style={{ fontSize: "14px", color: "var(--text-primary)" }}>
+                Clean Up Artifacts
+              </strong>
+              <button
+                type="button"
+                data-testid="artifact-cleanup-close-btn"
+                className="fd-btn"
+                onClick={() => setCleanupModalOpen(false)}
+                aria-label="Close Clean Up Artifacts modal"
+              >
+                ✕
+              </button>
+            </div>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Target Scope</span>
+              <select
+                aria-label="Cleanup Target Scope"
+                data-testid="artifact-cleanup-scope"
+                className="fd-select"
+                value={cleanupScope}
+                onChange={(e) =>
+                  setCleanupScope(
+                    e.target.value as "archived" | "live" | "scratch" | "attachments" | "all",
+                  )
+                }
+              >
+                <option value="archived">Archived &amp; Dead Worktree Artifacts</option>
+                <option value="live">Live Tracked Artifacts</option>
+                <option value="scratch">Non-User-Facing Scratch &amp; Source Files</option>
+                <option value="attachments">Old Session Attachments</option>
+                <option value="all">All Tracked Artifacts</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Retention Age</span>
+              <select
+                aria-label="Cleanup Retention Age"
+                data-testid="artifact-cleanup-age"
+                className="fd-select"
+                value={cleanupAge}
+                onChange={(e) =>
+                  setCleanupAge(e.target.value as "all" | "1d" | "7d" | "30d")
+                }
+              >
+                <option value="all">Any Age</option>
+                <option value="1d">Older than 1 day</option>
+                <option value="7d">Older than 7 days</option>
+                <option value="30d">Older than 30 days</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>File Kind</span>
+              <select
+                aria-label="Cleanup File Kind"
+                data-testid="artifact-cleanup-kind"
+                className="fd-select"
+                value={cleanupKind}
+                onChange={(e) =>
+                  setCleanupKind(e.target.value as "all" | "images" | "docs" | "code")
+                }
+              >
+                <option value="all">All File Kinds</option>
+                <option value="images">Images &amp; Diagrams</option>
+                <option value="docs">Documents &amp; PDFs</option>
+                <option value="code">Source Code &amp; Binary</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+                Version History Retention
+              </span>
+              <select
+                aria-label="Cleanup Version Retention"
+                data-testid="artifact-cleanup-versions-keep"
+                className="fd-select"
+                value={String(cleanupKeepVersions)}
+                onChange={(e) => setCleanupKeepVersions(Number(e.target.value) || 0)}
+              >
+                <option value="0">Keep all recorded versions</option>
+                <option value="1">Keep latest 1 version</option>
+                <option value="3">Keep latest 3 versions</option>
+                <option value="5">Keep latest 5 versions</option>
+              </select>
+            </label>
+
+            <div
+              data-testid="artifact-cleanup-preview-count"
+              className="fd-mono"
+              style={{
+                fontSize: "12px",
+                color: "var(--text-secondary)",
+                padding: "8px 10px",
+                borderRadius: "var(--radius-sm)",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              Matching tracked artifacts: {cleanupMatchingPaths.length}
+              {cleanupDryRunSummary && (
+                <div
+                  data-testid="artifact-cleanup-dryrun-summary"
+                  style={{ marginTop: "4px", color: "var(--accent-hover)" }}
+                >
+                  {cleanupDryRunSummary}
+                </div>
+              )}
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                data-testid="artifact-cleanup-dryrun-btn"
+                className="fd-btn"
+                disabled={pruning}
+                onClick={() => void handleRunCleanup(true)}
+              >
+                Preview (Dry Run)
+              </button>
+              <button
+                type="button"
+                data-testid="artifact-cleanup-confirm-btn"
+                className="fd-btn fd-btn-primary"
+                disabled={pruning}
+                onClick={() => void handleRunCleanup(false)}
+              >
+                {pruning ? "Cleaning Up..." : "Clean Up Selected"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 };

@@ -1902,6 +1902,12 @@ export const App: React.FC<AppProps> = ({
     setDesktopSidebarCollapsed((prev) => !prev);
   }, [leftPanelTab]);
 
+  const isMobileViewport =
+    typeof window !== "undefined" && window.innerWidth <= 768;
+  const leftSidebarOpen = isMobileViewport
+    ? mobileRosterOpen
+    : !desktopSidebarCollapsed;
+
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
       <RosterSidebar
@@ -1997,7 +2003,7 @@ export const App: React.FC<AppProps> = ({
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={handleToggleLeftSidebar}
-          mobileSidebarOpen={mobileRosterOpen}
+          mobileSidebarOpen={leftSidebarOpen}
         />
 
         <main

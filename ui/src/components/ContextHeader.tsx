@@ -456,7 +456,8 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             onClick={onOpenMobileRoster}
             aria-label="Toggle Agent Roster"
             title="Toggle Agent Roster"
-            aria-expanded={mobileSidebarOpen}
+            aria-expanded={Boolean(mobileSidebarOpen)}
+            aria-pressed={Boolean(mobileSidebarOpen)}
             data-testid="mobile-sidebar-toggle-btn"
             style={{ flexShrink: 0 }}
           >

@@ -262,7 +262,11 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     setShellStatus("connecting");
     emitTerminalEvent("open", openPayload);
 
-    const handleWindowResize = () => {
+    let lastCols = term?.cols ?? 100;
+    let lastRows = term?.rows ?? 28;
+    let rafId: number | null = null;
+
+    const syncTerminalFit = (forceEmit = false) => {
       try {
         fitAddonRef.current?.fit();
       } catch {
@@ -271,18 +275,48 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       const cols = termRef.current?.cols ?? 100;
       const rows = termRef.current?.rows ?? 28;
       setColsRows({ cols, rows });
-      const resizePayload: TerminalResizePayload = {
-        session_id: effectiveSessionId,
-        cols,
-        rows,
-      };
-      emitTerminalEvent("resize", resizePayload);
+      if (forceEmit || cols !== lastCols || rows !== lastRows) {
+        lastCols = cols;
+        lastRows = rows;
+        const resizePayload: TerminalResizePayload = {
+          session_id: effectiveSessionId,
+          cols,
+          rows,
+        };
+        emitTerminalEvent("resize", resizePayload);
+      }
+    };
+
+    const handleWindowResize = () => {
+      syncTerminalFit(true);
     };
 
     window.addEventListener("resize", handleWindowResize);
 
+    let containerObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined" && containerRef.current) {
+      containerObserver = new ResizeObserver(() => {
+        if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+          if (rafId !== null) {
+            window.cancelAnimationFrame(rafId);
+          }
+          rafId = window.requestAnimationFrame(() => {
+            rafId = null;
+            syncTerminalFit(false);
+          });
+        } else {
+          syncTerminalFit(false);
+        }
+      });
+      containerObserver.observe(containerRef.current);
+    }
+
     return () => {
       window.removeEventListener("resize", handleWindowResize);
+      if (rafId !== null && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(rafId);
+      }
+      containerObserver?.disconnect();
       const closePayload: TerminalClosePayload = {
         session_id: effectiveSessionId,
       };
@@ -336,34 +370,26 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       session_id: effectiveSessionId,
     };
     emitTerminalEvent("close", closePayload);
-    const openPayload: TerminalOpenPayload = {
-      session_id: effectiveSessionId,
-      cwd: effectiveCwd,
-      cols: colsRows.cols,
-      rows: colsRows.rows,
-      command: ["/bin/bash", "-i"],
-    };
-    setShellStatus("reconnecting");
-    emitTerminalEvent("open", openPayload);
-  };
-
-  const handleResizeTrigger = () => {
-    if (!isOwner) {
-      return;
-    }
+    setOutputLog("");
     try {
+      termRef.current?.reset();
+      termRef.current?.clear();
       fitAddonRef.current?.fit();
     } catch {
       // Ignore in jsdom.
     }
-    const cols = termRef.current?.cols ?? colsRows.cols;
-    const rows = termRef.current?.rows ?? colsRows.rows;
-    const resizePayload: TerminalResizePayload = {
+    const freshCols = termRef.current?.cols ?? colsRows.cols;
+    const freshRows = termRef.current?.rows ?? colsRows.rows;
+    setColsRows({ cols: freshCols, rows: freshRows });
+    const openPayload: TerminalOpenPayload = {
       session_id: effectiveSessionId,
-      cols,
-      rows,
+      cwd: effectiveCwd,
+      cols: freshCols,
+      rows: freshRows,
+      command: ["/bin/bash", "-i"],
     };
-    emitTerminalEvent("resize", resizePayload);
+    setShellStatus("reconnecting");
+    emitTerminalEvent("open", openPayload);
   };
 
   const handleQuickCommandSubmit = (e: React.FormEvent) => {
@@ -445,16 +471,37 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           alignItems: "center",
           justifyContent: "space-between",
           gap: "8px",
-          padding: "8px 16px",
+          padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           flexWrap: "wrap",
+          minWidth: 0,
+          maxWidth: "100%",
+          boxSizing: "border-box",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+            minWidth: 0,
+            maxWidth: "100%",
+          }}
+        >
           <span className="fd-badge fd-mono">{effectiveSessionId}</span>
           {effectiveCwd && (
-            <span className="fd-badge fd-mono" style={{ color: "var(--text-muted)" }}>
+            <span
+              className="fd-badge fd-mono"
+              style={{
+                color: "var(--text-muted)",
+                maxWidth: "100%",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+            >
               {effectiveCwd}
             </span>
           )}
@@ -463,10 +510,16 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           </span>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-          <button type="button" className="fd-btn" onClick={handleResizeTrigger}>
-            Fit ({colsRows.cols}×{colsRows.rows})
-          </button>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            flexWrap: "wrap",
+            minWidth: 0,
+            maxWidth: "100%",
+          }}
+        >
           <button
             type="button"
             className="fd-btn"
@@ -483,6 +536,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           </button>
           <button
             type="button"
+            data-testid="terminal-reconnect-btn"
             className="fd-btn fd-btn-primary"
             onClick={handleReconnect}
           >
@@ -499,6 +553,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           flexDirection: "column",
           gap: "12px",
           backgroundColor: "#0A0D12",
+          minWidth: 0,
+          maxWidth: "100%",
         }}
       >
         <div
@@ -508,6 +564,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
           style={{
             flex: 1,
             minHeight: "260px",
+            minWidth: 0,
+            maxWidth: "100%",
+            overflow: "hidden",
+            boxSizing: "border-box",
             borderRadius: "var(--radius-md)",
             border: "1px solid var(--border-subtle)",
             padding: "6px",
@@ -529,8 +589,13 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             color: "var(--text-secondary)",
             fontSize: "12px",
             maxHeight: "180px",
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            overflowX: "hidden",
             overflowY: "auto",
             whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
             wordBreak: "break-word",
             textAlign: "left",
           }}

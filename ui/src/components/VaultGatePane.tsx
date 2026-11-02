@@ -39,6 +39,9 @@ function errorMessage(err: unknown, fallback: string): string {
 
 const inputStyle: React.CSSProperties = {
   width: "100%",
+  minWidth: 0,
+  maxWidth: "100%",
+  boxSizing: "border-box",
   // 16px stops iPadOS Safari from zooming the viewport on focus.
   fontSize: "16px",
   minHeight: "40px",
@@ -51,6 +54,8 @@ const labelStyle: React.CSSProperties = {
   fontSize: "12px",
   fontWeight: 600,
   color: "var(--text-secondary)",
+  minWidth: 0,
+  maxWidth: "100%",
 };
 
 function Badges({ items, emptyLabel }: { items: string[]; emptyLabel: string }) {
@@ -433,14 +438,22 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               data-testid="vault-secret-form"
               onSubmit={(event) => void handleSubmit(event)}
               className="fd-card"
-              style={{ display: "flex", flexDirection: "column", gap: "12px" }}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "12px",
+                minWidth: 0,
+                maxWidth: "100%",
+                boxSizing: "border-box",
+              }}
             >
               <h4 style={{ margin: 0, fontSize: "13px" }}>+ Add / Rotate Secret</h4>
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
                   gap: "12px",
+                  minWidth: 0,
                 }}
               >
                 <label style={labelStyle}>

@@ -101,6 +101,48 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   const [sending, setSending] = useState<boolean>(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+  const [loadedIds, setLoadedIds] = useState<Set<string>>(() => new Set());
+  const paneRef = React.useRef<HTMLElement | null>(null);
+  const [paneWidth, setPaneWidth] = useState<number>(0);
+
+  React.useEffect(() => {
+    const el = paneRef.current;
+    if (!el) return;
+    const initialRect = el.getBoundingClientRect?.();
+    if (initialRect && initialRect.width > 0) {
+      setPaneWidth(initialRect.width);
+    }
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = entry.contentRect?.width ?? el.getBoundingClientRect?.().width ?? 0;
+        setPaneWidth(w);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const isNarrow = paneWidth < 680;
+
+  const toggleMessageExpanded = React.useCallback((messageId: string) => {
+    setLoadedIds((prev) => {
+      if (prev.has(messageId)) return prev;
+      const next = new Set(prev);
+      next.add(messageId);
+      return next;
+    });
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(messageId)) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
+      return next;
+    });
+  }, []);
 
   const effectiveMessages = messages ?? internalMessages;
   const effectiveLoading = loading || internalLoading;
@@ -228,8 +270,382 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     }
   };
 
+  const composePanel = (
+    <div
+      role="region"
+      aria-label="Compose FerroWire Message"
+      className="fd-card"
+      data-testid="wire-compose-form"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "10px",
+        minWidth: 0,
+        maxWidth: "100%",
+        boxSizing: "border-box",
+      }}
+    >
+      <div
+        style={{
+          fontWeight: 700,
+          fontSize: "13px",
+          textTransform: "uppercase",
+          letterSpacing: "0.05em",
+          color: "var(--text-secondary)",
+        }}
+      >
+        Compose FerroWire Message
+      </div>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Recipient (To)</span>
+        <select
+          aria-label="Recipient (To)"
+          className="fd-select"
+          value={toRecipient}
+          onChange={(e) => setToRecipient(e.target.value)}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        >
+          <option value="all">all (Broadcast to Workspace)</option>
+          {effectiveAgents.map((ag) => (
+            <option key={ag.name_key} value={ag.name_key.toLowerCase()}>
+              {ag.display_name} ({ag.name_key} · {ag.project})
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+          Custom Address Override (Optional)
+        </span>
+        <input
+          type="text"
+          name="fd-wire-custom-recipient"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          data-1p-ignore="true"
+          data-lpignore="true"
+          data-form-type="other"
+          aria-label="Custom Address Override"
+          className="fd-input fd-mono"
+          placeholder="e.g. kacey or agents.all"
+          value={customRecipient}
+          onChange={(e) => setCustomRecipient(e.target.value)}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        />
+      </label>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Urgency</span>
+        <select
+          aria-label="Message Urgency"
+          className="fd-select"
+          value={urgency}
+          onChange={(e) => setUrgency(e.target.value as "normal" | "urgent")}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        >
+          <option value="normal">normal</option>
+          <option value="urgent">urgent</option>
+        </select>
+      </label>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Subject</span>
+        <input
+          type="text"
+          name="fd-wire-subject"
+          autoComplete="off"
+          autoCorrect="off"
+          spellCheck={false}
+          data-1p-ignore="true"
+          data-lpignore="true"
+          data-form-type="other"
+          aria-label="Message Subject"
+          className="fd-input"
+          placeholder="Subject line"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        />
+      </label>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Body</span>
+        <textarea
+          rows={3}
+          name="fd-wire-body"
+          autoComplete="off"
+          autoCorrect="off"
+          spellCheck={false}
+          data-1p-ignore="true"
+          data-lpignore="true"
+          data-form-type="other"
+          aria-label="Message Body"
+          className="fd-textarea"
+          placeholder="Write your FerroWire message..."
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          style={{ resize: "vertical", width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        />
+      </label>
+
+      <button
+        type="button"
+        className="fd-btn fd-btn-primary"
+        onClick={() => void submitCompose()}
+        disabled={sending || !subject.trim() || !body.trim()}
+      >
+        {sending ? "Sending..." : "Send Message"}
+      </button>
+    </div>
+  );
+
+  const inboxColumn = (
+    <div
+      data-testid="wire-inbox-column"
+      style={{ display: "flex", flexDirection: "column", gap: "10px", minWidth: 0 }}
+    >
+      {effectiveError && (
+        <div
+          role="alert"
+          className="fd-card"
+          style={{
+            borderColor: "rgba(239, 68, 68, 0.45)",
+            backgroundColor: "rgba(239, 68, 68, 0.12)",
+            color: "#FCA5A5",
+            fontSize: "12px",
+          }}
+        >
+          {effectiveError}
+        </div>
+      )}
+
+      {(actionMessage || actionError) && (
+        <div
+          role="status"
+          className="fd-card"
+          style={{
+            borderColor: actionError
+              ? "rgba(239, 68, 68, 0.45)"
+              : "rgba(16, 185, 129, 0.45)",
+            backgroundColor: actionError
+              ? "rgba(239, 68, 68, 0.12)"
+              : "rgba(16, 185, 129, 0.12)",
+            color: actionError ? "#FCA5A5" : "var(--diff-add-text)",
+            fontSize: "12px",
+          }}
+        >
+          {actionError ?? actionMessage}
+        </div>
+      )}
+
+      {filteredMessages.length === 0 ? (
+        <div
+          className="fd-card"
+          data-testid="wire-mail-empty"
+          style={{
+            textAlign: "center",
+            padding: "28px 16px",
+            color: "var(--text-muted)",
+          }}
+        >
+          No FerroWire messages match the current filters.
+        </div>
+      ) : (
+        filteredMessages.map((item, index) => {
+          const msg = item.message;
+          const status = localAckedIds.has(ackKey(selectedAgentName, msg.id))
+            ? "acked"
+            : resolveDeliveryStatus(item, selectedAgentName);
+          const isUrgent = msg.urgency === "urgent";
+          const isAcked = status === "acked";
+          const isExpanded = expandedIds.has(msg.id);
+          const isMostRecent = index === 0;
+          const shouldMountBody = isMostRecent || isExpanded || loadedIds.has(msg.id);
+
+          return (
+            <article
+              key={msg.id}
+              data-testid={`mail-item-${msg.id}`}
+              data-expanded={isExpanded ? "true" : "false"}
+              className="fd-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                minWidth: 0,
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                borderColor: isUrgent ? "rgba(239, 68, 68, 0.45)" : undefined,
+              }}
+            >
+              <div
+                data-testid={`mail-toggle-${msg.id}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={isExpanded}
+                onClick={() => toggleMessageExpanded(msg.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    toggleMessageExpanded(msg.id);
+                  }
+                }}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  cursor: "pointer",
+                  minWidth: 0,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                      minWidth: 0,
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        fontSize: "11px",
+                        color: "var(--text-muted)",
+                        width: "12px",
+                        display: "inline-block",
+                      }}
+                    >
+                      {isExpanded ? "▾" : "▸"}
+                    </span>
+                    <span className="fd-badge fd-mono" style={{ fontWeight: 700 }}>
+                      {msg.sender_name}
+                    </span>
+                    <span style={{ color: "var(--text-dim)", fontSize: "12px" }}>→</span>
+                    <span className="fd-badge fd-mono">{msg.to}</span>
+
+                    <span
+                      data-testid={`mail-urgency-${msg.id}`}
+                      className="fd-badge"
+                      style={
+                        isUrgent
+                          ? {
+                              backgroundColor: "rgba(239, 68, 68, 0.16)",
+                              borderColor: "rgba(239, 68, 68, 0.45)",
+                              color: "#FCA5A5",
+                            }
+                          : undefined
+                      }
+                    >
+                      {msg.urgency}
+                    </span>
+
+                    <span
+                      data-testid={`mail-status-${msg.id}`}
+                      className="fd-badge"
+                      title={
+                        item.receipt?.acked_at
+                          ? `Acked at ${formatTimestamp(item.receipt.acked_at, activeTimeZone)}`
+                          : undefined
+                      }
+                      style={
+                        isAcked
+                          ? {
+                              color: "var(--status-alive)",
+                              borderColor: "rgba(16, 185, 129, 0.35)",
+                              backgroundColor: "rgba(16, 185, 129, 0.1)",
+                            }
+                          : {
+                              color: "var(--accent-hover)",
+                              borderColor: "var(--border-accent)",
+                              backgroundColor: "var(--accent-subtle)",
+                            }
+                      }
+                    >
+                      {status}
+                    </span>
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <time
+                      dateTime={msg.created_at}
+                      title={msg.created_at}
+                      className="fd-mono"
+                      style={{ fontSize: "11px", color: "var(--text-dim)" }}
+                    >
+                      {formatTimestamp(msg.created_at, activeTimeZone)}
+                    </time>
+
+                    {!isAcked && (
+                      <button
+                        type="button"
+                        data-testid={`ack-btn-${msg.id}`}
+                        className="fd-btn fd-btn-primary"
+                        style={{ padding: "3px 8px", fontSize: "11px" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void handleAck(msg.id);
+                        }}
+                      >
+                        Acknowledge
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    fontWeight: 600,
+                    fontSize: "14px",
+                    color: "var(--text-primary)",
+                    overflowWrap: "anywhere",
+                  }}
+                >
+                  {msg.subject}
+                </div>
+              </div>
+
+              {shouldMountBody && (
+                <div
+                  data-testid={`mail-body-${msg.id}`}
+                  data-preloaded={isMostRecent ? "true" : "false"}
+                  aria-hidden={!isExpanded}
+                  style={{
+                    display: isExpanded ? "block" : "none",
+                    fontSize: "13px",
+                    color: "var(--text-secondary)",
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    lineHeight: 1.5,
+                    paddingTop: "6px",
+                    borderTop: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  {msg.body}
+                </div>
+              )}
+            </article>
+          );
+        })
+      )}
+    </div>
+  );
+
   return (
-    <section className="fd-pane" data-testid="wire-mail-pane">
+    <section ref={paneRef} className="fd-pane" data-testid="wire-mail-pane">
       {/* Filter & Scope Toolbar */}
       <div
         style={{
@@ -237,13 +653,14 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           alignItems: "center",
           justifyContent: "space-between",
           gap: "8px",
-          padding: "8px 16px",
+          padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           flexWrap: "wrap",
+          minWidth: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", minWidth: 0 }}>
           <button
             type="button"
             className={`fd-btn ${scope === "selected" ? "fd-btn-active" : ""}`}
@@ -270,7 +687,17 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           </button>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            flexWrap: "wrap",
+            flex: "1 1 200px",
+            justifyContent: "flex-end",
+            minWidth: 0,
+          }}
+        >
           <input
             type="search"
             name="fd-wire-search"
@@ -286,7 +713,13 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
             aria-label="Search FerroWire messages"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            style={{ width: "220px", fontSize: "12px", padding: "5px 9px" }}
+            style={{
+              flex: "1 1 160px",
+              minWidth: 0,
+              maxWidth: "100%",
+              fontSize: "12px",
+              padding: "5px 9px",
+            }}
           />
           <button
             type="button"
@@ -305,318 +738,32 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         </div>
       </div>
 
-      {/* Main Split Content: Inbox List + Compose Panel */}
+      {/* Main Content: Stacked (Compose above Inbox) when narrow, 2-Column Split when wide */}
       <div
         className="fd-scroll"
+        data-testid="wire-mail-layout"
+        data-layout={isNarrow ? "stacked" : "split"}
         style={{
           display: "grid",
-          gridTemplateColumns: "minmax(0, 1.4fr) minmax(280px, 1fr)",
+          gridTemplateColumns: isNarrow
+            ? "minmax(0, 1fr)"
+            : "minmax(0, 1.4fr) minmax(280px, 1fr)",
           gap: "16px",
           alignItems: "start",
+          minWidth: 0,
         }}
       >
-        {/* Left Column: Inbox Messages */}
-        <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-          {effectiveError && (
-            <div
-              role="alert"
-              className="fd-card"
-              style={{
-                borderColor: "rgba(239, 68, 68, 0.45)",
-                backgroundColor: "rgba(239, 68, 68, 0.12)",
-                color: "#FCA5A5",
-                fontSize: "12px",
-              }}
-            >
-              {effectiveError}
-            </div>
-          )}
-
-          {(actionMessage || actionError) && (
-            <div
-              role="status"
-              className="fd-card"
-              style={{
-                borderColor: actionError
-                  ? "rgba(239, 68, 68, 0.45)"
-                  : "rgba(16, 185, 129, 0.45)",
-                backgroundColor: actionError
-                  ? "rgba(239, 68, 68, 0.12)"
-                  : "rgba(16, 185, 129, 0.12)",
-                color: actionError ? "#FCA5A5" : "var(--diff-add-text)",
-                fontSize: "12px",
-              }}
-            >
-              {actionError ?? actionMessage}
-            </div>
-          )}
-
-          {filteredMessages.length === 0 ? (
-            <div
-              className="fd-card"
-              data-testid="wire-mail-empty"
-              style={{
-                textAlign: "center",
-                padding: "28px 16px",
-                color: "var(--text-muted)",
-              }}
-            >
-              No FerroWire messages match the current filters.
-            </div>
-          ) : (
-            filteredMessages.map((item) => {
-              const msg = item.message;
-              const status = localAckedIds.has(ackKey(selectedAgentName, msg.id))
-                ? "acked"
-                : resolveDeliveryStatus(item, selectedAgentName);
-              const isUrgent = msg.urgency === "urgent";
-              const isAcked = status === "acked";
-
-              return (
-                <article
-                  key={msg.id}
-                  data-testid={`mail-item-${msg.id}`}
-                  className="fd-card"
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "8px",
-                    borderColor: isUrgent ? "rgba(239, 68, 68, 0.45)" : undefined,
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      flexWrap: "wrap",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "6px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <span className="fd-badge fd-mono" style={{ fontWeight: 700 }}>
-                        {msg.sender_name}
-                      </span>
-                      <span style={{ color: "var(--text-dim)", fontSize: "12px" }}>→</span>
-                      <span className="fd-badge fd-mono">{msg.to}</span>
-
-                      <span
-                        data-testid={`mail-urgency-${msg.id}`}
-                        className="fd-badge"
-                        style={
-                          isUrgent
-                            ? {
-                                backgroundColor: "rgba(239, 68, 68, 0.16)",
-                                borderColor: "rgba(239, 68, 68, 0.45)",
-                                color: "#FCA5A5",
-                              }
-                            : undefined
-                        }
-                      >
-                        {msg.urgency}
-                      </span>
-
-                      <span
-                        data-testid={`mail-status-${msg.id}`}
-                        className="fd-badge"
-                        title={
-                          item.receipt?.acked_at
-                            ? `Acked at ${formatTimestamp(item.receipt.acked_at, activeTimeZone)}`
-                            : undefined
-                        }
-                        style={
-                          isAcked
-                            ? {
-                                color: "var(--status-alive)",
-                                borderColor: "rgba(16, 185, 129, 0.35)",
-                                backgroundColor: "rgba(16, 185, 129, 0.1)",
-                              }
-                            : {
-                                color: "var(--accent-hover)",
-                                borderColor: "var(--border-accent)",
-                                backgroundColor: "var(--accent-subtle)",
-                              }
-                        }
-                      >
-                        {status}
-                      </span>
-                    </div>
-
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                      <time
-                        dateTime={msg.created_at}
-                        title={msg.created_at}
-                        className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-dim)" }}
-                      >
-                        {formatTimestamp(msg.created_at, activeTimeZone)}
-                      </time>
-
-                      {!isAcked && (
-                        <button
-                          type="button"
-                          data-testid={`ack-btn-${msg.id}`}
-                          className="fd-btn fd-btn-primary"
-                          style={{ padding: "3px 8px", fontSize: "11px" }}
-                          onClick={() => void handleAck(msg.id)}
-                        >
-                          Acknowledge
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  <div style={{ fontWeight: 600, fontSize: "14px", color: "var(--text-primary)" }}>
-                    {msg.subject}
-                  </div>
-
-                  <div
-                    style={{
-                      fontSize: "13px",
-                      color: "var(--text-secondary)",
-                      whiteSpace: "pre-wrap",
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    {msg.body}
-                  </div>
-                </article>
-              );
-            })
-          )}
-        </div>
-
-        {/* Right Column: Compose FerroWire Message Panel */}
-        <div
-          role="region"
-          aria-label="Compose FerroWire Message"
-          className="fd-card"
-          data-testid="wire-compose-form"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: "10px",
-          }}
-        >
-          <div
-            style={{
-              fontWeight: 700,
-              fontSize: "13px",
-              textTransform: "uppercase",
-              letterSpacing: "0.05em",
-              color: "var(--text-secondary)",
-            }}
-          >
-            Compose FerroWire Message
-          </div>
-
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Recipient (To)</span>
-            <select
-              aria-label="Recipient (To)"
-              className="fd-select"
-              value={toRecipient}
-              onChange={(e) => setToRecipient(e.target.value)}
-            >
-              <option value="all">all (Broadcast to Workspace)</option>
-              {effectiveAgents.map((ag) => (
-                <option key={ag.name_key} value={ag.name_key.toLowerCase()}>
-                  {ag.display_name} ({ag.name_key} · {ag.project})
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
-              Custom Address Override (Optional)
-            </span>
-            <input
-              type="text"
-              name="fd-wire-custom-recipient"
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              data-1p-ignore="true"
-              data-lpignore="true"
-              data-form-type="other"
-              aria-label="Custom Address Override"
-              className="fd-input fd-mono"
-              placeholder="e.g. kacey or agents.all"
-              value={customRecipient}
-              onChange={(e) => setCustomRecipient(e.target.value)}
-            />
-          </label>
-
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Urgency</span>
-            <select
-              aria-label="Message Urgency"
-              className="fd-select"
-              value={urgency}
-              onChange={(e) => setUrgency(e.target.value as "normal" | "urgent")}
-            >
-              <option value="normal">normal</option>
-              <option value="urgent">urgent</option>
-            </select>
-          </label>
-
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Subject</span>
-            <input
-              type="text"
-              name="fd-wire-subject"
-              autoComplete="off"
-              autoCorrect="off"
-              spellCheck={false}
-              data-1p-ignore="true"
-              data-lpignore="true"
-              data-form-type="other"
-              aria-label="Message Subject"
-              className="fd-input"
-              placeholder="Subject line"
-              value={subject}
-              onChange={(e) => setSubject(e.target.value)}
-            />
-          </label>
-
-          <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px" }}>
-            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Body</span>
-            <textarea
-              rows={4}
-              name="fd-wire-body"
-              autoComplete="off"
-              autoCorrect="off"
-              spellCheck={false}
-              data-1p-ignore="true"
-              data-lpignore="true"
-              data-form-type="other"
-              aria-label="Message Body"
-              className="fd-textarea"
-              placeholder="Write your FerroWire message..."
-              value={body}
-              onChange={(e) => setBody(e.target.value)}
-              style={{ resize: "vertical" }}
-            />
-          </label>
-
-          <button
-            type="button"
-            className="fd-btn fd-btn-primary"
-            onClick={() => void submitCompose()}
-            disabled={sending || !subject.trim() || !body.trim()}
-          >
-            {sending ? "Sending..." : "Send Message"}
-          </button>
-        </div>
+        {isNarrow ? (
+          <>
+            {composePanel}
+            {inboxColumn}
+          </>
+        ) : (
+          <>
+            {inboxColumn}
+            {composePanel}
+          </>
+        )}
       </div>
     </section>
   );

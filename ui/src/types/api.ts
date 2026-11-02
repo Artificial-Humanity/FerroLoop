@@ -163,21 +163,42 @@ export interface OfficePreviewResponse {
   preview: OfficePreview;
 }
 
+export interface ArtifactStorageStats {
+  root_dir?: string;
+  managed_files?: number;
+  managed_bytes?: number;
+  version_files?: number;
+  version_bytes?: number;
+  registry_entries?: number;
+}
+
 export interface ArtifactListResponse {
   artifacts: ArtifactSummaryItem[];
+  storage?: ArtifactStorageStats;
 }
 
 export interface PruneArtifactsRequest {
   session_id?: string;
   worktree_path?: string;
+  dry_run?: boolean;
+  max_age_days?: number;
+  status?: "archived" | "live" | "all";
+  kinds?: string[];
+  prune_versions_keep?: number;
 }
 
 export interface PruneArtifactsResponse {
+  dry_run?: boolean;
+  removed_entries?: number;
+  removed_versions?: number;
+  bytes_freed?: number;
   pruned_count?: number;
   pruned?: number;
   archived_count?: number;
+  live_count?: number;
   remaining_count?: number;
   pruned_paths?: string[];
+  storage?: ArtifactStorageStats;
 }
 
 export interface PruneAttachmentsRequest {
