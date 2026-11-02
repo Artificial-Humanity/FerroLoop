@@ -5,6 +5,7 @@
 //! holds the pure registry and file logic; path vetting (forbidden names, allowed roots) stays
 //! with the API handlers, which call in here only with paths they already checked.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -127,8 +128,8 @@ pub(crate) struct Reconciled {
 
 impl Registry {
     /// A missing or unreadable registry is empty; one malformed entry is skipped, not fatal.
-    /// Production code goes through [`with_registry`], which also keeps a damaged file.
-    #[cfg(test)]
+    /// A read-only load: nothing is written, not even the artifacts dir. Writers go through
+    /// [`with_registry`], which also keeps a damaged file.
     pub(crate) fn load(root: &Path) -> Self {
         Self::load_checked(root).0
     }
@@ -188,6 +189,20 @@ impl Registry {
         managed_dir: &Path,
         session_ids: Option<&[&str]>,
     ) -> Reconciled {
+        self.reconcile_with(managed_dir, session_ids, &mut |v| {
+            remove_snapshot(managed_dir, v);
+        })
+    }
+
+    /// [`Registry::reconcile`] with the handling of a dropped entry's version rows injected:
+    /// `on_drop` is called once per row of every entry that is dropped (and is the only thing
+    /// that touches a snapshot file), so a dry run can reconcile a clone and only count.
+    pub(crate) fn reconcile_with(
+        &mut self,
+        managed_dir: &Path,
+        session_ids: Option<&[&str]>,
+        on_drop: &mut impl FnMut(&ArtifactVersion),
+    ) -> Reconciled {
         let mut out = Reconciled::default();
         let now = now_ms();
         let mut kept = Vec::with_capacity(self.entries.len());
@@ -222,7 +237,7 @@ impl Registry {
             } else {
                 out.pruned += 1;
                 for v in &entry.versions {
-                    remove_snapshot(managed_dir, v);
+                    on_drop(v);
                 }
                 continue;
             }
@@ -252,16 +267,301 @@ fn versions_dir(root: &Path, canonical: &Path) -> PathBuf {
     root.join("versions").join(managed_file_name(canonical))
 }
 
-/// Best-effort removal of a revision's snapshot. `anchor` is any dir under the artifact root
-/// (the managed dir); the snapshot is only removed when it lies under `<root>/versions`.
-fn remove_snapshot(anchor: &Path, v: &ArtifactVersion) {
-    let Some(snap) = v.snapshot_path.as_deref() else {
-        return;
-    };
-    let Some(root) = anchor.parent() else { return };
+/// The snapshot file of `v` when it may be removed: a regular file (never a symlink) whose path
+/// lies under `<root>/versions`, has no `..`, and whose parent dir resolves inside the canonical
+/// `<root>/versions`. The registry file is only a hint, so nothing else is ever touched.
+/// Returns the path and its size.
+fn snapshot_target(root: &Path, v: &ArtifactVersion) -> Option<(PathBuf, u64)> {
+    let snap = v.snapshot_path.as_deref()?;
     let base = root.join("versions");
-    if Path::new(snap).starts_with(&base) && !snap.contains("..") {
+    if !Path::new(snap).starts_with(&base) || snap.contains("..") {
+        return None;
+    }
+    let meta = fs::symlink_metadata(snap).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let parent = fs::canonicalize(Path::new(snap).parent()?).ok()?;
+    parent
+        .starts_with(fs::canonicalize(&base).ok()?)
+        .then(|| (PathBuf::from(snap), meta.len()))
+}
+
+/// Best-effort removal of a revision's snapshot. `anchor` is any dir under the artifact root
+/// (the managed dir); the snapshot is only removed when [`snapshot_target`] accepts it.
+fn remove_snapshot(anchor: &Path, v: &ArtifactVersion) {
+    let Some(root) = anchor.parent() else { return };
+    if let Some((snap, _)) = snapshot_target(root, v) {
         let _ = fs::remove_file(snap);
+    }
+}
+
+/// Which entries a filtered cleanup picks, by `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusFilter {
+    Live,
+    Archived,
+    All,
+}
+
+/// The kinds an entry can have (see `classify_artifact_kind`).
+pub(crate) const ARTIFACT_KINDS: &[&str] = &[
+    "markdown", "mermaid", "svg", "image", "pdf", "code", "binary",
+];
+
+const MS_PER_DAY: u64 = 86_400_000;
+
+/// Optional filters of `POST /api/v1/artifacts/prune`.
+///
+/// The *selection* is every entry that matches all of `max_age_days`, `status` and `kinds` that
+/// are set (AND). Then:
+/// - `prune_versions_keep` not set, and a selection filter set: the selected entries are
+///   REMOVED: registry row, managed copy (only when it is a regular file inside `managed/`) and
+///   every version snapshot (only under `<root>/versions`). An entry's original file is never
+///   touched.
+/// - `prune_versions_keep` set: TRIM mode. Of the selected entries (all, when no selection
+///   filter is set) only the N newest version rows are kept and the dropped rows' snapshots are
+///   deleted. No entry is removed. With 0 the numbering of a later revision starts again at 1.
+/// - Nothing set: no filtered action.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CleanupFilter {
+    pub max_age_days: Option<u64>,
+    pub status: Option<StatusFilter>,
+    /// Lowercase kinds; empty means not set.
+    pub kinds: Vec<String>,
+    pub prune_versions_keep: Option<usize>,
+}
+
+impl CleanupFilter {
+    fn has_selection(&self) -> bool {
+        self.max_age_days.is_some() || self.status.is_some() || !self.kinds.is_empty()
+    }
+
+    /// Whether `entry` matches every selection filter that is set (all entries when none is).
+    fn selects(&self, entry: &ArtifactEntry, now: u64) -> bool {
+        if let Some(days) = self.max_age_days
+            && entry.updated_at_ms >= now.saturating_sub(days.saturating_mul(MS_PER_DAY))
+        {
+            return false;
+        }
+        let status_ok = match self.status {
+            None | Some(StatusFilter::All) => true,
+            Some(StatusFilter::Live) => entry.status == STATUS_LIVE,
+            Some(StatusFilter::Archived) => entry.status == STATUS_ARCHIVED,
+        };
+        status_ok
+            && (self.kinds.is_empty() || self.kinds.iter().any(|k| *k == entry.kind.to_lowercase()))
+    }
+}
+
+/// What a cleanup removed (or, in a dry run, would remove).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CleanupTotals {
+    /// Entries dropped by reconcile plus entries removed by the filter.
+    pub removed_entries: usize,
+    /// Version rows dropped by a trim plus the rows of removed entries.
+    pub removed_versions: usize,
+    /// Sizes of the regular files removed: managed copies and snapshots.
+    pub bytes_freed: u64,
+}
+
+/// Deletes (or, in a dry run, only counts) hub-managed files, each path once.
+struct Sweeper {
+    root: PathBuf,
+    dry_run: bool,
+    seen: HashSet<PathBuf>,
+    totals: CleanupTotals,
+}
+
+impl Sweeper {
+    fn new(root: &Path, dry_run: bool) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            dry_run,
+            seen: HashSet::new(),
+            totals: CleanupTotals::default(),
+        }
+    }
+
+    /// Delete `path` (a regular file of `len` bytes) unless it was handled already; a failed
+    /// delete frees nothing.
+    fn delete(&mut self, path: PathBuf, len: u64) {
+        if !self.seen.insert(path.clone()) {
+            return;
+        }
+        if self.dry_run || fs::remove_file(&path).is_ok() {
+            self.totals.bytes_freed = self.totals.bytes_freed.saturating_add(len);
+        }
+    }
+
+    /// One version row goes: count it and delete its snapshot when the guard accepts it.
+    fn drop_version(&mut self, v: &ArtifactVersion) {
+        self.totals.removed_versions += 1;
+        if let Some((snap, len)) = snapshot_target(&self.root, v) {
+            self.delete(snap, len);
+        }
+    }
+
+    /// The entry goes: its managed copy, its snapshots and, once empty, its snapshot dir.
+    fn remove_entry(&mut self, entry: &ArtifactEntry) {
+        self.totals.removed_entries += 1;
+        if let Some(copy) = entry
+            .managed_path
+            .as_deref()
+            .and_then(|m| valid_managed_path(&managed_dir(&self.root), m))
+            && let Ok(meta) = fs::symlink_metadata(&copy)
+            && meta.is_file()
+        {
+            self.delete(copy, meta.len());
+        }
+        for v in &entry.versions {
+            self.drop_version(v);
+        }
+        self.tidy_versions_dir(entry);
+    }
+
+    /// Remove the entry's snapshot dir when it is empty (never recursive; errors ignored).
+    fn tidy_versions_dir(&self, entry: &ArtifactEntry) {
+        if !self.dry_run {
+            let _ = fs::remove_dir(versions_dir(&self.root, Path::new(&entry.canonical_path)));
+        }
+    }
+}
+
+/// Apply the filtered part of a cleanup to `registry` (see [`CleanupFilter`]).
+fn apply_cleanup(registry: &mut Registry, filter: &CleanupFilter, now: u64, sweep: &mut Sweeper) {
+    if let Some(keep) = filter.prune_versions_keep {
+        for entry in registry
+            .entries
+            .iter_mut()
+            .filter(|e| filter.selects(e, now))
+        {
+            let drop = entry.versions.len().saturating_sub(keep);
+            if drop == 0 {
+                continue;
+            }
+            for v in entry.versions.drain(..drop) {
+                sweep.drop_version(&v);
+            }
+            sweep.tidy_versions_dir(entry);
+        }
+    } else if filter.has_selection() {
+        let mut kept = Vec::with_capacity(registry.entries.len());
+        for entry in std::mem::take(&mut registry.entries) {
+            if filter.selects(&entry, now) {
+                sweep.remove_entry(&entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        registry.entries = kept;
+    }
+}
+
+/// The outcome of [`run_cleanup`].
+#[derive(Debug)]
+pub(crate) struct CleanupReport {
+    pub reconciled: Reconciled,
+    pub totals: CleanupTotals,
+    /// Registry entries left after the cleanup.
+    pub registry_entries: usize,
+}
+
+/// Reconcile the registry (every entry, against the disk), then apply `filter`, as one step.
+/// A real run does it under the registry lock and saves; a dry run does the same on a copy
+/// loaded without writing anything (not even the artifacts dir) and deletes nothing, so its
+/// totals are what the same real call removes.
+pub(crate) fn run_cleanup(root: &Path, filter: &CleanupFilter, dry_run: bool) -> CleanupReport {
+    let pass = |registry: &mut Registry| {
+        let mut sweep = Sweeper::new(root, dry_run);
+        let reconciled = registry.reconcile_with(&managed_dir(root), None, &mut |v| {
+            sweep.drop_version(v);
+        });
+        sweep.totals.removed_entries = reconciled.pruned;
+        apply_cleanup(registry, filter, now_ms(), &mut sweep);
+        CleanupReport {
+            reconciled,
+            totals: sweep.totals,
+            registry_entries: registry.entries.len(),
+        }
+    };
+    if dry_run {
+        let _guard = REGISTRY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pass(&mut Registry::load(root))
+    } else {
+        with_registry(root, pass)
+    }
+}
+
+/// Most files [`storage_summary`] counts in one tree before it stops.
+const MAX_STORAGE_SCAN_FILES: usize = 50_000;
+/// Dir levels the storage walk reads, the tree root being the first.
+const MAX_STORAGE_SCAN_DEPTH: usize = 4;
+
+/// What the hub stores under the artifacts root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StorageSummary {
+    pub root_dir: String,
+    pub managed_files: u64,
+    pub managed_bytes: u64,
+    pub version_files: u64,
+    pub version_bytes: u64,
+    pub registry_entries: u64,
+    /// A tree held more than the scan cap, so the counts are lower bounds.
+    pub truncated: bool,
+}
+
+/// Count the regular files of `dir` and below (symlinks, dirs and unreadable entries are
+/// skipped), stopping at `cap` files. Returns `(files, bytes, hit_cap)`.
+fn scan_tree(dir: &Path, cap: usize) -> (u64, u64, bool) {
+    fn walk(dir: &Path, depth: usize, cap: usize, acc: &mut (u64, u64, bool)) {
+        let Ok(read) = fs::read_dir(dir) else { return };
+        for item in read.flatten() {
+            if acc.2 {
+                return;
+            }
+            let Ok(meta) = fs::symlink_metadata(item.path()) else {
+                continue;
+            };
+            if meta.is_file() {
+                if acc.0 >= cap as u64 {
+                    acc.2 = true;
+                    return;
+                }
+                acc.0 += 1;
+                acc.1 = acc.1.saturating_add(meta.len());
+            } else if meta.is_dir() && depth < MAX_STORAGE_SCAN_DEPTH {
+                walk(&item.path(), depth + 1, cap, acc);
+            }
+        }
+    }
+    let mut acc = (0, 0, false);
+    // A symlinked tree root is not followed either.
+    if fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        walk(dir, 1, cap, &mut acc);
+    }
+    acc
+}
+
+/// File counts and bytes of `<root>/managed` and `<root>/versions`. Never fails: a missing or
+/// unreadable dir counts as empty. `registry_entries` is passed in by the caller.
+pub(crate) fn storage_summary(root: &Path, registry_entries: usize) -> StorageSummary {
+    storage_summary_capped(root, registry_entries, MAX_STORAGE_SCAN_FILES)
+}
+
+fn storage_summary_capped(root: &Path, registry_entries: usize, cap: usize) -> StorageSummary {
+    let (managed_files, managed_bytes, managed_cut) = scan_tree(&managed_dir(root), cap);
+    let (version_files, version_bytes, version_cut) = scan_tree(&root.join("versions"), cap);
+    StorageSummary {
+        root_dir: root.display().to_string(),
+        managed_files,
+        managed_bytes,
+        version_files,
+        version_bytes,
+        registry_entries: registry_entries as u64,
+        truncated: managed_cut || version_cut,
     }
 }
 
@@ -1690,6 +1990,59 @@ pub(crate) fn office_preview(ext: &str, data: &[u8]) -> Result<Value, OfficeErro
     }
 }
 
+/// Test support: put an entry in the registry with real files behind it: a managed copy of 100
+/// bytes, `versions` snapshots (`v<n>` is `10 * n` bytes) and, for `live`, an original file in
+/// `orig_dir`. Returns the entry as stored.
+#[cfg(test)]
+pub(crate) fn seed_test_entry(
+    root: &Path,
+    orig_dir: &Path,
+    name: &str,
+    kind: &str,
+    status: &str,
+    updated_at_ms: u64,
+    versions: u32,
+) -> ArtifactEntry {
+    fs::create_dir_all(orig_dir).unwrap();
+    let original = orig_dir.join(name);
+    if status == STATUS_LIVE {
+        fs::write(&original, "orig").unwrap();
+    }
+    let managed = managed_dir(root).join(format!("seed-{name}"));
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::write(&managed, [b'm'; 100]).unwrap();
+    let dir = versions_dir(root, &original);
+    let mut rows = Vec::new();
+    for n in 1..=versions {
+        fs::create_dir_all(&dir).unwrap();
+        let snap = dir.join(format!("v{n}"));
+        fs::write(&snap, vec![b's'; 10 * n as usize]).unwrap();
+        rows.push(ArtifactVersion {
+            version: n,
+            sha256: format!("sha{n}"),
+            size_bytes: 10 * u64::from(n),
+            recorded_at_ms: 1,
+            source_mtime_ms: 0,
+            snapshot_path: Some(snap.display().to_string()),
+        });
+    }
+    let entry = ArtifactEntry {
+        path: original.display().to_string(),
+        canonical_path: original.display().to_string(),
+        managed_path: Some(managed.display().to_string()),
+        name: name.to_string(),
+        ext: name.rsplit('.').next().unwrap_or("").to_string(),
+        kind: kind.to_string(),
+        size_bytes: 4,
+        session_id: None,
+        status: status.to_string(),
+        updated_at_ms,
+        versions: rows,
+    };
+    with_registry(root, |reg| reg.entries.push(entry.clone()));
+    entry
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2283,6 +2636,488 @@ mod tests {
         let reg = Registry::load(&root);
         assert_eq!(reg.entries.len(), 1);
         assert!(reg.entries[0].versions.is_empty());
+    }
+
+    // ---- filtered cleanup and storage summary ----
+
+    fn registry_names(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = Registry::load(root)
+            .entries
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn filter() -> CleanupFilter {
+        CleanupFilter::default()
+    }
+
+    fn managed_of(e: &ArtifactEntry) -> PathBuf {
+        PathBuf::from(e.managed_path.as_deref().unwrap())
+    }
+
+    fn snaps_of(e: &ArtifactEntry) -> Vec<PathBuf> {
+        e.versions
+            .iter()
+            .map(|v| PathBuf::from(v.snapshot_path.as_deref().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn age_comparison_is_strictly_older_and_saturates() {
+        let day = MS_PER_DAY;
+        let now = 10 * day;
+        let at = |t: u64| ArtifactEntry {
+            updated_at_ms: t,
+            ..entry(Path::new("/x/a.md"), None)
+        };
+        let f = CleanupFilter {
+            max_age_days: Some(3),
+            ..filter()
+        };
+        assert!(f.selects(&at(7 * day - 1), now));
+        assert!(!f.selects(&at(7 * day), now));
+        assert!(!f.selects(&at(7 * day + 1), now));
+        let huge = CleanupFilter {
+            max_age_days: Some(u64::MAX),
+            ..filter()
+        };
+        assert!(!huge.selects(&at(0), now));
+        let zero = CleanupFilter {
+            max_age_days: Some(0),
+            ..filter()
+        };
+        assert!(zero.selects(&at(now - 1), now));
+        assert!(!zero.selects(&at(now), now));
+    }
+
+    #[test]
+    fn selection_is_the_and_of_age_status_and_kind_and_spares_originals() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let now = now_ms();
+        let live_old = seed_test_entry(&root, &orig, "live-old.md", "markdown", "live", 1, 2);
+        let arch_old_md =
+            seed_test_entry(&root, &orig, "arch-old.md", "markdown", "archived", 1, 2);
+        let arch_old_pdf = seed_test_entry(&root, &orig, "arch-old.pdf", "pdf", "archived", 1, 1);
+        let arch_new_md =
+            seed_test_entry(&root, &orig, "arch-new.md", "markdown", "archived", now, 1);
+
+        let f = CleanupFilter {
+            max_age_days: Some(30),
+            status: Some(StatusFilter::Archived),
+            kinds: vec!["markdown".into()],
+            ..filter()
+        };
+        let report = run_cleanup(&root, &f, false);
+        assert_eq!(report.totals.removed_entries, 1);
+        assert_eq!(report.totals.removed_versions, 2);
+        assert_eq!(report.totals.bytes_freed, 100 + 10 + 20);
+        assert_eq!(report.registry_entries, 3);
+        assert_eq!(
+            registry_names(&root),
+            ["arch-new.md", "arch-old.pdf", "live-old.md"]
+        );
+        assert!(!managed_of(&arch_old_md).exists());
+        assert!(snaps_of(&arch_old_md).iter().all(|p| !p.exists()));
+        assert!(!versions_dir(&root, Path::new(&arch_old_md.canonical_path)).exists());
+        for kept in [&live_old, &arch_old_pdf, &arch_new_md] {
+            assert!(managed_of(kept).exists(), "{}", kept.name);
+            assert!(snaps_of(kept).iter().all(|p| p.exists()), "{}", kept.name);
+        }
+
+        // `live` removes hub storage only; the original stays.
+        let f = CleanupFilter {
+            status: Some(StatusFilter::Live),
+            ..filter()
+        };
+        let report = run_cleanup(&root, &f, false);
+        assert_eq!(report.totals.removed_entries, 1);
+        assert!(Path::new(&live_old.canonical_path).exists());
+        assert!(!managed_of(&live_old).exists());
+
+        // `all` is a filter too; kinds are compared lowercased.
+        let f = CleanupFilter {
+            status: Some(StatusFilter::All),
+            kinds: vec!["pdf".into()],
+            ..filter()
+        };
+        assert_eq!(run_cleanup(&root, &f, false).totals.removed_entries, 1);
+        assert_eq!(registry_names(&root), ["arch-new.md"]);
+        let f = CleanupFilter {
+            status: Some(StatusFilter::All),
+            ..filter()
+        };
+        assert_eq!(run_cleanup(&root, &f, false).totals.removed_entries, 1);
+        assert!(registry_names(&root).is_empty());
+    }
+
+    #[test]
+    fn no_filter_removes_nothing_and_kinds_alone_select_by_kind() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let a = seed_test_entry(&root, &orig, "a.md", "markdown", "live", 1, 1);
+        let b = seed_test_entry(&root, &orig, "b.svg", "svg", "live", 1, 1);
+        let report = run_cleanup(&root, &filter(), false);
+        assert_eq!(report.totals, CleanupTotals::default());
+        assert_eq!(report.registry_entries, 2);
+        let f = CleanupFilter {
+            kinds: vec!["svg".into()],
+            ..filter()
+        };
+        assert_eq!(run_cleanup(&root, &f, false).totals.removed_entries, 1);
+        assert!(managed_of(&a).exists() && !managed_of(&b).exists());
+    }
+
+    #[test]
+    fn trim_keeps_the_newest_rows_and_never_removes_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let arch = seed_test_entry(&root, &orig, "arch.md", "markdown", "archived", 1, 5);
+        let live = seed_test_entry(&root, &orig, "live.md", "markdown", "live", 1, 3);
+
+        // Only the selected (archived) entry is trimmed.
+        let f = CleanupFilter {
+            status: Some(StatusFilter::Archived),
+            prune_versions_keep: Some(2),
+            ..filter()
+        };
+        let report = run_cleanup(&root, &f, false);
+        assert_eq!(report.totals.removed_entries, 0);
+        assert_eq!(report.totals.removed_versions, 3);
+        assert_eq!(report.totals.bytes_freed, 10 + 20 + 30);
+        let reg = Registry::load(&root);
+        let got = |name: &str| -> Vec<u32> {
+            reg.entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .versions
+                .iter()
+                .map(|v| v.version)
+                .collect()
+        };
+        assert_eq!(got("arch.md"), [4, 5]);
+        assert_eq!(got("live.md"), [1, 2, 3]);
+        let snaps = snaps_of(&arch);
+        assert!(snaps[..3].iter().all(|p| !p.exists()));
+        assert!(snaps[3..].iter().all(|p| p.exists()));
+        assert!(snaps_of(&live).iter().all(|p| p.exists()));
+        assert!(managed_of(&arch).exists());
+
+        // No other filter: every entry; N = 0 drops every row and the empty dir goes.
+        let f = CleanupFilter {
+            prune_versions_keep: Some(0),
+            ..filter()
+        };
+        let report = run_cleanup(&root, &f, false);
+        assert_eq!(report.totals.removed_versions, 5);
+        assert_eq!(report.registry_entries, 2);
+        assert!(
+            Registry::load(&root)
+                .entries
+                .iter()
+                .all(|e| e.versions.is_empty())
+        );
+        assert!(!versions_dir(&root, Path::new(&live.canonical_path)).exists());
+
+        // N above the row count changes nothing.
+        let f = CleanupFilter {
+            prune_versions_keep: Some(9),
+            ..filter()
+        };
+        assert_eq!(
+            run_cleanup(&root, &f, false).totals,
+            CleanupTotals::default()
+        );
+    }
+
+    #[test]
+    fn version_numbers_keep_counting_after_a_trim() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let file = tmp.path().join("a.md");
+        let canon = {
+            fs::write(&file, "one").unwrap();
+            fs::canonicalize(&file).unwrap()
+        };
+        with_registry(&root, |reg| reg.upsert(entry(&canon, None)));
+        for body in ["one", "two!", "three"] {
+            fs::write(&file, body).unwrap();
+            record_version(&root, &canon, &|_| true).unwrap();
+        }
+        let f = CleanupFilter {
+            prune_versions_keep: Some(1),
+            ..filter()
+        };
+        assert_eq!(run_cleanup(&root, &f, false).totals.removed_versions, 2);
+        fs::write(&file, "four-more").unwrap();
+        assert!(record_version(&root, &canon, &|_| true).unwrap());
+        let nums: Vec<u32> = versions_of(&root, &canon)
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(nums, [3, 4]);
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing_and_predicts_the_real_run() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let a = seed_test_entry(&root, &orig, "a.md", "markdown", "archived", 1, 2);
+        seed_test_entry(&root, &orig, "b.pdf", "pdf", "archived", 1, 1);
+        // Original and copy gone: reconcile drops it, and its snapshots go with it.
+        let gone = seed_test_entry(&root, &orig, "gone.md", "markdown", "archived", 1, 3);
+        fs::remove_file(managed_of(&gone)).unwrap();
+        let before = fs::read(registry_path(&root)).unwrap();
+        let f = CleanupFilter {
+            status: Some(StatusFilter::Archived),
+            kinds: vec!["markdown".into()],
+            ..filter()
+        };
+
+        let dry = run_cleanup(&root, &f, true);
+        assert_eq!(fs::read(registry_path(&root)).unwrap(), before);
+        assert!(managed_of(&a).exists() && snaps_of(&a).iter().all(|p| p.exists()));
+        assert!(snaps_of(&gone).iter().all(|p| p.exists()));
+
+        let real = run_cleanup(&root, &f, false);
+        assert_eq!(dry.totals, real.totals);
+        assert_eq!(dry.registry_entries, real.registry_entries);
+        assert_eq!(dry.reconciled.pruned, real.reconciled.pruned);
+        assert_eq!(real.totals.removed_entries, 2);
+        assert_eq!(real.totals.removed_versions, 2 + 3);
+        assert_eq!(real.totals.bytes_freed, 100 + 10 + 20 + 10 + 20 + 30);
+        assert_eq!(registry_names(&root), ["b.pdf"]);
+        assert!(!managed_of(&a).exists());
+        assert!(snaps_of(&gone).iter().all(|p| !p.exists()));
+    }
+
+    #[test]
+    fn a_dry_run_does_not_create_the_artifacts_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let f = CleanupFilter {
+            status: Some(StatusFilter::All),
+            ..filter()
+        };
+        let report = run_cleanup(&root, &f, true);
+        assert_eq!(report.totals, CleanupTotals::default());
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn removal_only_touches_hub_managed_regular_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        for n in [
+            "managed.md",
+            "snap.md",
+            "dotdot.md",
+            "linked.md",
+            "viadir.md",
+        ] {
+            fs::write(outside.join(n), "precious").unwrap();
+        }
+        let vdir = root.join("versions");
+        fs::create_dir_all(vdir.join("x")).unwrap();
+        fs::create_dir_all(managed_dir(&root)).unwrap();
+        // A symlink inside versions, and a dir symlink inside versions.
+        std::os::unix::fs::symlink(outside.join("linked.md"), vdir.join("x/v-link")).unwrap();
+        std::os::unix::fs::symlink(&outside, vdir.join("dirlink")).unwrap();
+        // A managed copy that is a symlink out of managed/.
+        std::os::unix::fs::symlink(
+            outside.join("managed.md"),
+            managed_dir(&root).join("m-link"),
+        )
+        .unwrap();
+        let version = |n: u32, path: String| ArtifactVersion {
+            version: n,
+            sha256: "s".into(),
+            size_bytes: 8,
+            recorded_at_ms: 1,
+            source_mtime_ms: 0,
+            snapshot_path: Some(path),
+        };
+        let row = |managed: &Path, versions: Vec<ArtifactVersion>| ArtifactEntry {
+            managed_path: Some(managed.display().to_string()),
+            versions,
+            status: STATUS_ARCHIVED.into(),
+            ..entry(Path::new("/definitely/gone/a.md"), None)
+        };
+        let dotdot = format!("{}/x/../../outside/dotdot.md", vdir.display());
+        with_registry(&root, |reg| {
+            reg.entries.push(row(
+                &outside.join("managed.md"),
+                vec![
+                    version(1, outside.join("snap.md").display().to_string()),
+                    version(2, dotdot),
+                    version(3, vdir.join("x/v-link").display().to_string()),
+                    version(4, vdir.join("dirlink/viadir.md").display().to_string()),
+                ],
+            ));
+            reg.entries
+                .push(row(&managed_dir(&root).join("m-link"), Vec::new()));
+        });
+        let f = CleanupFilter {
+            status: Some(StatusFilter::All),
+            ..filter()
+        };
+        let real = run_cleanup(&root, &f, false);
+        // Both rows were dropped by reconcile (no valid copy), the files were not.
+        assert_eq!(real.totals.removed_entries, 2);
+        assert_eq!(real.totals.removed_versions, 4);
+        assert_eq!(real.totals.bytes_freed, 0);
+        assert!(registry_names(&root).is_empty());
+        for n in [
+            "managed.md",
+            "snap.md",
+            "dotdot.md",
+            "linked.md",
+            "viadir.md",
+        ] {
+            assert!(outside.join(n).exists(), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_filter_removal_skips_unsafe_paths_too() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, "precious").unwrap();
+        // A live entry (original present) whose recorded copy and snapshots point elsewhere.
+        let mut e = seed_test_entry(&root, &orig, "a.md", "markdown", "live", 1, 1);
+        let real_copy = managed_of(&e);
+        let real_snap = snaps_of(&e).remove(0);
+        with_registry(&root, |reg| {
+            reg.entries[0].managed_path = Some(outside.display().to_string());
+            reg.entries[0].versions[0].snapshot_path = Some(outside.display().to_string());
+        });
+        e.versions.clear();
+        let f = CleanupFilter {
+            kinds: vec!["markdown".into()],
+            ..filter()
+        };
+        let dry = run_cleanup(&root, &f, true);
+        let real = run_cleanup(&root, &f, false);
+        assert_eq!(dry.totals, real.totals);
+        assert_eq!(real.totals.removed_entries, 1);
+        assert_eq!(real.totals.removed_versions, 1);
+        assert_eq!(real.totals.bytes_freed, 0);
+        assert!(outside.exists());
+        assert!(Path::new(&e.canonical_path).exists());
+        // What the registry no longer names stays on disk; nothing outside is deleted.
+        assert!(real_copy.exists() && real_snap.exists());
+    }
+
+    #[test]
+    fn bytes_freed_counts_only_files_that_were_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let e = seed_test_entry(&root, &orig, "a.md", "markdown", "archived", 1, 2);
+        let dir = versions_dir(&root, Path::new(&e.canonical_path));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let can_write = fs::write(dir.join("probe"), "x").is_ok();
+        let f = CleanupFilter {
+            status: Some(StatusFilter::Archived),
+            ..filter()
+        };
+        let real = run_cleanup(&root, &f, false);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if !can_write {
+            // Snapshots could not be removed: only the managed copy counts.
+            assert_eq!(real.totals.bytes_freed, 100);
+            assert!(snaps_of(&e).iter().all(|p| p.exists()));
+        }
+    }
+
+    #[test]
+    fn storage_summary_counts_regular_files_only() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("artifacts");
+        let missing = storage_summary(&root, 7);
+        assert_eq!(
+            (
+                missing.managed_files,
+                missing.version_files,
+                missing.truncated
+            ),
+            (0, 0, false)
+        );
+        assert_eq!(missing.registry_entries, 7);
+        assert_eq!(missing.root_dir, root.display().to_string());
+
+        let managed = managed_dir(&root);
+        let versions = root.join("versions");
+        fs::create_dir_all(managed.join("subdir")).unwrap();
+        fs::create_dir_all(versions.join("a")).unwrap();
+        fs::create_dir_all(versions.join("b/deeper")).unwrap();
+        fs::write(managed.join("one"), "123").unwrap();
+        fs::write(managed.join("two"), "12345").unwrap();
+        fs::write(versions.join("a/v1"), "1234567").unwrap();
+        fs::write(versions.join("b/v1"), "12").unwrap();
+        fs::write(versions.join("b/deeper/v2"), "1").unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), vec![0u8; 1000]).unwrap();
+        std::os::unix::fs::symlink(outside.join("big"), managed.join("link")).unwrap();
+        std::os::unix::fs::symlink(&outside, versions.join("dirlink")).unwrap();
+        // Too deep to be entered.
+        fs::create_dir_all(versions.join("d1/d2/d3/d4")).unwrap();
+        fs::write(versions.join("d1/d2/d3/d4/lost"), "x").unwrap();
+        fs::write(versions.join("d1/d2/d3/found"), "xy").unwrap();
+
+        let s = storage_summary(&root, 3);
+        assert_eq!((s.managed_files, s.managed_bytes), (2, 8));
+        assert_eq!((s.version_files, s.version_bytes), (4, 7 + 2 + 1 + 2));
+        assert!(!s.truncated);
+
+        // The cap: a tree with exactly `cap` files is complete, one more is cut.
+        let exact = storage_summary_capped(&root, 3, 4);
+        assert!(!exact.truncated);
+        let cut = storage_summary_capped(&root, 3, 3);
+        assert!(cut.truncated);
+        assert_eq!(cut.version_files, 3);
+        assert_eq!(cut.managed_files, 2);
+    }
+
+    #[test]
+    fn storage_summary_does_not_follow_a_symlinked_tree_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("artifacts");
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("f"), "abc").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, managed_dir(&root)).unwrap();
+        assert_eq!(storage_summary(&root, 0).managed_files, 0);
+    }
+
+    #[test]
+    fn reconcile_with_hands_every_dropped_row_to_the_callback() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let orig = tmp.path().join("orig");
+        let gone = seed_test_entry(&root, &orig, "gone.md", "markdown", "archived", 1, 3);
+        fs::remove_file(managed_of(&gone)).unwrap();
+        let mut reg = Registry::load(&root);
+        let mut seen = Vec::new();
+        let out = reg.reconcile_with(&managed_dir(&root), None, &mut |v| seen.push(v.version));
+        assert_eq!((out.pruned, seen), (1, vec![1, 2, 3]));
+        assert!(snaps_of(&gone).iter().all(|p| p.exists()));
+        assert!(reg.entries.is_empty());
     }
 
     // ---- office previews ----

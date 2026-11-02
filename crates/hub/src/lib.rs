@@ -6520,11 +6520,425 @@ default_target = "wire:felicity"
         }
         let empty = handle_http_request(&state, &owner_req(b""));
         assert_eq!(empty.status, 200);
+        let body = empty.json_value().unwrap();
         assert_eq!(
-            empty.json_value().unwrap(),
-            json!({ "ok": true, "pruned_count": 0, "archived_count": 0, "active_count": 0 })
+            body,
+            json!({
+                "ok": true, "pruned_count": 0, "archived_count": 0, "active_count": 0,
+                "dry_run": false, "removed_entries": 0, "removed_versions": 0, "bytes_freed": 0,
+                "storage": {
+                    "root_dir": artifacts_root_of(&tmp).display().to_string(),
+                    "managed_files": 0, "managed_bytes": 0, "version_files": 0,
+                    "version_bytes": 0, "registry_entries": 0, "truncated": false,
+                },
+            })
         );
         assert!(managed_files(&tmp).is_empty());
+    }
+
+    /// Seed `(name, kind, status, updated_at_ms, versions)` rows; originals live in `tmp/orig`.
+    fn seed_cleanup(
+        tmp: &TempDir,
+        rows: &[(&str, &str, &str, u64, u32)],
+    ) -> Vec<crate::artifacts::ArtifactEntry> {
+        let root = artifacts_root_of(tmp);
+        rows.iter()
+            .map(|(name, kind, status, at, versions)| {
+                crate::artifacts::seed_test_entry(
+                    &root,
+                    &tmp.path().join("orig"),
+                    name,
+                    kind,
+                    status,
+                    *at,
+                    *versions,
+                )
+            })
+            .collect()
+    }
+
+    fn registry_names_of(tmp: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = crate::artifacts::Registry::load(&artifacts_root_of(tmp))
+            .entries
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn prune_ok(state: &HubState, body: &Value) -> Value {
+        let resp = prune(state, OWNER, body);
+        assert_eq!(resp.status, 200, "{body}: {}", error_text(&resp));
+        resp.json_value().unwrap()
+    }
+
+    #[test]
+    fn artifact_prune_legacy_bodies_keep_their_fields_and_remove_nothing_new() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let seeded = seed_cleanup(
+            &tmp,
+            &[
+                ("a.md", "markdown", "live", 1, 2),
+                ("b.pdf", "pdf", "archived", 1, 1),
+            ],
+        );
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        for body in [
+            json!({}),
+            json!({ "paths": [] }),
+            json!({ "worktree_path": wt.display().to_string() }),
+            json!({ "session_id": "nope" }),
+            json!({ "kinds": [], "dry_run": false }),
+            json!({ "status": null, "max_age_days": null, "prune_versions_keep": null }),
+        ] {
+            let out = prune_ok(&state, &body);
+            assert_eq!(out["ok"], true, "{body}");
+            assert_eq!(out["pruned_count"], 0, "{body}");
+            assert_eq!(out["archived_count"], 1, "{body}");
+            assert_eq!(out["active_count"], 1, "{body}");
+            assert_eq!(out["dry_run"], false, "{body}");
+            assert_eq!(out["removed_entries"], 0, "{body}");
+            assert_eq!(out["removed_versions"], 0, "{body}");
+            assert_eq!(out["bytes_freed"], 0, "{body}");
+            assert_eq!(out["storage"]["registry_entries"], 2, "{body}");
+            assert_eq!(out["storage"]["managed_files"], 2, "{body}");
+            assert_eq!(out["storage"]["managed_bytes"], 200, "{body}");
+            assert_eq!(out["storage"]["version_files"], 3, "{body}");
+            assert_eq!(out["storage"]["version_bytes"], 10 + 20 + 10, "{body}");
+            assert!(out.get("live_count").is_none() && out.get("archived").is_none());
+        }
+        assert_eq!(registry_names_of(&tmp), ["a.md", "b.pdf"]);
+        assert!(
+            seeded
+                .iter()
+                .all(|e| std::path::Path::new(e.managed_path.as_deref().unwrap()).exists())
+        );
+    }
+
+    #[test]
+    fn artifact_prune_filters_select_with_and_logic_and_never_touch_originals() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let now = crate::artifacts::now_ms();
+        let seeded = seed_cleanup(
+            &tmp,
+            &[
+                ("live-old.md", "markdown", "live", 1, 2),
+                ("arch-old.md", "markdown", "archived", 1, 2),
+                ("arch-old.pdf", "pdf", "archived", 1, 1),
+                ("arch-new.md", "markdown", "archived", now, 1),
+            ],
+        );
+        let managed = |i: usize| std::path::PathBuf::from(seeded[i].managed_path.clone().unwrap());
+
+        // Combined: archived AND markdown AND older than 30 days -> exactly one entry.
+        let out = prune_ok(
+            &state,
+            &json!({ "status": "archived", "kinds": ["Markdown"], "max_age_days": 30 }),
+        );
+        assert_eq!(out["removed_entries"], 1);
+        assert_eq!(out["removed_versions"], 2);
+        assert_eq!(out["bytes_freed"], 100 + 10 + 20);
+        assert_eq!(out["pruned_count"], 0);
+        assert_eq!(out["storage"]["registry_entries"], 3);
+        assert_eq!(out["storage"]["managed_files"], 3);
+        assert_eq!(
+            registry_names_of(&tmp),
+            ["arch-new.md", "arch-old.pdf", "live-old.md"]
+        );
+        assert!(!managed(1).exists());
+
+        // Age alone: only the old ones (the live one and the pdf).
+        let out = prune_ok(&state, &json!({ "max_age_days": 1 }));
+        assert_eq!(out["removed_entries"], 2);
+        assert_eq!(registry_names_of(&tmp), ["arch-new.md"]);
+        // `live` removed hub storage only: the original is still there.
+        assert!(std::path::Path::new(&seeded[0].canonical_path).exists());
+        assert!(!managed(0).exists() && !managed(2).exists());
+
+        // `status: all` is a filter: everything goes.
+        let out = prune_ok(&state, &json!({ "status": "all" }));
+        assert_eq!(out["removed_entries"], 1);
+        assert!(registry_names_of(&tmp).is_empty());
+        assert_eq!(out["storage"]["managed_files"], 0);
+        assert_eq!(out["storage"]["version_files"], 0);
+    }
+
+    #[test]
+    fn artifact_prune_filters_by_kind_and_status_live() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        seed_cleanup(
+            &tmp,
+            &[
+                ("a.md", "markdown", "live", 1, 0),
+                ("b.svg", "svg", "live", 1, 0),
+                ("c.md", "markdown", "archived", 1, 0),
+            ],
+        );
+        let out = prune_ok(&state, &json!({ "kinds": ["svg", "pdf"] }));
+        assert_eq!(out["removed_entries"], 1);
+        assert_eq!(registry_names_of(&tmp), ["a.md", "c.md"]);
+        let out = prune_ok(&state, &json!({ "status": "live" }));
+        assert_eq!(out["removed_entries"], 1);
+        assert_eq!(registry_names_of(&tmp), ["c.md"]);
+    }
+
+    #[test]
+    fn artifact_prune_trim_mode_keeps_the_newest_versions_and_all_entries() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let seeded = seed_cleanup(
+            &tmp,
+            &[
+                ("a.md", "markdown", "live", 1, 4),
+                ("b.pdf", "pdf", "archived", 1, 3),
+            ],
+        );
+        let snap = |e: usize, v: usize| {
+            std::path::PathBuf::from(seeded[e].versions[v].snapshot_path.clone().unwrap())
+        };
+        // Only the archived entry is trimmed, even though a status filter would otherwise remove.
+        let out = prune_ok(
+            &state,
+            &json!({ "status": "archived", "prune_versions_keep": 1 }),
+        );
+        assert_eq!(out["removed_entries"], 0);
+        assert_eq!(out["removed_versions"], 2);
+        assert_eq!(out["bytes_freed"], 10 + 20);
+        assert!(!snap(1, 0).exists() && !snap(1, 1).exists() && snap(1, 2).exists());
+        assert!((0..4).all(|v| snap(0, v).exists()));
+        assert_eq!(registry_names_of(&tmp), ["a.md", "b.pdf"]);
+
+        // No other filter: every entry; 0 drops everything.
+        let out = prune_ok(&state, &json!({ "prune_versions_keep": 0 }));
+        assert_eq!(out["removed_versions"], 5);
+        assert_eq!(out["removed_entries"], 0);
+        assert_eq!(out["storage"]["version_files"], 0);
+        assert_eq!(out["storage"]["registry_entries"], 2);
+        assert_eq!(out["storage"]["managed_files"], 2);
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert!(reg.entries.iter().all(|e| e.versions.is_empty()));
+    }
+
+    #[test]
+    fn artifact_prune_rejects_bad_filter_values() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        seed_cleanup(&tmp, &[("a.md", "markdown", "live", 1, 1)]);
+        for bad in [
+            json!({ "dry_run": "yes" }),
+            json!({ "dry_run": 1 }),
+            json!({ "status": "gone" }),
+            json!({ "status": "Live" }),
+            json!({ "status": 3 }),
+            json!({ "status": ["live"] }),
+            json!({ "kinds": ["docx"] }),
+            json!({ "kinds": ["markdown", "nope"] }),
+            json!({ "kinds": "markdown" }),
+            json!({ "kinds": [1] }),
+            json!({ "kinds": {} }),
+            json!({ "max_age_days": -1 }),
+            json!({ "max_age_days": 1.5 }),
+            json!({ "max_age_days": "3" }),
+            json!({ "prune_versions_keep": -1 }),
+            json!({ "prune_versions_keep": 2.0 }),
+            json!({ "prune_versions_keep": "1" }),
+            json!({ "prune_versions_keep": true }),
+        ] {
+            let resp = prune(&state, OWNER, &bad);
+            assert_eq!(resp.status, 400, "{bad}");
+            // A bad request does nothing.
+            assert_eq!(registry_names_of(&tmp), ["a.md"], "{bad}");
+        }
+        let resp = prune(&state, OWNER, &json!({ "kinds": ["docx"] }));
+        let msg = error_text(&resp);
+        for kind in [
+            "markdown", "mermaid", "svg", "image", "pdf", "code", "binary",
+        ] {
+            assert!(msg.contains(kind), "{msg}");
+        }
+        assert_eq!(prune(&state, PEER, &json!({ "status": "all" })).status, 403);
+        assert_eq!(registry_names_of(&tmp), ["a.md"]);
+    }
+
+    #[test]
+    fn artifact_prune_dry_run_changes_nothing_and_matches_the_real_run() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let seeded = seed_cleanup(
+            &tmp,
+            &[
+                ("a.md", "markdown", "archived", 1, 2),
+                ("b.md", "markdown", "live", 1, 2),
+                ("gone.md", "markdown", "archived", 1, 3),
+            ],
+        );
+        // Neither original nor copy: reconcile will drop it.
+        fs::remove_file(seeded[2].managed_path.as_deref().unwrap()).unwrap();
+        let root = artifacts_root_of(&tmp);
+        let registry_file = root.join("registry.json");
+        let before = fs::read(&registry_file).unwrap();
+        let tree = |dir: &std::path::Path| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in fs::read_dir(d).unwrap().flatten() {
+                    if e.path().is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        out.push(e.path().display().to_string());
+                    }
+                }
+            }
+            out.sort();
+            out
+        };
+        let files_before = tree(&root);
+        // A named file in a worktree would be archived by a real call; a dry one must not.
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("new.md"), "# new").unwrap();
+        let body = json!({
+            "status": "archived", "kinds": ["markdown"],
+            "worktree_path": wt.display().to_string(),
+        });
+        let mut dry_body = body.clone();
+        dry_body["dry_run"] = json!(true);
+
+        let dry = prune_ok(&state, &dry_body);
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(fs::read(&registry_file).unwrap(), before);
+        assert_eq!(tree(&root), files_before);
+        assert!(managed_files(&tmp).iter().all(|n| n.starts_with("seed-")));
+        // The storage summary of a dry run is the current state.
+        assert_eq!(dry["storage"]["registry_entries"], 1);
+        assert_eq!(dry["storage"]["managed_files"], 2);
+
+        // The same call, real: the same numbers, and the files really go.
+        let real = prune_ok(&state, &body);
+        assert_eq!(real["dry_run"], false);
+        for key in [
+            "pruned_count",
+            "removed_entries",
+            "removed_versions",
+            "bytes_freed",
+        ] {
+            assert_eq!(dry[key], real[key], "{key}");
+        }
+        assert_eq!(real["removed_entries"], 2);
+        assert_eq!(real["removed_versions"], 5);
+        assert_eq!(real["bytes_freed"], 100 + 10 + 20 + 10 + 20 + 30);
+        assert_eq!(registry_names_of(&tmp), ["b.md"]);
+        assert_ne!(tree(&root), files_before);
+    }
+
+    #[test]
+    fn artifact_prune_dry_run_does_not_create_the_artifacts_dir() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let out = prune_ok(&state, &json!({ "dry_run": true, "status": "all" }));
+        assert_eq!(out["removed_entries"], 0);
+        assert_eq!(out["storage"]["managed_files"], 0);
+        assert!(!artifacts_root_of(&tmp).exists());
+    }
+
+    #[test]
+    fn artifact_prune_filters_never_delete_outside_hub_storage() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let root = artifacts_root_of(&tmp);
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        for n in ["copy.md", "snap.md", "dotdot.md", "link-target.md"] {
+            fs::write(outside.join(n), "precious").unwrap();
+        }
+        let vdir = root.join("versions");
+        fs::create_dir_all(vdir.join("x")).unwrap();
+        std::os::unix::fs::symlink(outside.join("link-target.md"), vdir.join("x/v-link")).unwrap();
+        let original = tmp.path().join("original.md");
+        fs::write(&original, "mine").unwrap();
+        let version = |n: u32, path: String| crate::artifacts::ArtifactVersion {
+            version: n,
+            sha256: "s".into(),
+            size_bytes: 8,
+            recorded_at_ms: 1,
+            source_mtime_ms: 0,
+            snapshot_path: Some(path),
+        };
+        crate::artifacts::with_registry(&root, |reg| {
+            reg.entries.push(crate::artifacts::ArtifactEntry {
+                path: original.display().to_string(),
+                canonical_path: original.display().to_string(),
+                managed_path: Some(outside.join("copy.md").display().to_string()),
+                name: "original.md".into(),
+                ext: "md".into(),
+                kind: "markdown".into(),
+                size_bytes: 4,
+                session_id: None,
+                status: "live".into(),
+                updated_at_ms: 1,
+                versions: vec![
+                    version(1, outside.join("snap.md").display().to_string()),
+                    version(2, format!("{}/x/../../outside/dotdot.md", vdir.display())),
+                    version(3, vdir.join("x/v-link").display().to_string()),
+                ],
+            });
+        });
+        for body in [
+            json!({ "status": "live", "dry_run": true }),
+            json!({ "status": "live" }),
+        ] {
+            let out = prune_ok(&state, &body);
+            assert_eq!(out["removed_entries"], 1, "{body}");
+            assert_eq!(out["removed_versions"], 3, "{body}");
+            assert_eq!(out["bytes_freed"], 0, "{body}");
+        }
+        assert!(registry_names_of(&tmp).is_empty());
+        for n in ["copy.md", "snap.md", "dotdot.md", "link-target.md"] {
+            assert!(outside.join(n).exists(), "{n}");
+        }
+        assert!(original.exists());
+    }
+
+    #[test]
+    fn artifact_list_reports_storage_and_keeps_its_fields() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let empty = list_artifacts(&state);
+        assert_eq!(empty["artifacts"], json!([]));
+        assert_eq!(empty["pruned_count"], 0);
+        assert_eq!(empty["storage"]["registry_entries"], 0);
+        assert_eq!(empty["storage"]["managed_files"], 0);
+        assert_eq!(
+            empty["storage"]["root_dir"],
+            artifacts_root_of(&tmp).display().to_string().as_str()
+        );
+
+        // A live file gets registered (and its snapshot stored); a gone one is pruned from the
+        // count of this very call.
+        let att = tmp.path().join("attachments");
+        fs::create_dir_all(&att).unwrap();
+        fs::write(att.join("plan.md"), "# plan").unwrap();
+        seed_cleanup(&tmp, &[("gone.md", "markdown", "archived", 1, 1)]);
+        let listed = list_artifacts(&state);
+        assert_eq!(listed["artifacts"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["storage"]["registry_entries"], 2);
+        assert_eq!(listed["storage"]["managed_files"], 1);
+        assert_eq!(listed["storage"]["managed_bytes"], 100);
+        assert_eq!(listed["storage"]["version_files"], 2);
+        assert_eq!(listed["storage"]["truncated"], false);
+        fs::remove_file(
+            crate::artifacts::managed_dir(&artifacts_root_of(&tmp)).join("seed-gone.md"),
+        )
+        .unwrap();
+        let after = list_artifacts(&state);
+        assert_eq!(after["pruned_count"], 1);
+        assert_eq!(after["storage"]["registry_entries"], 1);
+        assert_eq!(after["storage"]["version_files"], 1);
     }
 
     #[test]
