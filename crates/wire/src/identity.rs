@@ -1075,7 +1075,7 @@ impl RouteTable {
                 let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                if transcript_is_grok_build_subagent(&path) {
+                if transcript_is_grok_build_subagent(&path) || grok_flat_file_is_headless(&path) {
                     continue;
                 }
                 let Some(persona) = scan_transcript_for_persona(&path, 50) else {
@@ -1120,6 +1120,10 @@ impl RouteTable {
             let chat_path = dir.join("chat_history.jsonl");
             let summary_path = dir.join("summary.json");
             if chat_path.is_file() && transcript_is_grok_build_subagent(&chat_path) {
+                continue;
+            }
+            // A `grok -p` one-shot is a command, never an agent session.
+            if grok_summary_is_headless(&summary_path) {
                 continue;
             }
             let (summary_sid, summary_cwd, summary_updated_ms, summary_persona) =
@@ -1259,6 +1263,92 @@ fn read_grok_proc_env(pid: u32) -> (Option<String>, Option<String>) {
         }
     }
     (env_persona, tmux_pane)
+}
+
+/// True when a parsed Grok summary (or session metadata object) marks a headless `grok -p`
+/// one-shot. Grok writes `session_kind` at the top level of `summary.json` (interactive
+/// sessions omit it; sub-agents carry `"subagent"`); `/info/session_kind` is read as well.
+fn grok_value_is_headless(val: &serde_json::Value) -> bool {
+    ["/session_kind", "/info/session_kind", "/sessionKind"]
+        .iter()
+        .filter_map(|ptr| val.pointer(ptr).and_then(|v| v.as_str()))
+        .any(|kind| kind.trim().eq_ignore_ascii_case("headless"))
+}
+
+/// True when the Grok `summary.json` at `summary_path` says the session is headless
+/// (`grok -p`). A missing or unreadable file is not headless: the summary may not exist yet at
+/// `session_start`.
+pub fn grok_summary_is_headless(summary_path: &Path) -> bool {
+    fs::read_to_string(summary_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|val| grok_value_is_headless(&val))
+}
+
+/// Most bytes read from a flat-layout Grok session file per discovery pass.
+const GROK_FLAT_FILE_READ_CAP: u64 = 1 << 20;
+
+/// Flat-layout session file (`sessions/<id>.json` or `.jsonl`): the object itself, or the first
+/// line of a JSONL file, carries the metadata.
+fn grok_flat_file_is_headless(path: &Path) -> bool {
+    use std::io::{BufRead, BufReader, Read};
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = String::new();
+    if BufReader::new(file.take(GROK_FLAT_FILE_READ_CAP))
+        .read_line(&mut head)
+        .is_err()
+    {
+        return false;
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(head.trim())
+        && grok_value_is_headless(&val)
+    {
+        return true;
+    }
+    // A pretty-printed `.json` object spans many lines. The read is capped like the first line:
+    // a larger file is cut mid-object, fails to parse and counts as not headless.
+    path.extension().and_then(|e| e.to_str()) == Some("json")
+        && fs::File::open(path).is_ok_and(|file| {
+            let mut raw = String::new();
+            file.take(GROK_FLAT_FILE_READ_CAP)
+                .read_to_string(&mut raw)
+                .ok()
+                .and_then(|_| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|val| grok_value_is_headless(&val))
+        })
+}
+
+/// True when the Grok session `session_id` is headless. The summary is looked up next to
+/// `transcript_path` when given, then under `~/.grok/sessions/<id>/` and
+/// `~/.grok/sessions/*/<id>/`.
+pub fn grok_session_is_headless(
+    home: &Path,
+    session_id: &str,
+    transcript_path: Option<&Path>,
+) -> bool {
+    if let Some(dir) = transcript_path.and_then(Path::parent)
+        && grok_summary_is_headless(&dir.join("summary.json"))
+    {
+        return true;
+    }
+    let sid = session_id.trim();
+    // Reject ids that could climb out of the sessions tree.
+    if sid.is_empty() || sid.contains(['/', '\\']) || sid == "." || sid == ".." {
+        return false;
+    }
+    let sessions_dir = home.join(".grok").join("sessions");
+    if grok_summary_is_headless(&sessions_dir.join(sid).join("summary.json")) {
+        return true;
+    }
+    let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
+        return false;
+    };
+    read_dir.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_dir() && grok_summary_is_headless(&path.join(sid).join("summary.json"))
+    })
 }
 
 fn read_grok_summary_metadata(
@@ -1930,6 +2020,22 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
     None
 }
 
+/// The Grok route for the environment's `GROK_SESSION_ID`, or `None` when that session is a
+/// headless `grok -p` one-shot (its id must never reach the route table).
+fn grok_env_route(home: Option<&Path>, session_id: String) -> Option<VendorRoute> {
+    if home.is_some_and(|h| grok_session_is_headless(h, &session_id, None)) {
+        return None;
+    }
+    Some(VendorRoute::Grok {
+        session_id,
+        cwd: std::env::current_dir().ok(),
+        tmux_target: None,
+        tmux_pane: std::env::var("TMUX_PANE")
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    })
+}
+
 /// Capture the current process's vendor environment route so `fl wire` / `agent-msg`
 /// can register it in the route table automatically.
 pub fn capture_current_env_route() -> Option<VendorRoute> {
@@ -1985,14 +2091,11 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
     if let Ok(session_id) = std::env::var("GROK_SESSION_ID")
         && !session_id.trim().is_empty()
     {
-        return Some(VendorRoute::Grok {
-            session_id,
-            cwd: std::env::current_dir().ok(),
-            tmux_target: None,
-            tmux_pane: std::env::var("TMUX_PANE")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
-        });
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // A headless `grok -p` session is not a route: fall through to the other probes.
+        if let Some(route) = grok_env_route(home.as_deref(), session_id) {
+            return Some(route);
+        }
     }
     if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
         && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -2056,26 +2159,86 @@ fn resolve_persona_with_sources(
     load_routes: impl FnOnce() -> RouteTable,
     get_env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
 ) -> String {
+    resolve_persona_traced(
+        explicit,
+        transcript_path,
+        cwd,
+        registry,
+        load_routes,
+        get_env,
+    )
+    .0
+}
+
+/// Where a resolved persona came from. A persona the caller named (flag, `AGENT_PERSONA`) or
+/// that the hook session's own transcript declares is trusted to replace a route of another
+/// vendor. Everything else is inferred from the surroundings: the parent-process tree,
+/// inherited vendor session ids, the cwd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonaSource {
+    Explicit,
+    Env,
+    Transcript,
+    Inferred,
+}
+
+impl PersonaSource {
+    /// True when the persona is named by the caller or by the session's own transcript.
+    pub fn is_trusted(self) -> bool {
+        !matches!(self, PersonaSource::Inferred)
+    }
+}
+
+/// [`resolve_persona`] that also reports which source produced the persona.
+pub fn resolve_persona_with_source(
+    explicit: Option<&str>,
+    transcript_path: Option<&Path>,
+    cwd: &Path,
+    registry: Option<&dyn AgentRegistry>,
+    custom_routes_path: Option<&Path>,
+) -> (String, PersonaSource) {
+    resolve_persona_traced(
+        explicit,
+        transcript_path,
+        cwd,
+        registry,
+        || RouteTable::load(custom_routes_path),
+        &|k| std::env::var_os(k),
+    )
+}
+
+fn resolve_persona_traced(
+    explicit: Option<&str>,
+    transcript_path: Option<&Path>,
+    cwd: &Path,
+    registry: Option<&dyn AgentRegistry>,
+    load_routes: impl FnOnce() -> RouteTable,
+    get_env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> (String, PersonaSource) {
     let get_str = |k: &str| get_env(k).and_then(|v| v.into_string().ok());
     if let Some(exp) = explicit
         && let Some(norm) = normalize_persona(exp)
     {
-        return norm;
+        return (norm, PersonaSource::Explicit);
     }
 
     for var in ["AGENT_PERSONA", "AGENT_NAME"] {
         if let Some(val) = get_str(var)
             && let Some(norm) = normalize_persona(&val)
         {
-            return norm;
+            return (norm, PersonaSource::Env);
         }
     }
 
     if let Some(tp) = transcript_path
         && let Some(norm) = scan_transcript_for_persona(tp, 50)
     {
-        return norm;
+        return (norm, PersonaSource::Transcript);
     }
+
+    // Past this point the persona is inferred from the process tree, inherited session
+    // ids or the cwd, never named by the caller.
+    let inferred = |persona: String| (persona, PersonaSource::Inferred);
 
     if let Some(home) = get_env("HOME").map(PathBuf::from) {
         if let Some(sock) = get_env("CLAUDE_CODE_MESSAGING_SOCKET") {
@@ -2086,11 +2249,11 @@ fn resolve_persona_with_sources(
                 .and_then(|s| s.parse::<u32>().ok())
                 && let Some(norm) = resolve_claude_pid_persona(&home, pid)
             {
-                return norm;
+                return inferred(norm);
             }
         }
         if let Some(norm) = resolve_grok_pid_persona(&home, std::process::id()) {
-            return norm;
+            return inferred(norm);
         }
     }
 
@@ -2102,7 +2265,7 @@ fn resolve_persona_with_sources(
             if let VendorRoute::Claude { session_id, .. } = &entry.route
                 && session_id == &claude_sid
             {
-                return entry.persona.clone();
+                return inferred(entry.persona.clone());
             }
         }
     }
@@ -2115,7 +2278,7 @@ fn resolve_persona_with_sources(
             } = &entry.route
                 && conversation_id == &agy_cid
             {
-                return entry.persona.clone();
+                return inferred(entry.persona.clone());
             }
         }
     }
@@ -2126,7 +2289,7 @@ fn resolve_persona_with_sources(
             if let VendorRoute::Codex { thread_id, .. } = &entry.route
                 && thread_id == &codex_tid
             {
-                return entry.persona.clone();
+                return inferred(entry.persona.clone());
             }
         }
     }
@@ -2137,7 +2300,7 @@ fn resolve_persona_with_sources(
             if let VendorRoute::Muse { session_id, .. } = &entry.route
                 && session_id == &muse_sid
             {
-                return entry.persona.clone();
+                return inferred(entry.persona.clone());
             }
         }
     }
@@ -2148,7 +2311,7 @@ fn resolve_persona_with_sources(
             if let VendorRoute::Grok { session_id, .. } = &entry.route
                 && session_id == &grok_sid
             {
-                return entry.persona.clone();
+                return inferred(entry.persona.clone());
             }
         }
     }
@@ -2156,14 +2319,14 @@ fn resolve_persona_with_sources(
     if let Some(reg) = registry
         && let Some(lead) = resolve_cwd_lead(cwd, reg)
     {
-        return lead;
+        return inferred(lead);
     }
 
     if let Some(persona) = resolve_cwd_persona_md(cwd) {
-        return persona;
+        return inferred(persona);
     }
 
-    "unknown".to_string()
+    inferred("unknown".to_string())
 }
 
 fn resolve_claude_session_persona(
@@ -2283,6 +2446,9 @@ fn resolve_grok_pid_session(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())?
                     .to_string();
+                if grok_session_is_headless(home, &sid, None) {
+                    return None;
+                }
                 let cwd = item
                     .get("cwd")
                     .and_then(|v| v.as_str())
@@ -2318,6 +2484,9 @@ fn resolve_grok_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
         if let Some(dir) = candidate_dir {
             let chat_path = dir.join("chat_history.jsonl");
             if chat_path.is_file() && transcript_is_grok_build_subagent(&chat_path) {
+                return None;
+            }
+            if grok_summary_is_headless(&dir.join("summary.json")) {
                 return None;
             }
             if chat_path.is_file()
@@ -3259,6 +3428,277 @@ mod tests {
         let mut table = RouteTable::default();
         table.discover_routes(Some(home), At::parse("2026-10-29T04:00:00.000Z").unwrap());
         assert!(table.get("katie").is_none());
+    }
+
+    fn write_grok_summary(dir: &Path, sid: &str, extra: serde_json::Value) {
+        fs::create_dir_all(dir).unwrap();
+        let mut val = serde_json::json!({
+            "info": {"id": sid, "cwd": "/tmp"},
+            "session_summary": "Wendy registers as lead",
+            "updated_at": "2026-10-29T03:00:00.000Z"
+        });
+        if let (Some(base), Some(add)) = (val.as_object_mut(), extra.as_object()) {
+            for (k, v) in add {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        fs::write(dir.join("summary.json"), val.to_string()).unwrap();
+    }
+
+    fn grok_route_session(table: &RouteTable, persona: &str) -> Option<String> {
+        match table.get(persona).map(|e| &e.route) {
+            Some(VendorRoute::Grok { session_id, .. }) => Some(session_id.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn headless_grok_summary_is_not_a_route_but_interactive_is() {
+        let at = At::parse("2026-10-29T04:00:00.000Z").unwrap();
+        // Nested (`sessions/<proj>/<sid>`), top-level and `/info/` spellings.
+        for (layout, extra) in [
+            ("nested", serde_json::json!({"session_kind": "headless"})),
+            ("flat-dir", serde_json::json!({"session_kind": "Headless"})),
+            (
+                "info",
+                serde_json::json!({"info": {"id": "sid-h", "cwd": "/tmp", "session_kind": "headless"}}),
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path();
+            let root = home.join(".grok").join("sessions");
+            let dir = if layout == "flat-dir" {
+                root.join("sid-h")
+            } else {
+                root.join("proj").join("sid-h")
+            };
+            write_grok_summary(&dir, "sid-h", extra);
+            let mut table = RouteTable::default();
+            table.discover_routes(Some(home), at.clone());
+            assert!(
+                table.get("wendy").is_none(),
+                "{layout}: headless was routed"
+            );
+
+            // The same layout without `session_kind` is an interactive session.
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path();
+            let root = home.join(".grok").join("sessions");
+            let dir = if layout == "flat-dir" {
+                root.join("sid-i")
+            } else {
+                root.join("proj").join("sid-i")
+            };
+            write_grok_summary(&dir, "sid-i", serde_json::json!({}));
+            let mut table = RouteTable::default();
+            table.discover_routes(Some(home), at.clone());
+            assert_eq!(
+                grok_route_session(&table, "wendy").as_deref(),
+                Some("sid-i"),
+                "{layout}: interactive session lost its route"
+            );
+        }
+    }
+
+    #[test]
+    fn headless_grok_flat_files_are_not_routes() {
+        let at = At::parse("2026-10-29T04:00:00.000Z").unwrap();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let root = home.join(".grok").join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("headless-1.jsonl"),
+            "{\"sessionId\":\"headless-1\",\"agentName\":\"Gideon\",\"session_kind\":\"headless\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("headless-2.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "sessionId": "headless-2", "agentName": "Hector", "session_kind": "headless"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("live-1.jsonl"),
+            "{\"sessionId\":\"live-1\",\"agentName\":\"Iris\"}\n",
+        )
+        .unwrap();
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), at);
+        assert!(table.get("gideon").is_none());
+        assert!(table.get("hector").is_none());
+        assert_eq!(
+            grok_route_session(&table, "iris").as_deref(),
+            Some("live-1")
+        );
+    }
+
+    #[test]
+    fn grok_session_is_headless_finds_the_summary_by_id_or_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let root = home.join(".grok").join("sessions");
+        write_grok_summary(
+            &root.join("proj").join("sid-h"),
+            "sid-h",
+            serde_json::json!({"session_kind": "headless"}),
+        );
+        write_grok_summary(
+            &root.join("proj").join("sid-i"),
+            "sid-i",
+            serde_json::json!({}),
+        );
+        write_grok_summary(
+            &root.join("sid-top"),
+            "sid-top",
+            serde_json::json!({"session_kind": "headless"}),
+        );
+        write_grok_summary(
+            &root.join("proj").join("sid-sub"),
+            "sid-sub",
+            serde_json::json!({"session_kind": "subagent"}),
+        );
+        assert!(grok_session_is_headless(home, "sid-h", None));
+        assert!(grok_session_is_headless(home, "sid-top", None));
+        assert!(!grok_session_is_headless(home, "sid-i", None));
+        assert!(!grok_session_is_headless(home, "sid-sub", None));
+        assert!(!grok_session_is_headless(home, "missing", None));
+        assert!(!grok_session_is_headless(home, "", None));
+        assert!(!grok_session_is_headless(home, "../proj/sid-h", None));
+        // Via the directory of the transcript path, even with an unknown id.
+        let chat = root.join("proj").join("sid-h").join("chat_history.jsonl");
+        assert!(grok_session_is_headless(home, "other", Some(&chat)));
+        let chat = root.join("proj").join("sid-i").join("chat_history.jsonl");
+        assert!(!grok_session_is_headless(home, "sid-i", Some(&chat)));
+    }
+
+    #[test]
+    fn headless_grok_session_does_not_resolve_a_persona_from_the_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sid = "01a18599-c714-7700-85bb-e276825a98b3";
+        let session = home.join(".grok").join("sessions").join("proj").join(sid);
+        write_grok_summary(
+            &session,
+            sid,
+            serde_json::json!({"session_kind": "headless"}),
+        );
+        fs::write(
+            home.join(".grok").join("active_sessions.json"),
+            serde_json::json!([{"session_id": sid, "pid": std::process::id(), "cwd": "/tmp"}])
+                .to_string(),
+        )
+        .unwrap();
+        assert!(resolve_grok_pid_persona(home, std::process::id()).is_none());
+        // The same session without the marker resolves.
+        write_grok_summary(&session, sid, serde_json::json!({}));
+        assert_eq!(
+            resolve_grok_pid_persona(home, std::process::id()).as_deref(),
+            Some("wendy")
+        );
+    }
+
+    #[test]
+    fn headless_grok_session_is_not_resolved_or_captured_as_a_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sid = "01a18599-c714-7700-85bb-e276825a98b3";
+        let session = home.join(".grok").join("sessions").join("proj").join(sid);
+        write_grok_summary(
+            &session,
+            sid,
+            serde_json::json!({"session_kind": "headless"}),
+        );
+        fs::write(
+            home.join(".grok").join("active_sessions.json"),
+            serde_json::json!([{"session_id": sid, "pid": std::process::id(), "cwd": "/tmp"}])
+                .to_string(),
+        )
+        .unwrap();
+        // Process-tree path.
+        assert!(resolve_grok_pid_session(home, std::process::id()).is_none());
+        // `GROK_SESSION_ID` path.
+        assert!(grok_env_route(Some(home), sid.to_string()).is_none());
+        // The same session without the marker still resolves and is captured.
+        write_grok_summary(&session, sid, serde_json::json!({}));
+        let (got, _, _) = resolve_grok_pid_session(home, std::process::id()).unwrap();
+        assert_eq!(got, sid);
+        assert!(matches!(
+            grok_env_route(Some(home), sid.to_string()),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == sid
+        ));
+        // Without a home there is nothing to consult: the session is kept.
+        assert!(grok_env_route(None, sid.to_string()).is_some());
+    }
+
+    #[test]
+    fn flat_json_headless_check_reads_at_most_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let small = tmp.path().join("small.json");
+        fs::write(
+            &small,
+            "{\n  \"id\": \"s\",\n  \"session_kind\": \"headless\"\n}\n",
+        )
+        .unwrap();
+        assert!(grok_flat_file_is_headless(&small));
+        // `session_kind` sits past the cap, so it is never seen.
+        let big = tmp.path().join("big.json");
+        let filler = "x".repeat((GROK_FLAT_FILE_READ_CAP as usize) + 1024);
+        fs::write(
+            &big,
+            format!("{{\n  \"pad\": \"{filler}\",\n  \"session_kind\": \"headless\"\n}}\n"),
+        )
+        .unwrap();
+        assert!(!grok_flat_file_is_headless(&big));
+    }
+
+    #[test]
+    fn persona_source_distinguishes_named_from_inferred() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let none_env = |_: &str| None;
+        let r = resolve_persona_traced(
+            Some("Wendy"),
+            None,
+            cwd,
+            None,
+            RouteTable::default,
+            &none_env,
+        );
+        assert_eq!(r, ("wendy".to_string(), PersonaSource::Explicit));
+        let env = |k: &str| (k == "AGENT_PERSONA").then(|| std::ffi::OsString::from("Wesley"));
+        let r = resolve_persona_traced(None, None, cwd, None, RouteTable::default, &env);
+        assert_eq!(r, ("wesley".to_string(), PersonaSource::Env));
+        let tp = cwd.join("t.jsonl");
+        fs::write(
+            &tp,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Katie\"}\n",
+        )
+        .unwrap();
+        let r = resolve_persona_traced(None, Some(&tp), cwd, None, RouteTable::default, &none_env);
+        assert_eq!(r, ("katie".to_string(), PersonaSource::Transcript));
+        // Inherited vendor session id: inferred, not trusted.
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "jarvis",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let env = |k: &str| {
+            (k == "ANTIGRAVITY_CONVERSATION_ID").then(|| std::ffi::OsString::from("conv-1"))
+        };
+        let r = resolve_persona_traced(None, None, cwd, None, || routes, &env);
+        assert_eq!(r, ("jarvis".to_string(), PersonaSource::Inferred));
+        assert!(!r.1.is_trusted());
+        assert!(PersonaSource::Transcript.is_trusted());
     }
 
     #[test]

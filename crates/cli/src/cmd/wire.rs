@@ -22,7 +22,8 @@ use fl_wire::daemon::{
 };
 use fl_wire::dispatcher::dispatch_message_for_store;
 use fl_wire::identity::{
-    RouteTable, VendorRoute, capture_current_env_route, resolve_claude_key_path, resolve_persona,
+    PersonaSource, RouteTable, VendorRoute, capture_current_env_route, grok_session_is_headless,
+    resolve_claude_key_path, resolve_persona_with_source,
 };
 use serde_json::{Value, json};
 
@@ -310,10 +311,21 @@ pub fn resolve_caller(
     explicit: Option<&str>,
     transcript: Option<&Path>,
 ) -> String {
+    resolve_caller_with_source(env, explicit, transcript).0
+}
+
+/// [`resolve_caller`] that also reports where the persona came from, so a caller about to
+/// register a route can tell a named persona from one inferred out of the surroundings.
+pub fn resolve_caller_with_source(
+    env: &StateEnv<'_>,
+    explicit: Option<&str>,
+    transcript: Option<&Path>,
+) -> (String, PersonaSource) {
     let store = env.open_for_scope(Some(&StateScope::Workspace)).ok();
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
     let rpath = resolve_routes_path_for(env);
-    let persona = resolve_persona(explicit, transcript, env.cwd, reg, rpath.as_deref());
+    let (persona, source) =
+        resolve_persona_with_source(explicit, transcript, env.cwd, reg, rpath.as_deref());
     let has_env_persona_override =
         std::env::var_os("AGENT_PERSONA").is_some() || std::env::var_os("AGENT_NAME").is_some();
     let allow_route_capture = env.explicit_db.is_none() || resolve_routes_path().is_some();
@@ -323,9 +335,9 @@ pub fn resolve_caller(
         && persona != "unknown"
         && let Some(route) = capture_current_env_route()
     {
-        record_caller_route(env, &persona, route);
+        record_caller_route_checked(env, &persona, route, source);
     }
-    persona
+    (persona, source)
 }
 
 pub fn record_caller_route(env: &StateEnv<'_>, persona: &str, route: VendorRoute) {
@@ -341,6 +353,120 @@ pub fn record_caller_route(env: &StateEnv<'_>, persona: &str, route: VendorRoute
     let mut table = RouteTable::load(rpath.as_deref());
     table.upsert(persona, route, now_at());
     let _ = table.save(rpath.as_deref());
+}
+
+/// May `new` replace `existing` as the route of a persona resolved from `source`?
+///
+/// A persona the caller named (flag, `AGENT_PERSONA`) or that the session's own transcript
+/// declares may replace any route: that is a legitimate switch of vendor. A persona inferred
+/// from the surroundings (the parent-process tree, an inherited session id, the cwd) may
+/// refresh a route of the same vendor but never replace a route of a different vendor: a
+/// child process such as `grok -p` run from an Antigravity shell would otherwise take over
+/// its parent's route.
+pub fn route_replacement_allowed(
+    existing: Option<&VendorRoute>,
+    new: &VendorRoute,
+    source: PersonaSource,
+) -> bool {
+    source.is_trusted()
+        || existing.is_none_or(|old| std::mem::discriminant(old) == std::mem::discriminant(new))
+}
+
+/// True when the process behind `route` is demonstrably gone. Only what the route carries
+/// counts: a Claude `pid`, an Antigravity `ls_pid`. A route with no liveness signal is never
+/// dead, so it stays protected.
+pub fn route_is_dead(route: &VendorRoute, proc_exists: &dyn Fn(u32) -> bool) -> bool {
+    match route {
+        VendorRoute::Claude { pid, .. } => !proc_exists(*pid),
+        VendorRoute::Agy {
+            ls_pid: Some(pid), ..
+        } => !proc_exists(*pid),
+        _ => false,
+    }
+}
+
+fn route_vendor_name(route: &VendorRoute) -> &'static str {
+    match route {
+        VendorRoute::Claude { .. } => "Claude",
+        VendorRoute::Agy { .. } => "Antigravity",
+        VendorRoute::Codex { .. } => "Codex",
+        VendorRoute::Muse { .. } => "Muse",
+        VendorRoute::Grok { .. } => "Grok",
+        VendorRoute::Webhook { .. } => "Webhook",
+    }
+}
+
+/// [`route_replacement_allowed`] plus the dead-route escape: an inferred persona may replace a
+/// route of another vendor when the old route's process is gone. `Err` carries the one-line
+/// diagnostic to show when the replacement is refused.
+pub fn route_replacement_verdict(
+    persona: &str,
+    existing: Option<&VendorRoute>,
+    new: &VendorRoute,
+    source: PersonaSource,
+    proc_exists: &dyn Fn(u32) -> bool,
+) -> Result<(), String> {
+    if route_replacement_allowed(existing, new, source) {
+        return Ok(());
+    }
+    if let Some(old) = existing {
+        if route_is_dead(old, proc_exists) {
+            return Ok(());
+        }
+        return Err(format!(
+            "fl wire: not replacing {persona}'s {} route from an inferred {} session; \
+             set AGENT_PERSONA={persona} or run `agent-msg register` to switch",
+            route_vendor_name(old),
+            route_vendor_name(new),
+        ));
+    }
+    Ok(())
+}
+
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The route currently on file for `persona`: the daemon's table when it answers, else the
+/// routes file.
+fn existing_route_for(env: &StateEnv<'_>, persona: &str) -> Option<VendorRoute> {
+    let sock = resolve_socket_path(env, None);
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+        && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status)
+    {
+        return st
+            .routes
+            .into_iter()
+            .find(|r| r.persona.eq_ignore_ascii_case(persona))
+            .map(|r| r.route);
+    }
+    let rpath = resolve_routes_path_for(env);
+    RouteTable::load(rpath.as_deref())
+        .get(persona)
+        .map(|e| e.route.clone())
+}
+
+/// [`record_caller_route`] behind the provenance guard of [`route_replacement_allowed`].
+/// Returns `false`, leaving the route table alone, when the guard refuses.
+pub fn record_caller_route_checked(
+    env: &StateEnv<'_>,
+    persona: &str,
+    route: VendorRoute,
+    source: PersonaSource,
+) -> bool {
+    // A trusted source replaces anything, so the table is read only for an inferred persona.
+    if !source.is_trusted() {
+        let existing = existing_route_for(env, persona);
+        if let Err(note) =
+            route_replacement_verdict(persona, existing.as_ref(), &route, source, &process_exists)
+        {
+            // stderr only: the hook's stdout must stay valid JSON.
+            eprintln!("{note}");
+            return false;
+        }
+    }
+    record_caller_route(env, persona, route);
+    true
 }
 
 pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
@@ -1015,18 +1141,27 @@ pub fn run_vendor_hook(
     std::io::stdin()
         .read_to_string(&mut raw)
         .map_err(|e| (1, e.to_string()))?;
+    let out = vendor_hook_response(env, explicit_vendor, &raw)?;
+    println!("{}", serde_json::to_string(&out).unwrap());
+    Ok(0)
+}
+
+/// The hook's JSON answer for the payload `raw`, registering the session's route on the way.
+fn vendor_hook_response(
+    env: &StateEnv<'_>,
+    explicit_vendor: Option<&str>,
+    raw: &str,
+) -> Result<Value, (i32, String)> {
     if raw.trim().is_empty() {
-        println!("{{}}");
-        return Ok(0);
+        return Ok(json!({}));
     }
-    let payload: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    let payload: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({}));
     if payload
         .get("stop_hook_active")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        println!("{{}}");
-        return Ok(0);
+        return Ok(json!({}));
     }
     let env_grok_event = std::env::var("GROK_HOOK_EVENT").ok();
     let event_name = payload
@@ -1060,13 +1195,8 @@ pub fn run_vendor_hook(
         cwd: &hook_cwd,
     };
 
-    let persona = resolve_caller(&hook_env, None, transcript_path.as_deref());
-    if persona == "unknown" {
-        println!("{{}}");
-        return Ok(0);
-    }
-
-    // Register route for Muse, Grok, Codex, or Claude
+    // Classify the vendor first: a headless Grok session must be turned away before the
+    // persona lookup, which can record a route of its own.
     let vendor_str = explicit_vendor.or_else(|| payload.get("vendor").and_then(Value::as_str));
     let tp_str = transcript_path
         .as_ref()
@@ -1082,45 +1212,51 @@ pub fn run_vendor_hook(
         || payload.get("hookEventName").is_some();
     let is_codex = vendor_str == Some("codex") || tp_str.contains(".codex");
 
-    if is_muse && !session_id.is_empty() {
-        record_caller_route(
-            &hook_env,
-            &persona,
-            VendorRoute::Muse {
-                session_id,
-                cwd: Some(hook_cwd.clone()),
-                tmux_target: Some(format!("muse:{persona}")),
-                tmux_pane: std::env::var("TMUX_PANE")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty()),
-            },
-        );
+    // `grok -p` is a one-shot command, not an agent. It fires the same hooks as an interactive
+    // session but must never touch the route table or read the inbox. Its summary may not
+    // exist yet at `session_start`; the provenance guard below covers that case.
+    if is_grok
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && grok_session_is_headless(&home, &session_id, transcript_path.as_deref())
+    {
+        return Ok(json!({}));
+    }
+
+    let (persona, persona_source) =
+        resolve_caller_with_source(&hook_env, None, transcript_path.as_deref());
+    if persona == "unknown" {
+        return Ok(json!({}));
+    }
+
+    // Register route for Muse, Grok, Codex, or Claude
+
+    let route = if is_muse && !session_id.is_empty() {
+        Some(VendorRoute::Muse {
+            session_id,
+            cwd: Some(hook_cwd.clone()),
+            tmux_target: Some(format!("muse:{persona}")),
+            tmux_pane: std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        })
     } else if is_grok && !session_id.is_empty() {
         let mut cap = persona.clone();
         if let Some(first) = cap.get_mut(0..1) {
             first.make_ascii_uppercase();
         }
-        record_caller_route(
-            &hook_env,
-            &persona,
-            VendorRoute::Grok {
-                session_id,
-                cwd: Some(hook_cwd.clone()),
-                tmux_target: Some(format!("{cap}:grok")),
-                tmux_pane: std::env::var("TMUX_PANE")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty()),
-            },
-        );
+        Some(VendorRoute::Grok {
+            session_id,
+            cwd: Some(hook_cwd.clone()),
+            tmux_target: Some(format!("{cap}:grok")),
+            tmux_pane: std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        })
     } else if is_codex && !session_id.is_empty() {
-        record_caller_route(
-            &hook_env,
-            &persona,
-            VendorRoute::Codex {
-                thread_id: session_id,
-                cwd: Some(hook_cwd.clone()),
-            },
-        );
+        Some(VendorRoute::Codex {
+            thread_id: session_id,
+            cwd: Some(hook_cwd.clone()),
+        })
     } else if let Some(sock) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET") {
         let socket_path = PathBuf::from(sock);
         let pid = socket_path
@@ -1131,16 +1267,20 @@ pub fn run_vendor_hook(
         let key_path = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
             resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
         });
-        record_caller_route(
-            &hook_env,
-            &persona,
-            VendorRoute::Claude {
-                pid,
-                session_id,
-                socket_path,
-                key_path,
-            },
-        );
+        Some(VendorRoute::Claude {
+            pid,
+            session_id,
+            socket_path,
+            key_path,
+        })
+    } else {
+        None
+    };
+    // A persona inferred from the process tree must not take a route over from another vendor.
+    if let Some(route) = route
+        && !record_caller_route_checked(&hook_env, &persona, route, persona_source)
+    {
+        return Ok(json!({}));
     }
 
     let items = execute_read(
@@ -1157,8 +1297,7 @@ pub fn run_vendor_hook(
     .unwrap_or_default();
 
     if items.is_empty() {
-        println!("{{}}");
-        return Ok(0);
+        return Ok(json!({}));
     }
 
     let mut formatted = Vec::with_capacity(items.len());
@@ -1188,8 +1327,7 @@ pub fn run_vendor_hook(
         }),
         _ => json!({}),
     };
-    println!("{}", serde_json::to_string(&out).unwrap());
-    Ok(0)
+    Ok(out)
 }
 
 pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, String)> {
@@ -1492,8 +1630,449 @@ mod tests {
     use crate::config::{Config, WireConfig};
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
 
+    static HOOK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialises the tests that read or write process-global environment variables.
+    fn hook_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOOK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    const HOOK_ENV_VARS: [&str; 15] = [
+        "HOME",
+        "AGENT_PERSONA",
+        "AGENT_NAME",
+        "FL_WIRE_ROUTES",
+        "FL_WIRE_SOCKET",
+        "FL_WIRE_DISABLE_HOST_DISCOVERY",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_SESSION_ID",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "CODEX_THREAD_ID",
+        "MUSE_SESSION_ID",
+        "GROK_SESSION_ID",
+        "GROK_HOOK_EVENT",
+        "TMUX_PANE",
+        "FL_STORE_BACKEND",
+    ];
+
+    /// Sandbox for one hook run: a temp HOME, route table and store, and a cleared vendor
+    /// environment. Holds the env lock and restores the old environment on drop.
+    struct HookRig {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        dir: tempfile::TempDir,
+        db: PathBuf,
+        cfg: Config,
+    }
+
+    impl HookRig {
+        fn new(agent_persona: Option<&str>) -> Self {
+            let lock = hook_env_lock();
+            let dir = tempfile::tempdir().unwrap();
+            let saved = HOOK_ENV_VARS
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
+            // SAFETY: the env lock serialises every test that touches these variables.
+            unsafe {
+                // HOME is read by unrelated tests that do not take the lock: it is switched
+                // straight to the new value and never unset, even for an instant.
+                for k in HOOK_ENV_VARS {
+                    if k != "HOME" {
+                        std::env::remove_var(k);
+                    }
+                }
+                std::env::set_var("HOME", dir.path().join("home"));
+                std::env::set_var("FL_WIRE_ROUTES", dir.path().join("routes.json"));
+                std::env::set_var("FL_WIRE_SOCKET", dir.path().join("none.sock"));
+                std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+                if let Some(p) = agent_persona {
+                    std::env::set_var("AGENT_PERSONA", p);
+                }
+            }
+            std::fs::create_dir_all(dir.path().join("home")).unwrap();
+            let db = dir.path().join("fl.redb");
+            Self {
+                _lock: lock,
+                saved,
+                dir,
+                db,
+                cfg: Config::default(),
+            }
+        }
+
+        fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
+        }
+
+        fn routes_path(&self) -> PathBuf {
+            self.dir.path().join("routes.json")
+        }
+
+        fn seed(&self, persona: &str, route: VendorRoute) {
+            let path = self.routes_path();
+            let mut table = RouteTable::load(Some(&path));
+            table.upsert(persona, route, now_at());
+            table.save(Some(&path)).unwrap();
+        }
+
+        fn route_of(&self, persona: &str) -> Option<VendorRoute> {
+            RouteTable::load(Some(&self.routes_path()))
+                .get(persona)
+                .map(|e| e.route.clone())
+        }
+
+        fn run(&self, vendor: &str, payload: Value) -> Value {
+            let env = StateEnv {
+                explicit_db: Some(&self.db),
+                default_store: &self.db,
+                cfg: &self.cfg,
+                cwd: self.dir.path(),
+            };
+            vendor_hook_response(&env, Some(vendor), &payload.to_string()).unwrap()
+        }
+
+        /// A Grok `summary.json` for `sid` under the rig's HOME.
+        fn grok_summary(&self, sid: &str, extra: Value) {
+            let dir = self.home().join(".grok/sessions/proj").join(sid);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut val = json!({
+                "info": {"id": sid, "cwd": "/tmp"},
+                "session_summary": "Jarvis registers as lead",
+            });
+            if let (Some(base), Some(add)) = (val.as_object_mut(), extra.as_object()) {
+                base.extend(add.clone());
+            }
+            std::fs::write(dir.join("summary.json"), val.to_string()).unwrap();
+        }
+
+        /// Make this process look like the live Grok session `sid` to the process-tree walk.
+        fn grok_active(&self, sid: &str) {
+            std::fs::create_dir_all(self.home().join(".grok")).unwrap();
+            std::fs::write(
+                self.home().join(".grok/active_sessions.json"),
+                json!([{"session_id": sid, "pid": std::process::id(), "cwd": "/tmp"}]).to_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for HookRig {
+        fn drop(&mut self) {
+            // SAFETY: still holding the env lock.
+            unsafe {
+                for (k, v) in &self.saved {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hook_rig_never_leaves_home_unset() {
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_unset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller = {
+            let (stop, seen_unset) = (stop.clone(), seen_unset.clone());
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !stop.load(Relaxed) {
+                    if std::env::var_os("HOME").is_none() {
+                        seen_unset.store(true, Relaxed);
+                    }
+                }
+            })
+        };
+        for _ in 0..300 {
+            drop(HookRig::new(Some("jarvis")));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        poller.join().unwrap();
+        assert!(
+            !seen_unset.load(std::sync::atomic::Ordering::Relaxed),
+            "HOME was observed unset while a HookRig was created or dropped"
+        );
+    }
+
+    fn agy_route(conversation_id: &str) -> VendorRoute {
+        VendorRoute::Agy {
+            conversation_id: conversation_id.into(),
+            ls_pid: None,
+            ls_address: Some("127.0.0.1:1".into()),
+            csrf_token: None,
+            agentapi_exe: None,
+        }
+    }
+
+    fn grok_route(session_id: &str) -> VendorRoute {
+        VendorRoute::Grok {
+            session_id: session_id.into(),
+            cwd: Some(PathBuf::from("/old")),
+            tmux_target: None,
+            tmux_pane: None,
+        }
+    }
+
+    fn grok_hook_payload(sid: &str) -> Value {
+        json!({"hookEventName": "SessionStart", "session_id": sid, "cwd": "/tmp"})
+    }
+
+    #[test]
+    fn headless_grok_hook_leaves_the_route_table_alone() {
+        // Even with a named persona, a `grok -p` one-shot registers nothing.
+        let rig = HookRig::new(Some("jarvis"));
+        rig.seed("jarvis", agy_route("conv-1"));
+        rig.grok_summary("sid-h", json!({"session_kind": "headless"}));
+        let out = rig.run("grok", grok_hook_payload("sid-h"));
+        assert_eq!(out, json!({}));
+        assert_eq!(rig.route_of("jarvis"), Some(agy_route("conv-1")));
+    }
+
+    #[test]
+    fn headless_check_follows_the_transcript_directory() {
+        let rig = HookRig::new(Some("jarvis"));
+        rig.seed("jarvis", agy_route("conv-1"));
+        rig.grok_summary("sid-t", json!({"session_kind": "headless"}));
+        let transcript = rig
+            .home()
+            .join(".grok/sessions/proj/sid-t/chat_history.jsonl");
+        let mut payload = grok_hook_payload("some-other-id");
+        payload["transcript_path"] = json!(transcript);
+        rig.run("grok", payload);
+        assert_eq!(rig.route_of("jarvis"), Some(agy_route("conv-1")));
+    }
+
+    #[test]
+    fn inferred_persona_does_not_replace_a_route_of_another_vendor() {
+        // No AGENT_PERSONA and no summary yet (the headless case at `session_start`): the
+        // persona comes from the process-tree walk into the parent's Grok session.
+        let rig = HookRig::new(None);
+        rig.seed("jarvis", agy_route("conv-1"));
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        let out = rig.run("grok", grok_hook_payload("sid-child"));
+        assert_eq!(out, json!({}));
+        assert_eq!(rig.route_of("jarvis"), Some(agy_route("conv-1")));
+    }
+
+    #[test]
+    fn inherited_session_id_persona_does_not_replace_another_vendor_route() {
+        let rig = HookRig::new(None);
+        rig.seed("jarvis", agy_route("conv-1"));
+        // SAFETY: the rig holds the env lock; the rig restores the variable on drop.
+        unsafe { std::env::set_var("ANTIGRAVITY_CONVERSATION_ID", "conv-1") };
+        rig.run("grok", grok_hook_payload("sid-child"));
+        // The env capture may refresh the Agy route's fields; it stays an Agy route.
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-1"
+        ));
+    }
+
+    #[test]
+    fn explicit_persona_may_switch_vendor() {
+        let rig = HookRig::new(Some("jarvis"));
+        rig.seed("jarvis", agy_route("conv-1"));
+        rig.run("grok", grok_hook_payload("sid-new"));
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn transcript_persona_may_switch_vendor() {
+        let rig = HookRig::new(None);
+        rig.seed("jarvis", agy_route("conv-1"));
+        let transcript = rig.dir.path().join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Jarvis\"}\n",
+        )
+        .unwrap();
+        let mut payload = grok_hook_payload("sid-new");
+        payload["transcript_path"] = json!(transcript);
+        rig.run("grok", payload);
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn inferred_persona_still_refreshes_a_route_of_the_same_vendor() {
+        let rig = HookRig::new(None);
+        rig.seed("jarvis", grok_route("sid-old"));
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        rig.run("grok", grok_hook_payload("sid-new"));
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn inferred_persona_with_no_route_yet_registers() {
+        let rig = HookRig::new(None);
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        rig.run("grok", grok_hook_payload("sid-new"));
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn dead_route_is_replaced_by_an_inferred_persona() {
+        let claude = |pid: u32| VendorRoute::Claude {
+            pid,
+            session_id: "s".into(),
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            key_path: None,
+        };
+        let new = grok_route("sid-new");
+        let src = PersonaSource::Inferred;
+        // Dead Claude pid: replaced.
+        let dead = |_: u32| false;
+        assert_eq!(
+            route_replacement_verdict("jarvis", Some(&claude(4242)), &new, src, &dead),
+            Ok(())
+        );
+        // Live pid (this test process): blocked, with the diagnostic.
+        let me = std::process::id();
+        let err =
+            route_replacement_verdict("jarvis", Some(&claude(me)), &new, src, &process_exists)
+                .unwrap_err();
+        assert_eq!(
+            err,
+            "fl wire: not replacing jarvis's Claude route from an inferred Grok session; \
+             set AGENT_PERSONA=jarvis or run `agent-msg register` to switch"
+        );
+        // Agy: a dead ls_pid is replaced, a live one is not.
+        let agy_with = |ls_pid| VendorRoute::Agy {
+            conversation_id: "c".into(),
+            ls_pid,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert!(
+            route_replacement_verdict("j", Some(&agy_with(Some(4242))), &new, src, &dead).is_ok()
+        );
+        assert!(
+            route_replacement_verdict("j", Some(&agy_with(Some(me))), &new, src, &process_exists)
+                .is_err()
+        );
+        // No liveness signal: never dead, so blocked even when no pid exists.
+        assert!(route_replacement_verdict("j", Some(&agy_with(None)), &new, src, &dead).is_err());
+        let codex = VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        assert!(route_replacement_verdict("j", Some(&codex), &new, src, &dead).is_err());
+        assert!(!route_is_dead(&codex, &dead));
+        // A trusted source and the same vendor never produce a diagnostic.
+        assert!(
+            route_replacement_verdict("j", Some(&claude(me)), &new, PersonaSource::Env, &|_| true)
+                .is_ok()
+        );
+        assert!(
+            route_replacement_verdict("j", Some(&grok_route("a")), &new, src, &|_| true).is_ok()
+        );
+    }
+
+    #[test]
+    fn hook_replaces_a_dead_claude_route_from_an_inferred_grok_persona() {
+        let rig = HookRig::new(None);
+        rig.seed(
+            "jarvis",
+            VendorRoute::Claude {
+                // Far above any pid_max, so /proc/<pid> never exists.
+                pid: u32::MAX - 1,
+                session_id: "s".into(),
+                socket_path: PathBuf::from("/tmp/x.sock"),
+                key_path: None,
+            },
+        );
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        rig.run("grok", grok_hook_payload("sid-new"));
+        assert!(matches!(
+            rig.route_of("jarvis"),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
+        ));
+    }
+
+    #[test]
+    fn hook_keeps_a_live_claude_route_from_an_inferred_grok_persona() {
+        let rig = HookRig::new(None);
+        let live = VendorRoute::Claude {
+            pid: std::process::id(),
+            session_id: "s".into(),
+            socket_path: PathBuf::from("/tmp/x.sock"),
+            key_path: None,
+        };
+        rig.seed("jarvis", live.clone());
+        rig.grok_summary("sid-p", json!({}));
+        rig.grok_active("sid-p");
+        let out = rig.run("grok", grok_hook_payload("sid-new"));
+        assert_eq!(out, json!({}));
+        assert_eq!(rig.route_of("jarvis"), Some(live));
+    }
+
+    #[test]
+    fn route_replacement_decision_table() {
+        let agy = agy_route("c");
+        let grok = grok_route("s");
+        let codex = VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        let muse = VendorRoute::Muse {
+            session_id: "m".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        };
+        for source in [
+            PersonaSource::Explicit,
+            PersonaSource::Env,
+            PersonaSource::Transcript,
+        ] {
+            for new in [&grok, &codex, &muse] {
+                assert!(route_replacement_allowed(Some(&agy), new, source));
+            }
+        }
+        for new in [&grok, &codex, &muse] {
+            assert!(!route_replacement_allowed(
+                Some(&agy),
+                new,
+                PersonaSource::Inferred
+            ));
+        }
+        assert!(route_replacement_allowed(
+            Some(&grok),
+            &grok_route("other"),
+            PersonaSource::Inferred
+        ));
+        assert!(route_replacement_allowed(
+            None,
+            &grok,
+            PersonaSource::Inferred
+        ));
+    }
+
     #[test]
     fn test_wire_cli_send_read_ack_reply_and_agent_msg_compat() {
+        let _env_lock = hook_env_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: isolates test from discovering host agent routes.
         unsafe {
