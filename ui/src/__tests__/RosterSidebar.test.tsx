@@ -649,6 +649,10 @@ describe("ContextHeader session pill and header controls", () => {
     expect(screen.getByTestId("agent-settings-identity")).toContainElement(
       screen.getByTestId("session-id-pill"),
     );
+    expect(screen.getByTestId("recast-agent-btn-ferris")).toHaveAttribute(
+      "title",
+      "Reassign agent project or role in the registry without clearing the live session",
+    );
     expect(screen.queryByTestId("system-utility-bar")).toBeNull();
   });
 

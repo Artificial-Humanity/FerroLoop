@@ -726,6 +726,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               type="button"
               className="fd-btn fd-btn-primary"
               data-testid={`recast-agent-btn-${agentKey}`}
+              title="Reassign agent project or role in the registry without clearing the live session"
               onClick={() => {
                 setRecastProject(agentProject || "Workspace");
                 setRecastRole(agentRole || "assistant");
