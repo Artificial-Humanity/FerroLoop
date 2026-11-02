@@ -3,10 +3,19 @@
 //! from it. It opens no store: `run()` in `main.rs` hands over before any
 //! store path is resolved. `sync` and `check` build no registry client, so
 //! they have no network path (MCP spec §5).
+//!
+//! Besides the five built-in agent CLIs, `sync` and `check` write a file for every vendor in
+//! fl's vendor registry (a plugin vendor declared in the config) that is not built in and names
+//! an `mcp_config_rel_path`. Such a target is declared here, once per command, before the
+//! catalog is read: its servers key is `mcpServers` and it is taken NOT to expand `${VAR}`, so a
+//! server with a secret is left out of that file, with a line saying so, instead of being
+//! written as a reference the vendor may not expand. A catalog server's `vendors` list may name
+//! such a vendor by its id.
 
 use crate::config::{self, McpEntry};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
+use fl_core::{VendorDescriptor, VendorRegistry};
 use fl_exec::git::Git;
 use fl_exec::population::ExecError;
 use fl_mcp::McpError;
@@ -105,6 +114,7 @@ enum Package {
 }
 
 pub fn run(cmd: Cmd, switches: &[McpEntry], cwd: &Path) -> Result<i32> {
+    register_vendor_targets()?;
     let root = root(cwd)?;
     match cmd {
         Cmd::Registry { url } => {
@@ -618,9 +628,52 @@ fn upgrade(
     Ok(())
 }
 
+/// The MCP file of every registered vendor that is not built in and has one, declared to
+/// `fl-mcp`: `mcpServers` holds the servers, and `${VAR}` is not expanded (see the module
+/// note). Declared again in the same process, a target is left as it is.
+fn register_vendor_targets() -> Result<()> {
+    declare_targets(&VendorRegistry::global().list())
+}
+
+/// [`register_vendor_targets`] for these vendors.
+fn declare_targets(vendors: &[VendorDescriptor]) -> Result<()> {
+    for d in vendors {
+        let Some(file) = d.mcp_config_rel_path.as_deref() else {
+            continue;
+        };
+        if VendorRegistry::is_builtin(&d.id) {
+            continue;
+        }
+        let target = vendor::CustomTarget::new(&d.id, &d.display_name, file, "mcpServers", false);
+        let target = target.map_err(|e| anyhow!("vendor `{}`: {e}", d.id))?;
+        match vendor::register_target(target) {
+            Ok(()) | Err(vendor::TargetError::Duplicate(_)) => {}
+            Err(e) => bail!("vendor `{}`: {e}", d.id),
+        }
+    }
+    Ok(())
+}
+
 /// The plan `sync` applies and `check` reports, refused when git would
 /// commit a file it writes, with a warning when Codex will not read its file.
 fn plan(root: &Path, switches: &[McpEntry], replace: &[String]) -> Result<Plan> {
+    plan_in(root, switches, replace, || {
+        let state = config::fl_state_dir().context(
+            "neither an absolute $XDG_STATE_HOME nor $HOME is set, so fl has nowhere to keep \
+             the record of the entries it writes",
+        )?;
+        Ok(state.join("mcp"))
+    })
+}
+
+/// [`plan`] with the ownership records kept where `records` says, asked for after the catalog
+/// and the switches are read.
+fn plan_in(
+    root: &Path,
+    switches: &[McpEntry],
+    replace: &[String],
+    records: impl FnOnce() -> Result<PathBuf>,
+) -> Result<Plan> {
     let catalog = catalog(root)?;
     let switches = match config::mcp_entry(switches, root)? {
         Some(e) => Switches {
@@ -629,12 +682,7 @@ fn plan(root: &Path, switches: &[McpEntry], replace: &[String]) -> Result<Plan> 
         },
         None => Switches::default(),
     };
-    let records = config::fl_state_dir()
-        .context(
-            "neither an absolute $XDG_STATE_HOME nor $HOME is set, so fl has nowhere to keep \
-             the record of the entries it writes",
-        )?
-        .join("mcp");
+    let records = records()?;
     let plan = sync::plan(root, &catalog, &switches, &records, replace)?;
     for warning in plan.warnings() {
         eprintln!("warning: {warning}");
@@ -781,4 +829,334 @@ fn trusts(config: &toml::Table, keys: &[PathBuf]) -> bool {
         .and_then(|e| e.get("trust_level"))
         .and_then(toml::Value::as_str)
         == Some("trusted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::VendorTransport;
+    use std::fs;
+    use std::process::Command;
+
+    // The vendor and target registries are process-wide, and tests run in one process: each test
+    // names its own vendors and asserts only about them. Every test file lives under one
+    // directory the test repository ignores, so another test's target never fails the guard.
+    const DIR: &str = ".vsdk2-test";
+
+    const CATALOG: &str = r#"
+[server.docs]
+transport = "http"
+url = "https://docs.example.com/mcp"
+
+[server.notes]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@example/notes-mcp@1.2.0"]
+env.NOTES_TOKEN = { secret = true }
+"#;
+
+    /// A subscription-CLI vendor with this MCP file.
+    fn descriptor(id: &str, file: Option<&str>) -> VendorDescriptor {
+        let mut d = fl_core::lookup_vendor("claude").unwrap();
+        d.id = id.into();
+        d.display_name = format!("Agent {id}");
+        d.transport = VendorTransport::SubscriptionCli {
+            default_binary: id.into(),
+        };
+        d.mcp_config_rel_path = file.map(str::to_string);
+        d
+    }
+
+    /// Registers a vendor whose MCP file is `.vsdk2-test/<id>.json`; returns its file.
+    fn vendor_named(id: &str) -> String {
+        let file = format!("{DIR}/{id}.json");
+        let d = descriptor(id, Some(&file));
+        fl_core::register_vendor(d.clone()).unwrap();
+        // Its own target only: declaring every registered vendor is `run`'s job, and one test
+        // checks that `run` does it.
+        declare_targets(&[d]).unwrap();
+        file
+    }
+
+    struct Project {
+        dir: tempfile::TempDir,
+    }
+
+    impl Project {
+        /// A git repository ignoring every file `fl mcp` writes, with this catalog.
+        fn new(catalog: &str) -> Project {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("app");
+            fs::create_dir_all(root.join(".fl")).unwrap();
+            let ignored = "/.mcp.json\n/.codex/config.toml\n/.agents/mcp_config.json\n\
+                           /.muse/settings.json\n/.grok/config.toml\n/.vsdk2-test/\n";
+            fs::write(root.join(".gitignore"), ignored).unwrap();
+            fs::write(root.join(".fl/mcp.toml"), catalog).unwrap();
+            let git = Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(git.success());
+            Project { dir }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.dir.path().join("app")
+        }
+
+        fn catalog(&self, text: &str) {
+            fs::write(self.root().join(".fl/mcp.toml"), text).unwrap();
+        }
+
+        fn plan(&self, replace: &[&str]) -> Result<Plan> {
+            let replace: Vec<String> = replace.iter().map(|n| n.to_string()).collect();
+            let records = self.dir.path().join("state");
+            plan_in(&self.root(), &[], &replace, || Ok(records))
+        }
+
+        fn sync(&self) -> Plan {
+            let plan = self.plan(&[]).unwrap();
+            sync::apply(&plan).unwrap();
+            plan
+        }
+
+        fn read(&self, file: &str) -> String {
+            fs::read_to_string(self.root().join(file)).unwrap_or_default()
+        }
+
+        /// The plan's section for this vendor's file, as `fl mcp sync` prints it: its heading
+        /// line, then the indented lines under it.
+        fn section(plan: &Plan, file: &str) -> String {
+            let text = plan.to_string();
+            let lines: Vec<&str> = text.lines().collect();
+            let head = lines.iter().position(|l| {
+                !l.starts_with(' ')
+                    && (l.ends_with(&format!("{file}:")) || l.contains(&format!("{file}: ")))
+            });
+            let head = head.unwrap_or_else(|| panic!("{file} is not in the plan:\n{text}"));
+            let body = lines[head + 1..].iter().take_while(|l| l.starts_with("  "));
+            lines[head..=head]
+                .iter()
+                .chain(body)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    #[test]
+    fn sync_writes_a_registered_vendors_file_by_its_title_and_a_second_sync_changes_nothing() {
+        let id = "vsdk2-plain";
+        let file = vendor_named(id);
+        let project = Project::new(CATALOG);
+        let plan = project.sync();
+        let section = Project::section(&plan, &file);
+        assert!(
+            section.starts_with(&format!("Agent {id}, "))
+                && section.ends_with(&format!("{file}:\n  add docs")),
+            "{section}"
+        );
+        let text = project.read(&file);
+        assert!(text.contains("\"mcpServers\""), "{text}");
+        assert!(text.contains("https://docs.example.com/mcp"), "{text}");
+        // The built-ins are written as before.
+        assert!(project.read(".mcp.json").contains("notes"));
+        // A second sync, and a check, have nothing to do.
+        let again = project.plan(&[]).unwrap();
+        assert_eq!(
+            Project::section(&again, &file),
+            format!(
+                "Agent {id}, {}: no change",
+                project.root().join(&file).display()
+            )
+        );
+        sync::apply(&project.plan(&[]).unwrap()).unwrap();
+        assert_eq!(project.read(&file), text);
+    }
+
+    #[test]
+    fn a_secret_server_is_left_out_of_a_registered_vendors_file_and_the_built_ins_still_get_it() {
+        let id = "vsdk2-secret";
+        let file = vendor_named(id);
+        let project = Project::new(CATALOG);
+        let plan = project.sync();
+        let text = project.read(&file);
+        assert!(text.contains("docs") && !text.contains("notes"), "{text}");
+        assert!(!text.contains("NOTES_TOKEN"), "{text}");
+        let printed = plan.to_string();
+        let said = format!(
+            "Agent {id} cannot run server `notes`: `NOTES_TOKEN` is a secret, and Agent {id} \
+             does not expand `${{VAR}}`, so it could only be written as its value, which fl \
+             never does. It is left out of {file}; the other vendors still get it. To say so \
+             in the catalog, give the server a `vendors` list without `{id}`"
+        );
+        assert!(printed.contains(&said), "{printed}");
+        for built_in in [".mcp.json", ".codex/config.toml", ".agents/mcp_config.json"] {
+            assert!(project.read(built_in).contains("notes"), "{built_in}");
+        }
+    }
+
+    #[test]
+    fn a_hand_edit_is_refused_and_a_foreign_entry_is_kept_in_a_registered_vendors_file() {
+        let id = "vsdk2-guard";
+        let file = vendor_named(id);
+        let project = Project::new(CATALOG);
+        let theirs = "{\"mcpServers\": {\"theirs\": {\"command\": \"x\"}}}\n";
+        fs::create_dir_all(project.root().join(DIR)).unwrap();
+        fs::write(project.root().join(&file), theirs).unwrap();
+        project.sync();
+        let text = project.read(&file);
+        assert!(
+            text.contains("\"theirs\"") && text.contains("\"docs\""),
+            "{text}"
+        );
+        // A person edits fl's entry: refused, the file untouched, `check` says 2.
+        let edited = text.replace(
+            "https://docs.example.com/mcp",
+            "https://docs.example.com/v2",
+        );
+        fs::write(project.root().join(&file), &edited).unwrap();
+        let plan = project.plan(&[]).unwrap();
+        assert_eq!(plan.check().exit_code(), 2);
+        let printed = plan.to_string();
+        assert!(
+            printed.contains("`docs` was changed by hand since fl wrote it"),
+            "{printed}"
+        );
+        assert!(printed.contains(&file), "{printed}");
+        assert!(sync::apply(&plan).is_err());
+        assert_eq!(project.read(&file), edited);
+        // `--replace` names it and writes it again.
+        sync::apply(&project.plan(&["docs"]).unwrap()).unwrap();
+        let text = project.read(&file);
+        assert!(text.contains("https://docs.example.com/mcp") && text.contains("\"theirs\""));
+    }
+
+    #[test]
+    fn check_reports_a_registered_vendors_drift() {
+        let id = "vsdk2-drift";
+        let file = vendor_named(id);
+        let project = Project::new(CATALOG);
+        project.sync();
+        // Not the exit code: a vendor another test registers meanwhile is unwritten here, and
+        // `check` rightly says so. This vendor's own file has nothing to do.
+        let plan = project.plan(&[]).unwrap();
+        assert!(Project::section(&plan, &file).ends_with(": no change"));
+        assert!(
+            plan.targets()
+                .iter()
+                .filter(|t| t.path.ends_with(&file))
+                .all(|t| !t.changes())
+        );
+        // The file is deleted: a fresh clone. Only this vendor's file differs.
+        fs::remove_file(project.root().join(&file)).unwrap();
+        let plan = project.plan(&[]).unwrap();
+        assert_eq!(plan.check().exit_code(), 1);
+        assert!(Project::section(&plan, &file).contains("add docs"));
+        project.catalog(&CATALOG.replace("docs.example.com", "docs.example.org"));
+        let plan = project.plan(&[]).unwrap();
+        assert_eq!(plan.check().exit_code(), 1);
+        sync::apply(&plan).unwrap();
+        assert!(project.read(&file).contains("docs.example.org"));
+        // Not the exit code: a vendor another test registers meanwhile is unwritten here, and
+        // `check` rightly says so. This vendor's own file has nothing to do.
+        let plan = project.plan(&[]).unwrap();
+        assert!(Project::section(&plan, &file).ends_with(": no change"));
+        assert!(
+            plan.targets()
+                .iter()
+                .filter(|t| t.path.ends_with(&file))
+                .all(|t| !t.changes())
+        );
+    }
+
+    #[test]
+    fn a_servers_vendors_list_may_name_a_registered_vendor_and_an_unknown_one_is_refused() {
+        let id = "vsdk2-listed";
+        let file = vendor_named(id);
+        let only = format!(
+            "{CATALOG}\n[server.only]\ntransport = \"http\"\nurl = \"https://only.example.com/mcp\"\n\
+             vendors = [\"{id}\"]\n"
+        );
+        let project = Project::new(&only);
+        project.sync();
+        assert!(project.read(&file).contains("only.example.com"));
+        assert!(!project.read(".mcp.json").contains("only.example.com"));
+        let unknown = only.replace(&format!("\"{id}\""), "\"vsdk2-nobody\"");
+        project.catalog(&unknown);
+        let err = project.plan(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown variant <value>, expected one of `claude`"),
+            "{err}"
+        );
+        assert!(!err.contains("vsdk2-nobody"), "{err}");
+    }
+
+    #[test]
+    fn a_registered_vendors_file_git_does_not_ignore_is_refused_naming_the_line() {
+        let id = "vsdk2-unignored";
+        let file = vendor_named(id);
+        let project = Project::new(CATALOG);
+        // Everything else ignored; this vendor's directory is not.
+        let ignore = project.root().join(".gitignore");
+        let kept: String = (fs::read_to_string(&ignore).unwrap())
+            .lines()
+            .filter(|l| !l.contains(DIR))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        fs::write(&ignore, kept).unwrap();
+        let err = project.plan(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{file} is not ignored by git")),
+            "{err}"
+        );
+        assert!(err.contains(&format!("/{file}")), "{err}");
+        assert!(!project.root().join(&file).exists());
+    }
+
+    #[test]
+    fn every_command_declares_the_registered_vendors_before_it_reads_the_catalog() {
+        // Registered with fl-core only: `run` must declare the target itself, or the catalog's
+        // `vendors` list names an unknown vendor. `check` writes nothing.
+        let id = "vsdk2-run";
+        let file = format!("{DIR}/{id}.json");
+        fl_core::register_vendor(descriptor(id, Some(&file))).unwrap();
+        let catalog = format!(
+            "[server.docs]\ntransport = \"http\"\nurl = \"https://docs.example.com/mcp\"\n\
+             vendors = [\"{id}\"]\n"
+        );
+        let project = Project::new(&catalog);
+        let code = run(Cmd::Check, &[], &project.root()).unwrap();
+        assert_eq!(code, 1, "the vendor's file is to be written");
+        assert!(vendor::custom_target(id).is_some());
+        assert!(!project.root().join(&file).exists());
+    }
+
+    #[test]
+    fn only_a_vendor_that_is_not_built_in_and_names_a_file_gets_a_target() {
+        let none = descriptor("vsdk2-nofile", None);
+        let (a, b) = (fl_core::lookup_vendor("claude").unwrap(), none);
+        declare_targets(&[a, b]).unwrap();
+        assert!(vendor::custom_target("claude").is_none());
+        assert!(vendor::custom_target("vsdk2-nofile").is_none());
+        // Declared twice in one process: the second is the same target, not an error.
+        let again = descriptor("vsdk2-twice", Some(".vsdk2-test/twice.json"));
+        declare_targets(std::slice::from_ref(&again)).unwrap();
+        declare_targets(&[again]).unwrap();
+        let t = vendor::custom_target("vsdk2-twice").unwrap();
+        assert_eq!(
+            (t.title(), t.target()),
+            ("Agent vsdk2-twice", ".vsdk2-test/twice.json")
+        );
+    }
+
+    #[test]
+    fn a_vendor_whose_file_is_not_a_path_in_the_project_is_refused_naming_it() {
+        let bad = descriptor("vsdk2-badpath", Some("a//b.json"));
+        let err = declare_targets(&[bad]).unwrap_err().to_string();
+        assert!(err.starts_with("vendor `vsdk2-badpath`: "), "{err}");
+        assert!(err.contains("a path inside the project"), "{err}");
+        assert!(vendor::custom_target("vsdk2-badpath").is_none());
+    }
 }

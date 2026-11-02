@@ -16,8 +16,10 @@ pub use antigravity::Antigravity;
 pub use claude::Claude;
 pub use codex::Codex;
 pub use custom::{
-    CustomRefusal, CustomTarget, TargetError, custom_target, custom_targets, register_target,
+    CustomId, CustomRefusal, CustomTarget, TargetError, custom_target, custom_targets,
+    register_target,
 };
+pub(crate) use custom::{custom_name, custom_names, custom_vendor};
 pub use grok::Grok;
 pub use muse::Muse;
 
@@ -29,9 +31,9 @@ use std::path::{Path, PathBuf};
 pub trait Vendor: Sync {
     fn name(&self) -> VendorName;
     /// The vendor's name for a person.
-    fn title(&self) -> &'static str;
+    fn title(&self) -> &str;
     /// The file, relative to the project root.
-    fn target(&self) -> &'static str;
+    fn target(&self) -> &str;
     /// The entry exactly as fl writes it for the server `name`, or why this
     /// vendor cannot run the server; the other vendors still get it (MCP spec
     /// §4.2).
@@ -41,9 +43,17 @@ pub trait Vendor: Sync {
     fn open(&self, path: &Path, bytes: Option<&[u8]>) -> Result<VendorFile, FileRefusal>;
 }
 
+/// Every vendor fl writes a file for: the built-ins, then the registered targets by id.
+pub fn all() -> Vec<VendorName> {
+    let mut all = VendorName::ALL.to_vec();
+    all.extend(custom_names());
+    all
+}
+
 /// The vendor behind `name`.
 pub fn vendor(name: VendorName) -> &'static dyn Vendor {
     match name {
+        VendorName::Custom(id) => custom_vendor(id),
         VendorName::Claude => &Claude,
         VendorName::Codex => &Codex,
         VendorName::Antigravity => &Antigravity,
@@ -352,7 +362,7 @@ mod tests {
                 VendorName::Muse => {
                     "{\"mcp_servers\": {\"theirs\": {\"command\": \"their-tool\"}}}"
                 }
-                VendorName::Claude | VendorName::Antigravity => {
+                VendorName::Claude | VendorName::Antigravity | VendorName::Custom(_) => {
                     "{\"mcpServers\": {\"theirs\": {\"command\": \"their-tool\"}}}"
                 }
             };
@@ -399,7 +409,7 @@ mod tests {
                 VendorName::Muse => {
                     "{\n  \"mcp_servers\": {\n    \"theirs\": {\"command\": \"t\"}\n  }\n}\n"
                 }
-                VendorName::Claude | VendorName::Antigravity => {
+                VendorName::Claude | VendorName::Antigravity | VendorName::Custom(_) => {
                     "{\n  \"mcpServers\": {\n    \"theirs\": {\"command\": \"t\"}\n  }\n}\n"
                 }
             };

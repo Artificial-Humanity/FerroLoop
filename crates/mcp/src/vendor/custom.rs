@@ -6,17 +6,22 @@
 //! headers. Its entries have the shape Claude Code's `.mcp.json` uses. A vendor whose file is
 //! TOML, or shaped differently, is not covered by this registry.
 //!
-//! ⚠ These targets are looked up and rendered here; `fl mcp sync` still plans and writes only
-//! the five built-in vendors, because its plan, ownership records and `vendors` filter are keyed
-//! on the closed [`VendorName`](crate::catalog::VendorName). Wiring custom targets into `sync`
-//! is a separate change.
+//! A registered target is a vendor like the five built in. [`VendorName::Custom`] names it, so
+//! `fl mcp sync` plans and writes its file with the same ownership records, refusals, race
+//! detection and atomic write as a built-in's, and a catalog server's `vendors` list may name it.
+//! [`register_target`] is the only way to make such a name, which is what lets
+//! [`vendor`](super::vendor) answer for every name without a failure case. Targets are never
+//! unregistered.
 
 use super::Kind;
-use super::{Fields, FileRefusal, Rendered, VendorFile, args, command, env, headers, json, url};
+use super::{
+    Fields, FileRefusal, Rendered, Vendor, VendorFile, VendorRefusal, args, command, env, headers,
+    json, url,
+};
 use crate::catalog::{EnvValue, HeaderValue, Server, Transport, VendorName};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// A vendor's MCP file, declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +46,15 @@ pub enum TargetError {
 
 /// A server one custom target cannot run as the catalog gives it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{title} cannot run server `{server}`: {reason}")]
+#[error(
+    "{title} cannot run server `{server}`: {reason}. It is left out of {file}; the other vendors \
+     still get it. To say so in the catalog, give the server a `vendors` list without `{id}`"
+)]
 pub struct CustomRefusal {
     pub id: String,
     pub title: String,
+    /// The target's file, relative to the project root.
+    pub file: String,
     pub server: String,
     /// The reason, as a clause.
     pub reason: String,
@@ -126,6 +136,7 @@ impl CustomTarget {
         CustomRefusal {
             id: self.id.clone(),
             title: self.title.clone(),
+            file: self.target.clone(),
             server: server.to_string(),
             reason,
         }
@@ -196,7 +207,51 @@ impl CustomTarget {
     }
 }
 
-type Targets = RwLock<BTreeMap<String, Arc<CustomTarget>>>;
+/// A registered target as a vendor: the target, and the name that stands for it.
+struct Registered {
+    target: CustomTarget,
+    name: VendorName,
+}
+
+impl Vendor for Registered {
+    fn name(&self) -> VendorName {
+        self.name
+    }
+
+    fn title(&self) -> &str {
+        self.target.title()
+    }
+
+    fn target(&self) -> &str {
+        self.target.target()
+    }
+
+    fn render(&self, name: &str, server: &Server) -> Result<Rendered, VendorRefusal> {
+        (self.target.render(name, server)).map_err(|r| VendorRefusal {
+            vendor: self.name,
+            server: r.server,
+            reason: r.reason,
+        })
+    }
+
+    fn open(&self, path: &Path, bytes: Option<&[u8]>) -> Result<VendorFile, FileRefusal> {
+        self.target.open(path, bytes)
+    }
+}
+
+/// The name of a registered custom target: [`VendorName::Custom`] holds one. Only
+/// [`register_target`] and [`VendorName::parse`] make one, and only for an id in the registry,
+/// which never forgets a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CustomId(&'static str);
+
+impl CustomId {
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+type Targets = RwLock<BTreeMap<String, &'static Registered>>;
 
 fn targets() -> &'static Targets {
     static TARGETS: OnceLock<Targets> = OnceLock::new();
@@ -216,27 +271,41 @@ pub fn register_target(target: CustomTarget) -> Result<(), TargetError> {
     if map.contains_key(&target.id) {
         return Err(TargetError::Duplicate(target.id));
     }
-    map.insert(target.id.clone(), Arc::new(target));
+    let id = target.id.clone();
+    // Leaked: a target lives as long as the process, like its interned key.
+    let name = VendorName::Custom(CustomId(intern(&id)));
+    map.insert(id, Box::leak(Box::new(Registered { target, name })));
     Ok(())
 }
 
 /// The registered target with this id.
-pub fn custom_target(id: &str) -> Option<Arc<CustomTarget>> {
-    targets()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&id.trim().to_ascii_lowercase())
-        .cloned()
+pub fn custom_target(id: &str) -> Option<&'static CustomTarget> {
+    let map = targets().read().unwrap_or_else(|e| e.into_inner());
+    map.get(&id.trim().to_ascii_lowercase()).map(|r| &r.target)
 }
 
 /// Every registered target, by id.
-pub fn custom_targets() -> Vec<Arc<CustomTarget>> {
-    targets()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .values()
-        .cloned()
-        .collect()
+pub fn custom_targets() -> Vec<&'static CustomTarget> {
+    let map = targets().read().unwrap_or_else(|e| e.into_inner());
+    map.values().map(|r| &r.target).collect()
+}
+
+/// The name of the registered target with exactly this id.
+pub(crate) fn custom_name(id: &str) -> Option<VendorName> {
+    let map = targets().read().unwrap_or_else(|e| e.into_inner());
+    map.get(id).map(|r| r.name)
+}
+
+/// The registered target's vendor.
+pub(crate) fn custom_vendor(id: CustomId) -> &'static dyn Vendor {
+    let map = targets().read().unwrap_or_else(|e| e.into_inner());
+    *map.get(id.0).expect("a CustomId names a registered target")
+}
+
+/// The names of every registered target, by id.
+pub(crate) fn custom_names() -> Vec<VendorName> {
+    let map = targets().read().unwrap_or_else(|e| e.into_inner());
+    map.values().map(|r| r.name).collect()
 }
 
 #[cfg(test)]
