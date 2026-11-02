@@ -22,11 +22,13 @@ use sha2::{Digest, Sha256};
 /// Cookie name used for browser `FerroDeck` sessions (spec §2.2).
 pub const SESSION_COOKIE_NAME: &str = "fl_hub_session";
 
-/// Default pairing code time-to-live in seconds (10 minutes, spec §2.2).
-pub const DEFAULT_PAIRING_TTL_SECS: u64 = 600;
+/// Default pairing code time-to-live in seconds (1 hour, spec §2.2). A code is single-use, so
+/// the longer window leaves a phone time to scan or type it.
+pub const DEFAULT_PAIRING_TTL_SECS: u64 = 3600;
 
-/// Default owner session time-to-live in seconds (24 hours, spec §2.2).
-pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 3600;
+/// Default owner session time-to-live in seconds (30 days, spec §2.2). It is also the
+/// `Max-Age` of the `fl_hub_session` cookie, so a paired phone stays signed in that long.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
 
 /// Authority tier resolved for an authenticated HTTP or WebSocket request (spec §2.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1204,5 +1206,34 @@ mod tests {
         let b = auth.mint_session(None, "x").unwrap();
         assert_eq!((a.len(), b.len()), (64, 64));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn phone_friendly_defaults_pairing_code_one_hour_and_session_cookie_thirty_days() {
+        assert_eq!(DEFAULT_PAIRING_TTL_SECS, 3600);
+        assert_eq!(DEFAULT_SESSION_TTL_SECS, 2_592_000);
+
+        // A zero TTL means "use the default", in both mint paths.
+        let tmp = TempDir::new().unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
+        let before = now_millis();
+        let from_store = mint_pairing_code_in_store(&store, "http://127.0.0.1:8420", 0).unwrap();
+        let after = now_millis();
+        assert_eq!(from_store.ttl_secs, 3600);
+        assert!(
+            (before + 3_600_000..=after + 3_600_000).contains(&from_store.expires_at_ms),
+            "{from_store:?}"
+        );
+        let auth = AuthManager::new("lmcfarlin", Some("owner-secret".into()), None, false, 0);
+        let minted = auth
+            .mint_pairing_code(None, "http://127.0.0.1:8420", 0)
+            .unwrap();
+        assert_eq!(minted.ttl_secs, 3600);
+
+        // A zero session TTL becomes 30 days, and that is the cookie's Max-Age.
+        assert_eq!(auth.session_ttl_secs(), 2_592_000);
+        let cookie = format_session_set_cookie("tok", auth.session_ttl_secs());
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.ends_with("Max-Age=2592000"), "{cookie}");
     }
 }

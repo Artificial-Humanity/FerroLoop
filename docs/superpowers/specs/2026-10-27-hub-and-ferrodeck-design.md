@@ -196,7 +196,7 @@ pub enum HubAuthority {
    - Reads `$FL_HUB_OWNER_TOKEN` (if non-empty) or `[hub].owner_token_file` (trimmed).
 2. **One-Time Pairing Codes:**
    - Stored in the workspace state store as a sensitive runtime entry (`StateScope::Workspace`, key `hub/pairing/<code>`) or in-memory pairing table with an expiration timestamp (`expires_at_ms`) and `used: bool`.
-   - `fl hub pair` creates a 10-minute single-use code, persists it in the workspace state store so a running `fl hub serve` process sharing the store recognizes it immediately, and prints `http://<listen>/pair?code=<code>` (or `/?pair=<code>`).
+   - `fl hub pair` creates a 1-hour single-use code, persists it in the workspace state store so a running `fl hub serve` process sharing the store recognizes it immediately, and prints `http://<listen>/pair?code=<code>` (or `/?pair=<code>`).
 3. **Request Authentication Order:**
    - `POST /api/v1/auth/pair` accepts `{ "code": "..." }` or `{ "token": "..." }`. When valid, it mints a random 256-bit session token, stores the session with `expires_at`, and sets `Set-Cookie: fl_hub_session=<token>; HttpOnly; SameSite=Strict; Path=/; Max-Age=<ttl_secs>` and returns `{ "authenticated": true, "authority": { "tier": "owner", "login": "lmcfarlin" }, "session_token": "<token>" }`.
    - Every `/api/v1/*` and `/ws/v1` request (except `/api/v1/health` and `POST /api/v1/auth/pair`) checks:
