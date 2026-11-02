@@ -68,6 +68,11 @@ pub enum RegisterScannerError {
 struct Registered {
     id: String,
     scanner: Arc<dyn WireVendorScanner>,
+    /// Tests only: the thread that registered it. The registry is process-global and every test
+    /// in this binary runs discovery, so a scanner a test registers would otherwise add routes
+    /// to every other test's table; only discovery on the registering thread sees it.
+    #[cfg(test)]
+    owner: std::thread::ThreadId,
 }
 
 fn registry() -> &'static RwLock<Vec<Registered>> {
@@ -93,7 +98,12 @@ pub fn register_wire_scanner(
     if scanners.iter().any(|r| r.id == id) {
         return Err(RegisterScannerError::Duplicate(id));
     }
-    scanners.push(Registered { id, scanner });
+    scanners.push(Registered {
+        id,
+        scanner,
+        #[cfg(test)]
+        owner: std::thread::current().id(),
+    });
     Ok(())
 }
 
@@ -103,6 +113,17 @@ pub(crate) fn registered_scanners() -> Vec<(String, Arc<dyn WireVendorScanner>)>
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .filter(|r| {
+            #[cfg(test)]
+            {
+                r.owner == std::thread::current().id()
+            }
+            #[cfg(not(test))]
+            {
+                let _ = r;
+                true
+            }
+        })
         .map(|r| (r.id.clone(), Arc::clone(&r.scanner)))
         .collect()
 }
