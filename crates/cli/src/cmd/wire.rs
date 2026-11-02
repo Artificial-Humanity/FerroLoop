@@ -1675,8 +1675,12 @@ mod tests {
                 .collect();
             // SAFETY: the env lock serialises every test that touches these variables.
             unsafe {
+                // HOME is read by unrelated tests that do not take the lock: it is switched
+                // straight to the new value and never unset, even for an instant.
                 for k in HOOK_ENV_VARS {
-                    std::env::remove_var(k);
+                    if k != "HOME" {
+                        std::env::remove_var(k);
+                    }
                 }
                 std::env::set_var("HOME", dir.path().join("home"));
                 std::env::set_var("FL_WIRE_ROUTES", dir.path().join("routes.json"));
@@ -1765,6 +1769,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hook_rig_never_leaves_home_unset() {
+        if std::env::var_os("HOME").is_none() {
+            return;
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_unset = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let poller = {
+            let (stop, seen_unset) = (stop.clone(), seen_unset.clone());
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !stop.load(Relaxed) {
+                    if std::env::var_os("HOME").is_none() {
+                        seen_unset.store(true, Relaxed);
+                    }
+                }
+            })
+        };
+        for _ in 0..300 {
+            drop(HookRig::new(Some("jarvis")));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        poller.join().unwrap();
+        assert!(
+            !seen_unset.load(std::sync::atomic::Ordering::Relaxed),
+            "HOME was observed unset while a HookRig was created or dropped"
+        );
     }
 
     fn agy_route(conversation_id: &str) -> VendorRoute {
