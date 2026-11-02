@@ -667,6 +667,9 @@ export const App: React.FC<AppProps> = ({
         const bgRes = await apiClient
           .getSessionTranscript(session.id)
           .catch(() => null);
+        if (loggedOutRef.current) {
+          return;
+        }
         if (bgRes?.turns) {
           backgroundStampRef.current[persona] = stamp;
           recordTranscript(persona, bgRes.turns);
@@ -711,7 +714,7 @@ export const App: React.FC<AppProps> = ({
         if (sessRes) {
           setSessions(list);
         }
-        await scanBackgroundTranscripts(list);
+        void scanBackgroundTranscripts(list);
         const rawTargetId =
           sessionOverride === null
             ? null
@@ -1324,7 +1327,7 @@ export const App: React.FC<AppProps> = ({
         },
       ]);
     }
-    await refreshSessionsAndTranscript(targetId);
+    void refreshSessionsAndTranscript(targetId);
     return res;
   };
 
@@ -1352,7 +1355,7 @@ export const App: React.FC<AppProps> = ({
         },
       ]);
     }
-    await refreshSessionsAndTranscript(targetId);
+    void refreshSessionsAndTranscript(targetId);
   };
 
   const handleCancelQueued = async (promptId: string) => {
