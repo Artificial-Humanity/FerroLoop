@@ -2699,15 +2699,35 @@ fn context_usage_for_transcript(
     if tpath.to_string_lossy().contains(".claude")
         && let Some(raw) = files.raw(tpath_str)
     {
+        // The latest row wins: an assistant turn's `message.usage`, or a `compact_boundary`
+        // row's `compactMetadata.postTokens` (what the context holds after `/compact`).
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
-            if trimmed_line.is_empty() || !trimmed_line.contains("\"usage\"") {
+            if trimmed_line.is_empty()
+                || !(trimmed_line.contains("\"usage\"")
+                    || trimmed_line.contains("compact_boundary")
+                    || trimmed_line.contains("compactMetadata"))
+            {
                 continue;
             }
             let Ok(val) = serde_json::from_str::<Value>(trimmed_line) else {
                 continue;
             };
             if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if val.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                let post_tokens = val
+                    .pointer("/compactMetadata/postTokens")
+                    .and_then(Value::as_u64)
+                    .filter(|&n| n > 0);
+                if let Some(used_tokens) = post_tokens {
+                    return Some(SessionContextUsage {
+                        used_tokens,
+                        max_tokens: 1_000_000,
+                    });
+                }
+                // A boundary without a post-compaction size says nothing: keep looking.
                 continue;
             }
             if let Some(usage) = val.pointer("/message/usage") {
@@ -3056,15 +3076,32 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
 
         let mut raw_joined = content_parts.join("\n");
         let mut effective_role = role;
+        // Claude Code marks the summary it writes after a compaction boundary. Its text can
+        // differ from the known opener, so the flag alone makes it a system notice.
+        let is_compact_summary = effective_role == "user"
+            && obj.get("isCompactSummary").and_then(Value::as_bool) == Some(true);
         if effective_role == "user" {
             let trimmed_raw = raw_joined.trim();
-            if obj.get("synthetic_reason").is_some() || is_grok_scaffolding_turn(trimmed_raw) {
+            if is_compact_summary
+                || obj.get("synthetic_reason").is_some()
+                || is_grok_scaffolding_turn(trimmed_raw)
+            {
                 effective_role = "system".to_string();
             } else {
                 raw_joined = strip_grok_user_query_wrapper(&raw_joined);
             }
         }
-        let (mut role, content) = normalize_system_turn(&effective_role, &raw_joined);
+        let (mut role, mut content) = if is_compact_summary {
+            // Harness text, whatever it quotes: never re-sorted by the wrapper rules.
+            ("system".to_string(), raw_joined.trim().to_string())
+        } else {
+            normalize_system_turn(&effective_role, &raw_joined)
+        };
+        if role == "user"
+            && let Some(command) = slash_command_text(&content)
+        {
+            content = command;
+        }
         let thinking = if thinking_parts.is_empty() {
             None
         } else {
@@ -3500,11 +3537,13 @@ fn clean_sender_token(raw: &str) -> String {
 
 /// Openers of Claude Code transcript user turns that the harness, not the operator, wrote.
 /// A turn whose text starts with one is a system notice.
-const SYSTEM_NOTICE_OPENERS: [&str; 4] = [
+const SYSTEM_NOTICE_OPENERS: [&str; 5] = [
     "<task-notification>",
     "<local-command-caveat>",
     "<local-command-stdout>",
     "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+    // The summary Claude Code writes after a `/compact` boundary.
+    "This session is being continued from a previous conversation",
 ];
 /// Spellings of the `<agent-message ...>` open tag: plain, and backslash-escaped.
 const AGENT_MESSAGE_OPEN_TAGS: [&str; 2] = ["<agent-message", "<\\agent-message"];
@@ -3574,6 +3613,61 @@ fn clean_subagent_handback(text: &str) -> String {
 
 /// First words of the harness preamble in front of a `<SYSTEM_MESSAGE>` block.
 const SYSTEM_MESSAGE_PREAMBLE: &str = "The following is a <SYSTEM_MESSAGE>";
+
+/// How a tag's text is found in a string.
+enum TagText<'a> {
+    Absent,
+    /// An open tag with no close tag after it.
+    Unterminated,
+    Closed(&'a str),
+}
+
+/// The text between the first `<tag>` and the next `</tag>`. One forward search per tag.
+fn tag_text<'a>(text: &'a str, tag: &str) -> TagText<'a> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(start) = text.find(&open) else {
+        return TagText::Absent;
+    };
+    let inner = &text[start + open.len()..];
+    match inner.find(&close) {
+        Some(end) => TagText::Closed(&inner[..end]),
+        None => TagText::Unterminated,
+    }
+}
+
+/// The command a Claude Code slash-command wrapper stands for, such as `/compact` or
+/// `/compact focus on auth`. Claude Code records `<command-name>/compact</command-name>
+/// <command-message>compact</command-message><command-args></command-args>` as a user
+/// turn. `None` when the text does not START with a `<command-name>` or `<command-message>`
+/// tag (so prose that only quotes the tag stays as written), or when a tag it needs is
+/// unterminated or empty.
+fn slash_command_text(text: &str) -> Option<String> {
+    let text = text.trim_start();
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return None;
+    }
+    let name = match tag_text(text, "command-name") {
+        TagText::Closed(name) if !name.trim().is_empty() => name.trim().to_string(),
+        TagText::Unterminated => return None,
+        _ => match tag_text(text, "command-message") {
+            TagText::Closed(message) if !message.trim().is_empty() => {
+                let message = message.trim();
+                if message.starts_with('/') {
+                    message.to_string()
+                } else {
+                    format!("/{message}")
+                }
+            }
+            _ => return None,
+        },
+    };
+    match tag_text(text, "command-args") {
+        TagText::Unterminated => None,
+        TagText::Closed(args) if !args.trim().is_empty() => Some(format!("{name} {}", args.trim())),
+        TagText::Closed(_) | TagText::Absent => Some(name),
+    }
+}
 
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
@@ -8744,6 +8838,388 @@ mod tests {
         assert_eq!(
             (unreported.used_tokens, unreported.max_tokens),
             (10, 500_000)
+        );
+    }
+
+    fn claude_user_row(content: Value) -> String {
+        serde_json::json!({"type":"user","message":{"role":"user","content":content}}).to_string()
+    }
+
+    fn claude_user_turn(content: Value) -> (String, String) {
+        let turns = parse_jsonl_transcript(&claude_user_row(content));
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        (turns[0].role.clone(), turns[0].content.clone())
+    }
+
+    #[test]
+    fn slash_command_wrapper_becomes_the_command_the_operator_typed() {
+        let wrap = |inner: &str| format!("\n  {inner}\n");
+        let cases: [(&str, &str); 9] = [
+            (
+                "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>",
+                "/compact",
+            ),
+            (
+                "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args>focus on auth</command-args>",
+                "/compact focus on auth",
+            ),
+            // Only the message tag: the name is the message with a slash.
+            ("<command-message>compact</command-message>", "/compact"),
+            // The slash is never doubled.
+            ("<command-message>/compact</command-message>", "/compact"),
+            // Reversed tag order.
+            (
+                "<command-message>compact</command-message><command-args>  now  </command-args><command-name>/compact</command-name>",
+                "/compact now",
+            ),
+            // Whitespace-only args, and no args tag at all.
+            (
+                "<command-name>/clear</command-name><command-args>  \n </command-args>",
+                "/clear",
+            ),
+            ("<command-name>/clear</command-name>", "/clear"),
+            // A name without a slash is left as written.
+            ("<command-name>compact</command-name>", "compact"),
+            // An empty name falls back to the message.
+            (
+                "<command-name> </command-name><command-message>init</command-message>",
+                "/init",
+            ),
+        ];
+        for (wrapper, want) in cases {
+            for text in [wrapper.to_string(), wrap(wrapper)] {
+                let (role, content) = claude_user_turn(serde_json::json!(text));
+                assert_eq!(
+                    (role.as_str(), content.as_str()),
+                    ("user", want),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slash_command_wrapper_in_an_array_of_text_blocks() {
+        let (role, content) = claude_user_turn(serde_json::json!([
+            {"type": "text", "text": "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args>keep the plan</command-args>"}
+        ]));
+        assert_eq!(
+            (role.as_str(), content.as_str()),
+            ("user", "/compact keep the plan")
+        );
+        // The tags may arrive in separate blocks.
+        let (role, content) = claude_user_turn(serde_json::json!([
+            {"type": "text", "text": "<command-name>/model</command-name>"},
+            {"type": "text", "text": "<command-args>opus</command-args>"}
+        ]));
+        assert_eq!((role.as_str(), content.as_str()), ("user", "/model opus"));
+    }
+
+    #[test]
+    fn text_that_is_not_a_whole_slash_command_wrapper_is_unchanged() {
+        for text in [
+            // An unterminated tag, in each position.
+            "<command-name>/compact",
+            "<command-name>/compact</command-name><command-args>never closed",
+            "<command-message>compact",
+            // A close tag only.
+            "</command-name>/compact",
+            // Nothing in either tag.
+            "<command-name></command-name>",
+            "<command-message> </command-message>",
+            // Plain operator text, and text that merely contains the tag.
+            "please run /compact now",
+            "use <command-name>/compact</command-name> to shrink the context",
+            "<command-nameX>/compact</command-nameX>",
+        ] {
+            let (role, content) = claude_user_turn(serde_json::json!(text));
+            assert_eq!(
+                (role.as_str(), content.as_str()),
+                ("user", text),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_command_wrapper_with_multibyte_and_huge_text_stays_cheap() {
+        let (_, content) = claude_user_turn(serde_json::json!(
+            "<command-name>/compact</command-name><command-args>\u{e9}\u{1f600} \u{130}</command-args>"
+        ));
+        assert_eq!(content, "/compact \u{e9}\u{1f600} \u{130}");
+        // A very long run of opens with no close is a single pass, and unchanged.
+        let many = "<command-name>".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(slash_command_text(&many), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let big_args = "x".repeat(1_000_000);
+        let text =
+            format!("<command-name>/compact</command-name><command-args>{big_args}</command-args>");
+        assert_eq!(
+            slash_command_text(&text),
+            Some(format!("/compact {big_args}"))
+        );
+    }
+
+    #[test]
+    fn local_command_notices_stay_system_turns() {
+        let caveat = "<local-command-caveat>Caveat: the messages below were generated by the user</local-command-caveat>";
+        let stdout = "<local-command-stdout>Compacted</local-command-stdout>";
+        for text in [caveat, stdout] {
+            let (role, content) = claude_user_turn(serde_json::json!(text));
+            assert_eq!((role.as_str(), content.as_str()), ("system", text));
+        }
+    }
+
+    #[test]
+    fn compaction_continuation_summary_is_a_system_turn() {
+        let opener = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
+        // By opener text alone, string and block content, with leading whitespace.
+        for content in [
+            serde_json::json!(format!("{opener}\n\nSummary: built the thing")),
+            serde_json::json!([{"type": "text", "text": format!("\n{opener}\n\nSummary: x")}]),
+        ] {
+            let (role, text) = claude_user_turn(content);
+            assert_eq!(role, "system");
+            assert!(text.starts_with(opener), "{text:?}");
+        }
+        // By the flag alone, with text that is not the known opener.
+        let flagged = serde_json::json!({
+            "type": "user", "isCompactSummary": true, "parentUuid": "boundary-1",
+            "message": {"role": "user", "content": "Totally different wording of the recap."}
+        })
+        .to_string();
+        let turns = parse_jsonl_transcript(&flagged);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "system");
+        assert_eq!(turns[0].content, "Totally different wording of the recap.");
+        // The flag holds even when the recap quotes text the wrapper rules would reclassify.
+        let quoting = serde_json::json!({
+            "type": "user", "isCompactSummary": true,
+            "message": {"role": "user", "content": "Recap\n<SYSTEM_MESSAGE>quoted</SYSTEM_MESSAGE>"}
+        })
+        .to_string();
+        assert_eq!(parse_jsonl_transcript(&quoting)[0].role, "system");
+        // A false flag changes nothing.
+        let unflagged = serde_json::json!({
+            "type": "user", "isCompactSummary": false,
+            "message": {"role": "user", "content": "do the thing"}
+        })
+        .to_string();
+        assert_eq!(parse_jsonl_transcript(&unflagged)[0].role, "user");
+        // An operator turn that only mentions the phrase keeps its role.
+        let (role, _) = claude_user_turn(serde_json::json!(format!(
+            "why did you say \"{opener}\" earlier?"
+        )));
+        assert_eq!(role, "user");
+    }
+
+    #[test]
+    fn a_compaction_session_reads_as_command_boundary_summary_in_order() {
+        let boundary = serde_json::json!({
+            "type": "system", "subtype": "compact_boundary", "content": "Conversation compacted",
+            "compactMetadata": {"trigger": "manual", "preTokens": 746_687, "postTokens": 21_546}
+        })
+        .to_string();
+        let text = [
+            claude_user_row(serde_json::json!("hello")),
+            claude_user_row(serde_json::json!(
+                "<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"
+            )),
+            boundary,
+            serde_json::json!({
+                "type": "user", "isCompactSummary": true,
+                "message": {"role": "user", "content": "This session is being continued from a previous conversation that ran out of context."}
+            })
+            .to_string(),
+            claude_user_row(serde_json::json!("carry on")),
+        ]
+        .join("\n");
+        let turns = parse_jsonl_transcript(&text);
+        let seen: Vec<(&str, &str)> = turns
+            .iter()
+            .map(|t| (t.role.as_str(), t.content.as_str()))
+            .collect();
+        assert_eq!(seen[0], ("user", "hello"));
+        assert_eq!(seen[1], ("user", "/compact"));
+        assert_eq!(seen[2], ("system", "Conversation compacted"));
+        assert_eq!(seen[3].0, "system");
+        assert_eq!(seen[4], ("user", "carry on"));
+        assert_eq!(seen.len(), 5);
+    }
+
+    fn assistant_usage_row(input: u64, output: u64) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "usage": {
+                "input_tokens": input, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0, "output_tokens": output
+            }}
+        })
+        .to_string()
+    }
+
+    fn boundary_row(post_tokens: Option<u64>) -> String {
+        let mut meta = serde_json::json!({
+            "trigger": "manual", "preTokens": 746_687,
+            "cumulativeDroppedTokens": 725_141, "durationMs": 47_572
+        });
+        if let Some(n) = post_tokens {
+            meta["postTokens"] = serde_json::json!(n);
+        }
+        serde_json::json!({
+            "type": "system", "subtype": "compact_boundary",
+            "content": "Conversation compacted", "compactMetadata": meta
+        })
+        .to_string()
+    }
+
+    fn claude_context(rows: &[String]) -> Option<SessionContextUsage> {
+        let home = TempDir::new().unwrap();
+        write_transcript(
+            home.path(),
+            ".claude/projects/p/claude-ctx.jsonl",
+            format!("{}\n", rows.join("\n")).as_bytes(),
+        );
+        let snap = DiscoveryStoreSnapshot::default();
+        read_session_context_usage_from_snapshot("claude-ctx", &snap, Some(home.path()))
+    }
+
+    fn used(rows: &[String]) -> Option<u64> {
+        claude_context(rows).map(|u| u.used_tokens)
+    }
+
+    #[test]
+    fn claude_context_after_compaction_is_the_boundary_post_tokens() {
+        // The reported case: a 746,687-token turn, then a compaction down to 21,546.
+        let usage = claude_context(&[
+            assistant_usage_row(700_000, 46_687),
+            boundary_row(Some(21_546)),
+        ])
+        .unwrap();
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 21_546,
+                max_tokens: 1_000_000,
+            }
+        );
+        // Rows after the boundary that carry no usage do not bring the old figure back.
+        assert_eq!(
+            used(&[
+                assistant_usage_row(700_000, 46_687),
+                boundary_row(Some(21_546)),
+                claude_user_row(serde_json::json!("go on")),
+            ]),
+            Some(21_546)
+        );
+    }
+
+    #[test]
+    fn claude_context_latest_of_assistant_usage_and_boundary_wins() {
+        assert_eq!(
+            used(&[
+                assistant_usage_row(700_000, 46_687),
+                boundary_row(Some(21_546)),
+                assistant_usage_row(30_000, 500),
+            ]),
+            Some(30_500)
+        );
+        // A second compaction wins over the turn before it.
+        assert_eq!(
+            used(&[
+                boundary_row(Some(21_546)),
+                assistant_usage_row(300_000, 1_000),
+                boundary_row(Some(9_000)),
+            ]),
+            Some(9_000)
+        );
+        // A boundary before any usage is the only answer there is.
+        assert_eq!(used(&[boundary_row(Some(4_321))]), Some(4_321));
+    }
+
+    #[test]
+    fn claude_context_ignores_a_boundary_without_post_tokens() {
+        for boundary in [boundary_row(Some(0)), boundary_row(None)] {
+            assert_eq!(
+                used(&[assistant_usage_row(700_000, 46_687), boundary]),
+                Some(746_687)
+            );
+        }
+        // Nothing older to fall back on: no figure.
+        assert_eq!(used(&[boundary_row(None)]), None);
+        assert_eq!(used(&[boundary_row(Some(0))]), None);
+        // A wrong type does not count either.
+        let stringy = serde_json::json!({
+            "type": "system", "subtype": "compact_boundary",
+            "compactMetadata": {"postTokens": "21546"}
+        })
+        .to_string();
+        assert_eq!(used(&[assistant_usage_row(1_000, 5), stringy]), Some(1_005));
+    }
+
+    #[test]
+    fn claude_context_skips_sidechain_rows_and_quoted_boundaries() {
+        let mut side_boundary: Value = serde_json::from_str(&boundary_row(Some(77))).unwrap();
+        side_boundary["isSidechain"] = serde_json::json!(true);
+        let mut side_usage: Value = serde_json::from_str(&assistant_usage_row(5, 5)).unwrap();
+        side_usage["isSidechain"] = serde_json::json!(true);
+        // An assistant turn that merely talks about a boundary is not one.
+        let quoting = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": "the compact_boundary row has compactMetadata",
+                        "usage": {"input_tokens": 40, "output_tokens": 2}}
+        })
+        .to_string();
+        assert_eq!(
+            used(&[
+                assistant_usage_row(700_000, 46_687),
+                side_boundary.to_string(),
+                side_usage.to_string(),
+            ]),
+            Some(746_687)
+        );
+        assert_eq!(used(&[boundary_row(Some(21_546)), quoting]), Some(42));
+        // Unparseable candidate lines are skipped.
+        assert_eq!(
+            used(&[
+                assistant_usage_row(10, 1),
+                "{\"subtype\":\"compact_boundary\" broken".to_string(),
+            ]),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn session_context_usage_in_discovery_reflects_a_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let project = home.join(".claude").join("projects").join("p");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "claude-compacted-sess";
+        let transcript = [
+            assistant_usage_row(700_000, 46_687),
+            boundary_row(Some(21_546)),
+        ]
+        .join("\n");
+        fs::write(project.join(format!("{session_id}.jsonl")), transcript).unwrap();
+        write_routes(
+            home,
+            &[(
+                "kayla",
+                &format!(
+                    r#"{{"kind":"claude","pid":1,"session_id":"{session_id}","socket_path":"{}"}}"#,
+                    home.join("c.sock").display()
+                ),
+            )],
+        );
+        let sessions = discover_in(home);
+        assert_eq!(
+            session_for(&sessions, "kayla").context_usage,
+            Some(SessionContextUsage {
+                used_tokens: 21_546,
+                max_tokens: 1_000_000,
+            })
         );
     }
 }
