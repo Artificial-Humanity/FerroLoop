@@ -337,9 +337,10 @@ pub fn parse_http_request(buf: &[u8]) -> Result<Option<(HttpRequest, usize)>, St
 pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let resp = route_http_request(state, req);
     if req.method != "GET" && req.method != "HEAD" {
-        // A request that may have written the store: the next discovery read takes a fresh
-        // snapshot, so the caller sees its own change.
+        // A request that may have written the store: the next discovery or watch read takes a
+        // fresh snapshot, so the caller sees its own change.
         state.discovery_snapshots.invalidate();
+        state.watch_caches.invalidate();
     }
     resp
 }
