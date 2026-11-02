@@ -91,7 +91,7 @@ export interface AuthSessionResponse {
 ```
 
 - **Auto-Pairing Support:** When `FerroDeck` loads with `?pair=<code>` or `/pair?code=<code>` (the URL printed by `fl hub pair`), `App.tsx` automatically POSTs `{ code }` to `POST /api/v1/auth/pair`, receives the `fl_hub_session` `HttpOnly; SameSite=Strict` cookie (and `session_token`), strips the one-time query parameter from the URL bar via `history.replaceState`, and enters authenticated `Owner` mode.
-- **Manual Pairing / Token Modal (`PairingModal.tsx`):** If `GET /api/v1/auth/session` returns `401 Unauthorized`, `FerroDeck` displays a pairing dialog where the owner can paste either a 10-minute `fl hub pair` code or an owner/peer bearer token.
+- **Manual Pairing / Token Modal (`PairingModal.tsx`):** If `GET /api/v1/auth/session` returns `401 Unauthorized`, `FerroDeck` displays a pairing dialog where the owner can paste either a 1-hour `fl hub pair` code or an owner/peer bearer token.
 
 ### 2.2 Agents, Liveness, and Sessions (`crates/hub/src/discovery.rs`, `api.rs`)
 

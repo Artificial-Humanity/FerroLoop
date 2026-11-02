@@ -41,12 +41,12 @@ pub enum HubCmd {
         #[arg(long)]
         no_terminal: bool,
     },
-    /// Mint a single-use 10-minute pairing code and URL in the workspace store.
+    /// Mint a single-use 1-hour pairing code and URL in the workspace store.
     Pair {
         /// Base URL of the Hub server (defaults to `http://<listen>`).
         #[arg(long)]
         url: Option<String>,
-        /// Pairing code time-to-live in seconds (defaults to 600).
+        /// Pairing code time-to-live in seconds (defaults to 3600).
         #[arg(long, default_value_t = DEFAULT_PAIRING_TTL_SECS)]
         ttl_secs: u64,
         /// Format output as JSON.
