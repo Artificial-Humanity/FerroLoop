@@ -475,9 +475,13 @@ fn build_step_options(
 ) -> StepExecutionOptions {
     // No `--adapter` runs the step's own (default Claude). A name that is not one of the five
     // CLIs is a vendor, and `[adapters.*]` (the CLIs' binary and rate card) is not lent to it.
+    // The registry compares ids without case, so `Claude` is the CLI `claude` here as it is for
+    // the executor (see `Target::resolve`).
     let resolved_kind = match adapter.as_deref() {
         None => Some(AdapterKind::Claude),
-        Some(name) => AdapterKind::from_wire(name),
+        Some(name) => AdapterKind::from_wire(name).or_else(|| {
+            fl_core::lookup_vendor(name).and_then(|vendor| AdapterKind::from_wire(&vendor.id))
+        }),
     };
     let binary_override = binary.or_else(|| {
         adapters
@@ -1267,5 +1271,56 @@ pub fn run(
             }
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(adapter: Option<&str>) -> StepExecutionOptions {
+        let cfg = AdapterConfig {
+            binary: Some("/opt/claude-bin".into()),
+            input_usd_micros_per_mtok: Some(3),
+            output_usd_micros_per_mtok: Some(15),
+        };
+        let adapters = BTreeMap::from([(AdapterKind::Claude, cfg)]);
+        build_step_options(
+            None,
+            adapter.map(str::to_string),
+            None,
+            false,
+            60,
+            "owner".into(),
+            &adapters,
+        )
+    }
+
+    #[test]
+    fn an_adapter_name_in_any_case_gets_the_clis_binary_and_rate_card() {
+        for name in [None, Some("claude"), Some("Claude"), Some("CLAUDE")] {
+            let opts = options(name);
+            assert_eq!(
+                opts.binary_override.as_deref(),
+                Some("/opt/claude-bin"),
+                "{name:?}"
+            );
+            let card = opts.rate_card.expect("the rate card");
+            assert_eq!(
+                (
+                    card.input_usd_micros_per_mtok,
+                    card.output_usd_micros_per_mtok
+                ),
+                (3, 15),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vendor_that_is_not_one_of_the_five_clis_is_not_lent_their_settings() {
+        let opts = options(Some("kimi-api"));
+        assert_eq!(opts.binary_override, None);
+        assert!(opts.rate_card.is_none());
     }
 }
