@@ -514,6 +514,43 @@ impl RouteTable {
         self.discover_codex_routes(&home, &at);
         self.discover_muse_routes(&home, home_override.is_some(), &at);
         self.discover_grok_routes(&home, check_proc, &at);
+        self.discover_scanner_routes(&home, &at);
+    }
+
+    /// Merge the routes of every scanner registered with
+    /// [`register_wire_scanner`](crate::scanner::register_wire_scanner), after the built-in scans.
+    ///
+    /// A scanner never shadows a route a built-in scan or an earlier scanner produced for the
+    /// same agent name. The one entry it may replace is a [`VendorRoute::Webhook`] route left in
+    /// the table by an earlier pass (the only kind a scanner can produce), so a scanner can
+    /// refresh its own route. A scanner that panics is skipped for this pass.
+    fn discover_scanner_routes(&mut self, home: &Path, at: &At) {
+        let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (vendor_id, scanner) in crate::scanner::registered_scanners() {
+            let found =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.discover(home)));
+            let Ok(found) = found else {
+                eprintln!("fl-wire: route scanner `{vendor_id}` panicked; skipped for this pass");
+                continue;
+            };
+            for (agent, route) in found {
+                let Some(name) = normalize_persona(&agent) else {
+                    continue;
+                };
+                if !crate::scanner::scanner_route_is_valid(&route) || claimed.contains(&name) {
+                    continue;
+                }
+                match self.entries.get(&name).map(|e| &e.route) {
+                    None | Some(VendorRoute::Webhook { .. }) => {}
+                    Some(_) => continue,
+                }
+                claimed.insert(name.clone());
+                if self.entries.get(&name).is_some_and(|e| e.route == route) {
+                    continue;
+                }
+                self.upsert(&name, route, at.clone());
+            }
+        }
     }
 
     fn discover_claude_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
