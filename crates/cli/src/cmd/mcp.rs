@@ -670,7 +670,7 @@ fn declare_targets(vendors: &[VendorDescriptor]) -> Result<()> {
         let key = vendor::target_file_key(file);
         if key == ".fl" || key.starts_with(".fl/") {
             bail!(
-                "vendor `{}`: its MCP file `{file}` is under `.fl/`, which holds fl's own state;                  choose a file outside it",
+                "vendor `{}`: its MCP file `{file}` is under `.fl/`, which holds fl's own state; choose a file outside it",
                 d.id
             );
         }
