@@ -8,15 +8,24 @@
 //!    provisioned and unexpired. Secret values are never read, only metadata;
 //! 3. local inference engines (Ollama, Lemonade) on loopback: reachability, latency and models.
 //!
+//! The matrix also carries `vendor_quotas`: the account allowance of each vendor (see
+//! [`QuotaSource`]), and every CLI row says whether it can update itself (`update_supported`,
+//! `update_command`; see [`crate::runtime_update`], which serves `POST /api/v1/runtimes/update`).
+//!
 //! Every probe is bounded. The three tiers and every item inside them run concurrently, so the
 //! worst case is one probe timeout, not the sum of all of them. Probing is owner only and goes
 //! through a [`ProbeGate`]: one probe at a time, and a fresh result is served again.
+//!
+//! The quota reads are the slow part (each cold read may run a CLI or a network call), so they have
+//! a wall-clock budget of their own ([`QUOTA_BUDGET`]): a vendor that is not read in time is left
+//! out of `vendor_quotas`, and every reading is kept for 30 s ([`QuotaCache`]).
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport};
@@ -28,9 +37,12 @@ use serde_json::{Value, json};
 use crate::HubState;
 use crate::api::{HttpRequest, HttpResponse};
 use crate::auth::HubAuthority;
+use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
-    DiscoveredSessionSummary, discover_route_sessions_without_model_info, snapshot_discovery_store,
+    DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
+    quota_for_resolved_route, quota_for_resolved_route_at, snapshot_discovery_store,
 };
+use crate::runtime_update::update_command;
 
 /// Subscription CLI runtimes, in display order.
 pub const CLI_RUNTIMES: [&str; 5] = ["claude", "codex", "grok", "agy", "muse"];
@@ -44,7 +56,7 @@ pub const VAULT_PROVIDERS: [(&str, &str); 6] = [
     ("kimi", "MOONSHOT_API_KEY"),
 ];
 
-const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCAL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PROBE_OUTPUT: usize = 4096;
 const MAX_LOCAL_BODY: usize = 256 * 1024;
@@ -53,6 +65,11 @@ const MAX_TARGET_LEN: usize = 64;
 /// A probe result younger than this is served again for the same target, so a burst of requests
 /// spawns each CLI once.
 const PROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// The most wall-clock time one matrix build spends waiting for vendor quota reads. A vendor whose
+/// read is not done by then is left out of `vendor_quotas` (its read finishes in the background).
+pub(crate) const QUOTA_BUDGET: Duration = Duration::from_secs(4);
+/// How long a vendor's quota reading is served again by [`QuotaCache`].
+const QUOTA_CACHE_TTL_MS: u64 = 30_000;
 
 /// Loopback inference engine to probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +122,12 @@ pub struct CliRuntimeStatus {
     pub active_routes: usize,
     pub live_sessions: usize,
     pub probe_ms: u64,
+    /// Whether the CLI has a self-update command `POST /api/v1/runtimes/update` can run. Fixed
+    /// per runtime, whether or not the binary is installed.
+    pub update_supported: bool,
+    /// The update command as shown to a person (for example `claude update`); `None` when
+    /// `update_supported` is false.
+    pub update_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,6 +215,9 @@ pub struct RuntimeMatrix {
     /// The registered vendor catalog, sorted by id. Descriptor data only: no key value, and no
     /// probe result.
     pub vendors: Vec<VendorCatalogEntry>,
+    /// Account allowance per vendor adapter (`claude`, `codex`, `grok`, `antigravity`, `muse`),
+    /// for the CLI runtimes the probe selected. A vendor whose allowance is unknown has no entry.
+    pub vendor_quotas: BTreeMap<String, SessionQuotaUsage>,
     /// Vault failure (for example an unreadable vault file). The tier is then empty of
     /// `provisioned` secrets rather than the whole matrix failing.
     pub vault_error: Option<String>,
@@ -205,6 +231,255 @@ pub struct ProbeInputs {
     pub vault: Result<Vec<VaultSecretMetadata>, String>,
     pub local_engines: Vec<LocalEngineSpec>,
     pub now_ms: u64,
+    /// The hub's `home_override` (a sandboxed hub, such as a test's), as the quota readers need it:
+    /// `None` lets them read the real home.
+    pub home_override: Option<PathBuf>,
+    pub quota_source: QuotaSource,
+    /// Wall-clock budget for the whole quota phase (see [`QUOTA_BUDGET`]).
+    pub quota_budget: Duration,
+    /// Recent vendor readings, so repeated reads do not repeat the quota sources.
+    pub quota_cache: Arc<QuotaCache>,
+}
+
+/// Vendor quota readings by `(home_override, adapter)`, each served for
+/// [`QUOTA_CACHE_TTL_MS`] after it was read (by `ProbeInputs::now_ms`, so a test sets the clock).
+/// A reading that found nothing is cached too: the cold read is the expensive part. A reading that
+/// misses the quota budget is stored when it finishes.
+#[derive(Debug, Default)]
+pub struct QuotaCache {
+    entries: Mutex<QuotaEntries>,
+}
+
+/// `(home_override, adapter)` to `(read at ms, reading)`.
+type QuotaEntries = BTreeMap<(Option<PathBuf>, String), (u64, Option<SessionQuotaUsage>)>;
+
+impl QuotaCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QuotaEntries> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `Some(reading)` while the entry is fresh at `now_ms`.
+    fn get(
+        &self,
+        home: &Option<PathBuf>,
+        adapter: &str,
+        now_ms: u64,
+    ) -> Option<Option<SessionQuotaUsage>> {
+        let entries = self.lock();
+        let (at, reading) = entries.get(&(home.clone(), adapter.to_string()))?;
+        (now_ms.saturating_sub(*at) < QUOTA_CACHE_TTL_MS).then(|| reading.clone())
+    }
+
+    fn put(
+        &self,
+        home: &Option<PathBuf>,
+        adapter: &str,
+        now_ms: u64,
+        reading: Option<SessionQuotaUsage>,
+    ) {
+        self.lock()
+            .insert((home.clone(), adapter.to_string()), (now_ms, reading));
+    }
+}
+
+/// What one vendor's quota read needs, owned so the read can outlive the matrix build that
+/// started it.
+struct QuotaInputs {
+    sessions: Vec<DiscoveredSessionSummary>,
+    home_override: Option<PathBuf>,
+    quota_source: QuotaSource,
+    now_ms: u64,
+}
+
+/// How the matrix reads a vendor's account allowance. The readers are plain functions so a test
+/// can supply its own and never reach the host.
+#[derive(Clone, Copy)]
+pub struct QuotaSource {
+    /// The allowance a discovered route session reports (its transcript, and the account).
+    pub session: fn(&DiscoveredSessionSummary, Option<&Path>) -> Option<SessionQuotaUsage>,
+    /// The account allowance of an adapter that no session reports.
+    pub account: fn(&str, Option<&Path>) -> Option<SessionQuotaUsage>,
+}
+
+impl QuotaSource {
+    /// The host's readers, which the direct-quota caches bound (60 s, 3 s per cold probe).
+    pub const HOST: Self = Self {
+        session: host_session_quota,
+        account: host_account_quota,
+    };
+    /// Reads nothing.
+    pub const NONE: Self = Self {
+        session: |_, _| None,
+        account: |_, _| None,
+    };
+}
+
+fn host_session_quota(
+    session: &DiscoveredSessionSummary,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route(
+        &session.adapter,
+        session.transcript_path.as_deref(),
+        home_override,
+        &session.id,
+    )
+}
+
+/// The account probe `GET /api/v1/watch/balance` uses: no session, so no route, model or
+/// conversation id.
+fn host_account_quota(adapter: &str, home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
+    quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+}
+
+/// Route sessions per adapter whose allowance is read from disk, newest first. Bounds the cost
+/// of a probe on a host with many sessions.
+const MAX_QUOTA_SESSIONS_PER_ADAPTER: usize = 4;
+
+/// The adapter id discovery gives a session of the CLI runtime `cli`.
+fn quota_adapter(cli: &str) -> &str {
+    if cli == "agy" { "antigravity" } else { cli }
+}
+
+/// How many facts a quota reading holds; the reading with the most is the most useful. A window
+/// that reset before `now_ms` describes an allowance that no longer applies, so it counts for
+/// nothing.
+fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
+    let text = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let live = |w: &Option<crate::discovery::QuotaWindowUsage>| {
+        w.as_ref()
+            .is_some_and(|w| w.resets_at_ms.is_none_or(|reset| reset >= now_ms))
+    };
+    usize::from(text(&q.tier))
+        + usize::from(live(&q.primary_window))
+        + usize::from(live(&q.secondary_window))
+        + usize::from(text(&q.exhausted_reason))
+}
+
+/// The allowance of one vendor: the richest live reading among its sessions (the newest session
+/// wins a tie), else the account probe.
+fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
+    let home = inputs.home_override.as_deref();
+    let now_ms = inputs.now_ms;
+    let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
+        .sessions
+        .iter()
+        .filter(|s| s.adapter == adapter)
+        .collect();
+    // Newest first, and the sort is stable: among equally rich readings the first (newest) stays.
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
+    let mut best: Option<(usize, SessionQuotaUsage)> = None;
+    for session in sessions {
+        let reading = match &session.quota_usage {
+            Some(q) => Some(q.clone()),
+            None if session.source == "route" && reads_left > 0 => {
+                reads_left -= 1;
+                (inputs.quota_source.session)(session, home)
+            }
+            None => None,
+        };
+        let Some(reading) = reading else { continue };
+        let richness = quota_richness(&reading, now_ms);
+        if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
+            best = Some((richness, reading));
+        }
+    }
+    best.map(|(_, q)| q).or_else(|| {
+        (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q, now_ms) > 0)
+    })
+}
+
+/// Vendor quota reads in flight: [`start_vendor_quotas`] starts them, [`PendingQuotas::collect`]
+/// waits for them.
+struct PendingQuotas {
+    /// Readings already known (fresh in the cache).
+    quotas: BTreeMap<String, SessionQuotaUsage>,
+    rx: mpsc::Receiver<(String, Option<SessionQuotaUsage>)>,
+    pending: usize,
+    deadline: Instant,
+}
+
+impl PendingQuotas {
+    /// The readings that arrive before the deadline, with the cached ones. A vendor that misses the
+    /// deadline is omitted.
+    fn collect(mut self) -> BTreeMap<String, SessionQuotaUsage> {
+        for _ in 0..self.pending {
+            let left = self.deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok((adapter, Some(q))) => {
+                    self.quotas.insert(adapter, q);
+                }
+                Ok((_, None)) => {}
+                Err(_) => break,
+            }
+        }
+        self.quotas
+    }
+}
+
+/// Start every selected vendor's quota read, to be collected within `inputs.quota_budget` of
+/// wall-clock time from now. A fresh cached reading is used without a read. Each other vendor is
+/// read on its own thread, not scoped to the matrix build: one that misses the deadline is omitted,
+/// and its thread finishes later on its own (storing its reading in the cache) without holding the
+/// response.
+fn start_vendor_quotas(clis: &[&'static str], inputs: &ProbeInputs) -> PendingQuotas {
+    let deadline = Instant::now() + inputs.quota_budget;
+    let mut quotas: BTreeMap<String, SessionQuotaUsage> = BTreeMap::new();
+    let (tx, rx) = mpsc::channel::<(String, Option<SessionQuotaUsage>)>();
+    let mut pending = 0usize;
+    for cli in clis {
+        let adapter = quota_adapter(cli);
+        if let Some(cached) = inputs
+            .quota_cache
+            .get(&inputs.home_override, adapter, inputs.now_ms)
+        {
+            if let Some(q) = cached {
+                quotas.insert(adapter.to_string(), q);
+            }
+            continue;
+        }
+        let read_inputs = QuotaInputs {
+            sessions: inputs
+                .sessions
+                .iter()
+                .filter(|s| s.adapter == adapter)
+                .cloned()
+                .collect(),
+            home_override: inputs.home_override.clone(),
+            quota_source: inputs.quota_source,
+            now_ms: inputs.now_ms,
+        };
+        let cache = Arc::clone(&inputs.quota_cache);
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("quota-{adapter}"))
+            .spawn(move || {
+                let reading = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    vendor_quota(adapter, &read_inputs)
+                }))
+                .ok();
+                if let Some(reading) = &reading {
+                    cache.put(
+                        &read_inputs.home_override,
+                        adapter,
+                        read_inputs.now_ms,
+                        reading.clone(),
+                    );
+                }
+                // The receiver is gone once the budget ran out: a late reading has nowhere to go.
+                let _ = tx.send((adapter.to_string(), reading.flatten()));
+            });
+        if spawned.is_ok() {
+            pending += 1;
+        }
+    }
+    PendingQuotas {
+        quotas,
+        rx,
+        pending,
+        deadline,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +607,9 @@ fn select(target: Option<&str>, engines: &[LocalEngineSpec]) -> Result<Selection
 /// Run the selected probes. Unknown `target` is an error; no target selects everything.
 pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<RuntimeMatrix, String> {
     let sel = select(target, &inputs.local_engines)?;
+    // Started first and collected last, so the reads run beside the CLI and engine probes and the
+    // whole build waits for them no longer than the quota budget.
+    let pending_quotas = start_vendor_quotas(&sel.cli, inputs);
     let (cli_runtimes, local_engines) = std::thread::scope(|scope| {
         let cli_handles: Vec<_> = sel
             .cli
@@ -355,6 +633,7 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
             .collect();
         (cli, local)
     });
+    let vendor_quotas = pending_quotas.collect();
     let (vault_providers, vault_error) = match &inputs.vault {
         Ok(meta) => (vault_statuses(&sel.vault, meta, inputs.now_ms), None),
         Err(err) => (
@@ -368,6 +647,7 @@ pub fn build_matrix(inputs: &ProbeInputs, target: Option<&str>) -> Result<Runtim
         vault_providers,
         local_engines,
         vendors: sel.vendors.iter().map(VendorCatalogEntry::of).collect(),
+        vendor_quotas,
         vault_error,
     })
 }
@@ -382,6 +662,8 @@ fn panicked_cli(name: &str) -> CliRuntimeStatus {
         active_routes: 0,
         live_sessions: 0,
         probe_ms: 0,
+        update_command: update_command(name),
+        update_supported: update_command(name).is_some(),
     }
 }
 
@@ -398,14 +680,18 @@ fn panicked_local(spec: &LocalEngineSpec) -> LocalEngineStatus {
 
 // ---------------------------------------------------------------- tier 1: CLI runtimes
 
-/// First executable `name` in `path_env` directories, then `<home>/.local/bin`.
+/// First executable `name` in `path_env` directories, then `<home>/.local/bin`. A relative
+/// directory is skipped (it would resolve against whatever the hub's working directory is), and
+/// so is a relative home.
 pub fn find_binary(name: &str, path_env: &str, home: Option<&Path>) -> Option<PathBuf> {
     let from_path = path_env
         .split(':')
         .filter(|dir| !dir.is_empty())
         .map(|dir| Path::new(dir).join(name));
     let from_home = home.map(|h| h.join(".local").join("bin").join(name));
-    from_path.chain(from_home).find(|p| is_executable_file(p))
+    from_path
+        .chain(from_home)
+        .find(|p| p.is_absolute() && is_executable_file(p))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -447,6 +733,8 @@ fn probe_cli(name: &str, inputs: &ProbeInputs, timeout: Duration) -> CliRuntimeS
         active_routes,
         live_sessions,
         probe_ms: 0,
+        update_command: update_command(name),
+        update_supported: update_command(name).is_some(),
     };
     match find_binary(name, &inputs.path_env, inputs.home.as_deref()) {
         None => status.error = Some(format!("`{name}` not found in PATH or ~/.local/bin")),
@@ -543,7 +831,7 @@ fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Strin
 /// that still owns its pid, so `kill_group` can signal `-pid` knowing no other process holds that
 /// id; once a leader is reaped (`try_wait`, `wait`) and its group is empty, the id can be reused.
 #[cfg(unix)]
-fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+pub(crate) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
     // SAFETY: `waitid` with `WNOHANG | WNOWAIT` only fills `info` and leaves the child waitable;
     // an all-zero `siginfo_t` is a valid value to pass in. `si_pid` stays 0 while the child runs.
     unsafe {
@@ -562,13 +850,13 @@ fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
 }
 
 #[cfg(not(unix))]
-fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+pub(crate) fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
     child.try_wait().map(|status| status.is_some())
 }
 
 /// SIGKILL the child's process group, then reap the child. Call it only while the leader is
 /// unreaped, so `-pid` still names the child's own group.
-fn kill_group(
+pub(crate) fn kill_group(
     pid: u32,
     child: &mut std::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
@@ -735,7 +1023,7 @@ fn parse_model_ids(kind: LocalEngineKind, body: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn elapsed_ms(since: Instant) -> u64 {
+pub(crate) fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -774,6 +1062,12 @@ impl Drop for Running<'_> {
 impl ProbeGate {
     fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forget the last result, so the next probe runs again. A CLI update calls this: the
+    /// versions the last result holds are out of date.
+    pub(crate) fn invalidate(&self) {
+        self.lock().last = None;
     }
 
     /// Serve `target` from the last result, refuse while another probe runs, or run `probe` and
@@ -830,6 +1124,26 @@ pub(crate) fn vault_metadata(
         .map_err(|e| e.to_string())
 }
 
+/// Where this hub looks for the vendor CLIs: the `PATH` directories, and the home whose
+/// `.local/bin` is searched after them.
+///
+/// A hub with a `home_override` is sandboxed (its tests): it looks only under that home's
+/// `.local/bin`, never on the host's PATH, so a probe cannot run (and write the state of) the
+/// real `claude`, `codex`, `grok`, `agy` or `muse` of whoever runs it.
+pub(crate) fn cli_search_paths(state: &HubState) -> (String, Option<PathBuf>) {
+    let home = state
+        .config
+        .home_override
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let path_env = if state.config.home_override.is_some() {
+        String::new()
+    } else {
+        std::env::var("PATH").unwrap_or_default()
+    };
+    (path_env, home)
+}
+
 pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
     // Snapshot under the store guard, then drop it before any filesystem or network probing.
     let snapshot = match state.open_store() {
@@ -841,24 +1155,12 @@ pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpRespons
             ));
         }
     };
-    let home = state
-        .config
-        .home_override
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let (path_env, home) = cli_search_paths(state);
     let sessions = discover_route_sessions_without_model_info(
         &snapshot,
         state.config.home_override.as_deref(),
     );
     let vault = vault_metadata(state.config.home_override.as_deref());
-    // A hub with a `home_override` is sandboxed (its tests): it looks for the vendor CLIs only
-    // under that home's `.local/bin`, never on the host's PATH, so a probe cannot run (and
-    // write the state of) the real `claude`, `codex`, `grok`, `agy` or `muse` of whoever runs it.
-    let path_env = if state.config.home_override.is_some() {
-        String::new()
-    } else {
-        std::env::var("PATH").unwrap_or_default()
-    };
     Ok(ProbeInputs {
         path_env,
         home,
@@ -866,6 +1168,10 @@ pub(crate) fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpRespons
         vault,
         local_engines: default_local_engines(),
         now_ms: stamp::now().unix_millis(),
+        home_override: state.config.home_override.clone(),
+        quota_source: QuotaSource::HOST,
+        quota_budget: QUOTA_BUDGET,
+        quota_cache: Arc::clone(&state.quota_cache),
     })
 }
 
@@ -996,6 +1302,10 @@ mod tests {
             vault: Ok(Vec::new()),
             local_engines: Vec::new(),
             now_ms: 1_800_000_000_000,
+            home_override: None,
+            quota_source: QuotaSource::NONE,
+            quota_budget: QUOTA_BUDGET,
+            quota_cache: Arc::default(),
         }
     }
 
@@ -1607,5 +1917,389 @@ mod tests {
                 .to_string()
                 .contains("MOONSHOT_API_KEY")
         );
+    }
+
+    // ------------------------------------------------------------ vendor quotas
+
+    use crate::discovery::QuotaWindowUsage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn window(used: f64, minutes: u64) -> QuotaWindowUsage {
+        QuotaWindowUsage {
+            used_percent: used,
+            window_minutes: Some(minutes),
+            resets_at_ms: Some(1_800_000_600_000),
+        }
+    }
+
+    fn quota(
+        tier: Option<&str>,
+        primary: Option<f64>,
+        secondary: Option<f64>,
+    ) -> SessionQuotaUsage {
+        SessionQuotaUsage {
+            tier: tier.map(str::to_string),
+            primary_window: primary.map(|u| window(u, 300)),
+            secondary_window: secondary.map(|u| window(u, 10_080)),
+            exhausted_reason: None,
+        }
+    }
+
+    fn quota_session(
+        adapter: &str,
+        id: &str,
+        updated_at: &str,
+        q: Option<SessionQuotaUsage>,
+    ) -> DiscoveredSessionSummary {
+        let mut s = session(adapter, "route", "active");
+        s.id = id.to_string();
+        s.updated_at = Some(updated_at.to_string());
+        s.quota_usage = q;
+        s
+    }
+
+    fn only_cli(inp: &ProbeInputs, target: &str) -> RuntimeMatrix {
+        build_matrix(inp, Some(target)).unwrap()
+    }
+
+    #[test]
+    fn a_vendor_quota_is_the_richest_session_reading_and_the_account_is_not_probed() {
+        static ACCOUNT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                ACCOUNT_CALLS.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        };
+        inp.sessions = vec![
+            // Newest, but it knows only the tier.
+            quota_session(
+                "claude",
+                "c-new",
+                "2026-11-02T10:00:00Z",
+                Some(quota(Some("max"), None, None)),
+            ),
+            // Older, with both windows: the most data wins.
+            quota_session(
+                "claude",
+                "c-old",
+                "2026-11-01T10:00:00Z",
+                Some(quota(Some("max"), Some(40.0), Some(10.0))),
+            ),
+            quota_session(
+                "codex",
+                "x1",
+                "2026-11-01T10:00:00Z",
+                Some(quota(None, Some(5.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "claude");
+        let claude = &m.vendor_quotas["claude"];
+        assert_eq!(claude.primary_window.as_ref().unwrap().used_percent, 40.0);
+        assert_eq!(claude.secondary_window.as_ref().unwrap().used_percent, 10.0);
+        // A target selects its own vendor only.
+        assert_eq!(m.vendor_quotas.keys().collect::<Vec<_>>(), ["claude"]);
+        assert_eq!(ACCOUNT_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn equally_rich_readings_resolve_to_the_newest_session() {
+        let mut inp = inputs("", None);
+        inp.sessions = vec![
+            quota_session(
+                "codex",
+                "older",
+                "2026-11-01T10:00:00Z",
+                Some(quota(None, Some(90.0), None)),
+            ),
+            quota_session(
+                "codex",
+                "newer",
+                "2026-11-02T10:00:00Z",
+                Some(quota(None, Some(12.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "codex");
+        assert_eq!(
+            m.vendor_quotas["codex"]
+                .primary_window
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            12.0
+        );
+    }
+
+    #[test]
+    fn a_route_session_with_no_reading_is_read_from_disk_but_only_a_route_and_only_a_few() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |s, _| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                (s.id == "route-3").then(|| quota(Some("pro"), Some(7.0), Some(1.0)))
+            },
+            account: |_, _| None,
+        };
+        inp.sessions = (0..8)
+            .map(|i| {
+                quota_session(
+                    "grok",
+                    &format!("route-{i}"),
+                    &format!("2026-11-0{}T00:00:00Z", i + 1),
+                    None,
+                )
+            })
+            .collect();
+        let mut attempt = session("grok", "attempt", "running");
+        attempt.updated_at = Some("2026-12-01T00:00:00Z".into());
+        inp.sessions.push(attempt);
+        let m = only_cli(&inp, "grok");
+        // Newest first: route-7, 6, 5, 4 are read and hold nothing, so route-3 is out of reach.
+        assert_eq!(READS.load(Ordering::SeqCst), MAX_QUOTA_SESSIONS_PER_ADAPTER);
+        assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
+
+        READS.store(0, Ordering::SeqCst);
+        // The first result is cached: this is a different set of sessions.
+        inp.quota_cache = Arc::default();
+        inp.sessions
+            .retain(|s| s.id != "route-7" && s.id != "route-6");
+        let m = only_cli(&inp, "grok");
+        assert_eq!(m.vendor_quotas["grok"].tier.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn the_account_probe_fills_in_a_vendor_no_session_reports() {
+        static HOME_SEEN: Mutex<Option<Option<PathBuf>>> = Mutex::new(None);
+        static ADAPTERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let mut inp = inputs("", None);
+        inp.home_override = Some(PathBuf::from("/sandbox/home"));
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |adapter, home| {
+                ADAPTERS.lock().unwrap().push(adapter.to_string());
+                *HOME_SEEN.lock().unwrap() = Some(home.map(Path::to_path_buf));
+                (adapter == "antigravity").then(|| quota(Some("ultra"), Some(20.0), None))
+            },
+        };
+        // A claude session that reports nothing does not stop the account probe either.
+        inp.sessions = vec![quota_session("claude", "c", "2026-11-02T00:00:00Z", None)];
+        let m = build_matrix(&inp, Some("cli")).unwrap();
+        assert_eq!(m.vendor_quotas.keys().collect::<Vec<_>>(), ["antigravity"]);
+        assert_eq!(
+            m.vendor_quotas["antigravity"].tier.as_deref(),
+            Some("ultra")
+        );
+        let mut adapters = ADAPTERS.lock().unwrap().clone();
+        adapters.sort();
+        // `agy` is probed under its adapter id, once per selected vendor.
+        assert_eq!(adapters, ["antigravity", "claude", "codex", "grok", "muse"]);
+        // The sandboxed home reaches the reader: the real HOME is never consulted.
+        assert_eq!(
+            HOME_SEEN.lock().unwrap().clone(),
+            Some(Some(PathBuf::from("/sandbox/home")))
+        );
+    }
+
+    #[test]
+    fn a_reading_with_no_data_is_not_a_quota() {
+        static ACCOUNT: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                ACCOUNT.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("  "), None, None))
+            },
+        };
+        inp.sessions = vec![quota_session(
+            "muse",
+            "m",
+            "2026-11-02T00:00:00Z",
+            Some(quota(None, None, None)),
+        )];
+        let m = only_cli(&inp, "muse");
+        assert!(m.vendor_quotas.is_empty());
+        assert_eq!(
+            ACCOUNT.load(Ordering::SeqCst),
+            1,
+            "the empty session reading fell through"
+        );
+    }
+
+    #[test]
+    fn no_sessions_and_no_account_data_is_an_empty_map_that_still_serializes() {
+        let m = build_matrix(&inputs("", None), None).unwrap();
+        assert!(m.vendor_quotas.is_empty());
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["vendor_quotas"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_tier_that_selects_no_cli_runtime_reads_no_quota() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            account: |_, _| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("x"), Some(1.0), None))
+            },
+        };
+        inp.sessions = vec![quota_session("claude", "c", "2026-11-02T00:00:00Z", None)];
+        for target in ["vault", "local", "vendors", "openai"] {
+            let m = build_matrix(&inp, Some(target)).unwrap();
+            assert!(m.vendor_quotas.is_empty(), "{target}");
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_matrix_json_carries_vendor_quotas_and_update_capability() {
+        let mut inp = inputs("", None);
+        inp.sessions = vec![quota_session(
+            "claude",
+            "c",
+            "2026-11-02T00:00:00Z",
+            Some(quota(Some("max"), Some(40.0), Some(10.0))),
+        )];
+        let json = serde_json::to_value(build_matrix(&inp, None).unwrap()).unwrap();
+        let claude_quota = &json["vendor_quotas"]["claude"];
+        assert_eq!(claude_quota["tier"], "max");
+        assert_eq!(claude_quota["primary_window"]["used_percent"], 40.0);
+        assert_eq!(claude_quota["secondary_window"]["window_minutes"], 10_080);
+        assert!(claude_quota.get("exhausted_reason").is_none());
+
+        let cli = |name: &str| {
+            json["cli_runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        for name in ["claude", "codex", "grok", "agy"] {
+            let row = cli(name);
+            assert_eq!(row["update_supported"], true, "{name}");
+            assert_eq!(row["update_command"], format!("{name} update"), "{name}");
+        }
+        // Whether the binary is installed does not change what the CLI can do.
+        assert_eq!(cli("claude")["installed"], false);
+        let muse = cli("muse");
+        assert_eq!(muse["update_supported"], false);
+        assert_eq!(muse["update_command"], serde_json::Value::Null);
+    }
+
+    fn window_resetting(used: f64, resets_at_ms: u64) -> QuotaWindowUsage {
+        QuotaWindowUsage {
+            used_percent: used,
+            window_minutes: Some(300),
+            resets_at_ms: Some(resets_at_ms),
+        }
+    }
+
+    #[test]
+    fn a_window_that_already_reset_does_not_make_an_old_reading_richer() {
+        let mut inp = inputs("", None);
+        let past = inp.now_ms - 1;
+        let stale_but_rich = SessionQuotaUsage {
+            tier: None,
+            primary_window: Some(window_resetting(95.0, past)),
+            secondary_window: Some(window_resetting(80.0, past)),
+            exhausted_reason: None,
+        };
+        inp.sessions = vec![
+            quota_session("codex", "old", "2026-10-01T10:00:00Z", Some(stale_but_rich)),
+            quota_session(
+                "codex",
+                "new",
+                "2026-11-02T10:00:00Z",
+                Some(quota(None, Some(12.0), None)),
+            ),
+        ];
+        let m = only_cli(&inp, "codex");
+        let codex = &m.vendor_quotas["codex"];
+        assert_eq!(codex.primary_window.as_ref().unwrap().used_percent, 12.0);
+
+        // A reading that is stale all through is not a quota: the account probe is asked instead.
+        inp.sessions.truncate(1);
+        inp.quota_cache = Arc::default();
+        let m = only_cli(&inp, "codex");
+        assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
+    }
+
+    #[test]
+    fn a_slow_quota_source_is_left_out_and_does_not_hold_the_matrix() {
+        let mut inp = inputs("", None);
+        inp.quota_budget = Duration::from_millis(300);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |adapter, _| {
+                if adapter == "codex" {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                Some(quota(Some("pro"), Some(1.0), None))
+            },
+        };
+        let began = Instant::now();
+        let m = build_matrix(&inp, Some("cli")).unwrap();
+        let took = began.elapsed();
+        assert!(
+            took < Duration::from_millis(1200),
+            "the matrix waited {took:?} for a slow quota read"
+        );
+        assert_eq!(
+            m.vendor_quotas.keys().collect::<Vec<_>>(),
+            ["antigravity", "claude", "grok", "muse"]
+        );
+        assert_eq!(m.cli_runtimes.len(), CLI_RUNTIMES.len());
+        // The slow read finishes on its own and is kept for the next request.
+        let late = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            inp.quota_cache
+                .get(&inp.home_override, "codex", inp.now_ms)
+                .is_some()
+        });
+        assert!(late, "the late reading never reached the cache");
+        let began = Instant::now();
+        let again = build_matrix(&inp, Some("cli")).unwrap();
+        assert!(began.elapsed() < Duration::from_millis(1000));
+        assert!(again.vendor_quotas.contains_key("codex"));
+    }
+
+    #[test]
+    fn a_reading_is_served_from_the_cache_for_thirty_seconds_per_home_and_adapter() {
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        let mut inp = inputs("", None);
+        inp.quota_source = QuotaSource {
+            session: |_, _| None,
+            account: |_, _| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                Some(quota(Some("max"), Some(3.0), None))
+            },
+        };
+        let first = only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+        inp.now_ms += QUOTA_CACHE_TTL_MS - 1;
+        let second = only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 1, "served from the cache");
+        assert_eq!(first.vendor_quotas, second.vendor_quotas);
+
+        // Another home is another entry.
+        inp.home_override = Some(PathBuf::from("/sandbox/other"));
+        only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 2);
+
+        // Past the TTL the source is read again.
+        inp.home_override = None;
+        inp.now_ms += 2;
+        only_cli(&inp, "claude");
+        assert_eq!(READS.load(Ordering::SeqCst), 3);
     }
 }
