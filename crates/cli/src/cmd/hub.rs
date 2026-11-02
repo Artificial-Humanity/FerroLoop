@@ -262,7 +262,11 @@ fn hub_github(
     cfg: &crate::config::Config,
     get_env: impl Fn(&str) -> Option<String>,
 ) -> Result<fl_hub::github_pr::HubGithub, (i32, String)> {
-    let get = |k: &str| get_env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let get = |k: &str| {
+        get_env(k)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
     let api_url = match get("FL_GITHUB_API_URL") {
         None => None,
         Some(url) => {
@@ -1289,5 +1293,78 @@ mod tests {
             choose_hub_node_id(&empty, Some("Primary".to_string())).unwrap(),
             "primary"
         );
+    }
+
+    fn github_cfg() -> crate::config::Config {
+        use crate::config::{Config, Credential, Entry, GithubApp, TrackerBinding};
+        let entry = |name: &str, repo: Option<&str>| Entry {
+            name: Some(name.to_string()),
+            root: PathBuf::from(format!("/work/{name}")),
+            store: PathBuf::from(format!("/work/{name}.redb")),
+            tracker: repo.map(|r| TrackerBinding {
+                github: r.to_string(),
+                credential: Credential::Env,
+                ledger: None,
+            }),
+            state: None,
+        };
+        Config {
+            projects: vec![
+                entry("ferroloop", Some("Artificial-Humanity/FerroLoop")),
+                entry("local-only", None),
+            ],
+            github: Some(GithubApp {
+                app_id: 7,
+                private_key: PathBuf::from("/keys/app.pem"),
+                reviewer_ids: None,
+                reviewer_logins: None,
+            }),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn hub_github_binds_tracked_projects_and_reads_credentials() {
+        let none = |_: &str| None;
+        let g = hub_github(&github_cfg(), none).unwrap();
+        assert_eq!(
+            g.repos.get("ferroloop").map(String::as_str),
+            Some("Artificial-Humanity/FerroLoop")
+        );
+        assert!(!g.repos.contains_key("local-only"));
+        assert_eq!((g.app_id, g.token.as_deref()), (Some(7), None));
+        assert_eq!(g.private_key, Some(PathBuf::from("/keys/app.pem")));
+
+        // The environment wins for the App, and the first token variable that is set is the token.
+        let env = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("9".to_string()),
+            "FL_GITHUB_PRIVATE_KEY_PATH" => Some(" /env/key.pem ".to_string()),
+            "GITHUB_TOKEN" => Some(" tok ".to_string()),
+            "GH_TOKEN" => Some("other".to_string()),
+            _ => None,
+        };
+        let g = hub_github(&github_cfg(), env).unwrap();
+        assert_eq!(g.app_id, Some(9));
+        assert_eq!(g.private_key, Some(PathBuf::from("/env/key.pem")));
+        assert_eq!(g.token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn hub_github_refuses_a_credential_destination_that_is_not_https_or_loopback() {
+        let bad = |k: &str| (k == "FL_GITHUB_API_URL").then(|| "http://evil.example".to_string());
+        let (code, msg) = hub_github(&github_cfg(), bad).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("FL_GITHUB_API_URL"), "{msg}");
+        let ok = |k: &str| (k == "FL_GITHUB_API_URL").then(|| "http://127.0.0.1:9".to_string());
+        assert_eq!(
+            hub_github(&github_cfg(), ok).unwrap().api_url.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        let id = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("nope".to_string()),
+            "FL_GITHUB_PRIVATE_KEY_PATH" => Some("/k".to_string()),
+            _ => None,
+        };
+        assert_eq!(hub_github(&github_cfg(), id).unwrap_err().0, 2);
     }
 }
