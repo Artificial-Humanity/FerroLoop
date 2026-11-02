@@ -804,6 +804,28 @@ mod tests {
             fs::create_dir_all(home.join(dir).parent().unwrap()).unwrap();
             symlink(target, home.join(dir)).unwrap();
         }
+        // Skills that live outside every scanned dir and are reachable only through a link:
+        // one from the home into the workspace, one from the workspace into the home.
+        skill(
+            &ws.join("extras/ws-only"),
+            "ws-only",
+            "Only via a home link",
+        );
+        skill(
+            &home.join("stash/home-only"),
+            "home-only",
+            "Only via a workspace link",
+        );
+        symlink(
+            ws.join("extras/ws-only"),
+            home.join(".claude/skills/ws-only"),
+        )
+        .unwrap();
+        symlink(
+            home.join("stash/home-only"),
+            ws.join(".agents/skills/home-only"),
+        )
+        .unwrap();
         Layout {
             _tmp: tmp,
             ws,
@@ -838,8 +860,8 @@ mod tests {
                 "{want}: {names:?}"
             );
         }
-        // Built-ins still there, and nothing extra: 4 built-in skills + 4 discovered.
-        assert_eq!(names.len(), 8, "{names:?}");
+        // Built-ins still there, and nothing extra: 4 built-in skills + 6 discovered.
+        assert_eq!(names.len(), 10, "{names:?}");
         let described = |n: &str| {
             all.iter()
                 .find(|c| c.name == n && c.kind == "skill")
@@ -934,7 +956,7 @@ mod tests {
 
         let all = list_commands_with_home(&l.root, Some(&l.home));
         let names = skill_names(&all);
-        assert_eq!(names.len(), 8, "{names:?}");
+        assert_eq!(names.len(), 10, "{names:?}");
         assert!(!names.contains(&"evil"), "{names:?}");
         // The escape also fails when the link is the only route to the skill.
         let alone = discover_skills(&l.home.join(".claude/skills"));
