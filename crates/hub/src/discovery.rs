@@ -3008,11 +3008,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         let mut effective_role = role;
         if effective_role == "user" {
             let trimmed_raw = raw_joined.trim();
-            if obj.get("synthetic_reason").is_some()
-                || (trimmed_raw.starts_with("<user_info>") && trimmed_raw.ends_with("</user_info>"))
-                || (trimmed_raw.starts_with("<system-reminder>")
-                    && trimmed_raw.ends_with("</system-reminder>"))
-            {
+            if obj.get("synthetic_reason").is_some() || is_grok_scaffolding_turn(trimmed_raw) {
                 effective_role = "system".to_string();
             } else {
                 raw_joined = strip_grok_user_query_wrapper(&raw_joined);
@@ -3253,32 +3249,67 @@ fn handle_codex_rollout_line(
     }
 }
 
+/// Leading tags of the prompt scaffolding Grok writes as separate `user` rows: the
+/// `<user_info>` + `<rules>` preamble and `<system-reminder>` notices.
+const GROK_SCAFFOLDING_OPENERS: [&str; 4] =
+    ["<user_info>", "<rules>", "<user_rules", "<system-reminder>"];
+
+fn starts_with_grok_scaffolding(trimmed: &str) -> bool {
+    GROK_SCAFFOLDING_OPENERS
+        .iter()
+        .any(|tag| trimmed.starts_with(tag))
+}
+
+/// True for a Grok `user` row that is harness scaffolding, not an operator prompt: it opens
+/// with a scaffolding tag and carries no `<user_query>`. Only a leading tag counts, so a prompt
+/// that mentions `<rules>` mid-sentence is not scaffolding.
+fn is_grok_scaffolding_turn(trimmed: &str) -> bool {
+    !trimmed.contains("<user_query>") && starts_with_grok_scaffolding(trimmed)
+}
+
 fn strip_grok_user_query_wrapper(content: &str) -> String {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
     let trimmed = content.trim();
     let after_notice = trimmed
         .strip_prefix("The user sent a message while you were working:\n")
         .or_else(|| trimmed.strip_prefix("The user sent a message while you were working:\r\n"))
         .unwrap_or(trimmed)
         .trim_start();
-    if let Some(inner) = after_notice.strip_prefix("<user_query>") {
-        let without_close = inner
-            .trim_end()
-            .strip_suffix("</user_query>")
-            .unwrap_or(inner);
-        return without_close.trim().to_string();
-    }
-    content.to_string()
+    // Scaffolding and the prompt can share one message. The prompt is then the last
+    // `<user_query>` block and everything around it is scaffolding.
+    let inner = if let Some(inner) = after_notice.strip_prefix(OPEN) {
+        inner
+    } else if starts_with_grok_scaffolding(after_notice)
+        && let Some(at) = after_notice.rfind(OPEN)
+    {
+        &after_notice[at + OPEN.len()..]
+    } else {
+        return content.to_string();
+    };
+    // A truncated block has no close tag and keeps the rest of the text.
+    let body = match inner.rfind(CLOSE) {
+        Some(at) => &inner[..at],
+        None => inner,
+    };
+    body.trim().to_string()
 }
 
 /// Wrapper tags Antigravity puts around operator and notice turns.
-const AGY_WRAPPER_TAGS: [&str; 3] = ["user_request", "additional_metadata", "ephemeral_message"];
+const AGY_WRAPPER_TAGS: [&str; 5] = [
+    "user_request",
+    "additional_metadata",
+    "ephemeral_message",
+    "user_settings_change",
+    "context_summary",
+];
 
-/// Strip Antigravity `<USER_REQUEST>`, `<ADDITIONAL_METADATA>` and `<EPHEMERAL_MESSAGE>` wrappers
-/// from a user turn. Mirrors the UI's `stripAgyUserRequestWrapper`.
+/// Strip Antigravity `<USER_REQUEST>`, `<ADDITIONAL_METADATA>`, `<EPHEMERAL_MESSAGE>`,
+/// `<USER_SETTINGS_CHANGE>` and `<CONTEXT_SUMMARY>` wrappers from a user turn. Mirrors the UI's `stripAgyUserRequestWrapper`.
 ///
-/// Content that does not start with one of the three tags is returned unchanged, so a message
-/// that merely quotes a tag stays intact. Otherwise every `<ADDITIONAL_METADATA>` block is
-/// removed, every `<USER_REQUEST>` and `<EPHEMERAL_MESSAGE>` block is replaced by its trimmed
+/// Content that does not start with one of these tags is returned unchanged, so a message
+/// that merely quotes a tag stays intact. Otherwise every `<ADDITIONAL_METADATA>`,
+/// `<USER_SETTINGS_CHANGE>` and `<CONTEXT_SUMMARY>` block is removed, every `<USER_REQUEST>` and `<EPHEMERAL_MESSAGE>` block is replaced by its trimmed
 /// inner text, runs of three or more newlines become two, and the result is trimmed.
 pub(crate) fn strip_agy_user_request_wrapper(content: &str) -> String {
     if !starts_with_agy_wrapper_tag(content) {
@@ -3286,7 +3317,13 @@ pub(crate) fn strip_agy_user_request_wrapper(content: &str) -> String {
     }
     let (without_metadata, _) =
         replace_agy_blocks(content, "additional_metadata", |_| String::new());
-    let (without_request, _) = replace_agy_blocks(&without_metadata, "user_request", |inner| {
+    // Settings notices and compaction summaries go before `<USER_REQUEST>` so a summary that
+    // quotes a request tag cannot be mistaken for one.
+    let (without_settings, _) =
+        replace_agy_blocks(&without_metadata, "user_settings_change", |_| String::new());
+    let (without_summary, _) =
+        replace_agy_blocks(&without_settings, "context_summary", |_| String::new());
+    let (without_request, _) = replace_agy_blocks(&without_summary, "user_request", |inner| {
         inner.trim().to_string()
     });
     let (unwrapped, _) = replace_agy_blocks(&without_request, "ephemeral_message", |inner| {
@@ -3471,6 +3508,17 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     }
     let from_ephemeral = is_agy_ephemeral_message(content);
     let unwrapped = strip_agy_user_request_wrapper(content);
+    // An Antigravity turn that is only metadata, a settings notice or a compaction summary
+    // holds no operator text. A summary may quote `<USER_REQUEST>`, so a leading
+    // `<CONTEXT_SUMMARY>` decides on its own unless the turn also has a closed request.
+    if starts_with_agy_wrapper_tag(content) {
+        let lowered = content.trim_start().to_ascii_lowercase();
+        let is_summary_only =
+            lowered.starts_with("<context_summary>") && !lowered.contains("<user_request>");
+        if unwrapped.trim().is_empty() || is_summary_only {
+            return ("system".to_string(), unwrapped);
+        }
+    }
     let content = unwrapped.as_str();
     let trimmed_content = content.trim();
     let is_notice = trimmed_content.starts_with("[Notice] ");
@@ -4704,6 +4752,206 @@ mod tests {
             strip_agy_user_request_wrapper("<USER_REQUEST>\nno close"),
             "<USER_REQUEST>\nno close"
         );
+    }
+
+    fn grok_user_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "content": [{"type": "text", "text": text}]
+        })
+        .to_string()
+    }
+
+    const GROK_USER_INFO: &str = "<user_info>\nOS Version: linux\nWorkspace: /tmp/x\n</user_info>";
+    const GROK_RULES: &str =
+        "<rules>\n<user_rules description=\"r\">\nBe kind.\n</user_rules>\n</rules>";
+    const GROK_SKILLS: &str = "<system-reminder>\nThe following skills are available for use with the Skill tool:\n- a\n</system-reminder>";
+    const GROK_MCP: &str = "<system-reminder>\nMCP servers connected:\n- fl\n</system-reminder>";
+
+    fn grok_roles_and_content(texts: &[&str]) -> Vec<(String, String)> {
+        let jsonl = texts
+            .iter()
+            .map(|t| grok_user_line(t))
+            .collect::<Vec<_>>()
+            .join("\n");
+        parse_jsonl_transcript(&jsonl)
+            .into_iter()
+            .map(|t| (t.role, t.content))
+            .collect()
+    }
+
+    #[test]
+    fn grok_scaffolding_rows_are_system_never_operator() {
+        let preamble = format!("{GROK_USER_INFO}\n\n{GROK_RULES}");
+        // The preamble ends with `</rules>`, not `</user_info>`.
+        for text in [
+            preamble.as_str(),
+            GROK_SKILLS,
+            GROK_MCP,
+            GROK_RULES,
+            GROK_USER_INFO,
+        ] {
+            let turns = grok_roles_and_content(&[text]);
+            assert!(
+                turns.iter().all(|(role, _)| role != "user"),
+                "scaffolding became an operator turn: {turns:?}"
+            );
+        }
+        let turns = grok_roles_and_content(&[&preamble]);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].0, "system");
+        // A turn opening with `<user_rules` alone is scaffolding too.
+        let turns = grok_roles_and_content(&["<user_rules>\nBe kind.\n</user_rules>"]);
+        assert_eq!(turns[0].0, "system");
+        // The leading-whitespace case.
+        let turns = grok_roles_and_content(&[&format!("\n  {GROK_MCP}\n")]);
+        assert_eq!(turns[0].0, "system");
+    }
+
+    #[test]
+    fn grok_user_query_is_unwrapped_and_surrounding_scaffolding_removed() {
+        let query = "<user_query>\nFix the bug in foo.rs\n</user_query>";
+        let turns = grok_roles_and_content(&[query]);
+        assert_eq!(
+            turns,
+            vec![("user".to_string(), "Fix the bug in foo.rs".to_string())]
+        );
+
+        // Scaffolding and the prompt in one message.
+        let mixed =
+            format!("{GROK_USER_INFO}\n\n{GROK_RULES}\n\n{GROK_SKILLS}\n\n{query}\n\n{GROK_MCP}");
+        let turns = grok_roles_and_content(&[&mixed]);
+        assert_eq!(
+            turns,
+            vec![("user".to_string(), "Fix the bug in foo.rs".to_string())]
+        );
+
+        // The last block wins when several are present.
+        let two = format!(
+            "{GROK_SKILLS}\n<user_query>\nold\n</user_query>\n<user_query>\nnew\n</user_query>"
+        );
+        assert_eq!(strip_grok_user_query_wrapper(&two), "new");
+
+        // A truncated block keeps the rest of the text.
+        let cut = format!("{GROK_SKILLS}\n<user_query>\nhalf a prompt");
+        assert_eq!(strip_grok_user_query_wrapper(&cut), "half a prompt");
+        assert_eq!(
+            strip_grok_user_query_wrapper("<user_query>\nhalf a prompt"),
+            "half a prompt"
+        );
+        let turns = grok_roles_and_content(&[&cut]);
+        assert_eq!(
+            turns,
+            vec![("user".to_string(), "half a prompt".to_string())]
+        );
+
+        // A mid-run notice before the query is dropped too.
+        let notice =
+            "The user sent a message while you were working:\n<user_query>\nAlso x\n</user_query>";
+        assert_eq!(strip_grok_user_query_wrapper(notice), "Also x");
+    }
+
+    #[test]
+    fn grok_plain_prompts_and_mentions_of_tags_are_untouched() {
+        for text in [
+            "Please fix the build",
+            "Please look at the <rules> section of the doc",
+            "Why does <system-reminder> show up in my logs?",
+            "see <user_info> in the file",
+        ] {
+            let turns = grok_roles_and_content(&[text]);
+            assert_eq!(
+                turns,
+                vec![("user".to_string(), text.to_string())],
+                "{text}"
+            );
+            assert_eq!(strip_grok_user_query_wrapper(text), text);
+        }
+    }
+
+    #[test]
+    fn grok_full_four_row_turn_yields_one_clean_operator_turn() {
+        let preamble = format!("{GROK_USER_INFO}\n\n{GROK_RULES}");
+        let query = "<user_query>\nWhat changed today?\n</user_query>";
+        let turns = grok_roles_and_content(&[&preamble, GROK_SKILLS, query, GROK_MCP]);
+        let users: Vec<_> = turns.iter().filter(|(r, _)| r == "user").collect();
+        assert_eq!(users.len(), 1, "{turns:?}");
+        assert_eq!(users[0].1, "What changed today?");
+        assert!(
+            turns
+                .iter()
+                .filter(|(r, _)| r != "user")
+                .all(|(r, _)| r == "system"),
+            "{turns:?}"
+        );
+    }
+
+    #[test]
+    fn agy_settings_change_and_context_summary_are_stripped_and_system() {
+        let settings = "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from A to B\n</USER_SETTINGS_CHANGE>";
+        let meta = "<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>";
+
+        // A real request with trailing metadata + settings change renders just the request.
+        let raw = format!("<USER_REQUEST>\nPlease continue\n</USER_REQUEST>\n{meta}\n{settings}");
+        assert_eq!(strip_agy_user_request_wrapper(&raw), "Please continue");
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!(
+            (role.as_str(), content.as_str()),
+            ("user", "Please continue")
+        );
+
+        // Case-insensitive, as the other wrappers are.
+        let lower = "<user_request>\nhi\n</user_request>\n<user_settings_change>\nx\n</user_settings_change>";
+        assert_eq!(strip_agy_user_request_wrapper(lower), "hi");
+
+        // Metadata plus settings change and nothing else: system, empty.
+        let raw = format!("{meta}\n{settings}");
+        let (role, content) = normalize_system_turn("user", &raw);
+        assert_eq!((role.as_str(), content.as_str()), ("system", ""));
+        let (role, _) = normalize_system_turn("user", settings);
+        assert_eq!(role, "system");
+
+        // A compaction summary is a system turn, even when it quotes a request tag after
+        // the summary closed.
+        let summary = "<CONTEXT_SUMMARY>\nWe did things.\n</CONTEXT_SUMMARY>";
+        let (role, content) = normalize_system_turn("user", summary);
+        assert_eq!((role.as_str(), content.as_str()), ("system", ""));
+        let (role, _) =
+            normalize_system_turn("user", "<context_summary>\nlower\n</context_summary>");
+        assert_eq!(role, "system");
+        // An unclosed summary is still a system turn.
+        let (role, _) = normalize_system_turn("user", "<CONTEXT_SUMMARY>\ncut off, no close");
+        assert_eq!(role, "system");
+        // A summary followed by a real request keeps the request.
+        let both = format!("{summary}\n<USER_REQUEST>\nNext step\n</USER_REQUEST>");
+        let (role, content) = normalize_system_turn("user", &both);
+        assert_eq!((role.as_str(), content.as_str()), ("user", "Next step"));
+        // A summary quoting a request tag does not leak it.
+        let quoting =
+            "<CONTEXT_SUMMARY>\nUser asked <USER_REQUEST>x</USER_REQUEST>\n</CONTEXT_SUMMARY>";
+        let (role, content) = normalize_system_turn("user", quoting);
+        assert_eq!((role.as_str(), content.as_str()), ("system", ""));
+
+        // Quoted tags mid-text stay operator text.
+        let quoted = "Please explain <CONTEXT_SUMMARY> to me";
+        let (role, content) = normalize_system_turn("user", quoted);
+        assert_eq!((role.as_str(), content.as_str()), ("user", quoted));
+
+        // End to end: the settings-change turn never renders as an Operator turn.
+        let jsonl = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": format!("<USER_REQUEST>\nGo\n</USER_REQUEST>\n{meta}\n{settings}")}),
+            serde_json::json!({"step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": format!("{meta}\n{settings}")}),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&jsonl);
+        let users: Vec<_> = turns.iter().filter(|t| t.role == "user").collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].content, "Go");
     }
 
     #[test]
