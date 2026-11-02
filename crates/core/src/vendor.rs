@@ -140,6 +140,16 @@ impl VendorRegistry {
         Ok(())
     }
 
+    /// Like [`Self::register`], but a vendor already registered with an identical descriptor is
+    /// `Ok`: loading the same configuration twice in one process must not fail. A different
+    /// descriptor under a registered id is still [`VendorError::Duplicate`].
+    pub fn ensure_registered(&self, descriptor: VendorDescriptor) -> Result<(), VendorError> {
+        if self.get(&descriptor.id).as_ref() == Some(&descriptor) {
+            return Ok(());
+        }
+        self.register(descriptor)
+    }
+
     /// The vendor with this id (compared without case).
     pub fn get(&self, id: &str) -> Option<VendorDescriptor> {
         let vendors = self.vendors.read().unwrap_or_else(|e| e.into_inner());
@@ -163,6 +173,11 @@ impl VendorRegistry {
 /// it (HTTP API vendors) and `fl-mcp` can be told where its MCP file is.
 pub fn register_vendor(descriptor: VendorDescriptor) -> Result<(), VendorError> {
     VendorRegistry::global().register(descriptor)
+}
+
+/// [`VendorRegistry::ensure_registered`] on the process-wide registry.
+pub fn ensure_vendor_registered(descriptor: VendorDescriptor) -> Result<(), VendorError> {
+    VendorRegistry::global().ensure_registered(descriptor)
 }
 
 /// The vendor with this id in the process-wide registry.
@@ -498,6 +513,26 @@ mod tests {
         assert_eq!(reg.get("claude").unwrap().display_name, "Claude Code");
         assert!(VendorRegistry::is_builtin("Kimi-API"));
         assert!(!VendorRegistry::is_builtin("my-vllm"));
+    }
+
+    #[test]
+    fn ensure_registered_accepts_the_same_descriptor_again_but_not_a_different_one() {
+        let reg = VendorRegistry::with_builtins();
+        let d = custom("again", "https://e.example/v1");
+        reg.ensure_registered(d.clone()).unwrap();
+        reg.ensure_registered(d.clone()).unwrap();
+        let mut other = d;
+        other.default_model = "different".into();
+        assert_eq!(
+            reg.ensure_registered(other),
+            Err(VendorError::Duplicate("again".into()))
+        );
+        // A built-in id is never "the same" as a plugin's descriptor.
+        assert!(
+            reg.ensure_registered(custom("claude", "https://e.example"))
+                .is_err()
+        );
+        assert_eq!(reg.list().len(), 14);
     }
 
     #[test]
