@@ -808,9 +808,9 @@ fn load_vendors(
             .get(&id)
             .filter(|_| VendorRegistry::is_builtin(&id))
         {
-            check_builtin_override(&cfg, &builtin).map_err(&at)?;
+            check_builtin_override(&cfg, &builtin).map_err(at)?;
         } else {
-            let descriptor = new_vendor_descriptor(&id, &cfg).map_err(&at)?;
+            let descriptor = new_vendor_descriptor(&id, &cfg).map_err(at)?;
             // A conflict with a vendor registered earlier in this process is found here, before
             // the first vendor of this file is registered.
             if VendorRegistry::global()
