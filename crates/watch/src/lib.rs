@@ -39,8 +39,8 @@ pub use alerts::{
 };
 pub use balance::{
     BalanceAgent, BalanceError, BalanceHistory, BalanceInputs, BalancePlan, BalancePolicy,
-    BalanceTrigger, PlannedSwitch, SkipReason, SkippedAgent, VendorHealth, VendorStatus,
-    plan_balance,
+    BalanceTrigger, PlannedSwitch, Remodelable, SkipReason, SkippedAgent, VendorHealth,
+    VendorStatus, plan_balance, plan_balance_checked,
 };
 pub use balance_store::{BalanceAudit, SwitchResult, SwitchStatus};
 pub use liveness::{

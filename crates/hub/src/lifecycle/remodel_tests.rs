@@ -893,6 +893,73 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 }
 
 #[test]
+fn the_precheck_refuses_what_a_remodel_refuses_and_touches_nothing() {
+    let home = TempDir::new().unwrap();
+    let precheck = |store: &MemStore, env: &LifecycleEnv<'_>, id: &str, caller: Caller| {
+        remodel_precheck(store, env, &target(store, id), &remodel_req("grok"), caller)
+    };
+
+    // A runtime another live session shares.
+    let store = MemStore::default();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "assistant", "claude");
+    spin(&store, &env, "ada", "assistant", "codex");
+    // A record whose tmux target names another tmux session.
+    spin(&store, &env, "bo", "assistant", "claude");
+    let mut bo = record(&store, "claude:bo");
+    bo.tmux_target = Some("Other:claude".into());
+    persist_hosted_session(&store, &bo, "owner").unwrap();
+    fake.calls.borrow_mut().clear();
+    let before = list_hosted_sessions(&store).unwrap();
+    for (id, why) in [
+        ("claude:ada", "it also runs codex:ada"),
+        ("claude:bo", "started another tmux session"),
+    ] {
+        let pre = precheck(&store, &env, id, Caller::Owner).unwrap_err();
+        let err = remodel(&store, &env, id, &remodel_req("grok"), Caller::Owner).unwrap_err();
+        assert_eq!(pre, err, "{id}");
+        assert_eq!(pre.status(), 409, "{pre}");
+        assert!(pre.to_string().contains(why), "{pre}");
+    }
+    assert!(fake.calls.borrow().is_empty());
+    assert_eq!(list_hosted_sessions(&store).unwrap(), before);
+
+    // A session spin-up cannot restore, for a peer; and a decommissioned record.
+    let store = MemStore::default();
+    let off = self::env(&home);
+    register(&store, "jarvis", AgentRole::LabManager);
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    remodel(&store, &off, "jarvis", &prepare, Caller::Owner).unwrap();
+    let pre = precheck(&store, &off, "jarvis", Caller::Peer).unwrap_err();
+    assert_eq!(pre.status(), 409);
+    assert!(pre.to_string().contains("could not be restored"), "{pre}");
+    precheck(&store, &off, "jarvis", Caller::Owner).unwrap();
+    assert!(
+        handoff(&store, "jarvis").is_none(),
+        "the precheck writes nothing"
+    );
+
+    // One that passes is still remodeled afterwards.
+    let store = MemStore::default();
+    spin(&store, &off, "cy", "assistant", "claude");
+    precheck(&store, &off, "claude:cy", Caller::Peer).unwrap();
+    assert_eq!(record(&store, "claude:cy").status, STATUS_RUNNING);
+    let out = remodel(
+        &store,
+        &off,
+        "claude:cy",
+        &remodel_req("grok"),
+        Caller::Peer,
+    )
+    .unwrap();
+    assert_eq!(out.session_id, "grok:cy");
+}
+
+#[test]
 fn the_restore_of_a_session_with_no_record_keeps_it_unhosted() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();

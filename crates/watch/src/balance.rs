@@ -24,14 +24,24 @@
 //! report counts as 0% when the vendor has some other live reading. A fully unknown vendor is
 //! eligible only with `allow_unknown_quota_targets`, ranks after every known vendor, and takes at
 //! most one agent per plan. Known vendors rank by the lowest `max(primary, secondary)` (the
-//! score), then the lowest primary, then the lowest secondary, then the vendor id.
+//! score), then the lowest primary, then the lowest secondary, then the vendor id. The candidate
+//! vendors are the caller's (the hub passes the subscription vendors only, never a metered API
+//! vendor); the policy's lists only narrow them.
+//!
+//! **No load projection.** A plan does not add its own switches' load to a known target: every
+//! agent sees the readings as they were. With `max_switches_per_run` above 1, several agents can
+//! land on the same coolest vendor in one run (an unknown vendor takes one at most).
 //!
 //! **Order and skips.** Every agent appears in the plan: as a switch, or as a skip with its
-//! reason (pinned, excluded, healthy, no reading, not remodelable, cooldown, no eligible target,
-//! run limit). Triggered agents are taken worst first (an exhausted vendor, then the highest
-//! score, then persona and session id), so `max_switches_per_run` keeps the hottest. A plan made
-//! before `min_interval_ms` has passed since the last apply carries a `blocked` reason: its
-//! switches show what an apply would do once it may run, and an apply refuses it.
+//! reason (pinned, excluded, healthy, no reading, not remodelable, cooldown, persona already
+//! switched, no eligible target, run limit). Triggered agents are taken worst first (an exhausted
+//! vendor, then the highest score, then persona and session id), so `max_switches_per_run` keeps
+//! the hottest. A persona is switched once per run: a second session of it is skipped. With
+//! [`plan_balance_checked`] the caller also judges each chosen switch before it is planned (the
+//! hub runs the remodel's own pre-checks); a refused one is a `not_remodelable` skip and leaves
+//! its run slot to the next triggered agent. A plan made before `min_interval_ms` has passed since
+//! the last apply carries a `blocked` reason: its switches show what an apply would do once it
+//! may run, and an apply refuses it.
 //!
 //! **`enabled`.** The planner and an explicit apply (by the Owner, or a peer holding an Owner
 //! warrant) ignore it. It is the switch a future scheduler reads before it applies on its own.
@@ -218,17 +228,24 @@ pub struct BalanceHistory {
     /// When the last apply that ran a switch ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_apply_ms: Option<u64>,
-    /// Lowercased persona → when an apply last tried to move it (whatever the outcome).
+    /// Lowercased persona → when an apply last ran a remodel of it (whether it succeeded or
+    /// failed; a refused remodel touched nothing and does not count).
     pub persona_last_switch_ms: BTreeMap<String, u64>,
 }
 
 impl BalanceHistory {
-    /// Note an apply at `now_ms` that tried to move `personas`.
-    pub fn record<'a>(&mut self, now_ms: u64, personas: impl IntoIterator<Item = &'a str>) {
-        self.last_apply_ms = Some(now_ms);
+    /// Note an apply at `now_ms` that ran a remodel of each of `personas`. With no persona the
+    /// apply ran no switch, and nothing changes. Returns whether anything was noted.
+    pub fn record<'a>(&mut self, now_ms: u64, personas: impl IntoIterator<Item = &'a str>) -> bool {
+        let mut any = false;
         for p in personas {
             self.persona_last_switch_ms.insert(key(p), now_ms);
+            any = true;
         }
+        if any {
+            self.last_apply_ms = Some(now_ms);
+        }
+        any
     }
 }
 
@@ -328,6 +345,8 @@ pub enum SkipReason {
     NoReading,
     NotRemodelable,
     Cooldown,
+    /// Another session of the persona is switched in this run.
+    PersonaSwitched,
     NoEligibleTarget,
     RunLimit,
 }
@@ -363,8 +382,8 @@ pub struct BalanceInputs<'a> {
     pub now_ms: u64,
     pub agents: &'a [BalanceAgent],
     pub readings: &'a [WatchQuotaWindow],
-    /// The vendors an agent may move to before the policy narrows them (the hub's vendor
-    /// registry).
+    /// The vendors an agent may move to before the policy narrows them (the hub passes the
+    /// subscription vendors).
     pub candidate_vendors: &'a [String],
     pub history: &'a BalanceHistory,
 }
@@ -503,7 +522,7 @@ fn target_check(
 ) -> Result<(), String> {
     let excluded = key_set(&p.excluded_target_vendors);
     if !h.candidate {
-        return Err("not a candidate vendor (not in the vendor registry)".into());
+        return Err("not a candidate vendor (not a subscription vendor)".into());
     }
     if !allowed.is_empty() && !allowed.contains(&h.vendor) {
         return Err("not in `allowed_target_vendors`".into());
@@ -551,8 +570,24 @@ fn target_order(a: &VendorHealth, b: &VendorHealth) -> Ordering {
         .then_with(|| a.vendor.cmp(&b.vendor))
 }
 
-/// Plan a balance run. The policy is validated first.
+/// The caller's verdict on one chosen switch: the agent, and the vendor it would move to.
+/// `Err` says why the move would be refused.
+pub type Remodelable<'f> = dyn FnMut(&BalanceAgent, &str) -> Result<(), String> + 'f;
+
+/// Plan a balance run. The policy is validated first. Every chosen switch is planned as it is;
+/// see [`plan_balance_checked`] to judge each one first.
 pub fn plan_balance(inputs: &BalanceInputs<'_>) -> Result<BalancePlan, BalanceError> {
+    plan_balance_checked(inputs, &mut |_, _| Ok(()))
+}
+
+/// Plan a balance run, asking `remodelable` about each switch the planner chooses (in plan
+/// order, and only for an agent that triggered, is under the run limit and has a target). A
+/// refused switch becomes a `not_remodelable` skip with the verdict's reason, and its run slot
+/// goes to the next triggered agent. The plan is as deterministic as the verdicts.
+pub fn plan_balance_checked(
+    inputs: &BalanceInputs<'_>,
+    remodelable: &mut Remodelable<'_>,
+) -> Result<BalancePlan, BalanceError> {
     let p = inputs.policy;
     p.validate()?;
     let now = inputs.now_ms;
@@ -690,7 +725,19 @@ pub fn plan_balance(inputs: &BalanceInputs<'_>) -> Result<BalancePlan, BalanceEr
     let max = p.max_switches_per_run as usize;
     let mut switches: Vec<PlannedSwitch> = Vec::new();
     let mut unknown_taken: BTreeSet<String> = BTreeSet::new();
+    let mut personas_switched: BTreeSet<String> = BTreeSet::new();
     for (a, from, trigger, reason) in triggered {
+        if personas_switched.contains(&key(&a.persona)) {
+            skipped.push(skip(
+                a,
+                SkipReason::PersonaSwitched,
+                format!(
+                    "{reason}; another session of `{}` is switched in this run",
+                    a.persona
+                ),
+            ));
+            continue;
+        }
         if switches.len() >= max {
             skipped.push(skip(
                 a,
@@ -711,9 +758,21 @@ pub fn plan_balance(inputs: &BalanceInputs<'_>) -> Result<BalancePlan, BalanceEr
             ));
             continue;
         };
+        if let Err(why) = remodelable(a, &t.vendor) {
+            skipped.push(skip(
+                a,
+                SkipReason::NotRemodelable,
+                format!(
+                    "{reason}; a remodel to {} would be refused: {why}",
+                    t.vendor
+                ),
+            ));
+            continue;
+        }
         if t.status == VendorStatus::Unknown {
             unknown_taken.insert(t.vendor.clone());
         }
+        personas_switched.insert(key(&a.persona));
         let to = match t.score {
             Some(s) => format!("{} (score {s:.1}%)", t.vendor),
             None => format!("{} (no quota reading)", t.vendor),
@@ -1218,12 +1277,130 @@ mod tests {
         history.last_apply_ms = Some(NOW - policy.min_interval_ms);
         let plan = plan_with(&policy, &[agent("ada", "claude")], &r, &history);
         assert!(plan.blocked.is_none());
-        // `record` notes the apply and every persona it tried.
+        // `record` notes the apply and every persona it ran a remodel of.
         let mut h = BalanceHistory::default();
-        h.record(NOW, ["Ada", "bo"]);
+        assert!(h.record(NOW, ["Ada", "bo"]));
         assert_eq!(h.last_apply_ms, Some(NOW));
         assert_eq!(h.persona_last_switch_ms.get("ada"), Some(&NOW));
         assert_eq!(h.persona_last_switch_ms.len(), 2);
+    }
+
+    #[test]
+    fn an_apply_that_ran_no_remodel_records_nothing() {
+        let mut h = BalanceHistory::default();
+        assert!(!h.record(NOW, []));
+        assert_eq!(h, BalanceHistory::default());
+        // An earlier apply's time is kept, not moved forward.
+        h.record(NOW - HOUR, ["ada"]);
+        assert!(!h.record(NOW, std::iter::empty()));
+        assert_eq!(h.last_apply_ms, Some(NOW - HOUR));
+        assert_eq!(h.persona_last_switch_ms.get("ada"), Some(&(NOW - HOUR)));
+    }
+
+    #[test]
+    fn a_persona_is_switched_once_per_run() {
+        // ada has two sessions, both on hot vendors; ada's worse one (grok) moves.
+        let mut second = agent("ada", "grok");
+        second.session_id = "grok:ada".into();
+        let policy = BalancePolicy {
+            max_switches_per_run: 5,
+            ..BalancePolicy::default()
+        };
+        let plan = plan_with(
+            &policy,
+            &[agent("ada", "claude"), second, agent("bo", "claude")],
+            &cool_but(&[p("claude", 95.0), p("grok", 99.0)]),
+            &BalanceHistory::default(),
+        );
+        assert_eq!(
+            moves(&plan),
+            vec![("ada", "grok", "muse"), ("bo", "claude", "muse")]
+        );
+        let again = plan
+            .skipped
+            .iter()
+            .find(|s| s.session_id == "claude:ada")
+            .unwrap();
+        assert_eq!(again.reason, SkipReason::PersonaSwitched);
+        assert!(again.detail.contains("another session"), "{}", again.detail);
+        // Case does not make it another persona.
+        let mut upper = agent("ADA", "claude");
+        upper.session_id = "claude:ADA".into();
+        let plan = plan_with(
+            &policy,
+            &[agent("ada", "grok"), upper],
+            &cool_but(&[p("claude", 95.0), p("grok", 99.0)]),
+            &BalanceHistory::default(),
+        );
+        assert_eq!(plan.switches.len(), 1, "{plan:#?}");
+        assert_eq!(skip_of(&plan, "ADA"), SkipReason::PersonaSwitched);
+    }
+
+    #[test]
+    fn a_switch_the_caller_refuses_is_skipped_and_frees_its_run_slot() {
+        let r = cool_but(&[p("claude", 95.0)]);
+        let agents = [agent("ada", "claude"), agent("bo", "claude")];
+        let history = BalanceHistory::default();
+        let mut asked: Vec<(String, String)> = Vec::new();
+        let plan = plan_balance_checked(
+            &BalanceInputs {
+                policy: &BalancePolicy::default(),
+                now_ms: NOW,
+                agents: &agents,
+                readings: &r,
+                candidate_vendors: &vendors(),
+                history: &history,
+            },
+            &mut |a, to| {
+                asked.push((a.persona.clone(), to.to_string()));
+                if a.persona == "ada" {
+                    Err("tmux session `Ada` is shared".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        // ada is first (by persona) and refused; bo takes the one run slot.
+        assert_eq!(moves(&plan), vec![("bo", "claude", "muse")]);
+        assert_eq!(skip_of(&plan, "ada"), SkipReason::NotRemodelable);
+        let ada = plan.skipped.iter().find(|s| s.persona == "ada").unwrap();
+        assert!(ada.detail.contains("would be refused"), "{}", ada.detail);
+        assert!(ada.detail.contains("is shared"), "{}", ada.detail);
+        assert_eq!(
+            asked,
+            vec![
+                ("ada".to_string(), "muse".to_string()),
+                ("bo".to_string(), "muse".to_string())
+            ],
+            "asked once per chosen switch, in plan order"
+        );
+        // An unknown target refused for one agent stays free for the next.
+        let only = [p("claude", 99.0)];
+        let policy = BalancePolicy {
+            allow_unknown_quota_targets: true,
+            allowed_target_vendors: vec!["grok".into()],
+            ..BalancePolicy::default()
+        };
+        let plan = plan_balance_checked(
+            &BalanceInputs {
+                policy: &policy,
+                now_ms: NOW,
+                agents: &agents,
+                readings: &only,
+                candidate_vendors: &vendors(),
+                history: &history,
+            },
+            &mut |a, _| {
+                if a.persona == "ada" {
+                    Err("no".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(moves(&plan), vec![("bo", "claude", "grok")]);
     }
 
     #[test]

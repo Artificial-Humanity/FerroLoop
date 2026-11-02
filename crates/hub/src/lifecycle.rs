@@ -2040,11 +2040,26 @@ fn check_old_runtime_stoppable<S: StateStore>(
     )))
 }
 
+/// Whether [`remodel_session`] would refuse this remodel before its first side effect, with
+/// nothing done: the same checks, error texts and statuses (see `plan_remodel`, whose result this
+/// drops, so the two cannot drift). It only reads: the store, the runtime directory, the key
+/// probe and, when runtime calls are on, whether a tmux session of the persona's name runs.
+pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    caller: Caller,
+) -> Result<(), LifecycleError> {
+    plan_remodel(store, env, target, req, caller).map(drop)
+}
+
 /// Every check a remodel can make before its first side effect, in the order the siblings make
 /// them: the teardown gate (403), a decommissioned record (409), no record at all (404), the
 /// request fields as spin-up validates them (400), the runtime directory (400), the registry
 /// checks spin-up makes with the persona's own agent counted as retired (409), a non-Owner
 /// remodel that could not be restored (409), and an old runtime the teardown cannot stop (409).
+/// It has no side effect: [`remodel_precheck`] is this, with the plan dropped.
 fn plan_remodel<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,

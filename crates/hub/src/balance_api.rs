@@ -8,32 +8,50 @@
 //!   Answers `{ policy, enabled }` as stored.
 //! - `POST /api/v1/watch/balance/plan`: a dry run, writing nothing. Any authenticated caller.
 //!   An optional `{ "policy": { ... } }` is laid over the stored policy for this evaluation only.
-//!   Answers the [`fl_watch::BalancePlan`].
+//!   Each switch is prechecked as a remodel by this caller (see **Agents**), so the plan shows
+//!   what an apply by the same caller would run. Answers the [`fl_watch::BalancePlan`].
 //! - `POST /api/v1/watch/balance/apply`: the Owner, or a peer that presents
 //!   `{ "warrant": "<grant id or flw1. token>" }` for an Owner grant that names the peer's agent
-//!   name (`X-Fl-Agent`) or `*` and has scope `watch.balance.apply` or `*`. A single-use grant is
-//!   consumed when the apply runs a switch. The plan is made again from the stored policy under
-//!   the store guard; a `blocked` plan is a 409. Each switch is a remodel
-//!   ([`crate::api::run_remodel`], the remodel endpoint's own body) run as the caller: the Owner
-//!   as Owner, a peer as Peer, never more. A failed switch is recorded and the next one runs,
-//!   unless the failure left its persona down: then the apply stops. Answers
-//!   `{ plan, results, audit_slug, warnings }` and broadcasts `watch.balance.applied` on the
-//!   `watch` channel. An apply with nothing to switch writes nothing and spends no grant.
+//!   name (`X-Fl-Agent`) or `*` and has scope `watch.balance.apply` (no other scope). The plan is
+//!   made again from the stored policy under the store guard; a `blocked` plan is a 409. A
+//!   single-use grant is consumed under the guard immediately before the first remodel runs, so a
+//!   blocked apply, an apply with nothing to switch, and one whose every triggered agent fails its
+//!   precheck spend nothing. Each switch is a remodel ([`crate::api::run_remodel`], the remodel
+//!   endpoint's own body) run as the caller: the Owner as Owner, a peer as Peer, never more. A
+//!   failed switch is recorded and the next one runs, unless the failure left its persona down:
+//!   then the apply stops. Answers `{ plan, results, audit_slug, warnings }` and broadcasts
+//!   `watch.balance.applied` on the `watch` channel. An apply with nothing to switch writes
+//!   nothing. The history (`last_apply_ms` and each persona's cooldown) notes only the switches
+//!   whose remodel ran (`ok` or `failed`): a `refused` one touched nothing.
 //!
 //! Any other method on these paths is a 405 with an `Allow` header, and any query key but
 //! `token` a 400.
 //!
+//! **Peer identity.** A peer's agent name is its own `X-Fl-Agent` header: every peer shares the
+//! one peer token, so the hub cannot tell peers apart. Any peer that holds a warrant's grant id
+//! or token can therefore name that warrant's target agent and apply with it, as
+//! `POST /api/v1/auth/grants/verify` lets it consume one (`warrants.rs`). Closing that needs
+//! per-agent peer tokens. A peer never runs a switch as more than `Caller::Peer`.
+//!
+//! **Vendors.** The candidate targets are the subscription vendors
+//! ([`lifecycle::SPIN_UP_VENDORS`]), never a metered API vendor of the registry; the policy's
+//! `allowed_target_vendors` and `excluded_target_vendors` only narrow them.
+//!
 //! **Quota.** The planner reads the discovered sessions' quota
-//! ([`crate::watch_api::discovered_quotas`]), an account probe for every registry vendor no
+//! ([`crate::watch_api::discovered_quotas`]), an account probe for every subscription vendor no
 //! discovered session reports ([`account_quota`]; `codex` and `grok` have none without a
 //! transcript), and the stored `watch-quota-*` windows. Discovery and the probes run before the
 //! store guard is taken: a discovery snapshot miss opens the store itself.
 //!
-//! **Agents.** Every hosted-session record that is not decommissioned. One that is not running,
-//! or (when the hub starts runtimes) whose runtime the hub did not start, is listed as not
-//! remodelable: [`lifecycle::remodel_session`] would refuse it with a 409.
+//! **Agents.** Every hosted-session record that is not decommissioned. One that is not running
+//! is listed as not remodelable. For every other switch the planner chooses, the hub runs the
+//! remodel's own side-effect-free checks ([`lifecycle::remodel_precheck`]) under the store guard,
+//! for the caller and the chosen vendor: one that a remodel would refuse (a runtime other
+//! sessions share, a `tmux_target` naming another tmux session, a vendor that cannot be restored
+//! for a peer, a missing directory, ...) is a `not_remodelable` skip with the refusal, and the
+//! next triggered agent takes its run slot.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use fl_core::store::StoreError;
@@ -46,7 +64,7 @@ use fl_watch::balance_store::{
 };
 use fl_watch::{
     BalanceAgent, BalanceError, BalanceHistory, BalanceInputs, BalancePlan, BalancePolicy,
-    WatchQuotaWindow, plan_balance, read_runtime,
+    WatchQuotaWindow, plan_balance_checked, read_runtime,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -56,11 +74,12 @@ use crate::api::{
 };
 use crate::auth::HubAuthority;
 use crate::discovery::{
-    SessionQuotaUsage, discover_route_sessions_without_model_info, quota_for_resolved_route,
+    DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
+    quota_for_resolved_route,
 };
 use crate::lifecycle::{
-    self, Caller, HostedSessionRecord, RemodelRequest, STATUS_DECOMMISSIONED, STATUS_RUNNING,
-    SessionTarget,
+    self, Caller, HostedSessionRecord, LifecycleEnv, RemodelRequest, STATUS_DECOMMISSIONED,
+    STATUS_RUNNING, SessionTarget,
 };
 use crate::watch_api::{discovered_quotas, quota_windows, refuse_unknown_keys};
 use crate::{HttpRequest, HttpResponse, HubState};
@@ -93,7 +112,7 @@ pub(crate) fn route(
     Some(match path {
         BALANCE => handle_get(state),
         POLICY => handle_post_policy(state, authority, req),
-        PLAN => handle_plan(state, req),
+        PLAN => handle_plan(state, authority, req),
         _ => handle_apply(state, authority, req),
     })
 }
@@ -185,6 +204,20 @@ fn handle_post_policy(
     }
 }
 
+/// The vendors an agent may be moved to: the subscription vendors, never a metered API vendor.
+/// The policy only narrows this list.
+pub(crate) fn candidate_vendors() -> Vec<String> {
+    lifecycle::SPIN_UP_VENDORS.map(String::from).to_vec()
+}
+
+fn caller_of(authority: &HubAuthority) -> Caller {
+    if authority.is_owner() {
+        Caller::Owner
+    } else {
+        Caller::Peer
+    }
+}
+
 /// The one account-quota probe a balance plan makes for a vendor no discovered session reports.
 /// Every account probe goes through here.
 fn account_quota(vendor: &str, home: Option<&Path>) -> Option<SessionQuotaUsage> {
@@ -192,7 +225,7 @@ fn account_quota(vendor: &str, home: Option<&Path>) -> Option<SessionQuotaUsage>
 }
 
 /// The live quota readings: every discovered route session's, then an account probe for each
-/// registry vendor none of them reports. Must run with no store guard held.
+/// candidate vendor none of them reports. Must run with no store guard held.
 fn live_readings(state: &HubState, vendors: &[String]) -> Vec<WatchQuotaWindow> {
     let home = state.config.home_override.as_deref();
     let mut readings = discovered_quotas(state);
@@ -218,34 +251,27 @@ fn live_readings(state: &HubState, vendors: &[String]) -> Vec<WatchQuotaWindow> 
     readings
 }
 
-/// Why a remodel of `rec` would be refused before it starts, so the plan does not recommend it.
-/// It mirrors [`lifecycle::remodel_session`]: a session that is not running, or (when the hub
-/// starts runtimes) a hosted one whose runtime the hub did not start (409).
-fn remodel_blocker(rec: &HostedSessionRecord, spawn_runtime: bool) -> Option<String> {
-    if rec.status != STATUS_RUNNING {
-        return Some(format!(
+/// Why balancing leaves `rec` alone before any remodel check: a session that is not running
+/// (one being decommissioned, for example) is not moved. Every other refusal comes from
+/// [`lifecycle::remodel_precheck`].
+fn status_blocker(rec: &HostedSessionRecord) -> Option<String> {
+    (rec.status != STATUS_RUNNING).then(|| {
+        format!(
             "its hosted session `{}` is {}, not {STATUS_RUNNING}",
             rec.session_id, rec.status
-        ));
-    }
-    if spawn_runtime && rec.hosted && !rec.runtime_spawned {
-        return Some(format!(
-            "the hub did not start the runtime of `{}`, so a remodel would be refused",
-            rec.session_id
-        ));
-    }
-    None
+        )
+    })
 }
 
 /// What the plan reads from the store, under the guard.
-struct StoreInputs {
-    policy: BalancePolicy,
-    history: BalanceHistory,
-    agents: Vec<BalanceAgent>,
-    stored_quotas: Vec<WatchQuotaWindow>,
+pub(crate) struct StoreInputs {
+    pub(crate) policy: BalancePolicy,
+    pub(crate) history: BalanceHistory,
+    pub(crate) agents: Vec<BalanceAgent>,
+    pub(crate) stored_quotas: Vec<WatchQuotaWindow>,
 }
 
-fn read_store_inputs(store: &AnyStore, spawn_runtime: bool) -> Result<StoreInputs, HttpResponse> {
+pub(crate) fn read_store_inputs(store: &AnyStore) -> Result<StoreInputs, HttpResponse> {
     let policy = read_policy(store).map_err(balance_error)?;
     let history = read_history(store).map_err(balance_error)?;
     let agents = lifecycle::list_hosted_sessions(store)
@@ -253,7 +279,7 @@ fn read_store_inputs(store: &AnyStore, spawn_runtime: bool) -> Result<StoreInput
         .into_iter()
         .filter(|r| r.status != STATUS_DECOMMISSIONED)
         .map(|r| BalanceAgent {
-            remodel_blocker: remodel_blocker(&r, spawn_runtime),
+            remodel_blocker: status_blocker(&r),
             persona: r.persona,
             session_id: r.session_id,
             vendor: r.vendor,
@@ -270,24 +296,54 @@ fn read_store_inputs(store: &AnyStore, spawn_runtime: bool) -> Result<StoreInput
     })
 }
 
-fn evaluate(
+/// The remodel a balance switch runs: the target vendor, everything else as the session has it.
+fn switch_request(to_vendor: &str) -> RemodelRequest {
+    RemodelRequest {
+        vendor: to_vendor.to_string(),
+        ..RemodelRequest::default()
+    }
+}
+
+/// The plan for `policy`, each switch the planner chooses prechecked as a remodel by `caller`
+/// ([`lifecycle::remodel_precheck`]), and the resolved target of every planned switch by
+/// session id. Reads only; the caller holds the store guard, and has run discovery and the
+/// quota probes before taking it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checked_plan(
+    store: &AnyStore,
+    env: &LifecycleEnv<'_>,
+    sessions: &[DiscoveredSessionSummary],
+    caller: Caller,
     policy: &BalancePolicy,
     inputs: &StoreInputs,
     live: &[WatchQuotaWindow],
-    vendors: &[String],
     now_ms: u64,
-) -> Result<BalancePlan, HttpResponse> {
+) -> Result<(BalancePlan, BTreeMap<String, SessionTarget>), HttpResponse> {
     let mut readings = live.to_vec();
     readings.extend(inputs.stored_quotas.iter().cloned());
-    plan_balance(&BalanceInputs {
-        policy,
-        now_ms,
-        agents: &inputs.agents,
-        readings: &readings,
-        candidate_vendors: vendors,
-        history: &inputs.history,
-    })
-    .map_err(balance_error)
+    let vendors = candidate_vendors();
+    let mut targets: BTreeMap<String, SessionTarget> = BTreeMap::new();
+    let plan = plan_balance_checked(
+        &BalanceInputs {
+            policy,
+            now_ms,
+            agents: &inputs.agents,
+            readings: &readings,
+            candidate_vendors: &vendors,
+            history: &inputs.history,
+        },
+        &mut |agent, to_vendor| {
+            let discovered = resolve_session_target_in(sessions, &agent.session_id);
+            let target = SessionTarget::resolve(store, &agent.session_id, Some(discovered))
+                .map_err(|e| format!("{e} ({})", e.status()))?;
+            lifecycle::remodel_precheck(store, env, &target, &switch_request(to_vendor), caller)
+                .map_err(|e| format!("{e} ({})", e.status()))?;
+            targets.insert(agent.session_id.clone(), target);
+            Ok(())
+        },
+    )
+    .map_err(balance_error)?;
+    Ok((plan, targets))
 }
 
 #[derive(Deserialize)]
@@ -297,24 +353,27 @@ struct PlanBody {
     policy: Option<Map<String, Value>>,
 }
 
-fn handle_plan(state: &HubState, req: &HttpRequest) -> HttpResponse {
+fn handle_plan(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
     let body: PlanBody = match body_object(req).and_then(|m| {
         serde_json::from_value(Value::Object(m)).map_err(|e| error(400, e.to_string()))
     }) {
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let vendors = lifecycle::spin_up_vendor_ids();
+    // Discovery and probes first: both may open the store, so no guard may be held yet.
+    let home = state.config.home_override.as_deref();
+    let vendors = candidate_vendors();
     let live = live_readings(state, &vendors);
-    let spawn = crate::api::lifecycle_env(state).spawn_runtime;
+    let sessions =
+        discover_route_sessions_without_model_info(&load_discovery_snapshot(state), home);
+    let env = crate::api::lifecycle_env(state);
     let Ok(store) = state.open_store() else {
         return store_open_failure();
     };
-    let inputs = match read_store_inputs(&store, spawn) {
+    let inputs = match read_store_inputs(&store) {
         Ok(i) => i,
         Err(resp) => return resp,
     };
-    drop(store);
     let policy = match &body.policy {
         Some(patch) => match overlay(&inputs.policy, patch) {
             Ok(p) => p,
@@ -322,14 +381,20 @@ fn handle_plan(state: &HubState, req: &HttpRequest) -> HttpResponse {
         },
         None => inputs.policy.clone(),
     };
-    match evaluate(
+    // The prechecks read the store, so the guard is held through the evaluation (and only that).
+    let result = checked_plan(
+        &store,
+        &env,
+        &sessions,
+        caller_of(authority),
         &policy,
         &inputs,
         &live,
-        &vendors,
         stamp::now().unix_millis(),
-    ) {
-        Ok(plan) => HttpResponse::json(200, json!(plan)),
+    );
+    drop(store);
+    match result {
+        Ok((plan, _)) => HttpResponse::json(200, json!(plan)),
         Err(resp) => resp,
     }
 }
@@ -359,8 +424,20 @@ fn warrant_refused(reason: impl std::fmt::Display) -> HttpResponse {
     )
 }
 
-/// The Owner, or a named peer with a verified warrant of scope `watch.balance.apply` (or `*`)
-/// that names it. Nothing is consumed here.
+/// A warrant's scope authorizes an apply only when it is `watch.balance.apply` itself.
+fn check_scope(scope: &str) -> Result<(), HttpResponse> {
+    let scope = scope.trim();
+    if scope == APPLY_SCOPE {
+        Ok(())
+    } else {
+        Err(warrant_refused(format!(
+            "its scope is `{scope}`, not `{APPLY_SCOPE}`"
+        )))
+    }
+}
+
+/// The Owner, or a named peer with a verified warrant of scope `watch.balance.apply` that names
+/// it. Nothing is consumed here.
 fn authorize_apply(
     state: &HubState,
     authority: &HubAuthority,
@@ -378,6 +455,7 @@ fn authorize_apply(
             ),
         ));
     };
+    // The name is the peer's own `X-Fl-Agent` (see the module doc on peer identity).
     let named = matches!(authority, HubAuthority::Peer { agent: Some(a) } if !a.trim().is_empty())
         && authority.actor_name() != "peer";
     if !named {
@@ -397,17 +475,18 @@ fn authorize_apply(
             return Err(error(500, "warrant store error"));
         }
     };
-    let scope = verified.grant.scope.trim();
-    if scope != APPLY_SCOPE && scope != "*" {
-        return Err(warrant_refused(format!(
-            "its scope is `{scope}`, not `{APPLY_SCOPE}`"
-        )));
-    }
+    check_scope(&verified.grant.scope)?;
     Ok(ApplyAuthority::Warrant {
         grant_id: verified.grant.grant_id,
         id_or_token: warrant.to_string(),
         single_use: verified.grant.single_use,
     })
+}
+
+/// Whether a switch's remodel ran (and so counts for the history): it succeeded or failed. A
+/// refused remodel touched nothing; a switch not run never started.
+fn remodel_ran(status: SwitchStatus) -> bool {
+    matches!(status, SwitchStatus::Ok | SwitchStatus::Failed)
 }
 
 fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
@@ -432,21 +511,30 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
 
     // Discovery and probes first: both may open the store, so no guard may be held yet. A
     // fresh discovery snapshot, as every request that acts on a session uses.
-    let vendors = lifecycle::spin_up_vendor_ids();
+    let vendors = candidate_vendors();
     let live = live_readings(state, &vendors);
     let sessions =
         discover_route_sessions_without_model_info(&load_discovery_snapshot(state), home);
-    let spawn = crate::api::lifecycle_env(state).spawn_runtime;
+    let env = crate::api::lifecycle_env(state);
 
     let Ok(store) = state.open_store() else {
         return store_open_failure();
     };
-    let inputs = match read_store_inputs(&store, spawn) {
+    let inputs = match read_store_inputs(&store) {
         Ok(i) => i,
         Err(resp) => return resp,
     };
     let now_ms = stamp::now().unix_millis();
-    let plan = match evaluate(&inputs.policy, &inputs, &live, &vendors, now_ms) {
+    let (plan, mut targets) = match checked_plan(
+        &store,
+        &env,
+        &sessions,
+        caller,
+        &inputs.policy,
+        &inputs,
+        &live,
+        now_ms,
+    ) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -462,18 +550,10 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             json!({ "plan": plan, "results": [], "audit_slug": null, "warnings": [] }),
         );
     }
-    if let ApplyAuthority::Warrant {
-        id_or_token,
-        single_use: true,
-        ..
-    } = &auth
-        && let Err(e) = fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
-    {
-        return warrant_refused(e);
-    }
 
     let mut results: Vec<SwitchResult> = Vec::new();
     let mut down = false;
+    let mut grant_checked = false;
     for sw in &plan.switches {
         let mut result = SwitchResult {
             persona: sw.persona.clone(),
@@ -491,21 +571,34 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             results.push(result);
             continue;
         }
-        let discovered = resolve_session_target_in(&sessions, &sw.session_id);
-        let target = match SessionTarget::resolve(&*store, &sw.session_id, Some(discovered)) {
-            Ok(t) => t,
-            Err(e) => {
-                result.status = SwitchStatus::Refused;
-                result.error = Some(e.to_string());
-                results.push(result);
-                continue;
+        // Every planned switch passed its precheck, which resolved its target.
+        let Some(target) = targets.remove(&sw.session_id) else {
+            result.status = SwitchStatus::Refused;
+            result.error = Some(format!("`{}` was not prechecked", sw.session_id));
+            results.push(result);
+            continue;
+        };
+        // A single-use grant is spent only now, under the guard, just before the first remodel.
+        if !grant_checked {
+            grant_checked = true;
+            if let ApplyAuthority::Warrant {
+                id_or_token,
+                single_use: true,
+                ..
+            } = &auth
+                && let Err(e) = fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
+            {
+                return warrant_refused(e);
             }
-        };
-        let req = RemodelRequest {
-            vendor: sw.to_vendor.clone(),
-            ..RemodelRequest::default()
-        };
-        match run_remodel(state, &store, &target, &req, by, caller) {
+        }
+        match run_remodel(
+            state,
+            &store,
+            &target,
+            &switch_request(&sw.to_vendor),
+            by,
+            caller,
+        ) {
             RemodelRun::Done { out, .. } => {
                 result.status = SwitchStatus::Ok;
                 result.new_session_id = Some(out.session_id);
@@ -532,11 +625,11 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
 
     let mut warnings = Vec::new();
     let mut history = inputs.history.clone();
-    history.record(
+    let history_changed = history.record(
         now_ms,
         results
             .iter()
-            .filter(|r| r.status != SwitchStatus::NotRun)
+            .filter(|r| remodel_ran(r.status))
             .map(|r| r.persona.as_str()),
     );
     let audit = BalanceAudit {
@@ -554,7 +647,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             None
         }
     };
-    if let Err(e) = write_history(&*store, &history, stamp::now(), by) {
+    if history_changed && let Err(e) = write_history(&*store, &history, stamp::now(), by) {
         warnings.push(format!("the balance history was not updated: {e}"));
     }
     let data = json!({
@@ -585,35 +678,62 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
 mod tests {
     use super::*;
 
-    fn record(status: &str, hosted: bool, spawned: bool) -> HostedSessionRecord {
+    fn record(status: &str) -> HostedSessionRecord {
         serde_json::from_value(json!({
             "session_id": "claude:ada", "persona": "ada", "project": "p", "role": "assistant",
-            "vendor": "claude", "model": null, "node_id": "n", "hosted": hosted,
+            "vendor": "claude", "model": null, "node_id": "n", "hosted": true,
             "status": status, "restart_policy": "never", "restart_count": 0,
             "tmux_target": null, "cwd": null, "hydration_dispatched": false,
-            "runtime_spawned": spawned, "created_at_ms": 0, "updated_at_ms": 0,
+            "runtime_spawned": true, "created_at_ms": 0, "updated_at_ms": 0,
             "decommission_prepared_at_ms": null
         }))
         .unwrap()
     }
 
     #[test]
-    fn the_remodel_blocker_mirrors_what_a_remodel_refuses() {
-        assert_eq!(remodel_blocker(&record("running", true, true), true), None);
-        let why = remodel_blocker(&record("running", true, false), true).unwrap();
-        assert!(why.contains("did not start"), "{why}");
-        // With runtimes off (tests, FL_TEST_SPINUP_NO_SPAWN) nothing checks the old runtime.
-        assert_eq!(
-            remodel_blocker(&record("running", true, false), false),
-            None
-        );
-        // An unhosted session has no runtime to stop.
-        assert_eq!(
-            remodel_blocker(&record("running", false, false), true),
-            None
-        );
-        let why = remodel_blocker(&record("decommissioning", true, true), false).unwrap();
+    fn only_a_running_session_passes_the_status_blocker() {
+        assert_eq!(status_blocker(&record("running")), None);
+        let why = status_blocker(&record("decommissioning")).unwrap();
         assert!(why.contains("decommissioning"), "{why}");
+    }
+
+    #[test]
+    fn the_candidates_are_the_subscription_vendors_only() {
+        let c = candidate_vendors();
+        assert_eq!(c, ["claude", "antigravity", "codex", "grok", "muse"]);
+        assert!(c.iter().all(|v| !v.ends_with("-api")), "{c:?}");
+        // The registry holds metered API vendors the candidates leave out.
+        let registry = lifecycle::spin_up_vendor_ids();
+        assert!(registry.iter().any(|v| v.ends_with("-api")), "{registry:?}");
+    }
+
+    #[test]
+    fn only_the_apply_scope_itself_authorizes() {
+        check_scope(APPLY_SCOPE).unwrap();
+        check_scope(&format!(" {APPLY_SCOPE} ")).unwrap();
+        for scope in [
+            "*",
+            "watch.balance",
+            "watch.balance.apply.x",
+            "agent.replace",
+            "",
+        ] {
+            let resp = check_scope(scope).unwrap_err();
+            assert_eq!(resp.status, 403, "{scope}");
+            let v = resp.json_value().unwrap();
+            assert!(
+                v["error"].as_str().unwrap().contains(APPLY_SCOPE),
+                "{scope}: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_remodel_that_ran_counts_for_the_history() {
+        assert!(remodel_ran(SwitchStatus::Ok));
+        assert!(remodel_ran(SwitchStatus::Failed));
+        assert!(!remodel_ran(SwitchStatus::Refused));
+        assert!(!remodel_ran(SwitchStatus::NotRun));
     }
 
     #[test]

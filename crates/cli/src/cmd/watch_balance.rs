@@ -9,12 +9,15 @@
 //!   agent (`--agent`, default `$AGENT_PERSONA`, sent as `X-Fl-Agent`).
 //! - `fl watch balance policy`: the stored policy.
 //! - `fl watch balance policy set --file policy.json`: lay a full or partial policy over it
-//!   (Owner only).
+//!   (Owner only). The file is a policy object, or what `fl watch balance policy --json` prints
+//!   (`{ "policy": { ... }, "enabled": ... }`): its `policy` is sent and `enabled` beside it is
+//!   ignored (it repeats `policy.enabled`).
 //!
 //! The hub is `--hub`, else `$FL_HUB_URL`, else `http://<[hub].listen>`, else
 //! `http://127.0.0.1:8420`. The bearer token is `--token-file`, else `$FL_HUB_TOKEN`; it is sent
 //! only to `https` or to this machine. Exit status: 0 on success, 1 when the hub refuses (any
-//! HTTP status but 200) or an applied switch did not succeed, 2 for a usage or connection error.
+//! HTTP status but 200), an applied switch did not succeed, or the apply answered warnings (each
+//! is printed to stderr), 2 for a usage or connection error.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -362,12 +365,37 @@ pub fn render_policy(p: &BalancePolicy) -> Vec<String> {
     ]
 }
 
-/// Run `fl watch balance` against the hub, writing to `out`. `listen` is `[hub].listen`.
+/// The body `policy set` sends for a file's JSON: a policy object as it is, or the `policy` of
+/// what `fl watch balance policy --json` prints (`{ policy, enabled }`; `enabled` repeats
+/// `policy.enabled` and is dropped). A policy has no `policy` field, so the two cannot be mixed
+/// up.
+fn policy_patch(v: Value) -> Result<Value, String> {
+    let Value::Object(mut map) = v else {
+        return Err("must hold a JSON object".to_string());
+    };
+    let Some(inner) = map.remove("policy") else {
+        return Ok(Value::Object(map));
+    };
+    map.remove("enabled");
+    if let Some(extra) = map.keys().next() {
+        return Err(format!(
+            "`{extra}` beside `policy`: give a policy object, or `{{ \"policy\": {{ ... }} }}`"
+        ));
+    }
+    if !inner.is_object() {
+        return Err("`policy` must be a JSON object".to_string());
+    }
+    Ok(inner)
+}
+
+/// Run `fl watch balance` against the hub, writing to `out` (and an apply's warnings to `err`).
+/// `listen` is `[hub].listen`.
 pub fn run_with(
     args: BalanceArgs,
     listen: Option<&str>,
     get: &dyn Fn(&str) -> Option<String>,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<i32, (i32, String)> {
     if args.cmd.is_some() && (args.apply || args.dry_run || args.warrant.is_some()) {
         return Err((
@@ -386,9 +414,8 @@ pub fn run_with(
                         .map_err(|e| (2, format!("could not read {}: {e}", file.display())))?;
                     let patch: Value = serde_json::from_str(&text)
                         .map_err(|e| (2, format!("{} is not JSON: {e}", file.display())))?;
-                    if !patch.is_object() {
-                        return Err((2, format!("{} must hold a JSON object", file.display())));
-                    }
+                    let patch = policy_patch(patch)
+                        .map_err(|why| (2, format!("{}: {why}", file.display())))?;
                     hub.call(
                         "POST",
                         &format!("{BALANCE}/policy"),
@@ -436,13 +463,19 @@ pub fn run_with(
                 let plan: BalancePlan = decode(&answer["plan"])?;
                 lines(out, render_plan(&plan))?;
                 lines(out, render_results(&results, answer["audit_slug"].as_str()))?;
-                for w in answer["warnings"].as_array().into_iter().flatten() {
-                    writeln!(out, "warning: {}", w.as_str().unwrap_or_default())
-                        .map_err(|e| (2, e.to_string()))?;
-                }
+            }
+            // A warning means part of the apply was not recorded (its audit or its history).
+            let warnings: Vec<&Value> = answer["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .collect();
+            for w in &warnings {
+                let text = w.as_str().map_or_else(|| w.to_string(), str::to_string);
+                writeln!(err, "warning: {text}").map_err(|e| (2, e.to_string()))?;
             }
             let all_ok = results.iter().all(|r| r.status == SwitchStatus::Ok);
-            Ok(if all_ok { 0 } else { 1 })
+            Ok(if all_ok && warnings.is_empty() { 0 } else { 1 })
         }
         None => {
             let (status, answer) =
@@ -464,10 +497,16 @@ pub fn run_with(
     }
 }
 
-/// Run `fl watch balance` with this process's environment, printing to stdout.
+/// Run `fl watch balance` with this process's environment, printing to stdout and stderr.
 pub fn run(args: BalanceArgs, listen: Option<&str>) -> Result<i32, (i32, String)> {
     let get = |k: &str| std::env::var(k).ok();
-    run_with(args, listen, &get, &mut std::io::stdout().lock())
+    run_with(
+        args,
+        listen,
+        &get,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
 }
 
 #[cfg(test)]
@@ -574,12 +613,27 @@ mod tests {
         argv: &[&str],
         vars: &[(&str, &str)],
     ) -> (Result<i32, (i32, String)>, String) {
+        let (code, out, _) = run_against_err(hub, argv, vars);
+        (code, out)
+    }
+
+    /// As [`run_against`], with what went to stderr too.
+    fn run_against_err(
+        hub: &FakeHub,
+        argv: &[&str],
+        vars: &[(&str, &str)],
+    ) -> (Result<i32, (i32, String)>, String, String) {
         let mut argv: Vec<&str> = argv.to_vec();
         argv.extend(["--hub", hub.base.as_str()]);
         let args = parse(&argv).unwrap();
         let mut out = Vec::new();
-        let code = run_with(args, None, &env(vars), &mut out);
-        (code, String::from_utf8(out).unwrap())
+        let mut err = Vec::new();
+        let code = run_with(args, None, &env(vars), &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
     }
 
     fn plan_json() -> Value {
@@ -700,6 +754,82 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_that_answers_warnings_exits_one_and_prints_them_to_stderr() {
+        let answer = json!({
+            "plan": plan_json(),
+            "results": [{
+                "persona": "ada", "session_id": "claude:ada", "from_vendor": "claude",
+                "to_vendor": "muse", "status": "ok", "new_session_id": "muse:ada",
+                "outcome": "remodeled"
+            }],
+            "audit_slug": "watch-balance-audit-1-0",
+            "warnings": ["the balance history was not updated: disk full"]
+        });
+        for argv in [&["--apply"][..], &["--apply", "--json"][..]] {
+            let hub = FakeHub::start(200, answer.clone(), 1);
+            let (code, out, err) = run_against_err(&hub, argv, TOKEN);
+            assert_eq!(code, Ok(1), "{argv:?}");
+            assert_eq!(
+                err, "warning: the balance history was not updated: disk full\n",
+                "{argv:?}"
+            );
+            assert!(!out.contains("warning:"), "{argv:?}: {out}");
+        }
+        // No warnings, every switch ok: 0, and nothing on stderr.
+        let mut clean = answer;
+        clean["warnings"] = json!([]);
+        let hub = FakeHub::start(200, clean, 1);
+        let (code, _, err) = run_against_err(&hub, &["--apply"], TOKEN);
+        assert_eq!(code, Ok(0));
+        assert_eq!(err, "");
+    }
+
+    #[test]
+    fn policy_json_output_reads_back_into_policy_set() {
+        let policy = BalancePolicy {
+            enabled: true,
+            pinned_personas: vec!["ferris".into()],
+            ..BalancePolicy::default()
+        };
+        let shown = json!({ "policy": policy, "enabled": true });
+        let hub = FakeHub::start(200, shown.clone(), 1);
+        let (code, out) = run_against(&hub, &["policy", "--json"], TOKEN);
+        assert_eq!(code, Ok(0));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        std::fs::write(&path, &out).unwrap();
+        let p = path.to_str().unwrap();
+        let hub = FakeHub::start(200, shown, 1);
+        let (code, _) = run_against(&hub, &["policy", "set", "--file", p], TOKEN);
+        assert_eq!(code, Ok(0));
+        let seen = hub.seen();
+        assert_eq!(
+            seen[0].body,
+            serde_json::to_value(&policy).unwrap(),
+            "the `policy` is sent, without `enabled` beside it"
+        );
+        // A bare (partial) policy is sent as it is.
+        assert_eq!(
+            policy_patch(json!({ "cooldown_ms": 5 })).unwrap(),
+            json!({ "cooldown_ms": 5 })
+        );
+        // Anything else beside `policy`, or a `policy` that is not an object, is refused.
+        for bad in [
+            json!({ "policy": {}, "cooldown_ms": 5 }),
+            json!({ "policy": 5 }),
+            json!([1]),
+        ] {
+            assert!(policy_patch(bad.clone()).is_err(), "{bad}");
+        }
+        std::fs::write(&path, r#"{"policy": {}, "x": 1}"#).unwrap();
+        let args = parse(&["policy", "set", "--file", p, "--hub", "127.0.0.1:1"]).unwrap();
+        let err = run_with(args, None, &env(TOKEN), &mut Vec::new(), &mut Vec::new());
+        let (code, msg) = err.unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("`x` beside `policy`"), "{msg}");
+    }
+
+    #[test]
     fn policy_shows_the_stored_policy() {
         let mut policy = BalancePolicy {
             enabled: true,
@@ -743,7 +873,9 @@ mod tests {
         let args = parse(&["--apply", "policy"]).unwrap();
         let mut out = Vec::new();
         assert_eq!(
-            run_with(args, None, &env(TOKEN), &mut out).unwrap_err().0,
+            run_with(args, None, &env(TOKEN), &mut out, &mut Vec::new())
+                .unwrap_err()
+                .0,
             2
         );
     }
@@ -781,7 +913,7 @@ mod tests {
             .port();
         let args = parse(&["--hub", &format!("127.0.0.1:{port}")]).unwrap();
         let mut out = Vec::new();
-        let err = run_with(args, None, &env(TOKEN), &mut out).unwrap_err();
+        let err = run_with(args, None, &env(TOKEN), &mut out, &mut Vec::new()).unwrap_err();
         assert_eq!(err.0, 2);
         assert!(err.1.contains("could not reach"), "{}", err.1);
     }

@@ -4,9 +4,14 @@
 //! - `watch-balance-policy`: the [`BalancePolicy`]. Absent means the defaults.
 //! - `watch-balance-history`: the [`BalanceHistory`] the planner reads (the last apply that ran a
 //!   switch, and when each persona was last moved). Absent means none.
-//! - `watch-balance-audit-<ms>-<n>`: one [`BalanceAudit`] per apply that ran a switch: the plan,
-//!   who applied it and on what authority, and each switch's result. `<n>` tells apart two
-//!   audits written in the same millisecond.
+//! - `watch-balance-audit-<ms>-<n>`: one [`BalanceAudit`] per apply whose plan had a switch to
+//!   run: the plan, who applied it and on what authority, and each switch's result. `<n>` tells
+//!   apart two audits written in the same millisecond.
+//!
+//! **Audit growth.** Audits are never pruned: [`StateStore`] has no delete (a state entry can
+//! only be revised, and every revision is kept for sync), so each apply that had a switch adds
+//! one entry for good. Applies are rare (one per `min_interval_ms` at most, and only when an
+//! agent runs hot), so the growth is small; [`list_audits`] reads them all.
 //!
 //! These are the only entries fl-watch writes. The caller serializes writers (the hub holds its
 //! store guard across a whole apply).

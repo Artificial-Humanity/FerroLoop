@@ -593,3 +593,254 @@ fn a_failed_switch_is_recorded_and_a_down_persona_stops_the_apply() {
     assert!(history.persona_last_switch_ms.contains_key("ada"));
     lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(Vec::clear);
 }
+
+/// Whether a single-use grant can still be spent (checked without spending it).
+fn unspent(tmp: &TempDir, grant: &Value) -> bool {
+    fl_gate::verify_owner_grant(
+        Some(tmp.path()),
+        grant["grant_id"].as_str().unwrap(),
+        Some("felicity"),
+        false,
+    )
+    .is_ok()
+}
+
+fn skipped<'a>(plan: &'a Value, session_id: &str) -> &'a Value {
+    plan["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["session_id"] == session_id)
+        .unwrap_or_else(|| panic!("{session_id} not skipped: {plan}"))
+}
+
+#[test]
+fn no_metered_api_vendor_is_ever_a_target() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    for p in ["ada", "bo", "cy"] {
+        spin_up(&state, p, "claude");
+    }
+    // Every known subscription vendor is over the target maximums; with unknown targets
+    // allowed, only the unread subscription vendors (antigravity, grok) may take an agent. The
+    // registry's `*-api` vendors (`anthropic-api` sorts before `antigravity`) never do.
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 80.0);
+    quota(&state, "muse", 80.0);
+    let policy = json!({ "allow_unknown_quota_targets": true, "max_switches_per_run": 10 });
+    let (status, plan) = post(&state, PLAN, OWNER, json!({ "policy": policy }));
+    assert_eq!(status, 200, "{plan}");
+    let to: Vec<&str> = plan["switches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["to_vendor"].as_str().unwrap())
+        .collect();
+    assert_eq!(to, vec!["antigravity", "grok"], "{plan}");
+    assert_eq!(skipped(&plan, "claude:cy")["reason"], "no_eligible_target");
+    for v in plan["vendors"].as_array().unwrap() {
+        if v["vendor"].as_str().unwrap().ends_with("-api") {
+            assert_eq!(v["eligible"], false, "{v}");
+            assert_eq!(v["candidate"], false, "{v}");
+        }
+    }
+    // The policy can only narrow the candidates: naming an API vendor allows nothing.
+    let policy = json!({
+        "allow_unknown_quota_targets": true, "max_switches_per_run": 10,
+        "allowed_target_vendors": ["anthropic-api", "openai-api"],
+    });
+    let (status, plan) = post(&state, PLAN, OWNER, json!({ "policy": policy }));
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["switches"], json!([]), "{plan}");
+    // An apply with the same policy moves no one onto an API vendor either.
+    set_policy(
+        &state,
+        json!({ "allow_unknown_quota_targets": true, "max_switches_per_run": 10 }),
+    );
+    let (status, out) = post(&state, APPLY, OWNER, json!({}));
+    assert_eq!(status, 200, "{out}");
+    let mut running = live(&state);
+    running.sort();
+    assert_eq!(running, vec!["antigravity:ada", "claude:cy", "grok:bo"]);
+}
+
+#[test]
+fn a_switch_its_remodel_would_refuse_is_skipped_and_the_next_agent_moves() {
+    use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest};
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 40.0);
+    quota(&state, "muse", 10.0);
+    // Runtime calls on, against a fake tmux.
+    let fake = FakeRuntime::default();
+    let env = fake.env(tmp.path());
+    let store = state.open_store().unwrap();
+    let up = |persona: &str, vendor: &str| {
+        let req = SpinUpRequest {
+            persona: persona.into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: vendor.into(),
+            ..SpinUpRequest::default()
+        };
+        lifecycle::spin_up(&*store, &env, &req, "owner", Caller::Owner).unwrap();
+    };
+    // ada's claude and codex sessions share the tmux session `Ada`.
+    up("ada", "claude");
+    up("ada", "codex");
+    // bo's record names another tmux session than its own `Bo`.
+    up("bo", "claude");
+    let mut bo = lifecycle::list_hosted_sessions(&*store)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.session_id == "claude:bo")
+        .unwrap();
+    bo.tmux_target = Some("Other:claude".into());
+    lifecycle::persist_hosted_session(&*store, &bo, "owner").unwrap();
+    up("cy", "claude");
+    fake.calls.borrow_mut().clear();
+
+    let inputs = crate::balance_api::read_store_inputs(&store).unwrap();
+    let (plan, targets) = crate::balance_api::checked_plan(
+        &store,
+        &env,
+        &[],
+        Caller::Owner,
+        &inputs.policy,
+        &inputs,
+        &[],
+        1_000,
+    )
+    .unwrap_or_else(|_| panic!("the plan failed"));
+    drop(store);
+    // One run slot: ada and bo are worse off by order, but their remodels would be refused.
+    let moves: Vec<(&str, &str)> = plan
+        .switches
+        .iter()
+        .map(|s| (s.session_id.as_str(), s.to_vendor.as_str()))
+        .collect();
+    assert_eq!(moves, vec![("claude:cy", "muse")], "{plan:#?}");
+    for (id, why) in [
+        ("claude:ada", "it also runs codex:ada"),
+        ("claude:bo", "started another tmux session"),
+    ] {
+        let s = plan.skipped.iter().find(|s| s.session_id == id).unwrap();
+        assert_eq!(s.reason, fl_watch::SkipReason::NotRemodelable, "{id}");
+        assert!(s.detail.contains(why), "{id}: {}", s.detail);
+        assert!(s.detail.contains("(409)"), "{id}: {}", s.detail);
+    }
+    assert_eq!(targets.keys().collect::<Vec<_>>(), vec!["claude:cy"]);
+    assert!(
+        fake.calls.borrow().is_empty(),
+        "the precheck starts and stops nothing"
+    );
+}
+
+#[test]
+fn an_agent_that_fails_its_precheck_spends_no_grant_and_frees_its_slot() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    // ada's worktree is gone: a remodel would refuse it (400) before touching anything.
+    let wt = tmp.path().join("wt-ada");
+    std::fs::create_dir(&wt).unwrap();
+    let (status, v) = post(
+        &state,
+        "/api/v1/sessions/spin-up",
+        OWNER,
+        json!({
+            "persona": "ada", "project": "FerroLoop", "role": "assistant", "vendor": "claude",
+            "cwd": wt.display().to_string(),
+        }),
+    );
+    assert_eq!(status, 200, "{v}");
+    std::fs::remove_dir(&wt).unwrap();
+    spin_up(&state, "bo", "codex");
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 40.0);
+    quota(&state, "muse", 10.0);
+    let grant = issue(&state, "felicity", "watch.balance.apply", true);
+    let body = json!({ "warrant": grant["grant_id"] });
+
+    // The plan already says so, and agrees with the apply.
+    let (status, plan) = call(&state, "POST", PLAN, PEER, Some("felicity"), None);
+    assert_eq!(status, 200, "{plan}");
+    assert_eq!(plan["switches"], json!([]), "{plan}");
+    let ada = skipped(&plan, "claude:ada");
+    assert_eq!(ada["reason"], "not_remodelable");
+    assert!(
+        ada["detail"].as_str().unwrap().contains("not a directory"),
+        "{ada}"
+    );
+
+    let (status, out) = call(&state, "POST", APPLY, PEER, Some("felicity"), Some(&body));
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["results"], json!([]), "{out}");
+    assert_eq!(
+        skipped(&out["plan"], "claude:ada")["reason"],
+        "not_remodelable"
+    );
+    assert!(
+        unspent(&tmp, &grant),
+        "no switch passed its precheck: the grant is kept"
+    );
+    assert!(audits(&state).is_empty());
+    assert_eq!(
+        read_history(&*state.open_store().unwrap()).unwrap(),
+        fl_watch::BalanceHistory::default(),
+        "no cooldown and no last apply for a switch that never ran"
+    );
+
+    // cy, also on hot claude, takes the run slot ada cannot use; the grant is spent now.
+    spin_up(&state, "cy", "claude");
+    let (status, out) = call(&state, "POST", APPLY, PEER, Some("felicity"), Some(&body));
+    assert_eq!(status, 200, "{out}");
+    let results = out["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1, "{out}");
+    assert_eq!(results[0]["session_id"], "claude:cy");
+    assert_eq!(results[0]["status"], "ok", "{out}");
+    assert_eq!(
+        skipped(&out["plan"], "claude:ada")["reason"],
+        "not_remodelable"
+    );
+    assert!(!unspent(&tmp, &grant));
+    let mut running = live(&state);
+    running.sort();
+    assert_eq!(running, vec!["claude:ada", "codex:bo", "muse:cy"]);
+}
+
+#[test]
+fn a_blocked_or_empty_apply_leaves_a_single_use_grant_unspent() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    spin_up(&state, "ada", "claude");
+    spin_up(&state, "bo", "codex");
+    quota(&state, "claude", 20.0);
+    quota(&state, "codex", 40.0);
+    quota(&state, "muse", 10.0);
+    let grant = issue(&state, "felicity", "watch.balance.apply", true);
+    let body = json!({ "warrant": grant["compact_token"] });
+    let apply = || call(&state, "POST", APPLY, PEER, Some("felicity"), Some(&body));
+
+    // Nobody runs hot: nothing to switch.
+    let (status, out) = apply();
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["results"], json!([]));
+    assert!(unspent(&tmp, &grant), "an empty apply spends nothing");
+
+    // The Owner moves ada; inside `min_interval_ms` the peer's apply is blocked.
+    quota(&state, "claude", 95.0);
+    let (status, out) = post(&state, APPLY, OWNER, json!({}));
+    assert_eq!(status, 200, "{out}");
+    quota(&state, "codex", 99.0);
+    let (status, out) = apply();
+    assert_eq!(status, 409, "{out}");
+    assert!(unspent(&tmp, &grant), "a blocked apply spends nothing");
+
+    // Once it may run, the grant is spent by the apply that switches.
+    set_policy(&state, json!({ "min_interval_ms": 0 }));
+    let (status, out) = apply();
+    assert_eq!(status, 200, "{out}");
+    assert_eq!(out["results"][0]["persona"], "bo", "{out}");
+    assert!(!unspent(&tmp, &grant));
+}
