@@ -499,6 +499,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fl-watch"
+version = "0.1.0"
+dependencies = [
+ "fl-core",
+ "fl-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "fl-wire"
 version = "0.1.0"
 dependencies = [

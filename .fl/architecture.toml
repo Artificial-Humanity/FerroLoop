@@ -67,6 +67,14 @@ package = "fl-gate"
 paths = ["crates/gate/**"]
 
 [[components]]
+id = "fl_watch"
+title = "FerroWatch Observability"
+kind = "crate"
+description = "Standalone telemetry rollups, agent liveness health, and threshold alerting over a FerroLoop store"
+package = "fl-watch"
+paths = ["crates/watch/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
@@ -185,3 +193,23 @@ label = "runs fl hub and fl arch subcommands"
 from = "ferrodeck_ui"
 to = "fl_hub"
 label = "consumes /api/v1 REST API and /ws/v1 WebSocket stream"
+
+[[edges]]
+from = "fl_watch"
+to = "fl_core"
+label = "reads ledger, catalog, and runtime state through core traits and reuses core liveness and regret evaluation"
+
+[[edges]]
+from = "fl_watch"
+to = "fl_store"
+label = "sums attempts and gate runs through the store's columnar rollup"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_watch"
+label = "serves /api/v1/watch summary, alerts, and rollups with discovered vendor quota"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_watch"
+label = "runs fl watch status, rollups, liveness, and alerts"

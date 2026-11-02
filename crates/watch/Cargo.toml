@@ -1,0 +1,18 @@
+[package]
+name = "fl-watch"
+description = "FerroWatch: observability, telemetry rollups, liveness and alerting over a FerroLoop store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core = { path = "../core" }
+# The library only: a consumer of fl-watch does not need the `ferrostore` binary's clap arguments.
+fl-store = { path = "../store", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
