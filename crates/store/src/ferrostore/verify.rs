@@ -138,11 +138,17 @@ pub fn verify_redb_vs_ferrostore(
 /// taken when it is created and checked again before and after the link, and a
 /// mismatch is refused. This call only ever removes a temp file it created.
 ///
-/// Once the link is made, `fls_path` is the store and the result is
-/// `Ok(report)`. A failure after that point is a warning on stderr, not an
-/// `Err`: a temp file that cannot be removed is left behind; a directory that
-/// cannot be synced leaves the new entry not yet durable; a `.redb` that cannot
-/// be made 0400 stays writable.
+/// After the link, the directory is synced and only then is the `.redb` made
+/// 0400, so a crash never leaves a frozen `.redb` beside an entry the disk may
+/// lose. A directory that cannot be synced, or a `.redb` that cannot be made
+/// 0400, is an `Err`: the call unpublishes, removing `fls_path` only while it
+/// is still the file this call linked (an `fls_path` some other file now holds
+/// is left alone), removes its own temp file, and leaves the `.redb`
+/// unchanged and writable, so nothing written to it is lost and a retry can
+/// migrate again. `Ok(report)` with a clean report means the `.fls` entry was
+/// synced and the `.redb` is 0400. A temp file that cannot be removed after
+/// the link is the one failure that is only a warning on stderr: it is left
+/// behind, a second name for the published file.
 pub fn migrate_verified(redb_path: &Path, fls_path: &Path) -> Result<ParityReport, StoreError> {
     migrate_verified_with(redb_path, fls_path, |_| Ok(()))
 }
@@ -307,6 +313,12 @@ fn remove_own_temp(temp: &Path, ours: FileId) -> std::io::Result<()> {
     }
 }
 
+/// Step 6 of [`migrate_verified`]: make the kept `.redb` read-only.
+fn chmod_read_only(redb_path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
+}
+
 /// [`migrate_verified`] with `after_copy` run on the new store between the
 /// copy and the verify. Production passes a no-op; tests use it to make the
 /// two stores differ.
@@ -315,7 +327,13 @@ pub(super) fn migrate_verified_with(
     fls_path: &Path,
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
 ) -> Result<ParityReport, StoreError> {
-    migrate_verified_hooked(redb_path, fls_path, after_copy, || {})
+    migrate_verified_hooked(
+        redb_path,
+        fls_path,
+        after_copy,
+        super::sync_dir,
+        chmod_read_only,
+    )
 }
 
 /// [`migrate_verified_with`] with `before_chmod` also run after the link and
@@ -328,14 +346,30 @@ pub(super) fn migrate_verified_with_before_chmod(
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
     before_chmod: impl FnOnce(),
 ) -> Result<ParityReport, StoreError> {
-    migrate_verified_hooked(redb_path, fls_path, after_copy, before_chmod)
+    migrate_verified_hooked(redb_path, fls_path, after_copy, super::sync_dir, |redb| {
+        before_chmod();
+        chmod_read_only(redb)
+    })
+}
+
+/// [`migrate_verified`] with the directory `fsync` (step 5) and the `chmod`
+/// (step 6) replaced: tests use it to make either fail after the link.
+#[cfg(test)]
+pub(super) fn migrate_verified_with_steps(
+    redb_path: &Path,
+    fls_path: &Path,
+    sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
+    chmod: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<ParityReport, StoreError> {
+    migrate_verified_hooked(redb_path, fls_path, |_| Ok(()), sync_dir, chmod)
 }
 
 fn migrate_verified_hooked(
     redb_path: &Path,
     fls_path: &Path,
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
-    before_chmod: impl FnOnce(),
+    sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
+    chmod: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<ParityReport, StoreError> {
     sweep_stale_temps(fls_path);
     if std::fs::symlink_metadata(fls_path).is_ok() {
@@ -351,7 +385,7 @@ fn migrate_verified_hooked(
         )));
     }
     let temp = temp_path(fls_path)?;
-    migrate_into(redb_path, fls_path, &temp, after_copy, before_chmod)
+    migrate_into(redb_path, fls_path, &temp, after_copy, sync_dir, chmod)
 }
 
 /// [`migrate_verified`] through the temp file `temp`, for a test that must
@@ -362,17 +396,26 @@ pub(super) fn migrate_verified_with_temp(
     fls_path: &Path,
     temp: &Path,
 ) -> Result<ParityReport, StoreError> {
-    migrate_into(redb_path, fls_path, temp, |_| Ok(()), || {})
+    migrate_into(
+        redb_path,
+        fls_path,
+        temp,
+        |_| Ok(()),
+        super::sync_dir,
+        chmod_read_only,
+    )
 }
 
 /// Steps 1 to 6 of [`migrate_verified`], through `temp`, once the checks on
-/// `redb_path` and `fls_path` have passed.
+/// `redb_path` and `fls_path` have passed. `sync_dir` is step 5 and `chmod`
+/// step 6.
 fn migrate_into(
     redb_path: &Path,
     fls_path: &Path,
     temp: &Path,
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
-    before_chmod: impl FnOnce(),
+    sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
+    chmod: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<ParityReport, StoreError> {
     // `create_new` is `O_EXCL`: a taken name fails here and is not touched.
     let held = {
@@ -397,8 +440,9 @@ fn migrate_into(
 
     // Invariant: `src` holds redb's exclusive lock on the `.redb` from before
     // the copy until after the `chmod`, and is dropped only once the steps
-    // below (and any temp cleanup on their error paths) are done, so no other
-    // process can write the `.redb` after it was copied.
+    // below (and any temp cleanup or unpublish on their error paths) are
+    // done, so no other process can write the `.redb` after it was copied
+    // while the `.fls` it was copied into is published.
     let src = RedbStore::open(redb_path).map_err(cleanup)?;
     let result = (|| {
         let report = {
@@ -450,40 +494,67 @@ fn migrate_into(
         }
         drop(held);
 
-        // `fls_path` is the store from here on: what fails now is a warning.
+        // The temp name is now a second link to the store; one left behind is
+        // harmless (the sweep removes it), so a failure here is a warning. It
+        // is removed before the directory sync, so the sync covers it too.
         if let Err(err) = remove_own_temp(temp, ours) {
             warn(&format!(
-                "warning: {} is published, but its temp file {} was not removed: {err}",
+                "warning: {} is linked, but its temp file {} was not removed: {err}",
                 fls_path.display(),
                 temp.display()
             ));
         }
-        if let Err(err) = super::sync_dir(&super::parent_dir(fls_path)) {
-            warn(&format!(
-                "warning: {} is published, but its directory was not synced, so a crash \
-                 may still lose the new entry: {err}",
-                fls_path.display()
-            ));
+        // Until the `.redb` is frozen, the link can still be taken back: a
+        // failure from here on unpublishes and is an `Err`, and the `.redb`,
+        // still locked by `src`, is left unchanged and writable.
+        if let Err(err) = sync_dir(&super::parent_dir(fls_path)) {
+            let undone = unpublish(fls_path, redb_path, ours);
+            return Err(cleanup(backend(format!(
+                "the directory of {} was not synced after the link, so a crash could lose \
+                 it while {} is frozen ({err}); {undone}",
+                fls_path.display(),
+                redb_path.display()
+            ))));
         }
-        before_chmod();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) =
-                std::fs::set_permissions(redb_path, std::fs::Permissions::from_mode(0o400))
-            {
-                warn(&format!(
-                    "warning: {} is published, but chmod 0400 {} failed, so the redb store \
-                     remains writable: {err}",
-                    fls_path.display(),
-                    redb_path.display()
-                ));
-            }
+        if let Err(err) = chmod(redb_path) {
+            let undone = unpublish(fls_path, redb_path, ours);
+            return Err(cleanup(backend(format!(
+                "chmod 0400 {} failed after {} was linked ({err}); {undone}",
+                redb_path.display(),
+                fls_path.display()
+            ))));
         }
         Ok(report)
     })();
     // The lock is released here, last, on every path.
     drop(src);
     result
+}
+
+/// Take back the link [`migrate_into`] made at `fls_path`: remove it only while
+/// it is still the file this call linked (`ours`), then sync its directory so
+/// the removal is durable (best effort). Says what was done, for the error.
+fn unpublish(fls_path: &Path, redb_path: &Path, ours: FileId) -> String {
+    let (fls, redb) = (fls_path.display(), redb_path.display());
+    if id_at(fls_path) != Some(ours) {
+        return format!(
+            "{fls} is no longer the file this migration linked and was left alone; {redb} is \
+             unchanged and still writable"
+        );
+    }
+    if let Err(err) = std::fs::remove_file(fls_path) {
+        return format!(
+            "{fls} could not be unpublished ({err}): remove it before running on {redb}, which \
+             is unchanged and still writable"
+        );
+    }
+    match super::sync_dir(&super::parent_dir(fls_path)) {
+        Ok(()) => format!("{fls} was unpublished; {redb} is unchanged and still writable"),
+        Err(err) => format!(
+            "{fls} was unpublished, but the removal was not synced ({err}); {redb} is \
+             unchanged and still writable"
+        ),
+    }
 }
 
 /// One line on stderr, as the store's other warnings print: a closed stderr is

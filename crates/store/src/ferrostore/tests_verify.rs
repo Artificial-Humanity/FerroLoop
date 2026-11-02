@@ -1001,6 +1001,172 @@ fn the_redb_stays_locked_from_the_copy_until_after_the_chmod() {
     assert_eq!(open_failure(&redb_path), None, "the lock was released");
 }
 
+/// Which step after the link a fault test makes fail.
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    SyncDir,
+    Chmod,
+}
+
+/// What the step a [`Fault`] names does instead: optionally replace `fls`
+/// with another file first, then fail.
+struct Injected<'a> {
+    fault: Fault,
+    fls: &'a Path,
+    replace: bool,
+}
+
+impl Injected<'_> {
+    /// Put an impostor at `fls` (not the file the migration linked) when asked.
+    fn maybe_replace(&self) {
+        if self.replace {
+            let impostor = self.fls.with_file_name("impostor");
+            std::fs::write(&impostor, b"another file").unwrap();
+            std::fs::rename(&impostor, self.fls).unwrap();
+        }
+    }
+
+    fn run(&self, redb_path: &Path, fls: &Path) -> Result<ParityReport, fl_core::StoreError> {
+        let mut ran = false;
+        let result = match self.fault {
+            Fault::SyncDir => verify::migrate_verified_with_steps(
+                redb_path,
+                fls,
+                |_| {
+                    ran = true;
+                    assert!(fls.is_file(), "the store is linked before the sync");
+                    self.maybe_replace();
+                    Err(crate::backend("injected sync failure"))
+                },
+                |_| panic!("the chmod runs only after the directory sync succeeds"),
+            ),
+            Fault::Chmod => verify::migrate_verified_with_steps(
+                redb_path,
+                fls,
+                crate::ferrostore::sync_dir,
+                |_| {
+                    ran = true;
+                    self.maybe_replace();
+                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                },
+            ),
+        };
+        assert!(ran, "the {:?} fault was reached", self.fault);
+        result
+    }
+}
+
+/// `after` holds what `before` held: `before` migrated into a store in
+/// `scratch` verifies clean against `after`, table by table and view by view.
+fn assert_same_content(before: &Path, after: &Path, scratch: &Path) {
+    let reference = FerroStore::open(scratch.join("before.fls")).unwrap();
+    migrate_redb_to_ferrostore(&RedbStore::open(before).unwrap(), &reference).unwrap();
+    let report = verify_redb_vs_ferrostore(&RedbStore::open(after).unwrap(), &reference).unwrap();
+    assert!(
+        report.is_clean(),
+        "the redb changed: {:#?}",
+        report.mismatches()
+    );
+}
+
+/// A sync or chmod failure after the link is an `Err` that leaves no store,
+/// no temp file and a writable, unchanged `.redb`, and a retry once the fault
+/// clears migrates.
+fn a_failure_after_the_link_unpublishes(fault: Fault) {
+    let tmp = tempfile::tempdir().unwrap();
+    let redb_path = redb_file(tmp.path());
+    let fls = tmp.path().join("fl.fls");
+    // redb rewrites its header on open, so "unchanged" is compared by content.
+    let snapshot = tempfile::tempdir().unwrap();
+    let before = snapshot.path().join("before.redb");
+    std::fs::copy(&redb_path, &before).unwrap();
+    let err = Injected {
+        fault,
+        fls: &fls,
+        replace: false,
+    }
+    .run(&redb_path, &fls)
+    .unwrap_err();
+    let text = err.to_string();
+    let want = match fault {
+        Fault::SyncDir => "injected sync failure",
+        Fault::Chmod => "chmod 0400",
+    };
+    assert!(text.contains(want), "{fault:?}: {text}");
+    assert!(text.contains(&fls.display().to_string()), "{text}");
+    assert!(text.contains(&redb_path.display().to_string()), "{text}");
+    assert!(text.contains("was unpublished"), "{text}");
+    assert!(!fls.exists(), "{fault:?}: the store is unpublished");
+    assert_eq!(
+        entries(tmp.path()),
+        vec!["fl.redb".to_string()],
+        "{fault:?}: no temp file is left"
+    );
+    assert_eq!(
+        mode(&redb_path),
+        0o600,
+        "{fault:?}: the redb stays writable"
+    );
+    assert_same_content(&before, &redb_path, snapshot.path());
+    assert_eq!(
+        open_failure(&redb_path),
+        None,
+        "{fault:?}: the redb opens for writing"
+    );
+
+    // Once the fault clears, the same migration succeeds.
+    let report = migrate_verified(&redb_path, &fls).unwrap();
+    assert!(report.is_clean(), "{:#?}", report.mismatches());
+    assert_eq!(
+        entries(tmp.path()),
+        vec!["fl.fls".to_string(), "fl.redb".to_string()]
+    );
+    assert_eq!(mode(&redb_path), 0o400);
+}
+
+#[test]
+fn a_directory_sync_that_fails_after_the_link_unpublishes_and_keeps_the_redb_writable() {
+    a_failure_after_the_link_unpublishes(Fault::SyncDir);
+}
+
+#[test]
+fn a_chmod_that_fails_after_the_link_unpublishes_and_keeps_the_redb_writable() {
+    a_failure_after_the_link_unpublishes(Fault::Chmod);
+}
+
+#[test]
+fn a_store_replaced_after_the_link_is_not_unpublished() {
+    for fault in [Fault::SyncDir, Fault::Chmod] {
+        let tmp = tempfile::tempdir().unwrap();
+        let redb_path = redb_file(tmp.path());
+        let fls = tmp.path().join("fl.fls");
+        let err = Injected {
+            fault,
+            fls: &fls,
+            replace: true,
+        }
+        .run(&redb_path, &fls)
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("left alone"), "{fault:?}: {text}");
+        assert_eq!(
+            std::fs::read(&fls).unwrap(),
+            b"another file",
+            "{fault:?}: the file this call did not link is kept"
+        );
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["fl.fls".to_string(), "fl.redb".to_string()],
+            "{fault:?}: no temp file is left"
+        );
+        assert_eq!(
+            mode(&redb_path),
+            0o600,
+            "{fault:?}: the redb stays writable"
+        );
+    }
+}
+
 /// Set `path`'s modification time `age` in the past.
 fn age_by(path: &Path, age: std::time::Duration) {
     let when = std::time::SystemTime::now() - age;
