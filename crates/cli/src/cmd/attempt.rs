@@ -1,4 +1,4 @@
-use crate::config::AdapterConfig;
+use crate::config::{AdapterConfig, VendorConfig};
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
@@ -13,8 +13,8 @@ use fl_core::telemetry::{
     AdapterKind, AttemptHeartbeat, liveness_agent_slug, liveness_record_slug,
 };
 use fl_core::{Iri, Kind};
-use fl_exec::adapters::{AnyAdapter, LivenessSink};
-use fl_exec::runner::{AttemptSpec, Runner};
+use fl_exec::adapters::{AdapterBuild, AnyAdapter, LivenessSink};
+use fl_exec::runner::{AttemptError, AttemptSpec, Runner};
 use fl_exec::stamp;
 use std::collections::BTreeMap;
 
@@ -92,23 +92,88 @@ fn write_heartbeat(store: &fl_store::AnyStore, hb: &AttemptHeartbeat) {
     }
 }
 
+/// What `--adapter` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// One of the five subscription CLIs: `[adapters.<name>]` applies.
+    Kind(AdapterKind),
+    /// Any other registered vendor, by its lowercase id: `[vendors.<id>]` applies.
+    Vendor(String),
+}
+
+impl Target {
+    /// The five CLI names resolve first, so a vendor can never shadow one. Then any registered
+    /// vendor id. Anything else names the ids that exist.
+    pub(crate) fn resolve(name: &str) -> Result<Self> {
+        if let Some(kind) = AdapterKind::from_wire(name) {
+            return Ok(Self::Kind(kind));
+        }
+        if let Some(vendor) = fl_core::lookup_vendor(name) {
+            return Ok(Self::Vendor(vendor.id));
+        }
+        let known = fl_core::VendorRegistry::global()
+            .list()
+            .into_iter()
+            .map(|v| v.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("`{name}` is not a known adapter. Known adapters: {known}.");
+    }
+
+    /// The adapter string an attempt and its heartbeats are recorded under.
+    pub(crate) fn wire(&self) -> &str {
+        match self {
+            Self::Kind(kind) => kind.as_wire(),
+            Self::Vendor(id) => id,
+        }
+    }
+}
+
+/// Builds the adapter for `target`. A CLI kind keeps its `[adapters.<name>]` binary and rate
+/// card; any other vendor takes its overrides from `[vendors.<id>]`, and its key from the
+/// environment or the FerroGate Vault.
+pub(crate) fn build_adapter(
+    target: &Target,
+    binary: Option<String>,
+    adapters: &BTreeMap<AdapterKind, AdapterConfig>,
+    vendors: &BTreeMap<String, VendorConfig>,
+    liveness: (Iri, fl_core::ids::ProjectId, Option<String>, LivenessSink),
+) -> Result<AnyAdapter, AttemptError> {
+    match target {
+        Target::Kind(kind) => {
+            let binary = binary.or_else(|| adapters.get(kind).and_then(|c| c.binary.clone()));
+            let rate_card = adapters.get(kind).and_then(|c| c.rate_card());
+            let (entry, project, agent, sink) = liveness;
+            Ok(
+                AnyAdapter::new(*kind, binary, rate_card)
+                    .with_liveness(entry, project, agent, sink),
+            )
+        }
+        Target::Vendor(id) => {
+            let cfg = vendors.get(id).cloned().unwrap_or_default();
+            AnyAdapter::from_vendor_id(
+                id,
+                AdapterBuild {
+                    binary_override: binary,
+                    rate_card: cfg.rate_card(),
+                    model: cfg.default_model.clone(),
+                    base_url: cfg.base_url.clone(),
+                    api_key: Some(crate::vendor_keys::vault_key_resolver(cfg.base_url)),
+                    liveness: Some(liveness),
+                },
+            )
+        }
+    }
+}
+
 pub fn run(
     ctx: &Ctx<'_>,
     adapters: &BTreeMap<AdapterKind, AdapterConfig>,
+    vendors: &BTreeMap<String, VendorConfig>,
     cmd: Cmd,
 ) -> Result<i32> {
     let store = ctx.store;
-    let Some(kind) = AdapterKind::from_wire(&cmd.adapter) else {
-        let known = AdapterKind::ALL
-            .iter()
-            .map(|k| k.as_wire())
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "`{}` is not a known adapter. Known adapters: {known}.",
-            cmd.adapter
-        );
-    };
+    let target = Target::resolve(&cmd.adapter)?;
     let id = RecordId(ctx.resolve_item(Kind::Record, &cmd.record)?);
     let Some(record) = ctx.tracker.get_record(&id)? else {
         bail!(
@@ -129,11 +194,6 @@ pub fn run(
     crate::preflight::check(ctx, &record.project)?;
 
     let entry = stamp::entry_id();
-    let binary_override = cmd
-        .binary
-        .clone()
-        .or_else(|| adapters.get(&kind).and_then(|c| c.binary.clone()));
-    let rate_card = adapters.get(&kind).and_then(|c| c.rate_card());
     let agent_persona = std::env::var("AGENT_PERSONA")
         .ok()
         .map(|s| s.trim().to_ascii_lowercase())
@@ -163,14 +223,21 @@ pub fn run(
                 let _ = guard.send(hb.clone());
             }
         });
-        let adapter = AnyAdapter::new(kind, binary_override, rate_card).with_liveness(
-            entry.clone(),
-            record.project.clone(),
-            agent_persona,
-            sink,
-        );
-        let res = rt.block_on(adapter.attempt(spec));
-        drop(adapter);
+        // ⚠ A build that fails has already consumed the sink, so the writer ends.
+        let res = match build_adapter(
+            &target,
+            cmd.binary.clone(),
+            adapters,
+            vendors,
+            (entry.clone(), record.project.clone(), agent_persona, sink),
+        ) {
+            Ok(adapter) => {
+                let res = rt.block_on(adapter.attempt(spec));
+                drop(adapter);
+                res
+            }
+            Err(e) => Err(e),
+        };
         let _ = writer.join();
         res
     })
@@ -184,7 +251,7 @@ pub fn run(
         at: Some(stamp::now()),
         project: record.project,
         record: record.id,
-        adapter: kind.as_wire().to_owned(),
+        adapter: target.wire().to_owned(),
         status: outcome.status,
         duration_ms: outcome.duration_ms,
         tokens_in: outcome.tokens_in,

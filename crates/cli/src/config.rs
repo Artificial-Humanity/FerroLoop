@@ -11,6 +11,9 @@ use anyhow::{Context, Result, bail};
 use fl_core::pr_policy::{DEFAULT_REVIEWER_APP_IDS, ReviewerApps};
 use fl_core::state::{StateScope, validate_slug};
 use fl_core::telemetry::{AdapterKind, RateCard};
+use fl_core::vendor::{
+    ApiDialect, VendorDescriptor, VendorRegistry, VendorTransport, validate_api_base_url,
+};
 use fl_exec::state_sync::StateSyncTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -308,6 +311,116 @@ impl AdapterConfig {
     }
 }
 
+/// How a `[vendors.<id>]` entry says fl reaches its vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VendorTransportKind {
+    /// An HTTP API (hosted with a key, or a local engine without one).
+    HttpApi,
+    /// A subscription CLI. Configuration cannot add one: it needs a code adapter.
+    SubscriptionCli,
+}
+
+/// The wire protocol of a new vendor, as `[vendors.<id>]` spells it. (`fl_core::ApiDialect`'s own
+/// serde name for the first is `open_ai_chat_completions`; the config says
+/// `openai_chat_completions` and still accepts that.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VendorDialect {
+    #[serde(rename = "openai_chat_completions", alias = "open_ai_chat_completions")]
+    OpenAiChatCompletions,
+    AnthropicMessages,
+    GeminiGenerateContent,
+}
+
+impl From<VendorDialect> for ApiDialect {
+    fn from(d: VendorDialect) -> Self {
+        match d {
+            VendorDialect::OpenAiChatCompletions => Self::OpenAiChatCompletions,
+            VendorDialect::AnthropicMessages => Self::AnthropicMessages,
+            VendorDialect::GeminiGenerateContent => Self::GeminiGenerateContent,
+        }
+    }
+}
+
+/// Per-vendor `[vendors.<id>]` configuration.
+///
+/// For one of the 13 built-in vendors it is a set of OVERRIDES (`base_url`, `default_model`,
+/// the rate card) that fl applies when it builds that vendor's adapter; the registry's built-in
+/// is never changed. For any other id it DEFINES a new HTTP API vendor, so a vLLM, a proxy or
+/// a new hosted API needs no recompile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VendorConfig {
+    /// Required (`http_api`) for a new vendor; for a built-in it may only repeat its own.
+    #[serde(default)]
+    pub transport: Option<VendorTransportKind>,
+    /// The wire protocol of a new vendor: `openai_chat_completions`, `anthropic_messages` or
+    /// `gemini_generate_content`.
+    #[serde(default)]
+    pub dialect: Option<VendorDialect>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The environment variable holding a new vendor's API key.
+    #[serde(default)]
+    pub env_key: Option<String>,
+    /// The FerroGate Vault secret holding a new vendor's API key (default: `env_key`).
+    #[serde(default)]
+    pub vault_secret: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    #[serde(default, alias = "input_usd_micros_per_m")]
+    pub input_usd_micros_per_mtok: Option<u64>,
+    #[serde(default, alias = "output_usd_micros_per_m")]
+    pub output_usd_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    pub mcp_config_rel_path: Option<String>,
+}
+
+impl VendorConfig {
+    pub fn rate_card(&self) -> Option<RateCard> {
+        if self.input_usd_micros_per_mtok.is_none() && self.output_usd_micros_per_mtok.is_none() {
+            None
+        } else {
+            Some(RateCard {
+                input_usd_micros_per_mtok: self.input_usd_micros_per_mtok.unwrap_or(0),
+                output_usd_micros_per_mtok: self.output_usd_micros_per_mtok.unwrap_or(0),
+            })
+        }
+    }
+
+    /// The keys this entry sets, for the message that refuses them.
+    fn set_keys(&self, only: &[&str]) -> Vec<&'static str> {
+        let all = [
+            ("transport", self.transport.is_some()),
+            ("dialect", self.dialect.is_some()),
+            ("base_url", self.base_url.is_some()),
+            ("default_model", self.default_model.is_some()),
+            ("display_name", self.display_name.is_some()),
+            ("env_key", self.env_key.is_some()),
+            ("vault_secret", self.vault_secret.is_some()),
+            ("context_window", self.context_window.is_some()),
+            (
+                "input_usd_micros_per_mtok",
+                self.input_usd_micros_per_mtok.is_some(),
+            ),
+            (
+                "output_usd_micros_per_mtok",
+                self.output_usd_micros_per_mtok.is_some(),
+            ),
+            ("mcp_config_rel_path", self.mcp_config_rel_path.is_some()),
+        ];
+        all.into_iter()
+            .filter(|(k, set)| *set && only.contains(k))
+            .map(|(k, _)| k)
+            .collect()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
     pub state: Option<StateConfig>,
@@ -317,6 +430,8 @@ pub struct Config {
     pub github: Option<GithubApp>,
     pub mcp: Vec<McpEntry>,
     pub adapters: BTreeMap<AdapterKind, AdapterConfig>,
+    /// `[vendors.<id>]`, by lowercase id. A new vendor in it is already registered.
+    pub vendors: BTreeMap<String, VendorConfig>,
 }
 
 impl Config {
@@ -438,6 +553,8 @@ struct File {
     mcp: Vec<McpEntry>,
     #[serde(default)]
     adapters: BTreeMap<String, AdapterConfig>,
+    #[serde(default)]
+    vendors: BTreeMap<String, VendorConfig>,
 }
 
 /// The XDG config base directory: `xdg_config_home` if it is a non-empty,
@@ -673,6 +790,7 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         }
         adapters.insert(kind, adapter_cfg);
     }
+    let vendors = load_vendors(path, file.vendors)?;
     Ok(Config {
         state: file.state,
         wire: file.wire,
@@ -681,6 +799,197 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         github: file.github,
         mcp: file.mcp,
         adapters,
+        vendors,
+    })
+}
+
+/// Checks every `[vendors.<id>]` entry, then registers each new vendor in the process-wide
+/// registry. Returns the entries by lowercase id.
+///
+/// ⚠ Nothing is registered unless every entry is valid, and registering is idempotent
+/// ([`fl_core::ensure_vendor_registered`]): a process may load the config more than once. A
+/// different definition of an id already registered is an error naming the id, never a panic.
+fn load_vendors(
+    path: &Path,
+    raw: BTreeMap<String, VendorConfig>,
+) -> Result<BTreeMap<String, VendorConfig>> {
+    let mut vendors = BTreeMap::new();
+    let mut new_vendors = Vec::new();
+    for (raw_id, cfg) in raw {
+        let id = raw_id.trim().to_ascii_lowercase();
+        let at = |msg: String| anyhow::anyhow!("{}: `[vendors.{raw_id}]` {msg}", path.display());
+        if vendors.contains_key(&id) {
+            return Err(at(format!(
+                "repeats the vendor `{id}`: ids are compared without case"
+            )));
+        }
+        if let Some(builtin) = VendorRegistry::global()
+            .get(&id)
+            .filter(|_| VendorRegistry::is_builtin(&id))
+        {
+            check_builtin_override(&cfg, &builtin).map_err(&at)?;
+        } else {
+            new_vendors.push(new_vendor_descriptor(&id, &cfg).map_err(&at)?);
+        }
+        vendors.insert(id, cfg);
+    }
+    for descriptor in new_vendors {
+        let id = descriptor.id.clone();
+        fl_core::ensure_vendor_registered(descriptor).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: could not register the vendor `{id}` from `[vendors.{id}]`: {e}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(vendors)
+}
+
+/// What a built-in vendor's entry may hold: overrides only.
+fn check_builtin_override(cfg: &VendorConfig, builtin: &VendorDescriptor) -> Result<(), String> {
+    if cfg.mcp_config_rel_path.is_some() {
+        return Err(
+            "sets `mcp_config_rel_path`, but a built-in vendor's MCP file is fixed in \
+             fl-mcp (the five CLI files) or absent (API vendors); only a new vendor can set it"
+                .into(),
+        );
+    }
+    match &builtin.transport {
+        VendorTransport::SubscriptionCli { .. } => {
+            let set = cfg.set_keys(&[
+                "dialect",
+                "base_url",
+                "default_model",
+                "display_name",
+                "env_key",
+                "vault_secret",
+                "context_window",
+                "input_usd_micros_per_mtok",
+                "output_usd_micros_per_mtok",
+            ]);
+            if !set.is_empty() {
+                return Err(format!(
+                    "is a subscription CLI, which takes no API settings ({}); its binary and rate \
+                     card go in `[adapters.{}]`",
+                    set.join(", "),
+                    builtin.id
+                ));
+            }
+            if cfg.transport == Some(VendorTransportKind::HttpApi) {
+                return Err(
+                    "says `transport = \"http_api\"`, but this built-in vendor is a \
+                     subscription CLI"
+                        .into(),
+                );
+            }
+        }
+        VendorTransport::HttpApi { .. } => {
+            let set = cfg.set_keys(&[
+                "dialect",
+                "display_name",
+                "env_key",
+                "vault_secret",
+                "context_window",
+            ]);
+            if !set.is_empty() {
+                return Err(format!(
+                    "is a built-in vendor; only `base_url`, `default_model` and the rate card can \
+                     be overridden, not {}",
+                    set.join(", ")
+                ));
+            }
+            if cfg.transport == Some(VendorTransportKind::SubscriptionCli) {
+                return Err(
+                    "says `transport = \"subscription_cli\"`, but this built-in vendor \
+                     is an HTTP API"
+                        .into(),
+                );
+            }
+            if let Some(url) = &cfg.base_url {
+                validate_api_base_url(url).map_err(|e| format!("`base_url`: {e}"))?;
+            }
+            if cfg
+                .default_model
+                .as_deref()
+                .is_some_and(|m| m.trim().is_empty())
+            {
+                return Err("`default_model` must not be empty".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The descriptor of a new, config-defined HTTP API vendor.
+fn new_vendor_descriptor(id: &str, cfg: &VendorConfig) -> Result<VendorDescriptor, String> {
+    match cfg.transport {
+        Some(VendorTransportKind::HttpApi) => {}
+        Some(VendorTransportKind::SubscriptionCli) => {
+            return Err(
+                "sets `transport = \"subscription_cli\"`, which configuration cannot \
+                 add: a subscription CLI needs a code adapter (an `ExecVendorAdapter`). Only \
+                 `transport = \"http_api\"` can define a new vendor"
+                    .into(),
+            );
+        }
+        None => {
+            return Err(format!(
+                "is not a built-in vendor, so it defines a new one and needs \
+                 `transport = \"http_api\"`. Built-in vendors are: {}",
+                VendorRegistry::global()
+                    .list()
+                    .iter()
+                    .filter(|v| VendorRegistry::is_builtin(&v.id))
+                    .map(|v| v.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    let need = |key: &str, v: &Option<String>| -> Result<String, String> {
+        match v.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => Ok(s.to_string()),
+            Some(_) => Err(format!("`{key}` must not be empty")),
+            None => Err(format!("is a new vendor and needs `{key}`")),
+        }
+    };
+    let Some(api_dialect) = cfg.dialect else {
+        return Err(
+            "is a new vendor and needs `dialect` (`openai_chat_completions`, \
+             `anthropic_messages` or `gemini_generate_content`)"
+                .into(),
+        );
+    };
+    let base_url = need("base_url", &cfg.base_url)?;
+    validate_api_base_url(&base_url).map_err(|e| format!("`base_url`: {e}"))?;
+    let default_model = need("default_model", &cfg.default_model)?;
+    let key_name = |key: &str, v: &Option<String>| -> Result<Option<String>, String> {
+        match v.as_deref().map(str::trim) {
+            Some("") => Err(format!(
+                "`{key}` must not be empty; leave it out for no key"
+            )),
+            other => Ok(other.map(str::to_string)),
+        }
+    };
+    let env_key_name = key_name("env_key", &cfg.env_key)?;
+    let vault_secret_name = key_name("vault_secret", &cfg.vault_secret)?.or(env_key_name.clone());
+    Ok(VendorDescriptor {
+        id: id.to_string(),
+        display_name: match cfg.display_name.as_deref().map(str::trim) {
+            Some("") => return Err("`display_name` must not be empty".into()),
+            Some(n) => n.to_string(),
+            None => id.to_string(),
+        },
+        transport: VendorTransport::HttpApi {
+            default_base_url: base_url,
+            api_dialect: api_dialect.into(),
+            vault_secret_name,
+            env_key_name,
+        },
+        default_model,
+        default_context_window: cfg.context_window.unwrap_or(0),
+        default_rate_card: cfg.rate_card().unwrap_or_default(),
+        mcp_config_rel_path: cfg.mcp_config_rel_path.clone(),
     })
 }
 
@@ -1682,5 +1991,210 @@ mod tests {
         assert!(h.trust_tailscale_headers);
         assert_eq!(h.enable_terminal, Some(false));
         assert_eq!(h.session_ttl_hours, Some(48));
+    }
+
+    fn err_of(text: &str) -> String {
+        format!("{:#}", load_text(text).unwrap_err())
+    }
+
+    #[test]
+    fn a_built_in_vendor_takes_overrides_and_the_registry_is_untouched() {
+        let cfg = load_text(
+            "[vendors.Kimi-API]\n\
+             base_url = \"http://127.0.0.1:9000/v1\"\n\
+             default_model = \"kimi-custom\"\n\
+             input_usd_micros_per_m = 600000\n\
+             output_usd_micros_per_mtok = 2500000\n",
+        )
+        .unwrap();
+        let v = cfg.vendors.get("kimi-api").expect("keyed by lowercase id");
+        assert_eq!(v.base_url.as_deref(), Some("http://127.0.0.1:9000/v1"));
+        assert_eq!(v.default_model.as_deref(), Some("kimi-custom"));
+        assert_eq!(
+            v.rate_card(),
+            Some(RateCard {
+                input_usd_micros_per_mtok: 600_000,
+                output_usd_micros_per_mtok: 2_500_000,
+            })
+        );
+        // The built-in descriptor is never mutated.
+        let d = fl_core::lookup_vendor("kimi-api").unwrap();
+        assert_eq!(d.default_model, "kimi-k2.5");
+        assert!(matches!(
+            d.transport,
+            VendorTransport::HttpApi { default_base_url, .. }
+                if default_base_url == "https://api.moonshot.ai/v1"
+        ));
+        // Either spelling of the rate keys reads.
+        let cfg = load_text(
+            "[vendors.ollama]\ninput_usd_micros_per_mtok = 1\noutput_usd_micros_per_m = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.vendors["ollama"].output_usd_micros_per_mtok, Some(2));
+    }
+
+    #[test]
+    fn a_vendor_entry_refuses_what_cannot_be_right() {
+        let msg = err_of("[vendors.ollama]\nbase_url = \"http://127.0.0.1:1/v1\"\nbogus = 1\n");
+        assert!(
+            msg.contains("bogus") && msg.contains("config.toml"),
+            "{msg}"
+        );
+
+        let msg = err_of("[vendors.openai-api]\nmcp_config_rel_path = \".x/mcp.json\"\n");
+        assert!(
+            msg.contains("[vendors.openai-api]") && msg.contains("mcp_config_rel_path"),
+            "{msg}"
+        );
+        let msg = err_of("[vendors.claude]\nmcp_config_rel_path = \".x/mcp.json\"\n");
+        assert!(msg.contains("mcp_config_rel_path"), "{msg}");
+
+        let msg = err_of("[vendors.openai-api]\nbase_url = \"http://example.com/v1\"\n");
+        assert!(msg.contains("plain http"), "{msg}");
+        let msg = err_of("[vendors.openai-api]\nbase_url = \"https://user:pw@example.com/v1\"\n");
+        assert!(msg.contains("user name or password"), "{msg}");
+
+        // A subscription CLI takes no API settings and points at `[adapters.*]`.
+        let msg = err_of("[vendors.claude]\nbase_url = \"https://example.com\"\n");
+        assert!(
+            msg.contains("subscription CLI") && msg.contains("[adapters.claude]"),
+            "{msg}"
+        );
+        let msg = err_of("[vendors.codex]\ninput_usd_micros_per_mtok = 1\n");
+        assert!(msg.contains("[adapters.codex]"), "{msg}");
+
+        // A built-in's identity is not an override.
+        let msg = err_of("[vendors.openai-api]\nenv_key = \"OTHER\"\n");
+        assert!(msg.contains("env_key"), "{msg}");
+        let msg = err_of("[vendors.openai-api]\ndefault_model = \"  \"\n");
+        assert!(msg.contains("default_model"), "{msg}");
+    }
+
+    #[test]
+    fn a_new_vendor_needs_its_required_fields() {
+        let full = [
+            ("transport", "\"http_api\""),
+            ("dialect", "\"openai_chat_completions\""),
+            ("base_url", "\"http://127.0.0.1:8001/v1\""),
+            ("default_model", "\"m\""),
+        ];
+        for skip in 0..full.len() {
+            let body: String = full
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .map(|(_, (k, v))| format!("{k} = {v}\n"))
+                .collect();
+            let msg = err_of(&format!("[vendors.cfg-missing-{skip}]\n{body}"));
+            assert!(
+                msg.contains(&format!("[vendors.cfg-missing-{skip}]"))
+                    && msg.contains(full[skip].0),
+                "{msg}"
+            );
+            assert!(
+                fl_core::lookup_vendor(&format!("cfg-missing-{skip}")).is_none(),
+                "an invalid entry registers nothing"
+            );
+        }
+        let msg = err_of(
+            "[vendors.cfg-cli]\ntransport = \"subscription_cli\"\ndialect = \"anthropic_messages\"\n",
+        );
+        assert!(msg.contains("code adapter"), "{msg}");
+        let msg =
+            err_of("[vendors.cfg-bad-dialect]\ntransport = \"http_api\"\ndialect = \"soap\"\n");
+        assert!(msg.contains("soap"), "{msg}");
+        let msg = err_of(
+            "[vendors.cfg-bad-url]\ntransport = \"http_api\"\ndialect = \"anthropic_messages\"\n\
+             base_url = \"http://example.com\"\ndefault_model = \"m\"\n",
+        );
+        assert!(
+            msg.contains("[vendors.cfg-bad-url]") && msg.contains("plain http"),
+            "{msg}"
+        );
+        let msg = err_of(
+            "[vendors.\"Not A Slug\"]\ntransport = \"http_api\"\ndialect = \"anthropic_messages\"\n\
+             base_url = \"https://example.com\"\ndefault_model = \"m\"\n",
+        );
+        assert!(msg.contains("not a slug"), "{msg}");
+    }
+
+    #[test]
+    fn a_new_vendor_registers_and_the_same_config_loads_twice() {
+        let text = "[vendors.cfg-vllm]\n\
+                    transport = \"http_api\"\n\
+                    dialect = \"openai_chat_completions\"\n\
+                    base_url = \"http://localhost:8001/v1\"\n\
+                    default_model = \"qwen\"\n\
+                    display_name = \"Local vLLM\"\n\
+                    env_key = \"CFG_VLLM_KEY\"\n\
+                    context_window = 32000\n\
+                    input_usd_micros_per_mtok = 10\n\
+                    output_usd_micros_per_mtok = 20\n\
+                    mcp_config_rel_path = \".vllm/mcp.json\"\n";
+        let first = load_text(text).unwrap();
+        assert!(first.vendors.contains_key("cfg-vllm"));
+        let d = fl_core::lookup_vendor("cfg-vllm").expect("registered");
+        assert_eq!(d.display_name, "Local vLLM");
+        assert_eq!(d.default_model, "qwen");
+        assert_eq!(d.default_context_window, 32_000);
+        assert_eq!(d.mcp_config_rel_path.as_deref(), Some(".vllm/mcp.json"));
+        assert_eq!(d.default_rate_card.output_usd_micros_per_mtok, 20);
+        // `vault_secret` defaults to `env_key`.
+        assert_eq!(
+            d.transport,
+            VendorTransport::HttpApi {
+                default_base_url: "http://localhost:8001/v1".into(),
+                api_dialect: ApiDialect::OpenAiChatCompletions,
+                vault_secret_name: Some("CFG_VLLM_KEY".into()),
+                env_key_name: Some("CFG_VLLM_KEY".into()),
+            }
+        );
+        // The same file again is fine; a conflicting definition of the id is an error.
+        load_text(text).unwrap();
+        let msg = err_of(&text.replace("qwen", "llama"));
+        assert!(
+            msg.contains("cfg-vllm") && msg.contains("already registered"),
+            "{msg}"
+        );
+        assert_eq!(
+            fl_core::lookup_vendor("cfg-vllm").unwrap().default_model,
+            "qwen"
+        );
+    }
+
+    #[test]
+    fn a_new_vendor_with_no_key_name_is_keyless_and_a_vault_secret_alone_is_kept() {
+        load_text(
+            "[vendors.cfg-keyless]\ntransport = \"http_api\"\ndialect = \"openai_chat_completions\"\n\
+             base_url = \"http://127.0.0.1:8002/v1\"\ndefault_model = \"m\"\n\
+             [vendors.cfg-vaulted]\ntransport = \"http_api\"\ndialect = \"gemini_generate_content\"\n\
+             base_url = \"https://gw.example.com\"\ndefault_model = \"m\"\nvault_secret = \"gw_key\"\n",
+        )
+        .unwrap();
+        let keyless = fl_core::lookup_vendor("cfg-keyless").unwrap();
+        assert!(!keyless.transport.needs_api_key());
+        let vaulted = fl_core::lookup_vendor("cfg-vaulted").unwrap();
+        assert!(matches!(
+            vaulted.transport,
+            VendorTransport::HttpApi {
+                vault_secret_name: Some(ref v),
+                env_key_name: None,
+                ..
+            } if v == "gw_key"
+        ));
+    }
+
+    #[test]
+    fn a_new_vendor_cannot_replace_a_built_in_by_another_spelling() {
+        // `Claude` is the built-in `claude`: it is an override entry, never a definition.
+        let msg = err_of(
+            "[vendors.Claude]\ntransport = \"http_api\"\ndialect = \"anthropic_messages\"\n\
+             base_url = \"https://example.com\"\ndefault_model = \"m\"\n",
+        );
+        assert!(msg.contains("subscription CLI"), "{msg}");
+        assert!(matches!(
+            fl_core::lookup_vendor("claude").unwrap().transport,
+            VendorTransport::SubscriptionCli { .. }
+        ));
     }
 }
