@@ -15,6 +15,25 @@ import type {
   TerminalResizePayload,
 } from "../types/api";
 
+export interface TerminalLike {
+  cols: number;
+  rows: number;
+  open: (parent: HTMLElement) => void;
+  loadAddon: (addon: FitAddon) => void;
+  onData: (listener: (data: string) => void) => { dispose: () => void };
+  onResize: (
+    listener: (size: { cols: number; rows: number }) => void,
+  ) => { dispose: () => void };
+  write: (data: string) => void;
+  reset: () => void;
+  clear: () => void;
+  dispose: () => void;
+}
+
+export interface FitAddonLike {
+  fit: () => void;
+}
+
 export interface TerminalPaneProps {
   authority?: HubAuthority | null;
   sessionId?: string | null;
@@ -23,6 +42,9 @@ export interface TerminalPaneProps {
   terminalFrames?: HubWsFrame[];
   onSendTerminalFrame?: (event: string, data: unknown) => void;
   onOpenPairing?: () => void;
+  /** Optional factory overrides for testing xterm resize/reflow behavior in headless environments. */
+  createTerminal?: () => TerminalLike;
+  createFitAddon?: () => FitAddonLike;
 }
 
 const ANSI_ESCAPE_REGEX =
@@ -68,6 +90,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   terminalFrames,
   onSendTerminalFrame,
   onOpenPairing,
+  createTerminal,
+  createFitAddon,
 }) => {
   const isOwner = authority?.tier === "owner";
   const effectiveSessionId = sessionId || "default-shell";
@@ -76,8 +100,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   const effectiveCwd = cwd || undefined;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
+  const termRef = useRef<TerminalLike | null>(null);
+  const fitAddonRef = useRef<FitAddonLike | null>(null);
+  const rawOutputLogRef = useRef<string>("");
+  const lastColsRef = useRef<number>(100);
+  const lastRowsRef = useRef<number>(28);
+  const createTerminalRef = useRef(createTerminal);
+  createTerminalRef.current = createTerminal;
+  const createFitAddonRef = useRef(createFitAddon);
+  createFitAddonRef.current = createFitAddon;
   const processedFrameCountRef = useRef<number>(0);
   const prevFirstFrameRef = useRef<HubWsFrame | undefined>(undefined);
   const prevSessionForFramesRef = useRef<string>(effectiveSessionId);
@@ -139,6 +170,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         }
         const chunk = payload.data ?? payload.output ?? "";
         if (chunk) {
+          rawOutputLogRef.current = appendTerminalLog(rawOutputLogRef.current, chunk);
           setOutputLog((prev) => appendTerminalLog(prev, chunk));
           try {
             termRef.current?.write(chunk);
@@ -194,32 +226,38 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       return;
     }
 
-    let term: Terminal | null = null;
-    let fitAddon: FitAddon | null = null;
+    let term: TerminalLike | null = null;
+    let fitAddon: FitAddonLike | null = null;
     let dataDisposable: { dispose: () => void } | null = null;
     let resizeDisposable: { dispose: () => void } | null = null;
 
     const isJsdom =
       typeof navigator !== "undefined" && /jsdom/i.test(navigator.userAgent ?? "");
 
-    if (!isJsdom) {
+    if (!isJsdom || createTerminalRef.current) {
       try {
-        term = new Terminal({
-          convertEol: true,
-          cursorBlink: true,
-          fontFamily:
-            '"JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-          fontSize: 13,
-          cols: 100,
-          rows: 28,
-          theme: {
-            background: "#0A0D12",
-            foreground: "#F1F5F9",
-            cursor: "#F59E0B",
-          },
-        });
-        fitAddon = new FitAddon();
-        term.loadAddon(fitAddon);
+        term = createTerminalRef.current
+          ? createTerminalRef.current()
+          : new Terminal({
+              convertEol: true,
+              cursorBlink: true,
+              fontFamily:
+                '"JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+              fontSize: 13,
+              cols: 100,
+              rows: 28,
+              theme: {
+                background: "#0A0D12",
+                foreground: "#F1F5F9",
+                cursor: "#F59E0B",
+              },
+            });
+        fitAddon = createFitAddonRef.current
+          ? createFitAddonRef.current()
+          : new FitAddon();
+        if (!createFitAddonRef.current) {
+          term.loadAddon(fitAddon as FitAddon);
+        }
         termRef.current = term;
         fitAddonRef.current = fitAddon;
 
@@ -258,15 +296,17 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       command: ["/bin/bash", "-i"],
     };
     // A new session must not inherit the previous session's scrollback.
+    rawOutputLogRef.current = "";
     setOutputLog("");
     setShellStatus("connecting");
     emitTerminalEvent("open", openPayload);
 
-    let lastCols = term?.cols ?? 100;
-    let lastRows = term?.rows ?? 28;
+    lastColsRef.current = term?.cols ?? 100;
+    lastRowsRef.current = term?.rows ?? 28;
     let rafId: number | null = null;
 
     const syncTerminalFit = (forceEmit = false) => {
+      const prevCols = lastColsRef.current;
       try {
         fitAddonRef.current?.fit();
       } catch {
@@ -274,10 +314,18 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       }
       const cols = termRef.current?.cols ?? 100;
       const rows = termRef.current?.rows ?? 28;
+      if (cols !== prevCols && rawOutputLogRef.current.length > 0) {
+        try {
+          termRef.current?.reset();
+          termRef.current?.write(rawOutputLogRef.current);
+        } catch {
+          // Ignore in jsdom.
+        }
+      }
       setColsRows({ cols, rows });
-      if (forceEmit || cols !== lastCols || rows !== lastRows) {
-        lastCols = cols;
-        lastRows = rows;
+      if (forceEmit || cols !== lastColsRef.current || rows !== lastRowsRef.current) {
+        lastColsRef.current = cols;
+        lastRowsRef.current = rows;
         const resizePayload: TerminalResizePayload = {
           session_id: effectiveSessionId,
           cols,
@@ -370,6 +418,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       session_id: effectiveSessionId,
     };
     emitTerminalEvent("close", closePayload);
+    rawOutputLogRef.current = "";
     setOutputLog("");
     try {
       termRef.current?.reset();
@@ -380,6 +429,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     }
     const freshCols = termRef.current?.cols ?? colsRows.cols;
     const freshRows = termRef.current?.rows ?? colsRows.rows;
+    lastColsRef.current = freshCols;
+    lastRowsRef.current = freshRows;
     setColsRows({ cols: freshCols, rows: freshRows });
     const openPayload: TerminalOpenPayload = {
       session_id: effectiveSessionId,
@@ -524,8 +575,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             type="button"
             className="fd-btn"
             onClick={() => {
+              rawOutputLogRef.current = "";
               setOutputLog("");
               try {
+                termRef.current?.reset();
                 termRef.current?.clear();
               } catch {
                 // Ignore

@@ -153,4 +153,106 @@ describe("TerminalPane", () => {
     expect(xtermContainer.style.textAlign).toBe("left");
     expect(outputLog.style.textAlign).toBe("left");
   });
+
+  it("reflows full rawOutputLog via term.reset() and term.write() when narrowing and widening terminal columns, and resets rawOutputLog on Clear", () => {
+    let subscribedHandler: ((frame: HubWsFrame) => void) | null = null;
+    const mockWsClient = {
+      subscribe: vi.fn((channel: string, cb: (frame: HubWsFrame) => void) => {
+        if (channel === "terminal") {
+          subscribedHandler = cb;
+        }
+        return () => {
+          subscribedHandler = null;
+        };
+      }),
+      sendFrame: vi.fn(() => true),
+    };
+
+    let nextFitCols = 100;
+    const writtenBuffer: string[] = [];
+    const mockTerm = {
+      cols: 100,
+      rows: 28,
+      open: vi.fn(),
+      loadAddon: vi.fn(),
+      onData: vi.fn(() => ({ dispose: vi.fn() })),
+      onResize: vi.fn(() => ({ dispose: vi.fn() })),
+      write: vi.fn((data: string) => {
+        writtenBuffer.push(data);
+      }),
+      reset: vi.fn(() => {
+        writtenBuffer.length = 0;
+      }),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    };
+    const mockFitAddon = {
+      fit: vi.fn(() => {
+        mockTerm.cols = nextFitCols;
+      }),
+    };
+
+    const { unmount } = render(
+      <TerminalPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        sessionId="term-reflow-01"
+        cwd="/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop"
+        wsClient={mockWsClient as never}
+        createTerminal={() => mockTerm}
+        createFitAddon={() => mockFitAddon}
+      />,
+    );
+
+    const promptChunk =
+      "\u001b[01;32mlmcfarlin@ai-lab-0\u001b[00m:\u001b[01;34m~/Projects/Artificial-Humanity/FerroLoop\u001b[00m$ ";
+    act(() => {
+      subscribedHandler?.({
+        channel: "terminal",
+        event: "output",
+        data: {
+          session_id: "term-reflow-01",
+          stream: "stdout",
+          data: promptChunk,
+        },
+      });
+    });
+
+    expect(mockTerm.write).toHaveBeenCalledTimes(1);
+    expect(writtenBuffer.join("")).toContain("Artificial-Humanity/FerroLoop");
+
+    // 1. Narrow terminal from 100 cols to 38 cols -> resets and re-writes full promptChunk
+    nextFitCols = 38;
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(mockTerm.reset).toHaveBeenCalledTimes(1);
+    expect(mockTerm.write).toHaveBeenCalledTimes(2);
+    expect(mockTerm.write).toHaveBeenLastCalledWith(promptChunk);
+    expect(writtenBuffer.join("")).toBe(promptChunk);
+
+    // 2. Widen terminal back from 38 cols to 100 cols -> resets and re-writes full promptChunk without losing middle characters
+    nextFitCols = 100;
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(mockTerm.reset).toHaveBeenCalledTimes(2);
+    expect(mockTerm.write).toHaveBeenCalledTimes(3);
+    expect(mockTerm.write).toHaveBeenLastCalledWith(promptChunk);
+    expect(writtenBuffer.join("")).toBe(promptChunk);
+
+    // 3. Clicking Clear resets rawOutputLogRef so subsequent column resizes do not replay cleared output
+    fireEvent.click(screen.getByRole("button", { name: /^Clear$/i }));
+    expect(mockTerm.reset).toHaveBeenCalledTimes(3);
+    expect(mockTerm.clear).toHaveBeenCalledTimes(1);
+    expect(writtenBuffer.join("")).toBe("");
+
+    nextFitCols = 60;
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(mockTerm.write).toHaveBeenCalledTimes(3);
+    expect(writtenBuffer.join("")).toBe("");
+
+    unmount();
+  });
 });
