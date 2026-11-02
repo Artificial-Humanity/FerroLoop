@@ -15,8 +15,9 @@ pub mod stamp;
 pub mod state_sync;
 pub mod workflow;
 pub use adapters::{
-    AntigravityAdapter, AnyAdapter, ClaudeAdapter, CodexAdapter, GrokAdapter, LivenessSink,
-    MuseAdapter,
+    AdapterBuild, AntigravityAdapter, AnyAdapter, ApiKeyResolver, ClaudeAdapter, CodexAdapter,
+    ExecVendorAdapter, GrokAdapter, HttpApiAdapter, LivenessSink, MuseAdapter,
+    RegisterAdapterError, env_key_resolver, register_exec_adapter,
 };
 pub use command::{GateOutcome, run_command_gate};
 pub use evaluate::{
@@ -25,7 +26,7 @@ pub use evaluate::{
 pub use finding::{FindingExecError, FixReport, attach_reproduction, verify_finding};
 pub use git::Git;
 pub use population::{ChangedPaths, ExecError, refused_publish, resolve};
-pub use runner::{AttemptError, AttemptOutcome, AttemptSpec, Runner};
+pub use runner::{AttemptError, AttemptOutcome, AttemptSpec, DynamicRunner, Runner};
 pub use workflow::{
     FLOWS_DIR, SelectedStepAgent, StepCompletionManifest, StepExecutionAction,
     StepExecutionOptions, StepExecutionReport, StepManifest, WorkflowEnv, WorkflowExecError,

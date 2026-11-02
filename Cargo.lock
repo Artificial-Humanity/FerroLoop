@@ -392,8 +392,10 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tiny_http",
  "tokio",
  "toml",
+ "ureq",
  "uuid",
  "walkdir",
 ]

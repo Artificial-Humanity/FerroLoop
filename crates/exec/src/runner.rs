@@ -84,6 +84,34 @@ pub trait Runner {
     ) -> impl std::future::Future<Output = Result<AttemptOutcome, AttemptError>> + Send;
 }
 
+/// The `dyn`-compatible face of a [`Runner`], for adapters chosen at run time (a plugin vendor, one
+/// registered after the program started). Every `Runner + Send + Sync` is one.
+pub trait DynamicRunner: Send + Sync {
+    /// Named apart from [`Runner::id`] so a type that is both never has an ambiguous `.id()`.
+    fn runner_id(&self) -> &str;
+    fn attempt_boxed(
+        &self,
+        spec: AttemptSpec,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AttemptOutcome, AttemptError>> + Send + '_>,
+    >;
+}
+
+impl<R: Runner + Send + Sync> DynamicRunner for R {
+    fn runner_id(&self) -> &str {
+        Runner::id(self)
+    }
+
+    fn attempt_boxed(
+        &self,
+        spec: AttemptSpec,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AttemptOutcome, AttemptError>> + Send + '_>,
+    > {
+        Box::pin(self.attempt(spec))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
