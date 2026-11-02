@@ -405,6 +405,8 @@ export interface DiscoveredSessionSummary {
   cwd?: string | null;
   record_id?: string | null;
   transcript_path?: string | null;
+  context_usage?: SessionContextUsage | null;
+  execution_mode?: string | null;
   quota_usage?: SessionQuotaUsage | null;
 }
 

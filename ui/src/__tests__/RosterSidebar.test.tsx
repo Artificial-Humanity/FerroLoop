@@ -482,6 +482,74 @@ describe("RosterSidebar", () => {
       felix: "important",
     });
   });
+
+  it("renders circular context-used ring next to activity tag inside agent-status-group and does not invoke onClose when selecting an agent or clicking agent settings", () => {
+    const onSelectAgent = vi.fn();
+    const onOpenAgentSettings = vi.fn();
+    const onClose = vi.fn();
+
+    render(
+      <RosterSidebar
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{}}
+        contextUsageByAgent={{
+          ferris: {
+            used_tokens: 420_000,
+            max_tokens: 1_000_000,
+          },
+          jarvis: {
+            used_tokens: 185_000,
+            max_tokens: 200_000,
+          },
+        }}
+        selectedAgentName="ferris"
+        onSelectAgent={onSelectAgent}
+        onOpenAgentSettings={onOpenAgentSettings}
+        onClose={onClose}
+      />,
+    );
+
+    const ferrisStatusGroup = screen.getByTestId("agent-status-group-ferris");
+    const ferrisIdentityGroup = screen.getByTestId("agent-identity-group-ferris");
+    const ferrisActivityTag = screen.getByTestId("activity-tag-ferris");
+    const ferrisRing = screen.getByTestId("context-ring-ferris");
+
+    expect(ferrisStatusGroup).toContainElement(ferrisActivityTag);
+    expect(ferrisStatusGroup).toContainElement(ferrisRing);
+    expect(ferrisIdentityGroup).toContainElement(screen.getByTestId("role-badge-ferris"));
+    expect(ferrisIdentityGroup).toContainElement(screen.getByTestId("adapter-pill-ferris"));
+
+    expect(ferrisRing).toHaveAttribute("role", "img");
+    expect(ferrisRing).toHaveAttribute("data-percent", "42");
+    expect(ferrisRing).toHaveAttribute(
+      "title",
+      "Context used: 42% (420k / 1m tokens)",
+    );
+    expect(ferrisRing).toHaveAttribute(
+      "aria-label",
+      "Context used: 42% (420k / 1m tokens)",
+    );
+    expect(ferrisRing).toHaveTextContent("42%");
+    expect(ferrisRing.querySelectorAll("circle")).toHaveLength(2);
+
+    const jarvisRing = screen.getByTestId("context-ring-jarvis");
+    expect(jarvisRing).toHaveAttribute("data-percent", "93");
+    expect(jarvisRing).toHaveTextContent("93%");
+
+    // Clicking an agent row or agent settings button must NOT call onClose (which collapses desktop sidebar)
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    expect(onSelectAgent).toHaveBeenCalledWith("jarvis");
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(screen.getByTestId("agent-row-jarvis"), { key: "Enter" });
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(onOpenAgentSettings).toHaveBeenCalledWith("ferris");
+    expect(onClose).not.toHaveBeenCalled();
+  });
 });
 
 describe("ContextHeader", () => {
@@ -729,16 +797,23 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     expect(sidebar).toHaveAttribute("data-mobile-open", "false");
     expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
 
-    // Re-open drawer and select an agent -> auto-closes drawer
+    // Re-open drawer and select an agent -> auto-closes mobile drawer without collapsing desktop sidebar
     fireEvent.click(toggleBtn);
     expect(sidebar).toHaveAttribute("data-mobile-open", "true");
+    // Ensure desktop sidebar is expanded before selecting an agent
+    if (sidebar.getAttribute("data-desktop-collapsed") === "true") {
+      fireEvent.click(toggleBtn);
+    }
+    expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     fireEvent.click(screen.getByTestId("agent-row-jarvis"));
     expect(sidebar).toHaveAttribute("data-mobile-open", "false");
+    expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
 
-    // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal
+    // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal without collapsing desktop sidebar
     fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+    expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
 
     // On narrow mobile viewports (<= 768px), toggling left sidebar closes right split panel and vice versa

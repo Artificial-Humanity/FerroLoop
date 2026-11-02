@@ -5,10 +5,16 @@ import {
   type AgentLivenessItem,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type SessionContextUsage,
   type TranscriptTurn,
   type WireInboxItem,
   type WireMessage,
 } from "../types/api";
+import {
+  estimateSessionContextUsage,
+  formatTokenCount,
+  type EstimatedContextUsage,
+} from "./ChatPane";
 
 export const COLLAPSED_PROJECTS_STORAGE_KEY = "fd_collapsed_projects";
 export const PINNED_PROJECTS_STORAGE_KEY = "fd_pinned_projects";
@@ -322,11 +328,13 @@ export function hasTrailingIncompleteWork(turns: TranscriptTurn[]): boolean {
 export interface RosterSidebarProps {
   agents: AgentRecord[];
   routes: DiscoveredSessionSummary[];
+  sessions?: DiscoveredSessionSummary[];
   liveness: AgentLivenessItem[];
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
+  contextUsageByAgent?: Record<string, SessionContextUsage | null>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
@@ -497,6 +505,7 @@ interface EnrichedAgent {
   adapter: string | null;
   unreadCount: number;
   unreadSeverity: UnreadSeverity;
+  contextEstimate: EstimatedContextUsage;
 }
 
 export function formatRoleLabel(role: string): string {
@@ -523,11 +532,13 @@ export function getAdapterBadgeClass(adapter: string | null | undefined): string
 export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   agents,
   routes,
+  sessions,
   liveness,
   unreadByAgent,
   unreadSeverityByAgent,
   busyByAgent,
   transcriptsByAgent,
+  contextUsageByAgent,
   selectedAgentName,
   onSelectAgent,
   onOpenAgentSettings,
@@ -604,6 +615,13 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         routeMap.set(personaKey, r);
       }
     }
+    const sessionMap = new Map<string, DiscoveredSessionSummary>();
+    for (const s of sessions ?? []) {
+      const personaKey = (s.persona ?? "").trim().toLowerCase();
+      if (personaKey && !sessionMap.has(personaKey)) {
+        sessionMap.set(personaKey, s);
+      }
+    }
 
     const livenessMap = new Map<string, AgentLivenessItem>();
     for (const item of liveness) {
@@ -675,6 +693,19 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           ? "idle"
           : "offline";
 
+      const matchedSession = sessionMap.get(key) ?? route;
+      const explicitContextUsage =
+        contextUsageByAgent?.[key] ??
+        contextUsageByAgent?.[record.name_key] ??
+        matchedSession?.context_usage ??
+        route?.context_usage ??
+        null;
+      const contextEstimate = estimateSessionContextUsage(
+        agentTurns ?? [],
+        adapter,
+        explicitContextUsage,
+      );
+
       return {
         record,
         route,
@@ -684,16 +715,19 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         adapter,
         unreadCount,
         unreadSeverity,
+        contextEstimate,
       };
     });
   }, [
     agents,
     routes,
+    sessions,
     liveness,
     unreadByAgent,
     unreadSeverityByAgent,
     busyByAgent,
     transcriptsByAgent,
+    contextUsageByAgent,
   ]);
 
   const groupedByProject = useMemo(() => {
@@ -1052,7 +1086,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
                 {!isGroupCollapsed && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                    {items.map(({ record, livenessState, activityState, adapter, unreadCount, unreadSeverity }) => {
+                    {items.map(({ record, livenessState, activityState, adapter, unreadCount, unreadSeverity, contextEstimate }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
@@ -1087,6 +1121,22 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             ? "1px solid rgba(16, 185, 129, 0.45)"
                             : "1px solid var(--border-subtle)";
 
+                      const contextPct = Math.max(
+                        0,
+                        Math.min(100, contextEstimate.percent),
+                      );
+                      const ringRadius = 5.5;
+                      const ringCircumference = 2 * Math.PI * ringRadius;
+                      const ringDashOffset =
+                        ringCircumference * (1 - contextPct / 100);
+                      const ringColor =
+                        contextPct >= 80
+                          ? "var(--status-danger)"
+                          : contextPct >= 50
+                            ? "var(--status-stale)"
+                            : "#60A5FA";
+                      const contextTitle = `Context used: ${contextPct}% (${formatTokenCount(contextEstimate.usedTokens)} / ${formatTokenCount(contextEstimate.maxTokens)} tokens)`;
+
                       return (
                         <div
                           key={record.id || record.name_key}
@@ -1096,13 +1146,11 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           data-pinned={isAgentPinned ? "true" : "false"}
                           onClick={() => {
                             onSelectAgent(record.name_key);
-                            onClose?.();
                           }}
                           onKeyDown={(e) => {
                             if (e.key === "Enter" || e.key === " ") {
                               e.preventDefault();
                               onSelectAgent(record.name_key);
-                              onClose?.();
                             }
                           }}
                           style={{
@@ -1174,7 +1222,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   e.stopPropagation();
                                   onSelectAgent(record.name_key);
                                   onOpenAgentSettings?.(record.name_key);
-                                  onClose?.();
                                 }}
                                 style={{
                                   border: "none",
@@ -1199,6 +1246,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           </div>
 
                           <div
+                            data-testid={`agent-meta-row-${key}`}
                             style={{
                               display: "flex",
                               alignItems: "center",
@@ -1207,101 +1255,182 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               flexWrap: "wrap",
                             }}
                           >
-                            <span
-                              data-testid={`activity-tag-${key}`}
-                              data-activity={activityState}
-                              title={activityTitle}
-                              aria-label={activityTitle}
-                              className="fd-badge"
+                            <div
+                              data-testid={`agent-status-group-${key}`}
                               style={{
                                 display: "inline-flex",
                                 alignItems: "center",
-                                justifyContent: "center",
-                                padding: "2px 5px",
-                                lineHeight: 1,
-                                color: activityColor,
-                                backgroundColor: activityBg,
-                                border: activityBorder,
+                                gap: "6px",
+                                flexShrink: 0,
                               }}
                             >
-                              {activityState === "working" ? (
-                                <svg
-                                  width="11"
-                                  height="11"
-                                  viewBox="0 0 16 16"
-                                  fill="none"
-                                  aria-hidden="true"
-                                >
-                                  <path
-                                    d="M1.5 8H4.2L6 4L9.2 12L11.2 6.8L12.5 8H14.5"
-                                    stroke="currentColor"
-                                    strokeWidth="1.6"
-                                    strokeLinecap="round"
-                                    strokeLinejoin="round"
-                                  />
-                                </svg>
-                              ) : activityState === "idle" ? (
-                                <svg
-                                  width="11"
-                                  height="11"
-                                  viewBox="0 0 16 16"
-                                  fill="none"
-                                  aria-hidden="true"
-                                >
-                                  <circle
-                                    cx="8"
-                                    cy="8"
-                                    r="5.5"
-                                    stroke="currentColor"
-                                    strokeWidth="1.5"
-                                  />
-                                  <path
-                                    d="M5.6 8.2L7.3 9.9L10.6 6.4"
-                                    stroke="currentColor"
-                                    strokeWidth="1.5"
-                                    strokeLinecap="round"
-                                    strokeLinejoin="round"
-                                  />
-                                </svg>
-                              ) : (
-                                <svg
-                                  width="11"
-                                  height="11"
-                                  viewBox="0 0 16 16"
-                                  fill="none"
-                                  aria-hidden="true"
-                                >
-                                  <circle
-                                    cx="8"
-                                    cy="8"
-                                    r="5.5"
-                                    stroke="currentColor"
-                                    strokeWidth="1.4"
-                                    strokeDasharray="2.2 2.2"
-                                  />
-                                  <line
-                                    x1="5.5"
-                                    y1="8"
-                                    x2="10.5"
-                                    y2="8"
-                                    stroke="currentColor"
-                                    strokeWidth="1.4"
-                                    strokeLinecap="round"
-                                  />
-                                </svg>
-                              )}
-                            </span>
-                            <span className="fd-badge" data-testid={`role-badge-${key}`}>
-                              {formatRoleLabel(record.role)}
-                            </span>
-                            {adapter && (
                               <span
-                                data-testid={`adapter-pill-${key}`}
-                                className={getAdapterBadgeClass(adapter)}
+                                data-testid={`activity-tag-${key}`}
+                                data-activity={activityState}
+                                title={activityTitle}
+                                aria-label={activityTitle}
+                                className="fd-badge"
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  justifyContent: "center",
+                                  padding: "2px 5px",
+                                  lineHeight: 1,
+                                  color: activityColor,
+                                  backgroundColor: activityBg,
+                                  border: activityBorder,
+                                }}
                               >
-                                {adapter}
+                                {activityState === "working" ? (
+                                  <svg
+                                    width="11"
+                                    height="11"
+                                    viewBox="0 0 16 16"
+                                    fill="none"
+                                    aria-hidden="true"
+                                  >
+                                    <path
+                                      d="M1.5 8H4.2L6 4L9.2 12L11.2 6.8L12.5 8H14.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.6"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  </svg>
+                                ) : activityState === "idle" ? (
+                                  <svg
+                                    width="11"
+                                    height="11"
+                                    viewBox="0 0 16 16"
+                                    fill="none"
+                                    aria-hidden="true"
+                                  >
+                                    <circle
+                                      cx="8"
+                                      cy="8"
+                                      r="5.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.5"
+                                    />
+                                    <path
+                                      d="M5.6 8.2L7.3 9.9L10.6 6.4"
+                                      stroke="currentColor"
+                                      strokeWidth="1.5"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  </svg>
+                                ) : (
+                                  <svg
+                                    width="11"
+                                    height="11"
+                                    viewBox="0 0 16 16"
+                                    fill="none"
+                                    aria-hidden="true"
+                                  >
+                                    <circle
+                                      cx="8"
+                                      cy="8"
+                                      r="5.5"
+                                      stroke="currentColor"
+                                      strokeWidth="1.4"
+                                      strokeDasharray="2.2 2.2"
+                                    />
+                                    <line
+                                      x1="5.5"
+                                      y1="8"
+                                      x2="10.5"
+                                      y2="8"
+                                      stroke="currentColor"
+                                      strokeWidth="1.4"
+                                      strokeLinecap="round"
+                                    />
+                                  </svg>
+                                )}
                               </span>
-                            )}
+
+                              <span
+                                role="img"
+                                data-testid={`context-ring-${key}`}
+                                data-percent={String(contextPct)}
+                                title={contextTitle}
+                                aria-label={contextTitle}
+                                className="fd-badge"
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "4px",
+                                  padding: "1px 5px",
+                                  lineHeight: 1,
+                                }}
+                              >
+                                <svg
+                                  width="12"
+                                  height="12"
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  aria-hidden="true"
+                                  style={{ flexShrink: 0 }}
+                                >
+                                  <circle
+                                    cx="8"
+                                    cy="8"
+                                    r={ringRadius}
+                                    stroke="var(--border-strong, rgba(148, 163, 184, 0.35))"
+                                    strokeWidth="2.2"
+                                  />
+                                  <circle
+                                    data-testid={`context-ring-arc-${key}`}
+                                    cx="8"
+                                    cy="8"
+                                    r={ringRadius}
+                                    stroke={ringColor}
+                                    strokeWidth="2.2"
+                                    strokeLinecap="round"
+                                    strokeDasharray={ringCircumference}
+                                    strokeDashoffset={ringDashOffset}
+                                    transform="rotate(-90 8 8)"
+                                  />
+                                </svg>
+                                <span
+                                  className="fd-mono"
+                                  style={{
+                                    fontSize: "10px",
+                                    color:
+                                      contextPct >= 80
+                                        ? "var(--status-danger)"
+                                        : contextPct >= 50
+                                          ? "var(--status-stale)"
+                                          : "var(--text-secondary)",
+                                  }}
+                                >
+                                  {contextPct}%
+                                </span>
+                              </span>
+                            </div>
+
+                            <div
+                              data-testid={`agent-identity-group-${key}`}
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: "6px",
+                                flexWrap: "wrap",
+                                minWidth: 0,
+                              }}
+                            >
+                              <span className="fd-badge" data-testid={`role-badge-${key}`}>
+                                {formatRoleLabel(record.role)}
+                              </span>
+                              {adapter && (
+                                <span
+                                  data-testid={`adapter-pill-${key}`}
+                                  className={getAdapterBadgeClass(adapter)}
+                                >
+                                  {adapter}
+                                </span>
+                              )}
+                            </div>
                           </div>
                         </div>
                       );

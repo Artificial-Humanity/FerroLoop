@@ -531,6 +531,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         display: "flex",
         flexDirection: "column",
         gap: "8px",
+        flexShrink: 0,
       }}
     >
       <header
