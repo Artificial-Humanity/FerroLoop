@@ -23,13 +23,16 @@ const EXECUTION_MODE_MAX_CHARS: usize = 64;
 
 /// Canonical name for a vendor mode value. `bypassPermissions` and `yolo` are `yolo`;
 /// `acceptEdits` is `accept-edits`; `auto`, `plan` and `default` keep their names; any other
-/// plain value passes through lower-cased. Empty, over-long and control-character values are
-/// `None`.
+/// plain value passes through lower-cased. After trimming and ASCII lower-casing, only the
+/// characters `a-z 0-9 _ . : + / -` and the space are accepted, and at most
+/// `EXECUTION_MODE_MAX_CHARS` of them. Anything else is `None`: empty, over-long, control
+/// characters, and any non-ASCII character (Unicode format characters such as bidi overrides
+/// and zero-width characters included).
 pub(super) fn normalize_execution_mode(raw: &str) -> Option<String> {
     let lower = raw.trim().to_ascii_lowercase();
     if lower.is_empty()
         || lower.chars().count() > EXECUTION_MODE_MAX_CHARS
-        || lower.chars().any(char::is_control)
+        || !lower.chars().all(is_execution_mode_char)
     {
         return None;
     }
@@ -38,6 +41,12 @@ pub(super) fn normalize_execution_mode(raw: &str) -> Option<String> {
         "acceptedits" | "accept-edits" | "accept_edits" => "accept-edits".to_string(),
         _ => lower,
     })
+}
+
+fn is_execution_mode_char(c: char) -> bool {
+    c.is_ascii_lowercase()
+        || c.is_ascii_digit()
+        || matches!(c, '_' | '.' | ':' | '+' | '/' | '-' | ' ')
 }
 
 /// The effective mode of one route session, read from its transcript (through `files`, so the
@@ -62,20 +71,34 @@ pub(super) fn session_execution_mode(
 
 /// Newest `permissionMode` in Claude transcript JSONL. Claude writes a
 /// `{"type":"permission-mode","permissionMode":...}` record when the mode starts or changes,
-/// and stamps `permissionMode` on each user turn. Subagent (sidechain) lines are skipped.
+/// and stamps `permissionMode` on each user turn. Subagent (sidechain) lines and lines that
+/// do not parse are skipped. The newest remaining record that carries a `permissionMode` key
+/// decides: if its value is not a usable mode the answer is `None`, never an older record's.
+///
+/// Only the transcript text handed in is read, and the caller reads a bounded tail of the
+/// file, so in a very long session the newest record may fall outside it; the caller then
+/// falls back to the settings default.
 fn claude_transcript_mode(jsonl: &str) -> Option<String> {
-    jsonl.lines().rev().find_map(|line| {
-        if !line.contains("\"permissionMode\"") {
-            return None;
-        }
-        let val: Value = serde_json::from_str(line.trim()).ok()?;
-        if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            return None;
-        }
-        normalize_execution_mode(val.get("permissionMode")?.as_str()?)
-    })
+    jsonl
+        .lines()
+        .rev()
+        .find_map(|line| {
+            if !line.contains("\"permissionMode\"") {
+                return None;
+            }
+            let val: Value = serde_json::from_str(line.trim()).ok()?;
+            if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                return None;
+            }
+            let mode = val.get("permissionMode")?;
+            Some(mode.as_str().and_then(normalize_execution_mode))
+        })
+        .flatten()
 }
 
+/// Transcript first, else the user-level `~/.claude/settings.json` `permissions.defaultMode`.
+/// Only that user-level file is read: project and local `.claude/settings*.json` overrides are
+/// not, so a project that overrides the default can differ from what is reported here.
 fn claude_execution_mode(transcript: Option<&str>, home: Option<&Path>) -> Option<String> {
     transcript.and_then(claude_transcript_mode).or_else(|| {
         let settings = read_json_file(&home?.join(".claude").join("settings.json"))?;
@@ -104,34 +127,49 @@ fn codex_mode_from(approval: Option<&str>, sandbox: Option<&str>) -> Option<Stri
 }
 
 /// Mode from the newest rollout line that states one. `collaboration_mode.mode` `plan` wins
-/// over the approval and sandbox pair.
+/// over the approval and sandbox pair. Lines that are not `turn_context` or `session_meta`,
+/// do not parse, or carry neither `approval_policy` nor `collaboration_mode` are skipped. The
+/// newest line that carries either one decides: if it yields no mode (a structured approval
+/// policy, a missing one, an unusable value) the answer is `None`, never an older line's.
 fn codex_rollout_mode(jsonl: &str) -> Option<String> {
-    jsonl.lines().rev().find_map(|line| {
-        if !line.contains("approval_policy") && !line.contains("collaboration_mode") {
-            return None;
-        }
-        let val: Value = serde_json::from_str(line.trim()).ok()?;
-        if !matches!(
-            val.get("type").and_then(Value::as_str),
-            Some("turn_context" | "session_meta")
-        ) {
-            return None;
-        }
-        let payload = val.get("payload")?;
-        if payload
-            .pointer("/collaboration_mode/mode")
-            .and_then(Value::as_str)
-            .is_some_and(|m| m.eq_ignore_ascii_case("plan"))
-        {
-            return Some("plan".to_string());
-        }
-        let sandbox = payload
-            .pointer("/sandbox_policy/type")
-            .or_else(|| payload.get("sandbox_policy"))
-            .or_else(|| payload.get("sandbox_mode"))
-            .and_then(Value::as_str);
-        codex_mode_from(payload.get("approval_policy")?.as_str(), sandbox)
-    })
+    jsonl
+        .lines()
+        .rev()
+        .find_map(|line| {
+            if !line.contains("approval_policy") && !line.contains("collaboration_mode") {
+                return None;
+            }
+            let val: Value = serde_json::from_str(line.trim()).ok()?;
+            if !matches!(
+                val.get("type").and_then(Value::as_str),
+                Some("turn_context" | "session_meta")
+            ) {
+                return None;
+            }
+            let payload = val.get("payload")?;
+            if payload.get("approval_policy").is_none()
+                && payload.get("collaboration_mode").is_none()
+            {
+                return None;
+            }
+            if payload
+                .pointer("/collaboration_mode/mode")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.eq_ignore_ascii_case("plan"))
+            {
+                return Some(Some("plan".to_string()));
+            }
+            let sandbox = payload
+                .pointer("/sandbox_policy/type")
+                .or_else(|| payload.get("sandbox_policy"))
+                .or_else(|| payload.get("sandbox_mode"))
+                .and_then(Value::as_str);
+            Some(codex_mode_from(
+                payload.get("approval_policy").and_then(Value::as_str),
+                sandbox,
+            ))
+        })
+        .flatten()
 }
 
 fn codex_execution_mode(transcript: Option<&str>, home: Option<&Path>) -> Option<String> {
@@ -232,6 +270,10 @@ mod tests {
             ("", None),
             ("   ", None),
             ("bad\nvalue", None),
+            ("yolo\u{202e}", None),
+            ("yo\u{200b}lo", None),
+            ("caf\u{e9}", None),
+            ("a:b/c+d.e_f g-h", Some("a:b/c+d.e_f g-h")),
         ] {
             assert_eq!(normalize_execution_mode(raw).as_deref(), want, "{raw:?}");
         }
@@ -369,6 +411,83 @@ mod tests {
             )])
         );
         assert_eq!(codex_rollout_mode(&back).as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn codex_newest_stating_line_decides_even_when_it_yields_no_mode() {
+        let yolo = turn_context("never".into(), "danger-full-access", "default");
+        // A newer structured (granular) policy does not fall through to the older yolo.
+        let granular = lines(&[
+            yolo.clone(),
+            turn_context(
+                serde_json::json!({"granular": {"rules": true}}),
+                "workspace-write",
+                "default",
+            ),
+        ]);
+        assert_eq!(codex_rollout_mode(&granular), None);
+        // A newer line with no approval_policy at all, only a collaboration_mode, also stops.
+        let no_policy = lines(&[
+            yolo.clone(),
+            serde_json::json!({"type":"turn_context","payload":{
+                "collaboration_mode":{"mode":"default","settings":{}}}}),
+        ]);
+        assert_eq!(codex_rollout_mode(&no_policy), None);
+        // A newer on-request line wins over the older yolo.
+        let asked = lines(&[
+            yolo.clone(),
+            turn_context("on-request".into(), "workspace-write", "default"),
+        ]);
+        assert_eq!(codex_rollout_mode(&asked).as_deref(), Some("default"));
+        // Older plan, newer default-mode turn: newest wins.
+        let left_plan = lines(&[
+            turn_context("never".into(), "danger-full-access", "plan"),
+            turn_context("on-request".into(), "workspace-write", "default"),
+        ]);
+        assert_eq!(codex_rollout_mode(&left_plan).as_deref(), Some("default"));
+        // Lines that are not turn_context/session_meta never decide.
+        let noise = lines(&[
+            yolo,
+            serde_json::json!({"type":"event_msg","payload":{"approval_policy":{"x":1}}}),
+        ]);
+        assert_eq!(codex_rollout_mode(&noise).as_deref(), Some("yolo"));
+    }
+
+    #[test]
+    fn claude_newest_record_with_an_unusable_mode_stops_the_transcript_scan() {
+        let home = TempDir::new().unwrap();
+        write(
+            home.path(),
+            ".claude/settings.json",
+            r#"{"permissions":{"defaultMode":"plan"}}"#,
+        );
+        let old = serde_json::json!({"type":"user","permissionMode":"bypassPermissions"});
+        for bad in [
+            serde_json::json!("x".repeat(65)),
+            serde_json::json!("bad\nvalue"),
+            serde_json::json!("yolo\u{202e}"),
+            serde_json::json!({"nested": true}),
+        ] {
+            let jsonl = lines(&[
+                old.clone(),
+                serde_json::json!({"type":"permission-mode","permissionMode":bad}),
+            ]);
+            // The transcript layer says None, not the older yolo...
+            assert_eq!(claude_transcript_mode(&jsonl), None, "{bad}");
+            // ...and the settings layer still applies.
+            assert_eq!(
+                claude_execution_mode(Some(&jsonl), Some(home.path())).as_deref(),
+                Some("plan"),
+                "{bad}"
+            );
+        }
+        // An unparseable or sidechain newer line is still skipped.
+        let skipped = format!(
+            "{}{}\nnot json \"permissionMode\"\n",
+            lines(&[old]),
+            lines(&[serde_json::json!({"isSidechain":true,"permissionMode":"plan"})])
+        );
+        assert_eq!(claude_transcript_mode(&skipped).as_deref(), Some("yolo"));
     }
 
     #[test]
@@ -660,13 +779,29 @@ mod tests {
     #[test]
     fn a_vendor_with_no_stated_mode_leaves_it_none() {
         let tmp = TempDir::new().unwrap();
-        write_route(
-            tmp.path(),
-            "mia",
-            r#"{"kind":"muse","session_id":"muse-none-1"}"#,
+        let home = tmp.path();
+        // Grok states a mode and Muse's settings state none, in the same home.
+        write(home, ".grok/config.toml", "[ui]\nyolo = true\n");
+        write(
+            home,
+            ".config/muse/settings.json",
+            r#"{"permissions":{"schema_version":1}}"#,
         );
-        let session = discover(tmp.path(), true);
-        assert_eq!(session.execution_mode, None);
-        assert_eq!(session.context_usage, None);
+        write_route(home, "mia", r#"{"kind":"muse","session_id":"muse-none-1"}"#);
+        let muse = discover(home, true);
+        assert_eq!(muse.execution_mode, None);
+        assert_eq!(muse.context_usage, None);
+
+        write(
+            home,
+            ".grok/sessions/grok-none-1/chat_history.jsonl",
+            "{}\n",
+        );
+        write_route(
+            home,
+            "wendy",
+            r#"{"kind":"grok","session_id":"grok-none-1"}"#,
+        );
+        assert_eq!(discover(home, true).execution_mode.as_deref(), Some("yolo"));
     }
 }
