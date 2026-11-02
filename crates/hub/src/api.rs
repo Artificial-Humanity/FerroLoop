@@ -75,10 +75,11 @@ use crate::auth::{
 };
 use crate::cloud_adapters;
 use crate::discovery::{
-    DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
-    discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
-    read_session_quota_usage_with_home, read_session_transcript_from_snapshot, read_worktree_diff,
-    scan_cargo_architecture_conformance, snapshot_discovery_store,
+    DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
+    discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
+    list_git_worktrees, lookup_sessions, read_session_quota_usage_with_reads,
+    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
+    snapshot_discovery_store, transcript_from_sessions,
 };
 use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
@@ -3966,9 +3967,19 @@ fn handle_dynamic_api_routes(
                 drain_ready_session_queues(state);
                 let snap = state.cached_discovery_snapshot().unwrap_or_default();
                 let home = state.config.home_override.as_deref();
-                let (canonical_id, _persona) =
-                    resolve_session_target_from_snapshot(state, &snap, &session_id);
-                let all_turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
+                // One route lookup and one read and parse per transcript file serve every step.
+                let sessions = lookup_sessions(&snap, home);
+                let mut files = TranscriptReads::default();
+                let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
+                let all_turns =
+                    transcript_from_sessions(&session_id, &sessions, &snap, home, &mut files);
+                // The busy check reads the canonical id's transcript. It is the same read
+                // unless the persona resolved to another id; a file both reach is parsed once.
+                let canonical_turns = (canonical_id != session_id.trim()).then(|| {
+                    transcript_from_sessions(&canonical_id, &sessions, &snap, home, &mut files)
+                });
+                let busy_turns = canonical_turns.as_deref().unwrap_or(&all_turns);
+                let is_busy = state.is_session_busy_from_turns(&canonical_id, busy_turns);
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -3976,22 +3987,22 @@ fn handle_dynamic_api_routes(
                     None => Some(250),
                 };
                 let turns = match limit_opt {
-                    Some(limit) if total_turns > limit => all_turns[total_turns - limit..].to_vec(),
-                    _ => all_turns,
+                    Some(limit) if total_turns > limit => &all_turns[total_turns - limit..],
+                    _ => &all_turns[..],
                 };
-                let busy_turns = read_session_transcript_from_snapshot(&canonical_id, &snap, home);
-                let is_busy = state.is_session_busy_from_turns(&canonical_id, &busy_turns);
                 let queue = state.session_queue(&canonical_id);
                 let context_usage =
-                    read_session_context_usage_from_snapshot(&session_id, &snap, home);
+                    context_usage_from_sessions(&session_id, &sessions, home, &mut files);
                 let quota_usage =
-                    read_session_quota_usage_with_home(&canonical_id, home).or_else(|| {
-                        if canonical_id == session_id {
-                            None
-                        } else {
-                            read_session_quota_usage_with_home(&session_id, home)
-                        }
-                    });
+                    read_session_quota_usage_with_reads(&canonical_id, home, &mut files).or_else(
+                        || {
+                            if canonical_id == session_id {
+                                None
+                            } else {
+                                read_session_quota_usage_with_reads(&session_id, home, &mut files)
+                            }
+                        },
+                    );
                 return HttpResponse::json(
                     200,
                     json!({
@@ -4215,10 +4226,18 @@ fn resolve_session_target_from_snapshot(
     snap: &DiscoveryStoreSnapshot,
     raw_session_id: &str,
 ) -> (String, Option<String>) {
-    let trimmed = raw_session_id.trim();
     // Only `id` and `persona` are read, so skip model discovery.
     let sessions =
         discover_route_sessions_without_model_info(snap, state.config.home_override.as_deref());
+    resolve_session_target_in(&sessions, raw_session_id)
+}
+
+/// The canonical session id and persona for `raw_session_id` among `sessions`.
+fn resolve_session_target_in(
+    sessions: &[DiscoveredSessionSummary],
+    raw_session_id: &str,
+) -> (String, Option<String>) {
+    let trimmed = raw_session_id.trim();
     if let Some(matched) = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -4603,9 +4622,25 @@ fn handle_post_session_prompt(
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
     drain_ready_session_queues(state);
-    let (canonical_session_id, target_persona) = resolve_session_target(state, session_id);
-    let busy = state.is_session_busy_released(&canonical_session_id);
+    // One store snapshot and one route lookup serve the resolve, the busy check and the
+    // in-flight mark below.
+    let snap = load_discovery_snapshot(state);
+    let home = state.config.home_override.as_deref();
+    let sessions = lookup_sessions(&snap, home);
+    let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
     let has_queued = !state.session_queue(&canonical_session_id).is_empty();
+    // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
+    // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
+    let busy = !payload.send_now && {
+        let turns = transcript_from_sessions(
+            &canonical_session_id,
+            &sessions,
+            &snap,
+            home,
+            &mut TranscriptReads::default(),
+        );
+        state.is_session_busy_from_turns(&canonical_session_id, &turns)
+    };
 
     if !payload.send_now && (busy || has_queued) {
         let (item, queue) = state.enqueue_session_prompt(
@@ -4648,7 +4683,15 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    state.mark_session_in_flight_released(&canonical_session_id);
+    // The transcript as the dispatch left it: read again, not taken from the busy check.
+    let after = transcript_from_sessions(
+        &canonical_session_id,
+        &sessions,
+        &snap,
+        home,
+        &mut TranscriptReads::default(),
+    );
+    state.mark_session_in_flight_from_turns(&canonical_session_id, &after);
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({

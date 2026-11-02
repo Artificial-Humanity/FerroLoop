@@ -324,3 +324,130 @@ fn a_home_override_always_scans_fresh_and_never_shares_a_scan() {
     );
     assert_eq!((costs_one.route_scans, costs_two.route_scans), (1, 1));
 }
+
+// ---- item 2: the transcript and prompt endpoints ----
+
+/// The transcript response as the handler built it before the shared lookup: each step ran its
+/// own route lookup and read (and parsed) its file again.
+fn transcript_response_reference(
+    state: &HubState,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Vec<u8> {
+    use crate::discovery::{
+        discover_route_sessions_without_model_info, read_session_context_usage_from_snapshot,
+        read_session_quota_usage_with_home, read_session_transcript_from_snapshot,
+    };
+    let snap = state.cached_discovery_snapshot().unwrap_or_default();
+    let home = state.config.home_override.as_deref();
+    let trimmed = session_id.trim();
+    let (canonical_id, _) = discover_route_sessions_without_model_info(&snap, home)
+        .iter()
+        .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
+        .map(|m| (m.id.clone(), m.persona.clone()))
+        .unwrap_or_else(|| (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())));
+    let all_turns = read_session_transcript_from_snapshot(session_id, &snap, home);
+    let total_turns = all_turns.len();
+    let turns = match limit {
+        Some(limit) if total_turns > limit => all_turns[total_turns - limit..].to_vec(),
+        _ => all_turns,
+    };
+    let busy_turns = read_session_transcript_from_snapshot(&canonical_id, &snap, home);
+    let is_busy = state.is_session_busy_from_turns(&canonical_id, &busy_turns);
+    let queue = state.session_queue(&canonical_id);
+    let context_usage = read_session_context_usage_from_snapshot(session_id, &snap, home);
+    let quota_usage = read_session_quota_usage_with_home(&canonical_id, home).or_else(|| {
+        if canonical_id == session_id {
+            None
+        } else {
+            read_session_quota_usage_with_home(session_id, home)
+        }
+    });
+    HttpResponse::json(
+        200,
+        json!({
+            "session_id": session_id,
+            "turns": turns,
+            "total_turns": total_turns,
+            "is_busy": is_busy,
+            "queue": queue,
+            "context_usage": context_usage,
+            "quota_usage": quota_usage,
+        }),
+    )
+    .body
+}
+
+#[test]
+fn the_transcript_endpoint_scans_once_parses_once_and_answers_byte_for_byte_the_same() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 6);
+    for (id, query, limit) in [
+        // The persona resolves to the conversation id: two ids, one file.
+        ("ferris", "", Some(250)),
+        ("ferris", "?limit=2", Some(2)),
+        ("ferris", "?limit=all", None),
+        ("conv-ferris-1", "?limit=250", Some(250)),
+        // No session at all: the attempt fallback and the empty answer.
+        ("ghost", "", Some(250)),
+    ] {
+        let (resp, costs) = get(&state, &format!("/api/v1/sessions/{id}/transcript{query}"));
+        assert_eq!(resp.status, 200);
+        let expected = transcript_response_reference(&state, id, limit);
+        assert_eq!(
+            String::from_utf8_lossy(&resp.body),
+            String::from_utf8_lossy(&expected),
+            "{id}{query}"
+        );
+        assert_eq!(costs.route_scans, 1, "{id}{query}: one route lookup");
+        let found = id != "ghost";
+        assert_eq!(
+            costs.transcript_parses,
+            u64::from(found),
+            "{id}{query}: parsed once"
+        );
+        assert_eq!(
+            costs.transcript_reads,
+            u64::from(found),
+            "{id}{query}: read once"
+        );
+    }
+    let ferris = get(&state, "/api/v1/sessions/ferris/transcript").0;
+    assert_eq!(ferris.json_value().unwrap()["total_turns"], 6);
+}
+
+fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
+    measure(|| {
+        handle_http_request(
+            state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({ "prompt": "hi", "send_now": send_now })),
+        )
+    })
+}
+
+#[test]
+fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (queued_check, checked) = post_prompt(&state, false);
+    assert_eq!(queued_check.json_value().unwrap()["status"], "sent");
+    // Busy check, then the in-flight mark after the dispatch.
+    assert_eq!(checked.transcript_parses, 2);
+    assert_eq!(checked.store_snapshots, 1);
+
+    let (sent, skipped) = post_prompt(&state, true);
+    let body = sent.json_value().unwrap();
+    assert_eq!(body["status"], "sent");
+    assert_eq!(body["session_id"], "conv-ferris-1");
+    assert_eq!(
+        skipped.transcript_parses, 1,
+        "only the in-flight mark parses"
+    );
+    assert_eq!(skipped.store_snapshots, 1);
+
+    // The in-flight mark still took: a prompt without send_now now queues.
+    let (queued, _) = post_prompt(&state, false);
+    assert_eq!(queued.json_value().unwrap()["status"], "queued");
+}

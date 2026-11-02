@@ -469,10 +469,10 @@ pub fn discover_sessions_from_snapshot(
     discover_sessions_impl(snap, home_override, true)
 }
 
-/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `model`,
-/// `thinking_level` and `available_models` empty. For callers that only look a session up
-/// by `id`, `persona` or `source`: it never reads a model file or transcript tail and never
-/// calls a language server.
+/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `quota_usage`,
+/// `model`, `thinking_level` and `available_models` empty. For callers that only look a
+/// session up by `id`, `persona` or `source`: it never reads a model file, a transcript or a
+/// transcript tail, and never runs a quota probe or calls a language server.
 pub fn discover_route_sessions_without_model_info(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
@@ -481,8 +481,8 @@ pub fn discover_route_sessions_without_model_info(
 }
 
 /// Shared body of [`discover_sessions_from_snapshot`]. `with_model_info` is false for
-/// callers that only look a session up by id, so they never read model files or wait on
-/// a language server.
+/// callers that only look a session up by id, so they never read model files or transcripts
+/// for quota, run a quota probe, or wait on a language server.
 fn discover_sessions_impl(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
@@ -632,7 +632,7 @@ fn discover_sessions_impl(
     }
 
     for session in &mut out {
-        if session.source == "route" {
+        if session.source == "route" && with_model_info {
             // `home` is for transcript lookup only. Production passes `None`
             // so probes may use `PATH`; `Some($HOME)` would skip them.
             session.quota_usage = quota_for_resolved_route(
@@ -640,21 +640,19 @@ fn discover_sessions_impl(
                 session.transcript_path.as_deref(),
                 home_override,
             );
-            if with_model_info {
-                let endpoint = agy_endpoints.get(&session.id);
-                let info = session_model_info(
-                    &session.adapter,
-                    &session.id,
-                    session.transcript_path.as_deref(),
-                    home.as_deref(),
-                    endpoint.and_then(|(addr, _)| addr.as_deref()),
-                    endpoint.and_then(|(_, csrf)| csrf.as_deref()),
-                    agy_env_fallback_allowed(home_override),
-                );
-                session.model = info.model;
-                session.thinking_level = info.thinking_level;
-                session.available_models = info.available_models;
-            }
+            let endpoint = agy_endpoints.get(&session.id);
+            let info = session_model_info(
+                &session.adapter,
+                &session.id,
+                session.transcript_path.as_deref(),
+                home.as_deref(),
+                endpoint.and_then(|(addr, _)| addr.as_deref()),
+                endpoint.and_then(|(_, csrf)| csrf.as_deref()),
+                agy_env_fallback_allowed(home_override),
+            );
+            session.model = info.model;
+            session.thinking_level = info.thinking_level;
+            session.available_models = info.available_models;
         }
     }
 
@@ -2008,6 +2006,35 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
     latest
 }
 
+/// Transcript files one request has read. A second look at the same file (a busy check after
+/// the transcript, the context-window or quota scan) reuses the text and the parsed turns
+/// instead of reading and parsing a multi-MB file again. Keyed by path; a failed read is kept
+/// as `None`.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptReads {
+    raw: BTreeMap<String, Option<String>>,
+    turns: BTreeMap<String, Vec<TranscriptTurn>>,
+}
+
+impl TranscriptReads {
+    /// The file's text, read on the first call for `path` only.
+    fn raw(&mut self, path: &str) -> Option<&str> {
+        self.raw
+            .entry(path.to_string())
+            .or_insert_with(|| read_transcript(path).ok())
+            .as_deref()
+    }
+
+    /// The file's turns, parsed on the first call for `path` only; `None` when it cannot be read.
+    fn turns(&mut self, path: &str) -> Option<&[TranscriptTurn]> {
+        if !self.turns.contains_key(path) {
+            let parsed = parse_jsonl_transcript(self.raw(path)?);
+            self.turns.insert(path.to_string(), parsed);
+        }
+        self.turns.get(path).map(Vec::as_slice)
+    }
+}
+
 /// Read account quota for `session_id`.
 ///
 /// Codex rollouts supply both windows. Grok's unified log supplies the weekly window.
@@ -2028,6 +2055,25 @@ pub(crate) fn read_session_quota_usage_locked(
     session_id: &str,
     home_override: Option<&Path>,
 ) -> Option<SessionQuotaUsage> {
+    quota_usage_with_reads_locked(session_id, home_override, &mut TranscriptReads::default())
+}
+
+/// [`read_session_quota_usage_with_home`] that reads the transcript through `files`.
+pub(crate) fn read_session_quota_usage_with_reads(
+    session_id: &str,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionQuotaUsage> {
+    crate::direct_quota::with_probe_lock(|| {
+        quota_usage_with_reads_locked(session_id, home_override, files)
+    })
+}
+
+fn quota_usage_with_reads_locked(
+    session_id: &str,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionQuotaUsage> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return None;
@@ -2037,7 +2083,7 @@ pub(crate) fn read_session_quota_usage_locked(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
     let tpath = find_transcript_file_in_home(&home, trimmed)?;
     let adapter = adapter_for_transcript(Path::new(&tpath))?;
-    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override)
+    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override, files)
 }
 
 /// Quota for a route row whose transcript path is already known.
@@ -2049,7 +2095,12 @@ pub(crate) fn quota_for_resolved_route(
     home_override: Option<&Path>,
 ) -> Option<SessionQuotaUsage> {
     crate::direct_quota::with_probe_lock(|| {
-        quota_for_resolved_route_locked(adapter, transcript_path, home_override)
+        quota_for_resolved_route_locked(
+            adapter,
+            transcript_path,
+            home_override,
+            &mut TranscriptReads::default(),
+        )
     })
 }
 
@@ -2057,6 +2108,7 @@ fn quota_for_resolved_route_locked(
     adapter: &str,
     transcript_path: Option<&str>,
     home_override: Option<&Path>,
+    files: &mut TranscriptReads,
 ) -> Option<SessionQuotaUsage> {
     let home = home_override
         .map(Path::to_path_buf)
@@ -2064,8 +2116,7 @@ fn quota_for_resolved_route_locked(
     match adapter {
         "codex" => {
             let path = transcript_path?;
-            let raw = read_transcript(path).ok()?;
-            codex_quota_from_rollout(&raw)
+            codex_quota_from_rollout(files.raw(path)?)
         }
         "grok" => {
             transcript_path?;
@@ -2073,17 +2124,13 @@ fn quota_for_resolved_route_locked(
             grok_quota_from_home(&home)
         }
         "muse" => {
-            let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                muse_quota_from_session(&raw)
-            });
+            let disk = transcript_path.and_then(|path| muse_quota_from_session(files.raw(path)?));
             let account = crate::direct_quota::muse_account_quota(home_override);
             crate::direct_quota::merge_account_quota(account, disk)
         }
         "claude" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                let reason = crate::direct_quota::claude_rate_limit_reason(&raw)?;
+                let reason = crate::direct_quota::claude_rate_limit_reason(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
@@ -2096,8 +2143,7 @@ fn quota_for_resolved_route_locked(
         }
         "antigravity" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                let reason = crate::direct_quota::antigravity_exhausted_reason(&raw)?;
+                let reason = crate::direct_quota::antigravity_exhausted_reason(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
@@ -2159,8 +2205,27 @@ pub fn read_session_context_usage_from_snapshot(
     if trimmed.is_empty() {
         return None;
     }
-
     let sessions = discover_sessions_impl(snap, home_override, false);
+    context_usage_from_sessions(
+        trimmed,
+        &sessions,
+        home_override,
+        &mut TranscriptReads::default(),
+    )
+}
+
+/// The context-window read of [`read_session_context_usage_from_snapshot`] over sessions the
+/// caller already discovered, reading the transcript through `files`.
+pub(crate) fn context_usage_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionContextUsage> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let mut tpath_opt = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -2175,7 +2240,8 @@ pub fn read_session_context_usage_from_snapshot(
         }
     }
 
-    let tpath = PathBuf::from(tpath_opt?);
+    let tpath_str = tpath_opt?;
+    let tpath = PathBuf::from(&tpath_str);
     if tpath.file_name().and_then(|s| s.to_str()) == Some("chat_history.jsonl")
         && let Some(dir) = tpath.parent()
     {
@@ -2221,7 +2287,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".codex")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         let configured_max = read_codex_configured_context_window(&tpath);
         for line in raw.lines().rev() {
@@ -2269,7 +2335,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2309,7 +2375,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".claude")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2354,8 +2420,8 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if is_antigravity_transcript(&tpath)
-        && let Ok(raw) = read_transcript(&tpath)
-        && let Some(usage) = antigravity_context_from_transcript(&raw)
+        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(usage) = antigravity_context_from_transcript(raw)
     {
         return Some(usage);
     }
@@ -2389,17 +2455,45 @@ pub fn read_session_transcript_from_snapshot(
     if trimmed.is_empty() {
         return Vec::new();
     }
-
     let sessions = discover_sessions_impl(snap, home_override, false);
-    for s in &sessions {
+    transcript_from_sessions(
+        trimmed,
+        &sessions,
+        snap,
+        home_override,
+        &mut TranscriptReads::default(),
+    )
+}
+
+/// Lookup-only discovery (no model or quota information), for a request that resolves a
+/// session and reads its transcript, context window and quota from one route scan.
+pub(crate) fn lookup_sessions(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_impl(snap, home_override, false)
+}
+
+/// The transcript read of [`read_session_transcript_from_snapshot`] over sessions the caller
+/// already discovered, reading and parsing each file through `files`.
+pub(crate) fn transcript_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Vec<TranscriptTurn> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    for s in sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
-            && let Ok(raw) = read_transcript(tpath)
+            && let Some(turns) = files.turns(tpath)
+            && !turns.is_empty()
         {
-            let turns = parse_jsonl_transcript(&raw);
-            if !turns.is_empty() {
-                return turns;
-            }
+            return turns.to_vec();
         }
     }
 
@@ -2408,12 +2502,10 @@ pub fn read_session_transcript_from_snapshot(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     if let Some(ref h) = home
         && let Some(tpath) = find_transcript_file_in_home(h, trimmed)
-        && let Ok(raw) = read_transcript(tpath)
+        && let Some(turns) = files.turns(&tpath)
+        && !turns.is_empty()
     {
-        let turns = parse_jsonl_transcript(&raw);
-        if !turns.is_empty() {
-            return turns;
-        }
+        return turns.to_vec();
     }
 
     for attempt in &snap.attempts {
