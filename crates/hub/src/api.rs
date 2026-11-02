@@ -5474,8 +5474,13 @@ fn handle_post_session_decommission(
 /// `POST /api/v1/sessions/:id/remodel` (Local Record 59): move a session to another vendor,
 /// keeping its persona, project, role and worktree (see [`lifecycle::remodel_session`]).
 /// `prepare` asks the session to hand off (queued when no live route takes it); `execute`
-/// replaces it. The store guard is held from target resolution to the end of the remodel, so
-/// no other lifecycle request of this hub runs in between.
+/// replaces it. The store guard is held from target resolution to the end of the handler, past
+/// every queue, model-override and broadcast write, so no other lifecycle request of this hub
+/// runs in between and two remodels of one persona never interleave their writes.
+///
+/// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
+/// (`restored` or `down`). When the old session was restored, the operator's model override
+/// (and thinking level) the teardown cleared is put back as it was.
 fn handle_post_session_remodel(
     state: &HubState,
     authority: &HubAuthority,
@@ -5493,26 +5498,57 @@ fn handle_post_session_remodel(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    let result = SessionTarget::resolve(&*store, session_id, Some(discovered)).and_then(|target| {
-        lifecycle::remodel_session(
-            &*store,
-            &env,
-            &target,
-            &payload,
-            by,
-            caller_of(authority),
-            |key| {
-                state.clear_session_prompt_queue(key);
-                state.clear_session_model_override(key);
-            },
-        )
-    });
-    drop(store);
+    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+        Ok(target) => target,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    // The overrides the teardown clears, as they were, so a restore can put them back.
+    let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
+    let result = lifecycle::remodel_session(
+        &*store,
+        &env,
+        &target,
+        &payload,
+        by,
+        caller_of(authority),
+        |key| {
+            for k in [key.to_string(), key.to_ascii_lowercase()] {
+                if let Some(o) = state.session_model_override(&k)
+                    && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+                {
+                    cleared_overrides.push((k, o));
+                }
+            }
+            state.clear_session_prompt_queue(key);
+            state.clear_session_model_override(key);
+        },
+    );
     // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
     // write request. Drop the scan here too, so a failed remodel's restore shows at once.
     crate::discovery::invalidate_route_discovery_cache();
     let out = match result {
         Ok(out) => out,
+        Err(LifecycleError::Partial {
+            message,
+            restored_session_id,
+        }) => {
+            if restored_session_id.is_some() {
+                for (key, o) in cleared_overrides {
+                    state.set_session_model_override(&key, o);
+                }
+            }
+            let data = json!({
+                "session_id": target.session_id,
+                "persona": target.persona,
+                "vendor": payload.vendor.trim().to_ascii_lowercase(),
+                "outcome": if restored_session_id.is_some() { "restored" } else { "down" },
+                "restored_session_id": restored_session_id,
+                "error": message,
+            });
+            state.broadcast("sessions", "session.remodel_failed", data.clone());
+            drop(store);
+            return HttpResponse::json(502, data);
+        }
         Err(e) => return lifecycle_error_response(&e),
     };
     match out.mode {
@@ -5563,6 +5599,8 @@ fn handle_post_session_remodel(
     }
     let data = serde_json::to_value(&out).unwrap_or_default();
     state.broadcast("sessions", "session.remodeled", data.clone());
+    // Released only now: every write above belongs to this remodel.
+    drop(store);
     HttpResponse::json(200, data)
 }
 

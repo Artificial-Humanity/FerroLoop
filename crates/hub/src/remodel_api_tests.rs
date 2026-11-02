@@ -330,18 +330,94 @@ fn concurrent_remodels_of_one_persona_leave_exactly_one_live_session() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                remodel(&state, "felicity", OWNER, &json!({ "vendor": vendor })).status
+                let body = json!({ "vendor": vendor, "model": format!("m-{vendor}") });
+                remodel(&state, "felicity", OWNER, &body).status
             })
         })
         .collect();
     let statuses: Vec<u16> = racers.into_iter().map(|r| r.join().unwrap()).collect();
     // The store guard serializes them: each remodels whatever the one before left running.
     assert_eq!(statuses, [200, 200, 200]);
-    let live: Vec<String> = records(&state)
+    let live: Vec<HostedSessionRecord> = records(&state)
         .into_iter()
         .filter(|r| r.status != "decommissioned")
-        .map(|r| r.session_id)
         .collect();
     assert_eq!(live.len(), 1, "{live:?}");
     assert_eq!(status_of(&state, "felicity"), AgentStatus::Active);
+    // The last remodel's writes are the last ones: its model shows under the persona, and no
+    // earlier remodel's late write replaced it.
+    let last = format!("m-{}", live[0].vendor);
+    assert_eq!(live[0].model.as_deref(), Some(last.as_str()));
+    for key in ["felicity", live[0].session_id.as_str()] {
+        assert_eq!(
+            override_model(&state, key).as_deref(),
+            Some(last.as_str()),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_execute_broadcasts_its_outcome_and_a_restore_puts_the_override_back() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    spin_up(&state, "felicity", "assistant", "claude");
+    let chosen = ModelOverride {
+        model: "claude-opus-5-5".into(),
+        thinking_level: Some("high".into()),
+    };
+    for key in ["felicity", "claude:felicity"] {
+        state.set_session_model_override(key, chosen.clone());
+    }
+    lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(|v| v.push("codex".into()));
+    let mut frames = state.subscribe();
+
+    let resp = remodel(
+        &state,
+        "claude%3Afelicity",
+        OWNER,
+        &json!({ "vendor": "codex" }),
+    );
+    assert_eq!(resp.status, 502, "{}", body_text(&resp));
+    let out = resp.json_value().unwrap();
+    assert_eq!(out["outcome"], "restored");
+    assert_eq!(out["restored_session_id"], "claude:felicity");
+    assert_eq!(out["persona"], "felicity");
+    assert_eq!(out["vendor"], "codex");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains("codex binary is missing")
+    );
+    let frame = frames.try_recv().unwrap();
+    assert_eq!(
+        (frame.channel.as_str(), frame.event.as_str()),
+        ("sessions", "session.remodel_failed")
+    );
+    assert_eq!(frame.data, out);
+    assert!(frames.try_recv().is_err());
+    // The restored session runs the model and thinking level the operator chose before.
+    for key in ["felicity", "claude:felicity"] {
+        assert_eq!(
+            state.session_model_override(key),
+            Some(chosen.clone()),
+            "{key}"
+        );
+    }
+
+    // The restore fails too: the persona is down, and nothing is put back.
+    lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(|v| v.push("claude".into()));
+    let resp = remodel(&state, "felicity", OWNER, &json!({ "vendor": "codex" }));
+    assert_eq!(resp.status, 502, "{}", body_text(&resp));
+    let out = resp.json_value().unwrap();
+    assert_eq!(out["outcome"], "down");
+    assert!(out["restored_session_id"].is_null());
+    let frame = frames.try_recv().unwrap();
+    assert_eq!(frame.event, "session.remodel_failed");
+    assert_eq!(frame.data["outcome"], "down");
+    for key in ["felicity", "claude:felicity"] {
+        assert_eq!(state.session_model_override(key), None, "{key}");
+    }
+    lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(Vec::clear);
 }
