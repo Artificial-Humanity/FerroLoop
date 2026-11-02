@@ -73,14 +73,31 @@ fn resolve_key(
     }
     let secret = normalize_secret_name(vault_secret_name.as_deref()?).ok()?;
     let url = base_url.unwrap_or(default_base_url);
-    from_vault(&secret, url, vault_path, key_path)
+    let env_master = env(MASTER_KEY_ENV);
+    from_vault(&secret, url, env_master.as_deref(), vault_path, key_path)
+}
+
+/// The environment variable the Vault reads its master key from.
+const MASTER_KEY_ENV: &str = "FL_VAULT_MASTER_KEY";
+
+/// Whether the Vault will find a master key without creating one: the variable holds a value that
+/// is not blank once trimmed (`load_or_init_master_key`'s own rule, which trims it), or the key
+/// file exists.
+fn master_key_exists(env_master: Option<&str>, key_path: &Path) -> bool {
+    env_master.is_some_and(|v| !v.trim().is_empty()) || key_path.exists()
 }
 
 /// Reads `secret` from the Vault for a request to `url`, under the Vault's policy.
-fn from_vault(secret: &str, url: &str, vault_path: &Path, key_path: &Path) -> Option<String> {
+/// `env_master` is the value of [`MASTER_KEY_ENV`].
+fn from_vault(
+    secret: &str,
+    url: &str,
+    env_master: Option<&str>,
+    vault_path: &Path,
+    key_path: &Path,
+) -> Option<String> {
     // `load_or_init_master_key` would create a master key; a read must not.
-    let env_key = std::env::var_os("FL_VAULT_MASTER_KEY").is_some_and(|v| !v.is_empty());
-    if !vault_path.is_file() || !(env_key || key_path.exists()) {
+    if !vault_path.is_file() || !master_key_exists(env_master, key_path) {
         return None;
     }
     let master_key = load_or_init_master_key(key_path).ok()?;
@@ -218,6 +235,36 @@ mod tests {
         std::fs::remove_file(&f.key).unwrap();
         assert_eq!(resolve_key(&d, None, &no_env, &f.vault, &f.key), None);
         assert!(!f.key.exists());
+    }
+
+    #[test]
+    fn a_blank_master_key_variable_is_not_a_master_key_and_creates_none() {
+        // The Vault trims the variable, so a blank one is no key: it would create the key file.
+        assert!(!master_key_exists(
+            None,
+            Path::new("/nonexistent/vault.key")
+        ));
+        for blank in ["", "   ", "\n\t "] {
+            assert!(
+                !master_key_exists(Some(blank), Path::new("/nonexistent/vault.key")),
+                "{blank:?}"
+            );
+        }
+        assert!(master_key_exists(
+            Some(" 00ff "),
+            Path::new("/nonexistent/vault.key")
+        ));
+
+        // End to end: a Vault, no key file, and a whitespace-only variable.
+        let f = fixture("VK_KEY", "k", "api.example.com", &[], false);
+        std::fs::remove_file(&f.key).unwrap();
+        let d = vendor(None, Some("VK_KEY"), "https://api.example.com/v1");
+        let blank = |name: &str| (name == MASTER_KEY_ENV).then(|| "   ".to_string());
+        assert_eq!(resolve_key(&d, None, &blank, &f.vault, &f.key), None);
+        assert!(
+            !f.key.exists(),
+            "a blank variable must not create a master key"
+        );
     }
 
     #[test]
