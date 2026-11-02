@@ -79,7 +79,8 @@ use crate::discovery::{
 };
 use crate::github_pr;
 use crate::lifecycle::{
-    self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
+    self, DecommissionMode, LifecycleEnv, LifecycleError, RemodelMode, RemodelRequest,
+    SessionTarget, SpinUpRequest,
 };
 use crate::nodes::{
     DispatchTask, EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate,
@@ -4036,7 +4037,7 @@ fn handle_dynamic_api_routes(
         return records::handle_post_record_move(state, authority, req, segments[3]);
     }
 
-    // /api/v1/sessions/:id/transcript, /prompt, /clear, /decommission, or /queue
+    // /api/v1/sessions/:id/transcript, /prompt, /clear, /decommission, /remodel, or /queue
     if segments.len() == 5
         && segments[0] == "api"
         && segments[1] == "v1"
@@ -4125,6 +4126,9 @@ fn handle_dynamic_api_routes(
             }
             ("POST", "decommission") => {
                 return handle_post_session_decommission(state, authority, &session_id, req);
+            }
+            ("POST", "remodel") => {
+                return handle_post_session_remodel(state, authority, &session_id, req);
             }
             _ => {}
         }
@@ -5464,6 +5468,139 @@ fn handle_post_session_decommission(
     }
     let data = serde_json::to_value(&out).unwrap_or_default();
     state.broadcast("sessions", "session.decommission", data.clone());
+    HttpResponse::json(200, data)
+}
+
+/// `POST /api/v1/sessions/:id/remodel` (Local Record 59): move a session to another vendor,
+/// keeping its persona, project, role and worktree (see [`lifecycle::remodel_session`]).
+/// `prepare` asks the session to hand off (queued when no live route takes it); `execute`
+/// replaces it. The store guard is held from target resolution to the end of the handler, past
+/// every queue, model-override and broadcast write, so no other lifecycle request of this hub
+/// runs in between and two remodels of one persona never interleave their writes.
+///
+/// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
+/// (`restored` or `down`). When the old session was restored, the operator's model override
+/// (and thinking level) the teardown cleared is put back as it was.
+fn handle_post_session_remodel(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let payload: RemodelRequest = match req.json() {
+        Ok(payload) => payload,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    // Resolve before taking the store guard: discovery opens the store itself.
+    let discovered = resolve_session_target(state, session_id);
+    let by = authority.actor_name();
+    let env = lifecycle_env(state);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+        Ok(target) => target,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    // The overrides the teardown clears, as they were, so a restore can put them back.
+    let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
+    let result = lifecycle::remodel_session(
+        &*store,
+        &env,
+        &target,
+        &payload,
+        by,
+        caller_of(authority),
+        |key| {
+            for k in [key.to_string(), key.to_ascii_lowercase()] {
+                if let Some(o) = state.session_model_override(&k)
+                    && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+                {
+                    cleared_overrides.push((k, o));
+                }
+            }
+            state.clear_session_prompt_queue(key);
+            state.clear_session_model_override(key);
+        },
+    );
+    // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
+    // write request. Drop the scan here too, so a failed remodel's restore shows at once.
+    crate::discovery::invalidate_route_discovery_cache();
+    let out = match result {
+        Ok(out) => out,
+        Err(LifecycleError::Partial {
+            message,
+            restored_session_id,
+        }) => {
+            if restored_session_id.is_some() {
+                for (key, o) in cleared_overrides {
+                    state.set_session_model_override(&key, o);
+                }
+            }
+            let data = json!({
+                "session_id": target.session_id,
+                "persona": target.persona,
+                "vendor": payload.vendor.trim().to_ascii_lowercase(),
+                "outcome": if restored_session_id.is_some() { "restored" } else { "down" },
+                "restored_session_id": restored_session_id,
+                "error": message,
+            });
+            state.broadcast("sessions", "session.remodel_failed", data.clone());
+            drop(store);
+            return HttpResponse::json(502, data);
+        }
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    match out.mode {
+        RemodelMode::Prepare => {
+            if let (false, Some(prompt)) = (out.handshake_dispatched, out.prompt.as_ref()) {
+                // No live route took the handshake: leave it on the queue for the next idle turn.
+                let (_, queue) = state.enqueue_session_prompt(
+                    &out.session_id,
+                    Some(out.persona.clone()),
+                    prompt.clone(),
+                    prompt.clone(),
+                    by.to_string(),
+                    Vec::new(),
+                );
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": out.session_id,
+                        "persona": out.persona,
+                        "is_busy": true,
+                        "queue": queue,
+                    }),
+                );
+            }
+        }
+        RemodelMode::Execute => {
+            // Nothing queued for, or chosen for, the old run applies to the new one: the old
+            // vendor's model override must never mask the new vendor's model.
+            for key in [&out.previous_session_id, &out.session_id, &out.persona] {
+                state.clear_session_prompt_queue(key);
+                state.clear_session_model_override(key);
+            }
+            if let Some(model) = &out.model {
+                // Keyed by the persona (and the hosted id): discovery does not know the new
+                // vendor session's id yet, and `apply_model_overrides` matches the persona.
+                for key in [out.persona.to_ascii_lowercase(), out.session_id.clone()] {
+                    state.set_session_model_override(
+                        &key,
+                        ModelOverride {
+                            model: model.clone(),
+                            thinking_level: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let data = serde_json::to_value(&out).unwrap_or_default();
+    state.broadcast("sessions", "session.remodeled", data.clone());
+    // Released only now: every write above belongs to this remodel.
+    drop(store);
     HttpResponse::json(200, data)
 }
 

@@ -700,6 +700,9 @@ impl HubState {
 mod latency_tests;
 
 #[cfg(test)]
+mod remodel_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use fl_core::model::State;
@@ -3231,7 +3234,8 @@ mod tests {
         assert_eq!(out["status"], "decommissioned");
         assert_eq!(out["handshake_dispatched"], false);
         assert_eq!(out["unregistered"], true);
-        assert_eq!(out["runtime_stopped"], true);
+        // Runtime calls are off in tests: no runtime was started, so none is reported stopped.
+        assert_eq!(out["runtime_stopped"], false);
         assert!(out["prompt"].is_null());
 
         assert!(state.session_queue("claude:felicity").is_empty());
