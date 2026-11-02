@@ -397,6 +397,7 @@ export const EncapsulatedWorkBlock: React.FC<EncapsulatedWorkBlockProps> = ({
         gap: expanded ? "8px" : "0",
         padding: expanded ? undefined : "6px 12px",
         overflow: "hidden",
+        flexShrink: 0,
       }}
     >
       <button

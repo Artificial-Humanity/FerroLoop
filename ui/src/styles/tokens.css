@@ -211,6 +211,10 @@ body,
   padding: clamp(8px, 1.4vw, 14px);
 }
 
+.fd-scroll > * {
+  flex-shrink: 0;
+}
+
 /* Buttons & Inputs */
 .fd-btn {
   display: inline-flex;

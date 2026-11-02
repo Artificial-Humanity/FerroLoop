@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import {
@@ -1010,5 +1010,212 @@ describe("Agent switch transcript isolation", () => {
     );
 
     unmount();
+  });
+
+  it("preserves multiple outbound prompts across polls and keeps prompt_sent WebSocket / queued prompts visible while in FerroWire transit", async () => {
+    const now = Date.now();
+    const baseTurns: TranscriptTurn[] = [
+      turn({ index: 0, role: "assistant", content: "Initial greeting" }),
+    ];
+    const multiOptimistic = [
+      { content: "First outbound prompt", sentAt: now - 2000, agentKey: "ferris" },
+      { content: "Second outbound prompt", sentAt: now - 1000, agentKey: "ferris" },
+    ];
+
+    const preservedBoth = preserveOptimisticTurn(
+      baseTurns,
+      multiOptimistic,
+      now,
+      "ferris",
+    );
+    expect(preservedBoth.map((t) => t.content)).toEqual([
+      "Initial greeting",
+      "First outbound prompt",
+      "Second outbound prompt",
+    ]);
+
+    // When the first prompt flushes to disk, only the second remains appended optimistically
+    const afterFirstFlush = preserveOptimisticTurn(
+      [
+        ...baseTurns,
+        turn({ index: 1, role: "user", content: "First outbound prompt" }),
+      ],
+      multiOptimistic,
+      now,
+      "ferris",
+    );
+    expect(afterFirstFlush.map((t) => t.content)).toEqual([
+      "Initial greeting",
+      "First outbound prompt",
+      "Second outbound prompt",
+    ]);
+
+    // Verify prompt_sent WebSocket event and handleSendQueuedNow keep outbound prompts visible across transcript refreshes
+    let sessionListener: ((frame: unknown) => void) | null = null;
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.includes("/queue/q-1/send") && init?.method === "POST") {
+        return json({
+          status: "delivered",
+          prompt: "Force-sent queued prompt",
+          effective_body: "Force-sent queued prompt",
+          queue: [],
+          is_busy: true,
+        });
+      }
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) {
+        return json({
+          sessions: [
+            {
+              id: "sess-ferris",
+              source: "route",
+              adapter: "claude",
+              persona: "ferris",
+              status: "active",
+              updated_at: "t1",
+            },
+          ],
+        });
+      }
+      if (url.includes("/transcript")) {
+        // Disk JSONL has NOT yet flushed the outbound prompts
+        return json({
+          session_id: "sess-ferris",
+          turns: [
+            turn({
+              index: 0,
+              role: "assistant",
+              content: "Waiting for operator instructions.",
+            }),
+          ],
+          is_busy: false,
+          queue: [
+            {
+              id: "q-1",
+              session_id: "sess-ferris",
+              prompt: "Force-sent queued prompt",
+              created_at: new Date().toISOString(),
+            },
+          ],
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: (topic: string, cb: (frame: unknown) => void) => {
+        if (topic === "session") {
+          sessionListener = cb;
+        }
+        return () => {};
+      },
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    expect(
+      await screen.findByText(/Waiting for operator instructions\./),
+    ).toBeInTheDocument();
+
+    // Emit a prompt_sent WebSocket event (e.g. auto-drained queued prompt)
+    act(() => {
+      sessionListener?.({
+        type: "event",
+        topic: "session",
+        event: "prompt_sent",
+        data: {
+          session_id: "sess-ferris",
+          persona: "ferris",
+          effective_body: "Auto-drained queue prompt via WS",
+        },
+      });
+    });
+
+    expect(
+      (await screen.findAllByText("Auto-drained queue prompt via WS")).length,
+    ).toBeGreaterThan(0);
+
+    // Force-send a queued prompt via Send Now button — both prompts stay visible even after refreshSessionsAndTranscript runs against the un-flushed disk transcript
+    const sendNowBtn = await screen.findByTestId("queued-send-now-q-1");
+    fireEvent.click(sendNowBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("Force-sent queued prompt").length,
+      ).toBeGreaterThan(1);
+      expect(
+        screen.getAllByText("Auto-drained queue prompt via WS").length,
+      ).toBeGreaterThan(0);
+    });
+
+    unmount();
+  });
+
+  it("sets flexShrink: 0 on TurnCard and EncapsulatedWorkBlock root articles so chat entries never get squished or cut off", () => {
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        agentRole="lead"
+        agentProject="FerroLoop"
+        adapter="claude"
+        model="claude-opus-4-6"
+        sessionId="sess-ferris"
+        turns={[
+          turn({
+            index: 0,
+            role: "user",
+            content: "Run a quick check.",
+          }),
+          turn({
+            index: 1,
+            role: "assistant",
+            content: "",
+            thinking: "Checking workspace status...",
+            tool_calls: [{ name: "run_command", arguments: '{"cmd":"git status"}' }],
+          }),
+          turn({
+            index: 2,
+            role: "assistant",
+            content: "Workspace is clean.",
+          }),
+        ]}
+        isBusy={false}
+        queue={[]}
+        loading={false}
+        wsConnected={true}
+        onRefresh={() => {}}
+        onSendPrompt={async () => ({ status: "ok" })}
+      />,
+    );
+
+    const userCard = screen.getByTestId("turn-card-0");
+    const workBlock = screen.getByTestId("encapsulated-work-block");
+    const assistantCard = screen.getByTestId("turn-card-2");
+
+    expect(userCard.style.flexShrink).toBe("0");
+    expect(workBlock.style.flexShrink).toBe("0");
+    expect(assistantCard.style.flexShrink).toBe("0");
   });
 });

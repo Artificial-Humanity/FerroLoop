@@ -149,55 +149,92 @@ export interface OptimisticPrompt {
 
 export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
 
-/**
- * Keep a just-sent user turn visible until the vendor CLI flushes it to the
- * on-disk transcript. Without this, an immediate transcript refresh replaces
- * the optimistic turn with a stale disk snapshot and the prompt vanishes.
- */
-export function preserveOptimisticTurn(
-  turns: TranscriptTurn[],
-  optimistic: OptimisticPrompt | null,
-  nowMs: number = Date.now(),
-  currentAgentKey?: string | null,
-): TranscriptTurn[] {
-  if (!optimistic || !optimistic.content.trim()) {
-    return turns;
-  }
-  if (
-    currentAgentKey != null &&
-    optimistic.agentKey != null &&
-    optimistic.agentKey.trim().toLowerCase() !==
-      currentAgentKey.trim().toLowerCase()
-  ) {
-    return turns;
-  }
-  if (nowMs - optimistic.sentAt > OPTIMISTIC_PROMPT_TTL_MS) {
-    return turns;
-  }
-  const onDisk = turns.slice(-5).some((turn) => {
+function isPromptOnDisk(turns: TranscriptTurn[], content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) return true;
+  return turns.slice(-10).some((turn) => {
     if ((turn.role || "").toLowerCase() !== "user" || !turn.content) {
       return false;
     }
     return (
-      turn.content.trim() === optimistic.content.trim() ||
-      turn.content.includes(optimistic.content.trim())
+      turn.content.trim() === trimmed || turn.content.includes(trimmed)
     );
   });
-  if (onDisk) {
+}
+
+export function pruneOptimisticPrompts(
+  prompts: OptimisticPrompt[],
+  turns: TranscriptTurn[],
+  nowMs: number = Date.now(),
+  currentAgentKey?: string | null,
+): OptimisticPrompt[] {
+  const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
+  return prompts.filter((p) => {
+    if (!p || !p.content?.trim()) return false;
+    if (nowMs - p.sentAt > OPTIMISTIC_PROMPT_TTL_MS) return false;
+    const promptKey = (p.agentKey ?? "").trim().toLowerCase();
+    const matchesActive = !activeKey || !promptKey || promptKey === activeKey;
+    if (matchesActive && isPromptOnDisk(turns, p.content)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Keep just-sent user turns visible in chronological order until the vendor CLI
+ * flushes them to the on-disk transcript. Without this, an immediate transcript
+ * refresh replaces the optimistic turns with a stale disk snapshot and the
+ * outbound prompts vanish while in FerroWire transit or queue buffer.
+ */
+export function preserveOptimisticTurn(
+  turns: TranscriptTurn[],
+  optimistic: OptimisticPrompt | OptimisticPrompt[] | null | undefined,
+  nowMs: number = Date.now(),
+  currentAgentKey?: string | null,
+): TranscriptTurn[] {
+  const rawList: OptimisticPrompt[] = Array.isArray(optimistic)
+    ? optimistic
+    : optimistic
+      ? [optimistic]
+      : [];
+  if (rawList.length === 0) {
     return turns;
   }
-  const last = turns[turns.length - 1];
-  return [
-    ...turns,
-    {
-      index: last ? last.index + 1 : turns.length,
+  const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
+  const pending: OptimisticPrompt[] = [];
+  for (const item of rawList) {
+    if (!item || !item.content?.trim()) continue;
+    if (nowMs - item.sentAt > OPTIMISTIC_PROMPT_TTL_MS) continue;
+    const itemKey = (item.agentKey ?? "").trim().toLowerCase();
+    if (activeKey && itemKey && itemKey !== activeKey) {
+      continue;
+    }
+    if (isPromptOnDisk(turns, item.content)) {
+      continue;
+    }
+    pending.push(item);
+  }
+  if (pending.length === 0) {
+    return turns;
+  }
+  pending.sort((a, b) => a.sentAt - b.sentAt);
+  const out = [...turns];
+  for (const item of pending) {
+    if (isPromptOnDisk(out, item.content)) {
+      continue;
+    }
+    const last = out[out.length - 1];
+    out.push({
+      index: last ? last.index + 1 : out.length,
       role: "user",
-      content: optimistic.content,
+      content: item.content,
       thinking: null,
       tool_calls: [],
-      created_at: new Date(optimistic.sentAt).toISOString(),
-    },
-  ];
+      created_at: new Date(item.sentAt).toISOString(),
+    });
+  }
+  return out.length === turns.length ? turns : out;
 }
 
 /** Live transcript poll cadence: tighter while the agent works. */
@@ -615,7 +652,7 @@ export const App: React.FC<AppProps> = ({
     useState<SessionContextUsage | null>(null);
   const [sessionQuotaUsage, setSessionQuotaUsage] =
     useState<SessionQuotaUsage | null>(null);
-  const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
+  const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
   const refreshInFlightRef = useRef<boolean>(false);
   const tornDownTargetsRef = useRef<Set<string>>(new Set());
   const loggedOutRef = useRef<boolean>(false);
@@ -629,6 +666,9 @@ export const App: React.FC<AppProps> = ({
   backgroundTranscriptsRef.current = backgroundTranscripts;
   const backgroundStampRef = useRef<Record<string, string>>({});
   const [busyByAgent, setBusyByAgent] = useState<Record<string, boolean>>({});
+  const [contextUsageByAgent, setContextUsageByAgent] = useState<
+    Record<string, SessionContextUsage | null>
+  >({});
 
   const recordAgentBusy = useCallback(
     (agentKey: string | undefined | null, isBusy: boolean) => {
@@ -639,6 +679,58 @@ export const App: React.FC<AppProps> = ({
       setBusyByAgent((prev) =>
         prev[key] === isBusy ? prev : { ...prev, [key]: isBusy },
       );
+    },
+    [],
+  );
+
+  const recordAgentContextUsage = useCallback(
+    (
+      agentKey: string | undefined | null,
+      usage: SessionContextUsage | null | undefined,
+    ) => {
+      const key = (agentKey ?? "").trim().toLowerCase();
+      if (!key || usage === undefined) {
+        return;
+      }
+      setContextUsageByAgent((prev) => {
+        const existing = prev[key];
+        if (
+          existing === usage ||
+          (existing &&
+            usage &&
+            existing.used_tokens === usage.used_tokens &&
+            existing.max_tokens === usage.max_tokens)
+        ) {
+          return prev;
+        }
+        return { ...prev, [key]: usage };
+      });
+    },
+    [],
+  );
+
+  const recordOptimisticPrompt = useCallback(
+    (content: string, agentKey?: string | null, sentAt: number = Date.now()) => {
+      const trimmed = (content || "").trim();
+      if (!trimmed) return;
+      const normalizedKey = (agentKey ?? "").trim().toLowerCase();
+      const current = optimisticPromptRef.current.filter(
+        (p) => sentAt - p.sentAt <= OPTIMISTIC_PROMPT_TTL_MS,
+      );
+      const duplicate = current.some(
+        (p) =>
+          p.content.trim() === trimmed &&
+          (p.agentKey ?? "").trim().toLowerCase() === normalizedKey &&
+          Math.abs(sentAt - p.sentAt) < 3_000,
+      );
+      if (!duplicate) {
+        current.push({
+          content,
+          sentAt,
+          agentKey: normalizedKey || undefined,
+        });
+      }
+      optimisticPromptRef.current = current;
     },
     [],
   );
@@ -674,18 +766,22 @@ export const App: React.FC<AppProps> = ({
     [],
   );
 
-  /** Apply a disk transcript without wiping a just-sent optimistic turn. */
+  /** Apply a disk transcript without wiping just-sent optimistic turns. */
   const applyTranscriptTurns = useCallback((turns: TranscriptTurn[]) => {
+    const nowMs = Date.now();
+    const activeKey = selectedAgentNameRef.current;
     const merged = preserveOptimisticTurn(
       turns,
       optimisticPromptRef.current,
-      Date.now(),
-      selectedAgentNameRef.current,
+      nowMs,
+      activeKey,
     );
-    if (merged === turns && optimisticPromptRef.current) {
-      // Found on disk, aged out, or agent switched; guard has served its purpose.
-      optimisticPromptRef.current = null;
-    }
+    optimisticPromptRef.current = pruneOptimisticPrompts(
+      optimisticPromptRef.current,
+      turns,
+      nowMs,
+      activeKey,
+    );
     setTranscriptTurns(merged);
   }, []);
 
@@ -816,6 +912,9 @@ export const App: React.FC<AppProps> = ({
             backgroundStampRef.current[persona] = stamp;
             recordTranscript(persona, bgRes.turns);
           }
+          if (bgRes.context_usage !== undefined) {
+            recordAgentContextUsage(persona, bgRes.context_usage);
+          }
           const busy =
             typeof bgRes.is_busy === "boolean"
               ? bgRes.is_busy
@@ -824,7 +923,7 @@ export const App: React.FC<AppProps> = ({
         }
       }
     },
-    [apiClient, recordTranscript, recordAgentBusy],
+    [apiClient, recordTranscript, recordAgentBusy, recordAgentContextUsage],
   );
 
   // A refresh requested while one is in flight is coalesced into a single
@@ -891,6 +990,9 @@ export const App: React.FC<AppProps> = ({
             if (trRes.turns) {
               recordTranscript(targetPersona, trRes.turns);
             }
+            if (trRes.context_usage !== undefined) {
+              recordAgentContextUsage(targetPersona, trRes.context_usage);
+            }
             recordAgentBusy(
               targetPersona,
               typeof trRes.is_busy === "boolean"
@@ -935,6 +1037,7 @@ export const App: React.FC<AppProps> = ({
       scanBackgroundTranscripts,
       recordTranscript,
       recordAgentBusy,
+      recordAgentContextUsage,
     ],
   );
   refreshSessionsAndTranscriptRef.current = refreshSessionsAndTranscript;
@@ -1069,6 +1172,9 @@ export const App: React.FC<AppProps> = ({
           !tornDownTargetsRef.current.has(initialKey)
         ) {
           recordTranscript(initialAgentName, trRes.turns ?? []);
+          if (trRes.context_usage !== undefined) {
+            recordAgentContextUsage(initialAgentName, trRes.context_usage);
+          }
           recordAgentBusy(
             initialAgentName,
             typeof trRes.is_busy === "boolean"
@@ -1096,6 +1202,7 @@ export const App: React.FC<AppProps> = ({
     scanBackgroundTranscripts,
     recordTranscript,
     recordAgentBusy,
+    recordAgentContextUsage,
   ]);
 
   // Startup URL pairing check + Auth session check + initial load
@@ -1189,7 +1296,54 @@ export const App: React.FC<AppProps> = ({
     const unsubWire = wsClient.subscribe("wire", () => {
       void refreshWireAndRoster();
     });
-    const unsubSession = wsClient.subscribe("session", () => {
+    const unsubSession = wsClient.subscribe("session", (frame) => {
+      if (
+        frame?.event === "prompt_sent" &&
+        frame.data &&
+        typeof frame.data === "object"
+      ) {
+        const data = frame.data as Record<string, unknown>;
+        const rawContent = (
+          typeof data.effective_body === "string" && data.effective_body.trim()
+            ? data.effective_body
+            : typeof data.prompt === "string"
+              ? data.prompt
+              : ""
+        ).trim();
+        const rawPersona =
+          typeof data.persona === "string"
+            ? data.persona.trim().toLowerCase()
+            : "";
+        const rawSessionId =
+          typeof data.session_id === "string" ? data.session_id.trim() : "";
+        const activeKey = selectedAgentNameRef.current.trim().toLowerCase();
+        const targetAgentKey =
+          rawPersona ||
+          (rawSessionId && rawSessionId === selectedSessionIdRef.current
+            ? activeKey
+            : "");
+        if (rawContent) {
+          recordOptimisticPrompt(rawContent, targetAgentKey || activeKey);
+          if (!targetAgentKey || targetAgentKey === activeKey) {
+            setTranscriptTurns((prev) =>
+              preserveOptimisticTurn(
+                prev,
+                optimisticPromptRef.current,
+                Date.now(),
+                activeKey,
+              ),
+            );
+          }
+        }
+        if (!targetAgentKey || targetAgentKey === activeKey) {
+          if (Array.isArray(data.queue)) {
+            setSessionQueue(data.queue as QueuedOperatorPrompt[]);
+          }
+          if (typeof data.is_busy === "boolean") {
+            setIsSessionBusy(data.is_busy);
+          }
+        }
+      }
       void refreshSessionsAndTranscript();
     });
     const unsubWorkflow = wsClient.subscribe("workflow", () => {
@@ -1315,6 +1469,9 @@ export const App: React.FC<AppProps> = ({
           setSessionQueue(res.queue ?? []);
           setIsSessionBusy(Boolean(res.is_busy));
           setSessionContextUsage(res.context_usage ?? null);
+          if (res.context_usage !== undefined) {
+            recordAgentContextUsage(selectedAgent?.name_key, res.context_usage);
+          }
           setSessionQuotaUsage(res.quota_usage ?? null);
         }
       })
@@ -1330,7 +1487,7 @@ export const App: React.FC<AppProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [apiClient, activeSession?.id, selectedAgent?.name_key, authority?.tier, applyTranscriptTurns, recordTranscript]);
+  }, [apiClient, activeSession?.id, selectedAgent?.name_key, authority?.tier, applyTranscriptTurns, recordTranscript, recordAgentContextUsage]);
 
   // The hub emits no WebSocket event for raw transcript.jsonl appends, so
   // poll the active transcript while the chat is on screen.
@@ -1453,11 +1610,12 @@ export const App: React.FC<AppProps> = ({
     wsClient.disconnect();
     // Drop everything fetched under the old identity so the next principal
     // to pair on this browser never sees (or polls against) it.
-    optimisticPromptRef.current = null;
+    optimisticPromptRef.current = [];
     backgroundTranscriptsRef.current = {};
     backgroundStampRef.current = {};
     setBackgroundTranscripts({});
     setBusyByAgent({});
+    setContextUsageByAgent({});
     setTranscriptTurns([]);
     setSessionQueue([]);
     setIsSessionBusy(false);
@@ -1489,22 +1647,18 @@ export const App: React.FC<AppProps> = ({
     }
     if (!res.queued && res.status !== "queued") {
       const content = res.effective_body || payload.prompt;
-      optimisticPromptRef.current = {
-        content,
-        sentAt: Date.now(),
-        agentKey: selectedAgentName.trim().toLowerCase(),
-      };
-      setTranscriptTurns((prev) => [
-        ...prev,
-        {
-          index: prev.length,
-          role: "user",
-          content,
-          thinking: null,
-          tool_calls: [],
-          created_at: new Date().toISOString(),
-        },
-      ]);
+      const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
+        .trim()
+        .toLowerCase();
+      recordOptimisticPrompt(content, agentKey);
+      setTranscriptTurns((prev) =>
+        preserveOptimisticTurn(
+          prev,
+          optimisticPromptRef.current,
+          Date.now(),
+          selectedAgentNameRef.current,
+        ),
+      );
     }
     void refreshSessionsAndTranscript(targetId);
     return res;
@@ -1522,17 +1676,18 @@ export const App: React.FC<AppProps> = ({
     }
     const content = res.effective_body || res.prompt;
     if (content) {
-      setTranscriptTurns((prev) => [
-        ...prev,
-        {
-          index: prev.length,
-          role: "user",
-          content,
-          thinking: null,
-          tool_calls: [],
-          created_at: new Date().toISOString(),
-        },
-      ]);
+      const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
+        .trim()
+        .toLowerCase();
+      recordOptimisticPrompt(content, agentKey);
+      setTranscriptTurns((prev) =>
+        preserveOptimisticTurn(
+          prev,
+          optimisticPromptRef.current,
+          Date.now(),
+          selectedAgentNameRef.current,
+        ),
+      );
     }
     void refreshSessionsAndTranscript(targetId);
   };
@@ -1636,6 +1791,11 @@ export const App: React.FC<AppProps> = ({
           return next;
         });
         setBusyByAgent((prev) => {
+          const next = { ...prev };
+          delete next[agentKey];
+          return next;
+        });
+        setContextUsageByAgent((prev) => {
           const next = { ...prev };
           delete next[agentKey];
           return next;
@@ -1947,10 +2107,17 @@ export const App: React.FC<AppProps> = ({
           switchedAgent = true;
           selectedAgentNameRef.current = nameKey;
           selectedSessionIdRef.current = null;
-          setTranscriptTurns(backgroundTranscriptsRef.current[nextKey] ?? []);
+          setTranscriptTurns(
+            preserveOptimisticTurn(
+              backgroundTranscriptsRef.current[nextKey] ?? [],
+              optimisticPromptRef.current,
+              Date.now(),
+              nextKey,
+            ),
+          );
           setSessionQueue([]);
           setIsSessionBusy(false);
-          setSessionContextUsage(null);
+          setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
           setSessionQuotaUsage(null);
         }
         setSelectedAgentName(nameKey);
@@ -1959,12 +2126,13 @@ export const App: React.FC<AppProps> = ({
       if (!splitView && activeTab !== "chat") {
         setActiveTab("chat");
       }
+      setMobileRosterOpen(false);
       setAgentSettingsOpen(true);
       if (switchedAgent) {
         void refreshSessionsAndTranscript();
       }
     },
-    [splitView, activeTab, refreshSessionsAndTranscript],
+    [splitView, activeTab, refreshSessionsAndTranscript, contextUsageByAgent],
   );
 
   const effectiveBusyByAgent = useMemo<Record<string, boolean>>(() => {
@@ -1979,6 +2147,26 @@ export const App: React.FC<AppProps> = ({
     }
     return { ...busyByAgent, [selectedKey]: true };
   }, [busyByAgent, isSessionBusy, selectedAgent?.name_key, selectedAgentName]);
+
+  const effectiveContextUsageByAgent = useMemo<
+    Record<string, SessionContextUsage | null>
+  >(() => {
+    const selectedKey = (selectedAgent?.name_key ?? selectedAgentName)
+      .trim()
+      .toLowerCase();
+    if (!selectedKey || !sessionContextUsage) {
+      return contextUsageByAgent;
+    }
+    if (contextUsageByAgent[selectedKey] === sessionContextUsage) {
+      return contextUsageByAgent;
+    }
+    return { ...contextUsageByAgent, [selectedKey]: sessionContextUsage };
+  }, [
+    contextUsageByAgent,
+    sessionContextUsage,
+    selectedAgent?.name_key,
+    selectedAgentName,
+  ]);
 
   const handleToggleSplitView = useCallback(() => {
     setSplitView((prev) => {
@@ -2030,10 +2218,12 @@ export const App: React.FC<AppProps> = ({
       <RosterSidebar
         agents={agents}
         routes={mergedRoutes}
+        sessions={sessions}
         liveness={liveness}
         unreadByAgent={unreadByAgent}
         unreadSeverityByAgent={unreadSeverityByAgent}
         busyByAgent={effectiveBusyByAgent}
+        contextUsageByAgent={effectiveContextUsageByAgent}
         transcriptsByAgent={transcriptsByAgent}
         selectedAgentName={selectedAgent?.name_key ?? null}
         onSelectAgent={(nameKey) => {
@@ -2041,10 +2231,17 @@ export const App: React.FC<AppProps> = ({
           if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
             selectedAgentNameRef.current = nameKey;
             selectedSessionIdRef.current = null;
-            setTranscriptTurns(backgroundTranscriptsRef.current[nextKey] ?? []);
+            setTranscriptTurns(
+              preserveOptimisticTurn(
+                backgroundTranscriptsRef.current[nextKey] ?? [],
+                optimisticPromptRef.current,
+                Date.now(),
+                nextKey,
+              ),
+            );
             setSessionQueue([]);
             setIsSessionBusy(false);
-            setSessionContextUsage(null);
+            setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
             setSessionQuotaUsage(null);
           }
           setSelectedAgentName(nameKey);
