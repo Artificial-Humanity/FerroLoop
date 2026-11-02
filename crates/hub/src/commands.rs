@@ -36,7 +36,11 @@ pub const HOME_SKILLS_DIRS: [&str; 4] = [
     ".gemini/config/skills",
 ];
 /// Most directory entries examined per scan, so a huge directory cannot stall the request.
+/// The first this many names in sorted order are examined.
 const MAX_DIR_ENTRIES_SCANNED: usize = 1000;
+/// Most names read from a directory before sorting, so memory stays bounded. A directory with
+/// more entries than this is cut in filesystem order before the sort.
+const MAX_DIR_NAMES_READ: usize = 10_000;
 /// Most bytes read from one `SKILL.md` or flow file.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_NAME_CHARS: usize = 64;
@@ -199,10 +203,22 @@ pub fn list_commands_with_home(root: &Path, home: Option<&Path>) -> Vec<CommandE
     all
 }
 
-/// Canonical paths of the entries of `dir` in name order. An entry that is a symlink leaving
-/// `dir` and every root in `trusted` is dropped, and so is a second entry that resolves to an
-/// already listed path.
+/// Canonical paths of the entries of `dir` in name order, at most [`MAX_DIR_ENTRIES_SCANNED`]
+/// examined. An entry that is a symlink leaving `dir` and every root in `trusted` is dropped,
+/// and so is a second entry that resolves to an already listed path.
 fn contained_entries(dir: &Path, trusted: &[PathBuf]) -> Vec<PathBuf> {
+    contained_entries_capped(dir, trusted, MAX_DIR_ENTRIES_SCANNED, MAX_DIR_NAMES_READ)
+}
+
+/// [`contained_entries`] with explicit bounds: up to `read_bound` names are read, sorted, and
+/// the first `cap` are examined. The cap applies after the sort, so a directory of up to
+/// `read_bound` entries yields the same entries on every run.
+fn contained_entries_capped(
+    dir: &Path,
+    trusted: &[PathBuf],
+    cap: usize,
+    read_bound: usize,
+) -> Vec<PathBuf> {
     let Ok(root) = fs::canonicalize(dir) else {
         return Vec::new();
     };
@@ -214,10 +230,11 @@ fn contained_entries(dir: &Path, trusted: &[PathBuf]) -> Vec<PathBuf> {
     };
     let mut paths: Vec<PathBuf> = read
         .filter_map(Result::ok)
-        .take(MAX_DIR_ENTRIES_SCANNED)
+        .take(read_bound)
         .map(|e| e.path())
         .collect();
     paths.sort();
+    paths.truncate(cap);
     let mut seen = Vec::new();
     for canonical in paths.into_iter().filter_map(|p| fs::canonicalize(p).ok()) {
         let allowed =
@@ -342,7 +359,12 @@ pub fn discover_skills(dir: &Path) -> Vec<CommandEntry> {
 /// Append the skills under `dir` to `out`. A skill whose canonical dir is in `seen`, or whose
 /// name `out` already lists, is skipped; this makes the first dir that lists a skill win and
 /// collapses symlinked copies. Stops at [`MAX_ENTRIES_PER_KIND`] additions from this dir or
-/// when `out` holds [`MAX_TOTAL_SKILLS`]. A `SKILL.md` must lie inside its skill dir or `dir`.
+/// when `out` holds [`MAX_TOTAL_SKILLS`].
+///
+/// A skill dir may be a link into any trusted root, but a `SKILL.md` that is itself a symlink
+/// is accepted only when it resolves inside its own skill dir or inside the scanned `dir`.
+/// That is stricter than the rule for the skill dir, and it fails closed: a `SKILL.md` link
+/// into another trusted root is skipped.
 fn scan_skills(
     dir: &Path,
     trusted: &[PathBuf],
@@ -918,16 +940,31 @@ mod tests {
             l.home.join(".claude/skills/evil"),
         )
         .unwrap();
-        // A `..` path that leaves both roots.
+        // A `..` path that leaves both roots. It climbs one `..` per component of the link's
+        // parent, so it lands at the real `evil` dir, not on a dangling path.
         let dots = l.home.join(".codex/skills/dots");
+        let ups = dots.parent().unwrap().components().count() - 1;
+        let mut rel = PathBuf::new();
+        for _ in 0..ups {
+            rel.push("..");
+        }
         symlink(
-            Path::new("../../../../")
-                .join(outside.path().strip_prefix("/").unwrap())
+            rel.join(outside.path().strip_prefix("/").unwrap())
                 .join("evil"),
             &dots,
         )
         .unwrap();
-        // A SKILL.md link out of a skill dir, and a link to a dir without SKILL.md.
+        // Sanity: each escape resolves to a real, valid skill outside both trusted roots, so
+        // only containment can reject it.
+        let real_evil = fs::canonicalize(outside.path().join("evil")).unwrap();
+        assert!(real_evil.join("SKILL.md").is_file());
+        assert_eq!(fs::canonicalize(&dots).unwrap(), real_evil);
+        assert_eq!(
+            discover_skills(outside.path()),
+            vec![entry("evil", "skill", "escaped")]
+        );
+        // A SKILL.md link out of its skill dir (a containment case), and a skill dir without a
+        // SKILL.md (skipped for that reason, not containment).
         fs::create_dir_all(l.home.join(".claude/skills/linkmd")).unwrap();
         symlink(
             outside.path().join("evil/SKILL.md"),
@@ -935,7 +972,7 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(l.home.join(".claude/skills/nomd")).unwrap();
-        // A loop, and a dangling link.
+        // Skipped for other reasons, not containment: a loop and a dangling link do not resolve.
         symlink(
             l.home.join(".claude/skills/loop-b"),
             l.home.join(".claude/skills/loop-a"),
@@ -951,7 +988,8 @@ mod tests {
             l.home.join(".claude/skills/dangling"),
         )
         .unwrap();
-        // A link to the filesystem root's /etc.
+        // A link to /etc: outside the roots, but it holds no SKILL.md, so it would be skipped
+        // anyway. It adds nothing beyond the `evil` cases above for containment.
         symlink("/etc", l.home.join(".claude/skills/etc")).unwrap();
 
         let all = list_commands_with_home(&l.root, Some(&l.home));
@@ -961,6 +999,65 @@ mod tests {
         // The escape also fails when the link is the only route to the skill.
         let alone = discover_skills(&l.home.join(".claude/skills"));
         assert!(alone.iter().all(|e| e.name != "evil"));
+    }
+
+    #[test]
+    fn a_sibling_directory_sharing_a_root_name_prefix_is_not_trusted() {
+        use std::os::unix::fs::symlink;
+        let l = layout();
+        // `<tmp>/home2` starts with the string `<tmp>/home` but is not inside it.
+        let tmp = l.home.parent().unwrap();
+        skill(&tmp.join("home2/skill"), "sibling", "next door");
+        skill(&l.home.join("real/skill"), "inhome", "inside the home");
+        let skills_dir = l.ws.join(".agents/skills");
+        symlink(tmp.join("home2/skill"), skills_dir.join("sibling")).unwrap();
+        symlink(l.home.join("real/skill"), skills_dir.join("inhome")).unwrap();
+        // Sanity: both targets are real, valid skills and neither is under the workspace.
+        for target in [tmp.join("home2/skill"), l.home.join("real/skill")] {
+            assert!(target.join("SKILL.md").is_file());
+            assert!(!target.starts_with(&l.ws));
+        }
+        assert!(
+            tmp.join("home2")
+                .to_string_lossy()
+                .starts_with(&*l.home.to_string_lossy())
+        );
+
+        let all = list_commands_with_home(&l.root, Some(&l.home));
+        let names = skill_names(&all);
+        assert!(names.contains(&"inhome"), "{names:?}");
+        assert!(!names.contains(&"sibling"), "{names:?}");
+    }
+
+    #[test]
+    fn a_directory_over_the_cap_lists_its_first_names_in_sorted_order() {
+        let tmp = TempDir::new().unwrap();
+        // One directory is filled in ascending name order and one in descending order, so a
+        // filesystem that lists by creation order (either way) cuts one of them wrongly.
+        let names: Vec<String> = (0..30).map(|i| format!("e{i:02}")).collect();
+        for (dir, order) in [
+            ("up", names.clone()),
+            ("down", {
+                let mut rev = names.clone();
+                rev.reverse();
+                rev
+            }),
+        ] {
+            for name in order {
+                write(&tmp.path().join(dir).join(&name), "x");
+            }
+            let listed = contained_entries_capped(&tmp.path().join(dir), &[], 5, 100);
+            let got: Vec<_> = listed
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, names[..5], "{dir}");
+        }
+        // Without a cap in play, every entry is listed.
+        assert_eq!(
+            contained_entries_capped(&tmp.path().join("up"), &[], 100, 100).len(),
+            30
+        );
     }
 
     #[test]
