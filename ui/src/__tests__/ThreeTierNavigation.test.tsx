@@ -206,14 +206,20 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(scopeBadge).toHaveAttribute("data-tier", "agent");
     expect(scopeBadge).toHaveTextContent("Scope: Agent · Ferris");
     expect(screen.queryByTestId("chat-artifacts-toggle-btn")).toBeNull();
-    const chatPane = screen.getByTestId("chat-pane");
-    const splitToggleBtn = within(chatPane).getByTestId("split-view-toggle");
+    const tabBar = screen.getByTestId("cockpit-tab-bar");
+    const rosterToggleBtn = within(tabBar).getByTestId("mobile-sidebar-toggle-btn");
+    const agentNav = within(tabBar).getByTestId("tier-agent-nav");
+    const splitToggleBtn = within(tabBar).getByTestId("split-view-toggle");
+    expect(rosterToggleBtn.nextElementSibling).toBe(agentNav);
     expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
-    const rosterToggleBtn = within(chatPane).getByTestId("mobile-sidebar-toggle-btn");
+
+    const chatPane = screen.getByTestId("chat-pane");
+    expect(within(chatPane).queryByTestId("mobile-sidebar-toggle-btn")).toBeNull();
+    expect(within(chatPane).queryByTestId("split-view-toggle")).toBeNull();
     const filterInput = within(chatPane).getByPlaceholderText(
       /Filter transcript turns, tools, or reasoning/i,
     );
-    expect(rosterToggleBtn.nextElementSibling).toBe(filterInput);
+    expect(filterInput.style.fontSize).toBe("16px");
 
     // Open right split panel via split-view-toggle -> mounts right-panel-header
     fireEvent.click(splitToggleBtn);
@@ -269,7 +275,6 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     );
 
     // Switch to Hub & Arch (System tier) -> opens right split panel on Hub & Arch
-    const tabBar = screen.getByTestId("cockpit-tab-bar");
     fireEvent.click(within(tabBar).getByRole("tab", { name: /^Hub & Arch$/i }));
     expect(screen.getByTestId("active-context-tier-badge")).toHaveAttribute(
       "data-tier",

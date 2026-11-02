@@ -449,6 +449,48 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           {scopeBannerText}
         </span>
 
+        {onOpenMobileRoster && (
+          <button
+            type="button"
+            className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
+            onClick={onOpenMobileRoster}
+            aria-label="Toggle Agent Roster"
+            title="Toggle Agent Roster"
+            aria-expanded={mobileSidebarOpen}
+            data-testid="mobile-sidebar-toggle-btn"
+            style={{ flexShrink: 0 }}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect
+                x="1.5"
+                y="2.5"
+                width="13"
+                height="11"
+                rx="2"
+                stroke="currentColor"
+                strokeWidth="1.4"
+              />
+              <line
+                x1="6.5"
+                y1="2.5"
+                x2="6.5"
+                y2="13.5"
+                stroke="currentColor"
+                strokeWidth="1.4"
+              />
+              <rect
+                x="2.2"
+                y="3.2"
+                width="3.6"
+                height="9.6"
+                rx="0.8"
+                fill="currentColor"
+                fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
+              />
+            </svg>
+          </button>
+        )}
+
         {/* Tier 1: Agent Context */}
         <div
           className={`fd-tier-group fd-tier-agent${activeTier === "agent" || activeTier === "project" ? " is-active-tier" : ""}`}
@@ -540,7 +582,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           data-active-tier={activeTier === "system" ? "true" : undefined}
           style={
             activeTier === "system"
-              ? { marginLeft: "auto", position: "relative" }
+              ? { position: "relative" }
               : {
                   position: "absolute",
                   width: "1px",
@@ -632,6 +674,46 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             </span>
           )}
         </div>
+
+        <button
+          type="button"
+          data-testid="split-view-toggle"
+          className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+          onClick={() => onToggleSplitView?.()}
+          title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+          aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+          aria-pressed={splitView}
+          style={{ marginLeft: "auto", flexShrink: 0 }}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect
+              x="1.5"
+              y="2.5"
+              width="13"
+              height="11"
+              rx="2"
+              stroke="currentColor"
+              strokeWidth="1.4"
+            />
+            <line
+              x1="9.5"
+              y1="2.5"
+              x2="9.5"
+              y2="13.5"
+              stroke="currentColor"
+              strokeWidth="1.4"
+            />
+            <rect
+              x="10.2"
+              y="3.2"
+              width="3.6"
+              height="9.6"
+              rx="0.8"
+              fill="currentColor"
+              fillOpacity={splitView ? 0.45 : 0.12}
+            />
+          </svg>
+        </button>
       </div>
     </header>
   );

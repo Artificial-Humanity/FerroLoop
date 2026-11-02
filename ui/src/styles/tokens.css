@@ -275,6 +275,10 @@ body,
   outline: none;
 }
 
+.fd-transcript-filter-input {
+  font-size: 16px;
+}
+
 .fd-input:focus,
 .fd-select:focus,
 .fd-textarea:focus {

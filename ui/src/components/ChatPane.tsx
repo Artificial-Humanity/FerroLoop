@@ -924,10 +924,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   agentSettingsOpen,
   onOpenAgentSettings,
   onCloseAgentSettings,
-  splitView = false,
-  onToggleSplitView,
-  onOpenMobileRoster,
-  mobileSidebarOpen = false,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -2114,47 +2110,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             minWidth: 0,
           }}
         >
-          {onOpenMobileRoster && (
-            <button
-              type="button"
-              className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
-              onClick={onOpenMobileRoster}
-              aria-label="Toggle Agent Roster"
-              title="Toggle Agent Roster"
-              aria-expanded={mobileSidebarOpen}
-              data-testid="mobile-sidebar-toggle-btn"
-              style={{ flexShrink: 0 }}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <rect
-                  x="1.5"
-                  y="2.5"
-                  width="13"
-                  height="11"
-                  rx="2"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                />
-                <line
-                  x1="6.5"
-                  y1="2.5"
-                  x2="6.5"
-                  y2="13.5"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                />
-                <rect
-                  x="2.2"
-                  y="3.2"
-                  width="3.6"
-                  height="9.6"
-                  rx="0.8"
-                  fill="currentColor"
-                  fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
-                />
-              </svg>
-            </button>
-          )}
           <input
             type="search"
             name="fd-transcript-filter"
@@ -2170,7 +2125,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             aria-label="Filter transcript"
             value={filterQuery}
             onChange={(e) => setFilterQuery(e.target.value)}
-            style={{ width: "100%", maxWidth: "320px", fontSize: "12px", padding: "5px 9px" }}
+            style={{ width: "100%", maxWidth: "420px", fontSize: "16px", padding: "5px 9px" }}
           />
           <span
             className="fd-badge"
@@ -2287,21 +2242,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             title="Scroll to latest turn"
           >
             ↓ Latest
-          </button>
-          <button
-            type="button"
-            data-testid="split-view-toggle"
-            className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
-            onClick={() => onToggleSplitView?.()}
-            title="Toggle Desktop Split-View (Chat + Secondary Pane)"
-            aria-label={splitView ? "Close right split panel" : "Open right split panel"}
-            aria-pressed={splitView}
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
-              <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
-              <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
-            </svg>
           </button>
         </div>
       </div>
