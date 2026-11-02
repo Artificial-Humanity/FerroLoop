@@ -27,14 +27,21 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    * A pull request co-authored by an assisting agent is reviewed by the project Lead.
    * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
      The Lab Manager may also approve a Lead-tier pull request.
-   * The owner reviews a pull request that touches a protected path (the
+   * `fl` puts a pull request in the Owner tier when it touches a protected path (the
      `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
-     instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
-     without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has a
-     co-author who is not registered as an active agent.
+     `.github/**`, `.agents/**`, `.fl/manifest.json`; `fl` adds no other patterns), carries
+     a commit without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has
+     a co-author who is not registered as an active agent.
      [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
-     also requests the owner's review for the protected-path, missing-trailer and Lab
-     Manager co-author cases; it cannot see the agent registry.
+     requests the owner's review, and assigns the pull request to the owner, for those
+     paths and also for the instruction files `AGENTS.md`, `CLAUDE.md`, `WORKFLOW.md`,
+     `PERSONA.md` and `CONTRIBUTING.md` at any depth, and for the missing-trailer and Lab
+     Manager co-author cases; it cannot see the agent registry. So a pull request that
+     touches an instruction file gets the owner's review request even when
+     `fl github pr create` reports a lower tier, and it needs the owner's approval. The
+     workflow only requests the review: it adds no label and fails no check, and
+     `gh pr merge` does not check the tier, so the author waits for the owner's approval
+     before merging.
 5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
    by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
    machine account cannot approve a pull request it opened. The command needs the App's
