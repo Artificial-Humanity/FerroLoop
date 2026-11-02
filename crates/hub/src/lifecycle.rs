@@ -161,6 +161,12 @@ impl<'a> LifecycleEnv<'a> {
 
 /// Whether an API vendor's key is provisioned on this host. Only the presence is asked: no
 /// implementation returns, logs or decrypts a key value.
+///
+/// "Provisioned" means PRESENT and UNEXPIRED in the Hub process's own environment or Vault. It
+/// does not mean the key may be used: a Vault secret's policy (`allowed_agents`, `allowed_hosts`,
+/// `allowed_methods`) is checked when the executing process (agent `fl-exec`, the request's host
+/// and method) tries to use it, not here. The Hub's environment is what is checked: a key set
+/// only in the agent's own environment, or in another user's Vault, does not count.
 pub trait ApiKeyProbe: std::fmt::Debug {
     /// `true` when the environment variable `env_key_name` is set to a non-blank value, or the
     /// Vault holds a usable secret named `vault_secret_name`.
@@ -172,8 +178,15 @@ pub trait ApiKeyProbe: std::fmt::Debug {
     ) -> bool;
 }
 
-/// The real probe: the process environment, and the Vault's metadata (never its values, and no
-/// master key is read or created).
+/// Whether an environment variable's value counts as a key: set and not blank.
+fn env_value_present(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The real probe: the Hub process's environment, and the Vault's metadata (never its values, and
+/// no master key is read or created). A Vault secret is ready when it exists and has not expired;
+/// its `allowed_agents`, `allowed_hosts` and `allowed_methods` are NOT consulted (they are
+/// checked, for the executing agent, host and method, when the key is used).
 #[derive(Debug, Clone, Copy)]
 pub struct HostKeyProbe;
 
@@ -185,7 +198,7 @@ impl ApiKeyProbe for HostKeyProbe {
         vault_secret_name: Option<&str>,
     ) -> bool {
         if let Some(name) = env_key_name
-            && std::env::var_os(name).is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+            && env_value_present(std::env::var_os(name).as_deref().and_then(|v| v.to_str()))
         {
             return true;
         }
@@ -201,9 +214,25 @@ impl ApiKeyProbe for HostKeyProbe {
     }
 }
 
+/// The key probe of a remodel's restore: every key counts as provisioned. The restore puts back
+/// the session that was running, and refusing it over a key that has vanished since would leave
+/// the persona down; a session on a missing key fails at its first attempt instead.
+#[derive(Debug, Clone, Copy)]
+struct RestoreKeys;
+
+impl ApiKeyProbe for RestoreKeys {
+    fn key_provisioned(&self, _: Option<&Path>, _: Option<&str>, _: Option<&str>) -> bool {
+        true
+    }
+}
+
 /// Refuse (409) a spin-up on an API vendor whose key is not provisioned, naming the vendor, the
 /// environment variable and the Vault secret. A vendor that needs no key (a local engine), and a
 /// vendor with a CLI, pass. Runs before a spin-up's first side effect.
+///
+/// The 409 text says the key is not "provisioned": present and unexpired in the Hub's own
+/// environment or Vault. A key that is provisioned can still be refused at attempt time by its
+/// policy for the executing process (see [`ApiKeyProbe`]); this check does not predict that.
 fn check_api_key(env: &LifecycleEnv<'_>, vendor: &str) -> Result<(), LifecycleError> {
     let Some(VendorDescriptor {
         transport:
@@ -461,6 +490,63 @@ fn check_persona_fits_slug(vendor: &str, persona: &str) -> Result<(), LifecycleE
             ),
         ));
     }
+    if let Some(other) = colliding_session_id(vendor, persona, &spin_up_vendor_ids()) {
+        return Err(LifecycleError::Invalid(format!(
+            "session `{vendor}:{persona}` would share its hosted-session state slug `{}` with \
+             session `{other}`: choose another persona (every persona collides when this vendor's \
+             id extends another vendor's id), or rename one of the vendors",
+            hosted_session_slug(&format!("{vendor}:{persona}"))
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `persona` is a name a session can have (the rules [`SpinUpRequest::validate`] applies).
+fn is_valid_persona(persona: &str) -> bool {
+    !persona.is_empty()
+        && persona.len() <= MAX_PERSONA_LEN
+        && persona.as_bytes()[0].is_ascii_lowercase()
+        && persona
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !fl_wire::dispatcher::is_owner_sender(persona)
+}
+
+/// Another session id `o:p` whose hosted-session slug equals the slug of `vendor:persona`, over
+/// the vendor ids `vendor_ids`. The slug turns `:` into `-`, so `x:y-ada` and `x-y:ada` share
+/// `hosted-session-x-y-ada` when both `x` and `x-y` are vendors; the second would overwrite the
+/// first one's record. `None` when the slug is the session id's alone.
+fn colliding_session_id(vendor: &str, persona: &str, vendor_ids: &[String]) -> Option<String> {
+    let tail = format!("{vendor}-{persona}");
+    vendor_ids
+        .iter()
+        .filter(|o| o.as_str() != vendor)
+        .find_map(|o| {
+            let rest = tail.strip_prefix(o.as_str())?.strip_prefix('-')?;
+            is_valid_persona(rest).then(|| format!("{o}:{rest}"))
+        })
+}
+
+/// Refuse (409) a hosted session whose state slug already holds the record of a DIFFERENT
+/// session id, before anything is written. Two ids can share a slug only through a hyphenated
+/// vendor id (see [`colliding_session_id`]); the second write would replace the first's record.
+fn check_slug_free<S: StateStore>(store: &S, session_id: &str) -> Result<(), LifecycleError> {
+    let slug = hosted_session_slug(session_id);
+    let Some(entry) =
+        store.get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?
+    else {
+        return Ok(());
+    };
+    if let StatePayload::Runtime(rt) = entry.payload
+        && let Ok(stored) = serde_json::from_value::<HostedSessionRecord>(rt.value)
+        && stored.session_id != session_id
+    {
+        return Err(LifecycleError::Conflict(format!(
+            "session `{session_id}` would overwrite the hosted record of session `{}`: both use \
+             the state slug `{slug}`",
+            stored.session_id
+        )));
+    }
     Ok(())
 }
 
@@ -598,6 +684,8 @@ pub fn persist_hosted_session<S: StateStore>(
     by: &str,
 ) -> Result<(), LifecycleError> {
     let value = serde_json::to_value(record).map_err(|e| LifecycleError::Store(e.to_string()))?;
+    // Never replace another session's record (see `check_slug_free`).
+    check_slug_free(store, &record.session_id)?;
     store.upsert_state(UpsertStateArgs {
         scope: StateScope::Workspace,
         slug: hosted_session_slug(&record.session_id),
@@ -1226,6 +1314,8 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     // An HTTP API vendor has no CLI to host, so no tmux window is ever opened for it.
     let has_runtime = vendor_has_runtime(&v.vendor);
     let session_id = format!("{}:{}", v.vendor, v.persona);
+    // Before the agent is registered: another session's record may hold this session's slug.
+    check_slug_free(store, &session_id)?;
     // The unfiltered record carries `created_at_ms`, `restart_count` and `runtime_spawned` over;
     // the gate below looks only at whether it is LIVE.
     let previous =
@@ -1991,6 +2081,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
     // Before the teardown: a remodel onto an API vendor with no key would retire the old
     // session for nothing.
     check_api_key(env, &to.vendor)?;
+    check_slug_free(store, &format!("{}:{}", to.vendor, to.persona))?;
     check_runtime_cwd(&to)?;
     check_registration(store, &to, OwnAgent::Retiring)?;
     // The restore puts back what was there: a session with no record was not hosted, and a
@@ -2356,8 +2447,14 @@ fn remodel_with<S: AgentRegistry + StateStore>(
     // The persona may now be down and retired: put the old session back. The restore spins up
     // exactly what the caller was allowed to tear down, nothing the request chose, so it runs
     // with Owner authority: a half-registered new session must not lock its own restore out.
+    // The key check is skipped (see [`RestoreKeys`]): the restore must not fail on a key that
+    // vanished since the session first ran, which would leave the persona down for nothing.
+    let restore_env = LifecycleEnv {
+        key_probe: &RestoreKeys,
+        ..*env
+    };
     let restored = match &plan.restore {
-        Some(restore) => spin(store, env, restore, by, Caller::Owner)
+        Some(restore) => spin(store, &restore_env, restore, by, Caller::Owner)
             .and_then(|out| require_runtime(env, out))
             .map(|out| out.session_id)
             .map_err(|e| e.to_string()),
@@ -3693,24 +3790,108 @@ mod tests {
 
     #[test]
     fn hosted_session_slugs_stay_one_to_one_with_session_ids() {
-        // The slug turns `:` into `-`, so `a:b-c` and `a-b:c` would share one record if a vendor
-        // name could hold a `-`. Vendors are fixed, so this holds only while none does.
-        for vendor in SPIN_UP_VENDORS {
-            assert!(
-                !vendor.contains(['-', ':']),
-                "vendor `{vendor}` would let two session ids share one hosted-session record"
-            );
-        }
+        // The slug turns `:` into `-`, so `x:y-ada` and `x-y:ada` share one record when both `x`
+        // and `x-y` are vendors. Built-ins have no such pair; a plugin vendor can. Register one
+        // (ids of this test's own: the vendor registry is process-wide and tests run in parallel).
+        let x = vendor_registry_tests::custom_cli("fl-slugpair");
+        let xy = vendor_registry_tests::custom_cli("fl-slugpair-y");
+        let collide = |vendor: &str, persona: &str| {
+            SpinUpRequest {
+                persona: persona.into(),
+                project: "FerroLoop".into(),
+                role: "assistant".into(),
+                vendor: vendor.into(),
+                ..SpinUpRequest::default()
+            }
+            .validate()
+        };
+        // Every vendor in the registry, with personas that read like the rest of an id: no two
+        // ACCEPTED session ids may share a slug.
         let mut seen = std::collections::BTreeMap::new();
-        for vendor in SPIN_UP_VENDORS {
-            for persona in ["a", "a-b", "claude-a", "codex-a-b", "x1"] {
-                let id = format!("{vendor}:{persona}");
+        let personas = [
+            "a",
+            "a-b",
+            "claude-a",
+            "codex-a-b",
+            "x1",
+            "y-ada",
+            "ada",
+            "code-a",
+            "api-a",
+            "slugpair-y-ada",
+        ];
+        for vendor in spin_up_vendor_ids() {
+            for persona in personas {
+                let Ok(v) = collide(&vendor, persona) else {
+                    continue;
+                };
+                let id = format!("{}:{}", v.vendor, v.persona);
                 let slug = hosted_session_slug(&id);
                 if let Some(other) = seen.insert(slug.clone(), id.clone()) {
                     panic!("`{id}` and `{other}` share the slug `{slug}`");
                 }
             }
         }
+        // The pair: each colliding spin-up is refused, naming the other session.
+        for (vendor, persona, other) in [
+            (&x, "y-ada", format!("{xy}:ada")),
+            (&xy, "ada", format!("{x}:y-ada")),
+        ] {
+            let LifecycleError::Invalid(message) = collide(vendor, persona).unwrap_err() else {
+                panic!("{vendor}:{persona} must be Invalid");
+            };
+            assert!(message.contains(&format!("`{other}`")), "{message}");
+            assert!(message.contains("state slug"), "{message}");
+        }
+        // Every persona on the longer id `x-y` shares a slug with `x:y-<persona>`, so that vendor
+        // hosts nothing while `x` is registered.
+        let LifecycleError::Invalid(message) = collide(&xy, "bob").unwrap_err() else {
+            panic!("{xy}:bob must be Invalid");
+        };
+        assert!(message.contains(&format!("`{x}:y-bob`")), "{message}");
+        // A persona that does not collide still works on the shorter vendor, through a real
+        // spin-up.
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        for (vendor, persona) in [(&x, "z-ada"), (&x, "y"), (&x, "ada")] {
+            let out = spin_up(
+                &store,
+                &env,
+                &req(persona, "assistant", vendor),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap_or_else(|e| panic!("{vendor}:{persona}: {e}"));
+            assert_eq!(out.session_id, format!("{vendor}:{persona}"));
+        }
+        // The refused spin-up registered nothing.
+        let err = spin_up(
+            &store,
+            &env,
+            &req("y-ada", "assistant", &x),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 400, "{err:?}");
+        assert!(store.agent_by_name("y-ada").unwrap().is_none());
+        // The pure check: the persona rules apply to the remainder, and an unrelated vendor
+        // never collides.
+        let ids = |l: &[&str]| l.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            colliding_session_id("x", "y-ada", &ids(&["x", "x-y"])).as_deref(),
+            Some("x-y:ada")
+        );
+        assert_eq!(
+            colliding_session_id("x-y", "ada", &ids(&["x", "x-y"])).as_deref(),
+            Some("x:y-ada")
+        );
+        // The remainder `9-a` is not a persona (starts with a digit); `xa` is another id; a
+        // vendor id that is the whole tail leaves no persona.
+        assert_eq!(colliding_session_id("x-9", "a", &ids(&["x", "x-9"])), None);
+        assert_eq!(colliding_session_id("x", "a", &ids(&["x", "xa"])), None);
+        assert_eq!(colliding_session_id("x", "y", &ids(&["x", "x-y"])), None);
     }
 
     // ---- audit 2026-10-30 regressions ----

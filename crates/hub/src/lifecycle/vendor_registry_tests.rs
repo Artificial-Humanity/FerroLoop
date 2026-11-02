@@ -29,7 +29,7 @@ fn custom_http(id: &str, env_key: Option<&str>, vault_secret: Option<&str>) -> S
     id.to_string()
 }
 
-fn custom_cli(id: &str) -> String {
+pub(super) fn custom_cli(id: &str) -> String {
     ensure_vendor_registered(VendorDescriptor {
         id: id.to_string(),
         display_name: format!("Custom {id}"),
@@ -624,4 +624,172 @@ fn the_host_probe_reads_vault_metadata_and_a_missing_vault_is_not_a_key() {
     assert!(probe.key_provisioned(Some(home.path()), None, Some("hubreg_vault_key")));
     assert!(!probe.key_provisioned(Some(home.path()), Some(unset), Some("HUBREG_OTHER_KEY")));
     assert!(!probe.key_provisioned(Some(home.path()), None, None));
+}
+
+#[test]
+fn env_values_count_as_a_key_only_when_not_blank() {
+    assert!(env_value_present(Some("sk-abc")));
+    assert!(env_value_present(Some(" sk-abc ")));
+    for blank in [None, Some(""), Some("   "), Some("\t\n")] {
+        assert!(!env_value_present(blank), "{blank:?}");
+    }
+}
+
+#[test]
+fn the_host_probe_does_not_count_an_expired_vault_secret() {
+    use fl_gate::{MASTER_KEY_LEN, SetSecretArgs, Vault, resolve_vault_path};
+    let home = TempDir::new().unwrap();
+    let mut vault =
+        Vault::open(resolve_vault_path(Some(home.path())), [7u8; MASTER_KEY_LEN]).unwrap();
+    for (name, ttl) in [
+        ("HUBREG_EXPIRED_KEY", Some(0)),
+        ("HUBREG_LEASED_KEY", Some(3_600)),
+    ] {
+        vault
+            .set(SetSecretArgs {
+                name: name.into(),
+                value: "not-a-real-key".into(),
+                description: None,
+                allowed_hosts: Vec::new(),
+                allowed_methods: Vec::new(),
+                allowed_agents: Vec::new(),
+                allow_private_network: false,
+                lease_ttl_secs: ttl,
+            })
+            .unwrap();
+    }
+    // A zero-second lease expires the moment the clock ticks past it.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let probe = HostKeyProbe;
+    let unset = "FL_HUBREG_NEVER_SET_API_KEY_9F3B";
+    assert!(!probe.key_provisioned(Some(home.path()), Some(unset), Some("HUBREG_EXPIRED_KEY")));
+    // An unexpired lease, and a secret that never expires, still count.
+    assert!(probe.key_provisioned(Some(home.path()), Some(unset), Some("HUBREG_LEASED_KEY")));
+}
+
+// --------------------------------------------------------- slug sharing (hyphenated ids)
+
+fn stored_record(session_id: &str) -> HostedSessionRecord {
+    let (vendor, persona) = session_id.split_once(':').unwrap();
+    HostedSessionRecord {
+        session_id: session_id.into(),
+        persona: persona.into(),
+        project: "FerroLoop".into(),
+        role: "assistant".into(),
+        vendor: vendor.into(),
+        model: None,
+        node_id: DEFAULT_NODE_ID.into(),
+        hosted: true,
+        status: STATUS_RUNNING.into(),
+        restart_policy: "on-failure".into(),
+        restart_count: 0,
+        tmux_target: None,
+        cwd: None,
+        hydration_dispatched: false,
+        runtime_spawned: false,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        decommission_prepared_at_ms: None,
+    }
+}
+
+#[test]
+fn a_stored_record_of_another_session_id_on_the_same_slug_is_never_overwritten() {
+    // `ghost` is not a registered vendor (a legacy record), so only the stored record can
+    // reveal that `ghost-y:ada` shares the slug of `ghost:y-ada`.
+    let ghost_y = custom_cli("hubreg-ghost-y");
+    let legacy = "hubreg-ghost:y-ada";
+    assert_eq!(
+        hosted_session_slug(legacy),
+        hosted_session_slug(&format!("{ghost_y}:ada"))
+    );
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    persist_hosted_session(&store, &stored_record(legacy), "owner").unwrap();
+    let before = list_hosted_sessions(&store).unwrap();
+
+    // The persistence itself refuses.
+    let err = persist_hosted_session(&store, &stored_record(&format!("{ghost_y}:ada")), "owner")
+        .unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+    assert!(err.to_string().contains(legacy), "{err}");
+
+    // A spin-up refuses before it registers the agent or touches the runtime.
+    let err = spin(&store, &env, "ada", &ghost_y).unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+    assert!(err.to_string().contains(legacy), "{err}");
+    assert!(store.agent_by_name("ada").unwrap().is_none());
+    assert!(fake.calls.borrow().is_empty());
+    assert_eq!(list_hosted_sessions(&store).unwrap(), before);
+
+    // The same id updates its own record.
+    let mut own = stored_record(legacy);
+    own.restart_count = 3;
+    persist_hosted_session(&store, &own, "owner").unwrap();
+    assert_eq!(record(&store, legacy).restart_count, 3);
+}
+
+#[test]
+fn a_remodel_onto_a_session_id_that_shares_a_stored_slug_changes_nothing() {
+    let ghost_y = custom_cli("hubreg-ghost2-y");
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = env_with(&home, &fake, &ProvisionedKeys);
+    spin(&store, &env, "ada", "claude").unwrap();
+    persist_hosted_session(&store, &stored_record("hubreg-ghost2:y-ada"), "owner").unwrap();
+    let before_calls = fake.calls.borrow().clone();
+
+    let err = remodel(&store, &env, "claude:ada", &ghost_y).unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
+    assert_eq!(*fake.calls.borrow(), before_calls);
+    assert!(fake.is_live("Ada"));
+    assert_eq!(record(&store, "claude:ada").status, "running");
+    assert_eq!(
+        record(&store, "hubreg-ghost2:y-ada").vendor,
+        "hubreg-ghost2"
+    );
+}
+
+// ------------------------------------------------------------ restore skips the key check
+
+#[test]
+fn the_restore_after_a_failed_remodel_does_not_need_the_old_vendors_key() {
+    let old = custom_http("hubreg-restore", Some("HUBREG_RESTORE_ENV"), None);
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let with_key = FakeKeys {
+        have: vec!["HUBREG_RESTORE_ENV".into()],
+        ..FakeKeys::default()
+    };
+    spin(&store, &env_with(&home, &fake, &with_key), "ada", &old).unwrap();
+
+    // The key has vanished by the time of the remodel; the target is a CLI that needs none, and
+    // its spin-up fails.
+    let no_key = FakeKeys::default();
+    let env = env_with(&home, &fake, &no_key);
+    FAIL_SPIN_UP_VENDORS.with_borrow_mut(|v| v.push("codex".into()));
+    let out = remodel(&store, &env, &format!("{old}:ada"), "codex");
+    FAIL_SPIN_UP_VENDORS.with_borrow_mut(Vec::clear);
+    let LifecycleError::Partial {
+        message,
+        restored_session_id,
+    } = out.unwrap_err()
+    else {
+        panic!("a failed spin-up is a partial remodel");
+    };
+    assert_eq!(restored_session_id, Some(format!("{old}:ada")), "{message}");
+    assert!(!message.contains("DOWN"), "{message}");
+    assert_eq!(record(&store, &format!("{old}:ada")).status, "running");
+    assert_eq!(
+        store.agent_by_name("ada").unwrap().unwrap().status,
+        AgentStatus::Active
+    );
+
+    // A plain spin-up still checks the key.
+    let err = spin(&store, &env, "bob", &old).unwrap_err();
+    assert!(matches!(err, LifecycleError::Conflict(_)), "{err:?}");
 }
