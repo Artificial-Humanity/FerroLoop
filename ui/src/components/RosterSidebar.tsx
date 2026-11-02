@@ -295,12 +295,35 @@ export function usePinnedState(): {
   };
 }
 
+export function hasTrailingIncompleteWork(turns: TranscriptTurn[]): boolean {
+  if (!turns || turns.length === 0) {
+    return false;
+  }
+  const lastTurn = turns[turns.length - 1];
+  if (!lastTurn) {
+    return false;
+  }
+  const toolCalls = Array.isArray(lastTurn.tool_calls) ? lastTurn.tool_calls : [];
+  const hasContent = (lastTurn.content || "").trim().length > 0;
+  const hasThinking =
+    lastTurn.thinking !== null &&
+    lastTurn.thinking !== undefined &&
+    String(lastTurn.thinking).trim().length > 0;
+  return !(
+    lastTurn.role === "assistant" &&
+    toolCalls.length === 0 &&
+    (hasContent || !hasThinking)
+  );
+}
+
 export interface RosterSidebarProps {
   agents: AgentRecord[];
   routes: DiscoveredSessionSummary[];
   liveness: AgentLivenessItem[];
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
+  busyByAgent?: Record<string, boolean>;
+  transcriptsByAgent?: Record<string, TranscriptTurn[]>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
@@ -320,7 +343,13 @@ export interface RosterSidebarProps {
   onResizeStart?: (e: React.MouseEvent<HTMLDivElement>) => void;
 }
 
-export type LeftPanelTab = "roster" | "terminal" | "hub" | "gate" | "state";
+export type LeftPanelTab =
+  | "roster"
+  | "terminal"
+  | "hub"
+  | "gate"
+  | "state"
+  | "watch";
 
 export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
   { id: "roster", label: "Agent Roster" },
@@ -328,6 +357,7 @@ export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
   { id: "hub", label: "Hub & Arch" },
   { id: "gate", label: "Vault & Gate" },
   { id: "state", label: "FerroState" },
+  { id: "watch", label: "FerroWatch" },
 ];
 
 function renderLeftPanelTabIcon(tabId: LeftPanelTab): React.ReactNode {
@@ -413,6 +443,18 @@ function renderLeftPanelTabIcon(tabId: LeftPanelTab): React.ReactNode {
           />
         </svg>
       );
+    case "watch":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M1.5 8H4L5.75 4.25L8.25 11.75L10.25 6.75L11.75 8H14.5"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
     case "state":
     default:
       return (
@@ -448,6 +490,7 @@ interface EnrichedAgent {
   route: DiscoveredSessionSummary | null;
   livenessItem: AgentLivenessItem | null;
   livenessState: "alive" | "stale" | "dead";
+  activityState: "working" | "idle" | "offline";
   adapter: string | null;
   unreadCount: number;
   unreadSeverity: UnreadSeverity;
@@ -480,6 +523,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   liveness,
   unreadByAgent,
   unreadSeverityByAgent,
+  busyByAgent,
+  transcriptsByAgent,
   selectedAgentName,
   onSelectAgent,
   onOpenAgentSettings,
@@ -613,17 +658,42 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             unreadSeverityByAgent?.[record.name_key] ??
             "normal");
 
+      const explicitBusy =
+        busyByAgent?.[key] ?? busyByAgent?.[record.name_key];
+      const agentTurns =
+        transcriptsByAgent?.[key] ?? transcriptsByAgent?.[record.name_key];
+      const isWorking =
+        explicitBusy !== undefined
+          ? explicitBusy
+          : agentTurns
+            ? hasTrailingIncompleteWork(agentTurns)
+            : false;
+      const activityState: "working" | "idle" | "offline" = isWorking
+        ? "working"
+        : livenessState === "alive"
+          ? "idle"
+          : "offline";
+
       return {
         record,
         route,
         livenessItem,
         livenessState,
+        activityState,
         adapter,
         unreadCount,
         unreadSeverity,
       };
     });
-  }, [agents, routes, liveness, unreadByAgent, unreadSeverityByAgent]);
+  }, [
+    agents,
+    routes,
+    liveness,
+    unreadByAgent,
+    unreadSeverityByAgent,
+    busyByAgent,
+    transcriptsByAgent,
+  ]);
 
   const groupedByProject = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
@@ -978,7 +1048,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
                 {!isGroupCollapsed && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
-                    {items.map(({ record, livenessState, adapter, unreadCount, unreadSeverity }) => {
+                    {items.map(({ record, livenessState, activityState, adapter, unreadCount, unreadSeverity }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
@@ -988,6 +1058,30 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           : livenessState === "stale"
                             ? "fd-dot fd-dot-stale"
                             : "fd-dot fd-dot-dead";
+                      const activityTitle =
+                        activityState === "working"
+                          ? "Activity: Working (Busy)"
+                          : activityState === "idle"
+                            ? "Activity: Idle (Online)"
+                            : "Activity: Offline";
+                      const activityColor =
+                        activityState === "working"
+                          ? "var(--status-warning)"
+                          : activityState === "idle"
+                            ? "var(--status-online)"
+                            : "var(--text-muted)";
+                      const activityBg =
+                        activityState === "working"
+                          ? "rgba(245, 166, 35, 0.14)"
+                          : activityState === "idle"
+                            ? "rgba(16, 185, 129, 0.12)"
+                            : "transparent";
+                      const activityBorder =
+                        activityState === "working"
+                          ? "1px solid var(--status-warning)"
+                          : activityState === "idle"
+                            ? "1px solid rgba(16, 185, 129, 0.45)"
+                            : "1px solid var(--border-subtle)";
 
                       return (
                         <div
@@ -1108,6 +1202,90 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               flexWrap: "wrap",
                             }}
                           >
+                            <span
+                              data-testid={`activity-tag-${key}`}
+                              data-activity={activityState}
+                              title={activityTitle}
+                              aria-label={activityTitle}
+                              className="fd-badge"
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                padding: "2px 5px",
+                                lineHeight: 1,
+                                color: activityColor,
+                                backgroundColor: activityBg,
+                                border: activityBorder,
+                              }}
+                            >
+                              {activityState === "working" ? (
+                                <svg
+                                  width="11"
+                                  height="11"
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  aria-hidden="true"
+                                >
+                                  <path
+                                    d="M1.5 8H4.2L6 4L9.2 12L11.2 6.8L12.5 8H14.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.6"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              ) : activityState === "idle" ? (
+                                <svg
+                                  width="11"
+                                  height="11"
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  aria-hidden="true"
+                                >
+                                  <circle
+                                    cx="8"
+                                    cy="8"
+                                    r="5.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.5"
+                                  />
+                                  <path
+                                    d="M5.6 8.2L7.3 9.9L10.6 6.4"
+                                    stroke="currentColor"
+                                    strokeWidth="1.5"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </svg>
+                              ) : (
+                                <svg
+                                  width="11"
+                                  height="11"
+                                  viewBox="0 0 16 16"
+                                  fill="none"
+                                  aria-hidden="true"
+                                >
+                                  <circle
+                                    cx="8"
+                                    cy="8"
+                                    r="5.5"
+                                    stroke="currentColor"
+                                    strokeWidth="1.4"
+                                    strokeDasharray="2.2 2.2"
+                                  />
+                                  <line
+                                    x1="5.5"
+                                    y1="8"
+                                    x2="10.5"
+                                    y2="8"
+                                    stroke="currentColor"
+                                    strokeWidth="1.4"
+                                    strokeLinecap="round"
+                                  />
+                                </svg>
+                              )}
+                            </span>
                             <span className="fd-badge" data-testid={`role-badge-${key}`}>
                               {formatRoleLabel(record.role)}
                             </span>

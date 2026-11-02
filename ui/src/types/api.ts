@@ -1358,6 +1358,347 @@ export interface TerminalExitedPayload {
 }
 
 /**
+ * FerroWatch (`/api/v1/watch/*`, `crates/watch/src/{lib,alerts,liveness,rollups,runtime}.rs`
+ * and `crates/hub/src/watch_api.rs`) + Session Remodel (`/api/v1/sessions/:id/remodel`).
+ */
+export type WatchSeverity = "info" | "warning" | "critical";
+
+export type WatchAlertRule =
+  | "spend"
+  | "quota"
+  | "heartbeat_stale"
+  | "heartbeat_dead"
+  | "crash_loop"
+  | "transition_regret"
+  | string;
+
+export type WatchEntityKind =
+  | "workspace"
+  | "project"
+  | "agent"
+  | "vendor"
+  | "record"
+  | "transition"
+  | string;
+
+export interface WatchEntity {
+  kind: WatchEntityKind;
+  id: string;
+  label?: string | null;
+}
+
+export type WatchQuotaWindowKind = "primary" | "secondary";
+
+export interface WatchQuotaWindow {
+  vendor: string;
+  window: WatchQuotaWindowKind;
+  used_percent: number;
+  resets_at_ms?: number | null;
+  session?: string | null;
+  window_minutes?: number | null;
+  exhausted_reason?: string | null;
+}
+
+export interface WatchThresholds {
+  warn_quota_pct: number;
+  critical_quota_pct: number;
+  warn_cost_usd_micros: number;
+  critical_cost_usd_micros: number;
+  stale_after_ms: number;
+  crash_loop_warn_streak?: number;
+  crash_loop_critical_streak?: number;
+}
+
+export interface WatchThresholdOverrides {
+  warn_quota_pct?: number;
+  critical_quota_pct?: number;
+  warn_cost_usd_micros?: number;
+  critical_cost_usd_micros?: number;
+  stale_after_ms?: number;
+}
+
+export const DEFAULT_WATCH_THRESHOLDS: WatchThresholds = {
+  warn_quota_pct: 80,
+  critical_quota_pct: 95,
+  warn_cost_usd_micros: 100_000_000,
+  critical_cost_usd_micros: 500_000_000,
+  stale_after_ms: 30_000,
+  crash_loop_warn_streak: 3,
+  crash_loop_critical_streak: 5,
+};
+
+export interface WatchAlert {
+  id: string;
+  rule: WatchAlertRule;
+  severity: WatchSeverity;
+  entity: WatchEntity;
+  message: string;
+  observed: number;
+  threshold: number;
+  at_ms: number;
+  resets_at_ms?: number | null;
+  remediation: string;
+}
+
+export interface WatchHostedSession {
+  session_id: string;
+  persona: string;
+  project: string;
+  role: string;
+  vendor: string;
+  model?: string | null;
+  node_id: string;
+  status: string;
+  restart_count: number;
+  updated_at_ms: number;
+}
+
+export type WatchLiveness = "live" | "stale" | "dead" | "exited" | "missing";
+
+export interface WatchAgentHealth {
+  agent: string;
+  liveness: WatchLiveness;
+  active: boolean;
+  verdict: LivenessVerdict;
+  node?: string | null;
+  project?: string | null;
+  adapter?: string | null;
+  attempt_id?: string | null;
+  record?: string | null;
+  heartbeat_at_ms?: number | null;
+  heartbeat_age_ms?: number | null;
+  hosted_session?: WatchHostedSession | null;
+}
+
+export interface WatchLivenessCounts {
+  agents: number;
+  active: number;
+  live: number;
+  stale: number;
+  dead: number;
+  exited: number;
+  missing: number;
+}
+
+export interface WatchGroupHealth extends WatchLivenessCounts {
+  key: string;
+}
+
+export interface WatchHealthReport {
+  now_ms: number;
+  stale_after_ms: number;
+  local_host: string;
+  agents: WatchAgentHealth[];
+  totals: WatchLivenessCounts;
+  by_node: WatchGroupHealth[];
+  by_project: WatchGroupHealth[];
+  hosted_sessions: number;
+  hosted_sessions_undecodable: number;
+  heartbeats_undecodable: number;
+}
+
+export interface WatchAttemptCounts {
+  attempts: number;
+  succeeded: number;
+  failed: number;
+  crashed: number;
+  timed_out: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd_micros: number;
+  duration_ms: number;
+}
+
+export interface WatchProjectRollup extends WatchAttemptCounts {
+  project: string;
+  slug: string;
+  root: string;
+}
+
+export interface WatchBreakdown extends WatchAttemptCounts {
+  key: string;
+}
+
+export interface WatchGateTotals {
+  pass: number;
+  fail: number;
+  error: number;
+  duration_ms: number;
+  cost_usd_micros: number;
+}
+
+export interface WatchFailureStreak {
+  record: string;
+  project: string;
+  slug: string;
+  attempt_streak: number;
+  gate_streak: number;
+  gate?: string | null;
+  gate_name?: string | null;
+  last_attempt_status?: string | null;
+  last_gate_verdict?: string | null;
+}
+
+export interface WatchRegretSummary {
+  projects_audited: number;
+  challenges: Array<Record<string, unknown>>;
+}
+
+export interface WatchTelemetryReport {
+  project: string | null;
+  source: string;
+  totals: WatchAttemptCounts;
+  gate_runs: WatchGateTotals;
+  by_project: WatchProjectRollup[];
+  by_adapter: WatchBreakdown[];
+  by_agent: WatchBreakdown[];
+  regret: WatchRegretSummary;
+  failure_streaks: WatchFailureStreak[];
+}
+
+export interface WatchSummaryResponse {
+  telemetry: WatchTelemetryReport;
+  health: WatchHealthReport;
+  quotas: WatchQuotaWindow[];
+  alerts: WatchAlert[];
+  thresholds: WatchThresholds;
+}
+
+export interface WatchAlertsResponse {
+  alerts: WatchAlert[];
+  thresholds: WatchThresholds;
+}
+
+export interface WatchRollupsResponse {
+  telemetry: WatchTelemetryReport;
+}
+
+export type RemodelMode = "prepare" | "execute";
+
+export interface RemodelSessionRequest {
+  vendor: string;
+  model?: string | null;
+  mode?: RemodelMode;
+  cwd?: string | null;
+  node_id?: string | null;
+  hosted?: boolean;
+}
+
+export interface RemodelSessionResponse {
+  mode: RemodelMode;
+  session_id: string;
+  previous_session_id: string;
+  persona: string;
+  project: string;
+  role: string;
+  from_vendor: string;
+  vendor: string;
+  model: string | null;
+  node_id: string;
+  hosted: boolean;
+  cwd: string | null;
+  status: string;
+  handshake_dispatched: boolean;
+  hydration_dispatched: boolean;
+  runtime_stopped: boolean;
+  tmux_target: string | null;
+  prompt: string | null;
+  handoff: string | null;
+  warnings: string[];
+}
+
+export interface WatchBalancePolicy {
+  enabled: boolean;
+  primary_trigger_pct: number;
+  secondary_trigger_pct: number;
+  target_max_primary_pct: number;
+  target_max_secondary_pct: number;
+  cooldown_ms: number;
+  min_interval_ms: number;
+  max_switches_per_run: number;
+  pinned_personas: string[];
+  excluded_personas: string[];
+  allowed_target_vendors: string[];
+  excluded_target_vendors: string[];
+  allow_unknown_quota_targets: boolean;
+}
+
+export const DEFAULT_WATCH_BALANCE_POLICY: WatchBalancePolicy = {
+  enabled: false,
+  primary_trigger_pct: 90,
+  secondary_trigger_pct: 85,
+  target_max_primary_pct: 70,
+  target_max_secondary_pct: 70,
+  cooldown_ms: 1_800_000,
+  min_interval_ms: 300_000,
+  max_switches_per_run: 1,
+  pinned_personas: [],
+  excluded_personas: [],
+  allowed_target_vendors: [],
+  excluded_target_vendors: [],
+  allow_unknown_quota_targets: false,
+};
+
+export interface WatchBalanceStatusResponse {
+  policy: WatchBalancePolicy;
+  enabled: boolean;
+}
+
+export interface WatchBalanceSwitchItem {
+  persona: string;
+  session_id: string;
+  from_vendor: string;
+  to_vendor: string;
+  reason: string;
+  trigger: string;
+  target_score: number;
+}
+
+export interface WatchBalanceSkippedItem {
+  persona: string;
+  reason: string;
+}
+
+export interface WatchBalanceVendorHealth {
+  vendor: string;
+  primary_window?: {
+    used_percent: number;
+    resets_at_ms?: number | null;
+  } | null;
+  secondary_window?: {
+    used_percent: number;
+    resets_at_ms?: number | null;
+  } | null;
+  exhausted?: boolean;
+  exhausted_reason?: string | null;
+  unknown?: boolean;
+}
+
+export interface WatchBalancePlan {
+  evaluated_at_ms: number;
+  blocked: string | null;
+  switches: WatchBalanceSwitchItem[];
+  skipped: WatchBalanceSkippedItem[];
+  vendors: WatchBalanceVendorHealth[];
+}
+
+export interface WatchBalanceApplyResultItem {
+  persona: string;
+  from_vendor: string;
+  to_vendor: string;
+  ok: boolean;
+  session_id?: string | null;
+  error?: string | null;
+  outcome?: string | null;
+}
+
+export interface WatchBalanceApplyResponse {
+  plan: WatchBalancePlan;
+  results: WatchBalanceApplyResultItem[];
+  audit_slug?: string | null;
+}
+
+/**
  * Default AI-Lab-0 workspace agent roster used as fallback metadata when a fresh local store
  * has not yet seeded `AgentRecord` rows.
  */

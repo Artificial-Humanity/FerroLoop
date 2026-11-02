@@ -2128,7 +2128,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{ width: "100%", maxWidth: "420px", fontSize: "16px", padding: "5px 9px" }}
           />
           <span
-            className="fd-badge"
             data-testid="session-busy-badge"
             title={
               effectiveIsBusy
@@ -2136,15 +2135,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 : "Agent session is idle"
             }
             style={{
-              backgroundColor: effectiveIsBusy
-                ? "rgba(245, 158, 11, 0.16)"
-                : "rgba(16, 185, 129, 0.14)",
-              color: effectiveIsBusy ? "#FBBF24" : "#34D399",
-              borderColor: effectiveIsBusy
-                ? "rgba(245, 158, 11, 0.35)"
-                : "rgba(16, 185, 129, 0.3)",
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
               whiteSpace: "nowrap",
-              flexShrink: 0,
+              border: 0,
             }}
           >
             {effectiveIsBusy ? "Busy · Working" : "Idle"}

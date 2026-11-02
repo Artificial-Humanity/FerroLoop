@@ -20,6 +20,7 @@ import {
   RosterSidebar,
   classifyTurnUnreadSeverity,
   classifyWireUnreadSeverity,
+  hasTrailingIncompleteWork,
   mergeUnreadSeverity,
   type LeftPanelTab,
   type UnreadSeverity,
@@ -32,6 +33,7 @@ import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
+import { FerroWatchPane } from "./components/FerroWatchPane";
 import { WireMailPane } from "./components/WireMailPane";
 import {
   setActiveTimeZone,
@@ -509,6 +511,20 @@ export const App: React.FC<AppProps> = ({
   const backgroundTranscriptsRef = useRef<Record<string, TranscriptTurn[]>>({});
   backgroundTranscriptsRef.current = backgroundTranscripts;
   const backgroundStampRef = useRef<Record<string, string>>({});
+  const [busyByAgent, setBusyByAgent] = useState<Record<string, boolean>>({});
+
+  const recordAgentBusy = useCallback(
+    (agentKey: string | undefined | null, isBusy: boolean) => {
+      const key = (agentKey ?? "").trim().toLowerCase();
+      if (!key) {
+        return;
+      }
+      setBusyByAgent((prev) =>
+        prev[key] === isBusy ? prev : { ...prev, [key]: isBusy },
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     try {
@@ -591,7 +607,13 @@ export const App: React.FC<AppProps> = ({
     }
     if (splitView && secondaryTab === tab) {
       setSplitView(false);
-      setActiveTab(leftPanelTab === "roster" ? "chat" : leftPanelTab);
+      setActiveTab(
+        leftPanelTab === "roster"
+          ? "chat"
+          : leftPanelTab === "watch"
+            ? "state"
+            : leftPanelTab,
+      );
     } else {
       setSecondaryTab(tab);
       setActiveTab(tab);
@@ -612,6 +634,8 @@ export const App: React.FC<AppProps> = ({
               : "chat"
             : prev,
         );
+      } else if (tab === "watch") {
+        setActiveTab("state");
       } else {
         setActiveTab(tab);
       }
@@ -670,13 +694,20 @@ export const App: React.FC<AppProps> = ({
         if (loggedOutRef.current) {
           return;
         }
-        if (bgRes?.turns) {
-          backgroundStampRef.current[persona] = stamp;
-          recordTranscript(persona, bgRes.turns);
+        if (bgRes) {
+          if (bgRes.turns) {
+            backgroundStampRef.current[persona] = stamp;
+            recordTranscript(persona, bgRes.turns);
+          }
+          const busy =
+            typeof bgRes.is_busy === "boolean"
+              ? bgRes.is_busy
+              : hasTrailingIncompleteWork(bgRes.turns ?? []);
+          recordAgentBusy(persona, busy);
         }
       }
     },
-    [apiClient, recordTranscript],
+    [apiClient, recordTranscript, recordAgentBusy],
   );
 
   // A refresh requested while one is in flight is coalesced into a single
@@ -743,6 +774,12 @@ export const App: React.FC<AppProps> = ({
             if (trRes.turns) {
               recordTranscript(targetPersona, trRes.turns);
             }
+            recordAgentBusy(
+              targetPersona,
+              typeof trRes.is_busy === "boolean"
+                ? trRes.is_busy
+                : hasTrailingIncompleteWork(trRes.turns ?? []),
+            );
             const stillSameTarget =
               selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
               selectedSessionIdRef.current === requestedSessionId &&
@@ -775,7 +812,13 @@ export const App: React.FC<AppProps> = ({
     },
     // Selection is read through refs so the identity is stable across agent
     // and session switches (the WebSocket effect depends on this callback).
-    [apiClient, applyTranscriptTurns, scanBackgroundTranscripts, recordTranscript],
+    [
+      apiClient,
+      applyTranscriptTurns,
+      scanBackgroundTranscripts,
+      recordTranscript,
+      recordAgentBusy,
+    ],
   );
   refreshSessionsAndTranscriptRef.current = refreshSessionsAndTranscript;
 
@@ -909,6 +952,12 @@ export const App: React.FC<AppProps> = ({
           !tornDownTargetsRef.current.has(initialKey)
         ) {
           recordTranscript(initialAgentName, trRes.turns ?? []);
+          recordAgentBusy(
+            initialAgentName,
+            typeof trRes.is_busy === "boolean"
+              ? trRes.is_busy
+              : hasTrailingIncompleteWork(trRes.turns ?? []),
+          );
           if (
             selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
             selectedSessionIdRef.current === initialSessionId
@@ -924,7 +973,13 @@ export const App: React.FC<AppProps> = ({
     } finally {
       setLoading(false);
     }
-  }, [apiClient, applyTranscriptTurns, scanBackgroundTranscripts, recordTranscript]);
+  }, [
+    apiClient,
+    applyTranscriptTurns,
+    scanBackgroundTranscripts,
+    recordTranscript,
+    recordAgentBusy,
+  ]);
 
   // Startup URL pairing check + Auth session check + initial load
   useEffect(() => {
@@ -1134,6 +1189,12 @@ export const App: React.FC<AppProps> = ({
         if (!cancelled && !loggedOutRef.current) {
           applyTranscriptTurns(res.turns ?? []);
           recordTranscript(selectedAgent?.name_key, res.turns ?? []);
+          recordAgentBusy(
+            selectedAgent?.name_key,
+            typeof res.is_busy === "boolean"
+              ? res.is_busy
+              : hasTrailingIncompleteWork(res.turns ?? []),
+          );
           setSessionQueue(res.queue ?? []);
           setIsSessionBusy(Boolean(res.is_busy));
           setSessionContextUsage(res.context_usage ?? null);
@@ -1279,6 +1340,7 @@ export const App: React.FC<AppProps> = ({
     backgroundTranscriptsRef.current = {};
     backgroundStampRef.current = {};
     setBackgroundTranscripts({});
+    setBusyByAgent({});
     setTranscriptTurns([]);
     setSessionQueue([]);
     setIsSessionBusy(false);
@@ -1456,6 +1518,11 @@ export const App: React.FC<AppProps> = ({
           delete next[agentKey];
           return next;
         });
+        setBusyByAgent((prev) => {
+          const next = { ...prev };
+          delete next[agentKey];
+          return next;
+        });
       }
       setSelectedSessionId(null);
       selectedSessionIdRef.current = null;
@@ -1479,6 +1546,7 @@ export const App: React.FC<AppProps> = ({
     }
     const res = await apiClient.interruptSession(targetId);
     setIsSessionBusy(false);
+    recordAgentBusy(selectedAgent?.name_key, false);
     await refreshSessionsAndTranscript(targetId);
     return res;
   };
@@ -1545,8 +1613,21 @@ export const App: React.FC<AppProps> = ({
     return res;
   };
 
-  const renderSecondaryPane = (paneTab: CockpitTab) => {
+  const renderSecondaryPane = (paneTab: CockpitTab | LeftPanelTab) => {
     switch (paneTab) {
+      case "watch":
+        return (
+          <FerroWatchPane
+            authority={authority}
+            agents={agents}
+            sessions={mergedRoutes}
+            apiClient={apiClient}
+            onAfterRemodel={() => {
+              void refreshWireAndRoster();
+              void refreshSessionsAndTranscript();
+            }}
+          />
+        );
       case "artifacts":
         return (
           <ArtifactPreviewPane
@@ -1769,12 +1850,33 @@ export const App: React.FC<AppProps> = ({
     [splitView, activeTab, refreshSessionsAndTranscript],
   );
 
+  const effectiveBusyByAgent = useMemo<Record<string, boolean>>(() => {
+    const selectedKey = (selectedAgent?.name_key ?? selectedAgentName)
+      .trim()
+      .toLowerCase();
+    if (!selectedKey || !isSessionBusy) {
+      return busyByAgent;
+    }
+    if (busyByAgent[selectedKey] === true) {
+      return busyByAgent;
+    }
+    return { ...busyByAgent, [selectedKey]: true };
+  }, [busyByAgent, isSessionBusy, selectedAgent?.name_key, selectedAgentName]);
+
   const handleToggleSplitView = useCallback(() => {
     setSplitView((prev) => {
       const next = !prev;
       const targetTab =
         !selectedAgent && secondaryTab === "mail" ? "artifacts" : secondaryTab;
-      setActiveTab(next ? targetTab : leftPanelTab === "roster" ? "chat" : leftPanelTab);
+      setActiveTab(
+        next
+          ? targetTab
+          : leftPanelTab === "roster"
+            ? "chat"
+            : leftPanelTab === "watch"
+              ? "state"
+              : leftPanelTab,
+      );
       if (next) {
         setMobileRosterOpen(false);
       }
@@ -1787,7 +1889,13 @@ export const App: React.FC<AppProps> = ({
       const next = !prev;
       if (next && typeof window !== "undefined" && window.innerWidth <= 768) {
         setSplitView(false);
-        setActiveTab(leftPanelTab === "roster" ? "chat" : leftPanelTab);
+        setActiveTab(
+          leftPanelTab === "roster"
+            ? "chat"
+            : leftPanelTab === "watch"
+              ? "state"
+              : leftPanelTab,
+        );
       }
       return next;
     });
@@ -1802,6 +1910,8 @@ export const App: React.FC<AppProps> = ({
         liveness={liveness}
         unreadByAgent={unreadByAgent}
         unreadSeverityByAgent={unreadSeverityByAgent}
+        busyByAgent={effectiveBusyByAgent}
+        transcriptsByAgent={transcriptsByAgent}
         selectedAgentName={selectedAgent?.name_key ?? null}
         onSelectAgent={(nameKey) => {
           const nextKey = nameKey.trim().toLowerCase();
