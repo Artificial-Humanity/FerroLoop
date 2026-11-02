@@ -185,14 +185,14 @@ mod ttl_cache {
         let cache = TtlCache::new(TTL);
         let loads = AtomicUsize::new(0);
         let t0 = Instant::now();
-        let first = cache.get_or_load("k", t0, || counted_load(&loads, "a"));
+        let first = cache.get_or_load("k", || t0, || counted_load(&loads, "a"));
         assert_eq!(first, Ok(vec!["a".to_string()]));
-        let hit = cache.get_or_load("k", t0 + TTL - Duration::from_millis(1), || {
+        let hit = cache.get_or_load("k", || t0 + TTL - Duration::from_millis(1), || {
             counted_load(&loads, "b")
         });
         assert_eq!(hit, Ok(vec!["a".to_string()]), "inside the TTL: cached");
         assert_eq!(loads.load(Ordering::SeqCst), 1);
-        let expired = cache.get_or_load("k", t0 + TTL, || counted_load(&loads, "c"));
+        let expired = cache.get_or_load("k", || t0 + TTL, || counted_load(&loads, "c"));
         assert_eq!(
             expired,
             Ok(vec!["c".to_string()]),
@@ -202,16 +202,53 @@ mod ttl_cache {
     }
 
     #[test]
+    fn a_value_ages_from_the_end_of_its_load_not_the_start() {
+        let cache = TtlCache::new(TTL);
+        let t0 = Instant::now();
+        // An injected clock: the load "takes" most of a TTL, as a 1.4 s host scan does.
+        let now = std::cell::Cell::new(t0);
+        let load_time = TTL - Duration::from_millis(10);
+        let first = cache.get_or_load("k", || now.get(), || {
+            now.set(t0 + load_time);
+            Ok::<_, ()>(vec!["scan".to_string()])
+        });
+        assert_eq!(first, Ok(vec!["scan".to_string()]));
+        let loaded = t0 + load_time;
+        // Stamped at the start, this read would be past the TTL and load again.
+        now.set(loaded + TTL - Duration::from_millis(1));
+        let hit = cache.get_or_load("k", || now.get(), || Ok::<_, ()>(vec!["again".to_string()]));
+        assert_eq!(hit, Ok(vec!["scan".to_string()]), "a whole TTL after the load");
+        now.set(loaded + TTL);
+        let expired = cache.get_or_load("k", || now.get(), || Ok::<_, ()>(vec!["again".to_string()]));
+        assert_eq!(expired, Ok(vec!["again".to_string()]), "a TTL after the load");
+    }
+
+    #[test]
+    fn a_slow_load_that_an_invalidation_overtook_is_not_served() {
+        let cache = TtlCache::new(TTL);
+        let t0 = Instant::now();
+        let now = std::cell::Cell::new(t0);
+        let during = cache.get_or_load("k", || now.get(), || {
+            now.set(t0 + Duration::from_millis(50));
+            cache.invalidate();
+            Ok::<_, ()>(vec!["before-change".to_string()])
+        });
+        assert_eq!(during, Ok(vec!["before-change".to_string()]));
+        let next = cache.get_or_load("k", || now.get(), || Ok::<_, ()>(vec!["after".to_string()]));
+        assert_eq!(next, Ok(vec!["after".to_string()]), "stamped late, still discarded");
+    }
+
+    #[test]
     fn a_caller_changing_its_copy_does_not_change_the_cache() {
         let cache = TtlCache::new(TTL);
         let t0 = Instant::now();
         let mut mine = cache
-            .get_or_load("k", t0, || Ok::<_, ()>(vec!["a".to_string()]))
+            .get_or_load("k", || t0, || Ok::<_, ()>(vec!["a".to_string()]))
             .unwrap();
         mine.push("leak".to_string());
         mine[0] = "changed".to_string();
         let again = cache
-            .get_or_load("k", t0, || Ok::<_, ()>(vec!["reloaded".to_string()]))
+            .get_or_load("k", || t0, || Ok::<_, ()>(vec!["reloaded".to_string()]))
             .unwrap();
         assert_eq!(again, vec!["a".to_string()]);
     }
@@ -222,10 +259,10 @@ mod ttl_cache {
         let loads = AtomicUsize::new(0);
         let t0 = Instant::now();
         cache
-            .get_or_load("k", t0, || counted_load(&loads, "a"))
+            .get_or_load("k", || t0, || counted_load(&loads, "a"))
             .unwrap();
         cache.invalidate();
-        let after = cache.get_or_load("k", t0, || counted_load(&loads, "b"));
+        let after = cache.get_or_load("k", || t0, || counted_load(&loads, "b"));
         assert_eq!(after, Ok(vec!["b".to_string()]));
         assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
@@ -235,13 +272,13 @@ mod ttl_cache {
         let cache = TtlCache::new(TTL);
         let t0 = Instant::now();
         cache
-            .get_or_load("k", t0, || Ok::<_, String>(vec!["a".into()]))
+            .get_or_load("k", || t0, || Ok::<_, String>(vec!["a".into()]))
             .unwrap();
-        let other = cache.get_or_load("j", t0, || Ok::<_, String>(vec!["j".into()]));
+        let other = cache.get_or_load("j", || t0, || Ok::<_, String>(vec!["j".into()]));
         assert_eq!(other, Ok(vec!["j".to_string()]), "a different key loads");
-        let failed = cache.get_or_load("x", t0, || Err::<Vec<String>, _>("down".to_string()));
+        let failed = cache.get_or_load("x", || t0, || Err::<Vec<String>, _>("down".to_string()));
         assert_eq!(failed, Err("down".to_string()));
-        let next = cache.get_or_load("x", t0, || Ok::<_, String>(vec!["x".into()]));
+        let next = cache.get_or_load("x", || t0, || Ok::<_, String>(vec!["x".into()]));
         assert_eq!(next, Ok(vec!["x".to_string()]), "an error is not cached");
     }
 
@@ -250,12 +287,12 @@ mod ttl_cache {
         let cache = TtlCache::new(TTL);
         let t0 = Instant::now();
         // The load overlaps a lifecycle change: its result predates the change.
-        let during = cache.get_or_load("k", t0, || {
+        let during = cache.get_or_load("k", || t0, || {
             cache.invalidate();
             Ok::<_, ()>(vec!["before-change".to_string()])
         });
         assert_eq!(during, Ok(vec!["before-change".to_string()]));
-        let next = cache.get_or_load("k", t0, || Ok::<_, ()>(vec!["after".to_string()]));
+        let next = cache.get_or_load("k", || t0, || Ok::<_, ()>(vec!["after".to_string()]));
         assert_eq!(
             next,
             Ok(vec!["after".to_string()]),
@@ -275,7 +312,7 @@ mod ttl_cache {
                 std::thread::spawn(move || {
                     start.wait();
                     cache
-                        .get_or_load("k", t0, || {
+                        .get_or_load("k", || t0, || {
                             loads.fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(20));
                             Ok::<_, ()>(vec!["scan".to_string()])

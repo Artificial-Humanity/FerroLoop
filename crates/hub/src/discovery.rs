@@ -263,28 +263,34 @@ impl<K: PartialEq, V: Clone> TtlCache<K, V> {
         }
     }
 
-    /// The cached value for `key` when it is younger than the TTL at `now`; otherwise `load` runs
-    /// and its `Ok` value is cached under `key`. An `Err` is returned and not cached.
+    /// The cached value for `key` when it is younger than the TTL; otherwise `load` runs and its
+    /// `Ok` value is cached under `key`. An `Err` is returned and not cached. `clock` is the time
+    /// source (`Instant::now` outside tests); it is read for each freshness check and again when
+    /// `load` returns, so a value's age counts from the end of its load: a scan that took 1.4 s
+    /// still serves for the whole TTL.
     pub(crate) fn get_or_load<E>(
         &self,
         key: K,
-        now: Instant,
+        clock: impl Fn() -> Instant,
         load: impl FnOnce() -> Result<V, E>,
     ) -> Result<V, E> {
-        if let Some(hit) = self.fresh(&key, now) {
+        if let Some(hit) = self.fresh(&key, clock()) {
             return Ok(hit);
         }
         let _one_load = self.load_gate.lock().unwrap_or_else(|e| e.into_inner());
         // A caller that waited on the gate reads what the load before it stored.
-        if let Some(hit) = self.fresh(&key, now) {
+        if let Some(hit) = self.fresh(&key, clock()) {
             return Ok(hit);
         }
+        // The generation the load starts in. An invalidation during the load starts a new one,
+        // so `fresh` never serves this value.
         let generation = self.lock_state().generation;
         let value = load()?;
+        let loaded_at = clock();
         let mut state = self.lock_state();
         state.entry = Some(TtlCacheEntry {
             key,
-            loaded_at: now,
+            loaded_at,
             generation,
             value: value.clone(),
         });
@@ -347,7 +353,7 @@ pub(crate) fn discovered_route_table(home_override: Option<&Path>) -> RouteTable
         return scan_route_table(home_override);
     }
     let Ok(table) =
-        ROUTE_DISCOVERY_CACHE.get_or_load(RouteScanKey::current(), Instant::now(), || {
+        ROUTE_DISCOVERY_CACHE.get_or_load(RouteScanKey::current(), Instant::now, || {
             Ok::<_, std::convert::Infallible>(scan_route_table(None))
         });
     table

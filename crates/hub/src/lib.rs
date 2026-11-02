@@ -313,7 +313,7 @@ impl HubState {
         &self,
     ) -> Result<discovery::DiscoveryStoreSnapshot, StoreError> {
         self.discovery_snapshots
-            .get_or_load(self.config.store_path.clone(), Instant::now(), || {
+            .get_or_load(self.config.store_path.clone(), Instant::now, || {
                 self.open_store()
                     .map(|store| discovery::snapshot_discovery_store(&store))
             })
