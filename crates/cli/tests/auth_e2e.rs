@@ -186,6 +186,44 @@ fn single_use_is_spent_by_the_first_consuming_verify() {
 }
 
 #[test]
+fn consume_without_a_target_is_a_usage_error() {
+    let env = Env::new();
+    let g = grant(&env, &["--single-use"]);
+    let id = g["grant_id"].as_str().unwrap();
+    let out = env
+        .fl()
+        .args(["auth", "verify", id, "--consume"])
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 2, "{:?}", text(&out));
+    assert!(text(&out).1.contains("--target"), "{:?}", text(&out));
+}
+
+#[test]
+fn concurrent_processes_spend_a_single_use_grant_exactly_once() {
+    let env = Env::new();
+    let g = grant(&env, &["--single-use"]);
+    let id = g["grant_id"].as_str().unwrap();
+    // Spawn all, then wait, so the processes really overlap.
+    let children: Vec<_> = (0..6)
+        .map(|_| {
+            env.fl()
+                .args(["auth", "verify", id, "--consume", "--target", "feira"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let codes: Vec<i32> = children
+        .into_iter()
+        .map(|c| code(&c.wait_with_output().unwrap()))
+        .collect();
+    assert_eq!(codes.iter().filter(|c| **c == 0).count(), 1, "{codes:?}");
+    assert_eq!(codes.iter().filter(|c| **c == 1).count(), 5, "{codes:?}");
+}
+
+#[test]
 fn an_agent_session_cannot_grant_or_revoke_without_a_hub_owner_token() {
     let env = Env::new();
     for (var, value) in [

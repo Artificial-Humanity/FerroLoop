@@ -8,6 +8,11 @@
 //! A compact token is a credential: whoever holds it can present it. So only the Owner sees
 //! `compact_token` in a listing. A peer gets the same grants with that field left out.
 //!
+//! `grant_id` is as much a capability as the token: by-id verify has the same power. Hiding
+//! `compact_token` from peers only stops copying the portable form.
+//!
+//! Listing does not check signatures; `verify` is the authority.
+//!
 //! A peer may verify, which is the point of a warrant. A peer may spend (`consume`) a grant only
 //! as the agent the request names and that the hub resolved for it: a peer cannot burn another
 //! agent's single-use grant. That check is by name, and a peer chooses its own `X-Fl-Agent`, so
@@ -61,7 +66,11 @@ fn gate_failure(err: GateError) -> HttpResponse {
         GateError::WarrantRejected { reason } => {
             HttpResponse::json(422, json!({ "valid": false, "error": reason }))
         }
-        other => HttpResponse::json(500, json!({ "error": other.to_string() })),
+        other => {
+            // The detail has filesystem paths, and a peer can trigger this through verify.
+            eprintln!("warrant store error: {other}");
+            HttpResponse::json(500, json!({ "error": "warrant store error" }))
+        }
     }
 }
 
@@ -74,6 +83,7 @@ fn grant_view(stored: &StoredOwnerGrant, owner: bool) -> Value {
     value
 }
 
+/// Every grant, as stored. Listing does not check signatures; `verify` is the authority.
 fn get_grants(state: &HubState, authority: &HubAuthority) -> HttpResponse {
     let home = state.config.home_override.as_deref();
     let public_key = match owner_warrant_public_key(home) {
@@ -241,6 +251,7 @@ mod tests {
     use super::*;
     use crate::api::handle_http_request;
     use crate::{HubServerConfig, ReviewerApps};
+    use std::fs;
     use tempfile::TempDir;
 
     const OWNER: &str = "Bearer owner-tok-secret";
@@ -466,6 +477,9 @@ mod tests {
         ] {
             assert_eq!(verify(PEER, body).0, 403);
         }
+        // The Owner must name an agent too: an unnamed consume is a bad request.
+        let (status, out) = verify(OWNER, json!({ "id_or_token": id, "consume": true }));
+        assert_eq!(status, 400, "{out}");
         // The Owner may spend it for any agent.
         let (status, out) = verify(
             OWNER,
@@ -476,6 +490,27 @@ mod tests {
         let (status, out) = verify(OWNER, json!({ "id_or_token": id }));
         assert_eq!(status, 422);
         assert!(out["error"].as_str().unwrap().contains("already consumed"));
+    }
+
+    #[test]
+    fn a_store_failure_is_a_generic_500_without_paths() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let grant = issue(&state, wanted("ferris"));
+        let ledger = fl_gate::resolve_warrant_ledger_path(Some(tmp.path()));
+        fs::write(&ledger, "{ not json").unwrap();
+        let (status, out) = call(
+            &state,
+            "POST",
+            "/api/v1/auth/grants/verify",
+            PEER,
+            Some(json!({ "id_or_token": grant["grant_id"] })),
+        );
+        assert_eq!(status, 500, "{out}");
+        let text = out.to_string();
+        assert!(text.contains("warrant store error"), "{text}");
+        assert!(!text.contains("warrants.json"), "{text}");
+        assert!(!text.contains(tmp.path().to_str().unwrap()), "{text}");
     }
 
     #[test]

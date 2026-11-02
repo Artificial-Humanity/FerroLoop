@@ -58,8 +58,8 @@ pub enum AuthCmd {
         /// Agent the warrant must name (or be for `*`).
         #[arg(long)]
         target: Option<String>,
-        /// Mark the warrant consumed in the same step as the check.
-        #[arg(long)]
+        /// Mark the warrant consumed in the same step as the check. Needs `--target`.
+        #[arg(long, requires = "target")]
         consume: bool,
         /// Output JSON.
         #[arg(long)]
@@ -128,10 +128,27 @@ fn may_receive_token(url: &str) -> bool {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    // Userinfo (`@`) would make the real host something else; a backslash is a
+    // path delimiter to some parsers, so the authority could end earlier there.
+    if authority.contains(['@', '\\']) {
+        return false;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        // `[v6]` or `[v6]:port`; anything else after the bracket is not a port.
+        Some(v6) => match v6.split_once(']') {
+            Some((h, "")) => (h, ""),
+            Some((h, tail)) => match tail.strip_prefix(':') {
+                Some(p) => (h, p),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => authority.rsplit_once(':').unwrap_or((authority, "")),
     };
+    // A port, if present, is digits only.
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
@@ -258,13 +275,29 @@ fn expiry_text(stored: &StoredOwnerGrant) -> &str {
 }
 
 fn state_text(stored: &StoredOwnerGrant) -> &'static str {
+    state_text_at(stored, now_unix_millis())
+}
+
+fn state_text_at(stored: &StoredOwnerGrant, now_ms: u64) -> &'static str {
+    let expired =
+        stored.grant.expires_at.as_deref().is_some_and(|text| {
+            fl_core::At::parse(text).is_ok_and(|at| at.unix_millis() <= now_ms)
+        });
     if stored.revoked_at.is_some() {
         "revoked"
-    } else if stored.consumed_at.is_some() {
+    } else if stored.grant.single_use && stored.consumed_at.is_some() {
         "consumed"
+    } else if expired {
+        "expired"
     } else {
         "open"
     }
+}
+
+fn now_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 pub fn run(cmd: AuthCmd) -> Result<i32, (i32, String)> {
@@ -446,6 +479,52 @@ mod tests {
         ));
     }
 
+    fn stored(single_use: bool, expires_at: Option<&str>) -> StoredOwnerGrant {
+        serde_json::from_value(json!({
+            "grant_id": "fgw-x",
+            "issued_by": "lmcfarlin",
+            "target_agent": "ferris",
+            "scope": "agent.replace",
+            "statement": "s",
+            "created_at": "2026-01-01T00:00:00.000Z",
+            "expires_at": expires_at,
+            "single_use": single_use,
+            "public_key_b64": "k",
+            "signature_b64": "s",
+            "compact_token": "flw1.x.y",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_state_shows_revoked_consumed_expired_or_open() {
+        let now = fl_core::At::parse("2026-06-01T00:00:00.000Z")
+            .unwrap()
+            .unix_millis();
+        let at = Some("2026-01-01T00:00:00.000Z".to_string());
+
+        assert_eq!(state_text_at(&stored(false, None), now), "open");
+        assert_eq!(
+            state_text_at(&stored(false, Some("2027-01-01T00:00:00.000Z")), now),
+            "open"
+        );
+        assert_eq!(
+            state_text_at(&stored(false, Some("2026-03-01T00:00:00.000Z")), now),
+            "expired"
+        );
+        // A plain grant that was "consumed" is still reusable.
+        let mut plain = stored(false, None);
+        plain.consumed_at = at.clone();
+        assert_eq!(state_text_at(&plain, now), "open");
+        let mut once = stored(true, None);
+        once.consumed_at = at.clone();
+        assert_eq!(state_text_at(&once, now), "consumed");
+        let mut revoked = stored(true, Some("2026-03-01T00:00:00.000Z"));
+        revoked.consumed_at = at.clone();
+        revoked.revoked_at = at;
+        assert_eq!(state_text_at(&revoked, now), "revoked");
+    }
+
     #[test]
     fn a_plain_terminal_may_issue_without_a_hub() {
         assert_eq!(
@@ -524,6 +603,12 @@ mod tests {
             "http://localhost.evil.com:80",
             "http://evil.com/127.0.0.1",
             "http://127.0.0.1@evil.com",
+            "http://127.0.0.1:80@evil.com",
+            "http://localhost:1@evil.com",
+            "http://127.0.0.1:80\\@evil.com",
+            "http://user:pw@127.0.0.1:80",
+            "http://127.0.0.1:abc",
+            "http://[::1]x",
             "ftp://127.0.0.1",
             "127.0.0.1:8420",
         ] {

@@ -10,6 +10,9 @@
 //! Vault is. A caller that needs more must gate [`issue_owner_grant`] itself (the hub does, with
 //! the bearer authority).
 //!
+//! `grant_id` is as much a capability as the token: by-id verify has the same power. Hiding
+//! `compact_token` from peers only stops copying the portable form.
+//!
 //! Two forms identify a warrant. The short `grant_id` is looked up in the ledger. The compact
 //! token `flw1.<payload>.<signature>` carries the signed fields, so it can be pasted into a
 //! message. Both are checked against the **pinned** ledger public key: a key that a token or a
@@ -221,20 +224,28 @@ fn write_ledger(path: &Path, ledger: &OwnerWarrantLedger) -> Result<(), GateErro
 }
 
 /// The Owner key pair from the Vault, created on first use.
-fn load_or_create_signing_key(vault: &mut Vault) -> Result<Ed25519KeyPair, GateError> {
+///
+/// `vault` may be stale, and two first-time issuers may both see the key as absent. So the key
+/// is inserted only if the disk copy lacks it (under the Vault lock), and then the Vault is
+/// re-opened from disk: whichever key won is the one every issuer reads back.
+fn load_or_create_signing_key(
+    vault: &mut Vault,
+    home_override: Option<&Path>,
+) -> Result<Ed25519KeyPair, GateError> {
     if vault.get_metadata(WARRANT_KEY_SECRET).is_none() {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| GateError::Crypto {
             reason: "failed to generate the Owner warrant Ed25519 key".to_string(),
         })?;
-        vault.set(SetSecretArgs {
+        vault.set_if_absent(SetSecretArgs {
             name: WARRANT_KEY_SECRET.to_string(),
             value: BASE64.encode(pkcs8.as_ref()),
             description: Some("Owner warrant Ed25519 signing key (PKCS#8)".to_string()),
             ..SetSecretArgs::default()
         })?;
+        // Our insert may have lost to another process; read the key that is on disk.
+        *vault = Vault::open_default(home_override)?;
     }
-    // Re-open: another process may have created the key first, and its copy is the one on disk.
     let (_meta, encoded) = vault.decrypt_raw(WARRANT_KEY_SECRET)?;
     let pkcs8 = BASE64
         .decode(encoded.trim())
@@ -341,7 +352,7 @@ fn issue_owner_grant_at(
     };
 
     let mut vault = Vault::open_default(home_override)?;
-    let key = load_or_create_signing_key(&mut vault)?;
+    let key = load_or_create_signing_key(&mut vault, home_override)?;
     let public_key_b64 = B64URL.encode(key.public_key().as_ref());
 
     let ledger_path = resolve_warrant_ledger_path(home_override);
@@ -490,7 +501,17 @@ fn verify_owner_grant_at(
     if id_or_token.is_empty() {
         return Err(bad_input("a grant id or token is required"));
     }
+    if consume && target_agent.is_none_or(|a| a.trim().is_empty()) {
+        // An unnamed caller could otherwise spend a single-use grant meant for another agent.
+        return Err(bad_input("consume needs a target agent"));
+    }
     let ledger_path = resolve_warrant_ledger_path(home_override);
+    // Without a ledger there is nothing to verify or spend; do not create the lock file for it.
+    if !ledger_path.exists() {
+        return Err(rejected(
+            "no warrant ledger exists; no grant has been issued",
+        ));
+    }
     // A consuming check reads and writes under the lock, so two callers cannot both win.
     let _lock = if consume {
         Some(VaultLock::acquire(&ledger_path)?)
@@ -594,7 +615,7 @@ fn verify_owner_grant_at(
             target_agent
                 .map(|a| a.trim().to_ascii_lowercase())
                 .filter(|a| !a.is_empty())
-                .unwrap_or_else(|| "unknown".to_string()),
+                .expect("consume needs a target agent, checked above"),
         );
         write_ledger(&ledger_path, &ledger)?;
         consumed = true;
@@ -613,6 +634,8 @@ pub fn owner_warrant_public_key(home_override: Option<&Path>) -> Result<Option<S
 
 /// Every grant in the ledger, oldest first. `active_only` leaves out revoked, consumed
 /// single-use and expired grants.
+///
+/// Listing does not check signatures; [`verify_owner_grant`] is the authority.
 pub fn list_owner_grants(
     home_override: Option<&Path>,
     active_only: bool,
@@ -657,6 +680,12 @@ fn revoke_owner_grant_at(
 ) -> Result<StoredOwnerGrant, GateError> {
     let grant_id = grant_id.trim();
     let ledger_path = resolve_warrant_ledger_path(home_override);
+    // Without a ledger there is nothing to revoke; do not create the lock file for it.
+    if !ledger_path.exists() {
+        return Err(rejected(
+            "no warrant ledger exists; no grant has been issued",
+        ));
+    }
     let _lock = VaultLock::acquire(&ledger_path)?;
     let mut ledger = read_ledger(&ledger_path)?
         .ok_or_else(|| rejected("no warrant ledger exists; no grant has been issued"))?;
@@ -961,8 +990,90 @@ mod tests {
 
         let plain = issue_owner_grant(Some(home.path()), args("ferris")).unwrap();
         for _ in 0..3 {
-            verify_owner_grant(Some(home.path()), &plain.grant.grant_id, None, true).unwrap();
+            verify_owner_grant(
+                Some(home.path()),
+                &plain.grant.grant_id,
+                Some("ferris"),
+                true,
+            )
+            .unwrap();
         }
+    }
+
+    #[test]
+    fn consume_needs_a_target_agent_and_touches_nothing_without_one() {
+        let home = TempDir::new().unwrap();
+        let once = issue_owner_grant(
+            Some(home.path()),
+            IssueGrantArgs {
+                single_use: true,
+                ..args("ferris")
+            },
+        )
+        .unwrap();
+        let id = &once.grant.grant_id;
+        for target in [None, Some(""), Some("  ")] {
+            let err = verify_owner_grant(Some(home.path()), id, target, true).unwrap_err();
+            assert!(
+                matches!(&err, GateError::WarrantInput { reason } if reason.contains("target agent")),
+                "{err}"
+            );
+        }
+        assert!(ledger_of(home.path()).grants[id].consumed_at.is_none());
+        verify_owner_grant(Some(home.path()), id, Some("ferris"), true).unwrap();
+    }
+
+    #[test]
+    fn verify_and_revoke_without_a_ledger_create_no_lock_file() {
+        let home = TempDir::new().unwrap();
+        let lock = resolve_warrant_ledger_path(Some(home.path()))
+            .parent()
+            .unwrap()
+            .join(crate::vault::LOCK_FILE_NAME);
+        let text = err_text(verify_owner_grant(
+            Some(home.path()),
+            "fgw-nope",
+            Some("ferris"),
+            true,
+        ));
+        assert!(text.contains("no warrant ledger"), "{text}");
+        let err = revoke_owner_grant(Some(home.path()), "fgw-nope").unwrap_err();
+        assert!(err.to_string().contains("no warrant ledger"), "{err}");
+        assert!(!lock.exists(), "the lock file was created");
+    }
+
+    #[test]
+    fn two_first_time_issuers_end_up_with_one_key() {
+        let home = TempDir::new().unwrap();
+        // Two independent handles, both opened before either creates the key.
+        let mut a = Vault::open_default(Some(home.path())).unwrap();
+        let mut b = Vault::open_default(Some(home.path())).unwrap();
+        assert!(a.get_metadata(WARRANT_KEY_SECRET).is_none());
+        assert!(b.get_metadata(WARRANT_KEY_SECRET).is_none());
+        let key_a = load_or_create_signing_key(&mut a, Some(home.path())).unwrap();
+        let key_b = load_or_create_signing_key(&mut b, Some(home.path())).unwrap();
+        assert_eq!(key_a.public_key().as_ref(), key_b.public_key().as_ref());
+
+        // A ledger pinned from one key verifies grants signed through the other: the full
+        // issue path (which opens its own Vault) must agree with what the loaders returned.
+        let pinned = B64URL.encode(key_a.public_key().as_ref());
+        put_ledger(
+            home.path(),
+            &OwnerWarrantLedger {
+                schema_version: WARRANT_SCHEMA_VERSION,
+                public_key_b64: pinned.clone(),
+                grants: BTreeMap::new(),
+            },
+        );
+        let stored = issue_owner_grant(Some(home.path()), args("ferris")).unwrap();
+        assert_eq!(stored.grant.public_key_b64, pinned);
+        verify_owner_grant(
+            Some(home.path()),
+            &stored.grant.grant_id,
+            Some("ferris"),
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1080,7 +1191,13 @@ mod tests {
         let mut ledger = ledger_of(home.path());
         ledger.grants.clear();
         put_ledger(home.path(), &ledger);
-        let ok = verify_owner_grant(Some(home.path()), &g.grant.compact_token, None, true).unwrap();
+        let ok = verify_owner_grant(
+            Some(home.path()),
+            &g.grant.compact_token,
+            Some("ferris"),
+            true,
+        )
+        .unwrap();
         assert!(!ok.in_ledger && !ok.consumed);
         let text = err_text(verify_owner_grant(
             Some(home.path()),
