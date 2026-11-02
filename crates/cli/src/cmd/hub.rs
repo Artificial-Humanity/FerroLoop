@@ -253,6 +253,53 @@ fn resolve_base_url(env: &StateEnv<'_>, url_override: Option<String>) -> String 
     format!("http://{}", listen.trim().trim_end_matches('/'))
 }
 
+/// The GitHub side of the Hub's server-verified PR merge and review (`fl_hub::github_pr`): every
+/// project bound to a GitHub tracker in `config.toml`, a user token from `$FL_GITHUB_TOKEN`,
+/// `$GITHUB_TOKEN` or `$GH_TOKEN`, and the Reviewer App from `$FL_GITHUB_APP_ID` +
+/// `$FL_GITHUB_PRIVATE_KEY_PATH` or `[github]`. `$FL_GITHUB_API_URL` is checked like the other
+/// `fl github` commands, because the credential is sent there.
+fn hub_github(
+    cfg: &crate::config::Config,
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Result<fl_hub::github_pr::HubGithub, (i32, String)> {
+    let get = |k: &str| get_env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let api_url = match get("FL_GITHUB_API_URL") {
+        None => None,
+        Some(url) => {
+            crate::api_override_host(&url).map_err(|e| (2, e.to_string()))?;
+            Some(url)
+        }
+    };
+    let mut repos = std::collections::BTreeMap::new();
+    for entry in &cfg.projects {
+        if let (Some(slug), Some(binding)) = (entry.inferred_slug(), entry.tracker.as_ref()) {
+            repos.insert(slug.to_ascii_lowercase(), binding.github.clone());
+        }
+    }
+    let token = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+        .into_iter()
+        .find_map(get);
+    let (app_id, private_key) = match (get("FL_GITHUB_APP_ID"), get("FL_GITHUB_PRIVATE_KEY_PATH")) {
+        (Some(id), Some(path)) => {
+            let id = id
+                .parse::<u64>()
+                .map_err(|_| (2, format!("invalid $FL_GITHUB_APP_ID `{id}`")))?;
+            (Some(id), Some(PathBuf::from(path)))
+        }
+        _ => match cfg.github.as_ref() {
+            Some(app) => (Some(app.app_id), Some(app.private_key.clone())),
+            None => (None, None),
+        },
+    };
+    Ok(fl_hub::github_pr::HubGithub {
+        api_url,
+        repos,
+        token,
+        app_id,
+        private_key,
+    })
+}
+
 fn cmd_serve(
     env: &StateEnv<'_>,
     listen_flag: Option<String>,
@@ -307,6 +354,7 @@ fn cmd_serve(
         ui_dir,
         owner_login: DEFAULT_OWNER_LOGIN.to_string(),
         reviewer_apps: crate::config::reviewer_apps(env.cfg.github.as_ref()),
+        github: hub_github(env.cfg, |k| std::env::var(k).ok())?,
         owner_token,
         peer_token,
         trust_tailscale_headers,

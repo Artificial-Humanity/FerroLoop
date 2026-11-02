@@ -30,11 +30,6 @@ use fl_core::ferrowire::{
 use fl_core::ids::{GateId, Kind, MessageId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
 use fl_core::log::{AttemptStatus, GateRun};
-use fl_core::pr_policy::{
-    DEFAULT_OWNER_LOGIN, FlReviewMarker, PrCommitSummary, PrReviewSummary, ReviewVerdict,
-    ReviewerApps, authorize_agent_action, authorize_agent_merge, evaluate_pr_policy,
-    format_review_body, verify_merge_approvals,
-};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
@@ -82,6 +77,7 @@ use crate::discovery::{
     read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
     snapshot_discovery_store, transcript_from_sessions,
 };
+use crate::github_pr;
 use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
 };
@@ -4183,7 +4179,9 @@ fn handle_dynamic_api_routes(
         };
     }
 
-    // /api/v1/prs/:number/review or /api/v1/prs/:number/merge
+    // /api/v1/prs/:number/review or /api/v1/prs/:number/merge, and the project-scoped merge
+    // /api/v1/projects/:project/prs/:number/merge and /api/v1/projects/:project/pr/merge.
+    // The Hub reads the pull request from GitHub; see `github_pr`.
     if segments.len() == 5 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "prs" {
         let Ok(number) = segments[3].parse::<u64>() else {
             return HttpResponse::json(400, json!({ "error": "invalid PR number" }));
@@ -4193,18 +4191,45 @@ fn handle_dynamic_api_routes(
         };
         match (method, segments[4]) {
             ("POST", "review") => {
-                return handle_post_pr_review(&store, authority, number, req);
+                return github_pr::handle_post_pr_review(state, &store, authority, number, req);
             }
             ("POST", "merge") => {
-                return handle_post_pr_merge(
+                return github_pr::handle_post_pr_merge(
+                    state,
                     &store,
                     authority,
-                    &state.config.reviewer_apps,
-                    number,
+                    Some(number),
+                    None,
                     req,
                 );
             }
             _ => {}
+        }
+    }
+    if method == "POST"
+        && segments.len() >= 6
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "projects"
+    {
+        let project = percent_decode(segments[3]);
+        let target = match (segments.len(), segments[4], segments[5]) {
+            (6, "pr", "merge") => Some(None),
+            (7, "prs", number) if segments[6] == "merge" => number.parse::<u64>().ok().map(Some),
+            _ => None,
+        };
+        if let Some(number) = target {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            return github_pr::handle_post_pr_merge(
+                state,
+                &store,
+                authority,
+                number,
+                Some(&project),
+                req,
+            );
         }
     }
 
@@ -5666,220 +5691,6 @@ fn read_command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<S
     };
     reader.join().ok()?;
     status.success().then_some(output)
-}
-
-fn handle_post_pr_review(
-    store: &AnyStore,
-    authority: &HubAuthority,
-    number: u64,
-    req: &HttpRequest,
-) -> HttpResponse {
-    #[derive(Deserialize, Default)]
-    struct PrReviewPayload {
-        verdict: Option<String>,
-        #[serde(default)]
-        approve: bool,
-        #[serde(default)]
-        request_changes: bool,
-        #[serde(default)]
-        body: String,
-        by: Option<String>,
-        project: Option<String>,
-        head_sha: Option<String>,
-        #[serde(default)]
-        commits: Vec<PrCommitSummary>,
-        #[serde(default)]
-        files: Vec<String>,
-    }
-
-    let payload: PrReviewPayload = match req.json() {
-        Ok(p) => p,
-        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
-    };
-
-    let verdict = if payload.approve
-        || payload.verdict.as_deref().is_some_and(|v| {
-            v.eq_ignore_ascii_case("approved") || v.eq_ignore_ascii_case("approve")
-        }) {
-        ReviewVerdict::Approved
-    } else if payload.request_changes
-        || payload.verdict.as_deref().is_some_and(|v| {
-            v.eq_ignore_ascii_case("changes_requested") || v.eq_ignore_ascii_case("request_changes")
-        })
-    {
-        ReviewVerdict::ChangesRequested
-    } else {
-        ReviewVerdict::Commented
-    };
-
-    let project_slug = payload
-        .project
-        .unwrap_or_else(|| "ferroloop".to_string())
-        .to_ascii_lowercase();
-    let head_sha = payload.head_sha.unwrap_or_else(|| "HEAD".to_string());
-    let agents = store.list_agents(None, true).unwrap_or_default();
-    let eval = evaluate_pr_policy(
-        &project_slug,
-        &payload.commits,
-        &payload.files,
-        &[],
-        &agents,
-        DEFAULT_OWNER_LOGIN,
-    );
-
-    let caller_name = payload
-        .by
-        .as_deref()
-        .unwrap_or_else(|| authority.actor_name())
-        .trim()
-        .to_ascii_lowercase();
-
-    if !authority.is_owner() {
-        let Some(caller) = agents
-            .iter()
-            .find(|a| a.status == AgentStatus::Active && a.name_key == caller_name)
-        else {
-            return HttpResponse::json(
-                403,
-                json!({ "error": format!("unknown or inactive agent `{caller_name}`") }),
-            );
-        };
-        if matches!(
-            verdict,
-            ReviewVerdict::Approved | ReviewVerdict::ChangesRequested
-        ) && let Err(refusal) = authorize_agent_action(&eval, caller)
-        {
-            return HttpResponse::json(
-                403,
-                json!({ "error": refusal.to_string(), "refusal": refusal }),
-            );
-        }
-        let marker = FlReviewMarker {
-            reviewer: caller.name_key.clone(),
-            role: caller.role.clone(),
-            project: eval.project.clone(),
-            head_sha: head_sha.clone(),
-            verdict,
-            at: stamp::now(),
-        };
-        let formatted_body = format_review_body(&payload.body, &marker);
-        return HttpResponse::json(
-            200,
-            json!({
-                "number": number,
-                "verdict": verdict,
-                "reviewer": caller.name_key,
-                "role": caller.role,
-                "head_sha": head_sha,
-                "body": formatted_body,
-                "policy": eval,
-            }),
-        );
-    }
-
-    HttpResponse::json(
-        200,
-        json!({
-            "number": number,
-            "verdict": verdict,
-            "reviewer": caller_name,
-            "head_sha": head_sha,
-            "body": payload.body,
-            "policy": eval,
-        }),
-    )
-}
-
-fn handle_post_pr_merge(
-    store: &AnyStore,
-    authority: &HubAuthority,
-    reviewer_apps: &ReviewerApps,
-    number: u64,
-    req: &HttpRequest,
-) -> HttpResponse {
-    #[derive(Deserialize, Default)]
-    struct PrMergePayload {
-        method: Option<String>,
-        by: Option<String>,
-        project: Option<String>,
-        head_sha: Option<String>,
-        #[serde(default)]
-        commits: Vec<PrCommitSummary>,
-        #[serde(default)]
-        files: Vec<String>,
-        #[serde(default)]
-        reviews: Vec<PrReviewSummary>,
-    }
-
-    let payload: PrMergePayload = match req.json() {
-        Ok(p) => p,
-        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
-    };
-
-    let project_slug = payload
-        .project
-        .unwrap_or_else(|| "ferroloop".to_string())
-        .to_ascii_lowercase();
-    let head_sha = payload.head_sha.unwrap_or_else(|| "HEAD".to_string());
-    let agents = store.list_agents(None, true).unwrap_or_default();
-    let eval = evaluate_pr_policy(
-        &project_slug,
-        &payload.commits,
-        &payload.files,
-        &[],
-        &agents,
-        DEFAULT_OWNER_LOGIN,
-    );
-
-    let caller_name = payload
-        .by
-        .as_deref()
-        .unwrap_or_else(|| authority.actor_name())
-        .trim()
-        .to_ascii_lowercase();
-
-    if !authority.is_owner() {
-        let Some(caller) = agents
-            .iter()
-            .find(|a| a.status == AgentStatus::Active && a.name_key == caller_name)
-        else {
-            return HttpResponse::json(
-                403,
-                json!({ "error": format!("unknown or inactive agent `{caller_name}`") }),
-            );
-        };
-        if let Err(refusal) = authorize_agent_merge(&eval, caller) {
-            return HttpResponse::json(
-                403,
-                json!({ "error": refusal.to_string(), "refusal": refusal }),
-            );
-        }
-        if let Err(refusal) = verify_merge_approvals(
-            &head_sha,
-            &eval,
-            &payload.reviews,
-            &agents,
-            DEFAULT_OWNER_LOGIN,
-            reviewer_apps,
-        ) {
-            return HttpResponse::json(
-                403,
-                json!({ "error": refusal.to_string(), "refusal": refusal }),
-            );
-        }
-    }
-
-    HttpResponse::json(
-        200,
-        json!({
-            "number": number,
-            "merged": true,
-            "method": payload.method.unwrap_or_else(|| "merge".to_string()),
-            "merged_by": caller_name,
-            "head_sha": head_sha,
-            "policy": eval,
-        }),
-    )
 }
 
 fn handle_post_workflow_step(

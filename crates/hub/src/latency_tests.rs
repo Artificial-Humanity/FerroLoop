@@ -26,6 +26,7 @@ pub(crate) fn hub_with_ferris(tmp: &TempDir, turns: usize) -> HubState {
         ui_dir: None,
         owner_login: "lmcfarlin".into(),
         reviewer_apps: ReviewerApps::default(),
+        github: crate::github_pr::HubGithub::default(),
         owner_token: Some("owner-tok-secret".into()),
         peer_token: Some("peer-tok-secret".into()),
         trust_tailscale_headers: false,
