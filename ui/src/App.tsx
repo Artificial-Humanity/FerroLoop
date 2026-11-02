@@ -1788,13 +1788,6 @@ export const App: React.FC<AppProps> = ({
             agentSettingsOpen={agentSettingsOpen}
             onOpenAgentSettings={() => setAgentSettingsOpen(true)}
             onCloseAgentSettings={() => setAgentSettingsOpen(false)}
-            splitView={splitView}
-            onToggleSplitView={handleToggleSplitView}
-            onOpenMobileRoster={() => {
-              setMobileRosterOpen((prev) => !prev);
-              setDesktopSidebarCollapsed((prev) => !prev);
-            }}
-            mobileSidebarOpen={mobileRosterOpen}
             onRefresh={() => {
               void refreshSessionsAndTranscript();
               void refreshWireAndRoster();

@@ -4,7 +4,6 @@ import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { ContextHeader, RightPanelHeader } from "../components/ContextHeader";
-import { ChatPane } from "../components/ChatPane";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import { PairingModal } from "../components/PairingModal";
 import {
@@ -525,12 +524,6 @@ describe("ContextHeader", () => {
           authority={{ tier: "owner", login: "lmcfarlin" }}
           wsConnected={true}
           onOpenPairingModal={onOpenPairingModal}
-        />
-        <ChatPane
-          agentName={ferris.name_key}
-          agentDisplayName={ferris.display_name}
-          sessionId="sess-1"
-          turns={[]}
           onOpenMobileRoster={onOpenMobileRoster}
         />
         <RightPanelHeader
