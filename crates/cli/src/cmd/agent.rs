@@ -16,7 +16,8 @@ use fl_core::telemetry::{
     liveness_agent_slug, liveness_record_slug,
 };
 use fl_hub::lifecycle::{
-    self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
+    self, DecommissionMode, LifecycleEnv, LifecycleError, RemodelMode, RemodelRequest,
+    SessionTarget, SpinUpRequest,
 };
 use serde::Serialize;
 
@@ -111,6 +112,35 @@ pub enum AgentCmd {
         mode: String,
         /// Author recording this decommission.
         #[arg(long)]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a session to another vendor, keeping its persona, project, role and worktree:
+    /// `prepare` asks it to hand off, `execute` (the default) tears it down and spins it up again.
+    Remodel {
+        /// Session id (`claude:felicity`) or persona.
+        session: String,
+        /// New vendor runtime (`claude`, `antigravity`, `codex`, `grok`, or `muse`).
+        #[arg(long)]
+        vendor: String,
+        /// Model on the new vendor (default: the vendor's own default, never the old model).
+        #[arg(long)]
+        model: Option<String>,
+        /// `prepare` (handoff prompt, status `decommissioning`) or `execute`.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Working directory for the new runtime (default: the session's own).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Node the new session runs on (default: the session's own).
+        #[arg(long = "node", visible_alias = "node-id")]
+        node_id: Option<String>,
+        /// Open a tmux runtime for the new session (default: as the session was).
+        #[arg(long, action = clap::ArgAction::Set)]
+        hosted: Option<bool>,
+        /// Author recording this remodel.
+        #[arg(long, default_value = "owner")]
         by: String,
         #[arg(long)]
         json: bool,
@@ -654,6 +684,65 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                     println!(
                         "no live route took the handshake; send this prompt to the session:\n{prompt}"
                     );
+                }
+            }
+            Ok(())
+        }
+        AgentCmd::Remodel {
+            session,
+            vendor,
+            model,
+            mode,
+            cwd,
+            node_id,
+            hosted,
+            by,
+            json,
+        } => {
+            let req = RemodelRequest {
+                vendor,
+                model,
+                mode,
+                cwd,
+                node_id,
+                hosted,
+            };
+            let target =
+                SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
+            // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
+            let out = lifecycle::remodel_session(
+                store,
+                &LifecycleEnv::new(None),
+                &target,
+                &req,
+                &by,
+                lifecycle::Caller::Owner,
+                |_| {},
+            )
+            .map_err(lifecycle_failure)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else if out.mode == RemodelMode::Prepare {
+                println!(
+                    "{}\t{}\thandshake_dispatched={}",
+                    out.session_id, out.status, out.handshake_dispatched
+                );
+                if let (false, Some(prompt)) = (out.handshake_dispatched, &out.prompt) {
+                    println!(
+                        "no live route took the handshake; send this prompt to the session:\n{prompt}"
+                    );
+                }
+            } else {
+                println!(
+                    "{}\t{}\t{}\thydration_dispatched={}\tremodeled_from={}",
+                    out.session_id,
+                    out.status,
+                    out.tmux_target.as_deref().unwrap_or("-"),
+                    out.hydration_dispatched,
+                    out.previous_session_id
+                );
+                for warning in &out.warnings {
+                    eprintln!("warning: {warning}");
                 }
             }
             Ok(())

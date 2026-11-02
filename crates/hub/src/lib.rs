@@ -700,6 +700,9 @@ impl HubState {
 mod latency_tests;
 
 #[cfg(test)]
+mod remodel_api_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use fl_core::model::State;

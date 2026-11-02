@@ -1,4 +1,4 @@
-//! Black-box tests for `fl agent spin-up` and `fl agent decommission`, each in a private home,
+//! Black-box tests for `fl agent spin-up`, `decommission` and `remodel`, each in a private home,
 //! store and route table, with real `tmux` spawning switched off.
 
 use assert_cmd::Command;
@@ -363,4 +363,138 @@ fn decommission_prepare_then_teardown_retires_the_agent_and_removes_the_route() 
             .get("felicity")
             .is_none()
     );
+}
+
+impl Env {
+    fn remodel(&self, session: &str, extra: &[&str]) -> Command {
+        let mut c = self.fl();
+        c.args(["agent", "remodel", session]).args(extra);
+        c
+    }
+}
+
+#[test]
+fn remodel_execute_moves_the_persona_to_another_vendor_in_json_and_text() {
+    let env = Env::new();
+    let worktree = env.path().join("worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let worktree = worktree.display().to_string();
+    env.spin_up("felicity", "assistant", "claude")
+        .args(["--model", "claude-opus-5-5", "--cwd", &worktree])
+        .assert()
+        .success();
+
+    let mut c = env.remodel("claude:felicity", &["--vendor", "codex", "--json"]);
+    c.args(["--model", "gpt-6-sol", "--by", "owner"]);
+    let out = Env::json_of(c);
+    assert_eq!(out["mode"], "execute");
+    assert_eq!(out["session_id"], "codex:felicity");
+    assert_eq!(out["previous_session_id"], "claude:felicity");
+    assert_eq!(out["persona"], "felicity");
+    assert_eq!(out["project"], "FerroLoop");
+    assert_eq!(out["role"], "assistant");
+    assert_eq!(out["from_vendor"], "claude");
+    assert_eq!(out["vendor"], "codex");
+    assert_eq!(out["model"], "gpt-6-sol");
+    assert_eq!(out["cwd"], worktree.as_str());
+    assert_eq!(out["status"], "running");
+    assert_eq!(out["tmux_target"], "Felicity:codex");
+    assert_eq!(out["hydration_dispatched"], false);
+    assert_eq!(out["handoff"], "remodel-felicity");
+
+    let roster = env.roster(false);
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["name_key"], "felicity");
+    assert_eq!(roster[0]["role"], "assistant");
+    let records = env.hosted_records();
+    let by_id = |id: &str| records.iter().find(|r| r["session_id"] == id).unwrap();
+    assert_eq!(by_id("claude:felicity")["status"], "decommissioned");
+    assert_eq!(by_id("codex:felicity")["status"], "running");
+    assert_eq!(by_id("codex:felicity")["cwd"], worktree.as_str());
+
+    // The text form, like spin-up's, names the old session too. `--by` defaults to `owner`.
+    env.remodel("felicity", &["--vendor", "grok", "--node", "ai-lab-0"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "grok:felicity\trunning\tFelicity:grok\thydration_dispatched=false\t\
+             remodeled_from=codex:felicity",
+        ));
+
+    // The handoff entry is in the store for the next session to read.
+    let mut c = env.fl();
+    c.args(["state", "list", "--concern", "handoff", "--json"]);
+    let handoffs = Env::json_of(c);
+    let entry = handoffs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["slug"] == "remodel-felicity")
+        .unwrap();
+    assert_eq!(
+        entry["payload"]["handoff"]["summary"],
+        "Remodel of felicity: codex -> grok (remodeled)"
+    );
+}
+
+#[test]
+fn remodel_prepare_prints_the_undelivered_handshake_and_stops_nothing() {
+    let env = Env::new();
+    env.spin_up("felicity", "assistant", "claude")
+        .assert()
+        .success();
+    env.write_webhook_route("felicity");
+
+    let out = Env::json_of(env.remodel(
+        "claude:felicity",
+        &["--vendor", "codex", "--mode", "prepare", "--json"],
+    ));
+    assert_eq!(out["mode"], "prepare");
+    assert_eq!(out["status"], "decommissioning");
+    assert_eq!(out["session_id"], "claude:felicity");
+    assert_eq!(out["handshake_dispatched"], false);
+    assert!(out["prompt"].as_str().unwrap().contains("fl state handoff"));
+
+    env.remodel("felicity", &["--vendor", "codex", "--mode", "prepare"])
+        .assert()
+        .success()
+        .stdout(
+            contains("claude:felicity\tdecommissioning\thandshake_dispatched=false")
+                .and(contains("no live route took the handshake")),
+        );
+    assert_eq!(env.hosted_records()[0]["status"], "decommissioning");
+    assert_eq!(env.roster(false)[0]["status"], "active");
+}
+
+#[test]
+fn remodel_rejects_bad_fields_and_unknown_sessions_without_touching_the_store() {
+    let env = Env::new();
+    env.spin_up("felicity", "assistant", "claude")
+        .assert()
+        .success();
+    env.remodel("claude:felicity", &["--vendor", "gemini"])
+        .assert()
+        .code(1)
+        .stderr(contains(
+            "vendor must be one of: claude, antigravity, codex, grok, muse",
+        ));
+    env.remodel("claude:felicity", &["--vendor", "codex", "--mode", "wipe"])
+        .assert()
+        .code(1)
+        .stderr(contains("mode must be \"prepare\" or \"execute\""));
+    env.remodel(
+        "claude:felicity",
+        &["--vendor", "codex", "--cwd", "/no/such/dir"],
+    )
+    .assert()
+    .code(1)
+    .stderr(contains("cwd `/no/such/dir` is not a directory"));
+    env.remodel("ghost", &["--vendor", "codex"])
+        .assert()
+        .code(1)
+        .stderr(contains("no hosted session or agent record for `ghost`"));
+    let records = env.hosted_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "running");
+    assert_eq!(env.roster(false)[0]["status"], "active");
 }
