@@ -285,19 +285,32 @@ const AGY_HINT_MAX: usize = 256;
 type AgyHintMap = std::collections::BTreeMap<(String, String), AgyHint>;
 static AGY_HINTS: Mutex<AgyHintMap> = Mutex::new(std::collections::BTreeMap::new());
 
+/// Store `hint` for `key`, bounding the map. The caller holds the `AGY_HINTS` guard.
+fn agy_store_hint(hints: &mut AgyHintMap, key: (String, String), hint: AgyHint) {
+    if hints.len() >= AGY_HINT_MAX && !hints.contains_key(&key) {
+        hints.clear();
+    }
+    hints.insert(key, hint);
+}
+
+fn agy_clean(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Fill the fields `target` lacks from the hint stored for its session and store the merge
 /// back. A field `target` has replaces the stored one; a missing field never erases it.
 /// Hints are scoped to `home_override`, so another home never inherits them.
+///
+/// Where neither the caller nor an earlier read knows the model (a watch or transcript read
+/// on a cold hub), the model stays `None` and the quota group defaults to `gemini-*`. That is
+/// accepted: the model is only learned by a full discovery pass, and is not guessed here.
 fn agy_resolve_hint(home_override: Option<&Path>, target: &AgyQuotaTarget<'_>) -> AgyHint {
-    let clean = |v: Option<&str>| {
-        v.map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-    };
     let mut merged = AgyHint {
-        address: clean(target.address),
-        csrf: clean(target.csrf),
-        model: clean(target.model),
+        address: agy_clean(target.address),
+        csrf: agy_clean(target.csrf),
+        model: agy_clean(target.model),
     };
     let Some(session) = target.session.map(str::trim).filter(|s| !s.is_empty()) else {
         return merged;
@@ -310,12 +323,33 @@ fn agy_resolve_hint(home_override: Option<&Path>, target: &AgyQuotaTarget<'_>) -
         merged.model = merged.model.or_else(|| stored.model.clone());
     }
     if merged.address.is_some() || merged.csrf.is_some() || merged.model.is_some() {
-        if hints.len() >= AGY_HINT_MAX && !hints.contains_key(&key) {
-            hints.clear();
-        }
-        hints.insert(key, merged.clone());
+        agy_store_hint(&mut hints, key, merged.clone());
     }
     merged
+}
+
+/// Record the language-server address and token a route names for `session`, whether or not
+/// the caller reads a quota now, so a later watch or transcript read finds them. A field the
+/// route has replaces the stored one (a restarted language server gets a new endpoint); a
+/// field it lacks never erases a stored one; the remembered model is per conversation and is
+/// left alone.
+pub(crate) fn remember_agy_endpoint(
+    home_override: Option<&Path>,
+    session: &str,
+    address: Option<&str>,
+    csrf: Option<&str>,
+) {
+    let (address, csrf) = (agy_clean(address), agy_clean(csrf));
+    let session = session.trim();
+    if session.is_empty() || (address.is_none() && csrf.is_none()) {
+        return;
+    }
+    let key = (home_key(home_override), session.to_string());
+    let mut hints = AGY_HINTS.lock().unwrap_or_else(|err| err.into_inner());
+    let mut hint = hints.get(&key).cloned().unwrap_or_default();
+    hint.address = address.or(hint.address);
+    hint.csrf = csrf.or(hint.csrf);
+    agy_store_hint(&mut hints, key, hint);
 }
 
 pub(crate) fn agy_account_quota(
@@ -2285,6 +2319,182 @@ mod tests {
             let other = tempfile::tempdir().unwrap();
             assert_eq!(agy_account_quota(Some(other.path()), &session_only), None);
             stub.shutdown();
+        });
+    }
+
+    fn write_agy_route(home: &Path, conv: &str, endpoint: Option<(&str, &str)>) {
+        let routes = home.join(".cache").join("agent-bus").join("routes.json");
+        fs::create_dir_all(routes.parent().unwrap()).unwrap();
+        let ls = endpoint
+            .map(|(addr, csrf)| format!(r#","ls_address":"{addr}","csrf_token":"{csrf}""#))
+            .unwrap_or_default();
+        fs::write(
+            &routes,
+            format!(
+                r#"{{"entries":{{"ferris":{{"persona":"ferris","updated_at":"2026-10-29T00:00:00.000Z",
+                "route":{{"kind":"agy","conversation_id":"{conv}"{ls}}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn cold_discovery_pass(home: &Path) {
+        let snap = crate::discovery::DiscoveryStoreSnapshot::default();
+        let found = crate::discovery::discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(found.iter().any(|s| s.persona.as_deref() == Some("ferris")));
+    }
+
+    #[test]
+    fn cold_watch_discovery_remembers_the_route_endpoint_without_model_info() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            write_agy_route(home, "agy-cold-1", Some((&addr, "stub-csrf")));
+            expire_direct_quota_cache();
+            // No `discover_sessions_with_home` first: only the id-lookup discovery the watch
+            // summary runs, which makes no quota read of its own.
+            cold_discovery_pass(home);
+            assert!(stub.calls().is_empty(), "the lookup pass reads no quota");
+            let q = crate::discovery::quota_for_resolved_route(
+                "antigravity",
+                None,
+                Some(home),
+                "agy-cold-1",
+            )
+            .expect("the remembered route serves the cold watch read");
+            // The model is unknown on this path, so the group defaults to `gemini-*`.
+            assert_eq!(q.tier.as_deref(), Some("pro"));
+            assert_eq!(
+                q.primary_window.as_ref().unwrap().resets_at_ms,
+                Some(ms("2026-11-01T06:46:15Z"))
+            );
+            assert!(
+                stub.calls().iter().all(|(_, csrf)| csrf == "stub-csrf"),
+                "{:?}",
+                stub.calls()
+            );
+            assert!(!stub.calls().is_empty());
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn cold_by_id_transcript_read_uses_the_saved_route() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let conv = "agy-cold-2";
+            let logs = home
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("brain")
+                .join(conv)
+                .join(".system_generated")
+                .join("logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(
+                logs.join("transcript.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"ERROR_MESSAGE","error":"disk full"})
+                ),
+            )
+            .unwrap();
+            write_agy_route(home, conv, Some((&addr, "stub-csrf")));
+            expire_direct_quota_cache();
+            // Nothing ran a discovery pass: the by-id read finds the route itself.
+            let q = crate::discovery::read_session_quota_usage_locked(conv, Some(home))
+                .expect("live quota from the route");
+            assert_eq!(q.tier.as_deref(), Some("pro"));
+            assert_eq!(
+                q.primary_window.as_ref().unwrap().resets_at_ms,
+                Some(ms("2026-11-01T06:46:15Z"))
+            );
+            assert_eq!(q.exhausted_reason, None);
+            assert!(!stub.calls().is_empty());
+            assert!(stub.calls().iter().all(|(_, csrf)| csrf == "stub-csrf"));
+
+            // Without a route nothing is known about the endpoint, as before.
+            let bare = tempfile::tempdir().unwrap();
+            let logs = bare
+                .path()
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("brain")
+                .join(conv)
+                .join(".system_generated")
+                .join("logs");
+            fs::create_dir_all(&logs).unwrap();
+            fs::write(logs.join("transcript.jsonl"), "{}\n").unwrap();
+            assert_eq!(
+                crate::discovery::read_session_quota_usage_locked(conv, Some(bare.path())),
+                None
+            );
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn restarted_language_server_replaces_the_endpoint_and_keeps_the_model() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let old = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let new = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let old_addr = format!("127.0.0.1:{}", old.port);
+            let new_addr = format!("127.0.0.1:{}", new.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let conv = "agy-restart-1";
+            write_agy_route(home, conv, Some((&old_addr, "csrf-old")));
+            expire_direct_quota_cache();
+            cold_discovery_pass(home);
+            // A full pass elsewhere learned the model of this conversation.
+            agy_resolve_hint(
+                Some(home),
+                &AgyQuotaTarget {
+                    model: Some("claude-opus-5-5"),
+                    session: Some(conv),
+                    ..Default::default()
+                },
+            );
+            let watch = || {
+                expire_direct_quota_cache();
+                crate::discovery::quota_for_resolved_route("antigravity", None, Some(home), conv)
+            };
+            let claude_5h = Some(ms("2026-11-01T07:10:39Z"));
+            let first = watch().expect("old endpoint");
+            assert_eq!(
+                first.primary_window.as_ref().unwrap().resets_at_ms,
+                claude_5h
+            );
+            assert!(!old.calls().is_empty() && new.calls().is_empty());
+
+            // The language server restarted: new address and token in the route table.
+            write_agy_route(home, conv, Some((&new_addr, "csrf-new")));
+            cold_discovery_pass(home);
+            let old_before = old.calls().len();
+            let second = watch().expect("new endpoint");
+            assert_eq!(second, first, "the remembered model is kept");
+            assert_eq!(old.calls().len(), old_before, "the old stub is not asked");
+            assert!(!new.calls().is_empty());
+            assert!(new.calls().iter().all(|(_, csrf)| csrf == "csrf-new"));
+
+            // A route that names no endpoint never wipes the stored one.
+            write_agy_route(home, conv, None);
+            cold_discovery_pass(home);
+            let new_before = new.calls().len();
+            let third = watch().expect("endpoint survives an empty route");
+            assert_eq!(third, first);
+            assert!(new.calls().len() > new_before);
+            assert_eq!(old.calls().len(), old_before);
+            old.shutdown();
+            new.shutdown();
         });
     }
 

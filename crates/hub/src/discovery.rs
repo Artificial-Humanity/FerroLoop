@@ -689,6 +689,14 @@ fn discover_sessions_impl(
                 csrf_token,
                 ..
             } => {
+                // Remember the endpoint whatever the caller reads now: the watch and
+                // transcript quota reads never run a model-info pass, yet need it.
+                crate::direct_quota::remember_agy_endpoint(
+                    home_override,
+                    conversation_id,
+                    ls_address.as_deref(),
+                    csrf_token.as_deref(),
+                );
                 agy_endpoints.insert(
                     conversation_id.clone(),
                     (ls_address.clone(), csrf_token.clone()),
@@ -2260,16 +2268,53 @@ fn quota_usage_with_reads_locked(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
     let tpath = find_transcript_file_in_home(&home, trimmed)?;
     let adapter = adapter_for_transcript(Path::new(&tpath))?;
+    // An Antigravity session's language server comes from its route; a restarted one has a new
+    // address and token, so the route wins over what an earlier read stored. The model is not
+    // known here, so the stored hint (or the `gemini-*` default) supplies it.
+    let (address, csrf) = if adapter == "antigravity" {
+        agy_route_endpoint(home_override, trimmed)
+    } else {
+        (None, None)
+    };
     quota_for_resolved_route_locked(
         &adapter,
         Some(&tpath),
         home_override,
         files,
         &crate::direct_quota::AgyQuotaTarget {
+            address: address.as_deref(),
+            csrf: csrf.as_deref(),
+            model: None,
             session: Some(trimmed),
-            ..Default::default()
         },
     )
+}
+
+/// The language-server address and token the saved route table names for Antigravity conversation
+/// `conversation_id`, or `(None, None)` when no route matches.
+fn agy_route_endpoint(
+    home_override: Option<&Path>,
+    conversation_id: &str,
+) -> (Option<String>, Option<String>) {
+    // The host's shared scan is cached; a home override has no cache, so read its saved table
+    // (one file) rather than scan it again. The by-id endpoints budget one scan per request.
+    let routes = match route_table_path(home_override) {
+        Some(path) => RouteTable::load(Some(&path)),
+        None => discovered_route_table(None),
+    };
+    routes
+        .entries
+        .values()
+        .find_map(|entry| match &entry.route {
+            VendorRoute::Agy {
+                conversation_id: id,
+                ls_address,
+                csrf_token,
+                ..
+            } if id == conversation_id => Some((ls_address.clone(), csrf_token.clone())),
+            _ => None,
+        })
+        .unwrap_or((None, None))
 }
 
 /// Quota for a route row whose transcript path is already known.
