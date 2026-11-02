@@ -857,6 +857,10 @@ export interface ChatPaneProps {
   agentSettingsOpen?: boolean;
   onOpenAgentSettings?: () => void;
   onCloseAgentSettings?: () => void;
+  splitView?: boolean;
+  onToggleSplitView?: () => void;
+  onOpenMobileRoster?: () => void;
+  mobileSidebarOpen?: boolean;
   onRefresh?: () => void;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
@@ -920,6 +924,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   agentSettingsOpen,
   onOpenAgentSettings,
   onCloseAgentSettings,
+  splitView = false,
+  onToggleSplitView,
+  onOpenMobileRoster,
+  mobileSidebarOpen = false,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -2106,6 +2114,47 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             minWidth: 0,
           }}
         >
+          {onOpenMobileRoster && (
+            <button
+              type="button"
+              className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
+              onClick={onOpenMobileRoster}
+              aria-label="Toggle Agent Roster"
+              title="Toggle Agent Roster"
+              aria-expanded={mobileSidebarOpen}
+              data-testid="mobile-sidebar-toggle-btn"
+              style={{ flexShrink: 0 }}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect
+                  x="1.5"
+                  y="2.5"
+                  width="13"
+                  height="11"
+                  rx="2"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <line
+                  x1="6.5"
+                  y1="2.5"
+                  x2="6.5"
+                  y2="13.5"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <rect
+                  x="2.2"
+                  y="3.2"
+                  width="3.6"
+                  height="9.6"
+                  rx="0.8"
+                  fill="currentColor"
+                  fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
+                />
+              </svg>
+            </button>
+          )}
           <input
             type="search"
             name="fd-transcript-filter"
@@ -2126,6 +2175,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           <span
             className="fd-badge"
             data-testid="session-busy-badge"
+            title={
+              effectiveIsBusy
+                ? "Agent session is actively working"
+                : "Agent session is idle"
+            }
             style={{
               backgroundColor: effectiveIsBusy
                 ? "rgba(245, 158, 11, 0.16)"
@@ -2184,6 +2238,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             <button
               type="button"
               className="fd-btn"
+              data-testid="chat-refresh-btn"
+              aria-label={effectiveLoading ? "Syncing..." : "Refresh"}
+              title={effectiveLoading ? "Syncing..." : "Refresh"}
               onClick={() => {
                 if (onRefresh) {
                   onRefresh();
@@ -2193,7 +2250,34 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               }}
               disabled={effectiveLoading}
             >
-              {effectiveLoading ? "Syncing..." : "Refresh"}
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path
+                  d="M13.5 8A5.5 5.5 0 0 1 3.7 11.45"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M2.5 8A5.5 5.5 0 0 1 12.3 4.55"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                />
+                <polyline
+                  points="10.2 4.8 12.5 4.7 12.2 2.4"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <polyline
+                  points="5.8 11.2 3.5 11.3 3.8 13.6"
+                  stroke="currentColor"
+                  strokeWidth="1.45"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </button>
           )}
           <button
@@ -2203,6 +2287,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             title="Scroll to latest turn"
           >
             ↓ Latest
+          </button>
+          <button
+            type="button"
+            data-testid="split-view-toggle"
+            className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+            onClick={() => onToggleSplitView?.()}
+            title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+            aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+            aria-pressed={splitView}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
+              <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
+              <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
+            </svg>
           </button>
         </div>
       </div>

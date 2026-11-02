@@ -361,10 +361,10 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
 
     render(<App apiClient={client} wsClient={fakeWs} />);
 
-    const projectNav = await screen.findByTestId("tier-project-nav");
-    const boardTabBtn = within(projectNav).getByRole("tab", {
-      name: /^Records & Board$/i,
-    });
+    await screen.findByTestId("tier-agent-nav");
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    const rightHeader = screen.getByTestId("right-panel-header");
+    const boardTabBtn = within(rightHeader).getByTestId("right-panel-tab-board");
     fireEvent.click(boardTabBtn);
 
     expect(
