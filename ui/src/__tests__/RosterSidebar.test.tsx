@@ -370,9 +370,10 @@ describe("RosterSidebar", () => {
     expect(agentCog).toHaveClass("fd-gear-btn", "fd-roster-gear-btn");
     expect(agentCog).not.toHaveClass("fd-btn");
     expect(agentCog.style.background).toBe("transparent");
-    expect(agentCog.style.width).toBe("24px");
-    expect(agentCog.style.height).toBe("24px");
-    expect(agentCog.style.fontSize).toBe("14px");
+    // Touch-sized hit area (36px) with a 20px glyph; negative margin keeps the row height.
+    expect(agentCog.style.width).toBe("36px");
+    expect(agentCog.style.height).toBe("36px");
+    expect(agentCog.style.fontSize).toBe("20px");
     expect(agentCog.style.color).toBe("var(--text-muted)");
     expect(agentCog).toHaveTextContent("⚙");
 
