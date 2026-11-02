@@ -4461,7 +4461,16 @@ mod tests {
             .map(|r| r["name"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["claude", "codex", "grok", "agy", "muse"]);
-        assert_eq!(matrix["vault_providers"].as_array().unwrap().len(), 5);
+        assert_eq!(matrix["vault_providers"].as_array().unwrap().len(), 6);
+        // The registered vendor catalog rides along, sorted by id.
+        let vendors: Vec<_> = matrix["vendors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(vendors.windows(2).all(|w| w[0] < w[1]), "{vendors:?}");
+        assert!(vendors.iter().any(|v| v == "kimi-api"), "{vendors:?}");
         assert!(
             matrix["vault_providers"]
                 .as_array()

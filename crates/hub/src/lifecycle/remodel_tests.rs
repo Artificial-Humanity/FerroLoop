@@ -12,6 +12,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         home_override: Some(home.path()),
         spawn_runtime: false,
         runtime: &TmuxRuntime,
+        key_probe: &ProvisionedKeys,
     }
 }
 

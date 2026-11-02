@@ -168,7 +168,8 @@ fn spin_up_rejects_each_invalid_field_without_touching_the_store() {
         .assert()
         .code(1)
         .stderr(contains(
-            "vendor must be one of: claude, antigravity, codex, grok, muse",
+            "vendor must be one of: anthropic-api, antigravity, claude, codex, gemini-api, grok, \
+kimi-api, lemonade, muse, ollama, openai-api, openrouter-api, xai-api",
         ));
     env.fl()
         .args(["agent", "spin-up", "felicity", "--project", " "])
@@ -477,7 +478,8 @@ fn remodel_rejects_bad_fields_and_unknown_sessions_without_touching_the_store() 
         .assert()
         .code(1)
         .stderr(contains(
-            "vendor must be one of: claude, antigravity, codex, grok, muse",
+            "vendor must be one of: anthropic-api, antigravity, claude, codex, gemini-api, grok, \
+kimi-api, lemonade, muse, ollama, openai-api, openrouter-api, xai-api",
         ));
     env.remodel("claude:felicity", &["--vendor", "codex", "--mode", "wipe"])
         .assert()

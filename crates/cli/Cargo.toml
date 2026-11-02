@@ -32,4 +32,5 @@ fl-github = { path = "../github", features = ["fake"] }
 fl-mcp = { path = "../mcp", features = ["fake"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
+tiny_http.workspace = true
 predicates.workspace = true

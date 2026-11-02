@@ -112,8 +112,8 @@ pub use store::{
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
 pub use vendor::{
-    ApiDialect, VendorDescriptor, VendorError, VendorRegistry, VendorTransport, lookup_vendor,
-    register_vendor, validate_api_base_url,
+    ApiDialect, VendorDescriptor, VendorError, VendorRegistry, VendorTransport,
+    ensure_vendor_registered, lookup_vendor, register_vendor, validate_api_base_url,
 };
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{

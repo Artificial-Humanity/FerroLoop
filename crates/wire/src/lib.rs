@@ -5,4 +5,5 @@ pub mod daemon;
 pub mod dispatcher;
 pub mod identity;
 pub mod peer;
+pub mod scanner;
 pub mod ws;

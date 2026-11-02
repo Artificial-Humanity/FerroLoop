@@ -32,7 +32,7 @@ pub use fl_core::workflow::{SelectedStepAgent, select_step_agent, validate_revie
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::AnyAdapter;
+use crate::adapters::{AdapterBuild, AnyAdapter};
 use crate::decision;
 use crate::evaluate::{GateReport, TransitionReport, run_single_gate_with_regret};
 use crate::population::{ExecError, refused_publish};
@@ -850,11 +850,47 @@ fn commit_step_snapshot(
     Ok(workflows.update_workflow_run(fresh)?)
 }
 
+/// What a step's `adapter` names: one of the five CLIs, or another registered vendor.
+enum StepTarget {
+    Kind(AdapterKind),
+    Vendor(String),
+}
+
+impl StepTarget {
+    /// The string recorded as the step's `adapter_used` and on its attempt.
+    fn wire(&self) -> &str {
+        match self {
+            Self::Kind(kind) => kind.as_wire(),
+            Self::Vendor(id) => id,
+        }
+    }
+}
+
+/// Gives the [`AdapterBuild`] for a registered vendor that is not one of the five CLIs: its
+/// model, base URL, rate card and key source. It is asked once per step that runs such a vendor,
+/// and its answer is the whole build (the options' `binary_override` and `rate_card` are the CLIs').
+pub type StepBuildHook<'a> = dyn Fn(&str) -> AdapterBuild + Send + Sync + 'a;
+
 /// Execute (or dispatch a FerroWire task offer for) an active step in `run_id` (spec §3.3).
+///
+/// A step's adapter is one of the five CLIs or any other vendor in the vendor registry. Such a
+/// vendor is built with [`AnyAdapter::from_vendor_id`] and the environment-variable key; use
+/// [`execute_workflow_step_with`] to supply its model, base URL, rate card and key source.
 pub fn execute_workflow_step(
     env: WorkflowEnv<'_>,
     run_id: &WorkflowRunId,
     options: &StepExecutionOptions,
+) -> Result<StepExecutionReport, WorkflowExecError> {
+    execute_workflow_step_with(env, run_id, options, None)
+}
+
+/// [`execute_workflow_step`], with `build_hook` supplying the [`AdapterBuild`] of a vendor that
+/// is not one of the five CLIs (see [`StepBuildHook`]). The five CLIs ignore the hook.
+pub fn execute_workflow_step_with(
+    env: WorkflowEnv<'_>,
+    run_id: &WorkflowRunId,
+    options: &StepExecutionOptions,
+    build_hook: Option<&StepBuildHook<'_>>,
 ) -> Result<StepExecutionReport, WorkflowExecError> {
     let mut run = env
         .workflows
@@ -1018,12 +1054,23 @@ pub fn execute_workflow_step(
         })
         .unwrap_or_else(|| "claude".to_string());
 
-    let Some(adapter_kind) = AdapterKind::from_wire(&raw_adapter) else {
+    // ⚠ The five CLI names resolve first, so a registered vendor can never shadow one.
+    let target = if let Some(kind) = AdapterKind::from_wire(&raw_adapter) {
+        StepTarget::Kind(kind)
+    } else if let Some(vendor) = fl_core::lookup_vendor(&raw_adapter) {
+        // `Claude` is `claude`: the registry compares without case, so a CLI spelled another way
+        // is still the CLI and keeps its binary and rate card.
+        match AdapterKind::from_wire(&vendor.id) {
+            Some(kind) => StepTarget::Kind(kind),
+            None => StepTarget::Vendor(vendor.id),
+        }
+    } else {
         return Err(AttemptError::UnknownAdapter(raw_adapter).into());
     };
+    let adapter_wire = target.wire().to_string();
 
     if let Some(ref ag) = assigned_agent {
-        validate_reviewer_independence(&def, &run, &step_id, ag, Some(adapter_kind.as_wire()))?;
+        validate_reviewer_independence(&def, &run, &step_id, ag, Some(&adapter_wire))?;
     }
 
     let project = env
@@ -1061,7 +1108,7 @@ pub fn execute_workflow_step(
     {
         let step = run.steps.get_mut(&step_id).expect("step exists");
         step.state = State::Doing;
-        step.adapter_used = Some(adapter_kind.as_wire().to_string());
+        step.adapter_used = Some(adapter_wire.clone());
     }
 
     let budget_usd_micros = step_def
@@ -1085,7 +1132,22 @@ pub fn execute_workflow_step(
                 .enable_all()
                 .build()
                 .expect("tokio current_thread runtime builds");
-            let adapter = AnyAdapter::new(adapter_kind, binary_override, rate_card);
+            let adapter = match &target {
+                StepTarget::Kind(kind) => AnyAdapter::new(*kind, binary_override, rate_card),
+                StepTarget::Vendor(id) => {
+                    // ⚠ With a hook, the hook is the whole build: `options.binary_override` and
+                    // `options.rate_card` are the five CLIs' settings and are not lent to a vendor.
+                    let build = match build_hook {
+                        Some(hook) => hook(id),
+                        None => AdapterBuild {
+                            binary_override,
+                            rate_card,
+                            ..AdapterBuild::default()
+                        },
+                    };
+                    AnyAdapter::from_vendor_id(id, build)?
+                }
+            };
             rt.block_on(adapter.attempt(spec))
         })
         .join()
@@ -1099,7 +1161,7 @@ pub fn execute_workflow_step(
         at: Some(now.clone()),
         project: run.project.clone(),
         record: record_id.clone(),
-        adapter: adapter_kind.as_wire().to_string(),
+        adapter: adapter_wire.clone(),
         status: outcome.status,
         duration_ms: outcome.duration_ms,
         tokens_in: outcome.tokens_in,
@@ -1331,7 +1393,7 @@ pub fn execute_workflow_step(
         step_id,
         action: StepExecutionAction::Executed {
             agent: assigned_agent,
-            adapter: adapter_kind.as_wire().to_string(),
+            adapter: adapter_wire,
             attempt_id,
             outcome: step_outcome,
             approval_message_id,
