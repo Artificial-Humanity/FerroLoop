@@ -120,7 +120,7 @@ fn agent_harness_marker(get: &dyn Fn(&str) -> Option<String>) -> Option<&'static
 }
 
 /// Whether a bearer token may be sent to `url`: `https`, or `http` to this machine.
-fn may_receive_token(url: &str) -> bool {
+pub(crate) fn may_receive_token(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
     }

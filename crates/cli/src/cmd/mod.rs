@@ -23,4 +23,5 @@ pub mod store;
 pub mod transition;
 pub mod vault;
 pub mod watch;
+pub mod watch_balance;
 pub mod wire;

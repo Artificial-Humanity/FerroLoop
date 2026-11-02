@@ -82,6 +82,9 @@ pub enum WatchCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Subscription usage balancing: plan, apply, and the policy. A client of the hub, which
+    /// holds the live quota and runs the remodels.
+    Balance(crate::cmd::watch_balance::BalanceArgs),
 }
 
 /// The thresholds `fl watch alerts` runs with: the defaults, with each flag given replacing one.
@@ -423,6 +426,8 @@ pub fn run_at(
                 0
             })
         }
+        // A hub client: the binary runs it before any store is opened.
+        WatchCmd::Balance(args) => crate::cmd::watch_balance::run(args, None),
     }
 }
 
