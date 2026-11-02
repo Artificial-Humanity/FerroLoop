@@ -108,6 +108,14 @@ pub(crate) fn expire_direct_quota_cache() {
     if let Some(slot) = cache.agy.as_mut() {
         slot.stale = true;
     }
+    drop(cache);
+    for entry in AGY_LIVE_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .values_mut()
+    {
+        entry.1 = true;
+    }
 }
 
 pub(crate) fn merge_account_quota(
@@ -254,17 +262,299 @@ fn resolve_claude_tier(
     fresh_tier.or(auth_tier)
 }
 
-pub(crate) fn agy_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
-    let raw = std::env::var("FL_AGY_QUOTA_JSON").ok()?;
-    let raw = raw.trim();
-    if raw.is_empty() {
+/// Where to find the Antigravity language server for a quota read, and which model the
+/// session runs. The route's address and token win; the environment fills a gap only when
+/// the host may be probed (no `home_override`, host discovery on).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AgyQuotaTarget<'a> {
+    pub address: Option<&'a str>,
+    pub csrf: Option<&'a str>,
+    pub model: Option<&'a str>,
+}
+
+pub(crate) fn agy_account_quota(
+    home_override: Option<&Path>,
+    target: &AgyQuotaTarget<'_>,
+) -> Option<SessionQuotaUsage> {
+    // `FL_AGY_QUOTA_JSON` is an explicit override and stays authoritative.
+    if let Ok(raw) = std::env::var("FL_AGY_QUOTA_JSON") {
+        let raw = raw.trim();
+        if !raw.is_empty() {
+            let key = format!("agy:{}", home_key(home_override));
+            let raw = raw.to_string();
+            return cached(ProbeKind::Agy, &key, move || {
+                let value = load_json_override(&raw)?;
+                agy_allowance(&value)
+            });
+        }
+    }
+    let (port, csrf) = agy_live_endpoint(home_override, target)?;
+    let live = agy_live_snapshot(port, &csrf)?;
+    agy_live_usage(&live, target.model)
+}
+
+/// Port and csrf token of the language server to ask, or `None` when there is none or
+/// the token is not one plain header value.
+fn agy_live_endpoint(
+    home_override: Option<&Path>,
+    target: &AgyQuotaTarget<'_>,
+) -> Option<(u16, String)> {
+    let env_ok = crate::discovery::agy_env_fallback_allowed(home_override);
+    let from_env = |name: &str| {
+        env_ok
+            .then(|| std::env::var(name).ok())
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let csrf = clean(target.csrf).or_else(|| from_env("ANTIGRAVITY_CSRF_TOKEN"))?;
+    if csrf.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return None;
     }
-    let key = format!("agy:{}", home_key(home_override));
-    let raw = raw.to_string();
-    cached(ProbeKind::Agy, &key, move || {
-        let value = load_json_override(&raw)?;
-        agy_allowance(&value)
+    let addresses = [clean(target.address), from_env("ANTIGRAVITY_LS_ADDRESS")];
+    let port = addresses.into_iter().flatten().find_map(|addr| {
+        let port = fl_wire::identity::agy_ls_port(&addr)?;
+        // A cached answer (hit or miss) means the port was just tried; skip the connect probe.
+        (agy_live_cache_has(port) || fl_wire::identity::agy_ls_address_listening(&addr))
+            .then_some(port)
+    })?;
+    Some((port, csrf))
+}
+
+/// One `RetrieveUserQuotaSummary` bucket.
+#[derive(Debug, Clone, PartialEq)]
+struct AgyBucket {
+    id: String,
+    window: String,
+    used_percent: f64,
+    resets_at_ms: Option<u64>,
+}
+
+/// One model's `quotaInfo` from `GetUserStatus`.
+#[derive(Debug, Clone, PartialEq)]
+struct AgyModelQuota {
+    model_id: String,
+    used_percent: f64,
+    resets_at_ms: Option<u64>,
+}
+
+/// The parsed answers of the two language-server calls.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct AgyLive {
+    buckets: Vec<AgyBucket>,
+    models: Vec<AgyModelQuota>,
+    tier: Option<String>,
+}
+
+const AGY_LIVE_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+const AGY_LIVE_MAX_BYTES: usize = 1024 * 1024;
+
+type AgyLiveCache = std::collections::BTreeMap<u16, (Instant, bool, Option<AgyLive>)>;
+static AGY_LIVE_CACHE: Mutex<AgyLiveCache> = Mutex::new(std::collections::BTreeMap::new());
+
+fn agy_live_cache_has(port: u16) -> bool {
+    AGY_LIVE_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(&port)
+        .is_some_and(|(at, stale, value)| !stale && at.elapsed() < agy_live_ttl(value.is_some()))
+}
+
+fn agy_live_ttl(hit: bool) -> Duration {
+    if hit {
+        CACHE_TTL
+    } else {
+        AGY_LIVE_NEGATIVE_TTL
+    }
+}
+
+/// Both language-server answers for `port`, cached for [`CACHE_TTL`] (a miss for a shorter
+/// time), so discovery and `/api/v1/watch` polls cost one pair of calls a minute.
+fn agy_live_snapshot(port: u16, csrf: &str) -> Option<AgyLive> {
+    {
+        let cache = AGY_LIVE_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some((at, stale, value)) = cache.get(&port)
+            && !stale
+            && at.elapsed() < agy_live_ttl(value.is_some())
+        {
+            return value.clone();
+        }
+    }
+    let live = fetch_agy_live(port, csrf);
+    let mut cache = AGY_LIVE_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(port, (Instant::now(), false, live.clone()));
+    live
+}
+
+fn fetch_agy_live(port: u16, csrf: &str) -> Option<AgyLive> {
+    let summary = crate::discovery::agy_rpc(
+        port,
+        csrf,
+        "RetrieveUserQuotaSummary",
+        "{}",
+        AGY_LIVE_MAX_BYTES,
+    );
+    // A dead server costs one timeout, not two.
+    let status = summary.as_ref().and_then(|_| {
+        crate::discovery::agy_rpc(port, csrf, "GetUserStatus", "{}", AGY_LIVE_MAX_BYTES)
+    });
+    let mut live = AgyLive::default();
+    if let Some(doc) = summary.and_then(|body| serde_json::from_str::<Value>(&body).ok()) {
+        live.buckets = parse_agy_buckets(&doc);
+    }
+    if let Some(doc) = status.and_then(|body| serde_json::from_str::<Value>(&body).ok()) {
+        live.tier = parse_agy_tier(&doc);
+        live.models = parse_agy_model_quotas(&doc);
+    }
+    (live.tier.is_some() || !live.buckets.is_empty() || !live.models.is_empty()).then_some(live)
+}
+
+/// `used_percent` for a protobuf-JSON `remainingFraction`. The wire format omits a zero,
+/// so a missing fraction beside a reset time means nothing is left.
+fn used_percent_of(entry: &Value) -> Option<f64> {
+    let remaining = match json_f64(entry.get("remainingFraction")) {
+        Some(fraction) => fraction,
+        None if entry.get("resetTime").is_some() => 0.0,
+        None => return None,
+    };
+    Some((1.0 - remaining).clamp(0.0, 1.0) * 100.0)
+}
+
+fn reset_ms(entry: &Value) -> Option<u64> {
+    entry
+        .get("resetTime")
+        .and_then(Value::as_str)
+        .and_then(parse_iso8601_unix_millis)
+}
+
+fn parse_agy_buckets(doc: &Value) -> Vec<AgyBucket> {
+    let root = doc.get("response").unwrap_or(doc);
+    let Some(groups) = root.get("groups").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .filter_map(|group| group.get("buckets").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|bucket| {
+            let id = bucket.get("bucketId").and_then(Value::as_str)?.to_string();
+            let window = bucket
+                .get("window")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| id.rsplit_once('-').map(|(_, tail)| tail.to_string()))?;
+            Some(AgyBucket {
+                used_percent: used_percent_of(bucket)?,
+                resets_at_ms: reset_ms(bucket),
+                id,
+                window,
+            })
+        })
+        .collect()
+}
+
+fn agy_user_status(doc: &Value) -> &Value {
+    let root = doc.get("response").unwrap_or(doc);
+    root.get("userStatus").unwrap_or(root)
+}
+
+fn parse_agy_tier(doc: &Value) -> Option<String> {
+    let info = agy_user_status(doc).pointer("/planStatus/planInfo")?;
+    let text = |key: &str| {
+        info.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    text("planName").map(str::to_ascii_lowercase).or_else(|| {
+        text("teamsTier").map(|tier| {
+            tier.strip_prefix("TEAMS_TIER_")
+                .unwrap_or(tier)
+                .to_ascii_lowercase()
+        })
+    })
+}
+
+fn parse_agy_model_quotas(doc: &Value) -> Vec<AgyModelQuota> {
+    let Some(configs) = agy_user_status(doc)
+        .pointer("/cascadeModelConfigData/clientModelConfigs")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    configs
+        .iter()
+        .filter_map(|entry| {
+            let info = entry.get("quotaInfo")?;
+            Some(AgyModelQuota {
+                model_id: entry.get("modelId").and_then(Value::as_str)?.to_string(),
+                used_percent: used_percent_of(info)?,
+                resets_at_ms: reset_ms(info),
+            })
+        })
+        .collect()
+}
+
+/// `claude-*` and `gpt-*` models draw on the shared third-party buckets (`3p-*`); every
+/// other model draws on the Gemini buckets.
+fn agy_bucket_prefix(model: Option<&str>) -> &'static str {
+    match model {
+        Some(m) if m.starts_with("claude-") || m.starts_with("gpt-") => "3p-",
+        _ => "gemini-",
+    }
+}
+
+/// The configured entry for `model`: an exact id, or the id with a thinking suffix.
+fn agy_model_quota<'a>(live: &'a AgyLive, model: &str) -> Option<&'a AgyModelQuota> {
+    live.models.iter().find(|entry| {
+        entry.model_id == model
+            || entry
+                .model_id
+                .strip_prefix(model)
+                .is_some_and(|rest| matches!(rest, "-low" | "-medium" | "-high"))
+    })
+}
+
+fn agy_live_usage(live: &AgyLive, model: Option<&str>) -> Option<SessionQuotaUsage> {
+    let prefix = agy_bucket_prefix(model);
+    let window = |name: &str, minutes: u64| {
+        live.buckets
+            .iter()
+            .find(|b| b.id.starts_with(prefix) && b.window == name)
+            .map(|b| QuotaWindowUsage {
+                used_percent: b.used_percent,
+                window_minutes: Some(minutes),
+                resets_at_ms: b.resets_at_ms,
+            })
+    };
+    let mut primary_window = window("5h", 300);
+    let secondary_window = window("weekly", 10_080);
+    // The active model's own quota replaces the shared 5h bucket once it resets later.
+    if let Some(entry) = model.and_then(|m| agy_model_quota(live, m))
+        && entry.resets_at_ms > primary_window.as_ref().and_then(|w| w.resets_at_ms)
+    {
+        primary_window = Some(QuotaWindowUsage {
+            used_percent: entry.used_percent,
+            window_minutes: Some(300),
+            resets_at_ms: entry.resets_at_ms,
+        });
+    }
+    if live.tier.is_none() && primary_window.is_none() && secondary_window.is_none() {
+        return None;
+    }
+    Some(SessionQuotaUsage {
+        tier: live.tier.clone(),
+        primary_window,
+        secondary_window,
+        exhausted_reason: None,
     })
 }
 
@@ -932,6 +1222,9 @@ mod tests {
                 std::env::remove_var("FL_HUB_CLAUDE_BIN");
                 std::env::remove_var("FL_CLAUDE_USAGE_JSON");
                 std::env::remove_var("FL_AGY_QUOTA_JSON");
+                std::env::remove_var("ANTIGRAVITY_LS_ADDRESS");
+                std::env::remove_var("ANTIGRAVITY_CSRF_TOKEN");
+                std::env::remove_var("FL_WIRE_DISABLE_HOST_DISCOVERY");
             }
         }
     }
@@ -1457,5 +1750,436 @@ mod tests {
             antigravity_exhausted_reason(agy_open).as_deref(),
             Some("429 RESOURCE_EXHAUSTED: quota exceeded")
         );
+    }
+
+    const AGY_SUMMARY: &str = r#"{"response":{"groups":[
+        {"displayName":"Gemini Models","buckets":[
+            {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.9739852,"resetTime":"2026-11-07T20:27:46Z"},
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.99091005,"resetTime":"2026-11-01T06:46:15Z"}]},
+        {"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.9975795,"resetTime":"2026-11-02T19:29:36Z"},
+            {"bucketId":"3p-5h","window":"5h","remainingFraction":1,"resetTime":"2026-11-01T07:10:39Z"}]}]}}"#;
+    const AGY_STATUS: &str = r#"{"userStatus":{"planStatus":{"planInfo":{"teamsTier":"TEAMS_TIER_PRO","planName":"Pro"}},
+        "cascadeModelConfigData":{"defaultOverrideModelConfig":{"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"}},
+        "clientModelConfigs":[
+            {"modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"},
+             "quotaInfo":{"remainingFraction":0.9811882,"resetTime":"2026-11-02T17:46:15Z"}},
+            {"modelId":"claude-opus-5-5","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M12"}}]}}}"#;
+
+    fn ms(iso: &str) -> u64 {
+        parse_iso8601_unix_millis(iso).unwrap()
+    }
+
+    fn agy_fixture_live() -> AgyLive {
+        AgyLive {
+            buckets: parse_agy_buckets(&serde_json::from_str(AGY_SUMMARY).unwrap()),
+            models: parse_agy_model_quotas(&serde_json::from_str(AGY_STATUS).unwrap()),
+            tier: parse_agy_tier(&serde_json::from_str(AGY_STATUS).unwrap()),
+        }
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn agy_live_picks_the_bucket_group_for_the_model() {
+        let live = agy_fixture_live();
+        assert_eq!(live.tier.as_deref(), Some("pro"));
+        assert_eq!(live.buckets.len(), 4);
+
+        // A Claude or GPT model reads the `3p-*` buckets.
+        for model in ["claude-opus-5-5", "gpt-oss-120b"] {
+            let q = agy_live_usage(&live, Some(model)).unwrap();
+            let (five, week) = (q.primary_window.unwrap(), q.secondary_window.unwrap());
+            assert!(near(five.used_percent, 0.0), "{model}: {five:?}");
+            assert_eq!(five.window_minutes, Some(300));
+            assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T07:10:39Z")));
+            assert!(near(week.used_percent, (1.0 - 0.9975795) * 100.0));
+            assert_eq!(week.window_minutes, Some(10_080));
+            assert_eq!(week.resets_at_ms, Some(ms("2026-11-02T19:29:36Z")));
+            assert_eq!(q.tier.as_deref(), Some("pro"));
+        }
+        // Any other model, and an unknown one, reads `gemini-*`.
+        let week_pct = (1.0 - 0.9739852) * 100.0;
+        for model in [Some("gemini-3.8-flash"), None] {
+            let q = agy_live_usage(&live, model).unwrap();
+            assert!(near(q.secondary_window.unwrap().used_percent, week_pct));
+        }
+    }
+
+    #[test]
+    fn agy_live_model_quota_replaces_the_5h_bucket_only_when_it_resets_later() {
+        let live = agy_fixture_live();
+        // The model resets 2026-11-02T17:46:15Z, after the 5h bucket's 2026-11-01T06:46:15Z.
+        let q = agy_live_usage(&live, Some("gemini-4-argon")).unwrap();
+        let five = q.primary_window.unwrap();
+        assert!(
+            near(five.used_percent, (1.0 - 0.9811882) * 100.0),
+            "{five:?}"
+        );
+        assert_eq!(five.window_minutes, Some(300));
+        assert_eq!(five.resets_at_ms, Some(ms("2026-11-02T17:46:15Z")));
+        // The weekly window is untouched.
+        assert!(near(
+            q.secondary_window.unwrap().used_percent,
+            (1.0 - 0.9739852) * 100.0
+        ));
+
+        // An older model reset keeps the bucket.
+        let mut older = live.clone();
+        older.models[0].resets_at_ms = Some(ms("2026-11-01T06:00:00Z"));
+        let five = agy_live_usage(&older, Some("gemini-4-argon"))
+            .unwrap()
+            .primary_window
+            .unwrap();
+        assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T06:46:15Z")));
+        // A model with no quotaInfo keeps the bucket.
+        let five = agy_live_usage(&live, Some("claude-opus-5-5"))
+            .unwrap()
+            .primary_window
+            .unwrap();
+        assert_eq!(five.resets_at_ms, Some(ms("2026-11-01T07:10:39Z")));
+    }
+
+    #[test]
+    fn agy_live_parsers_handle_odd_shapes() {
+        // protobuf JSON omits a zero fraction: a bucket with a reset time and none is empty.
+        let doc: Value = serde_json::from_str(
+            r#"{"groups":[{"buckets":[{"bucketId":"gemini-5h","resetTime":"2026-11-01T06:46:15Z"},
+                {"bucketId":"gemini-weekly"}, {"window":"5h","remainingFraction":0.5}]}]}"#,
+        )
+        .unwrap();
+        let buckets = parse_agy_buckets(&doc);
+        assert_eq!(
+            buckets.len(),
+            1,
+            "no id and no data are skipped: {buckets:?}"
+        );
+        assert_eq!(
+            buckets[0].window, "5h",
+            "window falls back to the id suffix"
+        );
+        assert!(near(buckets[0].used_percent, 100.0));
+        // The fraction is clamped.
+        let over: Value = serde_json::from_str(
+            r#"{"groups":[{"buckets":[{"bucketId":"gemini-5h","remainingFraction":1.5},
+                {"bucketId":"gemini-weekly","remainingFraction":-1}]}]}"#,
+        )
+        .unwrap();
+        let used: Vec<f64> = parse_agy_buckets(&over)
+            .iter()
+            .map(|b| b.used_percent)
+            .collect();
+        assert_eq!(used, vec![0.0, 100.0]);
+        // Tier: the plan name wins, the tier enum is the fallback, and neither is an error.
+        let tier = |s: &str| parse_agy_tier(&serde_json::from_str(s).unwrap());
+        assert_eq!(
+            tier(r#"{"userStatus":{"planStatus":{"planInfo":{"planName":" Ultra "}}}}"#).as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            tier(r#"{"userStatus":{"planStatus":{"planInfo":{"teamsTier":"TEAMS_TIER_PRO"}}}}"#)
+                .as_deref(),
+            Some("pro")
+        );
+        assert_eq!(tier(r#"{"userStatus":{}}"#), None);
+        assert_eq!(tier("{}"), None);
+        // No data at all is no quota.
+        assert_eq!(agy_live_usage(&AgyLive::default(), None), None);
+    }
+
+    struct QuotaStub {
+        port: u16,
+        seen: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    impl QuotaStub {
+        fn calls(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+        fn shutdown(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.handle.join().unwrap();
+        }
+    }
+
+    /// A loopback language server answering the quota calls (and the model config call that
+    /// discovery makes) with the fixtures above.
+    fn spawn_quota_stub(summary: &'static str, status: &'static str) -> QuotaStub {
+        use std::io::{BufRead, BufReader};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        AGY_LIVE_CACHE.lock().unwrap().remove(&port);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (seen_t, stop_t) = (Arc::clone(&seen), Arc::clone(&stop));
+        let handle = thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                if request_line.is_empty() {
+                    continue; // the listening probe connects and hangs up
+                }
+                let (mut csrf, mut len) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("x-codeium-csrf-token") {
+                            csrf = value.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            len = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let reply = if path.ends_with("/RetrieveUserQuotaSummary") {
+                    summary
+                } else if path.ends_with("/GetUserStatus") {
+                    status
+                } else if path.ends_with("/GetCascadeModelConfigData") {
+                    // The status document's model block, without the `userStatus` wrapper.
+                    r#"{"defaultOverrideModelConfig":{"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M12"}},
+                        "clientModelConfigs":[{"modelId":"claude-opus-5-5","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M12"}}]}"#
+                } else {
+                    "{}"
+                };
+                seen_t.lock().unwrap().push((path, csrf));
+                let mut out = stream;
+                let _ = std::io::Write::write_all(
+                    &mut out,
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        QuotaStub {
+            port,
+            seen,
+            stop,
+            handle,
+        }
+    }
+
+    #[test]
+    fn agy_account_quota_probes_the_language_server_and_caches_for_a_minute() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = Some(tmp.path());
+            let target = AgyQuotaTarget {
+                address: Some(&addr),
+                csrf: Some("stub-csrf"),
+                model: Some("claude-opus-5-5"),
+            };
+            expire_direct_quota_cache();
+            let first = agy_account_quota(home, &target).expect("live quota");
+            assert_eq!(first.tier.as_deref(), Some("pro"));
+            assert!(near(
+                first.secondary_window.as_ref().unwrap().used_percent,
+                (1.0 - 0.9975795) * 100.0
+            ));
+            let calls = stub.calls();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(
+                calls
+                    .iter()
+                    .any(|(p, _)| p.ends_with("/RetrieveUserQuotaSummary"))
+            );
+            assert!(calls.iter().any(|(p, _)| p.ends_with("/GetUserStatus")));
+            assert!(calls.iter().all(|(_, csrf)| csrf == "stub-csrf"));
+
+            // A second read, even for another model family, is served from the cache.
+            let gemini = AgyQuotaTarget {
+                model: Some("gemini-4-argon"),
+                ..target
+            };
+            let second = agy_account_quota(home, &gemini).expect("cached quota");
+            assert!(near(
+                second.secondary_window.as_ref().unwrap().used_percent,
+                (1.0 - 0.9739852) * 100.0
+            ));
+            assert_eq!(stub.calls().len(), 2, "no new request inside the TTL");
+
+            // Expiry asks again.
+            expire_direct_quota_cache();
+            agy_account_quota(home, &target).expect("refreshed");
+            assert_eq!(stub.calls().len(), 4);
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn agy_account_quota_override_wins_and_a_home_override_never_reaches_the_host() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let target = AgyQuotaTarget {
+                address: Some(&addr),
+                csrf: Some("c"),
+                model: None,
+            };
+
+            // SAFETY: this test holds PROBE_LOCK until `_clear` drops and removes the vars.
+            unsafe {
+                std::env::set_var(
+                    "FL_AGY_QUOTA_JSON",
+                    r#"{"tier":"forced","window":{"usedPercent":7}}"#,
+                );
+            }
+            expire_direct_quota_cache();
+            let forced = agy_account_quota(Some(tmp.path()), &target).unwrap();
+            assert_eq!(forced.tier.as_deref(), Some("forced"));
+            assert!(
+                stub.calls().is_empty(),
+                "the override short-circuits the probe"
+            );
+            // SAFETY: as above.
+            unsafe {
+                std::env::remove_var("FL_AGY_QUOTA_JSON");
+                std::env::set_var("ANTIGRAVITY_LS_ADDRESS", &addr);
+                std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", "env-csrf");
+            }
+            expire_direct_quota_cache();
+            // A home override ignores the environment: nothing names a server.
+            let none = AgyQuotaTarget::default();
+            assert_eq!(agy_account_quota(Some(tmp.path()), &none), None);
+            assert!(
+                stub.calls().is_empty(),
+                "home override must not read the env endpoint"
+            );
+            // Host discovery off ignores it too.
+            // SAFETY: as above.
+            unsafe { std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1") };
+            assert_eq!(agy_account_quota(None, &none), None);
+            assert!(
+                stub.calls().is_empty(),
+                "disabled host discovery must not read the env endpoint"
+            );
+            // SAFETY: as above.
+            unsafe { std::env::remove_var("FL_WIRE_DISABLE_HOST_DISCOVERY") };
+            // With the host allowed, the environment fills the gap.
+            let live = agy_account_quota(None, &none).expect("env endpoint");
+            assert_eq!(live.tier.as_deref(), Some("pro"));
+            assert!(stub.calls().iter().all(|(_, csrf)| csrf == "env-csrf"));
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn agy_account_quota_dead_server_and_bad_token_are_misses() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let tmp = tempfile::tempdir().unwrap();
+            let dead = AgyQuotaTarget {
+                address: Some("127.0.0.1:1"),
+                csrf: Some("c"),
+                model: None,
+            };
+            assert_eq!(agy_account_quota(Some(tmp.path()), &dead), None);
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            for csrf in ["bad token", "a\nb", ""] {
+                let bad = AgyQuotaTarget {
+                    address: Some(&addr),
+                    csrf: Some(csrf),
+                    model: None,
+                };
+                assert_eq!(agy_account_quota(Some(tmp.path()), &bad), None, "{csrf:?}");
+            }
+            assert!(stub.calls().is_empty());
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn discovery_reads_live_quota_for_the_sessions_model_family() {
+        with_probe_lock(|| {
+            let _clear = ClearProbeEnv;
+            let stub = spawn_quota_stub(AGY_SUMMARY, AGY_STATUS);
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let routes = home.join(".cache").join("agent-bus").join("routes.json");
+            fs::create_dir_all(routes.parent().unwrap()).unwrap();
+            fs::write(
+                &routes,
+                format!(
+                    r#"{{"entries":{{"ferris":{{"persona":"ferris","updated_at":"2026-10-29T00:00:00.000Z",
+                    "route":{{"kind":"agy","conversation_id":"agy-q-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}}}}}}}"#
+                ),
+            )
+            .unwrap();
+            expire_direct_quota_cache();
+            let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
+            let sessions = crate::discovery::discover_sessions_with_home(&store, Some(home));
+            let agy = sessions
+                .iter()
+                .find(|s| s.persona.as_deref() == Some("ferris"))
+                .expect("agy session");
+            // The stub's config names claude-opus-5-5 as the default model, so `3p-*` is read.
+            assert_eq!(agy.model.as_deref(), Some("claude-opus-5-5"));
+            let q = agy.quota_usage.as_ref().expect("live quota on the session");
+            assert_eq!(q.tier.as_deref(), Some("pro"));
+            assert_eq!(
+                q.primary_window.as_ref().unwrap().resets_at_ms,
+                Some(ms("2026-11-01T07:10:39Z"))
+            );
+            stub.shutdown();
+        });
+    }
+
+    #[test]
+    fn agy_live_miss_expires_sooner_than_a_hit() {
+        with_probe_lock(|| {
+            let port = 1u16; // never connected: the cache is read directly
+            let aged = |secs: u64, value: Option<AgyLive>| {
+                let at = Instant::now() - Duration::from_secs(secs);
+                AGY_LIVE_CACHE
+                    .lock()
+                    .unwrap()
+                    .insert(port, (at, false, value));
+            };
+            aged(11, None);
+            assert!(
+                !agy_live_cache_has(port),
+                "a miss older than 10s is retried"
+            );
+            aged(5, None);
+            assert!(agy_live_cache_has(port), "a young miss is served");
+            aged(11, Some(AgyLive::default()));
+            assert!(agy_live_cache_has(port), "a hit lives 60s");
+            aged(61, Some(AgyLive::default()));
+            assert!(!agy_live_cache_has(port));
+            AGY_LIVE_CACHE.lock().unwrap().remove(&port);
+        });
     }
 }
