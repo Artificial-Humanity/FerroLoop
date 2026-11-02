@@ -169,7 +169,7 @@ fn status_human_and_json() {
         assert!(v.get(key).is_some(), "missing {key}: {v}");
     }
     assert_eq!(v["telemetry"]["totals"]["attempts"], 4);
-    assert_eq!(v["telemetry"]["source"], "columnar");
+    assert_eq!(v["telemetry"]["source"], "rows");
     assert_eq!(v["thresholds"]["warn_quota_pct"], 80.0);
     let ids: Vec<&str> = v["alerts"]
         .as_array()
@@ -211,7 +211,7 @@ fn rollups_human_json_and_project_scope() {
     assert!(out.status.success(), "{out:?}");
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
-        text.starts_with(&format!("scope: {} (source: columnar)", p.as_str())),
+        text.starts_with(&format!("scope: {} (source: rows)", p.as_str())),
         "{text}"
     );
     assert!(text.contains("totals: 1 attempts"), "{text}");
@@ -332,4 +332,69 @@ fn a_missing_store_is_refused_not_created() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing to watch"));
     assert!(!fl_store::store_exists(&env.logical()));
+}
+
+/// `fl watch` opens the store for a scan: a lone `.redb` under the ferro engine is read with the
+/// redb engine and is never migrated, chmodded or written.
+#[test]
+fn a_lone_redb_under_the_ferro_engine_is_not_migrated() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let redb = env.logical();
+    {
+        let store = fl_store::open_store_with(
+            &redb,
+            &StoreOptions {
+                backend: Some(BackendKind::Redb),
+                ..StoreOptions::default()
+            },
+        )
+        .unwrap();
+        let p = store.add_project("/w/lone").unwrap();
+        store
+            .append_attempt(attempt(&p, 1, AttemptStatus::Crashed, 5))
+            .unwrap();
+    }
+    std::fs::set_permissions(&redb, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let fls = fl_store::physical_path(&redb, BackendKind::Ferro);
+    assert_ne!(fls, redb);
+    assert!(!fls.exists());
+    let before = std::fs::read(&redb).unwrap();
+    let meta = std::fs::metadata(&redb).unwrap();
+    let listing = |dir: &std::path::Path| {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let files_before = listing(env.stores.path());
+
+    for args in [
+        vec!["watch", "status", "--json"],
+        vec!["watch", "rollups"],
+        vec!["watch", "alerts"],
+    ] {
+        let out = env.fl().args(&args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        if args.contains(&"--json") {
+            let v = json_of(&out.stdout);
+            assert_eq!(v["telemetry"]["totals"]["attempts"], 1, "{v}");
+        }
+    }
+
+    assert!(
+        !fls.exists(),
+        "no `.fls` was migrated beside the lone `.redb`"
+    );
+    assert_eq!(listing(env.stores.path()), files_before, "no file created");
+    assert_eq!(
+        std::fs::read(&redb).unwrap(),
+        before,
+        "the `.redb` bytes are unchanged"
+    );
+    let after = std::fs::metadata(&redb).unwrap();
+    assert_eq!(after.permissions().mode() & 0o777, 0o644, "not chmodded");
+    assert_eq!(after.modified().unwrap(), meta.modified().unwrap());
 }

@@ -202,7 +202,7 @@ label = "reads ledger, catalog, and runtime state through core traits and reuses
 [[edges]]
 from = "fl_watch"
 to = "fl_store"
-label = "sums attempts and gate runs through the store's columnar rollup"
+label = "reads the AnyStore it is handed: attempt and gate-run rows, once per report"
 
 [[edges]]
 from = "fl_hub"

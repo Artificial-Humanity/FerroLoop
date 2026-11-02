@@ -4,8 +4,8 @@
 //! The crate is usable on its own: it depends only on `fl-core` and `fl-store`. It reads the
 //! store, and never writes it.
 //!
-//! - [`rollups`]: attempt and gate-run telemetry ([`WatchTelemetryReport`]): totals from the
-//!   store's columnar rollup, breakdowns by project, adapter (vendor) and agent, failure streaks,
+//! - [`rollups`]: attempt and gate-run telemetry ([`WatchTelemetryReport`]): totals summed from
+//!   the ledger rows, breakdowns by project, adapter (vendor) and agent, failure streaks,
 //!   and the Decision 21 transition-regret audit.
 //! - [`liveness`]: agent health ([`WatchHealthReport`]) from attempt heartbeats and hosted-session
 //!   records, with the clock passed in.
@@ -13,7 +13,8 @@
 //!   ([`evaluate_watch_alerts`]).
 //! - [`runtime`]: the workspace runtime entries the other modules read, decoded in one pass.
 //!
-//! [`build_summary`] runs all of them over one store.
+//! [`build_summary`] runs all of them over one store: [`read_store_snapshot`] reads it once and
+//! [`summarize`] evaluates health and alerts from that read, so a caller can cache the read.
 
 pub mod alerts;
 pub mod liveness;
@@ -24,7 +25,9 @@ use fl_core::ids::ProjectId;
 use fl_core::store::{Catalog, StoreError};
 use fl_store::AnyStore;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
+pub use alerts::QUOTA_EXHAUSTED;
 pub use alerts::{
     QuotaWindowKind, Severity, WatchAlert, WatchAlertRule, WatchEntity, WatchEntityKind,
     WatchQuotaWindow, WatchThresholds, evaluate_watch_alerts,
@@ -63,11 +66,81 @@ pub struct WatchSummary {
     pub thresholds: WatchThresholds,
 }
 
-/// Build the telemetry, health and alerts for `store` at `now_ms`.
+/// What FerroWatch reads from a store for a summary, in one pass: `list_state` once,
+/// `list_projects` once, then per project its attempts, gates, each gate's runs and its
+/// transitions (`3P + G + 2` reads). It depends on neither the thresholds nor the clock, so a
+/// caller may keep it a while and [`summarize`] it again and again (the hub does, for 2 s).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchStoreSnapshot {
+    pub telemetry: WatchTelemetryReport,
+    pub runtime: RuntimeSnapshot,
+    /// Project IRI → slug, for every project the catalog lists.
+    pub project_labels: BTreeMap<String, String>,
+}
+
+/// Read a [`WatchStoreSnapshot`] of `store`, scoped to `project` when given.
+pub fn read_store_snapshot(
+    store: &AnyStore,
+    project: Option<&ProjectId>,
+) -> Result<WatchStoreSnapshot, WatchError> {
+    let runtime = read_runtime(store)?;
+    let projects = store.list_projects()?;
+    let telemetry = rollups::telemetry_over(store, &projects, project, &runtime)?;
+    let project_labels = projects
+        .iter()
+        .map(|p| (p.id.as_str().to_string(), project_slug(&p.root)))
+        .collect();
+    Ok(WatchStoreSnapshot {
+        telemetry,
+        runtime,
+        project_labels,
+    })
+}
+
+/// The health and alerts of `snapshot` against `thresholds` at `now_ms`. Reads no store.
 ///
 /// `quotas` are vendor quota windows the caller knows of (the hub passes its discovered
 /// sessions' quota); quota windows stored as `watch-quota-*` runtime entries are added to them.
 /// `thresholds` are validated first. Health uses `thresholds.stale_after_ms`.
+pub fn summarize(
+    snapshot: &WatchStoreSnapshot,
+    thresholds: &WatchThresholds,
+    quotas: Vec<WatchQuotaWindow>,
+    now_ms: u64,
+    local_host: &str,
+    pid_is_alive: &dyn Fn(u32) -> bool,
+) -> Result<WatchSummary, WatchError> {
+    thresholds.validate()?;
+    let health = evaluate_health(
+        &snapshot.runtime,
+        &snapshot.project_labels,
+        now_ms,
+        &LivenessOptions {
+            stale_after_ms: thresholds.stale_after_ms,
+            local_host,
+            pid_is_alive,
+        },
+    );
+    let mut all_quotas = quotas;
+    all_quotas.extend(snapshot.runtime.quotas.iter().cloned());
+    let alerts = evaluate_watch_alerts(
+        &snapshot.telemetry,
+        &health,
+        &all_quotas,
+        thresholds,
+        now_ms,
+    );
+    Ok(WatchSummary {
+        telemetry: snapshot.telemetry.clone(),
+        health,
+        quotas: all_quotas,
+        alerts,
+        thresholds: thresholds.clone(),
+    })
+}
+
+/// Build the telemetry, health and alerts for `store` at `now_ms`: [`read_store_snapshot`]
+/// then [`summarize`]. Bad `thresholds` are refused before anything is read.
 pub fn build_summary(
     store: &AnyStore,
     project: Option<&ProjectId>,
@@ -78,29 +151,15 @@ pub fn build_summary(
     pid_is_alive: &dyn Fn(u32) -> bool,
 ) -> Result<WatchSummary, WatchError> {
     thresholds.validate()?;
-    let runtime = read_runtime(store)?;
-    let telemetry = build_telemetry_with(store, project, &runtime)?;
-    let labels = liveness::project_labels(store)?;
-    let health = evaluate_health(
-        &runtime,
-        &labels,
+    let snapshot = read_store_snapshot(store, project)?;
+    summarize(
+        &snapshot,
+        thresholds,
+        quotas,
         now_ms,
-        &LivenessOptions {
-            stale_after_ms: thresholds.stale_after_ms,
-            local_host,
-            pid_is_alive,
-        },
-    );
-    let mut all_quotas = quotas;
-    all_quotas.extend(runtime.quotas.iter().cloned());
-    let alerts = evaluate_watch_alerts(&telemetry, &health, &all_quotas, thresholds, now_ms);
-    Ok(WatchSummary {
-        telemetry,
-        health,
-        quotas: all_quotas,
-        alerts,
-        thresholds: thresholds.clone(),
-    })
+        local_host,
+        pid_is_alive,
+    )
 }
 
 /// The short name of a project: the last component of its root, lowercased (`/src/FerroLoop/`
@@ -265,12 +324,27 @@ mod tests {
             &store,
             None,
             &WatchThresholds::default(),
-            given,
+            given.clone(),
             now,
             "here",
             &alive,
         )
         .unwrap();
+        // The same summary from one store read evaluated apart, as the hub caches it.
+        let snap = read_store_snapshot(&store, None).unwrap();
+        let again = summarize(
+            &snap,
+            &WatchThresholds::default(),
+            given,
+            now,
+            "here",
+            &alive,
+        );
+        assert_eq!(again.unwrap(), s);
+        assert_eq!(
+            snap.project_labels.get(p.as_str()).map(String::as_str),
+            Some("pricey")
+        );
         let ids: Vec<&str> = s.alerts.iter().map(|a| a.id.as_str()).collect();
         let spend = format!("spend:project:{}", p.as_str());
         assert_eq!(

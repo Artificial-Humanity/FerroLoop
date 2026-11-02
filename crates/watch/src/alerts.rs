@@ -3,8 +3,9 @@
 //! [`evaluate_watch_alerts`] takes everything it needs as arguments, the clock included, so the
 //! same input always gives the same alerts in the same order: most severe first, then by id.
 //! An alert id is built from its rule and the entity it is about (`spend:project:<iri>`,
-//! `quota:claude:primary`, `heartbeat_dead:agent:ada`, `crash_loop:record:<iri>`), so a caller
-//! can track one alert across polls.
+//! `quota:claude:primary`, `quota:claude:exhausted`, `heartbeat_dead:agent:ada`,
+//! `crash_loop:record:<iri>`, `crash_loop:record:<iri>:gate:<gate iri>`), so a caller can track
+//! one alert across polls.
 //!
 //! # Default thresholds
 //!
@@ -249,10 +250,16 @@ pub fn usd_to_micros(usd: f64) -> Option<u64> {
     (micros <= u64::MAX as f64).then_some(micros as u64)
 }
 
+/// The window name of the alert a vendor's exhausted (or rate-limited) report raises:
+/// `quota:<vendor>:exhausted`.
+pub const QUOTA_EXHAUSTED: &str = "exhausted";
+
 /// One active alert.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatchAlert {
-    /// `<rule>:<entity kind>:<entity id>` (quota: `quota:<vendor>:<window>`). Stable across polls.
+    /// `<rule>:<entity kind>:<entity id>` (quota: `quota:<vendor>:<window>` or
+    /// `quota:<vendor>:exhausted`; a gate crash loop: `crash_loop:record:<iri>:gate:<gate iri>`).
+    /// Stable across polls.
     pub id: String,
     pub rule: WatchAlertRule,
     pub severity: Severity,
@@ -292,10 +299,16 @@ fn usd(micros: u64) -> String {
 ///
 /// - **Spend**: each project in `telemetry.by_project`, and the workspace total when the
 ///   telemetry is not scoped to one project.
-/// - **Quota**: per vendor and window, the highest finite reading. A reading whose
-///   `resets_at_ms` is not after `now_ms` has already reset and raises nothing.
+/// - **Quota**: a vendor with a reading that carries an `exhausted_reason` (the vendor said
+///   exhausted or rate limited) raises one critical `quota:<vendor>:exhausted` alert whatever
+///   the window percent, and that vendor's window percentages raise nothing more: the vendor's
+///   own report wins. Every other vendor raises, per window, its highest finite reading
+///   against the percentage thresholds. A reading whose `resets_at_ms` is not after `now_ms`
+///   has already reset and raises nothing.
 /// - **Heartbeat**: an active agent whose liveness is `stale` (warning) or `dead` (critical).
-/// - **Crash loop**: the longer of a record's trailing failed-attempt and failed-gate streaks.
+/// - **Crash loop**: the longer of a record's trailing failed-attempt streak and its longest
+///   per-gate failed-run streak. A gate streak's id names the gate
+///   (`crash_loop:record:<iri>:gate:<gate iri>`).
 /// - **Transition regret**: each regret challenge, as `info`.
 pub fn evaluate_watch_alerts(
     telemetry: &WatchTelemetryReport,
@@ -387,13 +400,74 @@ pub fn evaluate_watch_alerts(
         }
     }
 
-    // Quota: the highest finite, not-yet-reset reading per vendor and window.
-    let mut worst: BTreeMap<(String, QuotaWindowKind), &WatchQuotaWindow> = BTreeMap::new();
-    for q in quotas {
-        if !q.used_percent.is_finite() || q.resets_at_ms.is_some_and(|r| r <= now_ms) {
+    // Quota. A vendor that reports its allowance exhausted (or rate limited) wins over the
+    // window percentages: it raises one critical `quota:<vendor>:exhausted` alert, whatever its
+    // windows read, and no window alert of its own. Every other vendor raises, per window, the
+    // highest finite, not-yet-reset reading.
+    let live = |q: &&WatchQuotaWindow| !q.resets_at_ms.is_some_and(|r| r <= now_ms);
+    let vendor_key = |q: &WatchQuotaWindow| q.vendor.trim().to_ascii_lowercase();
+    let mut exhausted: BTreeMap<String, &WatchQuotaWindow> = BTreeMap::new();
+    for q in quotas.iter().filter(live) {
+        if q.exhausted_reason.is_none() {
             continue;
         }
-        let key = (q.vendor.trim().to_ascii_lowercase(), q.window);
+        let pct = |w: &WatchQuotaWindow| {
+            if w.used_percent.is_finite() {
+                w.used_percent
+            } else {
+                f64::NEG_INFINITY
+            }
+        };
+        match exhausted.get(&vendor_key(q)) {
+            Some(prev) if pct(prev) >= pct(q) => {}
+            _ => {
+                exhausted.insert(vendor_key(q), q);
+            }
+        }
+    }
+    for (vendor, q) in &exhausted {
+        let reason = q.exhausted_reason.as_deref().unwrap_or_default();
+        let observed = if q.used_percent.is_finite() {
+            q.used_percent
+        } else {
+            100.0
+        };
+        let resets = match q.resets_at_ms {
+            Some(r) => format!(
+                ", resets in {} min",
+                r.saturating_sub(now_ms).div_ceil(60_000)
+            ),
+            None => String::new(),
+        };
+        push(
+            WatchAlertRule::Quota,
+            Severity::Critical,
+            WatchEntity {
+                kind: WatchEntityKind::Vendor,
+                id: vendor.clone(),
+                label: q.session.clone(),
+            },
+            format!("{vendor}:{QUOTA_EXHAUSTED}"),
+            format!(
+                "{vendor} quota is {QUOTA_EXHAUSTED}: the vendor reports `{reason}` (its {} \
+                 window reads {observed:.1}%){resets}",
+                q.window.as_str()
+            ),
+            observed,
+            thresholds.critical_quota_pct,
+            q.resets_at_ms,
+            format!(
+                "remodel sessions on {vendor} onto an available vendor, or hold new work until \
+                 the allowance resets"
+            ),
+        );
+    }
+    let mut worst: BTreeMap<(String, QuotaWindowKind), &WatchQuotaWindow> = BTreeMap::new();
+    for q in quotas.iter().filter(live) {
+        if !q.used_percent.is_finite() || exhausted.contains_key(&vendor_key(q)) {
+            continue;
+        }
+        let key = (vendor_key(q), q.window);
         match worst.get(&key) {
             Some(prev) if prev.used_percent >= q.used_percent => {}
             _ => {
@@ -416,11 +490,6 @@ pub fn evaluate_watch_alerts(
             ),
             None => String::new(),
         };
-        let reason = q
-            .exhausted_reason
-            .as_deref()
-            .map(|r| format!(" ({r})"))
-            .unwrap_or_default();
         push(
             WatchAlertRule::Quota,
             sev,
@@ -431,7 +500,7 @@ pub fn evaluate_watch_alerts(
             },
             format!("{vendor}:{}", window.as_str()),
             format!(
-                "{vendor} {} quota window is {:.1}% used{resets}{reason}",
+                "{vendor} {} quota window is {:.1}% used{resets}",
                 window.as_str(),
                 q.used_percent
             ),
@@ -495,11 +564,8 @@ pub fn evaluate_watch_alerts(
 
     // Crash loops.
     for s in &telemetry.failure_streaks {
-        let (streak, what) = if s.attempt_streak >= s.gate_streak {
-            (s.attempt_streak, "failed attempts")
-        } else {
-            (s.gate_streak, "failed gate runs")
-        };
+        let on_gate = s.gate_streak > s.attempt_streak;
+        let streak = s.attempt_streak.max(s.gate_streak);
         let Some((sev, limit)) = level(
             streak,
             thresholds.crash_loop_warn_streak,
@@ -507,8 +573,26 @@ pub fn evaluate_watch_alerts(
         ) else {
             continue;
         };
+        let (what, id_tail) = match (&s.gate, on_gate) {
+            (Some(gate), true) => (
+                format!(
+                    "failed runs of gate `{}`",
+                    s.gate_name.as_deref().unwrap_or(gate)
+                ),
+                format!("record:{}:gate:{gate}", s.record),
+            ),
+            (None, true) => (
+                "failed gate runs".to_string(),
+                format!("record:{}", s.record),
+            ),
+            (_, false) => (
+                "failed attempts".to_string(),
+                format!("record:{}", s.record),
+            ),
+        };
         let last = s
             .last_attempt_status
+            .filter(|_| !on_gate)
             .map(AttemptStatus::as_wire)
             .map(|w| format!(", last attempt {w}"))
             .unwrap_or_default();
@@ -520,7 +604,7 @@ pub fn evaluate_watch_alerts(
                 id: s.record.clone(),
                 label: Some(s.slug.clone()),
             },
-            format!("record:{}", s.record),
+            id_tail,
             format!(
                 "record {} in `{}` has {streak} consecutive {what}{last}",
                 s.record, s.slug
@@ -664,6 +748,8 @@ mod tests {
             slug: "one".into(),
             attempt_streak: attempts,
             gate_streak: gates,
+            gate: None,
+            gate_name: None,
             last_attempt_status: (attempts > 0).then_some(AttemptStatus::Crashed),
             last_gate_verdict: None,
         }
@@ -905,6 +991,49 @@ mod tests {
             ]
         );
         assert_eq!(alerts[0].observed, 97.0);
+    }
+
+    /// Finding: a vendor that says exhausted (or rate limited) is critical whatever its windows
+    /// read, and its own report wins over the window percentages.
+    #[test]
+    fn an_exhausted_vendor_is_critical_whatever_its_windows_read() {
+        let reset = NOW + 30 * 60_000;
+        let mut low = quota("claude", QuotaWindowKind::Primary, 40.0, Some(reset));
+        low.exhausted_reason = Some("rate limited".into());
+        let mut low2 = quota("claude", QuotaWindowKind::Secondary, 85.0, None);
+        low2.exhausted_reason = Some("rate limited".into());
+        let q = [
+            low,
+            low2,
+            quota("codex", QuotaWindowKind::Primary, 85.0, None),
+        ];
+        let alerts = eval(&telemetry(), &health(), &q);
+        assert_eq!(
+            ids(&alerts),
+            vec![
+                ("quota:claude:exhausted", Severity::Critical),
+                ("quota:codex:primary", Severity::Warning),
+            ]
+        );
+        let a = &alerts[0];
+        assert!(a.message.contains(QUOTA_EXHAUSTED), "{}", a.message);
+        assert!(a.message.contains("rate limited"), "{}", a.message);
+        assert_eq!(
+            a.observed, 85.0,
+            "the highest reading that carries the report"
+        );
+        assert_eq!(a.threshold, DEFAULT_CRITICAL_QUOTA_PCT);
+        // A report whose window has already reset raises nothing.
+        let mut gone = quota("claude", QuotaWindowKind::Primary, 40.0, Some(NOW));
+        gone.exhausted_reason = Some("rate limited".into());
+        assert!(eval(&telemetry(), &health(), &[gone]).is_empty());
+        // A report with no percentage (NaN) is still critical.
+        let mut nan = quota("muse", QuotaWindowKind::Primary, f64::NAN, None);
+        nan.exhausted_reason = Some("exhausted".into());
+        assert_eq!(
+            ids(&eval(&telemetry(), &health(), &[nan])),
+            vec![("quota:muse:exhausted", Severity::Critical)]
+        );
     }
 
     #[test]

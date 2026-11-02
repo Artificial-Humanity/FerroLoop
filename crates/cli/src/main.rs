@@ -979,8 +979,11 @@ fn run(cli: Cli) -> Result<i32> {
             db,
             command: Command::Watch { cmd },
         } => {
-            // Read-only: `--db`/`$FL_DB`, else the workspace state store the hub serves. A
-            // missing store is refused rather than created.
+            // `--db`/`$FL_DB`, else the workspace state store the hub serves. A missing store
+            // is refused rather than created, and the store is opened for a scan
+            // (`open_store_for_scan`): a lone `.redb` under the ferro engine is read with the
+            // redb engine, read-only, and never migrated or chmodded. (Only a `.redb` the
+            // read-only open cannot read, one that needs repair, falls back to a writable open.)
             let path = match explicit_db(db) {
                 Some(p) => p,
                 None => cfg.workspace_state_store(&default_state_store_path()?),
@@ -991,7 +994,7 @@ fn run(cli: Cli) -> Result<i32> {
                     path.display()
                 );
             }
-            let store = fl_store::open_store(&path)
+            let store = fl_store::open_store_for_scan(&path)
                 .with_context(|| format!("could not open the store at {}", path.display()))?;
             return match cmd::watch::run(&store, cmd) {
                 Ok(code) => Ok(code),

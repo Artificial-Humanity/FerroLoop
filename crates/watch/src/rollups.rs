@@ -1,17 +1,20 @@
 //! Attempt and gate-run telemetry.
 //!
-//! Where each number comes from:
+//! Every number comes from the rows, read once per report:
 //!
-//! - **Totals and per-project sums** (attempts, tokens, cost, wall clock): fl-store's
-//!   [`attempt_totals`], which on the ferro engine answers from the columnar rollup
-//!   (`FerroStore::attempt_rollup`) without handing rows to the caller, and on a remote ferro
-//!   store is one RPC each. `source` says `columnar`, or `rows` when any of them fell back.
-//! - **Workspace gate-run totals**: [`gate_run_totals`] (columnar the same way). Scoped to one
-//!   project they are summed from that project's gate rows, which are read anyway.
-//! - **Outcome counts, adapter and agent breakdowns, failure streaks**: the columnar rollup
-//!   carries no status, adapter or record column, so these read each project's attempt rows
-//!   (one `attempts(project)` call per project) and the gate rows (one `gate_runs(gate)` per
-//!   gate).
+//! - `list_projects` once, then per project one `attempts(project)`, one `list_gates(project)`,
+//!   one `gate_runs(gate)` per gate and one `list_transitions(project)`: `3P + G + 1` store
+//!   reads, plus the one `list_state` of [`read_runtime`]. The store has no read for every
+//!   attempt or gate run at once, so these stay per project and per gate.
+//! - **Totals and per-project sums** (attempts, outcomes, tokens, cost, wall clock) are summed
+//!   from those attempt rows, so `succeeded + failed + crashed + timed_out == attempts` holds in
+//!   every count. The columnar rollup (`fl_store::attempt_totals`) is not read: it is a
+//!   separate read, and on a live store it can disagree with the rows. `source` is `rows`.
+//! - **Gate-run totals** are summed from the same gate rows.
+//! - **Failure streaks**: per record, the trailing run of attempts that did not complete, in
+//!   store append order; and per record and gate, the trailing run of that gate's runs that did
+//!   not pass, in store append order (never by `at`, which a run may lack). A record reports its
+//!   longest gate streak and the gate it is on.
 //! - **Transition regret**: core's [`audit_transition_regret`] over each project's transitions
 //!   and gate runs, as `fl stats` runs it.
 //!
@@ -22,15 +25,16 @@
 //! entries keep only the newest attempt per record and per agent, so older attempts count under
 //! `unattributed`.
 //!
-//! ⚠ Like the columnar rollup, this reads only the store's own ledger tables, never a GitHub
-//! ledger.
+//! ⚠ This reads only the store's own ledger tables, never a GitHub ledger, and only the
+//! attempts of the projects the catalog lists.
 
 use fl_core::ids::ProjectId;
 use fl_core::log::{Attempt, AttemptStatus, GateRun};
+use fl_core::model::Project;
 use fl_core::store::{Catalog, Ledger};
 use fl_core::telemetry::{RegretChallenge, audit_transition_regret};
 use fl_core::verdict::Verdict;
-use fl_store::{AnyStore, TotalsSource, attempt_totals, gate_run_totals};
+use fl_store::AnyStore;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -74,19 +78,16 @@ impl WatchAttemptCounts {
         self.duration_ms = self.duration_ms.saturating_add(a.duration_ms);
     }
 
-    fn set_sums(&mut self, t: &fl_store::AttemptTotals) {
-        self.attempts = t.count;
-        self.tokens_in = t.tokens_in;
-        self.tokens_out = t.tokens_out;
-        self.cost_usd_micros = t.cost_usd_micros;
-        self.duration_ms = t.duration_ms;
-    }
-
-    fn add_outcomes(&mut self, other: &WatchAttemptCounts) {
+    fn add_counts(&mut self, other: &WatchAttemptCounts) {
+        self.attempts = self.attempts.saturating_add(other.attempts);
         self.succeeded = self.succeeded.saturating_add(other.succeeded);
         self.failed = self.failed.saturating_add(other.failed);
         self.crashed = self.crashed.saturating_add(other.crashed);
         self.timed_out = self.timed_out.saturating_add(other.timed_out);
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.cost_usd_micros = self.cost_usd_micros.saturating_add(other.cost_usd_micros);
+        self.duration_ms = self.duration_ms.saturating_add(other.duration_ms);
     }
 }
 
@@ -131,13 +132,15 @@ pub struct WatchRegretChallenge {
 /// The Decision 21 audit over every project in scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchRegretSummary {
-    /// Projects with at least two gated transitions, the least the audit compares.
+    /// Projects with at least two gated transitions that have gate runs, the least the audit
+    /// compares (core `audit_transition_regret` skips a transition no run measures).
     pub projects_audited: u64,
     pub challenges: Vec<WatchRegretChallenge>,
 }
 
-/// A record's trailing run of failures: attempts that did not complete, and gate runs that did
-/// not pass, counted back from the newest until the first success.
+/// A record's trailing run of failures, counted back from the newest in store append order
+/// until the first success: attempts that did not complete, and, per gate, that gate's runs
+/// that did not pass. `gate_streak` is the longest of the per-gate streaks, on `gate`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchFailureStreak {
     pub record: String,
@@ -145,9 +148,17 @@ pub struct WatchFailureStreak {
     pub slug: String,
     pub attempt_streak: u64,
     pub gate_streak: u64,
+    /// The gate (IRI) `gate_streak` is on; `None` when no gate's newest run on the record
+    /// failed. Of gates with equal streaks, the lowest id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    /// That gate's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_status: Option<AttemptStatus>,
-    /// `pass`, `fail` or `error`.
+    /// The newest verdict of `gate` (`fail` or `error`); `pass` when the record has gate runs
+    /// and every gate's newest run on it passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_gate_verdict: Option<String>,
 }
@@ -158,7 +169,7 @@ pub struct WatchTelemetryReport {
     /// The project the report is scoped to (IRI); `None` is the whole store.
     #[serde(default)]
     pub project: Option<String>,
-    /// `columnar` when every attempt sum came from the columnar rollup, else `rows`.
+    /// Where the numbers came from: always `rows` (see the module docs).
     pub source: String,
     pub totals: WatchAttemptCounts,
     pub gate_runs: WatchGateTotals,
@@ -194,6 +205,9 @@ pub fn build_telemetry(
     build_telemetry_with(store, project, &runtime)
 }
 
+/// The source every report names: the rows (see the module docs).
+pub const SOURCE_ROWS: &str = "rows";
+
 /// Telemetry for `project`, or the whole store when `None`. `runtime` supplies the heartbeats
 /// that name each attempt's agent.
 pub fn build_telemetry_with(
@@ -201,15 +215,59 @@ pub fn build_telemetry_with(
     project: Option<&ProjectId>,
     runtime: &RuntimeSnapshot,
 ) -> Result<WatchTelemetryReport, WatchError> {
-    let mut projects = store.list_projects()?;
-    if let Some(p) = project {
-        projects.retain(|x| &x.id == p);
-        if projects.is_empty() {
-            return Err(WatchError::UnknownProject(format!(
-                "no project `{}` in this store",
-                p.as_str()
-            )));
+    let projects = store.list_projects()?;
+    telemetry_over(store, &projects, project, runtime)
+}
+
+/// The trailing streak of failed runs of one gate on each record, the gate's runs in store
+/// append order. Records with no run of the gate are absent.
+fn gate_streaks_by_record(runs: &[GateRun]) -> BTreeMap<String, (u64, &'static str)> {
+    let mut per_record: BTreeMap<String, Vec<&GateRun>> = BTreeMap::new();
+    for r in runs {
+        if let Some(rec) = &r.record {
+            per_record
+                .entry(rec.as_str().to_string())
+                .or_default()
+                .push(r);
         }
+    }
+    per_record
+        .into_iter()
+        .filter_map(|(rec, runs)| {
+            let last = verdict_name(&runs.last()?.verdict);
+            let streak = trailing(&runs, |r| !matches!(r.verdict, Verdict::Pass { .. }));
+            Some((rec, (streak, last)))
+        })
+        .collect()
+}
+
+/// The longest per-gate failure streak on one record, so far.
+#[derive(Default)]
+struct WorstGate {
+    streak: u64,
+    gate: Option<(String, String)>,
+    last_verdict: Option<&'static str>,
+}
+
+/// [`build_telemetry_with`] over a project list already read (`all_projects`, the whole
+/// catalog).
+pub(crate) fn telemetry_over(
+    store: &AnyStore,
+    all_projects: &[Project],
+    project: Option<&ProjectId>,
+    runtime: &RuntimeSnapshot,
+) -> Result<WatchTelemetryReport, WatchError> {
+    let mut projects: Vec<&Project> = all_projects
+        .iter()
+        .filter(|x| project.is_none_or(|p| &x.id == p))
+        .collect();
+    if let Some(p) = project
+        && projects.is_empty()
+    {
+        return Err(WatchError::UnknownProject(format!(
+            "no project `{}` in this store",
+            p.as_str()
+        )));
     }
     projects.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
 
@@ -227,35 +285,26 @@ pub fn build_telemetry_with(
 
     let mut report = WatchTelemetryReport {
         project: project.map(|p| p.as_str().to_string()),
+        source: SOURCE_ROWS.to_string(),
         ..WatchTelemetryReport::default()
     };
-    let (totals, mut source) = attempt_totals(store, project)?;
-    report.totals.set_sums(&totals);
-
     let mut by_adapter: BTreeMap<String, WatchAttemptCounts> = BTreeMap::new();
     let mut by_agent: BTreeMap<String, WatchAttemptCounts> = BTreeMap::new();
-    let mut scoped_gates = WatchGateTotals::default();
 
-    for p in &projects {
+    for p in projects {
         let slug = project_slug(&p.root);
-        let (sums, s) = attempt_totals(store, Some(&p.id))?;
-        if s == TotalsSource::Rows {
-            source = TotalsSource::Rows;
-        }
         let mut row = WatchProjectRollup {
             project: p.id.as_str().to_string(),
             slug: slug.clone(),
             root: p.root.clone(),
             counts: WatchAttemptCounts::default(),
         };
-        row.counts.set_sums(&sums);
 
-        // Outcomes and breakdowns: the rows.
+        // Attempts: every count and sum, the breakdowns and the attempt streaks.
         let attempts = store.attempts(&p.id)?;
-        let mut outcomes = WatchAttemptCounts::default();
         let mut per_record: BTreeMap<String, Vec<&Attempt>> = BTreeMap::new();
         for a in &attempts {
-            outcomes.add_status(a.status);
+            row.counts.add_attempt(a);
             by_adapter
                 .entry(a.adapter.clone())
                 .or_default()
@@ -274,67 +323,72 @@ pub fn build_telemetry_with(
                 .or_default()
                 .push(a);
         }
-        row.counts.add_outcomes(&outcomes);
-        report.totals.add_outcomes(&outcomes);
+        report.totals.add_counts(&row.counts);
 
-        // Gate runs: every gate of the project, for streaks, regret and scoped totals.
+        // Gate runs: one read per gate, in id order so a tie between gates is deterministic.
+        let mut gates = store.list_gates(&p.id)?;
+        gates.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         let mut runs: Vec<GateRun> = Vec::new();
-        for g in store.list_gates(&p.id)? {
-            runs.extend(store.gate_runs(&g.id)?);
-        }
-        for r in &runs {
-            let slot = match r.verdict {
-                Verdict::Pass { .. } => &mut scoped_gates.pass,
-                Verdict::Fail { .. } => &mut scoped_gates.fail,
-                Verdict::Error { .. } => &mut scoped_gates.error,
-            };
-            *slot = slot.saturating_add(1);
-            scoped_gates.duration_ms = scoped_gates.duration_ms.saturating_add(r.duration_ms);
-            scoped_gates.cost_usd_micros = scoped_gates
-                .cost_usd_micros
-                .saturating_add(r.cost_usd_micros);
-        }
-        let mut gate_per_record: BTreeMap<String, Vec<(u64, usize, &GateRun)>> = BTreeMap::new();
-        for (i, r) in runs.iter().enumerate() {
-            if let Some(rec) = &r.record {
-                let at = r.at.as_ref().map(|a| a.unix_millis()).unwrap_or(0);
-                gate_per_record
-                    .entry(rec.as_str().to_string())
-                    .or_default()
-                    .push((at, i, r));
+        let mut worst: BTreeMap<String, WorstGate> = BTreeMap::new();
+        for g in &gates {
+            let gate_runs = store.gate_runs(&g.id)?;
+            for r in &gate_runs {
+                let t = &mut report.gate_runs;
+                let slot = match r.verdict {
+                    Verdict::Pass { .. } => &mut t.pass,
+                    Verdict::Fail { .. } => &mut t.fail,
+                    Verdict::Error { .. } => &mut t.error,
+                };
+                *slot = slot.saturating_add(1);
+                t.duration_ms = t.duration_ms.saturating_add(r.duration_ms);
+                t.cost_usd_micros = t.cost_usd_micros.saturating_add(r.cost_usd_micros);
             }
+            for (rec, (streak, last)) in gate_streaks_by_record(&gate_runs) {
+                let w = worst.entry(rec).or_default();
+                if streak > w.streak {
+                    *w = WorstGate {
+                        streak,
+                        gate: Some((g.id.as_str().to_string(), g.name.clone())),
+                        last_verdict: Some(last),
+                    };
+                } else if w.last_verdict.is_none() {
+                    w.last_verdict = Some(last);
+                }
+            }
+            runs.extend(gate_runs);
         }
 
         let mut records: Vec<String> = per_record.keys().cloned().collect();
-        records.extend(gate_per_record.keys().cloned());
+        records.extend(worst.keys().cloned());
         records.sort();
         records.dedup();
         for rec in records {
             let atts = per_record.get(&rec).map(Vec::as_slice).unwrap_or(&[]);
             let attempt_streak = trailing(atts, |a| a.status != AttemptStatus::Completed);
-            let mut gates = gate_per_record.remove(&rec).unwrap_or_default();
-            gates.sort_by_key(|(at, i, _)| (*at, *i));
-            let gate_streak = trailing(&gates, |(_, _, r)| {
-                !matches!(r.verdict, Verdict::Pass { .. })
-            });
-            if attempt_streak == 0 && gate_streak == 0 {
+            let w = worst.remove(&rec).unwrap_or_default();
+            if attempt_streak == 0 && w.streak == 0 {
                 continue;
             }
+            let (gate, gate_name) = w.gate.unzip();
             report.failure_streaks.push(WatchFailureStreak {
                 record: rec,
                 project: row.project.clone(),
                 slug: slug.clone(),
                 attempt_streak,
-                gate_streak,
+                gate_streak: w.streak,
+                gate,
+                gate_name,
                 last_attempt_status: atts.last().map(|a| a.status),
-                last_gate_verdict: gates
-                    .last()
-                    .map(|(_, _, r)| verdict_name(&r.verdict).to_string()),
+                last_gate_verdict: w.last_verdict.map(str::to_string),
             });
         }
 
         let transitions = store.list_transitions(&p.id)?;
-        if transitions.iter().filter(|t| !t.gates.is_empty()).count() >= 2 {
+        let measured = transitions
+            .iter()
+            .filter(|t| !t.gates.is_empty() && runs.iter().any(|r| t.gates.contains(&r.gate)))
+            .count();
+        if measured >= 2 {
             report.regret.projects_audited += 1;
             for challenge in audit_transition_regret(&transitions, &runs) {
                 report.regret.challenges.push(WatchRegretChallenge {
@@ -348,22 +402,6 @@ pub fn build_telemetry_with(
         report.by_project.push(row);
     }
 
-    report.gate_runs = if project.is_none() {
-        let (g, s) = gate_run_totals(store, None)?;
-        if s == TotalsSource::Rows {
-            source = TotalsSource::Rows;
-        }
-        WatchGateTotals {
-            pass: g.pass,
-            fail: g.fail,
-            error: g.error,
-            duration_ms: g.duration_ms,
-            cost_usd_micros: g.cost_usd_micros,
-        }
-    } else {
-        scoped_gates
-    };
-    report.source = source.as_str().to_string();
     report.by_adapter = by_adapter
         .into_iter()
         .map(|(key, counts)| WatchBreakdown { key, counts })
@@ -536,7 +574,8 @@ mod tests {
         let lint = store
             .add_gate(&alpha, "lint", gate_kind(), sel(), 1, "c1", "o")
             .unwrap();
-        // Record 100: a gate failure streak of 2 after a pass, ordered by time across gates.
+        // Record 100: per gate in append order, `fmt` passed then failed (streak 1) and `lint`
+        // failed once (streak 1); the `at` stamps are out of order and do not count.
         for r in [
             run(&fmt, Some(100), true, 1_000, 1),
             run(&lint, Some(100), false, 3_000, 1),
@@ -685,7 +724,7 @@ mod tests {
             .map(|f| (f.record.as_str(), f.attempt_streak, f.gate_streak))
             .collect();
         let rec = |n: u64| seq_iri(n).as_str().to_string();
-        let mut want = [(rec(100), 0, 2), (rec(101), 3, 0), (rec(200), 1, 0)];
+        let mut want = [(rec(100), 0, 1), (rec(101), 3, 0), (rec(200), 1, 0)];
         want.sort();
         let want: Vec<(&str, u64, u64)> =
             want.iter().map(|(r, a, g)| (r.as_str(), *a, *g)).collect();
@@ -702,6 +741,8 @@ mod tests {
             .find(|f| f.record == rec(100))
             .unwrap();
         assert_eq!(r100.last_gate_verdict.as_deref(), Some("fail"));
+        assert!(r100.gate.is_some(), "the streak names its gate");
+        assert_eq!(t.succeeded + t.failed + t.crashed + t.timed_out, t.attempts);
 
         assert_eq!(r.regret.projects_audited, 1);
         assert_eq!(r.regret.challenges.len(), 1);
@@ -720,8 +761,8 @@ mod tests {
         let rr = build_telemetry(&redb, None).unwrap();
         check_workspace(&rf, &sf);
         check_workspace(&rr, &sr);
-        // The ferro engine answered from its columnar rollup; redb from the rows.
-        assert_eq!(rf.source, "columnar");
+        // Both engines answer from the rows, so both say the same.
+        assert_eq!(rf.source, "rows");
         assert_eq!(rr.source, "rows");
     }
 
@@ -738,7 +779,7 @@ mod tests {
         assert_eq!(r.by_project.len(), 1);
         assert_eq!((r.gate_runs.pass, r.gate_runs.fail), (3, 0));
         assert_eq!(r.gate_runs.cost_usd_micros, 1_002_000);
-        assert_eq!(r.source, "columnar");
+        assert_eq!(r.source, "rows");
         let unknown = ProjectId(seq_iri(9_999));
         assert!(build_telemetry(&store, Some(&unknown)).is_err());
     }
@@ -750,6 +791,163 @@ mod tests {
         let r = build_telemetry(&store, None).unwrap();
         assert_eq!(r.totals, WatchAttemptCounts::default());
         assert!(r.by_project.is_empty() && r.by_adapter.is_empty() && r.failure_streaks.is_empty());
-        assert_eq!(r.source, "columnar");
+        assert_eq!(r.source, "rows");
+    }
+
+    fn undated(mut r: GateRun) -> GateRun {
+        r.at = None;
+        r
+    }
+
+    /// Finding: the gate streak is per record and gate. A passing lint gate interleaved with a
+    /// failing test gate used to keep the record's streak at 1 or less.
+    #[test]
+    fn a_failing_gate_beside_a_passing_one_is_a_crash_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [BackendKind::Ferro, BackendKind::Redb] {
+            let store = open(&dir, &format!("{kind:?}"), kind);
+            let p = store.add_project("/w/p").unwrap();
+            let sel = || Selector::Glob {
+                pattern: "**".into(),
+            };
+            let lint = store
+                .add_gate(&p, "lint", gate_kind(), sel(), 1, "c1", "o")
+                .unwrap();
+            let test = store
+                .add_gate(&p, "test", gate_kind(), sel(), 1, "c1", "o")
+                .unwrap();
+            for i in 0..4u64 {
+                store
+                    .append_gate_run(run(&lint, Some(7), true, 10 * i + 1, 0))
+                    .unwrap();
+                store
+                    .append_gate_run(run(&test, Some(7), false, 10 * i + 2, 0))
+                    .unwrap();
+            }
+            let r = build_telemetry(&store, None).unwrap();
+            assert_eq!(r.failure_streaks.len(), 1, "{kind:?}");
+            let s = &r.failure_streaks[0];
+            assert_eq!(s.gate_streak, 4, "{kind:?}");
+            assert_eq!(s.gate.as_deref(), Some(test.as_str()));
+            assert_eq!(s.gate_name.as_deref(), Some("test"));
+            assert_eq!(s.last_gate_verdict.as_deref(), Some("fail"));
+            let alerts = crate::evaluate_watch_alerts(
+                &r,
+                &crate::WatchHealthReport::default(),
+                &[],
+                &crate::WatchThresholds::default(),
+                0,
+            );
+            let want = format!(
+                "crash_loop:record:{}:gate:{}",
+                seq_iri(7).as_str(),
+                test.as_str()
+            );
+            assert_eq!(alerts.len(), 1, "{alerts:?}");
+            assert_eq!(alerts[0].id, want);
+            assert_eq!(alerts[0].severity, crate::Severity::Warning);
+            assert!(
+                alerts[0].message.contains("`test`"),
+                "{}",
+                alerts[0].message
+            );
+        }
+    }
+
+    /// Finding: attempts and gate runs both follow store append order. An undated run appended
+    /// last is the newest; a run stamped earlier but appended later is newer.
+    #[test]
+    fn streaks_follow_append_order_not_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir, "f", BackendKind::Ferro);
+        let p = store.add_project("/w/p").unwrap();
+        let sel = || Selector::Glob {
+            pattern: "**".into(),
+        };
+        let g = store
+            .add_gate(&p, "g", gate_kind(), sel(), 1, "c1", "o")
+            .unwrap();
+        // Record 1: fail at 9000, then an undated pass appended last: streak 0.
+        // Record 2: pass at 9000, then fails stamped 1 and undated: streak 2.
+        for r in [
+            run(&g, Some(1), false, 9_000, 0),
+            undated(run(&g, Some(1), true, 0, 0)),
+            run(&g, Some(2), true, 9_000, 0),
+            run(&g, Some(2), false, 1, 0),
+            undated(run(&g, Some(2), false, 0, 0)),
+        ] {
+            store.append_gate_run(r).unwrap();
+        }
+        let r = build_telemetry(&store, None).unwrap();
+        let streaks: Vec<(String, u64)> = r
+            .failure_streaks
+            .iter()
+            .map(|f| (f.record.clone(), f.gate_streak))
+            .collect();
+        assert_eq!(streaks, vec![(seq_iri(2).as_str().to_string(), 2)]);
+    }
+
+    /// Finding: the totals and the outcome counts come from the same rows, so they add up.
+    #[test]
+    fn totals_and_outcomes_come_from_the_same_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in [BackendKind::Ferro, BackendKind::Redb] {
+            let store = open(&dir, &format!("t{kind:?}"), kind);
+            let s = seed(&store);
+            for scope in [None, Some(&s.alpha), Some(&s.beta)] {
+                let r = build_telemetry(&store, scope).unwrap();
+                let t = r.totals;
+                assert_eq!(t.succeeded + t.failed + t.crashed + t.timed_out, t.attempts);
+                let summed = r
+                    .by_project
+                    .iter()
+                    .fold(WatchAttemptCounts::default(), |mut a, p| {
+                        a.add_counts(&p.counts);
+                        a
+                    });
+                assert_eq!(summed, t, "{kind:?} {scope:?}");
+            }
+        }
+    }
+
+    /// Finding: a project counts as audited only with two transitions whose gates have runs.
+    #[test]
+    fn a_project_with_unmeasured_transitions_is_not_audited() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir, "f", BackendKind::Ferro);
+        let p = store.add_project("/w/p").unwrap();
+        let sel = || Selector::Glob {
+            pattern: "**".into(),
+        };
+        let ran = store
+            .add_gate(&p, "ran", gate_kind(), sel(), 1, "c1", "o")
+            .unwrap();
+        let idle = store
+            .add_gate(&p, "idle", gate_kind(), sel(), 1, "c1", "o")
+            .unwrap();
+        store.append_gate_run(run(&ran, None, true, 1, 5)).unwrap();
+        for (name, from, to, gate) in [
+            ("start", State::Todo, State::Doing, ran.clone()),
+            ("ship", State::Doing, State::Done, idle.clone()),
+        ] {
+            store
+                .add_transition(Transition {
+                    project: p.clone(),
+                    name: name.into(),
+                    from,
+                    to,
+                    regret: Regret::Low,
+                    gates: vec![gate],
+                })
+                .unwrap();
+        }
+        let r = build_telemetry(&store, None).unwrap();
+        assert_eq!(
+            r.regret.projects_audited, 0,
+            "only one transition is measured"
+        );
+        store.append_gate_run(run(&idle, None, true, 2, 5)).unwrap();
+        let r = build_telemetry(&store, None).unwrap();
+        assert_eq!(r.regret.projects_audited, 1);
     }
 }

@@ -35,7 +35,7 @@ pub enum WatchCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Attempt and gate-run rollups: totals (columnar where the engine has it), outcomes, and
+    /// Attempt and gate-run rollups: totals and outcomes summed from the ledger rows, and
     /// breakdowns by project, adapter and agent, failure streaks and transition regret.
     Rollups {
         /// One project: its id, or the last component of its root.
@@ -172,8 +172,13 @@ pub fn render_telemetry(t: &WatchTelemetryReport) -> Vec<String> {
         out.push(format!("agent {}: {}", b.key, counts_line(&b.counts)));
     }
     for s in &t.failure_streaks {
+        let on_gate = match (&s.gate_name, &s.gate) {
+            (Some(name), _) => format!(" of gate `{name}`"),
+            (None, Some(id)) => format!(" of gate {id}"),
+            (None, None) => String::new(),
+        };
         out.push(format!(
-            "failure streak {} ({}): {} attempts, {} gate runs",
+            "failure streak {} ({}): {} attempts, {} gate runs{on_gate}",
             s.record, s.slug, s.attempt_streak, s.gate_streak
         ));
     }
