@@ -7009,6 +7009,23 @@ mod tests {
         for raw in ["pro", "plus", "free", "team"] {
             assert_eq!(normalize_codex_plan(raw), raw);
         }
+        let rollout = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "prolite",
+                    "primary": {
+                        "used_percent": 5.0,
+                        "window_minutes": 300,
+                        "resets_at": 1_700_000_000_i64
+                    }
+                }
+            }
+        })
+        .to_string();
+        let quota = codex_quota_from_rollout(&format!("{rollout}\n")).expect("rollout quota");
+        assert_eq!(quota.tier.as_deref(), Some("plus"));
     }
 
     #[test]

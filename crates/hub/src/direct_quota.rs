@@ -208,18 +208,19 @@ fn claude_quota_uncached(
     // `subscriptionType` is written once at `claude auth login`, so the
     // credentials file and `claude auth status` stay on the old plan after an
     // upgrade. `~/.claude.json` and the live profile track the account.
-    let mut fresh_tier = claude_json_plan(home_override);
-    if home_override.is_none()
-        && matches!(fresh_tier.as_deref(), None | Some("pro"))
-        && let Some(live) = creds
-            .as_ref()
-            .and_then(|creds| creds.token.as_deref())
-            .and_then(fetch_claude_oauth_profile)
-            .and_then(|profile| plan_from_profile(&profile))
-    {
-        fresh_tier = Some(live);
-    }
-    if let Some(tier) = fresh_tier.or(auth_tier) {
+    let fresh_tier = resolve_claude_tier(
+        claude_json_plan(home_override),
+        home_override.is_none(),
+        || {
+            creds
+                .as_ref()
+                .and_then(|creds| creds.token.as_deref())
+                .and_then(fetch_claude_oauth_profile)
+                .and_then(|profile| plan_from_profile(&profile))
+        },
+        auth_tier,
+    );
+    if let Some(tier) = fresh_tier {
         quota.tier = Some(tier);
     } else if quota.tier.is_none()
         && let Some(creds) = creds.as_ref()
@@ -231,6 +232,26 @@ fn claude_quota_uncached(
     } else {
         Some(quota)
     }
+}
+
+/// Picks the Claude plan tier. `~/.claude.json` wins when it names a plan
+/// above `pro`; otherwise the live profile (fetched lazily, only when
+/// `query_profile` is set and the json plan is missing or `pro`) may upgrade
+/// it; `auth_tier` is the last resort.
+fn resolve_claude_tier(
+    json_plan: Option<String>,
+    query_profile: bool,
+    live_profile: impl FnOnce() -> Option<String>,
+    auth_tier: Option<String>,
+) -> Option<String> {
+    let mut fresh_tier = json_plan;
+    if query_profile
+        && matches!(fresh_tier.as_deref(), None | Some("pro"))
+        && let Some(live) = live_profile()
+    {
+        fresh_tier = Some(live);
+    }
+    fresh_tier.or(auth_tier)
 }
 
 pub(crate) fn agy_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
@@ -844,6 +865,48 @@ mod tests {
     use crate::discovery::read_session_quota_usage_locked;
     use fl_core::At;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn resolve_claude_tier_prefers_json_and_fetches_profile_lazily() {
+        let s = |v: &str| Some(v.to_string());
+        let calls = Cell::new(0);
+        let live = |value: Option<String>| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                value
+            }
+        };
+        assert_eq!(
+            resolve_claude_tier(s("pro"), true, live(s("max")), None),
+            s("max")
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            resolve_claude_tier(s("pro"), true, live(None), None),
+            s("pro")
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            resolve_claude_tier(s("max"), true, live(s("pro")), s("pro")),
+            s("max")
+        );
+        assert_eq!(calls.get(), 2, "json max must not fetch the profile");
+        assert_eq!(
+            resolve_claude_tier(None, false, live(s("max")), s("pro")),
+            s("pro")
+        );
+        assert_eq!(calls.get(), 2, "query_profile=false must not fetch");
+        assert_eq!(
+            resolve_claude_tier(None, true, live(None), s("pro")),
+            s("pro")
+        );
+        assert_eq!(
+            resolve_claude_tier(None, true, live(s("max")), s("pro")),
+            s("max")
+        );
+        assert_eq!(calls.get(), 4);
+    }
 
     fn write_script(path: &Path, body: &str) {
         fs::write(path, body).unwrap();
