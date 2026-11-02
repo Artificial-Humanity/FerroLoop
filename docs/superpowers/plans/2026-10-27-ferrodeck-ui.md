@@ -62,7 +62,7 @@
 2. `ContextHeader.tsx`:
    - Displays the selected agent's identity, project, role, active session selector (`DiscoveredSessionSummary[]` for that agent or all sessions), working directory badge, current `HubAuthority` status pill (`Owner: <login>` or `Peer`), **Split-View toggle button**, and the 5 mode tabs (`Chat`, `Git & PRs`, `Wire Mail`, `Terminal`, `Hub & Arch`).
 3. `PairingModal.tsx`:
-   - Allows entering a 10-minute `fl hub pair` code or an Owner/Peer bearer token and exchanges it via `POST /api/v1/auth/pair`.
+   - Allows entering a 1-hour `fl hub pair` code or an Owner/Peer bearer token and exchanges it via `POST /api/v1/auth/pair`.
 4. `RosterSidebar.test.tsx`:
    - Verifies grouping by project, search filtering, adapter/role badges, unread counts, and clicking an agent row.
 
