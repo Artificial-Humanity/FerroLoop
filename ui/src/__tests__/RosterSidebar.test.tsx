@@ -761,6 +761,23 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) {
+        return new Response(
+          JSON.stringify({
+            sessions: [
+              {
+                id: "sess-ferris-yolo",
+                source: "route",
+                adapter: "claude",
+                persona: "ferris",
+                status: "active",
+                execution_mode: "yolo",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify({}), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -810,9 +827,15 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
 
-    // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal without collapsing desktop sidebar
+    // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal without collapsing desktop sidebar,
+    // and passes activeSession?.execution_mode immediately into AgentSettingsModal
     fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("execution-mode-badge")).toHaveAttribute(
+      "data-mode",
+      "yolo",
+    );
+    expect(screen.getByTestId("execution-mode-badge")).toHaveTextContent("Yolo");
     expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
 
