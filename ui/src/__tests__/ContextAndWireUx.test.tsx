@@ -881,4 +881,134 @@ describe("Agent switch transcript isolation", () => {
 
     unmount();
   });
+
+  it("resolves handleSendPrompt and clears Sending... state immediately without waiting for slow post-send session/transcript refresh", async () => {
+    let holdRefresh = false;
+    let resolvePendingSessionsRefresh = null as ((res: Response) => void) | null;
+    let resolvePendingBgTranscript = null as ((res: Response) => void) | null;
+
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.includes("/prompt") && init?.method === "POST") {
+        return json({
+          status: "delivered",
+          queued: false,
+          is_busy: true,
+          effective_body: "Fast operator prompt",
+        });
+      }
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) {
+        if (holdRefresh) {
+          return new Promise<Response>((resolve) => {
+            resolvePendingSessionsRefresh = resolve;
+          });
+        }
+        return json({
+          sessions: [
+            {
+              id: "sess-ferris",
+              source: "route",
+              adapter: "claude",
+              persona: "ferris",
+              status: "active",
+              updated_at: "t1",
+            },
+            {
+              id: "sess-jarvis",
+              source: "route",
+              adapter: "claude",
+              persona: "jarvis",
+              status: "active",
+              updated_at: "t1",
+            },
+          ],
+        });
+      }
+      if (url.includes("/sess-jarvis/transcript")) {
+        if (holdRefresh) {
+          return new Promise<Response>((resolve) => {
+            resolvePendingBgTranscript = resolve;
+          });
+        }
+        return json({
+          session_id: "sess-jarvis",
+          turns: [],
+          is_busy: false,
+          queue: [],
+        });
+      }
+      if (url.includes("/transcript")) {
+        return json({
+          session_id: "sess-ferris",
+          turns: [],
+          is_busy: false,
+          queue: [],
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    const textarea = (await screen.findByPlaceholderText(
+      /Send a message to Ferris/i,
+    )) as HTMLTextAreaElement;
+    const sendBtn = screen.getByTestId("send-prompt-btn");
+
+    // Hold post-send /api/v1/sessions and background transcript refresh calls
+    holdRefresh = true;
+
+    fireEvent.change(textarea, { target: { value: "Fast operator prompt" } });
+    fireEvent.click(sendBtn);
+
+    // Even while the post-send refresh is still pending, Sending... clears immediately,
+    // the textarea resets to empty, and the optimistic turn renders right away
+    await waitFor(() => {
+      expect(textarea.value).toBe("");
+      expect(sendBtn).toHaveTextContent("Send Message");
+    });
+    expect(screen.getAllByText("Fast operator prompt").length).toBeGreaterThan(0);
+    expect(resolvePendingSessionsRefresh).not.toBeNull();
+
+    // Clean up pending promises
+    resolvePendingSessionsRefresh?.(
+      new Response(JSON.stringify({ sessions: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    resolvePendingBgTranscript?.(
+      new Response(JSON.stringify({ session_id: "sess-jarvis", turns: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    unmount();
+  });
 });
