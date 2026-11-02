@@ -141,8 +141,233 @@ struct DiscoveryAttemptRow {
     created_at: Option<String>,
 }
 
+/// Per-thread counts of the costly steps a request takes, so tests can prove a step was skipped.
+/// A handler runs on the calling thread, so a test reads the counts of its own requests only.
+#[cfg(test)]
+pub(crate) mod cost_counters {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// Host route scans ([`super::scan_route_table`]): one `RouteTable::discover_routes` each.
+        pub(crate) static ROUTE_SCANS: Cell<u64> = const { Cell::new(0) };
+        /// Transcript files read in full ([`super::read_transcript`]).
+        pub(crate) static TRANSCRIPT_READS: Cell<u64> = const { Cell::new(0) };
+        /// Transcripts parsed into turns ([`super::parse_jsonl_transcript`]).
+        pub(crate) static TRANSCRIPT_PARSES: Cell<u64> = const { Cell::new(0) };
+        /// Store snapshots ([`super::snapshot_discovery_store`]): `2 + projects` store reads each.
+        pub(crate) static STORE_SNAPSHOTS: Cell<u64> = const { Cell::new(0) };
+        /// Workspace store opens (`HubState::open_store_at`).
+        pub(crate) static STORE_OPENS: Cell<u64> = const { Cell::new(0) };
+        /// Calls to [`super::invalidate_route_discovery_cache`].
+        pub(crate) static ROUTE_CACHE_INVALIDATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump(counter: &'static LocalKey<Cell<u64>>) {
+        counter.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Counts taken on this thread while one closure ran.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Costs {
+        pub route_scans: u64,
+        pub transcript_reads: u64,
+        pub transcript_parses: u64,
+        pub store_snapshots: u64,
+        pub store_opens: u64,
+    }
+
+    fn now() -> Costs {
+        Costs {
+            route_scans: ROUTE_SCANS.with(Cell::get),
+            transcript_reads: TRANSCRIPT_READS.with(Cell::get),
+            transcript_parses: TRANSCRIPT_PARSES.with(Cell::get),
+            store_snapshots: STORE_SNAPSHOTS.with(Cell::get),
+            store_opens: STORE_OPENS.with(Cell::get),
+        }
+    }
+
+    /// Run `body` and return what it cost on this thread.
+    pub(crate) fn measure<T>(body: impl FnOnce() -> T) -> (T, Costs) {
+        let before = now();
+        let out = body();
+        let after = now();
+        let costs = Costs {
+            route_scans: after.route_scans - before.route_scans,
+            transcript_reads: after.transcript_reads - before.transcript_reads,
+            transcript_parses: after.transcript_parses - before.transcript_parses,
+            store_snapshots: after.store_snapshots - before.store_snapshots,
+            store_opens: after.store_opens - before.store_opens,
+        };
+        (out, costs)
+    }
+}
+
+/// The route table file the hub reads: the override home's `routes.json`, else `None` (the
+/// default path merged with the legacy agent-bus file, see [`RouteTable::load`]).
+pub(crate) fn route_table_path(home_override: Option<&Path>) -> Option<PathBuf> {
+    home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"))
+}
+
+/// Load the route table and scan the host's vendor session files for live routes. This is the
+/// costly step (every vendor directory, transcript heads and `/proc`), so callers that only read
+/// go through [`discovered_route_table`].
+pub(crate) fn scan_route_table(home_override: Option<&Path>) -> RouteTable {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::ROUTE_SCANS);
+    let mut routes = RouteTable::load(route_table_path(home_override).as_deref());
+    routes.discover_routes(home_override, stamp::now());
+    routes
+}
+
+/// A thread-safe cache of one value that expires `ttl` after it was loaded, or at the next
+/// [`TtlCache::invalidate`]. Every read returns a clone, so a caller that changes its copy never
+/// changes the cache.
+///
+/// One load at a time: callers that miss together wait for the first one's load and then read
+/// its value. A load that an invalidation overtook is not served, because each value carries the
+/// generation it was loaded in and an invalidation starts a new one.
+pub(crate) struct TtlCache<K, V> {
+    ttl: Duration,
+    state: Mutex<TtlCacheState<K, V>>,
+    load_gate: Mutex<()>,
+}
+
+struct TtlCacheState<K, V> {
+    generation: u64,
+    entry: Option<TtlCacheEntry<K, V>>,
+}
+
+struct TtlCacheEntry<K, V> {
+    key: K,
+    loaded_at: Instant,
+    generation: u64,
+    value: V,
+}
+
+impl<K, V> std::fmt::Debug for TtlCache<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtlCache")
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: PartialEq, V: Clone> TtlCache<K, V> {
+    pub(crate) const fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            state: Mutex::new(TtlCacheState {
+                generation: 0,
+                entry: None,
+            }),
+            load_gate: Mutex::new(()),
+        }
+    }
+
+    /// The cached value for `key` when it is younger than the TTL at `now`; otherwise `load` runs
+    /// and its `Ok` value is cached under `key`. An `Err` is returned and not cached.
+    pub(crate) fn get_or_load<E>(
+        &self,
+        key: K,
+        now: Instant,
+        load: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        if let Some(hit) = self.fresh(&key, now) {
+            return Ok(hit);
+        }
+        let _one_load = self.load_gate.lock().unwrap_or_else(|e| e.into_inner());
+        // A caller that waited on the gate reads what the load before it stored.
+        if let Some(hit) = self.fresh(&key, now) {
+            return Ok(hit);
+        }
+        let generation = self.lock_state().generation;
+        let value = load()?;
+        let mut state = self.lock_state();
+        state.entry = Some(TtlCacheEntry {
+            key,
+            loaded_at: now,
+            generation,
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// Drop the cached value. A load already running when this is called is not served either.
+    pub(crate) fn invalidate(&self) {
+        let mut state = self.lock_state();
+        state.generation = state.generation.wrapping_add(1);
+        state.entry = None;
+    }
+
+    fn fresh(&self, key: &K, now: Instant) -> Option<V> {
+        let state = self.lock_state();
+        let entry = state.entry.as_ref()?;
+        (entry.generation == state.generation
+            && entry.key == *key
+            && now.saturating_duration_since(entry.loaded_at) < self.ttl)
+            .then(|| entry.value.clone())
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, TtlCacheState<K, V>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How long the hub reuses one host route scan. FerroDeck polls several discovery endpoints at
+/// once and each needs the route table, so they share one scan instead of each taking ~1.4 s.
+const ROUTE_DISCOVERY_TTL: Duration = Duration::from_millis(2500);
+
+/// What a host route scan read: the route files it loaded and whether host discovery was on.
+/// A scan cached under other values (a test that moved `HOME` or `XDG_RUNTIME_DIR`) is not reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteScanKey {
+    primary: PathBuf,
+    legacy: Option<PathBuf>,
+    host_discovery_disabled: bool,
+}
+
+impl RouteScanKey {
+    fn current() -> Self {
+        Self {
+            primary: fl_wire::identity::default_routes_path(),
+            legacy: fl_wire::identity::legacy_routes_path(),
+            host_discovery_disabled: std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref()
+                == Ok("1"),
+        }
+    }
+}
+
+static ROUTE_DISCOVERY_CACHE: TtlCache<RouteScanKey, RouteTable> =
+    TtlCache::new(ROUTE_DISCOVERY_TTL);
+
+/// The host's route table after discovery. With no home override the scan is shared for
+/// [`ROUTE_DISCOVERY_TTL`]; a `Some(home)` call (tests, hermetic runs) always scans fresh and
+/// never reads or fills the shared cache.
+pub(crate) fn discovered_route_table(home_override: Option<&Path>) -> RouteTable {
+    if home_override.is_some() {
+        return scan_route_table(home_override);
+    }
+    let Ok(table) =
+        ROUTE_DISCOVERY_CACHE.get_or_load(RouteScanKey::current(), Instant::now(), || {
+            Ok::<_, std::convert::Infallible>(scan_route_table(None))
+        });
+    table
+}
+
+/// Forget the shared route scan, so the next discovery reads the host again. Called when the hub
+/// spawns, restarts, clears or stops a session, or writes the route table, so a change the hub
+/// made itself shows at once.
+pub(crate) fn invalidate_route_discovery_cache() {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::ROUTE_CACHE_INVALIDATIONS);
+    ROUTE_DISCOVERY_CACHE.invalidate();
+}
+
 /// Read agent names and attempt rows. Does not walk the filesystem.
 pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::STORE_SNAPSHOTS);
     let registered_names = store
         .list_agents(None, true)
         .unwrap_or_default()
@@ -267,10 +492,7 @@ fn discover_sessions_impl(
     let mut agy_endpoints: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut seen_ids = BTreeSet::new();
 
-    let route_override =
-        home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(home_override, stamp::now());
+    let routes = discovered_route_table(home_override);
 
     let home = home_override
         .map(Path::to_path_buf)
@@ -951,6 +1173,8 @@ fn read_transcript_lossy(path: &Path, max_bytes: u64) -> std::io::Result<String>
 }
 
 fn read_transcript(path: impl AsRef<Path>) -> std::io::Result<String> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::TRANSCRIPT_READS);
     read_transcript_lossy(path.as_ref(), TRANSCRIPT_READ_MAX_BYTES)
 }
 
@@ -2257,6 +2481,8 @@ fn remember_agy_step_zero(
 /// Normalize JSONL lines from Antigravity (`transcript.jsonl`), Claude Code, Codex, Muse, or Grok
 /// into a unified `Vec<TranscriptTurn>` sequence (spec §3.2).
 pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::TRANSCRIPT_PARSES);
     let mut turns = Vec::new();
     let mut last_step_index: Option<u64> = None;
     let mut step_zero_turn: Option<TranscriptTurn> = None;

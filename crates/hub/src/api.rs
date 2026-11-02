@@ -64,7 +64,6 @@ use fl_wire::dispatcher::{
     MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
     dispatch_to_route,
 };
-use fl_wire::identity::RouteTable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -337,6 +336,16 @@ pub fn parse_http_request(buf: &[u8]) -> Result<Option<(HttpRequest, usize)>, St
 
 /// Handle an incoming HTTP/1.1 request against [`HubState`] (spec §2.3, §3).
 pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let resp = route_http_request(state, req);
+    if req.method != "GET" && req.method != "HEAD" {
+        // A request that may have written the store: the next discovery read takes a fresh
+        // snapshot, so the caller sees its own change.
+        state.discovery_snapshots.invalidate();
+    }
+    resp
+}
+
+fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let method = req.method.as_str();
     let path = req.path.as_str();
 
@@ -1262,9 +1271,8 @@ fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
 
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
-    let snap = match state.open_store() {
-        Ok(store) => snapshot_discovery_store(&store),
-        Err(_) => return store_open_failure(),
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
     };
     let sessions = state.with_model_overrides(discover_sessions_from_snapshot(
         &snap,
@@ -1408,8 +1416,10 @@ fn handle_get_agents(state: &HubState, req: &HttpRequest) -> HttpResponse {
         Ok(a) => a,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
-    let snap = snapshot_discovery_store(&store);
     drop(store);
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
+    };
     let routes = state.with_model_overrides(discover_sessions_from_snapshot(
         &snap,
         state.config.home_override.as_deref(),
@@ -1458,8 +1468,10 @@ fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpRespon
             });
         heartbeats.push(hb);
     }
-    let snap = snapshot_discovery_store(&store);
     drop(store);
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
+    };
     // Liveness reads only `source`, `persona` and `adapter`: no model discovery.
     let sessions =
         discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
@@ -1645,13 +1657,7 @@ fn handle_post_wire_send(
     };
     drop(store);
 
-    let route_override = state
-        .config
-        .home_override
-        .as_ref()
-        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(state.config.home_override.as_deref(), now.clone());
+    let routes = crate::discovery::scan_route_table(state.config.home_override.as_deref());
     let mut any_updated = false;
     for rcpt in &receipts {
         if matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
@@ -3958,7 +3964,7 @@ fn handle_dynamic_api_routes(
         match (method, segments[4]) {
             ("GET", "transcript") => {
                 drain_ready_session_queues(state);
-                let snap = load_discovery_snapshot(state);
+                let snap = state.cached_discovery_snapshot().unwrap_or_default();
                 let home = state.config.home_override.as_deref();
                 let (canonical_id, _persona) =
                     resolve_session_target_from_snapshot(state, &snap, &session_id);
@@ -4814,7 +4820,10 @@ fn reset_session(
     } else {
         SessionResetMode::Clear
     };
-    clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()).map_err(|e| (502, e))?;
+    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
+    // A clear can start a new vendor session (a new id) behind the same persona.
+    crate::discovery::invalidate_route_discovery_cache();
+    reset.map_err(|e| (502, e))?;
 
     let data = json!({
         "ok": true,

@@ -184,7 +184,17 @@ pub struct HubState {
     pub(crate) code_sidecars: Arc<fl_store::CodeSidecarCache>,
     /// Set while an attachment sweep runs, so only one runs at a time (see [`attachments`]).
     pub(crate) attachment_sweep_running: Arc<AtomicBool>,
+    /// The discovery store snapshot (agent names and every attempt row) the read-only discovery
+    /// endpoints share for [`DISCOVERY_SNAPSHOT_TTL`], keyed by the store path. Any request
+    /// other than a `GET` or `HEAD` drops it (see [`api::handle_http_request`]).
+    pub(crate) discovery_snapshots:
+        Arc<discovery::TtlCache<PathBuf, discovery::DiscoveryStoreSnapshot>>,
 }
+
+/// How long the read-only discovery endpoints reuse one store snapshot. A snapshot costs
+/// `2 + projects` store reads, each an RPC on a remote store, and FerroDeck polls several of
+/// these endpoints together.
+pub(crate) const DISCOVERY_SNAPSHOT_TTL: Duration = Duration::from_secs(2);
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
 /// the wait for another process (the CLI) that holds the `.redb` file.
@@ -292,7 +302,21 @@ impl HubState {
             store_backend: None,
             code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
             attachment_sweep_running: Arc::new(AtomicBool::new(false)),
+            discovery_snapshots: Arc::new(discovery::TtlCache::new(DISCOVERY_SNAPSHOT_TTL)),
         }
+    }
+
+    /// The discovery snapshot for a read-only endpoint: shared for [`DISCOVERY_SNAPSHOT_TTL`],
+    /// so it can lag a write made outside the hub (the CLI) by that long. A request that acts
+    /// on a session (prompt, queue drain, busy check) uses a fresh snapshot instead.
+    pub fn cached_discovery_snapshot(
+        &self,
+    ) -> Result<discovery::DiscoveryStoreSnapshot, StoreError> {
+        self.discovery_snapshots
+            .get_or_load(self.config.store_path.clone(), Instant::now(), || {
+                self.open_store()
+                    .map(|store| discovery::snapshot_discovery_store(&store))
+            })
     }
 
     /// Remember the model an operator chose. `key` is the discovered session id when discovery
@@ -569,6 +593,8 @@ impl HubState {
     /// [`HubState::open_store`] for another `.redb` file (a per-project store): the same retry
     /// loop and the same `store_lock`, so every open the hub makes stays serialized.
     pub fn open_store_at(&self, path: &Path) -> Result<HubStoreGuard<'_>, StoreError> {
+        #[cfg(test)]
+        discovery::cost_counters::bump(&discovery::cost_counters::STORE_OPENS);
         let guard = Some(self.store_lock.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -664,6 +690,9 @@ impl HubState {
         self.ws_tx.subscribe()
     }
 }
+
+#[cfg(test)]
+mod latency_tests;
 
 #[cfg(test)]
 mod tests {

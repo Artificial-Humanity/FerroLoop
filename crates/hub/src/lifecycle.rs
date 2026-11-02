@@ -543,10 +543,7 @@ pub(crate) fn find_route(
     persona: Option<&str>,
     fallback_session_id: &str,
 ) -> Option<VendorRoute> {
-    let route_override =
-        home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(home_override, stamp::now());
+    let routes = crate::discovery::scan_route_table(home_override);
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
         return Some(entry.route.clone());
@@ -675,6 +672,8 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     record.runtime_spawned |= spawned;
     record.hydration_dispatched = hydration_dispatched;
     record.updated_at_ms = now_ms();
+    // A runtime may have started: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
     if let Err(e) = persist_hosted_session(store, &record, by) {
         if spawned {
             // The record cannot learn about this runtime, so teardown could never stop it.
@@ -1082,6 +1081,8 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         // Spawning is off, so no runtime was started in this run to stop.
         _ => true,
     };
+    // Its routes are gone and its runtime may be: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
 
     if let Some(agent) = agent
         && agent.status == AgentStatus::Active
@@ -1137,6 +1138,8 @@ pub fn restart_hosted_session<S: StateStore>(
     let prompt = prompt_for(&display, &record.project, &record.role);
     record.hydration_dispatched =
         deliver_prompt(env, &record.persona, &record.session_id, by, &prompt);
+    // A runtime may have reopened: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
     record.status = STATUS_RUNNING.to_string();
     record.decommission_prepared_at_ms = None;
@@ -1446,6 +1449,30 @@ mod tests {
             AgentStatus::Active
         );
         assert!(RouteTable::load(Some(&routes)).get("felicity").is_some());
+    }
+
+    #[test]
+    fn spin_up_restart_and_teardown_each_drop_the_shared_route_scan() {
+        use crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS;
+        let count = || ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let before = count();
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(count() - before, 1, "spin-up");
+        restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap();
+        assert_eq!(count() - before, 2, "restart");
+        let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(count() - before, 3, "teardown");
     }
 
     #[test]
