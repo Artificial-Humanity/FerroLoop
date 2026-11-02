@@ -350,7 +350,8 @@ fn decommission_prepare_then_teardown_retires_the_agent_and_removes_the_route() 
     assert_eq!(out["status"], "decommissioned");
     assert_eq!(out["handshake_dispatched"], false);
     assert_eq!(out["unregistered"], true);
-    assert_eq!(out["runtime_stopped"], true);
+    // `FL_TEST_SPINUP_NO_SPAWN`: no runtime was started, so none is reported stopped.
+    assert_eq!(out["runtime_stopped"], false);
     assert!(out["prompt"].is_null());
 
     assert_eq!(env.hosted_records()[0]["status"], "decommissioned");

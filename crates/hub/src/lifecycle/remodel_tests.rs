@@ -11,6 +11,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
     LifecycleEnv {
         home_override: Some(home.path()),
         spawn_runtime: false,
+        runtime: &TmuxRuntime,
     }
 }
 
@@ -171,7 +172,8 @@ fn execute_moves_vendor_and_keeps_persona_project_role_email_extra_areas_and_cwd
     assert_eq!(out.cwd.as_deref(), Some(cwd.as_str()));
     assert_eq!(out.status, STATUS_RUNNING);
     assert_eq!(out.tmux_target.as_deref(), Some("Felicity:codex"));
-    assert!(out.runtime_stopped);
+    // Runtime calls are off: no runtime was started, so none is reported stopped.
+    assert!(!out.runtime_stopped);
     assert_eq!(out.handoff.as_deref(), Some("remodel-felicity"));
     assert!(out.warnings.is_empty());
     assert!(cleared.contains(&"claude:felicity".to_string()));
@@ -356,6 +358,8 @@ fn a_peer_cannot_remodel_an_unmanaged_session() {
     .unwrap();
     assert_eq!(out.session_id, "codex:jarvis");
     assert_eq!(out.role, "lab-manager");
+    // With no record to keep it from, the new session takes spin-up's default: hosted.
+    assert!(out.hosted);
     let jarvis = agent(&store, "jarvis");
     assert_eq!(
         (jarvis.status, jarvis.role, jarvis.email.as_str()),
@@ -454,20 +458,22 @@ fn remodel_failing(
     req: &RemodelRequest,
     failing: &[&str],
 ) -> (Result<RemodelResponse, LifecycleError>, Vec<String>) {
+    remodel_failing_as(store, env, id, req, failing, Caller::Owner)
+}
+
+fn remodel_failing_as(
+    store: &MemStore,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+    req: &RemodelRequest,
+    failing: &[&str],
+    caller: Caller,
+) -> (Result<RemodelResponse, LifecycleError>, Vec<String>) {
     let calls = std::cell::RefCell::new(Vec::new());
     let target = target(store, id);
     let out = {
         let mut step = failing_spin(failing, &calls);
-        remodel_with(
-            store,
-            env,
-            &target,
-            req,
-            "owner",
-            Caller::Owner,
-            |_| {},
-            &mut step,
-        )
+        remodel_with(store, env, &target, req, "owner", caller, |_| {}, &mut step)
     };
     (out, calls.into_inner())
 }
@@ -566,7 +572,7 @@ fn a_failed_spin_up_after_teardown_restores_the_old_vendor() {
     let (out, calls) = remodel_failing(&store, &env, "claude:felicity", &req, &["codex"]);
     let err = out.unwrap_err();
     assert_eq!(calls, ["codex", "claude"]);
-    assert!(matches!(err, LifecycleError::Partial(_)), "{err}");
+    assert!(matches!(err, LifecycleError::Partial { .. }), "{err}");
     assert_eq!(err.status(), 502);
     let msg = err.to_string();
     assert!(
@@ -721,4 +727,524 @@ fn remodel_of_a_decommissioned_session_conflicts() {
     .unwrap_err();
     assert_eq!(err.status(), 409, "{err}");
     assert!(handoff(&store, "felicity").is_none());
+}
+
+/// The restore message's session, `None` when the persona is down.
+fn restored_of(err: &LifecycleError) -> Option<&str> {
+    match err {
+        LifecycleError::Partial {
+            restored_session_id,
+            ..
+        } => restored_session_id.as_deref(),
+        other => panic!("not a partial failure: {other}"),
+    }
+}
+
+#[test]
+fn a_new_runtime_that_does_not_start_is_a_failed_spin_up_and_restores_the_old_vendor() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    register(&store, "felicity", AgentRole::Assistant);
+    spin(&store, &env, "felicity", "assistant", "claude");
+    assert!(fake.is_live("Felicity"));
+    assert!(record(&store, "claude:felicity").runtime_spawned);
+
+    // tmux cannot start the new vendor's runtime: spin-up registers and records it, and starts
+    // nothing.
+    fake.fail_windows.borrow_mut().push("codex".into());
+    let err = remodel(
+        &store,
+        &env,
+        "claude:felicity",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 502);
+    assert_eq!(restored_of(&err), Some("claude:felicity"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("spin-up on codex failed: its tmux runtime did not start"),
+        "{msg}"
+    );
+    assert_eq!(
+        *fake.calls.borrow(),
+        [
+            "spawn Felicity:claude",
+            "kill Felicity",
+            "spawn Felicity:codex",
+            "spawn Felicity:claude",
+        ]
+    );
+    // One runtime runs, the restored one, and only its record claims the persona.
+    assert!(fake.is_live("Felicity"));
+    let old = record(&store, "claude:felicity");
+    assert_eq!(old.status, STATUS_RUNNING);
+    assert!(old.runtime_spawned);
+    assert_eq!(
+        record(&store, "codex:felicity").status,
+        STATUS_DECOMMISSIONED
+    );
+    assert_eq!(target_of(&store, "felicity"), "claude:felicity");
+    assert_eq!(agent(&store, "felicity").status, AgentStatus::Active);
+    assert_eq!(
+        handoff(&store, "felicity").unwrap().1["outcome"],
+        "restored"
+    );
+}
+
+#[test]
+fn a_restore_that_starts_no_runtime_reports_the_persona_down() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "felicity", "assistant", "claude");
+    fake.fail_windows
+        .borrow_mut()
+        .extend(["codex".to_string(), "claude".to_string()]);
+    let err = remodel(
+        &store,
+        &env,
+        "claude:felicity",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(restored_of(&err), None);
+    let msg = err.to_string();
+    assert!(msg.contains("restore on claude ALSO failed"), "{msg}");
+    assert!(!fake.is_live("Felicity"));
+    assert_eq!(handoff(&store, "felicity").unwrap().1["outcome"], "down");
+}
+
+#[test]
+fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() {
+    let home = TempDir::new().unwrap();
+
+    // Hosted, but its runtime was not started by this lifecycle (the name was taken).
+    let store = MemStore::default();
+    spin(&store, &env(&home), "felicity", "assistant", "claude");
+    let fake = FakeRuntime::running(&["Felicity"]);
+    let env = fake.env(home.path());
+    let before = list_hosted_sessions(&store).unwrap();
+    let agent_before = agent(&store, "felicity");
+    let err = remodel(
+        &store,
+        &env,
+        "claude:felicity",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(err.to_string().contains("did not start it"), "{err}");
+    assert_eq!(list_hosted_sessions(&store).unwrap(), before);
+    assert_eq!(agent(&store, "felicity"), agent_before);
+    assert!(handoff(&store, "felicity").is_none());
+    assert!(fake.calls.borrow().is_empty() && fake.is_live("Felicity"));
+    // A prepare stops nothing, so it is not refused.
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    remodel(&store, &env, "claude:felicity", &prepare, Caller::Owner).unwrap();
+
+    // No hosted record at all: the session runs outside the lifecycle.
+    let store = MemStore::default();
+    register(&store, "jarvis", AgentRole::LabManager);
+    let fake = FakeRuntime::running(&["Jarvis"]);
+    let err = remodel(
+        &store,
+        &fake.env(home.path()),
+        "claude:jarvis",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(err.to_string().contains("no hosted record"), "{err}");
+    assert!(list_hosted_sessions(&store).unwrap().is_empty());
+    assert_eq!(agent(&store, "jarvis").status, AgentStatus::Active);
+    assert!(fake.calls.borrow().is_empty() && fake.is_live("Jarvis"));
+
+    // Started by this lifecycle, but another live session shares it.
+    let store = MemStore::default();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "assistant", "claude");
+    spin(&store, &env, "ada", "assistant", "codex");
+    fake.calls.borrow_mut().clear();
+    let err = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("grok"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(err.to_string().contains("it also runs codex:ada"), "{err}");
+    assert!(fake.calls.borrow().is_empty() && fake.is_live("Ada"));
+    assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+}
+
+#[test]
+fn the_restore_of_a_session_with_no_record_keeps_it_unhosted() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    register(&store, "jarvis", AgentRole::LabManager);
+    let (out, calls) = remodel_failing(
+        &store,
+        &env,
+        "claude:jarvis",
+        &remodel_req("codex"),
+        &["codex"],
+    );
+    assert_eq!(restored_of(&out.unwrap_err()), Some("claude:jarvis"));
+    assert_eq!(calls, ["codex", "claude"]);
+    // It was not hosted before the remodel, so the restore does not make it managed.
+    let rec = record(&store, "claude:jarvis");
+    assert_eq!(rec.status, STATUS_RUNNING);
+    assert!(!rec.hosted);
+}
+
+#[test]
+fn a_remodel_that_could_not_be_restored_needs_the_owner_and_warns() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    register(&store, "jarvis", AgentRole::LabManager);
+    // The Owner's prepare adopts the session under an id that names no vendor.
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    remodel(&store, &env, "jarvis", &prepare, Caller::Owner).unwrap();
+    let adopted = record(&store, "jarvis");
+    assert_eq!(adopted.vendor, "unknown");
+
+    for req in [prepare.clone(), remodel_req("codex")] {
+        let err = remodel(&store, &env, "jarvis", &req, Caller::Peer).unwrap_err();
+        assert_eq!(err.status(), 409, "{err}");
+        assert!(err.to_string().contains("could not be restored"), "{err}");
+    }
+    assert_eq!(record(&store, "jarvis"), adopted);
+    assert_eq!(agent(&store, "jarvis").status, AgentStatus::Active);
+    assert!(handoff(&store, "jarvis").is_none());
+
+    let out = remodel(&store, &env, "jarvis", &remodel_req("codex"), Caller::Owner).unwrap();
+    assert_eq!(out.session_id, "codex:jarvis");
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].starts_with("no restore was possible"));
+}
+
+/// A store whose writes can be made to fail: the `nth` write (from 1) of one state slug, and
+/// every `retire_agent`.
+#[derive(Default)]
+struct FaultyStore {
+    inner: MemStore,
+    fail_state_write: std::cell::RefCell<Option<(String, usize)>>,
+    fail_retire: std::cell::Cell<bool>,
+}
+
+fn injected() -> StoreError {
+    StoreError::Backend("injected store failure".into())
+}
+
+impl AgentRegistry for FaultyStore {
+    fn upsert_area(
+        &self,
+        area: fl_core::agent::AreaRecord,
+    ) -> Result<fl_core::agent::AreaRecord, StoreError> {
+        self.inner.upsert_area(area)
+    }
+    fn get_area(&self, key: &str) -> Result<Option<fl_core::agent::AreaRecord>, StoreError> {
+        self.inner.get_area(key)
+    }
+    fn list_areas(&self) -> Result<Vec<fl_core::agent::AreaRecord>, StoreError> {
+        self.inner.list_areas()
+    }
+    fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
+        self.inner.register_agent(args)
+    }
+    fn retire_agent(
+        &self,
+        id: &fl_core::ids::AgentId,
+        at: At,
+        by: &str,
+    ) -> Result<AgentRecord, StoreError> {
+        if self.fail_retire.get() {
+            return Err(injected());
+        }
+        self.inner.retire_agent(id, at, by)
+    }
+    fn get_agent(&self, id: &fl_core::ids::AgentId) -> Result<Option<AgentRecord>, StoreError> {
+        self.inner.get_agent(id)
+    }
+    fn agent_by_name(&self, name_key: &str) -> Result<Option<AgentRecord>, StoreError> {
+        self.inner.agent_by_name(name_key)
+    }
+    fn list_agents(
+        &self,
+        project: Option<&str>,
+        include_retired: bool,
+    ) -> Result<Vec<AgentRecord>, StoreError> {
+        self.inner.list_agents(project, include_retired)
+    }
+    fn registry_events_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, fl_core::agent::RegistryEvent)>, StoreError> {
+        self.inner.registry_events_after(after_seq)
+    }
+    fn import_registry_events(
+        &self,
+        events: &[fl_core::agent::RegistryEvent],
+    ) -> Result<(), StoreError> {
+        self.inner.import_registry_events(events)
+    }
+}
+
+impl StateStore for FaultyStore {
+    fn upsert_state(
+        &self,
+        args: UpsertStateArgs,
+    ) -> Result<fl_core::state::StateEntry, StoreError> {
+        let mut fault = self.fail_state_write.borrow_mut();
+        if let Some((slug, nth)) = fault.as_mut()
+            && *slug == args.slug
+        {
+            if *nth == 1 {
+                // Only this one write fails; later writes of the slug land.
+                *fault = None;
+                return Err(injected());
+            }
+            *nth -= 1;
+        }
+        drop(fault);
+        self.inner.upsert_state(args)
+    }
+    fn retire_memory(
+        &self,
+        scope: &StateScope,
+        slug: &str,
+        lifecycle: fl_core::state::MemoryLifecycle,
+        superseded_by: Option<fl_core::ids::StateId>,
+        at: At,
+        by: &str,
+    ) -> Result<fl_core::state::StateEntry, StoreError> {
+        self.inner
+            .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+    }
+    fn get_state(
+        &self,
+        id: &fl_core::ids::StateId,
+    ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+        self.inner.get_state(id)
+    }
+    fn get_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+        self.inner.get_state_by_key(scope, concern, slug)
+    }
+    fn list_state(
+        &self,
+        scope: Option<&StateScope>,
+        concern: Option<StateConcern>,
+    ) -> Result<Vec<fl_core::state::StateEntry>, StoreError> {
+        self.inner.list_state(scope, concern)
+    }
+    fn state_revisions(
+        &self,
+        id: &fl_core::ids::StateId,
+    ) -> Result<Vec<fl_core::state::StateRevision>, StoreError> {
+        self.inner.state_revisions(id)
+    }
+    fn list_conflicts(&self) -> Result<Vec<fl_core::state::StateConflict>, StoreError> {
+        self.inner.list_conflicts()
+    }
+    fn resolve_conflict(
+        &self,
+        id: &fl_core::ids::StateId,
+        keep: &fl_core::ids::RevisionId,
+        at: At,
+        by: &str,
+    ) -> Result<fl_core::state::StateEntry, StoreError> {
+        self.inner.resolve_conflict(id, keep, at, by)
+    }
+    fn state_revisions_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, fl_core::state::StateRevision)>, StoreError> {
+        self.inner.state_revisions_after(after_seq)
+    }
+    fn import_state_revisions(
+        &self,
+        revisions: &[fl_core::state::StateRevision],
+        merge_at: At,
+    ) -> Result<(), StoreError> {
+        self.inner.import_state_revisions(revisions, merge_at)
+    }
+    fn sync_cursor(
+        &self,
+        remote: &str,
+    ) -> Result<Option<fl_core::state::StateSyncCursor>, StoreError> {
+        self.inner.sync_cursor(remote)
+    }
+    fn set_sync_cursor(&self, cursor: fl_core::state::StateSyncCursor) -> Result<(), StoreError> {
+        self.inner.set_sync_cursor(cursor)
+    }
+}
+
+fn faulty_remodel(
+    store: &FaultyStore,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+    vendor: &str,
+) -> Result<RemodelResponse, LifecycleError> {
+    let target = SessionTarget::resolve(store, id, None).unwrap();
+    remodel_session(
+        store,
+        env,
+        &target,
+        &remodel_req(vendor),
+        "owner",
+        Caller::Owner,
+        |_| {},
+    )
+}
+
+#[test]
+fn a_spin_up_that_fails_after_registering_restores_and_decommissions_its_record() {
+    let store = FaultyStore::default();
+    let home = TempDir::new().unwrap();
+    let env = env(&home);
+    register(&store.inner, "felicity", AgentRole::Assistant);
+    spin(&store.inner, &env, "felicity", "assistant", "claude");
+    // The new session's first record write lands (after its agent registered); the second, made
+    // once its runtime and reforge prompt ran, fails inside the real spin-up.
+    *store.fail_state_write.borrow_mut() = Some((hosted_session_slug("codex:felicity"), 2));
+
+    let err = faulty_remodel(&store, &env, "claude:felicity", "codex").unwrap_err();
+    assert_eq!(restored_of(&err), Some("claude:felicity"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("spin-up on codex failed") && msg.contains("injected store failure"),
+        "{msg}"
+    );
+    // The half-made record is no longer `running`: only the restored session claims the persona.
+    assert_eq!(
+        record(&store.inner, "codex:felicity").status,
+        STATUS_DECOMMISSIONED
+    );
+    assert_eq!(
+        record(&store.inner, "claude:felicity").status,
+        STATUS_RUNNING
+    );
+    assert_eq!(target_of(&store.inner, "felicity"), "claude:felicity");
+    let after = agent(&store.inner, "felicity");
+    assert_eq!(
+        (after.status, after.email.as_str()),
+        (AgentStatus::Active, "felicity@example.org")
+    );
+    assert_eq!(after.extra_areas, ["notes"]);
+}
+
+#[test]
+fn a_teardown_that_fails_after_stopping_the_runtime_restores_it() {
+    let store = FaultyStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store.inner, &env, "felicity", "assistant", "claude");
+    store.fail_retire.set(true);
+
+    let err = faulty_remodel(&store, &env, "claude:felicity", "codex").unwrap_err();
+    assert_eq!(restored_of(&err), Some("claude:felicity"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("teardown of `claude:felicity` failed") && msg.contains("injected"),
+        "{msg}"
+    );
+    // The runtime was stopped before the retire failed; the restore started it again and the
+    // new vendor was never tried.
+    assert_eq!(
+        *fake.calls.borrow(),
+        [
+            "spawn Felicity:claude",
+            "kill Felicity",
+            "spawn Felicity:claude"
+        ]
+    );
+    assert!(fake.is_live("Felicity"));
+    let rec = record(&store.inner, "claude:felicity");
+    assert_eq!(rec.status, STATUS_RUNNING);
+    assert!(rec.runtime_spawned);
+    assert_eq!(list_hosted_sessions(&store.inner).unwrap().len(), 1);
+    assert_eq!(agent(&store.inner, "felicity").status, AgentStatus::Active);
+}
+
+#[test]
+fn a_peers_failed_remodel_restores_exactly_the_session_it_tore_down() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let worktree = TempDir::new().unwrap();
+    register(&store, "felicity", AgentRole::Assistant);
+    spin_with(
+        &store,
+        &env,
+        "felicity",
+        "assistant",
+        "claude",
+        Some("claude-opus-5-5"),
+        Some(worktree.path()),
+    );
+    let before = record(&store, "claude:felicity");
+    let agent_before = agent(&store, "felicity");
+
+    let req = RemodelRequest {
+        model: Some("gpt-6".into()),
+        node_id: Some("ai-lab-1".into()),
+        ..remodel_req("codex")
+    };
+    let (out, calls) = remodel_failing_as(
+        &store,
+        &env,
+        "claude:felicity",
+        &req,
+        &["codex"],
+        Caller::Peer,
+    );
+    assert_eq!(restored_of(&out.unwrap_err()), Some("claude:felicity"));
+    assert_eq!(calls, ["codex", "claude"]);
+
+    // Everything but the write time is as it was before the teardown.
+    let after = record(&store, "claude:felicity");
+    assert_eq!(
+        HostedSessionRecord {
+            updated_at_ms: before.updated_at_ms,
+            ..after
+        },
+        before
+    );
+    let agent_after = agent(&store, "felicity");
+    assert_eq!(
+        AgentRecord {
+            updated_at: agent_before.updated_at.clone(),
+            by: agent_before.by.clone(),
+            ..agent_after
+        },
+        agent_before
+    );
+    assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    assert!(fake.is_live("Felicity"));
 }

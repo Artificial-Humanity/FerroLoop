@@ -136,7 +136,8 @@ fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
         ("status", json!("running")),
         ("handshake_dispatched", json!(false)),
         ("hydration_dispatched", json!(false)),
-        ("runtime_stopped", json!(true)),
+        // Runtime calls are off in tests: nothing was started, so nothing is reported stopped.
+        ("runtime_stopped", json!(false)),
         ("tmux_target", json!("Felicity:codex")),
         ("handoff", json!("remodel-felicity")),
         ("warnings", json!([])),

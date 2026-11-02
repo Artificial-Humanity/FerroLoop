@@ -58,8 +58,12 @@ pub enum LifecycleError {
     /// The store failed (500).
     Store(String),
     /// A multi-step operation failed after its first side effect (502). The message says what
-    /// state it left (see [`remodel_session`]).
-    Partial(String),
+    /// state it left (see [`remodel_session`]); `restored_session_id` names the session a
+    /// restore brought back, `None` when nothing was restored.
+    Partial {
+        message: String,
+        restored_session_id: Option<String>,
+    },
 }
 
 impl LifecycleError {
@@ -70,7 +74,7 @@ impl LifecycleError {
             Self::Forbidden(_) => 403,
             Self::Conflict(_) => 409,
             Self::Store(_) => 500,
-            Self::Partial(_) => 502,
+            Self::Partial { .. } => 502,
         }
     }
 }
@@ -83,7 +87,7 @@ impl std::fmt::Display for LifecycleError {
             | Self::Forbidden(m)
             | Self::Conflict(m)
             | Self::Store(m)
-            | Self::Partial(m) => f.write_str(m),
+            | Self::Partial { message: m, .. } => f.write_str(m),
         }
     }
 }
@@ -101,12 +105,15 @@ impl From<StoreError> for LifecycleError {
     }
 }
 
-/// Where lifecycle side effects go. `spawn_runtime` gates every real `tmux` call.
+/// Where lifecycle side effects go. `spawn_runtime` gates every runtime call.
 #[derive(Debug, Clone, Copy)]
 pub struct LifecycleEnv<'a> {
     /// Replaces `$HOME` when it locates the wire route table (tests, hub `home_override`).
     pub home_override: Option<&'a Path>,
+    /// `false`: no runtime is started, stopped or looked up.
     pub spawn_runtime: bool,
+    /// The runtime calls when `spawn_runtime` is on: [`TmuxRuntime`], or a fake in tests.
+    pub runtime: &'a dyn SessionRuntime,
 }
 
 impl<'a> LifecycleEnv<'a> {
@@ -117,7 +124,93 @@ impl<'a> LifecycleEnv<'a> {
         Self {
             home_override,
             spawn_runtime: !disabled,
+            runtime: &TmuxRuntime,
         }
+    }
+}
+
+/// The runtime calls a lifecycle makes on a session's `tmux` session (named by the capitalised
+/// persona). Only [`LifecycleEnv::runtime`] makes them, and only when `spawn_runtime` is on.
+pub trait SessionRuntime: std::fmt::Debug {
+    /// Start a detached session; `false` when it did not start (tmux failed, or the name exists).
+    fn spawn(&self, session: &str, window: &str, cwd: Option<&str>) -> bool;
+    /// Stop a session; `true` when it is gone afterwards.
+    fn kill(&self, session: &str) -> bool;
+    /// `true` when a session of this name runs.
+    fn exists(&self, session: &str) -> bool;
+}
+
+/// The real runtime: the host's `tmux`.
+#[derive(Debug, Clone, Copy)]
+pub struct TmuxRuntime;
+
+impl SessionRuntime for TmuxRuntime {
+    fn spawn(&self, session: &str, window: &str, cwd: Option<&str>) -> bool {
+        spawn_tmux_runtime(session, window, cwd)
+    }
+
+    fn kill(&self, session: &str) -> bool {
+        kill_tmux_runtime(session)
+    }
+
+    fn exists(&self, session: &str) -> bool {
+        tmux_session_exists(session)
+    }
+}
+
+/// A runtime that only records: `live` holds the session names it runs. A spawn fails when the
+/// name already runs or its window (the vendor) is in `fail_windows`.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct FakeRuntime {
+    pub(crate) live: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    pub(crate) fail_windows: std::cell::RefCell<Vec<String>>,
+    pub(crate) calls: std::cell::RefCell<Vec<String>>,
+}
+
+#[cfg(test)]
+impl FakeRuntime {
+    pub(crate) fn running(sessions: &[&str]) -> Self {
+        let fake = Self::default();
+        fake.live
+            .borrow_mut()
+            .extend(sessions.iter().map(ToString::to_string));
+        fake
+    }
+
+    pub(crate) fn env<'a>(&'a self, home: &'a Path) -> LifecycleEnv<'a> {
+        LifecycleEnv {
+            home_override: Some(home),
+            spawn_runtime: true,
+            runtime: self,
+        }
+    }
+
+    pub(crate) fn is_live(&self, session: &str) -> bool {
+        self.live.borrow().contains(session)
+    }
+}
+
+#[cfg(test)]
+impl SessionRuntime for FakeRuntime {
+    fn spawn(&self, session: &str, window: &str, _cwd: Option<&str>) -> bool {
+        self.calls
+            .borrow_mut()
+            .push(format!("spawn {session}:{window}"));
+        if self.fail_windows.borrow().iter().any(|w| w == window) {
+            return false;
+        }
+        self.live.borrow_mut().insert(session.to_string())
+    }
+
+    fn kill(&self, session: &str) -> bool {
+        self.calls.borrow_mut().push(format!("kill {session}"));
+        self.live.borrow_mut().remove(session);
+        true
+    }
+
+    fn exists(&self, session: &str) -> bool {
+        self.is_live(session)
     }
 }
 
@@ -266,6 +359,11 @@ pub struct SpinUpResponse {
     pub tmux_target: Option<String>,
     pub hydration_dispatched: bool,
     pub prompt: Option<String>,
+    /// Whether this spin-up started the session's `tmux` runtime. `false` when the session is
+    /// not hosted, runtime calls are off, or the start failed (tmux failed, or a session of the
+    /// name already runs).
+    #[serde(default)]
+    pub runtime_spawned: bool,
 }
 
 /// Durable record of a hosted session, one `hosted-session-*` workspace runtime entry each.
@@ -586,7 +684,12 @@ fn spawn_tmux_runtime(session: &str, window: &str, cwd: Option<&str>) -> bool {
 /// Kill a `tmux` session this lifecycle created; `true` when it is gone afterwards.
 fn kill_tmux_runtime(session: &str) -> bool {
     let target = format!("={session}");
-    tmux_ok(&["kill-session", "-t", &target]) || !tmux_ok(&["has-session", "-t", &target])
+    tmux_ok(&["kill-session", "-t", &target]) || !tmux_session_exists(session)
+}
+
+/// `true` when a `tmux` session of exactly this name runs.
+fn tmux_session_exists(session: &str) -> bool {
+    tmux_ok(&["has-session", "-t", &format!("={session}")])
 }
 
 /// The route for `persona`, else any route that matches `fallback_session_id`, in `routes`.
@@ -971,7 +1074,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     persist_hosted_session(store, &record, by)?;
 
     let spawned =
-        v.hosted && env.spawn_runtime && spawn_tmux_runtime(&display, &v.vendor, v.cwd.as_deref());
+        v.hosted && env.spawn_runtime && env.runtime.spawn(&display, &v.vendor, v.cwd.as_deref());
     let hydration_dispatched = deliver_prompt(env, &v.persona, &session_id, by, &prompt);
     record.runtime_spawned |= spawned;
     record.hydration_dispatched = hydration_dispatched;
@@ -981,12 +1084,13 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     if let Err(e) = persist_hosted_session(store, &record, by) {
         if spawned {
             // The record cannot learn about this runtime, so teardown could never stop it.
-            kill_tmux_runtime(&display);
+            env.runtime.kill(&display);
         }
         return Err(e);
     }
 
     Ok(SpinUpResponse {
+        runtime_spawned: spawned,
         session_id,
         persona: v.persona,
         project: v.project,
@@ -1304,6 +1408,26 @@ fn tmux_session_name(tmux_target: &str) -> &str {
     tmux_target.split(':').next().unwrap_or(tmux_target)
 }
 
+/// The other live hosted records whose runtime is `record`'s tmux session. The tmux session name
+/// is the capitalised persona, so `claude:ada` and `codex:ada` share session `Ada`; killing it
+/// would end the other, still-live session.
+fn runtime_sharers<S: StateStore>(
+    store: &S,
+    record: &HostedSessionRecord,
+) -> Result<Vec<HostedSessionRecord>, LifecycleError> {
+    let Some(name) = record.tmux_target.as_deref().map(tmux_session_name) else {
+        return Ok(Vec::new());
+    };
+    Ok(list_hosted_sessions(store)?
+        .into_iter()
+        .filter(|r| {
+            r.session_id != record.session_id
+                && !is_decommissioned(r)
+                && r.tmux_target.as_deref().map(tmux_session_name) == Some(name)
+        })
+        .collect())
+}
+
 /// The gate `teardown_session` runs before its first effect. A caller that wants to act on a
 /// teardown's behalf (such as archiving the session's artifacts) asks this first, so a refused
 /// teardown never causes a side effect and the decision stays in one place.
@@ -1338,20 +1462,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     authorize_teardown(store, target, caller)?;
     let mut record = record_for_target(store, target)?;
     let agent = store.agent_by_name(&target.persona)?;
-    // The tmux session name is the capitalised persona, so `claude:ada` and `codex:ada` share
-    // session `Ada`. Killing it would end the other, still-live session.
-    let sharing: Vec<HostedSessionRecord> = match record.tmux_target.as_deref() {
-        Some(tmux_target) => list_hosted_sessions(store)?
-            .into_iter()
-            .filter(|r| {
-                r.session_id != record.session_id
-                    && !is_decommissioned(r)
-                    && r.tmux_target.as_deref().map(tmux_session_name)
-                        == Some(tmux_session_name(tmux_target))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let sharing = runtime_sharers(store, &record)?;
     let shared_runtime = record.runtime_spawned && !sharing.is_empty();
     if shared_runtime {
         // The runtime stays up for the other sessions, so ownership of it moves to them: the
@@ -1373,17 +1484,17 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         &[target.session_id.as_str(), target.raw_id.as_str()],
     );
 
+    // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
+    // start, one still running for the sessions that share it, or none at all (runtime calls are
+    // off) is not reported as stopped.
     let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
         (Some(tmux_target), true) if env.spawn_runtime => {
-            let gone = kill_tmux_runtime(tmux_session_name(tmux_target));
+            let gone = env.runtime.kill(tmux_session_name(tmux_target));
             // The runtime is gone, so the decommissioned record must not claim it any more.
             record.runtime_spawned &= !gone;
             gone
         }
-        // Still running for the sessions that share it: report that truthfully.
-        _ if shared_runtime => false,
-        // Spawning is off, so no runtime was started in this run to stop.
-        _ => true,
+        _ => false,
     };
     // Its routes are gone and its runtime may be: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
@@ -1435,7 +1546,9 @@ pub fn restart_hosted_session<S: StateStore>(
     let display = capitalize(&record.persona);
     if record.hosted
         && env.spawn_runtime
-        && spawn_tmux_runtime(&display, &record.vendor, record.cwd.as_deref())
+        && env
+            .runtime
+            .spawn(&display, &record.vendor, record.cwd.as_deref())
     {
         record.runtime_spawned = true;
     }
@@ -1574,12 +1687,51 @@ fn check_runtime_cwd(v: &ValidSpinUp) -> Result<(), LifecycleError> {
     }
 }
 
+/// A hosted remodel starts its new runtime under the same tmux session name (the capitalised
+/// persona), so the teardown must stop the old one first. Refused (409) when a session of the
+/// name runs that the teardown will not stop: one this lifecycle did not start (no hosted
+/// record, or `runtime_spawned` unset), or one other live hosted sessions share. Otherwise the
+/// new runtime could not start, or the old vendor would keep running under the new registry.
+fn check_old_runtime_stoppable<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    to: &ValidSpinUp,
+) -> Result<(), LifecycleError> {
+    let name = capitalize(&target.persona);
+    if !to.hosted || !env.spawn_runtime || !env.runtime.exists(&name) {
+        return Ok(());
+    }
+    let why = match target.hosted.as_ref() {
+        None => "no hosted record started it".to_string(),
+        Some(r) if !r.runtime_spawned => format!("`{}` did not start it", r.session_id),
+        Some(r) if r.tmux_target.as_deref().map(tmux_session_name) != Some(name.as_str()) => {
+            format!("`{}` started another tmux session", r.session_id)
+        }
+        Some(r) => {
+            let sharers = runtime_sharers(store, r)?;
+            if sharers.is_empty() {
+                return Ok(());
+            }
+            let ids: Vec<&str> = sharers.iter().map(|s| s.session_id.as_str()).collect();
+            format!("it also runs {}", ids.join(", "))
+        }
+    };
+    Err(LifecycleError::Conflict(format!(
+        "tmux session `{name}` runs and the teardown of `{}` would not stop it ({why}); stop it \
+         first, or remodel with `hosted: false`",
+        target.session_id
+    )))
+}
+
 /// Every check a remodel can make before its first side effect, in the order the siblings make
 /// them: the teardown gate (403), a decommissioned record (409), no record at all (404), the
-/// request fields as spin-up validates them (400), the runtime directory (400), and the
-/// registry checks spin-up makes with the persona's own agent counted as retired (409).
+/// request fields as spin-up validates them (400), the runtime directory (400), the registry
+/// checks spin-up makes with the persona's own agent counted as retired (409), a non-Owner
+/// remodel that could not be restored (409), and an old runtime the teardown cannot stop (409).
 fn plan_remodel<S: AgentRegistry + StateStore>(
     store: &S,
+    env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     req: &RemodelRequest,
     caller: Caller,
@@ -1605,7 +1757,6 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         |r| r.vendor.clone(),
     );
     let old_node = old.map_or_else(|| DEFAULT_NODE_ID.to_string(), |r| r.node_id.clone());
-    let old_hosted = old.is_none_or(|r| r.hosted);
     let old_cwd = old.and_then(|r| r.cwd.clone());
     let from_model = old.and_then(|r| r.model.clone());
     let to = SpinUpRequest {
@@ -1615,12 +1766,15 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         vendor: req.vendor.clone(),
         model: req.model.clone(),
         node_id: req.node_id.clone().or_else(|| Some(old_node.clone())),
-        hosted: req.hosted.or(Some(old_hosted)),
+        // The new session keeps the old one's `hosted`; with no record, spin-up's default.
+        hosted: req.hosted.or(old.map(|r| r.hosted)),
         cwd: req.cwd.clone().or_else(|| old_cwd.clone()),
     }
     .validate()?;
     check_runtime_cwd(&to)?;
     check_registration(store, &to, OwnAgent::Retiring)?;
+    // The restore puts back what was there: a session with no record was not hosted, and a
+    // restore must not turn it into a managed one.
     let restore = SPIN_UP_VENDORS
         .contains(&from_vendor.as_str())
         .then(|| SpinUpRequest {
@@ -1630,9 +1784,21 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
             vendor: from_vendor.clone(),
             model: from_model.clone(),
             node_id: Some(old_node),
-            hosted: Some(old_hosted),
+            hosted: Some(old.is_some_and(|r| r.hosted)),
             cwd: old_cwd,
         });
+    // With no restore, a failed spin-up leaves the persona down; only the Owner may take that
+    // risk (the remodel then warns that no restore is possible).
+    if restore.is_none() && caller != Caller::Owner {
+        return Err(LifecycleError::Conflict(format!(
+            "`{}` runs on vendor `{from_vendor}`, which spin-up cannot start, so a failed remodel \
+             could not be restored; only Owner authority may remodel it",
+            target.session_id
+        )));
+    }
+    if mode == RemodelMode::Execute {
+        check_old_runtime_stoppable(store, env, target, &to)?;
+    }
     Ok(RemodelPlan {
         mode,
         persona: target.persona.clone(),
@@ -1824,8 +1990,25 @@ pub fn remodel_session<S: AgentRegistry + StateStore>(
         by,
         caller,
         clear_queue,
-        &mut spin_up::<S>,
+        &mut |store, env, req, by, caller| {
+            #[cfg(test)]
+            if FAIL_SPIN_UP_VENDORS.with_borrow(|v| v.contains(&req.vendor)) {
+                return Err(LifecycleError::Store(format!(
+                    "{} binary is missing",
+                    req.vendor
+                )));
+            }
+            spin_up(store, env, req, by, caller)
+        },
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Vendors whose spin-up every [`remodel_session`] on this thread fails, for tests that
+    /// reach a remodel only through the hub's handler.
+    pub(crate) static FAIL_SPIN_UP_VENDORS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1839,7 +2022,7 @@ fn remodel_with<S: AgentRegistry + StateStore>(
     clear_queue: impl FnMut(&str),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
-    let plan = plan_remodel(store, target, req, caller)?;
+    let plan = plan_remodel(store, env, target, req, caller)?;
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
@@ -1874,6 +2057,11 @@ fn remodel_with<S: AgentRegistry + StateStore>(
         agent: agent.as_ref(),
         ..RemodelReport::default()
     };
+    // What the new session's record was before the remodel, so a failed spin-up that wrote it
+    // can be undone. Read before any side effect.
+    let to_session_id = format!("{}:{}", to.vendor, plan.persona);
+    let to_before =
+        find_hosted_session(store, &[&to_session_id])?.filter(|r| r.session_id == to_session_id);
     // The last step that can fail with nothing changed: if it does, the session still runs.
     let handoff = record_remodel_handoff(store, &plan, RemodelOutcome::InProgress, &report, by)?;
 
@@ -1881,6 +2069,7 @@ fn remodel_with<S: AgentRegistry + StateStore>(
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
             spin(store, env, &plan.spin_up_request(), by, caller)
+                .and_then(|out| require_runtime(env, out))
                 .map(|out| (torn, out))
                 .map_err(|e| format!("spin-up on {} failed: {e}", to.vendor))
         });
@@ -1890,6 +2079,13 @@ fn remodel_with<S: AgentRegistry + StateStore>(
     let error = match spun {
         Ok((torn, out)) => {
             let mut warnings = Vec::new();
+            if plan.restore.is_none() {
+                warnings.push(format!(
+                    "no restore was possible: spin-up cannot start vendor `{}`, so a failure \
+                     would have left `{}` down",
+                    plan.from_vendor, plan.persona
+                ));
+            }
             let report = RemodelReport {
                 to_session_id: Some(&out.session_id),
                 ..report
@@ -1925,11 +2121,24 @@ fn remodel_with<S: AgentRegistry + StateStore>(
         Err(error) => error,
     };
 
+    // A spin-up that failed after its first persist left the new session's record `running`
+    // with nothing behind it: put that record back as it was (marked decommissioned when it did
+    // not exist), so only the restored session claims the persona.
+    let mut cleanup_error = None;
+    if to_session_id != plan.from_session_id
+        && let Err(e) = undo_new_record(store, &to_session_id, to_before, by)
+    {
+        cleanup_error = Some(format!(
+            "; the record of `{to_session_id}` was not reset: {e}"
+        ));
+    }
+
     // The persona may now be down and retired: put the old session back. The restore spins up
     // exactly what the caller was allowed to tear down, nothing the request chose, so it runs
     // with Owner authority: a half-registered new session must not lock its own restore out.
     let restored = match &plan.restore {
         Some(restore) => spin(store, env, restore, by, Caller::Owner)
+            .and_then(|out| require_runtime(env, out))
             .map(|out| out.session_id)
             .map_err(|e| e.to_string()),
         None => Err(format!(
@@ -1963,10 +2172,60 @@ fn remodel_with<S: AgentRegistry + StateStore>(
         restore_error,
         ..report
     };
+    if let Some(e) = cleanup_error {
+        message.push_str(&e);
+    }
     if let Err(e) = record_remodel_handoff(store, &plan, outcome, &report, by) {
         message.push_str(&format!("; handoff `{handoff}` was not updated: {e}"));
     }
-    Err(LifecycleError::Partial(message))
+    Err(LifecycleError::Partial {
+        message,
+        restored_session_id: restored.ok(),
+    })
+}
+
+/// A spin-up that should have started a runtime and did not is a failed spin-up: the persona
+/// would be registered on a runtime that does not run (or, when the name was taken, on someone
+/// else's).
+fn require_runtime(
+    env: &LifecycleEnv<'_>,
+    out: SpinUpResponse,
+) -> Result<SpinUpResponse, LifecycleError> {
+    if env.spawn_runtime && out.hosted && !out.runtime_spawned {
+        let session = out
+            .tmux_target
+            .as_deref()
+            .map_or(out.persona.as_str(), tmux_session_name);
+        return Err(LifecycleError::Store(format!(
+            "its tmux runtime did not start (tmux failed, or session `{session}` already runs)"
+        )));
+    }
+    Ok(out)
+}
+
+/// Put the record of `session_id` back as it was before a failed remodel's spin-up wrote it:
+/// `before` when there was one, else the record marked decommissioned.
+fn undo_new_record<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    before: Option<HostedSessionRecord>,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    let Some(mut now) =
+        find_hosted_session(store, &[session_id])?.filter(|r| r.session_id == session_id)
+    else {
+        return Ok(());
+    };
+    match before {
+        Some(before) if before != now => persist_hosted_session(store, &before, by),
+        Some(_) => Ok(()),
+        None if is_decommissioned(&now) => Ok(()),
+        None => {
+            now.status = STATUS_DECOMMISSIONED.to_string();
+            now.updated_at_ms = now_ms();
+            persist_hosted_session(store, &now, by)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1993,6 +2252,7 @@ mod tests {
         LifecycleEnv {
             home_override: Some(home.path()),
             spawn_runtime: false,
+            runtime: &TmuxRuntime,
         }
     }
 
@@ -2331,7 +2591,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out.status, "decommissioned");
-        assert!(out.unregistered && out.runtime_stopped && !out.handshake_dispatched);
+        // Runtime calls are off: no runtime was started, so none is reported stopped.
+        assert!(out.unregistered && !out.runtime_stopped && !out.handshake_dispatched);
         assert_eq!(out.prompt, None);
         assert!(cleared.contains(&"claude:felicity".to_string()));
         assert!(cleared.contains(&"felicity".to_string()));
@@ -3084,6 +3345,8 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
+        let fake = FakeRuntime::running(&["Ada"]);
+        let fake_env = fake.env(home.path());
         spin_up(
             &store,
             &env,
@@ -3115,9 +3378,11 @@ mod tests {
         set_spawned("claude:ada", true);
 
         let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
-        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let out =
+            teardown_session(&store, &fake_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
         assert_eq!(out.status, "decommissioned");
         assert!(!out.runtime_stopped, "the shared session is still running");
+        assert!(fake.is_live("Ada") && fake.calls.borrow().is_empty());
         // Ownership moved to the surviving session, which stops it in its turn.
         assert!(!spawned("claude:ada") && spawned("codex:ada"));
         assert_eq!(
@@ -3129,9 +3394,12 @@ mod tests {
         );
 
         let target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
-        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        let out =
+            teardown_session(&store, &fake_env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        // The last sharer stops it, and its record no longer claims it.
         assert!(out.runtime_stopped);
-        assert!(spawned("codex:ada"));
+        assert_eq!(*fake.calls.borrow(), ["kill Ada"]);
+        assert!(!fake.is_live("Ada") && !spawned("codex:ada"));
     }
 
     #[test]
@@ -3164,11 +3432,20 @@ mod tests {
         persist_hosted_session(&store, &rec, "owner").unwrap();
 
         let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
-        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
-        // Spawning is off in tests, so the stop is reported without a real `tmux` call.
+        let fake = FakeRuntime::running(&["Ada"]);
+        let out = teardown_session(
+            &store,
+            &fake.env(home.path()),
+            &target,
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
         assert!(out.runtime_stopped);
+        assert!(!fake.is_live("Ada"));
         assert!(
-            find_hosted_session(&store, &["claude:ada"])
+            !find_hosted_session(&store, &["claude:ada"])
                 .unwrap()
                 .unwrap()
                 .runtime_spawned
