@@ -17,7 +17,7 @@ use fl_core::state::{
 };
 use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use fl_exec::stamp;
-use fl_wire::dispatcher::dispatch_operator_prompt_to_route;
+use fl_wire::dispatcher::{PushError, push_operator_prompt_to_route};
 use fl_wire::identity::{RouteTable, VendorRoute, default_routes_path, legacy_routes_path};
 use serde::{Deserialize, Serialize};
 
@@ -537,16 +537,12 @@ fn kill_tmux_runtime(session: &str) -> bool {
     tmux_ok(&["kill-session", "-t", &target]) || !tmux_ok(&["has-session", "-t", &target])
 }
 
-/// The live route for `persona`, else any route that matches `fallback_session_id`.
-pub(crate) fn find_route(
-    home_override: Option<&Path>,
+/// The route for `persona`, else any route that matches `fallback_session_id`, in `routes`.
+fn route_in(
+    routes: &RouteTable,
     persona: Option<&str>,
     fallback_session_id: &str,
 ) -> Option<VendorRoute> {
-    let route_override =
-        home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(home_override, stamp::now());
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
         return Some(entry.route.clone());
@@ -558,6 +554,238 @@ pub(crate) fn find_route(
         .map(|e| e.route.clone())
 }
 
+/// The cheap liveness checks discovery itself uses, nothing heavier: a Claude route's process
+/// must exist (only where discovery checks `/proc`: no home override, host discovery on) and a
+/// webhook route's socket must exist. Other routes have no check this cheap; a dispatch checks
+/// more before it sends ([`undeliverable`]).
+fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
+    let check_proc = home_override.is_none()
+        && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1");
+    match route {
+        VendorRoute::Claude { pid, .. } if check_proc && *pid > 0 => {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        VendorRoute::Webhook { socket_path } => socket_path.exists(),
+        _ => true,
+    }
+}
+
+/// Where [`lookup_route`] found a route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouteLookup {
+    /// From the saved route table, without a host scan. It may be stale.
+    Saved(VendorRoute),
+    /// From a host scan made for this lookup.
+    Scanned(VendorRoute),
+}
+
+impl RouteLookup {
+    pub(crate) fn into_route(self) -> VendorRoute {
+        match self {
+            Self::Saved(route) | Self::Scanned(route) => route,
+        }
+    }
+}
+
+/// The session a route lookup is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteQuery<'a> {
+    /// The persona whose route is wanted. `None` looks the route up by `fallback_session_id`.
+    pub(crate) persona: Option<&'a str>,
+    /// The id a route must match when `persona` has no route.
+    pub(crate) fallback_session_id: &'a str,
+    /// The vendor session the caller resolved the request to (discovery's session id), when it
+    /// resolved one. A saved route that names another session is stale: the persona opened a new
+    /// conversation or thread after the route was saved, and the old one still accepts input.
+    pub(crate) session_id: Option<&'a str>,
+}
+
+impl<'a> RouteQuery<'a> {
+    /// A lookup by persona alone (a hosted-session id is not a vendor session id).
+    pub(crate) fn persona(persona: &'a str, fallback_session_id: &'a str) -> Self {
+        Self {
+            persona: Some(persona),
+            fallback_session_id,
+            session_id: None,
+        }
+    }
+}
+
+/// `false` when `route` names a vendor session other than `session_id`. A route that names no
+/// session (a webhook route, a Claude route with no session id) serves any.
+fn route_serves_session(route: &VendorRoute, session_id: &str) -> bool {
+    match route {
+        VendorRoute::Webhook { .. } => true,
+        VendorRoute::Claude {
+            session_id: own, ..
+        } if own.trim().is_empty() => true,
+        _ => route_matches_session_id(route, session_id),
+    }
+}
+
+/// The route for the query's persona, else any route that matches its fallback id. A route in
+/// the saved table is used without a host scan only when all of these hold:
+///
+/// - the hub scanned the host and saved the scan to this route file within fl-wire's
+///   [`ROUTE_REDISCOVERY_INTERVAL`] (the bound the daemon's dispatch uses), so a saved route is
+///   never older than that;
+/// - when the query names a vendor session, the route serves it ([`route_serves_session`]);
+/// - the route passes the cheap liveness check ([`route_looks_live`]).
+///
+/// Otherwise the host is scanned, the scan saved, and the route taken from the scan.
+///
+/// [`ROUTE_REDISCOVERY_INTERVAL`]: fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+pub(crate) fn lookup_route(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+) -> Option<RouteLookup> {
+    if crate::discovery::saved_routes_fresh(home_override, Instant::now()) {
+        let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
+        if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
+            .filter(|route| {
+                query
+                    .session_id
+                    .is_none_or(|id| route_serves_session(route, id))
+            })
+            .filter(|route| route_looks_live(route, home_override))
+        {
+            return Some(RouteLookup::Saved(route));
+        }
+    }
+    rescan_route(home_override, query).map(RouteLookup::Scanned)
+}
+
+/// Scan the host for the session's route (never from the shared scan cache), save what the scan
+/// learned, and look the route up in it.
+pub(crate) fn rescan_route(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+) -> Option<VendorRoute> {
+    let scanned = crate::discovery::scan_and_save_route_table(home_override);
+    route_in(&scanned, query.persona, query.fallback_session_id)
+}
+
+/// The live route for the query's session (see [`lookup_route`]).
+pub(crate) fn find_route(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+) -> Option<VendorRoute> {
+    lookup_route(home_override, query).map(RouteLookup::into_route)
+}
+
+/// Why a route cannot take a delivery, found before anything is sent on it. These are the
+/// refusals fl-wire's dispatch itself raises before it writes a byte, so a route refused here
+/// has received nothing, and sending to another route instead can never deliver twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Undeliverable {
+    /// The Claude process the route names is no longer running.
+    ProcessGone { pid: u32 },
+    /// The webhook socket file does not exist.
+    NoSocket,
+    /// No tmux pane or target the route names exists any more.
+    PaneGone,
+}
+
+/// The pre-delivery check of [`dispatch_with_rediscovery`]: `Some` when `route` would refuse a
+/// delivery before receiving anything. `None` does not promise the delivery works; it means
+/// only that no cheap check proves it cannot.
+///
+/// - Claude: the route's pid (when it names one) has no `/proc` entry.
+/// - Webhook: the socket file does not exist. The check never connects: fl-wire's webhook
+///   contract is one connection per JSON line, so a probe connection would reach the receiver
+///   as a delivery. A socket that exists but refuses is found by the real push instead (see
+///   [`dispatch_with_rediscovery`]).
+/// - Muse, Grok: the route names tmux targets and none of them exists. fl-wire would then run
+///   the vendor's headless CLI on the old session id instead.
+/// - Antigravity, Codex: no check; a stale route is bounded by [`lookup_route`] instead.
+pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
+    match route {
+        VendorRoute::Claude { pid, .. } if *pid != 0 => (!Path::new(&format!("/proc/{pid}"))
+            .exists())
+        .then_some(Undeliverable::ProcessGone { pid: *pid }),
+        VendorRoute::Claude { .. } | VendorRoute::Agy { .. } | VendorRoute::Codex { .. } => None,
+        VendorRoute::Webhook { socket_path } => socket_path
+            .symlink_metadata()
+            .is_err()
+            .then_some(Undeliverable::NoSocket),
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => {
+            let mut targets = [tmux_target, tmux_pane]
+                .into_iter()
+                .flatten()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .peekable();
+            targets.peek()?;
+            (!targets.any(tmux_target_exists)).then_some(Undeliverable::PaneGone)
+        }
+    }
+}
+
+/// `true` when tmux knows `target` (the binary fl-wire uses: `FL_WIRE_TMUX_BIN`, else `tmux`).
+fn tmux_target_exists(target: &str) -> bool {
+    let tmux =
+        std::env::var_os("FL_WIRE_TMUX_BIN").map_or_else(|| PathBuf::from("tmux"), PathBuf::from);
+    let mut cmd = Command::new(tmux);
+    cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
+    command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
+}
+
+/// Send to the session's route; `None` when the session has no route.
+///
+/// Nothing `send` delivers is ever delivered again. A route from the saved table first passes
+/// the pre-delivery check ([`undeliverable`]). When the check refuses it, nothing has been sent:
+/// the host is scanned, the scan saved, and `send` runs on the route the scan found instead.
+/// When the scan finds the same route or none, `send` runs on the saved route, so the caller
+/// gets fl-wire's own refusal (or its headless fallback).
+///
+/// `send` runs a second time only when its first run on a saved route failed with
+/// [`PushError::NotConnected`] (the receiver was never reached, so nothing was delivered) and a
+/// scan then finds a different route. Every other failure of `send` is returned as it is, never
+/// retried: by then part of the delivery may have landed.
+pub(crate) fn dispatch_with_rediscovery<T>(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+    mut send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
+) -> Option<Result<T, String>> {
+    let (route, from_saved) = match lookup_route(home_override, query)? {
+        RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
+            (rescan_route(home_override, query).unwrap_or(saved), false)
+        }
+        RouteLookup::Saved(saved) => (saved, true),
+        RouteLookup::Scanned(scanned) => (scanned, false),
+    };
+    Some(match send(&route) {
+        Err(PushError::NotConnected(refused)) if from_saved => {
+            match rescan_route(home_override, query).filter(|fresh| *fresh != route) {
+                Some(fresh) => send(&fresh).map_err(String::from),
+                None => Err(refused),
+            }
+        }
+        sent => sent.map_err(String::from),
+    })
+}
+
+/// Run `send` once on the route [`lookup_route`] finds, with no pre-delivery check and no second
+/// route. For a session reset, which is several steps (a `/clear` or `/new`, then the reforge
+/// prompt): once one step lands the session has changed, so a reset is never run again.
+pub(crate) fn dispatch_once<T>(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+    send: impl FnOnce(&VendorRoute) -> Result<T, String>,
+) -> Option<Result<T, String>> {
+    let route = lookup_route(home_override, query)?.into_route();
+    Some(send(&route))
+}
+
 /// Best-effort delivery of `prompt` to a live route for the session; `true` when delivered.
 fn deliver_prompt(
     env: &LifecycleEnv<'_>,
@@ -566,8 +794,12 @@ fn deliver_prompt(
     by: &str,
     prompt: &str,
 ) -> bool {
-    find_route(env.home_override, Some(persona), session_id)
-        .is_some_and(|route| dispatch_operator_prompt_to_route(&route, by, prompt).is_ok())
+    dispatch_with_rediscovery(
+        env.home_override,
+        RouteQuery::persona(persona, session_id),
+        |route| push_operator_prompt_to_route(route, by, prompt),
+    )
+    .is_some_and(|delivered| delivered.is_ok())
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
@@ -581,7 +813,24 @@ fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
 }
 
 /// Drop every route keyed by one of `personas` or matching one of `session_ids`; returns the count.
-fn remove_routes(home_override: Option<&Path>, personas: &[&str], session_ids: &[&str]) -> usize {
+/// Holds the hub's route-file lock, so a scan the hub saves at the same time cannot put a removed
+/// route back (see [`crate::discovery::with_route_file_lock`] for the window left with the
+/// `fl wire daemon`).
+pub(crate) fn remove_routes(
+    home_override: Option<&Path>,
+    personas: &[&str],
+    session_ids: &[&str],
+) -> usize {
+    crate::discovery::with_route_file_lock(|| {
+        remove_routes_locked(home_override, personas, session_ids)
+    })
+}
+
+fn remove_routes_locked(
+    home_override: Option<&Path>,
+    personas: &[&str],
+    session_ids: &[&str],
+) -> usize {
     let mut removed = 0;
     for path in route_table_paths(home_override) {
         if !path.is_file() {
@@ -675,6 +924,8 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     record.runtime_spawned |= spawned;
     record.hydration_dispatched = hydration_dispatched;
     record.updated_at_ms = now_ms();
+    // A runtime may have started: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
     if let Err(e) = persist_hosted_session(store, &record, by) {
         if spawned {
             // The record cannot learn about this runtime, so teardown could never stop it.
@@ -1082,6 +1333,8 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         // Spawning is off, so no runtime was started in this run to stop.
         _ => true,
     };
+    // Its routes are gone and its runtime may be: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
 
     if let Some(agent) = agent
         && agent.status == AgentStatus::Active
@@ -1137,6 +1390,8 @@ pub fn restart_hosted_session<S: StateStore>(
     let prompt = prompt_for(&display, &record.project, &record.role);
     record.hydration_dispatched =
         deliver_prompt(env, &record.persona, &record.session_id, by, &prompt);
+    // A runtime may have reopened: the next discovery must scan the host again.
+    crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
     record.status = STATUS_RUNNING.to_string();
     record.decommission_prepared_at_ms = None;
@@ -1446,6 +1701,30 @@ mod tests {
             AgentStatus::Active
         );
         assert!(RouteTable::load(Some(&routes)).get("felicity").is_some());
+    }
+
+    #[test]
+    fn spin_up_restart_and_teardown_each_drop_the_shared_route_scan() {
+        use crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS;
+        let count = || ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let before = count();
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(count() - before, 1, "spin-up");
+        restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap();
+        assert_eq!(count() - before, 2, "restart");
+        let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(count() - before, 3, "teardown");
     }
 
     #[test]

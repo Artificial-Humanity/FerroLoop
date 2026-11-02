@@ -24,8 +24,8 @@ use fl_core::ferrostate::{
     resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
 };
 use fl_core::ferrowire::{
-    DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
-    validate_sender_name,
+    DeliveryReceipt, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId,
+    WireAddress, WireFilter, validate_sender_name,
 };
 use fl_core::ids::{GateId, Kind, MessageId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
@@ -61,10 +61,10 @@ use fl_gate::{
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
-    MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
-    dispatch_to_route,
+    MAX_DELIVER, PushError, SessionResetMode, clear_or_reforge_session,
+    dispatch_operator_prompt_to_route, push_operator_prompt_to_route, push_to_route,
 };
-use fl_wire::identity::RouteTable;
+use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -76,10 +76,11 @@ use crate::auth::{
 };
 use crate::cloud_adapters;
 use crate::discovery::{
-    DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
-    discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
-    read_session_quota_usage_with_home, read_session_transcript_from_snapshot, read_worktree_diff,
-    scan_cargo_architecture_conformance, snapshot_discovery_store,
+    DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
+    discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
+    list_git_worktrees, lookup_sessions, read_session_quota_usage_with_reads,
+    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
+    snapshot_discovery_store, transcript_from_sessions,
 };
 use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
@@ -337,6 +338,16 @@ pub fn parse_http_request(buf: &[u8]) -> Result<Option<(HttpRequest, usize)>, St
 
 /// Handle an incoming HTTP/1.1 request against [`HubState`] (spec §2.3, §3).
 pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let resp = route_http_request(state, req);
+    if req.method != "GET" && req.method != "HEAD" {
+        // A request that may have written the store: the next discovery read takes a fresh
+        // snapshot, so the caller sees its own change.
+        state.discovery_snapshots.invalidate();
+    }
+    resp
+}
+
+fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let method = req.method.as_str();
     let path = req.path.as_str();
 
@@ -1262,9 +1273,8 @@ fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
 
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
-    let snap = match state.open_store() {
-        Ok(store) => snapshot_discovery_store(&store),
-        Err(_) => return store_open_failure(),
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
     };
     let sessions = state.with_model_overrides(discover_sessions_from_snapshot(
         &snap,
@@ -1408,8 +1418,10 @@ fn handle_get_agents(state: &HubState, req: &HttpRequest) -> HttpResponse {
         Ok(a) => a,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
-    let snap = snapshot_discovery_store(&store);
     drop(store);
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
+    };
     let routes = state.with_model_overrides(discover_sessions_from_snapshot(
         &snap,
         state.config.home_override.as_deref(),
@@ -1458,8 +1470,10 @@ fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpRespon
             });
         heartbeats.push(hb);
     }
-    let snap = snapshot_discovery_store(&store);
     drop(store);
+    let Ok(snap) = state.cached_discovery_snapshot() else {
+        return store_open_failure();
+    };
     // Liveness reads only `source`, `persona` and `adapter`: no model discovery.
     let sessions =
         discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
@@ -1541,9 +1555,10 @@ fn handle_get_wire_messages(store: &AnyStore, req: &HttpRequest) -> HttpResponse
 
     match store.wire_messages_after(0) {
         Ok(seq_msgs) => {
+            let mut receipts_by_message = all_wire_receipts_by_message(store);
             let mut out = Vec::with_capacity(seq_msgs.len());
             for (_seq, msg) in seq_msgs {
-                let receipts = store.list_wire_receipts(&msg.id).unwrap_or_default();
+                let receipts = receipts_by_message.remove(&msg.id).unwrap_or_default();
                 if unread_only && receipts.iter().all(|r| r.status == DeliveryStatus::Acked) {
                     continue;
                 }
@@ -1555,6 +1570,40 @@ fn handle_get_wire_messages(store: &AnyStore, req: &HttpRequest) -> HttpResponse
             HttpResponse::json(200, json!({ "messages": out }))
         }
         Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// Every delivery receipt in one store read, grouped by message, each group in the order
+/// [`MessageStore::list_wire_receipts`] returns it (by `recipient_id`, ties as stored).
+///
+/// An unfiltered `list_wire_inbox` returns every receipt: no status, `limit`, recipient or
+/// thread filter applies, and every backend (mem, redb, ferro local and remote) drops only a
+/// receipt whose message is gone, which no listed message can own. It sorts by message id, then
+/// `recipient_id`, stably, so each message's receipts keep their per-message order. A failed
+/// read lists no receipts, as a failed per-message read did.
+fn all_wire_receipts_by_message(store: &AnyStore) -> BTreeMap<MessageId, Vec<DeliveryReceipt>> {
+    let mut grouped: BTreeMap<MessageId, Vec<DeliveryReceipt>> = BTreeMap::new();
+    for item in store
+        .list_wire_inbox(&WireFilter::default())
+        .unwrap_or_default()
+    {
+        grouped
+            .entry(item.message.id)
+            .or_default()
+            .push(item.receipt);
+    }
+    grouped
+}
+
+/// Scan the host into `routes` unless this request already did; `started` records when.
+fn scan_routes_once(
+    routes: &mut RouteTable,
+    home_override: Option<&Path>,
+    started: &mut Option<Instant>,
+) {
+    if started.is_none() {
+        *started = Some(Instant::now());
+        crate::discovery::discover_routes_into(routes, home_override);
     }
 }
 
@@ -1645,24 +1694,64 @@ fn handle_post_wire_send(
     };
     drop(store);
 
-    let route_override = state
-        .config
-        .home_override
-        .as_ref()
-        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(state.config.home_override.as_deref(), now.clone());
+    // The saved route table first, as fl-wire's dispatcher does. The host is scanned at most once
+    // per send, and the scan saved, only when a recipient is still to deliver (fl-wire's rule:
+    // not acked or expired, under `MAX_DELIVER` attempts, a valid persona) and the saved table is
+    // older than fl-wire's `ROUTE_REDISCOVERY_INTERVAL`, a recipient has no route there, or a
+    // saved route fails the pre-delivery check or never reaches its receiver. Each recipient is
+    // delivered at most once: a push that fails stays `Pending` and is never repeated here,
+    // since part of it may have landed. The one exception is a push to a saved route that never
+    // reached its receiver (`PushError::NotConnected`): nothing was delivered, so it goes to the
+    // route a scan finds instead, when that route is different.
+    let home = state.config.home_override.as_deref();
+    let saved = RouteTable::load(crate::discovery::route_table_path(home).as_deref());
+    let mut routes = saved.clone();
+    let mut scan_started: Option<Instant> = None;
+    let deliverable = |rcpt: &DeliveryReceipt| {
+        !matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+            && rcpt.attempts < MAX_DELIVER
+    };
+    let to_deliver: Vec<&DeliveryReceipt> = receipts
+        .iter()
+        .filter(|rcpt| deliverable(rcpt) && normalize_persona(&rcpt.recipient_name).is_some())
+        .collect();
+    let missing_route = to_deliver
+        .iter()
+        .any(|rcpt| routes.get(&rcpt.recipient_name).is_none());
+    if !to_deliver.is_empty()
+        && (missing_route || !crate::discovery::saved_routes_fresh(home, Instant::now()))
+    {
+        scan_routes_once(&mut routes, home, &mut scan_started);
+    }
     let mut any_updated = false;
     for rcpt in &receipts {
-        if matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
-            || rcpt.attempts >= MAX_DELIVER
-        {
+        if !deliverable(rcpt) {
             continue;
         }
-        let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
+        let Some(mut entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
-        let target_status = match dispatch_to_route(&entry.route, &msg) {
+        if scan_started.is_none() && crate::lifecycle::undeliverable(&entry.route).is_some() {
+            // Nothing was sent on the saved route: the session may have been replaced since it
+            // was saved, so scan once and push on the route the scan found, if any.
+            scan_routes_once(&mut routes, home, &mut scan_started);
+            if let Some(fresh) = routes.get(&rcpt.recipient_name).cloned() {
+                entry = fresh;
+            }
+        }
+        let mut pushed = push_to_route(&entry.route, &msg);
+        if scan_started.is_none() && matches!(pushed, Err(PushError::NotConnected(_))) {
+            // The saved route's receiver was never reached, so nothing was delivered: scan once
+            // and push on the route the scan found, when it is a different one.
+            scan_routes_once(&mut routes, home, &mut scan_started);
+            if let Some(fresh) = routes
+                .get(&rcpt.recipient_name)
+                .filter(|fresh| fresh.route != entry.route)
+            {
+                pushed = push_to_route(&fresh.route, &msg);
+            }
+        }
+        let target_status = match pushed {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
@@ -1681,6 +1770,9 @@ fn handle_post_wire_send(
         {
             any_updated = true;
         }
+    }
+    if let Some(started) = scan_started {
+        crate::discovery::save_route_scan(home, &saved, &routes, started);
     }
     if any_updated
         && let Ok(store) = state.open_store()
@@ -3958,11 +4050,21 @@ fn handle_dynamic_api_routes(
         match (method, segments[4]) {
             ("GET", "transcript") => {
                 drain_ready_session_queues(state);
-                let snap = load_discovery_snapshot(state);
+                let snap = state.cached_discovery_snapshot().unwrap_or_default();
                 let home = state.config.home_override.as_deref();
-                let (canonical_id, _persona) =
-                    resolve_session_target_from_snapshot(state, &snap, &session_id);
-                let all_turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
+                // One route lookup and one read and parse per transcript file serve every step.
+                let sessions = lookup_sessions(&snap, home);
+                let mut files = TranscriptReads::default();
+                let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
+                let all_turns =
+                    transcript_from_sessions(&session_id, &sessions, &snap, home, &mut files);
+                // The busy check reads the canonical id's transcript. It is the same read
+                // unless the persona resolved to another id; a file both reach is parsed once.
+                let canonical_turns = (canonical_id != session_id.trim()).then(|| {
+                    transcript_from_sessions(&canonical_id, &sessions, &snap, home, &mut files)
+                });
+                let busy_turns = canonical_turns.as_deref().unwrap_or(&all_turns);
+                let is_busy = state.is_session_busy_from_turns(&canonical_id, busy_turns);
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -3970,22 +4072,22 @@ fn handle_dynamic_api_routes(
                     None => Some(250),
                 };
                 let turns = match limit_opt {
-                    Some(limit) if total_turns > limit => all_turns[total_turns - limit..].to_vec(),
-                    _ => all_turns,
+                    Some(limit) if total_turns > limit => &all_turns[total_turns - limit..],
+                    _ => &all_turns[..],
                 };
-                let busy_turns = read_session_transcript_from_snapshot(&canonical_id, &snap, home);
-                let is_busy = state.is_session_busy_from_turns(&canonical_id, &busy_turns);
                 let queue = state.session_queue(&canonical_id);
                 let context_usage =
-                    read_session_context_usage_from_snapshot(&session_id, &snap, home);
+                    context_usage_from_sessions(&session_id, &sessions, home, &mut files);
                 let quota_usage =
-                    read_session_quota_usage_with_home(&canonical_id, home).or_else(|| {
-                        if canonical_id == session_id {
-                            None
-                        } else {
-                            read_session_quota_usage_with_home(&session_id, home)
-                        }
-                    });
+                    read_session_quota_usage_with_reads(&canonical_id, home, &mut files).or_else(
+                        || {
+                            if canonical_id == session_id {
+                                None
+                            } else {
+                                read_session_quota_usage_with_reads(&session_id, home, &mut files)
+                            }
+                        },
+                    );
                 return HttpResponse::json(
                     200,
                     json!({
@@ -4209,10 +4311,18 @@ fn resolve_session_target_from_snapshot(
     snap: &DiscoveryStoreSnapshot,
     raw_session_id: &str,
 ) -> (String, Option<String>) {
-    let trimmed = raw_session_id.trim();
     // Only `id` and `persona` are read, so skip model discovery.
     let sessions =
         discover_route_sessions_without_model_info(snap, state.config.home_override.as_deref());
+    resolve_session_target_in(&sessions, raw_session_id)
+}
+
+/// The canonical session id and persona for `raw_session_id` among `sessions`.
+fn resolve_session_target_in(
+    sessions: &[DiscoveredSessionSummary],
+    raw_session_id: &str,
+) -> (String, Option<String>) {
+    let trimmed = raw_session_id.trim();
     if let Some(matched) = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -4250,22 +4360,54 @@ pub(crate) fn route_matches_session_id(
     }
 }
 
+/// The route lookup for a session a request resolved: `canonical_id` is the id discovery gave
+/// the session (or the raw id when discovery found none), so a saved route that names another
+/// vendor session is stale and the host is scanned again.
+fn session_route_query<'a>(
+    persona: Option<&'a str>,
+    canonical_id: &'a str,
+) -> crate::lifecycle::RouteQuery<'a> {
+    crate::lifecycle::RouteQuery {
+        persona,
+        fallback_session_id: canonical_id,
+        session_id: Some(canonical_id),
+    }
+}
+
 fn vendor_route_for_session(
     state: &HubState,
     persona: Option<&str>,
-    fallback_session_id: &str,
+    canonical_id: &str,
 ) -> Result<fl_wire::identity::VendorRoute, String> {
     crate::lifecycle::find_route(
         state.config.home_override.as_deref(),
-        persona,
-        fallback_session_id,
+        session_route_query(persona, canonical_id),
     )
-    .ok_or_else(|| {
-        format!(
-            "no active vendor route for `{}`",
-            persona.unwrap_or(fallback_session_id)
-        )
-    })
+    .ok_or_else(|| no_route_error(persona, canonical_id))
+}
+
+fn no_route_error(persona: Option<&str>, fallback_session_id: &str) -> String {
+    format!(
+        "no active vendor route for `{}`",
+        persona.unwrap_or(fallback_session_id)
+    )
+}
+
+/// Send on the session's route; a saved route that fails the pre-delivery check, or whose
+/// receiver could not be reached at all, is swapped for the one a rescan finds (see
+/// [`crate::lifecycle::dispatch_with_rediscovery`]). The outer `Err` is the no-route error.
+fn dispatch_to_session_route<T>(
+    state: &HubState,
+    persona: Option<&str>,
+    canonical_id: &str,
+    send: impl FnMut(&fl_wire::identity::VendorRoute) -> Result<T, PushError>,
+) -> Result<Result<T, String>, String> {
+    crate::lifecycle::dispatch_with_rediscovery(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, canonical_id),
+        send,
+    )
+    .ok_or_else(|| no_route_error(persona, canonical_id))
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -4275,8 +4417,9 @@ fn dispatch_operator_prompt_for_session(
     sender_name: &str,
     effective_body: &str,
 ) -> Result<(), String> {
-    let route = vendor_route_for_session(state, persona, fallback_session_id)?;
-    dispatch_operator_prompt_to_route(&route, sender_name, effective_body)
+    dispatch_to_session_route(state, persona, fallback_session_id, |route| {
+        push_operator_prompt_to_route(route, sender_name, effective_body)
+    })?
 }
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
@@ -4597,9 +4740,25 @@ fn handle_post_session_prompt(
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
     drain_ready_session_queues(state);
-    let (canonical_session_id, target_persona) = resolve_session_target(state, session_id);
-    let busy = state.is_session_busy_released(&canonical_session_id);
+    // One store snapshot and one route lookup serve the resolve, the busy check and the
+    // in-flight mark below.
+    let snap = load_discovery_snapshot(state);
+    let home = state.config.home_override.as_deref();
+    let sessions = lookup_sessions(&snap, home);
+    let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
     let has_queued = !state.session_queue(&canonical_session_id).is_empty();
+    // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
+    // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
+    let busy = !payload.send_now && {
+        let turns = transcript_from_sessions(
+            &canonical_session_id,
+            &sessions,
+            &snap,
+            home,
+            &mut TranscriptReads::default(),
+        );
+        state.is_session_busy_from_turns(&canonical_session_id, &turns)
+    };
 
     if !payload.send_now && (busy || has_queued) {
         let (item, queue) = state.enqueue_session_prompt(
@@ -4642,7 +4801,15 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    state.mark_session_in_flight_released(&canonical_session_id);
+    // The transcript as the dispatch left it: read again, not taken from the busy check.
+    let after = transcript_from_sessions(
+        &canonical_session_id,
+        &sessions,
+        &snap,
+        home,
+        &mut TranscriptReads::default(),
+    );
+    state.mark_session_in_flight_from_turns(&canonical_session_id, &after);
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({
@@ -4808,13 +4975,23 @@ fn reset_session(
         None
     };
 
-    let route = vendor_route_for_session(state, persona, canonical_id).map_err(|e| (404, e))?;
     let reset_mode = if mode == "reforge" {
         SessionResetMode::Reforge
     } else {
         SessionResetMode::Clear
     };
-    clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()).map_err(|e| (502, e))?;
+    // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
+    // that then fails is never run again on another route.
+    let reset = crate::lifecycle::dispatch_once(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, canonical_id),
+        |route| clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref()),
+    )
+    .ok_or_else(|| no_route_error(persona, canonical_id))
+    .map_err(|e| (404, e))?;
+    // A clear can start a new vendor session (a new id) behind the same persona.
+    crate::discovery::invalidate_route_discovery_cache();
+    reset.map_err(|e| (502, e))?;
 
     let data = json!({
         "ok": true,
@@ -4862,22 +5039,24 @@ fn handle_post_session_interrupt(
         Err(resp) => return resp,
     };
     let (canonical_id, persona) = resolve_session_target(state, session_id);
-    let route = match vendor_route_for_session(state, persona.as_deref(), &canonical_id) {
-        Ok(route) => route,
-        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
-    };
     // Claude and Codex routes carry no tmux target; a hosted session's record names its pane.
     // A Claude session the hub does not host falls back to the live pane its key file names.
-    let hosted_tmux = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
-        .and_then(|record| record.tmux_target)
-        .or_else(|| fl_wire::dispatcher::claude_route_live_pane(&route));
-    let method = match session_actions::interrupt_route(
-        &lifecycle_env(state),
-        &route,
-        hosted_tmux.as_deref(),
-    ) {
-        Ok(method) => method,
-        Err(e) => return HttpResponse::json(502, json!({ "error": e })),
+    let hosted_pane = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
+        .and_then(|record| record.tmux_target);
+    let env = lifecycle_env(state);
+    let interrupted =
+        dispatch_to_session_route(state, persona.as_deref(), &canonical_id, |route| {
+            let pane = hosted_pane
+                .clone()
+                .or_else(|| fl_wire::dispatcher::claude_route_live_pane(route));
+            session_actions::interrupt_route(&env, route, pane.as_deref())
+                .map(|method| (method, route_vendor(route)))
+                .map_err(PushError::Failed)
+        });
+    let (method, vendor) = match interrupted {
+        Ok(Ok(done)) => done,
+        Ok(Err(e)) => return HttpResponse::json(502, json!({ "error": e })),
+        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
     };
     // Whatever prompt was in flight is no longer running, so the session stops reading as busy.
     // Queued prompts stay queued and drain as usual once the session is idle.
@@ -4885,7 +5064,6 @@ fn handle_post_session_interrupt(
     if session_id != canonical_id {
         state.clear_session_in_flight(session_id);
     }
-    let vendor = route_vendor(&route);
     let data = json!({
         "session_id": canonical_id,
         "interrupted": true,

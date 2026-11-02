@@ -1,5 +1,36 @@
 //! Host session & transcript discovery, git worktree & diff inspection, and Cargo
 //! workspace architecture conformance scanning (spec §1.3, §3.2, §3.3).
+//!
+//! # How stale discovery can be
+//!
+//! The hub caches the costly discovery reads. These are all the windows in which an answer can
+//! lag the host or the store. A `Some(home)` override (tests, hermetic runs) bypasses the route
+//! cache and keeps its own saved-route clock, so none of them crosses between two homes.
+//!
+//! - **Route cache, 2.5 s** (`ROUTE_DISCOVERY_TTL`). `discovered_route_table` serves one host
+//!   scan (route files, vendor session files, `/proc`) for 2.5 s after the scan ends. The hub
+//!   drops it when it spawns, restarts, resets or tears down a session and whenever it saves the
+//!   route table file (`invalidate_route_discovery_cache`), so its own changes show at once.
+//! - **External writers, up to 2.5 s.** A change the hub did not make (the `fl wire daemon` or
+//!   the `fl wire` CLI saving the route table, a vendor CLI starting or replacing a session) is
+//!   not an invalidation: it shows when the cached scan expires.
+//! - **Store snapshot, 2 s** (`DISCOVERY_SNAPSHOT_TTL`). The read-only endpoints share
+//!   one `DiscoveryStoreSnapshot` (agent names and attempt rows) through
+//!   `HubState::cached_discovery_snapshot`. Any request other than a `GET` or `HEAD` drops it
+//!   (`api::handle_http_request`); a store write from outside the hub (the CLI) shows within 2 s.
+//!   Requests that act on a session (prompt, queue drain) take a fresh snapshot.
+//! - **Saved routes, 60 s** (fl-wire's `ROUTE_REDISCOVERY_INTERVAL`). Dispatches read routes
+//!   from the saved route table file, not from a scan (`lifecycle::lookup_route`, `/wire/send`).
+//!   A saved route is used only when the hub saved a host scan to that file within the
+//!   interval (`saved_routes_fresh`) and, when the request resolved a vendor session, the
+//!   route names that session. A lookup with no session id (lifecycle hydration, a wire push
+//!   by name) can therefore reach a replaced Antigravity, Codex, Muse or Grok conversation that
+//!   still accepts input for up to 60 s. The daemon can also overwrite the file with its own
+//!   older view (see `with_route_file_lock`).
+//! - **`/agents` mixes ages.** It reads agents and areas from the store live, but its `routes`
+//!   come from the cached store snapshot (2 s) and the cached route scan (2.5 s), so an agent
+//!   registered or retired within those windows can be listed with a route list that does not
+//!   reflect it yet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -141,8 +172,364 @@ struct DiscoveryAttemptRow {
     created_at: Option<String>,
 }
 
+/// Per-thread counts of the costly steps a request takes, so tests can prove a step was skipped.
+/// A handler runs on the calling thread, so a test reads the counts of its own requests only.
+#[cfg(test)]
+pub(crate) mod cost_counters {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        /// Host route scans ([`super::discover_routes_into`]): one `RouteTable::discover_routes` each.
+        pub(crate) static ROUTE_SCANS: Cell<u64> = const { Cell::new(0) };
+        /// Transcript files read in full ([`super::read_transcript`]).
+        pub(crate) static TRANSCRIPT_READS: Cell<u64> = const { Cell::new(0) };
+        /// Transcripts parsed into turns ([`super::parse_jsonl_transcript`]).
+        pub(crate) static TRANSCRIPT_PARSES: Cell<u64> = const { Cell::new(0) };
+        /// Store snapshots ([`super::snapshot_discovery_store`]): `2 + projects` store reads each.
+        pub(crate) static STORE_SNAPSHOTS: Cell<u64> = const { Cell::new(0) };
+        /// Workspace store opens (`HubState::open_store_at`).
+        pub(crate) static STORE_OPENS: Cell<u64> = const { Cell::new(0) };
+        /// Calls to [`super::invalidate_route_discovery_cache`].
+        pub(crate) static ROUTE_CACHE_INVALIDATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump(counter: &'static LocalKey<Cell<u64>>) {
+        counter.with(|n| n.set(n.get() + 1));
+    }
+
+    /// Counts taken on this thread while one closure ran.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Costs {
+        pub route_scans: u64,
+        pub transcript_reads: u64,
+        pub transcript_parses: u64,
+        pub store_snapshots: u64,
+        pub store_opens: u64,
+    }
+
+    fn now() -> Costs {
+        Costs {
+            route_scans: ROUTE_SCANS.with(Cell::get),
+            transcript_reads: TRANSCRIPT_READS.with(Cell::get),
+            transcript_parses: TRANSCRIPT_PARSES.with(Cell::get),
+            store_snapshots: STORE_SNAPSHOTS.with(Cell::get),
+            store_opens: STORE_OPENS.with(Cell::get),
+        }
+    }
+
+    /// Run `body` and return what it cost on this thread.
+    pub(crate) fn measure<T>(body: impl FnOnce() -> T) -> (T, Costs) {
+        let before = now();
+        let out = body();
+        let after = now();
+        let costs = Costs {
+            route_scans: after.route_scans - before.route_scans,
+            transcript_reads: after.transcript_reads - before.transcript_reads,
+            transcript_parses: after.transcript_parses - before.transcript_parses,
+            store_snapshots: after.store_snapshots - before.store_snapshots,
+            store_opens: after.store_opens - before.store_opens,
+        };
+        (out, costs)
+    }
+}
+
+/// The route table file the hub reads: the override home's `routes.json`, else `None` (the
+/// default path merged with the legacy agent-bus file, see [`RouteTable::load`]).
+pub(crate) fn route_table_path(home_override: Option<&Path>) -> Option<PathBuf> {
+    home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"))
+}
+
+/// Load the route table and scan the host's vendor session files for live routes. This is the
+/// costly step (every vendor directory, transcript heads and `/proc`), so callers that only read
+/// go through [`discovered_route_table`].
+pub(crate) fn scan_route_table(home_override: Option<&Path>) -> RouteTable {
+    let mut routes = RouteTable::load(route_table_path(home_override).as_deref());
+    discover_routes_into(&mut routes, home_override);
+    routes
+}
+
+/// A thread-safe cache of one value that expires `ttl` after it was loaded, or at the next
+/// [`TtlCache::invalidate`]. Every read returns a clone, so a caller that changes its copy never
+/// changes the cache.
+///
+/// One load at a time: callers that miss together wait for the first one's load and then read
+/// its value. A load that an invalidation overtook is not served, because each value carries the
+/// generation it was loaded in and an invalidation starts a new one.
+pub(crate) struct TtlCache<K, V> {
+    ttl: Duration,
+    state: Mutex<TtlCacheState<K, V>>,
+    load_gate: Mutex<()>,
+}
+
+struct TtlCacheState<K, V> {
+    generation: u64,
+    entry: Option<TtlCacheEntry<K, V>>,
+}
+
+struct TtlCacheEntry<K, V> {
+    key: K,
+    loaded_at: Instant,
+    generation: u64,
+    value: V,
+}
+
+impl<K, V> std::fmt::Debug for TtlCache<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtlCache")
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: PartialEq, V: Clone> TtlCache<K, V> {
+    pub(crate) const fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            state: Mutex::new(TtlCacheState {
+                generation: 0,
+                entry: None,
+            }),
+            load_gate: Mutex::new(()),
+        }
+    }
+
+    /// The cached value for `key` when it is younger than the TTL; otherwise `load` runs and its
+    /// `Ok` value is cached under `key`. An `Err` is returned and not cached. `clock` is the time
+    /// source (`Instant::now` outside tests); it is read for each freshness check and again when
+    /// `load` returns, so a value's age counts from the end of its load: a scan that took 1.4 s
+    /// still serves for the whole TTL.
+    pub(crate) fn get_or_load<E>(
+        &self,
+        key: K,
+        clock: impl Fn() -> Instant,
+        load: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E> {
+        if let Some(hit) = self.fresh(&key, clock()) {
+            return Ok(hit);
+        }
+        let _one_load = self.load_gate.lock().unwrap_or_else(|e| e.into_inner());
+        // A caller that waited on the gate reads what the load before it stored.
+        if let Some(hit) = self.fresh(&key, clock()) {
+            return Ok(hit);
+        }
+        // The generation the load starts in. An invalidation during the load starts a new one,
+        // so `fresh` never serves this value.
+        let generation = self.lock_state().generation;
+        let value = load()?;
+        let loaded_at = clock();
+        let mut state = self.lock_state();
+        state.entry = Some(TtlCacheEntry {
+            key,
+            loaded_at,
+            generation,
+            value: value.clone(),
+        });
+        Ok(value)
+    }
+
+    /// Drop the cached value. A load already running when this is called is not served either.
+    pub(crate) fn invalidate(&self) {
+        let mut state = self.lock_state();
+        state.generation = state.generation.wrapping_add(1);
+        state.entry = None;
+    }
+
+    fn fresh(&self, key: &K, now: Instant) -> Option<V> {
+        let state = self.lock_state();
+        let entry = state.entry.as_ref()?;
+        (entry.generation == state.generation
+            && entry.key == *key
+            && now.saturating_duration_since(entry.loaded_at) < self.ttl)
+            .then(|| entry.value.clone())
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, TtlCacheState<K, V>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// How long the hub reuses one host route scan. FerroDeck polls several discovery endpoints at
+/// once and each needs the route table, so they share one scan instead of each taking ~1.4 s.
+const ROUTE_DISCOVERY_TTL: Duration = Duration::from_millis(2500);
+
+/// What a host route scan read: the route files it loaded and whether host discovery was on.
+/// A scan cached under other values (a test that moved `HOME` or `XDG_RUNTIME_DIR`) is not reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteScanKey {
+    primary: PathBuf,
+    legacy: Option<PathBuf>,
+    host_discovery_disabled: bool,
+}
+
+impl RouteScanKey {
+    fn current() -> Self {
+        Self {
+            primary: fl_wire::identity::default_routes_path(),
+            legacy: fl_wire::identity::legacy_routes_path(),
+            host_discovery_disabled: std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref()
+                == Ok("1"),
+        }
+    }
+}
+
+static ROUTE_DISCOVERY_CACHE: TtlCache<RouteScanKey, RouteTable> =
+    TtlCache::new(ROUTE_DISCOVERY_TTL);
+
+/// The host's route table after discovery. With no home override the scan is shared for
+/// [`ROUTE_DISCOVERY_TTL`]; a `Some(home)` call (tests, hermetic runs) always scans fresh and
+/// never reads or fills the shared cache.
+pub(crate) fn discovered_route_table(home_override: Option<&Path>) -> RouteTable {
+    if home_override.is_some() {
+        return scan_route_table(home_override);
+    }
+    let Ok(table) =
+        ROUTE_DISCOVERY_CACHE.get_or_load(RouteScanKey::current(), Instant::now, || {
+            Ok::<_, std::convert::Infallible>(scan_route_table(None))
+        });
+    table
+}
+
+/// Forget the shared route scan, so the next discovery reads the host again. Called when the hub
+/// spawns, restarts, clears or stops a session, or writes the route table, so a change the hub
+/// made itself shows at once.
+pub(crate) fn invalidate_route_discovery_cache() {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::ROUTE_CACHE_INVALIDATIONS);
+    ROUTE_DISCOVERY_CACHE.invalidate();
+}
+
+/// Scan the host like [`scan_route_table`] and save what the scan learned to the route table
+/// file, so the next lookup finds it without a scan. Returns the scanned table.
+///
+/// The file is shared with the live `fl wire daemon`, which saves its whole table by writing a
+/// private temp file and renaming it over the target ([`RouteTable::save`]); the CLI fallback
+/// does load, change, save. The hub writes the same way and merges as the daemon merges a
+/// dispatch's scan into its live table ([`RouteTable::merge_dispatch_result`]): it reads the file
+/// again just before saving, so a route the daemon registered during the scan is kept, a route
+/// is dropped only when the scan pruned it and nobody changed it meanwhile, and a route removed
+/// during the scan stays removed ([`merge_route_scan`]). Like the daemon, it writes only when
+/// the scan changed a route. Hub writers are serialized ([`with_route_file_lock`]).
+pub(crate) fn scan_and_save_route_table(home_override: Option<&Path>) -> RouteTable {
+    let started = Instant::now();
+    let saved = RouteTable::load(route_table_path(home_override).as_deref());
+    let mut scanned = saved.clone();
+    discover_routes_into(&mut scanned, home_override);
+    save_route_scan(home_override, &saved, &scanned, started);
+    scanned
+}
+
+/// Scan the host's vendor session files into `routes` (one [`RouteTable::discover_routes`]).
+pub(crate) fn discover_routes_into(routes: &mut RouteTable, home_override: Option<&Path>) {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::ROUTE_SCANS);
+    routes.discover_routes(home_override, stamp::now());
+}
+
+/// Save the routes `scanned` learned over `base` (the table the scan started from) to the route
+/// table file. See [`scan_and_save_route_table`] for how this shares the file with the daemon.
+/// `started` is when the scan began: once the file holds the scan, saved routes count as fresh
+/// from then ([`saved_routes_fresh`]).
+pub(crate) fn save_route_scan(
+    home_override: Option<&Path>,
+    base: &RouteTable,
+    scanned: &RouteTable,
+    started: Instant,
+) {
+    if scanned.same_routes(base) {
+        // The file already held what the scan found.
+        note_route_file_scan(home_override, started);
+        return;
+    }
+    let path = route_table_path(home_override);
+    let saved = with_route_file_lock(|| {
+        let mut live = RouteTable::load(path.as_deref());
+        merge_route_scan(&mut live, base, scanned);
+        live.save(path.as_deref()).is_ok()
+    });
+    if saved {
+        note_route_file_scan(home_override, started);
+    }
+    // The hub wrote the route table: the shared scan must not hide it.
+    invalidate_route_discovery_cache();
+}
+
+/// When the hub last scanned the host and the route table file then held the scan, per file
+/// ([`route_table_path`]; `None` is the default file). Kept per file so a `Some(home)` test never
+/// sees another test's scan. Only scans saved to the file count: the shared discovery scan
+/// ([`discovered_route_table`]) is not saved, so it does not make saved routes fresh.
+static ROUTE_FILE_SCANS: Mutex<BTreeMap<Option<PathBuf>, Instant>> = Mutex::new(BTreeMap::new());
+
+/// Record that the route table file for `home_override` holds a host scan that began at `started`.
+pub(crate) fn note_route_file_scan(home_override: Option<&Path>, started: Instant) {
+    let mut scans = ROUTE_FILE_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    let last = scans
+        .entry(route_table_path(home_override))
+        .or_insert(started);
+    *last = (*last).max(started);
+}
+
+/// `true` when the route table file for `home_override` holds a host scan that began no more
+/// than fl-wire's [`ROUTE_REDISCOVERY_INTERVAL`] before `now`. A route read from a file that is
+/// not fresh may name a session the persona has since replaced, so the caller scans again.
+/// `false` until this process has saved a scan.
+///
+/// [`ROUTE_REDISCOVERY_INTERVAL`]: fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+pub(crate) fn saved_routes_fresh(home_override: Option<&Path>, now: Instant) -> bool {
+    let scans = ROUTE_FILE_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    scans
+        .get(&route_table_path(home_override))
+        .is_some_and(|last| {
+            now.saturating_duration_since(*last) <= fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+        })
+}
+
+/// Fold what a scan learned into `live`, the route table file as it is now. `scanned` started
+/// as a copy of `base` and went through discovery:
+///
+/// - a route the scan pruned (in `base`, gone from `scanned`) is dropped from `live`, unless
+///   another writer changed it meanwhile;
+/// - a route the scan found or changed merges as [`RouteTable::merge_newer`] does;
+/// - a route the scan left as `base` had it is only restamped in `live`, never written back:
+///   when `live` no longer holds it, another writer removed it during the scan (a teardown's
+///   `remove_routes`, the daemon), and it stays removed.
+pub(crate) fn merge_route_scan(live: &mut RouteTable, base: &RouteTable, scanned: &RouteTable) {
+    let mut learned = scanned.clone();
+    learned.entries.retain(|key, entry| {
+        let unchanged = base
+            .entries
+            .get(key)
+            .is_some_and(|before| before.route == entry.route);
+        !unchanged || live.entries.contains_key(key)
+    });
+    live.merge_dispatch_result(base, learned);
+}
+
+/// Serializes every hub writer of the route table file: [`save_route_scan`] and the teardown's
+/// route removal (`lifecycle::remove_routes`). Each does load, change, save; without the lock a
+/// removal saved between another writer's load and its save is overwritten and the route comes
+/// back.
+///
+/// The lock is held in this process only. The `fl wire daemon` and the `fl wire` CLI fallback
+/// write the same file from other processes, and nothing serializes them with the hub. Every
+/// write is a whole-file rename ([`RouteTable::save`]), so no reader sees a torn file, but a
+/// change one process saves between another's load and its rename is lost. The daemon is the
+/// wider window: it keeps its table in memory, never re-reads the file, and saves that whole
+/// table only on a `RegisterRoute` request or a dispatch whose scan changed a route. Such a save
+/// drops any route the hub saved that the daemon does not hold, and brings back a route a
+/// teardown removed while the daemon still holds it, until the next scan learns or prunes it again.
+static ROUTE_FILE_WRITE: Mutex<()> = Mutex::new(());
+
+/// Run `write` (a load, change and save of the route table file) holding [`ROUTE_FILE_WRITE`].
+pub(crate) fn with_route_file_lock<T>(write: impl FnOnce() -> T) -> T {
+    let _one_writer = ROUTE_FILE_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+    write()
+}
+
 /// Read agent names and attempt rows. Does not walk the filesystem.
 pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::STORE_SNAPSHOTS);
     let registered_names = store
         .list_agents(None, true)
         .unwrap_or_default()
@@ -244,10 +631,10 @@ pub fn discover_sessions_from_snapshot(
     discover_sessions_impl(snap, home_override, true)
 }
 
-/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `model`,
-/// `thinking_level` and `available_models` empty. For callers that only look a session up
-/// by `id`, `persona` or `source`: it never reads a model file or transcript tail and never
-/// calls a language server.
+/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `quota_usage`,
+/// `model`, `thinking_level` and `available_models` empty. For callers that only look a
+/// session up by `id`, `persona` or `source`: it never reads a model file, a transcript or a
+/// transcript tail, and never runs a quota probe or calls a language server.
 pub fn discover_route_sessions_without_model_info(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
@@ -256,8 +643,8 @@ pub fn discover_route_sessions_without_model_info(
 }
 
 /// Shared body of [`discover_sessions_from_snapshot`]. `with_model_info` is false for
-/// callers that only look a session up by id, so they never read model files or wait on
-/// a language server.
+/// callers that only look a session up by id, so they never read model files or transcripts
+/// for quota, run a quota probe, or wait on a language server.
 fn discover_sessions_impl(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
@@ -267,10 +654,7 @@ fn discover_sessions_impl(
     let mut agy_endpoints: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut seen_ids = BTreeSet::new();
 
-    let route_override =
-        home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(home_override, stamp::now());
+    let routes = discovered_route_table(home_override);
 
     let home = home_override
         .map(Path::to_path_buf)
@@ -410,7 +794,7 @@ fn discover_sessions_impl(
     }
 
     for session in &mut out {
-        if session.source == "route" {
+        if session.source == "route" && with_model_info {
             // `home` is for transcript lookup only. Production passes `None`
             // so probes may use `PATH`; `Some($HOME)` would skip them.
             session.quota_usage = quota_for_resolved_route(
@@ -418,21 +802,19 @@ fn discover_sessions_impl(
                 session.transcript_path.as_deref(),
                 home_override,
             );
-            if with_model_info {
-                let endpoint = agy_endpoints.get(&session.id);
-                let info = session_model_info(
-                    &session.adapter,
-                    &session.id,
-                    session.transcript_path.as_deref(),
-                    home.as_deref(),
-                    endpoint.and_then(|(addr, _)| addr.as_deref()),
-                    endpoint.and_then(|(_, csrf)| csrf.as_deref()),
-                    agy_env_fallback_allowed(home_override),
-                );
-                session.model = info.model;
-                session.thinking_level = info.thinking_level;
-                session.available_models = info.available_models;
-            }
+            let endpoint = agy_endpoints.get(&session.id);
+            let info = session_model_info(
+                &session.adapter,
+                &session.id,
+                session.transcript_path.as_deref(),
+                home.as_deref(),
+                endpoint.and_then(|(addr, _)| addr.as_deref()),
+                endpoint.and_then(|(_, csrf)| csrf.as_deref()),
+                agy_env_fallback_allowed(home_override),
+            );
+            session.model = info.model;
+            session.thinking_level = info.thinking_level;
+            session.available_models = info.available_models;
         }
     }
 
@@ -951,6 +1333,8 @@ fn read_transcript_lossy(path: &Path, max_bytes: u64) -> std::io::Result<String>
 }
 
 fn read_transcript(path: impl AsRef<Path>) -> std::io::Result<String> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::TRANSCRIPT_READS);
     read_transcript_lossy(path.as_ref(), TRANSCRIPT_READ_MAX_BYTES)
 }
 
@@ -1784,6 +2168,35 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
     latest
 }
 
+/// Transcript files one request has read. A second look at the same file (a busy check after
+/// the transcript, the context-window or quota scan) reuses the text and the parsed turns
+/// instead of reading and parsing a multi-MB file again. Keyed by path; a failed read is kept
+/// as `None`.
+#[derive(Debug, Default)]
+pub(crate) struct TranscriptReads {
+    raw: BTreeMap<String, Option<String>>,
+    turns: BTreeMap<String, Vec<TranscriptTurn>>,
+}
+
+impl TranscriptReads {
+    /// The file's text, read on the first call for `path` only.
+    fn raw(&mut self, path: &str) -> Option<&str> {
+        self.raw
+            .entry(path.to_string())
+            .or_insert_with(|| read_transcript(path).ok())
+            .as_deref()
+    }
+
+    /// The file's turns, parsed on the first call for `path` only; `None` when it cannot be read.
+    fn turns(&mut self, path: &str) -> Option<&[TranscriptTurn]> {
+        if !self.turns.contains_key(path) {
+            let parsed = parse_jsonl_transcript(self.raw(path)?);
+            self.turns.insert(path.to_string(), parsed);
+        }
+        self.turns.get(path).map(Vec::as_slice)
+    }
+}
+
 /// Read account quota for `session_id`.
 ///
 /// Codex rollouts supply both windows. Grok's unified log supplies the weekly window.
@@ -1804,6 +2217,25 @@ pub(crate) fn read_session_quota_usage_locked(
     session_id: &str,
     home_override: Option<&Path>,
 ) -> Option<SessionQuotaUsage> {
+    quota_usage_with_reads_locked(session_id, home_override, &mut TranscriptReads::default())
+}
+
+/// [`read_session_quota_usage_with_home`] that reads the transcript through `files`.
+pub(crate) fn read_session_quota_usage_with_reads(
+    session_id: &str,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionQuotaUsage> {
+    crate::direct_quota::with_probe_lock(|| {
+        quota_usage_with_reads_locked(session_id, home_override, files)
+    })
+}
+
+fn quota_usage_with_reads_locked(
+    session_id: &str,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionQuotaUsage> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return None;
@@ -1813,7 +2245,7 @@ pub(crate) fn read_session_quota_usage_locked(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
     let tpath = find_transcript_file_in_home(&home, trimmed)?;
     let adapter = adapter_for_transcript(Path::new(&tpath))?;
-    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override)
+    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override, files)
 }
 
 /// Quota for a route row whose transcript path is already known.
@@ -1825,7 +2257,12 @@ pub(crate) fn quota_for_resolved_route(
     home_override: Option<&Path>,
 ) -> Option<SessionQuotaUsage> {
     crate::direct_quota::with_probe_lock(|| {
-        quota_for_resolved_route_locked(adapter, transcript_path, home_override)
+        quota_for_resolved_route_locked(
+            adapter,
+            transcript_path,
+            home_override,
+            &mut TranscriptReads::default(),
+        )
     })
 }
 
@@ -1833,6 +2270,7 @@ fn quota_for_resolved_route_locked(
     adapter: &str,
     transcript_path: Option<&str>,
     home_override: Option<&Path>,
+    files: &mut TranscriptReads,
 ) -> Option<SessionQuotaUsage> {
     let home = home_override
         .map(Path::to_path_buf)
@@ -1840,8 +2278,7 @@ fn quota_for_resolved_route_locked(
     match adapter {
         "codex" => {
             let path = transcript_path?;
-            let raw = read_transcript(path).ok()?;
-            codex_quota_from_rollout(&raw)
+            codex_quota_from_rollout(files.raw(path)?)
         }
         "grok" => {
             transcript_path?;
@@ -1849,17 +2286,13 @@ fn quota_for_resolved_route_locked(
             grok_quota_from_home(&home)
         }
         "muse" => {
-            let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                muse_quota_from_session(&raw)
-            });
+            let disk = transcript_path.and_then(|path| muse_quota_from_session(files.raw(path)?));
             let account = crate::direct_quota::muse_account_quota(home_override);
             crate::direct_quota::merge_account_quota(account, disk)
         }
         "claude" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                let reason = crate::direct_quota::claude_rate_limit_reason(&raw)?;
+                let reason = crate::direct_quota::claude_rate_limit_reason(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
@@ -1872,8 +2305,7 @@ fn quota_for_resolved_route_locked(
         }
         "antigravity" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = read_transcript(path).ok()?;
-                let reason = crate::direct_quota::antigravity_exhausted_reason(&raw)?;
+                let reason = crate::direct_quota::antigravity_exhausted_reason(files.raw(path)?)?;
                 Some(SessionQuotaUsage {
                     tier: None,
                     primary_window: None,
@@ -1935,8 +2367,27 @@ pub fn read_session_context_usage_from_snapshot(
     if trimmed.is_empty() {
         return None;
     }
-
     let sessions = discover_sessions_impl(snap, home_override, false);
+    context_usage_from_sessions(
+        trimmed,
+        &sessions,
+        home_override,
+        &mut TranscriptReads::default(),
+    )
+}
+
+/// The context-window read of [`read_session_context_usage_from_snapshot`] over sessions the
+/// caller already discovered, reading the transcript through `files`.
+pub(crate) fn context_usage_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<SessionContextUsage> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let mut tpath_opt = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -1951,7 +2402,8 @@ pub fn read_session_context_usage_from_snapshot(
         }
     }
 
-    let tpath = PathBuf::from(tpath_opt?);
+    let tpath_str = tpath_opt?;
+    let tpath = PathBuf::from(&tpath_str);
     if tpath.file_name().and_then(|s| s.to_str()) == Some("chat_history.jsonl")
         && let Some(dir) = tpath.parent()
     {
@@ -1997,7 +2449,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".codex")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         let configured_max = read_codex_configured_context_window(&tpath);
         for line in raw.lines().rev() {
@@ -2045,7 +2497,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2085,7 +2537,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".claude")
-        && let Ok(raw) = read_transcript(&tpath)
+        && let Some(raw) = files.raw(&tpath_str)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -2130,8 +2582,8 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if is_antigravity_transcript(&tpath)
-        && let Ok(raw) = read_transcript(&tpath)
-        && let Some(usage) = antigravity_context_from_transcript(&raw)
+        && let Some(raw) = files.raw(&tpath_str)
+        && let Some(usage) = antigravity_context_from_transcript(raw)
     {
         return Some(usage);
     }
@@ -2165,17 +2617,45 @@ pub fn read_session_transcript_from_snapshot(
     if trimmed.is_empty() {
         return Vec::new();
     }
-
     let sessions = discover_sessions_impl(snap, home_override, false);
-    for s in &sessions {
+    transcript_from_sessions(
+        trimmed,
+        &sessions,
+        snap,
+        home_override,
+        &mut TranscriptReads::default(),
+    )
+}
+
+/// Lookup-only discovery (no model or quota information), for a request that resolves a
+/// session and reads its transcript, context window and quota from one route scan.
+pub(crate) fn lookup_sessions(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_impl(snap, home_override, false)
+}
+
+/// The transcript read of [`read_session_transcript_from_snapshot`] over sessions the caller
+/// already discovered, reading and parsing each file through `files`.
+pub(crate) fn transcript_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Vec<TranscriptTurn> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    for s in sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
-            && let Ok(raw) = read_transcript(tpath)
+            && let Some(turns) = files.turns(tpath)
+            && !turns.is_empty()
         {
-            let turns = parse_jsonl_transcript(&raw);
-            if !turns.is_empty() {
-                return turns;
-            }
+            return turns.to_vec();
         }
     }
 
@@ -2184,12 +2664,10 @@ pub fn read_session_transcript_from_snapshot(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     if let Some(ref h) = home
         && let Some(tpath) = find_transcript_file_in_home(h, trimmed)
-        && let Ok(raw) = read_transcript(tpath)
+        && let Some(turns) = files.turns(&tpath)
+        && !turns.is_empty()
     {
-        let turns = parse_jsonl_transcript(&raw);
-        if !turns.is_empty() {
-            return turns;
-        }
+        return turns.to_vec();
     }
 
     for attempt in &snap.attempts {
@@ -2257,6 +2735,8 @@ fn remember_agy_step_zero(
 /// Normalize JSONL lines from Antigravity (`transcript.jsonl`), Claude Code, Codex, Muse, or Grok
 /// into a unified `Vec<TranscriptTurn>` sequence (spec §3.2).
 pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::TRANSCRIPT_PARSES);
     let mut turns = Vec::new();
     let mut last_step_index: Option<u64> = None;
     let mut step_zero_turn: Option<TranscriptTurn> = None;
