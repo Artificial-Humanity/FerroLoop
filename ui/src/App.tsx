@@ -1543,10 +1543,6 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             agentSettingsOpen={agentSettingsOpen}
             onOpenAgentSettings={() => setAgentSettingsOpen(true)}
             onCloseAgentSettings={() => setAgentSettingsOpen(false)}
-            onToggleArtifacts={() => {
-              setSplitView((prev) => !prev || secondaryTab !== "artifacts");
-              setSecondaryTab("artifacts");
-            }}
             onRefresh={() => void refreshSessionsAndTranscript()}
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
@@ -1752,9 +1748,6 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             agentSettingsOpen={agentSettingsOpen}
             onOpenAgentSettings={() => setAgentSettingsOpen(true)}
             onCloseAgentSettings={() => setAgentSettingsOpen(false)}
-            onToggleArtifacts={() => handleSelectTab("artifacts")}
-            splitView={splitView}
-            onToggleSplitView={handleToggleSplitView}
             onRefresh={() => {
               void refreshSessionsAndTranscript();
               void refreshWireAndRoster();

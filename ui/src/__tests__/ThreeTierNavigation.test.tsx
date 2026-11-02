@@ -86,9 +86,13 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(projectNav).queryByTestId("session-cwd-badge")).toBeNull();
     expect(within(projectNav).getByRole("tab", { name: /^Artifacts$/i })).toBeInTheDocument();
     expect(within(projectNav).getByRole("tab", { name: /^Git & PRs$/i })).toBeInTheDocument();
-    expect(
-      within(projectNav).getByRole("tab", { name: /^Records & Board$/i }),
-    ).toBeInTheDocument();
+    const recordsTabBtn = within(projectNav).getByRole("tab", {
+      name: /^Records & Board$/i,
+    });
+    expect(recordsTabBtn).toBeInTheDocument();
+    const splitToggleBtn = within(projectNav).getByTestId("split-view-toggle");
+    expect(splitToggleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(recordsTabBtn.nextElementSibling).toBe(splitToggleBtn);
 
     // Tier 3: System Context (inline inside tier-system-nav)
     const systemNav = within(tabBar).getByTestId("tier-system-nav");
@@ -151,6 +155,11 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     const scopeBadge = await screen.findByTestId("active-context-tier-badge");
     expect(scopeBadge).toHaveAttribute("data-tier", "agent");
     expect(scopeBadge).toHaveTextContent("Scope: Agent · Ferris");
+    expect(screen.queryByTestId("chat-artifacts-toggle-btn")).toBeNull();
+    expect(within(screen.getByTestId("chat-pane")).queryByTestId("split-view-toggle")).toBeNull();
+    expect(
+      within(screen.getByTestId("tier-project-nav")).getByTestId("split-view-toggle"),
+    ).toHaveAttribute("aria-pressed", "false");
 
     // Switch to Git & PRs (Project tier) -> opens right split panel while keeping ChatPane mounted
     const tabBar = screen.getByTestId("cockpit-tab-bar");

@@ -93,7 +93,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onSelectSession,
   activeTab,
   onSelectTab,
-  splitView,
+  splitView = false,
   onToggleSplitView,
   themeMode = "dark",
   onToggleTheme,
@@ -296,6 +296,21 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
 
           <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
             {PROJECT_TIER_TABS.map(renderTabButton)}
+            <button
+              type="button"
+              data-testid="split-view-toggle"
+              className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+              onClick={() => onToggleSplitView?.()}
+              title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+              aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+              aria-pressed={splitView}
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
+                <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
+                <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
+              </svg>
+            </button>
           </div>
         </div>
 
