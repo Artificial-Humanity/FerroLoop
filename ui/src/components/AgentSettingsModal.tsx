@@ -10,9 +10,8 @@ import {
   RECAST_ROLE_OPTIONS,
   type RecastConflictState,
 } from "./SettingsModal";
+import { QuotaUsageBadge } from "./QuotaUsageBadge";
 import {
-  formatQuotaResetCountdown,
-  formatQuotaWindowRemaining,
   formatTokenCount,
   getVendorModelOptions,
   hasQuotaUsageData,
@@ -184,12 +183,6 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
       : THINKING_LEVEL_OPTIONS;
   const showQuota = hasQuotaUsageData(quotaUsage);
-  const quotaExhausted = Boolean(
-    quotaUsage &&
-      ((quotaUsage.exhausted_reason && quotaUsage.exhausted_reason.trim().length > 0) ||
-        (quotaUsage.primary_window?.used_percent ?? 0) >= 100 ||
-        (quotaUsage.secondary_window?.used_percent ?? 0) >= 100),
-  );
 
   return (
     <div className="fd-modal-backdrop" onClick={onClose}>
@@ -541,163 +534,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               >
                 Vendor Account Quota
               </span>
-              <div
-                data-testid="quota-usage-badge"
-                data-exhausted={quotaExhausted ? "true" : undefined}
-                className={`fd-badge fd-quota-badge${quotaExhausted ? " is-exhausted" : ""}`}
-                title={
-                  quotaUsage.exhausted_reason?.trim() ||
-                  "Vendor account usage allowance"
-                }
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  padding: "4px 8px",
-                  flexWrap: "wrap",
-                  borderColor: quotaExhausted
-                    ? "var(--diff-del-border, rgba(239, 68, 68, 0.45))"
-                    : "var(--border-subtle)",
-                  backgroundColor: quotaExhausted
-                    ? "var(--diff-del-bg, rgba(239, 68, 68, 0.14))"
-                    : "var(--bg-surface)",
-                  color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--text-secondary)",
-                }}
-              >
-                {quotaUsage.tier && quotaUsage.tier.trim().length > 0 && (
-                  <span
-                    data-testid="quota-tier-chip"
-                    style={{
-                      padding: "1px 5px",
-                      borderRadius: "3px",
-                      fontSize: "10px",
-                      fontWeight: 700,
-                      letterSpacing: "0.04em",
-                      backgroundColor: quotaExhausted
-                        ? "rgba(239, 68, 68, 0.2)"
-                        : "var(--accent-subtle)",
-                      color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--accent-hover)",
-                      border: `1px solid ${
-                        quotaExhausted
-                          ? "rgba(239, 68, 68, 0.45)"
-                          : "var(--border-accent)"
-                      }`,
-                    }}
-                  >
-                    {quotaUsage.tier.trim().toUpperCase()}
-                  </span>
-                )}
-                {quotaUsage.primary_window && (() => {
-                  const win = quotaUsage.primary_window;
-                  const remaining = formatQuotaWindowRemaining(win);
-                  const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                  const barColor =
-                    win.used_percent >= 100 || remaining <= 10
-                      ? "var(--status-danger)"
-                      : remaining <= 25
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)";
-                  return (
-                    <span
-                      data-testid="quota-primary-window"
-                      style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                    >
-                      <span>5h: {remaining}% left</span>
-                      <span
-                        role="progressbar"
-                        aria-label="5h session allowance remaining"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={remaining}
-                        style={{
-                          width: "48px",
-                          height: "6px",
-                          borderRadius: "3px",
-                          backgroundColor: "var(--bg-input)",
-                          border: "1px solid var(--border-subtle)",
-                          overflow: "hidden",
-                          display: "inline-block",
-                        }}
-                      >
-                        <span
-                          style={{
-                            display: "block",
-                            width: `${remaining}%`,
-                            height: "100%",
-                            backgroundColor: barColor,
-                          }}
-                        />
-                      </span>
-                      {resetLabel && (
-                        <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                          ({resetLabel})
-                        </span>
-                      )}
-                    </span>
-                  );
-                })()}
-                {quotaUsage.secondary_window && (() => {
-                  const win = quotaUsage.secondary_window;
-                  const remaining = formatQuotaWindowRemaining(win);
-                  const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
-                  const barColor =
-                    win.used_percent >= 100 || remaining <= 10
-                      ? "var(--status-danger)"
-                      : remaining <= 25
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)";
-                  return (
-                    <span
-                      data-testid="quota-secondary-window"
-                      style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
-                    >
-                      <span>7d: {remaining}% left</span>
-                      <span
-                        role="progressbar"
-                        aria-label="Weekly allowance remaining"
-                        aria-valuemin={0}
-                        aria-valuemax={100}
-                        aria-valuenow={remaining}
-                        style={{
-                          width: "48px",
-                          height: "6px",
-                          borderRadius: "3px",
-                          backgroundColor: "var(--bg-input)",
-                          border: "1px solid var(--border-subtle)",
-                          overflow: "hidden",
-                          display: "inline-block",
-                        }}
-                      >
-                        <span
-                          style={{
-                            display: "block",
-                            width: `${remaining}%`,
-                            height: "100%",
-                            backgroundColor: barColor,
-                          }}
-                        />
-                      </span>
-                      {resetLabel && (
-                        <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
-                          ({resetLabel})
-                        </span>
-                      )}
-                    </span>
-                  );
-                })()}
-                {quotaExhausted && (
-                  <span
-                    data-testid="quota-exhausted-alert"
-                    style={{
-                      fontWeight: 600,
-                      color: "var(--diff-del-text, #FCA5A5)",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {quotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
-                  </span>
-                )}
-              </div>
+              <QuotaUsageBadge quota={quotaUsage} />
             </div>
           )}
         </div>

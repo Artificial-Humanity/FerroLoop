@@ -66,6 +66,7 @@ import {
   type EnrolledNode,
   type FederatedTask,
   type RuntimeMatrix,
+  type RuntimeUpdateResult,
   type GateConnectorsResponse,
   type GateSecretResponse,
   type GateSecretsResponse,
@@ -1414,6 +1415,19 @@ export class HubApiClient {
       method: "POST",
       body: JSON.stringify(target ? { target } : {}),
     });
+  }
+
+  /**
+   * Run a CLI's own update command (owner only). `runtime` is `claude`, `codex`, `grok`, `agy`,
+   * `muse` or `all`. The hub answers one object for one runtime and an array for `all`; this
+   * always returns an array.
+   */
+  public async updateRuntime(runtime: string): Promise<RuntimeUpdateResult[]> {
+    const res = await this.request<RuntimeUpdateResult | RuntimeUpdateResult[]>(
+      "/api/v1/runtimes/update",
+      { method: "POST", body: JSON.stringify({ runtime }) },
+    );
+    return Array.isArray(res) ? res : [res];
   }
 
   public async fetchNodeTasks(nodeId: string): Promise<FederatedTask[]> {

@@ -17,6 +17,7 @@ import {
 } from "../lib/accessibility";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
+import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -34,7 +35,7 @@ import {
   type TotpEnrollmentResponse,
 } from "../types/api";
 
-export type SettingsTabId = "agents" | "system" | "accessibility" | "auth";
+export type SettingsTabId = "agents" | "system" | "runtimes" | "accessibility" | "auth";
 
 export interface SettingsModalProps {
   isOpen: boolean;
@@ -1038,6 +1039,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 System
               </button>
+              {authority?.tier === "owner" && (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "runtimes"}
+                  data-testid="settings-tab-runtimes"
+                  className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("runtimes")}
+                >
+                  Runtimes &amp; Quotas
+                </button>
+              )}
               <button
                 type="button"
                 role="tab"
@@ -3019,6 +3032,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
           </>
+        )}
+
+        {/* Runtimes & Quotas: the hub answers it for the owner only */}
+        {activeTab === "runtimes" && !initialProject && (
+          <div
+            role="tabpanel"
+            aria-label="Runtimes and Quotas Panel"
+            data-testid="settings-panel-runtimes"
+          >
+            {authority?.tier === "owner" ? (
+              <RuntimesQuotasPanel apiClient={apiClient} />
+            ) : (
+              <div
+                className="fd-card"
+                data-testid="settings-runtimes-owner-only"
+                style={{ fontSize: "12px", color: "var(--text-muted)" }}
+              >
+                Owner authority is required to view runtimes and quotas.
+              </div>
+            )}
+          </div>
         )}
 
         {/* Re-Cast Modal Dialog */}
