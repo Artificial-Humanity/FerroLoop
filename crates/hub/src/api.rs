@@ -554,6 +554,14 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/roles") => handle_get_roles(state),
         ("POST", "/api/v1/roles") => handle_post_role(state, &authority, req),
+        ("GET", "/api/v1/notifications/subscribe") => handle_get_notifications_subscribe(state),
+        ("POST", "/api/v1/notifications/subscribe") => {
+            handle_post_notifications_subscribe(state, &authority, req)
+        }
+        ("POST", "/api/v1/notifications/test") => {
+            handle_post_notifications_test(state, &authority, req)
+        }
+        ("GET", "/api/v1/notifications/events") => handle_get_notifications_events(state),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("GET", "/api/v1/version") => crate::version_api::handle_get(state),
         ("GET", "/api/v1/doctor") => crate::doctor_api::handle_get(state, &authority),
@@ -4169,6 +4177,184 @@ fn handle_delete_role(state: &HubState, authority: &HubAuthority, raw_slug: &str
     }
 }
 
+/// `GET /api/v1/notifications/subscribe` (Record #67): current operator push
+/// state (defaults when unset). Any authenticated caller.
+fn handle_get_notifications_subscribe(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::get_operator_push_state(&*store) {
+        Ok(saved) => HttpResponse::json(200, serde_json::to_value(&saved).unwrap_or(json!({}))),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `POST /api/v1/notifications/subscribe` (Record #67): validate and persist
+/// the operator push state. Owner only, like `POST /api/v1/roles`.
+fn handle_post_notifications_subscribe(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change notifications" }),
+        );
+    }
+    let parsed: fl_core::OperatorPushSubscriptionState = match serde_json::from_slice(&req.body) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid notification subscription: {e}") }),
+            );
+        }
+    };
+    if let Err(e) = parsed.validate() {
+        return HttpResponse::json(400, json!({ "error": e.to_string() }));
+    }
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::set_operator_push_state(&*store, parsed) {
+        Ok(saved) => HttpResponse::json(200, serde_json::to_value(&saved).unwrap_or(json!({}))),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TestPushBody {
+    deep_link: String,
+    #[serde(default)]
+    project_scope: Option<String>,
+}
+
+/// Same-origin path only: starts with a single `/` (not `//`, which a
+/// browser treats as protocol-relative) and has no backslash, whitespace,
+/// or control characters.
+fn is_valid_deep_link(deep_link: &str) -> bool {
+    deep_link.starts_with('/')
+        && !deep_link.starts_with("//")
+        && !deep_link
+            .chars()
+            .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestPushEvaluation {
+    dispatched: bool,
+    deep_link: String,
+    project_scope: Option<String>,
+    channels: Vec<String>,
+    quiet_hours_active: bool,
+    receipt: fl_core::PushDispatchReceipt,
+}
+
+/// Pure test-push evaluation: quiet/channel decision and the receipt to
+/// record, for an explicit UTC `current_hh_mm` and `at_ms`.
+fn evaluate_test_push(
+    state: &fl_core::OperatorPushSubscriptionState,
+    deep_link: String,
+    project_scope: Option<String>,
+    current_hh_mm: &str,
+    at_ms: u64,
+) -> TestPushEvaluation {
+    let quiet_hours_active = state.quiet_hours.is_quiet_at(current_hh_mm);
+    let channels: Vec<String> = fl_core::active_channels(state)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let dispatched = !channels.is_empty() && !quiet_hours_active;
+    let receipt = fl_core::PushDispatchReceipt {
+        deep_link: deep_link.clone(),
+        project_scope: project_scope.clone(),
+        channels: channels.clone(),
+        quiet_hours_active,
+        dispatched,
+        at_ms,
+    };
+    TestPushEvaluation {
+        dispatched,
+        deep_link,
+        project_scope,
+        channels,
+        quiet_hours_active,
+        receipt,
+    }
+}
+
+/// `POST /api/v1/notifications/test` (Record #67): record a test dispatch.
+/// Owner only. The hub has no injected clock here, so the current time comes
+/// from `fl_exec::stamp::now()` (an `fl_core::At` UTC timestamp); its
+/// `HH:MM` slice (chars 11..16) is the UTC wall-clock time quiet hours are
+/// checked against.
+fn handle_post_notifications_test(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may send test notifications" }),
+        );
+    }
+    let body: TestPushBody = match serde_json::from_slice(&req.body) {
+        Ok(body) => body,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid test notification: {e}") }),
+            );
+        }
+    };
+    if !is_valid_deep_link(&body.deep_link) {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "deep_link must be a same-origin path starting with '/'" }),
+        );
+    }
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let push_state = match fl_core::get_operator_push_state(&*store) {
+        Ok(push_state) => push_state,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    let now = stamp::now();
+    let evaluation = evaluate_test_push(
+        &push_state,
+        body.deep_link,
+        body.project_scope,
+        &now.as_str()[11..16],
+        now.unix_millis(),
+    );
+    if let Err(e) = fl_core::append_push_receipt(&*store, evaluation.receipt.clone()) {
+        return HttpResponse::json(500, json!({ "error": e.to_string() }));
+    }
+    HttpResponse::json(
+        200,
+        json!({
+            "dispatched": evaluation.dispatched,
+            "deep_link": evaluation.deep_link,
+            "project_scope": evaluation.project_scope,
+            "channels": evaluation.channels,
+            "quiet_hours_active": evaluation.quiet_hours_active,
+        }),
+    )
+}
+
+/// `GET /api/v1/notifications/events` (Record #67): stored dispatch receipts.
+/// Any authenticated caller.
+fn handle_get_notifications_events(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let receipts = fl_core::list_push_receipts(&*store);
+    HttpResponse::json(200, serde_json::to_value(&receipts).unwrap_or(json!([])))
+}
+
 /// `GET /api/v1/cloud/adapters` (Records 52 and 53): the saved cloud adapter config, or the
 /// defaults. A saved file that cannot be used is a 500, never a silent reset.
 fn handle_get_cloud_adapters(state: &HubState) -> HttpResponse {
@@ -7116,6 +7302,201 @@ mod tests {
         assert_eq!(status, 403);
         let (status, _) = roles_call(&state, "DELETE", "/api/v1/roles/y", "peer-test-tok", None);
         assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn notifications_subscribe_defaults_persist_and_owner_gate() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let (status, got) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/notifications/subscribe",
+            owner,
+            None,
+        );
+        assert_eq!(status, 200, "{got}");
+        assert_eq!(got["project_scope"], "all");
+        assert_eq!(got["web_push_permission"], "granted");
+        assert_eq!(got["quiet_hours"]["enabled"], true);
+        assert_eq!(got["quiet_hours"]["start_time"], "22:00");
+        // Any authenticated caller may read.
+        let (status, _) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/notifications/subscribe",
+            "peer-test-tok",
+            None,
+        );
+        assert_eq!(status, 200);
+
+        // Persist with quiet disabled, then GET reflects it.
+        let mut body = got.clone();
+        body["quiet_hours"]["enabled"] = json!(false);
+        body["project_scope"] = json!("ferroloop");
+        let (status, saved) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/subscribe",
+            owner,
+            Some(serde_json::to_vec(&body).unwrap()),
+        );
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["project_scope"], "ferroloop");
+        let (status, got) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/notifications/subscribe",
+            owner,
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(got["project_scope"], "ferroloop");
+        assert_eq!(got["quiet_hours"]["enabled"], false);
+
+        // Non-owner write -> 403 and no change; invalid quiet time -> 400.
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/subscribe",
+            "peer-test-tok",
+            Some(serde_json::to_vec(&body).unwrap()),
+        );
+        assert_eq!(status, 403, "{err}");
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("only Owner authority")
+        );
+        let mut bad = body.clone();
+        bad["quiet_hours"]["enabled"] = json!(true);
+        bad["quiet_hours"]["start_time"] = json!("25:00");
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/subscribe",
+            owner,
+            Some(serde_json::to_vec(&bad).unwrap()),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(err.get("error").is_some());
+    }
+
+    #[test]
+    fn notifications_test_dispatch_validates_and_records_receipt() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        // Deterministic: disable quiet hours first.
+        let (_, got) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/notifications/subscribe",
+            owner,
+            None,
+        );
+        let mut body = got;
+        body["quiet_hours"]["enabled"] = json!(false);
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/subscribe",
+            owner,
+            Some(serde_json::to_vec(&body).unwrap()),
+        );
+        assert_eq!(status, 200);
+
+        let test_body = serde_json::to_vec(&json!({
+            "deep_link": "/sessions/abc", "project_scope": "ferroloop"
+        }))
+        .unwrap();
+        let (status, resp) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/test",
+            owner,
+            Some(test_body),
+        );
+        assert_eq!(status, 200, "{resp}");
+        assert_eq!(resp["dispatched"], true);
+        assert_eq!(resp["deep_link"], "/sessions/abc");
+        assert_eq!(resp["project_scope"], "ferroloop");
+        assert_eq!(resp["channels"], json!(["vapid", "apns", "fcm"]));
+        assert_eq!(resp["quiet_hours_active"], false);
+
+        for bad_link in [
+            "https://evil",
+            "//evil",
+            "/a\nb",
+            "relative",
+            "/a\\b",
+            "/a b",
+            "/a\tb",
+            "/a\u{1}b",
+        ] {
+            let bad = serde_json::to_vec(&json!({ "deep_link": bad_link })).unwrap();
+            let (status, err) = roles_call(
+                &state,
+                "POST",
+                "/api/v1/notifications/test",
+                owner,
+                Some(bad),
+            );
+            assert_eq!(status, 400, "{bad_link}: {err}");
+            assert!(err.get("error").is_some());
+        }
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/notifications/test",
+            "peer-test-tok",
+            Some(serde_json::to_vec(&json!({ "deep_link": "/x" })).unwrap()),
+        );
+        assert_eq!(status, 403);
+
+        let (status, events) =
+            roles_call(&state, "GET", "/api/v1/notifications/events", owner, None);
+        assert_eq!(status, 200, "{events}");
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["deep_link"], "/sessions/abc");
+        assert_eq!(events[0]["dispatched"], true);
+        assert_eq!(events[0]["channels"], json!(["vapid", "apns", "fcm"]));
+        assert!(events[0]["at_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn notifications_test_push_quiet_window_records_undispatched_receipt() {
+        let (_tmp, state) = roles_test_state();
+        // Default state: quiet 22:00-07:00 UTC, enabled.
+        let push_state = fl_core::OperatorPushSubscriptionState::default();
+        let evaluation = evaluate_test_push(
+            &push_state,
+            "/sessions/abc".to_string(),
+            Some("ferroloop".to_string()),
+            "23:00",
+            1_700_000_000_000,
+        );
+        assert!(evaluation.quiet_hours_active);
+        assert!(!evaluation.dispatched);
+        assert!(evaluation.receipt.quiet_hours_active);
+        assert!(!evaluation.receipt.dispatched);
+        assert_eq!(evaluation.receipt.at_ms, 1_700_000_000_000);
+        let store = state.open_store().unwrap();
+        fl_core::append_push_receipt(&*store, evaluation.receipt).unwrap();
+        drop(store);
+        let (status, events) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/notifications/events",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200, "{events}");
+        let events = events.as_array().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["quiet_hours_active"], true);
+        assert_eq!(events[0]["dispatched"], false);
     }
 
     fn put_memory(
