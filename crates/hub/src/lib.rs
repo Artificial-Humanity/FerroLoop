@@ -755,6 +755,9 @@ mod runtime_update_tests;
 mod artifact_dirs_tests;
 
 #[cfg(test)]
+mod artifact_consolidate_tests;
+
+#[cfg(test)]
 mod remodel_api_tests;
 
 #[cfg(test)]

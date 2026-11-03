@@ -4,6 +4,7 @@ mod wire;
 
 pub mod agent;
 pub mod arch;
+pub mod artifact_layout;
 pub mod at;
 pub mod build_info;
 pub mod child_env;
@@ -57,6 +58,12 @@ pub use arch::{
     ArchComponent, ArchComponentKind, ArchConformanceReport, ArchEdge, ArchError, ArchViolation,
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, PackageDep, SourceReference,
     check_architecture_conformance, export_likec4_dsl, validate_architecture_model,
+};
+pub use artifact_layout::{
+    ARTIFACT_KINDS, ArtifactLayoutError, ArtifactRetentionPolicyConfig, ArtifactScatterVendor,
+    DEDICATED_ARTIFACT_LAYOUT_SLUG, DedicatedArtifactLayoutState, ScatterVendor,
+    VendorArtifactScatterOrigin, consolidate_artifact_layout, get_artifact_layout,
+    get_artifact_layout_strict, scattered_totals, set_artifact_layout,
 };
 pub use at::{At, AtError};
 pub use cloud_sessions::{
