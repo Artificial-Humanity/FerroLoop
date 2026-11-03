@@ -82,6 +82,7 @@ pub struct PrReviewSummary {
   - For every commit in the PR where `author_login` is not the Owner (`owner_login`, default `"lmcfarlin"`):
     - If `parse_co_authors(&commit.message)` is empty, the commit SHA is recorded in `unattributed_commits: Vec<String>`.
   - If any commit has `author_login` equal to `owner_login` (case-insensitively) with no `Co-authored-by:` trailer, `owner_authored_commits: bool` is set to `true`.
+  - Merge commits (more than one parent) are exempt from the trailer check while the PR has at least one non-merge commit; a PR of merge commits alone is checked in full (fails closed). Trailers on an exempt merge commit still count toward co-author escalation and `unknown_co_authors`, but never attribute it: it is never recorded in `unattributed_commits` and never sets `owner_authored_commits`.
   - If a parsed `CommitTrailerAuthor` does not match an `Active` agent in `agents: &[AgentRecord]` (matched by `name_key` or `email` case-insensitively), it is recorded in `unknown_co_authors: Vec<String>`.
 
 ### 1.3 Protected Paths
@@ -137,7 +138,7 @@ pub struct PrPolicyEvaluation {
 
 Escalation rules (evaluated in order):
 1. **Protected paths:** If `protected_files` is non-empty, `required_tier = RequiredTier::Owner`, `target_reviewer = owner_login`.
-2. **Unattributed, unknown, empty, or Owner-direct commits:** If `commits` is empty, `unattributed_commits` is non-empty, `unknown_co_authors` is non-empty, or `co_authors` is empty (e.g., all commits were authored directly by `owner_login` without agent trailers), `required_tier = RequiredTier::Owner`, `target_reviewer = owner_login`.
+2. **Unattributed, unknown, empty, or Owner-direct commits** (merge commits are exempt as described in 1.2 while a non-merge commit exists): If `commits` is empty, `unattributed_commits` is non-empty, `unknown_co_authors` is non-empty, or `co_authors` is empty (e.g., all commits were authored directly by `owner_login` without agent trailers), `required_tier = RequiredTier::Owner`, `target_reviewer = owner_login`.
 3. **LabManager co-author:** If any commit co-author has `role == AgentRole::LabManager`, `required_tier = RequiredTier::Owner`, `target_reviewer = owner_login`.
 4. **Lead co-author:** If any commit co-author has `role == AgentRole::Lead`, `required_tier = RequiredTier::LabManager`.
    - Look up an active `AgentRecord` with `role == AgentRole::LabManager` who is not in `co_authors`.

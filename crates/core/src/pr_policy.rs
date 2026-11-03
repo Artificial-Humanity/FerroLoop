@@ -443,15 +443,17 @@ pub fn evaluate_pr_policy(
     let mut owner_authored_commits = false;
 
     // A merge commit (for example the one GitHub makes when a pull request merges into `uat`)
-    // carries no trailer of its own; the commits it merged are on the pull request too. Skip it
-    // only while a non-merge commit remains to carry the attribution. A pull request of merge
-    // commits alone is checked in full, so it cannot pass with no attributed commit.
+    // carries no trailer of its own; the commits it merged are on the pull request too. Exempt it
+    // from the trailer check only while a non-merge commit remains to carry the attribution. A
+    // pull request of merge commits alone is checked in full, so it cannot pass with no attributed
+    // commit. An exempt merge commit is still parsed: its trailers raise the reviewer tier
+    // (`co_authors`, `co_author_roles`) and flag unregistered names (`unknown_co_authors`), but it
+    // attributes nothing, so it never enters `unattributed_commits` and never sets
+    // `owner_authored_commits`.
     let skip_merge_commits = commits.iter().any(|c| !c.is_merge());
 
     for commit in commits {
-        if skip_merge_commits && commit.is_merge() {
-            continue;
-        }
+        let exempt = skip_merge_commits && commit.is_merge();
         let trailers = parse_co_authors(&commit.message);
         let is_owner_commit = commit
             .author_login
@@ -459,7 +461,9 @@ pub fn evaluate_pr_policy(
             .is_some_and(|login| login.eq_ignore_ascii_case(owner));
 
         if trailers.is_empty() {
-            if is_owner_commit {
+            if exempt {
+                // Nothing to attribute and nothing to flag.
+            } else if is_owner_commit {
                 owner_authored_commits = true;
             } else {
                 push_unique(&mut unattributed_commits, commit.sha.clone());
@@ -473,7 +477,7 @@ pub fn evaluate_pr_policy(
                 // A trailer is text anyone can write: it names the Owner only on
                 // a commit the Owner's login authored. Otherwise it attributes
                 // nothing (so it cannot launder an unattributed commit).
-                if is_owner_commit {
+                if is_owner_commit && !exempt {
                     owner_authored_commits = true;
                     attributed = true;
                 }
@@ -492,7 +496,7 @@ pub fn evaluate_pr_policy(
                 }
             }
         }
-        if !attributed && !is_owner_commit {
+        if !attributed && !is_owner_commit && !exempt {
             push_unique(&mut unattributed_commits, commit.sha.clone());
         }
     }
@@ -1083,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_commit_does_not_hide_a_forged_owner_trailer() {
+    fn a_merge_commit_does_not_launder_an_unattributed_commit_beside_it() {
         // The skipped merge commit attributes nothing, and an unattributed non-merge commit
         // beside it still escalates.
         let roster = sample_roster();
@@ -1097,6 +1101,92 @@ mod tests {
         ];
         let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
         assert_eq!(eval.unattributed_commits, vec!["forged".to_string()]);
+    }
+
+    const FELICIA_TRAILER: &str =
+        "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>";
+
+    #[test]
+    fn a_skipped_merge_commit_trailer_still_raises_the_tier() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit("felicia", Some("machine"), FELICIA_TRAILER),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: Jarvis <jarvis@artificialhumanity.io>",
+            ),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+        assert!(eval.co_authors.contains(&"jarvis".to_string()), "{eval:?}");
+        assert!(eval.co_authors.contains(&"felicia".to_string()), "{eval:?}");
+        assert!(
+            eval.escalation_reasons
+                .contains(&"co-authored by lab_manager".to_string()),
+            "{eval:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_merge_commit_by_the_owner_does_not_set_owner_authored() {
+        let roster = sample_roster();
+        for merge in [
+            merge_commit("m", Some("lmcfarlin"), "Merge x"),
+            merge_commit(
+                "m",
+                Some("lmcfarlin"),
+                "Merge x\n\nCo-authored-by: lmcfarlin <lmcfarlin@gmail.com>",
+            ),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: lmcfarlin <lmcfarlin@gmail.com>",
+            ),
+        ] {
+            let commits = vec![
+                commit("felicia", Some("machine"), FELICIA_TRAILER),
+                merge.clone(),
+            ];
+            let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+            assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+            assert_eq!(eval.co_authors, vec!["felicia".to_string()]);
+            assert_eq!(
+                eval.required_tier,
+                RequiredTier::Lead {
+                    project: "ferroloop".into()
+                }
+            );
+
+            // With no registered co-author the Owner-authored flag would add a reason; it must not.
+            let commits = vec![commit("bare", Some("machine"), "fix: no trailer"), merge];
+            let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+            assert_eq!(eval.unattributed_commits, vec!["bare".to_string()]);
+            assert!(
+                !eval
+                    .escalation_reasons
+                    .iter()
+                    .any(|r| r.contains("authored directly by repository Owner")),
+                "{eval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_merge_commit_with_an_unregistered_co_author_is_flagged() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit("felicia", Some("machine"), FELICIA_TRAILER),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: Ghost <ghost@example.com>",
+            ),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert_eq!(eval.unknown_co_authors, vec!["ghost".to_string()]);
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+        assert_eq!(eval.required_tier, RequiredTier::Owner);
     }
 
     #[test]
