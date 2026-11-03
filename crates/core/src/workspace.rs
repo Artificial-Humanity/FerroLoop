@@ -128,6 +128,22 @@ fn default_hook_output_limit() -> u64 {
     65_536
 }
 
+/// Recognize common interpreter names with an optional numeric version suffix.
+/// Their entrypoint script is independent content that must be approved separately.
+fn is_script_interpreter(name: &str) -> bool {
+    [
+        "python", "node", "ruby", "perl", "bash", "dash", "zsh", "sh",
+    ]
+    .iter()
+    .any(|base| {
+        name.strip_prefix(base).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
+}
 fn valid_env(a: &[String]) -> bool {
     a.len() <= 64
         && a.iter().all(|s| {
@@ -494,6 +510,48 @@ last = 29999
             digest,
             workspace_policy_digest(&policy, &paths, &base, &content).unwrap()
         );
+    }
+
+    #[test]
+    fn versioned_interpreters_bind_their_scripts() {
+        let (dir, repo, common) = fixture();
+        let paths = paths(dir.path(), &repo, &common);
+        let base = "a".repeat(40);
+        for interpreter in [
+            "python3.11",
+            "python3.12",
+            "perl5.38.2",
+            "ruby3.3",
+            "node20",
+            "bash5.2",
+        ] {
+            let mut policy = WorkspacePolicy::parse(POLICY).unwrap();
+            policy.post_create[0].argv = vec![interpreter.into(), "tools/task".into()];
+            let mut content = vec![ContentEvidence {
+                path: interpreter.into(),
+                sha256: executable_digest(b"interpreter"),
+            }];
+            assert!(
+                workspace_policy_digest(&policy, &paths, &base, &content).is_err(),
+                "{interpreter}"
+            );
+            content.push(ContentEvidence {
+                path: "tools/task".into(),
+                sha256: executable_digest(b"first"),
+            });
+            let digest = workspace_policy_digest(&policy, &paths, &base, &content).unwrap();
+            content[1].sha256 = executable_digest(b"changed");
+            assert_ne!(
+                digest,
+                workspace_policy_digest(&policy, &paths, &base, &content).unwrap(),
+                "{interpreter}"
+            );
+            policy.post_create[0].argv = vec![interpreter.into(), "-c".into(), "code".into()];
+            assert!(
+                workspace_policy_digest(&policy, &paths, &base, &content).is_err(),
+                "{interpreter}"
+            );
+        }
     }
 
     #[test]
@@ -1151,11 +1209,7 @@ pub fn workspace_policy_digest(
         ) {
             return Err(WorkspaceError::Content("unresolved command wrapper".into()));
         }
-        let interpreter = matches!(
-            executable,
-            "sh" | "bash" | "dash" | "zsh" | "python" | "python3" | "node" | "ruby" | "perl"
-        );
-        if interpreter {
+        if is_script_interpreter(executable) {
             if argv
                 .iter()
                 .skip(1)
