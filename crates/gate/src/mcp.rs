@@ -4,8 +4,7 @@
 use serde_json::{Value, json};
 
 use crate::adapter::{SecretProviderAdapter, authorize_mcp_tool};
-use crate::connector::{ConnectorManifest, project_response_body};
-use crate::proxy::execute_proxied_request_with_provider;
+use crate::connector::{ConnectorManifest, ToolOutcome};
 use crate::vault::Vault;
 
 /// Build the MCP `tools/list` array across all enabled `connectors` (plus built-in discovery tools).
@@ -42,11 +41,15 @@ pub fn build_mcp_tools_list(
             continue;
         }
         for tool in &conn.tools {
-            tools.push(json!({
+            let mut entry = json!({
                 "name": tool.name,
                 "description": format!("[{}] {}", conn.title, tool.description),
                 "inputSchema": tool.input_schema
-            }));
+            });
+            if let Some(contract) = &tool.response_contract {
+                entry["outputSchema"] = contract.schema.as_value().clone();
+            }
+            tools.push(entry);
         }
     }
     tools
@@ -175,7 +178,7 @@ pub fn handle_mcp_jsonrpc_request_with_secret_provider(
                 {
                     continue;
                 }
-                if let Some(tool) = conn.tools.iter().find(|t| t.name == tool_name) {
+                if conn.tools.iter().any(|t| t.name == tool_name) {
                     if let Some(provider) = secret_provider {
                         if let Err(err) = authorize_mcp_tool(
                             provider,
@@ -185,55 +188,29 @@ pub fn handle_mcp_jsonrpc_request_with_secret_provider(
                         ) {
                             return Some(mcp_tool_text_response(id_val, &err.to_string(), true));
                         }
-                        let proxy_req =
-                            match conn.build_tool_request(tool, &arguments, caller_agent) {
-                                Ok(proxy_req) => proxy_req,
-                                Err(err) => {
-                                    return Some(mcp_tool_text_response(
-                                        id_val,
-                                        &err.to_string(),
-                                        true,
-                                    ));
-                                }
-                            };
-                        return match execute_proxied_request_with_provider(
+                        return match conn.execute_tool_outcome_with_provider(
                             vault,
-                            &proxy_req,
+                            tool_name,
+                            &arguments,
+                            caller_agent,
                             Some(provider),
                         ) {
-                            Ok(resp) => {
-                                let is_error = resp.status >= 400;
-                                let projected =
-                                    project_response_body(&resp.body, &tool.response_fields);
-                                let payload = json!({
-                                    "status": resp.status,
-                                    "data": projected,
-                                    "scrubbed_secrets": resp.scrubbed_secrets,
-                                });
-                                Some(mcp_tool_text_response(
-                                    id_val,
-                                    &serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                                    is_error,
-                                ))
+                            Ok((resp, outcome)) => {
+                                Some(mcp_tool_outcome_response(id_val, &resp, outcome))
                             }
                             Err(err) => {
                                 Some(mcp_tool_text_response(id_val, &err.to_string(), true))
                             }
                         };
                     }
-                    return match conn.execute_tool(vault, tool_name, &arguments, caller_agent) {
-                        Ok((resp, projected)) => {
-                            let is_error = resp.status >= 400;
-                            let payload = json!({
-                                "status": resp.status,
-                                "data": projected,
-                                "scrubbed_secrets": resp.scrubbed_secrets,
-                            });
-                            Some(mcp_tool_text_response(
-                                id_val,
-                                &serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                                is_error,
-                            ))
+                    return match conn.invoke_tool_outcome(
+                        vault,
+                        tool_name,
+                        &arguments,
+                        caller_agent,
+                    ) {
+                        Ok((resp, outcome)) => {
+                            Some(mcp_tool_outcome_response(id_val, &resp, outcome))
                         }
                         Err(err) => Some(mcp_tool_text_response(id_val, &err.to_string(), true)),
                     };
@@ -257,6 +234,57 @@ pub fn handle_mcp_jsonrpc_request_with_secret_provider(
     }
 }
 
+/// Render a connector [`ToolOutcome`] as an MCP `tools/call` result.
+///
+/// Shape (documented choice): tool errors use the existing `isError: true`
+/// text-result shape, not a JSON-RPC protocol error. `ContractOk` carries
+/// `structuredContent` = validated value plus the legacy text envelope
+/// (`{status,data,scrubbed_secrets}`) for compat. `Uncontracted` keeps the
+/// legacy envelope only, marked `_meta: {uncontracted: true}`.
+/// `ContractFailedAfterExecution` is an `isError` text result whose text is
+/// only the typed refusal (`executed_result_withheld`, sha256, bytes,
+/// violation rule) — never the executed body, in text or structured form.
+fn mcp_tool_outcome_response(
+    id: Value,
+    resp: &crate::proxy::ProxyResponse,
+    outcome: ToolOutcome,
+) -> Value {
+    let is_error = resp.status >= 400;
+    match outcome {
+        ToolOutcome::ContractOk {
+            value,
+            token_count,
+            count_unit,
+        } => {
+            let mut payload = json!({"status": resp.status, "outcome": "contract_ok", "data": value, "scrubbed_secrets": resp.scrubbed_secrets});
+            if let Some(tc) = token_count {
+                payload["token_count"] = json!(tc);
+                payload["count_unit"] = json!(count_unit);
+            }
+            let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
+            let mut r = mcp_tool_text_response(id, &text, is_error);
+            r["result"]["structuredContent"] = payload["data"].clone();
+            r["result"]["_meta"] = json!({"outcome": "contract_ok"});
+            r
+        }
+        ToolOutcome::Uncontracted(value) => {
+            let payload = json!({"status": resp.status, "outcome": "uncontracted", "data": value, "scrubbed_secrets": resp.scrubbed_secrets});
+            let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
+            let mut r = mcp_tool_text_response(id, &text, is_error);
+            r["result"]["_meta"] = json!({"uncontracted": true, "outcome": "uncontracted"});
+            r
+        }
+        ToolOutcome::ContractFailedAfterExecution {
+            body_sha256,
+            body_bytes,
+            violation,
+        } => {
+            let refusal = json!({"error": "executed_result_withheld", "outcome": "executed_result_withheld", "body_sha256": body_sha256, "body_bytes": body_bytes, "violation": violation});
+            mcp_tool_text_response(id, &refusal.to_string(), true)
+        }
+    }
+}
+
 fn mcp_tool_text_response(id: Value, text: &str, is_error: bool) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -271,4 +299,131 @@ fn mcp_tool_text_response(id: Value, text: &str, is_error: bool) -> Value {
             "isError": is_error
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::{ConnectorToolDef, evaluate_tool_response};
+    use crate::contract::{ResponseContract, ResponseSchema};
+    use std::collections::BTreeMap;
+
+    fn contract() -> ResponseContract {
+        ResponseContract {
+            schema: ResponseSchema::from_value(json!({"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":{"type":"string"}}})).unwrap(),
+            max_response_bytes: 100000,
+            max_response_tokens: None,
+            max_depth: 32,
+            max_array_len: 1000,
+            max_string_len: 10000,
+        }
+    }
+    fn manifest(contracted: bool) -> ConnectorManifest {
+        ConnectorManifest {
+            id: "demo".into(),
+            title: "Demo".into(),
+            version: "0.1.0".into(),
+            description: String::new(),
+            base_url: "http://127.0.0.1/".into(),
+            allowed_hosts: vec![],
+            default_headers: BTreeMap::new(),
+            enabled: true,
+            tools: vec![ConnectorToolDef {
+                name: "get_thing".into(),
+                description: "Get".into(),
+                method: "GET".into(),
+                path: "/thing".into(),
+                path_params: vec![],
+                query_params: vec![],
+                body_params: vec![],
+                headers: BTreeMap::new(),
+                response_fields: vec![],
+                input_schema: json!({"type":"object","properties":{}}),
+                response_contract: if contracted { Some(contract()) } else { None },
+            }],
+            bridges: vec![],
+        }
+    }
+    fn fake_resp(body: &str) -> crate::proxy::ProxyResponse {
+        crate::proxy::ProxyResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: body.to_string(),
+            scrubbed_secrets: vec![],
+        }
+    }
+
+    #[test]
+    fn mcp_output_schema_matches_result() {
+        let m = manifest(true);
+        let tools = build_mcp_tools_list(std::slice::from_ref(&m), None);
+        let tool = tools.iter().find(|t| t["name"] == "get_thing").unwrap();
+        assert_eq!(tool["outputSchema"], contract().schema.as_value().clone());
+        // Uncontracted tool has no outputSchema.
+        let tools2 = build_mcp_tools_list(&[manifest(false)], None);
+        assert!(
+            tools2
+                .iter()
+                .find(|t| t["name"] == "get_thing")
+                .unwrap()
+                .get("outputSchema")
+                .is_none()
+        );
+        // ContractOk structuredContent validates against that same schema.
+        let outcome = evaluate_tool_response(Some(&contract()), r#"{"id":"x1"}"#, &[]);
+        let resp = mcp_tool_outcome_response(json!(1), &fake_resp(r#"{"id":"x1"}"#), outcome);
+        assert_eq!(resp["result"]["structuredContent"], json!({"id":"x1"}));
+        assert!(
+            contract()
+                .validate_value(&resp["result"]["structuredContent"])
+                .is_ok()
+        );
+        // Uncontracted marker.
+        let outcome = evaluate_tool_response(None, r#"{"id":"x1"}"#, &[]);
+        let resp = mcp_tool_outcome_response(json!(1), &fake_resp(r#"{"id":"x1"}"#), outcome);
+        assert_eq!(resp["result"]["_meta"]["uncontracted"], json!(true));
+        assert!(resp["result"].get("structuredContent").is_none());
+    }
+
+    #[test]
+    fn mcp_connector_public_result_parity() {
+        // Same fixture body via connector outcome (CLI cmd_call is raw proxy = Uncontracted,
+        // Hub bridge/CLI MCP share this path) and via MCP rendering must agree.
+        for (body, ok) in [
+            (r#"{"id":"x1"}"#, true),
+            (r#"{"id":42,"secret_body":"BODY_SENTINEL"}"#, false),
+        ] {
+            let outcome = evaluate_tool_response(Some(&contract()), body, &[]);
+            let mcp = mcp_tool_outcome_response(json!(1), &fake_resp(body), outcome.clone());
+            match (&outcome, ok) {
+                (ToolOutcome::ContractOk { value: v, .. }, true) => {
+                    assert_eq!(&mcp["result"]["structuredContent"], v)
+                }
+                (
+                    ToolOutcome::ContractFailedAfterExecution {
+                        body_sha256,
+                        body_bytes,
+                        violation,
+                    },
+                    false,
+                ) => {
+                    assert_eq!(mcp["result"]["isError"], json!(true));
+                    assert!(mcp["result"].get("structuredContent").is_none());
+                    let text = mcp["result"]["content"][0]["text"].as_str().unwrap();
+                    assert!(
+                        text.contains("executed_result_withheld")
+                            && text.contains(body_sha256)
+                            && text.contains(&body_bytes.to_string())
+                            && text.contains(violation.as_str())
+                    );
+                    assert!(
+                        !text.contains("BODY_SENTINEL")
+                            && !mcp.to_string().contains("BODY_SENTINEL"),
+                        "body must be withheld: {mcp}"
+                    );
+                }
+                other => panic!("unexpected {other:?} ok={ok}"),
+            }
+        }
+    }
 }

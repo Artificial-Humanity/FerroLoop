@@ -895,6 +895,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 response_fields: Vec::new(),
                 input_schema: json!({"type": "object", "properties": {}}),
+                response_contract: None,
             }],
             bridges: Vec::new(),
         }

@@ -10,7 +10,14 @@ use serde_json::{Value, json};
 
 use crate::GateError;
 use crate::bridge::BridgeConfig;
-use crate::proxy::{PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse, execute_proxied_request};
+use crate::contract::{
+    ResponseContract, ResponseSchema, check_pre_parse_depth, count_tokens_bounded,
+    count_unit_string,
+};
+use crate::proxy::{
+    PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse, execute_proxied_request_with_contract,
+    execute_proxied_request_with_provider_and_contract,
+};
 use crate::vault::Vault;
 
 fn default_true() -> bool {
@@ -62,6 +69,176 @@ pub struct ConnectorToolDef {
     pub response_fields: Vec<String>,
     #[serde(default = "default_input_schema")]
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_contract: Option<ResponseContract>,
+}
+
+/// Outcome of evaluating a tool response against its contract, if any.
+/// A failed contract carries no body, only its digest, size, and violation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolOutcome {
+    ContractOk {
+        value: Value,
+        token_count: Option<u64>,
+        count_unit: Option<String>,
+    },
+    ContractFailedAfterExecution {
+        body_sha256: String,
+        body_bytes: u64,
+        violation: String,
+    },
+    Uncontracted(Value),
+}
+
+impl ToolOutcome {
+    pub fn value(&self) -> Option<&Value> {
+        match self {
+            Self::ContractOk { value, .. } => Some(value),
+            Self::Uncontracted(v) => Some(v),
+            Self::ContractFailedAfterExecution { .. } => None,
+        }
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for b in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+fn contract_failed(raw_body: &str, violation: String) -> ToolOutcome {
+    contract_failed_bytes(raw_body.as_bytes(), violation)
+}
+
+fn contract_failed_bytes(raw_bytes: &[u8], violation: String) -> ToolOutcome {
+    ToolOutcome::ContractFailedAfterExecution {
+        body_sha256: sha256_hex(raw_bytes),
+        body_bytes: raw_bytes.len() as u64,
+        violation,
+    }
+}
+
+/// Map a typed contracted-transport error to a body-free contract failure.
+pub fn contract_outcome_for_transport_error(err: &GateError) -> Option<ToolOutcome> {
+    match err {
+        GateError::ContractResponseTooLarge {
+            prefix_sha256,
+            read_bytes,
+            max_bytes,
+            ..
+        } => Some(ToolOutcome::ContractFailedAfterExecution {
+            // These slots carry the read-prefix digest/count (cap+1 bytes),
+            // not a full-body digest/count; the violation text says so.
+            body_sha256: prefix_sha256.clone(),
+            body_bytes: *read_bytes,
+            violation: format!(
+                "contract_violation at $: max_response_bytes_exceeded read_prefix_bytes {read_bytes} above max_response_bytes {max_bytes}"
+            ),
+        }),
+        GateError::ContractInvalidUtf8 {
+            body_sha256,
+            body_bytes,
+            ..
+        } => Some(ToolOutcome::ContractFailedAfterExecution {
+            body_sha256: body_sha256.clone(),
+            body_bytes: *body_bytes,
+            violation: "contract_violation at $: invalid_utf8 body is not valid UTF-8".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn transport_error_status(err: &GateError) -> u16 {
+    match err {
+        GateError::ContractResponseTooLarge { status, .. }
+        | GateError::ContractInvalidUtf8 { status, .. } => *status,
+        _ => 0,
+    }
+}
+
+/// Pure evaluation: project `raw_body`, then enforce `contract` if present.
+pub fn evaluate_tool_response(
+    contract: Option<&ResponseContract>,
+    raw_body: &str,
+    response_fields: &[String],
+) -> ToolOutcome {
+    evaluate_tool_response_bytes(contract, raw_body.as_bytes(), response_fields)
+}
+
+/// Bytes form of [`evaluate_tool_response`]. Under a contract the raw bytes
+/// are size-checked before projection, decoded strictly as UTF-8, depth-
+/// scanned before parsing, and only then projected and validated. The
+/// legacy (uncontracted) path keeps lossy decoding.
+pub fn evaluate_tool_response_bytes(
+    contract: Option<&ResponseContract>,
+    raw_bytes: &[u8],
+    response_fields: &[String],
+) -> ToolOutcome {
+    let Some(contract) = contract else {
+        let raw_body = String::from_utf8_lossy(raw_bytes).into_owned();
+        return ToolOutcome::Uncontracted(project_response_body(&raw_body, response_fields));
+    };
+    if raw_bytes.len() as u64 > contract.max_response_bytes {
+        return contract_failed_bytes(
+            raw_bytes,
+            format!(
+                "contract_violation at $: max_response_bytes_exceeded bytes {} above max_response_bytes {}",
+                raw_bytes.len(),
+                contract.max_response_bytes
+            ),
+        );
+    }
+    let raw_body = match std::str::from_utf8(raw_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return contract_failed_bytes(
+                raw_bytes,
+                "contract_violation at $: invalid_utf8 body is not valid UTF-8".to_string(),
+            );
+        }
+    };
+    if let Err(v) = check_pre_parse_depth(contract, raw_body) {
+        return contract_failed(raw_body, v.to_string());
+    }
+    if serde_json::from_str::<Value>(raw_body).is_err() {
+        return contract_failed(
+            raw_body,
+            "contract_violation at $: invalid_json body is not valid JSON".to_string(),
+        );
+    }
+    let projected = project_response_body(raw_body, response_fields);
+    if let Err(v) = contract.validate_value(&projected) {
+        return contract_failed(raw_body, v.to_string());
+    }
+    let serialized = serde_json::to_string(&projected).unwrap_or_default();
+    if serialized.len() as u64 > contract.max_response_bytes {
+        return contract_failed(
+            raw_body,
+            format!(
+                "contract_violation at $: max_response_bytes_exceeded bytes {} above max_response_bytes {}",
+                serialized.len(),
+                contract.max_response_bytes
+            ),
+        );
+    }
+    let token_count = match count_tokens_bounded(contract, &serialized) {
+        Ok(c) => c,
+        Err(v) => return contract_failed(raw_body, v.to_string()),
+    };
+    let count_unit = if token_count.is_some() {
+        count_unit_string()
+    } else {
+        None
+    };
+    ToolOutcome::ContractOk {
+        value: projected,
+        token_count,
+        count_unit,
+    }
 }
 
 /// A parse error as `line L, column C: message`, with no source text.
@@ -200,6 +377,22 @@ impl ConnectorManifest {
                     ),
                 });
             }
+            if let Some(contract) = &tool.response_contract {
+                // Re-check the stored schema value (programmatic construction
+                // can bypass Deserialize) and the load-time enforceability.
+                if let Err(e) = ResponseSchema::from_value(contract.schema.as_value().clone()) {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!("tool `{}` response_contract: {e}", tool.name),
+                    });
+                }
+                if let Err(e) = contract.validate_load() {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!("tool `{}` response_contract: {e}", tool.name),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -325,14 +518,16 @@ impl ConnectorManifest {
         })
     }
 
-    /// Execute a declared tool against `vault` and apply optional `response_fields` projection.
-    pub fn execute_tool(
+    /// Strict sibling of [`Self::execute_tool`]: after execution (already
+    /// scrubbed by the proxy) and projection, enforce the tool's contract.
+    /// Contract failures are reported as a body-free [`ToolOutcome`], not an error.
+    pub fn execute_tool_outcome(
         &self,
         vault: &Vault,
         tool_name: &str,
         arguments: &Value,
         caller_agent: Option<String>,
-    ) -> Result<(ProxyResponse, Value), GateError> {
+    ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
         let tool = self
             .tools
             .iter()
@@ -341,9 +536,127 @@ impl ConnectorManifest {
                 tool: tool_name.to_string(),
             })?;
         let req = self.build_tool_request(tool, arguments, caller_agent)?;
-        let resp = execute_proxied_request(vault, &req)?;
-        let projected = project_response_body(&resp.body, &tool.response_fields);
-        Ok((resp, projected))
+        // Contracted dispatch caps/strict-decodes on the wire; transport
+        // contract failures become a body-free outcome with a synthetic
+        // empty-body response carrying only the upstream status.
+        let resp = match &tool.response_contract {
+            Some(contract) => match execute_proxied_request_with_contract(vault, &req, contract) {
+                Ok(r) => r,
+                Err(e) => {
+                    if let Some(outcome) = contract_outcome_for_transport_error(&e) {
+                        let synthetic = ProxyResponse {
+                            status: transport_error_status(&e),
+                            headers: BTreeMap::new(),
+                            body: String::new(),
+                            scrubbed_secrets: vec![],
+                        };
+                        return Ok((synthetic, outcome));
+                    }
+                    return Err(e);
+                }
+            },
+            None => crate::proxy::execute_proxied_request(vault, &req)?,
+        };
+        let outcome = evaluate_tool_response_bytes(
+            tool.response_contract.as_ref(),
+            resp.body.as_bytes(),
+            &tool.response_fields,
+        );
+        Ok((resp, outcome))
+    }
+
+    /// Provider variant of [`Self::execute_tool_outcome`] (MCP provider path).
+    pub fn execute_tool_outcome_with_provider(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        provider: Option<&dyn crate::adapter::SecretProviderAdapter>,
+    ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.name == tool_name)
+            .ok_or_else(|| GateError::NoSuchTool {
+                tool: tool_name.to_string(),
+            })?;
+        let req = self.build_tool_request(tool, arguments, caller_agent)?;
+        let resp = match execute_proxied_request_with_provider_and_contract(
+            vault,
+            &req,
+            provider,
+            tool.response_contract.as_ref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(outcome) = contract_outcome_for_transport_error(&e) {
+                    let synthetic = ProxyResponse {
+                        status: transport_error_status(&e),
+                        headers: BTreeMap::new(),
+                        body: String::new(),
+                        scrubbed_secrets: vec![],
+                    };
+                    return Ok((synthetic, outcome));
+                }
+                return Err(e);
+            }
+        };
+        let outcome = evaluate_tool_response_bytes(
+            tool.response_contract.as_ref(),
+            resp.body.as_bytes(),
+            &tool.response_fields,
+        );
+        Ok((resp, outcome))
+    }
+
+    /// Alias for [`Self::execute_tool_outcome`].
+    pub fn invoke_tool_outcome(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+    ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
+        self.execute_tool_outcome(vault, tool_name, arguments, caller_agent)
+    }
+
+    /// Alias for [`Self::execute_tool`].
+    pub fn invoke_tool(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+    ) -> Result<(ProxyResponse, Value), GateError> {
+        self.execute_tool(vault, tool_name, arguments, caller_agent)
+    }
+
+    /// Legacy entry point, now delegating to [`Self::execute_tool_outcome`]:
+    /// a contract failure is a body-free [`GateError::ContractFailed`]
+    /// refusal, never the projected body.
+    pub fn execute_tool(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+    ) -> Result<(ProxyResponse, Value), GateError> {
+        let (resp, outcome) =
+            self.execute_tool_outcome(vault, tool_name, arguments, caller_agent)?;
+        match outcome {
+            ToolOutcome::ContractOk { value, .. } => Ok((resp, value)),
+            ToolOutcome::Uncontracted(value) => Ok((resp, value)),
+            ToolOutcome::ContractFailedAfterExecution {
+                body_sha256,
+                body_bytes,
+                violation,
+            } => Err(GateError::ContractFailed {
+                violation,
+                body_sha256,
+                body_bytes,
+            }),
+        }
     }
 }
 
@@ -361,11 +674,16 @@ pub fn project_response_body(raw_body: &str, response_fields: &[String]) -> Valu
 
 fn project_value(val: &Value, fields: &[String]) -> Value {
     match val {
-        Value::Object(map) => {
+        Value::Object(_) => {
             let mut out = serde_json::Map::new();
             for f in fields {
-                if let Some(v) = map.get(f) {
-                    out.insert(f.clone(), v.clone());
+                let segments = parse_field_path(f);
+                if let Some(fragment) = project_path(val, &segments)
+                    && let Value::Object(frag) = fragment
+                {
+                    for (k, v) in frag {
+                        merge_projected(&mut out, k, v);
+                    }
                 }
             }
             Value::Object(out)
@@ -374,6 +692,86 @@ fn project_value(val: &Value, fields: &[String]) -> Value {
             Value::Array(arr.iter().map(|item| project_value(item, fields)).collect())
         }
         other => other.clone(),
+    }
+}
+
+/// One path segment: a field name and whether `[]` follows it.
+fn parse_field_path(field: &str) -> Vec<(String, bool)> {
+    field
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(|seg| match seg.strip_suffix("[]") {
+            Some(name) => (name.to_string(), true),
+            None => (seg.to_string(), false),
+        })
+        .collect()
+}
+
+/// Projected fragment (an object) for `segments` under `val`, or `None` if absent.
+fn project_path(val: &Value, segments: &[(String, bool)]) -> Option<Value> {
+    let ((name, is_array), rest) = segments.split_first()?;
+    let child = val.as_object()?.get(name)?;
+    let projected_child = if *is_array {
+        let arr = child.as_array()?;
+        let items: Vec<Value> = arr
+            .iter()
+            .map(|item| {
+                if rest.is_empty() {
+                    item.clone()
+                } else {
+                    project_path(item, rest)
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+                }
+            })
+            .collect();
+        Value::Array(items)
+    } else if rest.is_empty() {
+        child.clone()
+    } else {
+        project_path(child, rest)?
+    };
+    let mut out = serde_json::Map::new();
+    out.insert(name.clone(), projected_child);
+    Some(Value::Object(out))
+}
+
+fn merge_projected(out: &mut serde_json::Map<String, Value>, key: String, value: Value) {
+    match out.get_mut(&key) {
+        None => {
+            out.insert(key, value);
+        }
+        Some(existing) => merge_value(existing, value),
+    }
+}
+
+fn merge_value(existing: &mut Value, incoming: Value) {
+    match (existing, incoming) {
+        (Value::Object(dst), Value::Object(src)) => {
+            for (k, v) in src {
+                match dst.get_mut(&k) {
+                    Some(e) => merge_value(e, v),
+                    None => {
+                        dst.insert(k, v);
+                    }
+                }
+            }
+        }
+        (Value::Array(dst), Value::Array(src)) => {
+            for (i, v) in src.into_iter().enumerate() {
+                if i < dst.len() {
+                    // An empty object is a missing-field placeholder; it must not erase data.
+                    if v.as_object().is_some_and(|o| o.is_empty())
+                        && !dst[i].as_object().is_some_and(|o| o.is_empty())
+                    {
+                        continue;
+                    }
+                    merge_value(&mut dst[i], v);
+                } else {
+                    dst.push(v);
+                }
+            }
+        }
+        (dst, src) => *dst = src,
     }
 }
 
@@ -722,6 +1120,7 @@ pub fn import_openapi_to_connector(
                     headers: BTreeMap::new(),
                     response_fields: Vec::new(),
                     input_schema,
+                    response_contract: None,
                 });
             }
         }
@@ -863,6 +1262,288 @@ body_params = ["content"]
         );
         let req = call(&m, "chat_get_channel", json!({"channel_id": "..a"})).unwrap();
         assert!(req.url.ends_with("/channels/..a"), "{}", req.url);
+    }
+
+    fn test_contract(schema: Value, max_bytes: u64) -> ResponseContract {
+        ResponseContract {
+            schema: ResponseSchema::from_value(schema).unwrap(),
+            max_response_bytes: max_bytes,
+            max_response_tokens: None,
+            max_depth: 32,
+            max_array_len: 1000,
+            max_string_len: 100_000,
+        }
+    }
+
+    #[test]
+    fn non_json_under_contract_refused() {
+        let c = test_contract(
+            json!({"type":"object","additionalProperties":false,"properties":{"id":{"type":"string"}}}),
+            1_000_000,
+        );
+        let out = evaluate_tool_response(Some(&c), "not json at all", &[]);
+        assert!(
+            matches!(out, ToolOutcome::ContractFailedAfterExecution { .. }),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn contract_failure_returns_no_body() {
+        let c = test_contract(
+            json!({"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":{"type":"string"}}}),
+            1_000_000,
+        );
+        let body = r#"{"id":123,"secret_marker":"should-not-leak"}"#;
+        let out = evaluate_tool_response(Some(&c), body, &[]);
+        match out {
+            ToolOutcome::ContractFailedAfterExecution {
+                body_sha256,
+                body_bytes,
+                violation,
+            } => {
+                assert_eq!(body_bytes, body.len() as u64);
+                assert_eq!(body_sha256.len(), 64);
+                assert!(!violation.contains("should-not-leak"), "{violation}");
+                assert!(!violation.contains("123"), "{violation}");
+            }
+            other => panic!("expected contract failure, got {other:?}"),
+        }
+        // Over-size envelope also fails with no body.
+        let small = test_contract(json!({"type":"string"}), 4);
+        assert!(matches!(
+            evaluate_tool_response(Some(&small), r#""hello world""#, &[]),
+            ToolOutcome::ContractFailedAfterExecution { .. }
+        ));
+    }
+
+    #[test]
+    fn uncontracted_flagged_not_silent() {
+        let out = evaluate_tool_response(None, r#"{"id":1}"#, &[]);
+        assert_eq!(out, ToolOutcome::Uncontracted(json!({"id": 1})));
+        let c = test_contract(
+            json!({"type":"object","additionalProperties":false,"properties":{"id":{"type":"integer"}}}),
+            1_000_000,
+        );
+        assert_eq!(
+            evaluate_tool_response(Some(&c), r#"{"id":1}"#, &[]),
+            ToolOutcome::ContractOk {
+                value: json!({"id": 1}),
+                token_count: None,
+                count_unit: None
+            }
+        );
+    }
+
+    #[test]
+    fn oversize_raw_with_tiny_projection_fails() {
+        // Raw is over the byte bound even though projection `id` is tiny.
+        let mut c = test_contract(
+            json!({"type":"object","additionalProperties":false,"properties":{"id":{"type":"integer"}}}),
+            64,
+        );
+        c.max_response_bytes = 64;
+        let body = format!(r#"{{"id":1,"pad":"{}"}}"#, "x".repeat(200));
+        let out = evaluate_tool_response(Some(&c), &body, &["id".to_string()]);
+        match out {
+            ToolOutcome::ContractFailedAfterExecution {
+                violation,
+                body_bytes,
+                ..
+            } => {
+                assert!(
+                    violation.contains("max_response_bytes_exceeded"),
+                    "{violation}"
+                );
+                assert_eq!(body_bytes, body.len() as u64);
+            }
+            other => panic!("expected oversize failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contract_ok_records_token_count_and_unit_when_bound_present() {
+        let mut c = test_contract(json!({"type":"string"}), 1_000_000);
+        c.max_response_tokens = Some(1000);
+        let out = evaluate_tool_response(Some(&c), r#""hello""#, &[]);
+        if fl_core::token_count::count_unit().is_some() {
+            match out {
+                ToolOutcome::ContractOk {
+                    token_count,
+                    count_unit,
+                    ..
+                } => {
+                    assert!(token_count.unwrap() > 0);
+                    assert_eq!(count_unit.as_deref(), Some("o200k_base"));
+                }
+                other => panic!("expected ContractOk, got {other:?}"),
+            }
+        } else {
+            assert!(matches!(
+                out,
+                ToolOutcome::ContractFailedAfterExecution { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_and_deep_nesting_fail_pre_parse() {
+        let c = test_contract(
+            json!({"type":"object","additionalProperties":false}),
+            1_000_000,
+        );
+        let out = evaluate_tool_response_bytes(Some(&c), b"{\"id\":\xff\xfe}", &[]);
+        match &out {
+            ToolOutcome::ContractFailedAfterExecution { violation, .. } => {
+                assert!(violation.contains("invalid_utf8"), "{violation}")
+            }
+            other => panic!("expected utf8 failure, got {other:?}"),
+        }
+        let mut deep = test_contract(json!({"type":"array"}), 1_000_000);
+        deep.max_depth = 3;
+        let body = "[[[[\"SENTINEL\"]]]]";
+        let out = evaluate_tool_response(Some(&deep), body, &[]);
+        match out {
+            ToolOutcome::ContractFailedAfterExecution { violation, .. } => {
+                assert!(violation.contains("max_depth_exceeded"), "{violation}");
+                assert!(!violation.contains("SENTINEL"), "{violation}");
+            }
+            other => panic!("expected depth failure, got {other:?}"),
+        }
+        // Legacy path stays lossy/uncontracted on the same malformed bytes.
+        assert!(matches!(
+            evaluate_tool_response_bytes(None, b"\xff", &[]),
+            ToolOutcome::Uncontracted(_)
+        ));
+    }
+
+    #[test]
+    fn legacy_invoke_tool_refuses_on_contract_failure() {
+        use crate::vault::SetSecretArgs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok(req) = server.recv() {
+                    let _ = req.respond(tiny_http::Response::from_string(
+                        r#"{"id":42,"marker":"LEGACY_SENTINEL"}"#,
+                    ));
+                }
+            }
+        });
+        let mut vault = Vault::open(tmp.path().join("v.enc"), [3u8; 32]).unwrap();
+        vault
+            .set(SetSecretArgs {
+                name: "T".into(),
+                value: "tok".into(),
+                description: None,
+                allowed_hosts: vec!["127.0.0.1".into()],
+                allowed_methods: vec!["GET".into()],
+                allowed_agents: vec![],
+                allow_private_network: true,
+                lease_ttl_secs: None,
+            })
+            .unwrap();
+        let toml = format!(
+            r#"
+id = "svc"
+title = "Svc"
+base_url = "http://127.0.0.1:{port}"
+allowed_hosts = ["127.0.0.1"]
+default_headers = {{ Authorization = "Bearer {{{{FERROGATE:T}}}}" }}
+[[tools]]
+name = "get_one"
+description = "Get"
+method = "GET"
+path = "/one"
+[tools.response_contract]
+max_response_bytes = 100000
+max_depth = 32
+max_array_len = 100
+max_string_len = 10000
+[tools.response_contract.schema]
+type = "object"
+additionalProperties = false
+required = ["id"]
+[tools.response_contract.schema.properties]
+id = {{ type = "string" }}
+"#
+        );
+        let m = ConnectorManifest::parse_toml(&toml, Path::new("svc.toml")).unwrap();
+        for legacy in [true, false] {
+            let res = if legacy {
+                m.execute_tool(&vault, "get_one", &json!({}), None)
+            } else {
+                m.invoke_tool(&vault, "get_one", &json!({}), None)
+            };
+            let err = res.unwrap_err();
+            assert!(matches!(err, GateError::ContractFailed { .. }), "{err}");
+            assert!(!err.to_string().contains("LEGACY_SENTINEL"), "{err}");
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn dotted_and_array_projection_paths() {
+        let body = r#"{"user":{"name":"ada","pw":"x"},"items":[{"id":1,"v":9},{"id":2}],"top":1}"#;
+        let fields = vec![
+            "user.name".to_string(),
+            "items[].id".to_string(),
+            "missing.deep".to_string(),
+        ];
+        assert_eq!(
+            project_response_body(body, &fields),
+            json!({"user":{"name":"ada"},"items":[{"id":1},{"id":2}]})
+        );
+        // Plain fields and top-level arrays keep legacy behaviour.
+        let arr = r#"[{"a":{"b":1,"c":2}}]"#;
+        assert_eq!(
+            project_response_body(arr, &["a.b".to_string()]),
+            json!([{"a":{"b":1}}])
+        );
+        assert_eq!(
+            project_response_body(body, &["top".to_string()]),
+            json!({"top":1})
+        );
+    }
+
+    #[test]
+    fn response_contract_parses_from_toml() {
+        let toml = r#"
+id = "chat"
+title = "Chat"
+base_url = "https://api.example.com/v1"
+[[tools]]
+name = "get_one"
+description = "Get"
+method = "GET"
+path = "/one"
+[tools.response_contract]
+max_response_bytes = 1000
+max_depth = 32
+max_array_len = 10
+max_string_len = 100
+[tools.response_contract.schema]
+type = "object"
+additionalProperties = false
+[tools.response_contract.schema.properties]
+id = { type = "integer" }
+"#;
+        let m = ConnectorManifest::parse_toml(toml, Path::new("c.toml")).unwrap();
+        let c = m.tools[0].response_contract.as_ref().unwrap();
+        assert_eq!(c.max_response_bytes, 1000);
+    }
+
+    #[test]
+    fn contract_in_manifest_validation_names_contract_error() {
+        let mut m = manifest("");
+        let mut c = test_contract(json!({"type":"string"}), 100);
+        c.max_response_bytes = 0;
+        m.tools[0].response_contract = Some(c);
+        let err = m.validate(Path::new("x.toml")).unwrap_err();
+        assert!(matches!(err, GateError::InvalidConnector { .. }), "{err}");
+        assert!(err.to_string().contains("contract_unenforceable"), "{err}");
     }
 
     #[test]
