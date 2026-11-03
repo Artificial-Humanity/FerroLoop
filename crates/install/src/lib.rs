@@ -7,6 +7,8 @@
 //! * [`observe`]: gather the doctor's facts (reads only) and run the engine.
 //! * [`read_ui_build_info`]: a UI bundle's `build-info.json`.
 //!
+//! * [`install_from_git`], [`plan_from_git`]: `fl install --from-git <rev>` (phase A4b), a
+//!   build of a reviewed commit that is then installed by the same transaction.
 //! * [`apply`], [`recover`]: the transactional installer (phase A4a): `install.lock`, an
 //!   append-only journal, staged and verified releases, an atomic switch of `current`, the
 //!   launcher and aliases, and the receipt written last; see `docs/installer.md`.
@@ -17,32 +19,48 @@
 #[cfg(all(feature = "fault-injection", not(debug_assertions)))]
 compile_error!("the `fault-injection` feature must not be enabled in a release build");
 
+mod builder;
 mod engine;
 mod error;
 mod fault;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixture;
+mod fromgit;
 mod fsprobe;
+mod git;
 mod journal;
 mod lock;
 mod observe;
+mod process;
 mod safe;
 mod services;
 mod tree;
 mod ui;
 
 #[cfg(test)]
+mod fromgit_tests;
+#[cfg(test)]
 mod observe_tests;
 #[cfg(test)]
 mod txn_tests;
 
+pub use builder::{
+    BIN_PACKAGES, BuildCtx, BuildError, BuildJob, Builder, ENV_FIXED, ENV_PASSTHROUGH,
+    ProcessBuilder, Toolchain, cargo_args, env_name_allowed, npm_ci_args, sandbox_env,
+};
 pub use engine::{
     ApplyArgs, ApplyReport, DEFAULT_LOCK_TIMEOUT_SECS, Decisions, Env, Outcome, RecoverAction,
-    RecoverMode, RecoverReport, apply, recover,
+    RecoverMode, RecoverReport, apply, installed_receipt, is_installed, plan_only, preflight,
+    recover,
 };
 pub use error::{InstallError, Result};
 pub use fault::{Death, FaultPoint, Faults, When, faults_from_env};
+pub use fromgit::{
+    BUILD_ROOT, DEFAULT_BUILD_TIMEOUT_SECS, FromGitArgs, FromGitResult, MARKER, SourceInfo,
+    install as install_from_git, plan as plan_from_git,
+};
 pub use fsprobe::{FsProbe, open_regular, read_bounded};
+pub use git::{HARDENING, rev_problem, tree_path_problem};
 pub use journal::{Found, Journal, MAX_JOURNAL_BYTES, Pending, PendingState, read as read_journal};
 pub use lock::{LockGuard, acquire as acquire_lock, pid_alive};
 pub use observe::{Observe, UiDir, node_meta, observe};

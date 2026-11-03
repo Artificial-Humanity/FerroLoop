@@ -6,8 +6,11 @@
 //! document that carries any other field (a `token`, a `vault_key`) does not
 //! parse.
 
-use super::manifest::ReleaseKind;
-use super::{Product, Profile, RECEIPT_SCHEMA_VERSION, file_name_ok, is_sha256_hex};
+use super::manifest::{BuildProvenance, ReleaseKind};
+use super::{
+    Product, Profile, RECEIPT_SCHEMA_SOURCE_BUILD, RECEIPT_SCHEMA_VERSION, file_name_ok,
+    is_sha256_hex,
+};
 use serde::{Deserialize, Serialize};
 
 /// A receipt larger than this is refused unread.
@@ -25,6 +28,21 @@ pub struct ReceiptRelease {
     pub kind: ReleaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// How a source build was made (reviewed or not, the toolchain). Present exactly when the
+    /// receipt's `schema_version` is [`RECEIPT_SCHEMA_SOURCE_BUILD`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildProvenance>,
+}
+
+impl ReceiptRelease {
+    /// The `schema_version` a receipt of this release is written with.
+    pub fn schema_version(&self) -> u32 {
+        if self.build.is_some() {
+            RECEIPT_SCHEMA_SOURCE_BUILD
+        } else {
+            RECEIPT_SCHEMA_VERSION
+        }
+    }
 }
 
 /// The directories the install used, as the plan displayed them.
@@ -158,7 +176,7 @@ pub enum ReceiptError {
     #[error("receipt is not valid: {0}")]
     Malformed(String),
     #[error(
-        "unsupported receipt schema_version {found}; this release reads {RECEIPT_SCHEMA_VERSION}"
+        "unsupported receipt schema_version {found}; this release reads {RECEIPT_SCHEMA_VERSION} and {RECEIPT_SCHEMA_SOURCE_BUILD}"
     )]
     UnsupportedSchema { found: u64 },
     #[error("receipt has more than {MAX_ENTRIES} entries in `{0}`")]
@@ -207,7 +225,9 @@ impl InstallReceipt {
         let value: serde_json::Value =
             serde_json::from_str(json).map_err(|e| ReceiptError::Malformed(e.to_string()))?;
         match value.get("schema_version").and_then(|v| v.as_u64()) {
-            Some(v) if v == u64::from(RECEIPT_SCHEMA_VERSION) => {}
+            Some(v)
+                if v == u64::from(RECEIPT_SCHEMA_VERSION)
+                    || v == u64::from(RECEIPT_SCHEMA_SOURCE_BUILD) => {}
             Some(found) => return Err(ReceiptError::UnsupportedSchema { found }),
             None => {
                 return Err(ReceiptError::Malformed(
@@ -229,9 +249,34 @@ impl InstallReceipt {
     }
 
     pub fn validate(&self) -> Result<(), ReceiptError> {
-        if self.schema_version != RECEIPT_SCHEMA_VERSION {
+        if self.schema_version != RECEIPT_SCHEMA_VERSION
+            && self.schema_version != RECEIPT_SCHEMA_SOURCE_BUILD
+        {
             return Err(ReceiptError::UnsupportedSchema {
                 found: u64::from(self.schema_version),
+            });
+        }
+        // Version 2 carries the source-build block and nothing else does.
+        if self.schema_version != self.release.schema_version() {
+            return Err(ReceiptError::Bad {
+                field: "schema_version",
+                reason: "does not match whether the release carries a build block (2) or not (1)",
+            });
+        }
+        if let Some(b) = &self.release.build
+            && let Some(why) = b.problem()
+        {
+            return Err(ReceiptError::Bad {
+                field: "release.build",
+                reason: why,
+            });
+        }
+        if self.release.build.is_some()
+            && (self.release.kind != ReleaseKind::SourceBuild || self.release.commit.is_none())
+        {
+            return Err(ReceiptError::Bad {
+                field: "release.build",
+                reason: "a build block belongs to a source build with a commit",
             });
         }
         for (name, n) in [
@@ -395,6 +440,7 @@ pub(crate) mod tests {
                 name: "0.1.0+0123456789ab".into(),
                 kind: ReleaseKind::Release,
                 commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                build: None,
             },
             profile: Profile::Full,
             products: vec![Product::Ferroloop, Product::Ferrowire],
@@ -589,14 +635,113 @@ pub(crate) mod tests {
             );
         }
         let mut r = full_receipt();
-        r.schema_version = 2;
+        r.schema_version = 3;
         assert!(matches!(
             InstallReceipt::parse(&r.to_json()),
-            Err(ReceiptError::UnsupportedSchema { found: 2 })
+            Err(ReceiptError::UnsupportedSchema { found: 3 })
         ));
         assert!(matches!(
             InstallReceipt::parse(&" ".repeat(MAX_RECEIPT_BYTES + 1)),
             Err(ReceiptError::TooLarge { .. })
         ));
+    }
+
+    // ---- schema 1 and 2 (#205 A4b)
+
+    fn build_block() -> BuildProvenance {
+        BuildProvenance {
+            reviewed: false,
+            rustc: "rustc 1.98.0 (abc 2026-01-01)".into(),
+            cargo: "cargo 1.98.0 (def 2026-01-01)".into(),
+            build_id: "0123456789ab-fedcba987654".into(),
+            build_time_unix: 1_700_000_000,
+        }
+    }
+
+    fn source_receipt() -> InstallReceipt {
+        let mut r = full_receipt();
+        r.release.kind = ReleaseKind::SourceBuild;
+        r.release.build = Some(build_block());
+        r.schema_version = RECEIPT_SCHEMA_SOURCE_BUILD;
+        r
+    }
+
+    #[test]
+    fn a_receipt_with_a_build_block_is_schema_2_and_round_trips() {
+        let r = source_receipt();
+        let json = r.to_json();
+        assert!(json.contains("\"schema_version\": 2"));
+        let back = InstallReceipt::parse(&json).expect("parses");
+        assert_eq!(back, r);
+        assert_eq!(back.to_json(), json);
+        assert!(!back.release.build.unwrap().reviewed);
+    }
+
+    #[test]
+    fn a_version_1_receipt_reads_and_writes_as_it_always_did() {
+        // An A4a receipt: no `build` key anywhere.
+        let old = full_receipt();
+        assert_eq!(old.release.schema_version(), RECEIPT_SCHEMA_VERSION);
+        let json = old.to_json();
+        assert!(!json.contains("\"build\""));
+        assert_eq!(InstallReceipt::parse(&json).unwrap(), old);
+    }
+
+    #[test]
+    fn schema_and_build_block_must_agree() {
+        // version 1 carrying the block
+        let mut r = source_receipt();
+        r.schema_version = RECEIPT_SCHEMA_VERSION;
+        assert!(matches!(
+            InstallReceipt::parse(&r.to_json()),
+            Err(ReceiptError::Bad {
+                field: "schema_version",
+                ..
+            })
+        ));
+        // version 2 without it
+        let mut r = full_receipt();
+        r.schema_version = RECEIPT_SCHEMA_SOURCE_BUILD;
+        assert!(matches!(
+            InstallReceipt::parse(&r.to_json()),
+            Err(ReceiptError::Bad {
+                field: "schema_version",
+                ..
+            })
+        ));
+        // a block on a signed release
+        let mut r = source_receipt();
+        r.release.kind = ReleaseKind::Release;
+        assert!(matches!(
+            InstallReceipt::parse(&r.to_json()),
+            Err(ReceiptError::Bad {
+                field: "release.build",
+                ..
+            })
+        ));
+        // a block without a commit
+        let mut r = source_receipt();
+        r.release.commit = None;
+        assert!(matches!(
+            InstallReceipt::parse(&r.to_json()),
+            Err(ReceiptError::Bad {
+                field: "release.build",
+                ..
+            })
+        ));
+        // unbounded text in the block
+        let mut r = source_receipt();
+        r.release.build.as_mut().unwrap().rustc = "x\ny".into();
+        assert!(matches!(
+            InstallReceipt::parse(&r.to_json()),
+            Err(ReceiptError::Bad {
+                field: "release.build",
+                ..
+            })
+        ));
+        // a key the block does not have
+        let mut v = serde_json::to_value(source_receipt()).unwrap();
+        v["release"]["build"]["token"] = "hunter2".into();
+        assert!(InstallReceipt::parse(&v.to_string()).is_err());
     }
 }

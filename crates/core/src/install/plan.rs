@@ -609,6 +609,12 @@ pub struct PlanRelease {
     pub version: String,
     pub name: String,
     pub kind: ReleaseKind,
+    /// The commit a source build is made from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// How a source build is made (`fl install --from-git`): reviewed or not, the toolchain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<super::BuildProvenance>,
 }
 
 /// The deterministic result of `fl install --dry-run`.
@@ -986,7 +992,7 @@ pub fn plan(
         });
     }
     let mut artifacts: BTreeMap<String, PlannedArtifact> = BTreeMap::new();
-    if manifest.release.kind == ReleaseKind::Release {
+    if manifest.release.kind == ReleaseKind::Release || !manifest.artifacts.is_empty() {
         for p in &set {
             let a = manifest
                 .artifacts
@@ -1206,11 +1212,23 @@ pub fn plan(
         Management::Unmanaged
     };
     if manifest.release.kind == ReleaseKind::SourceBuild {
-        notes.push(
-            "this manifest lists no signed artifacts: the files above would come from a \
-             reviewed-commit source build, which is not implemented in this release"
-                .into(),
-        );
+        match &manifest.release.build {
+            None => notes.push(
+                "this manifest lists no signed artifacts: the files above would come from a \
+                 source build of a commit (`fl install --from-git <rev>`)"
+                    .into(),
+            ),
+            Some(b) if b.reviewed => notes.push(
+                "source build of a reviewed commit (an ancestor of origin/main); it is not a \
+                 signed release"
+                    .into(),
+            ),
+            Some(_) => notes.push(
+                "source build of an UNREVIEWED commit (not an ancestor of origin/main, \
+                 --allow-unreviewed); the receipt records reviewed: false and `fl doctor` warns"
+                    .into(),
+            ),
+        }
     }
     match receipt {
         None => notes.push(format!(
@@ -1259,6 +1277,8 @@ pub fn plan(
             version: manifest.release.version.clone(),
             name,
             kind: manifest.release.kind,
+            commit: manifest.release.commit.clone(),
+            build: manifest.release.build.clone(),
         },
         compat: manifest.compat,
         host,
@@ -1300,6 +1320,14 @@ impl InstallPlan {
             self.release.name,
             self.release.kind.as_wire()
         ));
+        if let Some(c) = &self.release.commit {
+            let reviewed = match &self.release.build {
+                Some(b) if b.reviewed => ", reviewed",
+                Some(_) => ", UNREVIEWED",
+                None => "",
+            };
+            line(format!("commit    {c}{reviewed}"));
+        }
         line(format!(
             "host      {}/{}",
             self.host.os.as_wire(),

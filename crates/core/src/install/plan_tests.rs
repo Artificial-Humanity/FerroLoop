@@ -864,6 +864,7 @@ fn owned_world(p: &InstallPlan) -> (InstallReceipt, MapProbe) {
             name: p.release.name.clone(),
             kind: p.release.kind,
             commit: None,
+            build: None,
         },
         profile: p.profile,
         products: p.products.iter().map(|s| s.id).collect(),
@@ -1205,4 +1206,47 @@ fn prefix_beats_the_isolated_root_beats_the_default() {
     );
     assert!(resolve_layout(Some(Path::new("/usr")), None).is_err());
     assert!(resolve_layout(None, Some("/".into())).is_err());
+}
+
+#[test]
+fn a_source_build_plan_says_which_commit_and_whether_it_was_reviewed() {
+    use crate::install::BuildProvenance;
+    for reviewed in [true, false] {
+        let mut m = default_manifest();
+        m.release.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        m.release.build = Some(BuildProvenance {
+            reviewed,
+            rustc: "(determined when built)".into(),
+            cargo: "(determined when built)".into(),
+            build_id: "0123456789ab".into(),
+            build_time_unix: 1,
+        });
+        m.validate().expect("valid");
+        let p = plan(
+            &req(Some(Profile::Minimal), &[], &[]),
+            &m,
+            None,
+            host(),
+            &MapProbe::new(),
+        )
+        .expect("plan");
+        assert_eq!(p.release.name, "0.1.0+0123456789ab");
+        assert_eq!(p.release.build.as_ref().map(|b| b.reviewed), Some(reviewed));
+        let text = p.render_text();
+        assert!(
+            text.contains("commit    0123456789abcdef0123456789abcdef01234567"),
+            "{text}"
+        );
+        assert_eq!(
+            p.notes.iter().any(|n| n.contains("UNREVIEWED")),
+            !reviewed,
+            "{:?}",
+            p.notes
+        );
+        // the JSON carries the provenance only when there is one
+        assert!(p.to_json().contains("\"reviewed\""));
+    }
+    let plain = plan_with(&req(Some(Profile::Minimal), &[], &[]));
+    assert!(!plain.to_json().contains("\"build\""));
+    assert!(!plain.render_text().contains("commit    "));
 }

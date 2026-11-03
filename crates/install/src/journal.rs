@@ -230,6 +230,7 @@ mod tests {
                 name: "0.1.0+aaaaaaaaaaaa".into(),
                 kind: ReleaseKind::Release,
                 commit: None,
+                build: None,
             },
             profile: Profile::Minimal,
             products: vec![Product::Ferroloop],

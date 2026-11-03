@@ -1760,6 +1760,7 @@ fn build_intent(
         name: plan.release.name.clone(),
         kind: plan.release.kind,
         commit: args.manifest.release.commit.clone(),
+        build: args.manifest.release.build.clone(),
     };
     if new_release {
         let src = source.ok_or_else(|| {
@@ -1889,13 +1890,90 @@ fn abandon_fresh(guard: &LockGuard, created: &[PathBuf], safe: &Safe) {
     }
 }
 
+/// Where the engine would look, resolved read-only.
+fn read_only_view(env: &Env, layout: &Layout) -> Result<(Safe, Paths, FsProbe)> {
+    let safe = Safe::new(&env.declared_root, env.home.as_deref())?;
+    let paths = Paths::new(&safe, layout)?;
+    safe.check_chain(&paths.prefix.join("x"))?;
+    safe.check_chain(&paths.bin_dir.join("x"))?;
+    let probe = FsProbe::new(env.home.clone());
+    Ok((safe, paths, probe))
+}
+
+/// The plan `args` would apply. Reads (`lstat`, the receipt) and writes nothing.
+pub fn plan_only(env: &Env, args: &ApplyArgs<'_>) -> Result<InstallPlan> {
+    let (_, paths, probe) = read_only_view(env, &args.request.layout)?;
+    Ok(make_plan(env, &paths, args, &probe)?.plan)
+}
+
+/// Everything `apply` checks BEFORE it creates anything (the plan, the decisions on every
+/// conflict), without needing the artifacts. A caller that is about to spend a long time
+/// producing the artifacts runs this first, so a refusal costs nothing. An interrupted
+/// transaction (a journal) is for `apply` to finish or undo: nothing is checked then.
+pub fn preflight(env: &Env, args: &ApplyArgs<'_>) -> Result<()> {
+    let (safe, paths, probe) = read_only_view(env, &args.request.layout)?;
+    if lstat(&paths.journal)?.is_some() {
+        return Ok(());
+    }
+    let pre = make_plan(env, &paths, args, &probe)?;
+    resolve_decisions(&pre.plan, args.decisions, &safe)?;
+    Ok(())
+}
+
+/// Whether the installed state already is what `args` would produce (the engine's own
+/// idempotence test, read-only): `manifest` must name the artifact the receipt recorded.
+pub fn is_installed(env: &Env, args: &ApplyArgs<'_>) -> Result<bool> {
+    let (safe, paths, probe) = read_only_view(env, &args.request.layout)?;
+    if lstat(&paths.journal)?.is_some() {
+        return Ok(false);
+    }
+    let planned = make_plan(env, &paths, args, &probe)?;
+    let Ok(resolved) = resolve_decisions(&planned.plan, args.decisions, &safe) else {
+        return Ok(false);
+    };
+    Ok(is_noop(&planned.plan, planned.receipt.as_ref(), &resolved))
+}
+
+/// The committed install receipt under `layout`, if there is one. Reads only.
+pub fn installed_receipt(env: &Env, layout: &Layout) -> Result<Option<InstallReceipt>> {
+    let (_, paths, _) = read_only_view(env, layout)?;
+    read_receipt_text(&paths.receipt)?
+        .map(|t| parse_receipt(&t, &paths.receipt.display().to_string()))
+        .transpose()
+}
+
 /// Apply the install the planner printed. Takes `install.lock`, finishes or undoes any
 /// interrupted transaction first, re-plans under the lock, and then runs the transaction.
+///
+/// A manifest that claims a source build with artifacts, or carries `release.build`, is
+/// refused: that provenance (reviewed or not, the toolchain) is recorded in the receipt, and
+/// only `fl install --from-git` (which produced the artifact and made the claim) may write it,
+/// through [`apply_from_source_build`]. A hand-written manifest cannot.
 pub fn apply(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
-    if args.manifest.release.kind != ReleaseKind::Release {
+    let r = &args.manifest.release;
+    if r.build.is_some()
+        || (r.kind == ReleaseKind::SourceBuild && !args.manifest.artifacts.is_empty())
+    {
         return Err(InstallError::refused(
-            "this manifest lists no artifacts (a source build): installing from a reviewed \
-             commit is not implemented in this release",
+            "the manifest claims a source build (`release.build`, or kind `source_build` with \
+             artifacts); only `fl install --from-git` records that provenance, and it builds \
+             the artifact itself",
+        ));
+    }
+    apply_trusted(env, args)
+}
+
+/// [`apply`] for the manifest `--from-git` made in memory from its own build. Not public:
+/// only the crate's source-build path can reach it.
+pub(crate) fn apply_from_source_build(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
+    apply_trusted(env, args)
+}
+
+fn apply_trusted(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
+    if args.manifest.artifacts.is_empty() {
+        return Err(InstallError::refused(
+            "this manifest lists no artifacts (a plan-only source build): build one from a \
+             reviewed commit with `fl install --from-git <rev>`",
         ));
     }
     let safe = Safe::new(&env.declared_root, env.home.as_deref())?;
@@ -2120,6 +2198,7 @@ mod publish_tests {
                 name: "0.1.0+aaaaaaaaaaaa".into(),
                 kind: ReleaseKind::Release,
                 commit: None,
+                build: None,
             },
             profile: Profile::Minimal,
             products: vec![Product::Ferroloop],

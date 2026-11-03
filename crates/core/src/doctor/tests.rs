@@ -29,6 +29,7 @@ fn receipt() -> InstallReceipt {
             name: "0.1.0+0123456789ab".into(),
             kind: ReleaseKind::SourceBuild,
             commit: Some(C.into()),
+            build: None,
         },
         profile: Profile::Full,
         products: vec![Product::Ferroloop],
@@ -372,10 +373,10 @@ fn receipt_integrity_table() {
 
     // An unsupported schema names the version.
     let mut v = serde_json::to_value(receipt()).unwrap();
-    v["schema_version"] = 2.into();
+    v["schema_version"] = 3.into();
     let (s, d) = case(ReceiptSource::Text(v.to_string()));
     assert_eq!(s, CheckStatus::Fail);
-    assert!(d.contains("schema_version 2"), "{d}");
+    assert!(d.contains("schema_version 3"), "{d}");
 
     // A field-level reason.
     let mut r = receipt();

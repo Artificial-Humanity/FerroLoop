@@ -34,6 +34,7 @@ fn receipt() -> InstallReceipt {
             name: "0.1.0+0123456789ab".into(),
             kind: ReleaseKind::SourceBuild,
             commit: Some(C.into()),
+            build: None,
         },
         profile: Profile::Full,
         products: vec![Product::Ferroloop],

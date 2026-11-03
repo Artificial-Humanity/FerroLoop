@@ -1,4 +1,4 @@
-//! `fl install`: plan, and with `--yes` apply (#205 phases A2 and A4a).
+//! `fl install`: plan, and with `--yes` apply (#205 phases A2, A4a and A4b).
 //!
 //! `--dry-run` reads a manifest (the built-in one, or `--manifest`), the install receipt if
 //! there is one, and `lstat`/`readlink`/read of the paths the plan names, and writes nothing,
@@ -11,7 +11,8 @@ use fl_core::install::{
     ReleaseManifest, default_manifest, plan, resolve_layout,
 };
 use fl_install::{
-    ApplyArgs, Decisions, Env, FsProbe, RecoverMode, apply, manager_for, read_bounded, recover,
+    ApplyArgs, Decisions, Env, FromGitArgs, FromGitResult, FsProbe, ProcessBuilder, RecoverMode,
+    apply, install_from_git, manager_for, plan_from_git, read_bounded, recover,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -64,9 +65,28 @@ pub struct Cmd {
     /// Seconds to wait for another installer's lock (0: do not wait).
     #[arg(long, value_name = "SECONDS", default_value_t = fl_install::DEFAULT_LOCK_TIMEOUT_SECS)]
     pub lock_timeout: u64,
-    /// Build from a reviewed commit. Not implemented in this release.
+    /// Build the commit REV (a revision of --repo) in a clean directory under the install
+    /// prefix and install the result. The commit must be an ancestor of the local origin/main
+    /// unless --allow-unreviewed is given. `--dry-run` plans without building.
     #[arg(long, value_name = "REV")]
     pub from_git: Option<String>,
+    /// With --from-git: the git checkout holding REV (default: the current directory's).
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+    /// With --from-git: build a commit that is not an ancestor of origin/main. Loud, and the
+    /// receipt records `reviewed: false`.
+    #[arg(long)]
+    pub allow_unreviewed: bool,
+    /// With --from-git: also build the UI (`npm ci && npm run build` in ui/).
+    #[arg(long)]
+    pub with_ui: bool,
+    /// With --from-git --with-ui: also run the npm dependencies' lifecycle scripts
+    /// (`npm ci` without --ignore-scripts). Those scripts run arbitrary code from the registry.
+    #[arg(long)]
+    pub npm_scripts: bool,
+    /// With --from-git: kill the build after this many seconds.
+    #[arg(long, value_name = "SECONDS", default_value_t = fl_install::DEFAULT_BUILD_TIMEOUT_SECS)]
+    pub build_timeout: u64,
     /// Clear old releases. Not implemented in this release.
     #[arg(long)]
     pub gc: bool,
@@ -122,8 +142,24 @@ fn execute(cmd: &Cmd) -> Done {
             format!("{what} is not implemented in this release"),
         )
     };
+    if cmd.from_git.is_none()
+        && (cmd.repo.is_some() || cmd.allow_unreviewed || cmd.with_ui || cmd.npm_scripts)
+    {
+        return usage("--repo, --allow-unreviewed, --with-ui and --npm-scripts go with --from-git");
+    }
+    if cmd.npm_scripts && !cmd.with_ui {
+        return usage("--npm-scripts goes with --with-ui");
+    }
     if cmd.from_git.is_some() {
-        return not_implemented("--from-git");
+        if cmd.artifact_dir.is_some() || cmd.manifest.is_some() {
+            return usage(
+                "--from-git builds its own artifact: it cannot be combined with --artifact-dir \
+                 or --manifest",
+            );
+        }
+        if cmd.resume || cmd.rollback {
+            return usage("--from-git cannot be combined with --resume or --rollback");
+        }
     }
     if cmd.gc {
         return not_implemented("--gc");
@@ -203,6 +239,16 @@ fn execute(cmd: &Cmd) -> Done {
             );
         }
     };
+    if let Some(rev) = &cmd.from_git {
+        let request = InstallRequest {
+            profile,
+            add,
+            remove,
+            layout,
+            adopt: cmd.adopt,
+        };
+        return from_git(cmd, rev, &request, host, declared_root, &probe);
+    }
     let manifest = match &cmd.manifest {
         Some(p) => match read_manifest(p) {
             Ok(m) => m,
@@ -273,6 +319,91 @@ fn execute(cmd: &Cmd) -> Done {
     }
 }
 
+/// `fl install --from-git <rev>`: plan (`--dry-run`, or no `--yes`) or build and apply.
+fn from_git(
+    cmd: &Cmd,
+    rev: &str,
+    request: &InstallRequest,
+    host: HostInfo,
+    root: Option<PathBuf>,
+    probe: &FsProbe,
+) -> Done {
+    let Some(root) = root else {
+        return Done::fail(EXIT_REFUSED, "HOME is not set; pass --prefix".into());
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return Done::fail(EXIT_REFUSED, "cannot read the current directory".into());
+    };
+    let mut env = Env::new(root, probe.home.clone());
+    env.lock_timeout = Duration::from_secs(cmd.lock_timeout);
+    env.faults = fl_install::faults_from_env();
+    env.services = manager_for(host.os);
+    let decisions = Decisions {
+        replace: cmd.replace.clone(),
+        keep: cmd.keep.clone(),
+    };
+    let parent_env: Vec<_> = std::env::vars_os().collect();
+    let args = FromGitArgs {
+        rev,
+        repo: cmd.repo.as_deref(),
+        cwd: &cwd,
+        allow_unreviewed: cmd.allow_unreviewed,
+        with_ui: cmd.with_ui,
+        npm_scripts: cmd.npm_scripts,
+        on_warning: &|m| eprintln!("{m}"),
+        build_timeout: Duration::from_secs(cmd.build_timeout),
+        parent_env: &parent_env,
+        request,
+        host,
+        decisions: &decisions,
+    };
+    let result = if cmd.yes {
+        install_from_git(&env, &args, &ProcessBuilder)
+    } else {
+        plan_from_git(&env, &args)
+    };
+    let (info, res) = match result {
+        Ok(r) => r,
+        Err(e) => return Done::fail(e.exit_code(), e.to_string()),
+    };
+    match res {
+        FromGitResult::Planned { plan } => {
+            let out = if cmd.json {
+                let v = serde_json::json!({
+                    "from_git": info,
+                    "plan": serde_json::from_str::<serde_json::Value>(&plan.to_json())
+                        .unwrap_or_default(),
+                });
+                serde_json::to_string_pretty(&v).unwrap() + "\n"
+            } else {
+                format!("{}\n{}", info.render_text(), plan.render_text())
+            };
+            if cmd.dry_run {
+                Done::ok(out)
+            } else {
+                Done {
+                    code: EXIT_REFUSED,
+                    stdout: out,
+                    stderr: Some("pass --yes to build and apply (or --dry-run)".into()),
+                }
+            }
+        }
+        FromGitResult::Applied { report, built } => {
+            if cmd.json {
+                let v = serde_json::json!({
+                    "from_git": info,
+                    "built": built,
+                    "result": serde_json::from_str::<serde_json::Value>(&report.to_json())
+                        .unwrap_or_default(),
+                });
+                Done::ok(serde_json::to_string_pretty(&v).unwrap() + "\n")
+            } else {
+                Done::ok(format!("{}\n{}", info.render_text(), report.render_text()))
+            }
+        }
+    }
+}
+
 /// Where this install may write: `--prefix`, else `$FL_INSTALL_ROOT`, else `$HOME`.
 fn declared_root(cmd: &Cmd, probe: &FsProbe) -> Option<PathBuf> {
     if let Some(p) = &cmd.prefix {
@@ -289,7 +420,7 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifest, (i32, String)> {
     let raw = read_bounded(path, MAX_MANIFEST_BYTES)
         .map_err(|e| (EXIT_REFUSED, format!("manifest {shown}: {e}")))?
         .ok_or_else(|| (EXIT_REFUSED, format!("manifest {shown} does not exist")))?;
-    ReleaseManifest::parse(&raw).map_err(|errs| {
+    let manifest = ReleaseManifest::parse(&raw).map_err(|errs| {
         (
             EXIT_REFUSED,
             format!(
@@ -300,7 +431,19 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifest, (i32, String)> {
                     .join("; ")
             ),
         )
-    })
+    })?;
+    // The build record says "this was built from a reviewed (or unreviewed) commit with this
+    // toolchain". Only `--from-git`, which does the build, may write it.
+    if manifest.release.build.is_some() {
+        return Err((
+            EXIT_REFUSED,
+            format!(
+                "manifest {shown} carries `release.build`, which only `fl install --from-git` \
+                 may record; remove it"
+            ),
+        ));
+    }
+    Ok(manifest)
 }
 
 /// The receipt at `display` (the unexpanded path), if there is one. A receipt

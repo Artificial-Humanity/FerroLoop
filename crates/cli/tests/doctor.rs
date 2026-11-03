@@ -151,6 +151,7 @@ impl World {
                 name: format!("{}+0123456789ab", env!("CARGO_PKG_VERSION")),
                 kind: ReleaseKind::SourceBuild,
                 commit: commit.map(str::to_string),
+                build: None,
             },
             profile: Profile::Full,
             products: vec![Product::Ferroloop],

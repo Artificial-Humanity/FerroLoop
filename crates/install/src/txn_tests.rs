@@ -1324,10 +1324,7 @@ fn a_source_build_manifest_is_refused_without_changing_anything() {
         .apply_with(&m, None, &Decisions::default(), &w.env())
         .unwrap_err();
     assert_eq!(e.exit_code(), 3);
-    assert!(
-        e.to_string().contains("not implemented in this release"),
-        "{e}"
-    );
+    assert!(e.to_string().contains("fl install --from-git"), "{e}");
     assert_eq!(w.snap(), pre);
 }
 

@@ -26,9 +26,8 @@ pub(super) fn check(inputs: &DoctorInputs<'_>, receipt: &ReceiptView) -> DoctorC
             CheckStatus::Fail,
             format!("install receipt {shown} is invalid ({why}); it is not treated as unmanaged"),
         ),
-        ReceiptView::Valid(r) => (
-            CheckStatus::Pass,
-            format!(
+        ReceiptView::Valid(r) => {
+            let mut detail = format!(
                 "{shown} is valid (schema_version {}, release {}, profile {}, {} products, {} owned paths, {} aliases, {} units)",
                 r.schema_version,
                 r.release.name,
@@ -37,8 +36,25 @@ pub(super) fn check(inputs: &DoctorInputs<'_>, receipt: &ReceiptView) -> DoctorC
                 r.paths.len(),
                 r.aliases.len(),
                 r.units.len()
-            ),
-        ),
+            );
+            // A source build of a commit nobody reviewed stays visible for as long as it is
+            // installed.
+            let unreviewed = r.release.build.as_ref().is_some_and(|b| !b.reviewed);
+            if unreviewed {
+                detail.push_str(
+                    "; the release is a source build of a commit that was NOT an ancestor of \
+                     origin/main (installed with --allow-unreviewed)",
+                );
+            }
+            (
+                if unreviewed {
+                    CheckStatus::Warn
+                } else {
+                    CheckStatus::Pass
+                },
+                detail,
+            )
+        }
     };
     make(ids::RECEIPT_INTEGRITY, TITLE, status, detail)
 }
