@@ -1736,6 +1736,9 @@ fn a_forged_but_parseable_journal_is_refused_and_touches_nothing() {
         ("release name absolute", |i, _| {
             i["release"]["name"] = "/tmp/x".into()
         }),
+        ("release name extends its version with a path", |i, _| {
+            i["release"]["name"] = "0.1.0+/../../x".into()
+        }),
         ("release name leading dash", |i, _| {
             i["release"]["name"] = "-rf".into()
         }),
