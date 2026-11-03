@@ -34,8 +34,9 @@ private_key = "/home/you/.config/fl/widgets-app.pem"
 `github` names the repository as `owner/repo`: two non-empty parts and no whitespace.
 `credential` is `"env"` or `"app"`, and the next section says what each reads. The
 `[github]` section is needed only by `credential = "app"`; it holds the App's numeric id and
-the absolute path of its private key file. A binding that says `"app"` with no `[github]`
-section is refused.
+where its private key is: `private_key` (the absolute path of a PEM file) or `private_key_ref`
+(a FerroGate Vault secret, `vault://NAME`; see `docs/ferrogate.md`). Set exactly one of the two.
+A binding that says `"app"` with no `[github]` section is refused.
 
 `[github]` also takes an optional `reviewer_ids`, the numeric GitHub user ids whose reviews may
 carry an `fl-review` agent marker, and an optional `reviewer_logins`, GitHub logins that may do
@@ -121,6 +122,9 @@ file: an RSA key in PEM form, as GitHub hands it out. fl signs a short-lived tok
 key, looks up the App's installation on the bound repository, and exchanges the signed token
 for an installation token, which it renews before it expires. The key is read from the file; it
 never appears on a command line, and a message may name the file's path but never its contents.
+With `private_key_ref` the key is in the Vault instead, the Vault signs, and fl receives only the
+signed token; `docs/ferrogate.md` says how that is resolved, what it refuses and where its
+protection ends.
 
 `fl github whoami`, run inside the project's checkout, prints the identity GitHub reports for
 the credential (a user's login, or an App's `<slug>[bot]`), where the credential came from (the
