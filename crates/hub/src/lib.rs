@@ -759,6 +759,14 @@ mod tests {
         test_hub_state_at(tmp, tmp.path(), tmp.path())
     }
 
+    /// A state whose repository root is the temp dir and whose home is another directory in
+    /// it: code search scans the root (it does not scan a root that IS the home directory).
+    fn test_hub_state_away_from_home(tmp: &TempDir) -> HubState {
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        test_hub_state_at(tmp, tmp.path(), &home)
+    }
+
     fn test_hub_state_at(
         tmp: &TempDir,
         repo_root: &std::path::Path,
@@ -2412,7 +2420,7 @@ mod tests {
     #[test]
     fn code_search_route_records_token_gain_and_stats_exposes_it() {
         let tmp = TempDir::new().unwrap();
-        let state = test_hub_state(&tmp);
+        let state = test_hub_state_away_from_home(&tmp);
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         let mut code = String::from("pub fn hub_widget() {}\n");
         for i in 0..40 {
@@ -2619,9 +2627,50 @@ mod tests {
     }
 
     #[test]
+    fn code_search_does_not_scan_a_root_that_is_the_home_directory() {
+        let tmp = TempDir::new().unwrap();
+        // repo_root == the effective home (`home_override`), as a hub with no WorkingDirectory
+        let state = test_hub_state(&tmp);
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/widget.rs"), "pub fn hub_widget() {}\n").unwrap();
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["symbols"].as_array().unwrap().len(), 0, "{body}");
+        assert_eq!(body["tokens_saved_this_query"], 0, "{body}");
+        assert!(
+            body["note"].as_str().unwrap().contains("home directory"),
+            "{body}"
+        );
+        // nothing was scanned or recorded
+        assert_eq!(body["token_gain"]["queries_count"], 0, "{body}");
+    }
+
+    #[test]
+    fn code_search_scans_a_root_that_is_not_the_home_directory() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state_away_from_home(&tmp);
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/widget.rs"), "pub fn hub_widget() {}\n").unwrap();
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(resp.status, 200);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["symbols"][0]["name"], "hub_widget", "{body}");
+        assert!(body.get("note").is_none(), "{body}");
+    }
+
+    #[test]
     fn code_search_route_on_ferro_never_writes_the_code_vector_index() {
         let tmp = TempDir::new().unwrap();
-        let mut state = test_hub_state(&tmp);
+        let mut state = test_hub_state_away_from_home(&tmp);
         // A `.fls` path selects FerroStore without touching the environment.
         let store_path = tmp.path().join("hub.fls");
         state.config.store_path = store_path.clone();
@@ -2720,7 +2769,7 @@ mod tests {
     #[test]
     fn code_search_route_holds_a_read_only_sidecar_handle() {
         let tmp = TempDir::new().unwrap();
-        let mut state = test_hub_state(&tmp);
+        let mut state = test_hub_state_away_from_home(&tmp);
         let store_path = tmp.path().join("hub.fls");
         state.config.store_path = store_path.clone();
         let sidecar = tmp.path().join("hub.code.fls");

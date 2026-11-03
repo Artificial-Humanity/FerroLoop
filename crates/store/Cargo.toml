@@ -35,6 +35,10 @@ required-features = ["cli"]
 name = "ferrostore_bin"
 required-features = ["cli"]
 
+[[test]]
+name = "unit_templates"
+required-features = ["cli"]
+
 [dev-dependencies]
 tempfile.workspace = true
 fl-core = { path = "../core", features = ["conformance"] }

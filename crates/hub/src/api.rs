@@ -2162,6 +2162,22 @@ fn handle_get_state_search(
     )
 }
 
+/// Whether `root` is the directory `home` names (both resolved; a path that cannot be
+/// resolved is not).
+fn is_same_dir(root: &Path, home: &Path) -> bool {
+    matches!(
+        (fs::canonicalize(root), fs::canonicalize(home)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
+/// Whether the hub runs in the user's home directory: its `repo_root` is the effective home
+/// (`home_override`, else `$HOME`; see [`crate::commands::resolve_home`]).
+fn repo_root_is_home(state: &HubState) -> bool {
+    crate::commands::resolve_home(state.config.home_override.as_deref())
+        .is_some_and(|home| is_same_dir(&state.config.repo_root, &home))
+}
+
 fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let kind = match req.query.get("kind") {
         Some(raw) if !raw.trim().is_empty() => match CodeSearchKind::from_wire(raw.trim()) {
@@ -2214,6 +2230,25 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
                 "symbols": [],
                 "tokens_saved_this_query": 0,
                 "token_gain": load_token_gain(&*store),
+            }),
+        );
+    }
+
+    // A hub started in the home directory (a user service with no `WorkingDirectory`) has no
+    // repository: the scan would walk the whole home directory on every request.
+    if repo_root_is_home(state) {
+        let Ok(store) = open_store_response(state) else {
+            return store_open_failure();
+        };
+        return HttpResponse::json(
+            200,
+            json!({
+                "query": query,
+                "kind": kind.as_wire(),
+                "symbols": [],
+                "tokens_saved_this_query": 0,
+                "token_gain": load_token_gain(&*store),
+                "note": "the hub runs in the home directory, which is not searched; start it with the repository as its working directory",
             }),
         );
     }
@@ -6736,6 +6771,25 @@ mod tests {
             "/w/data/foo.fls.migrate.lock"
         )));
         assert!(!is_forbidden_artifact_path(Path::new("/w/data/notes.md")));
+    }
+
+    #[test]
+    fn a_root_that_is_the_home_directory_is_recognised_through_a_link_and_a_dot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let link = tmp.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(is_same_dir(&home, &home));
+        assert!(is_same_dir(&link, &home));
+        assert!(is_same_dir(&home.join("."), &home));
+        assert!(!is_same_dir(&repo, &home));
+        // a repository inside the home directory is a repository, not the home directory
+        fs::create_dir_all(home.join("proj")).unwrap();
+        assert!(!is_same_dir(&home.join("proj"), &home));
+        assert!(!is_same_dir(&tmp.path().join("missing"), &home));
     }
 
     fn memory_entry(n: u64, slug: &str, body: &str, sensitive: bool) -> StateEntry {
