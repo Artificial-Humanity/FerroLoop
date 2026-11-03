@@ -8,6 +8,7 @@ import type {
   GateSecretResponse,
   HubAuthority,
   SetVaultSecretInput,
+  VaultAuditState,
   VaultConsumerDeniedInfo,
   VaultConsumerReportEntry,
   VaultConsumerSourceClass,
@@ -18,6 +19,7 @@ import type {
 } from "../types/api";
 
 export type {
+  VaultAuditState,
   VaultConsumerDeniedInfo,
   VaultConsumerReportEntry,
   VaultConsumerSourceClass,
@@ -265,78 +267,55 @@ export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
 ];
 
 // Record #86 (Gate G6): Observational FerroGate Vault Consumer Status (`GET /api/v1/gate/vault-consumers`)
-export type VaultConsumerCutoverStatus =
-  | "pending-cutover"
-  | "unverified"
-  | VaultConsumerSourceClass;
+export type VaultConsumerCutoverStatus = VaultConsumerSourceClass;
 
-export interface VaultConsumerCutoverRow {
-  id: string;
-  consumer?: string;
-  consumer_label: string;
-  source_module: string;
-  binding: string;
-  class: VaultConsumerSourceClass;
-  vault_entry: string | null;
-  vault_key_field: string | null;
-  evidence?: string;
-  plaintext_path_present?: boolean | null;
-  plaintext_secrets: number | null;
-  host_allowlist: string[];
-  status: VaultConsumerCutoverStatus;
-  last_denied?: VaultConsumerDeniedInfo | null;
-}
+export type VaultConsumerCutoverRow = VaultConsumerReportEntry;
 
 export const DEFAULT_VAULT_CONSUMERS_DISCLAIMER =
-  "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.";
+  "Configuration facts observed by this hub process: which source each consumer is set to read. A class of vault-ref means a Vault reference is configured, not that it works, and nothing here says a plaintext secret is gone. Verifying a cutover is the Owner-window drill (Gate G6 acceptance); this report does not perform it and never reports it.";
 
-export const DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS: VaultConsumerCutoverRow[] = [
+export const DEFAULT_VAULT_CUSTODY_NOTE =
+  "The Vault master key and the Vault file belong to one Unix user, and every FerroLoop process runs as that user. Any process of that user can read the key and decrypt every secret. Custody is file permission, not a separate signer boundary.";
+
+export const DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS: VaultConsumerReportEntry[] = [
   {
-    id: "github.reviewer",
-    consumer: "github.reviewer",
-    consumer_label: "GitHub App Reviewer Private Key",
-    source_module: "crates/github/src/creds.rs",
-    binding: "vault://GITHUB_APP_REVIEWER_PEM",
+    id: "github-app-private-key",
+    label: "GitHub App private key",
     class: "unknown",
-    vault_entry: null,
-    vault_key_field: null,
-    evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
+    evidence: "the hub was not given its `[github]` configuration",
     plaintext_path_present: null,
-    plaintext_secrets: null,
-    host_allowlist: ["api.github.com", "uploads.github.com"],
-    status: "pending-cutover",
     last_denied: null,
   },
   {
     id: "github-token",
-    consumer: "github-token",
-    consumer_label: "config.toml Tracker Credentials",
-    source_module: "crates/core/src/config.rs",
-    binding: "vault://GITHUB_APP_TOKEN",
+    label: "GitHub user token",
     class: "unknown",
-    vault_entry: null,
-    vault_key_field: null,
-    evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
+    evidence: "no token variable is set; the hub was not given its tracker configuration",
     plaintext_path_present: null,
-    plaintext_secrets: null,
-    host_allowlist: ["api.github.com"],
-    status: "pending-cutover",
     last_denied: null,
   },
   {
-    id: "discord.bridge",
-    consumer: "discord.bridge",
-    consumer_label: "FerroWire Discord Bridge Consumer",
-    source_module: "crates/gate/src/connectors.rs",
-    binding: "vault://DISCORD_BOT_TOKEN",
+    id: "hub-owner-token",
+    label: "Hub owner token",
     class: "unknown",
-    vault_entry: null,
-    vault_key_field: null,
+    evidence: "$FL_HUB_OWNER_TOKEN is not set; the hub was not given the file setting `[hub] owner_token_file`",
+    plaintext_path_present: null,
+    last_denied: null,
+  },
+  {
+    id: "wire-peer-token",
+    label: "Wire peer token",
+    class: "unknown",
+    evidence: "$FL_WIRE_TOKEN is not set; the hub was not given the file setting `[wire] token_file`",
+    plaintext_path_present: null,
+    last_denied: null,
+  },
+  {
+    id: "vault-master-key",
+    label: "Vault master key",
+    class: "unknown",
     evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
     plaintext_path_present: null,
-    plaintext_secrets: null,
-    host_allowlist: ["discord.com"],
-    status: "pending-cutover",
     last_denied: null,
   },
 ];
@@ -346,28 +325,15 @@ export const DEFAULT_VAULT_CONSUMERS_REPORT: VaultConsumersReport = {
   disclaimer: DEFAULT_VAULT_CONSUMERS_DISCLAIMER,
   custody: {
     mode: "same-unix-user",
-    master_key_source: "unverified",
-    key_file_mode: null,
-    vault_key_mode: null,
+    note: DEFAULT_VAULT_CUSTODY_NOTE,
     vault_key_readable_by_group_or_other: null,
-    note: "The Vault master key and the Vault file belong to one Unix user, and every FerroLoop process runs as that user. Custody is file permission, not a separate signer boundary.",
+    vault_key_mode: null,
   },
-  consumers: DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.map((row) => ({
-    id: row.id,
-    consumer: row.consumer ?? row.id,
-    label: row.consumer_label,
-    class: row.class,
-    evidence: row.evidence,
-    plaintext_path_present: row.plaintext_path_present,
-    vault_entry: row.vault_entry,
-    vault_key_field: row.vault_key_field,
-    last_denied: row.last_denied ?? null,
-  })),
+  consumers: DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
   audit: {
     state: "unverified",
     last_denied: null,
   },
-  last_denied: null,
 };
 
 /** Mirrors `normalize_secret_name` in `crates/gate/src/vault.rs` (server uppercases). */
@@ -714,74 +680,51 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               : [];
             const consumers: VaultConsumerReportEntry[] =
               rawConsumers.length > 0
-                ? rawConsumers.map((item) => {
-                    const key =
-                      item.consumer ?? item.id ?? "unknown-consumer";
-                    return {
-                      id: item.id ?? key,
-                      consumer: item.consumer ?? key,
-                      label: item.label ?? key,
-                      class: normalizeVaultConsumerClass(item.class),
-                      evidence:
-                        typeof item.evidence === "string"
-                          ? item.evidence
-                          : undefined,
-                      plaintext_path_present:
-                        typeof item.plaintext_path_present === "boolean"
-                          ? item.plaintext_path_present
-                          : null,
-                      vault_entry:
-                        typeof item.vault_entry === "string"
-                          ? item.vault_entry
-                          : null,
-                      vault_key_field:
-                        typeof item.vault_key_field === "string"
-                          ? item.vault_key_field
-                          : null,
-                      last_denied: item.last_denied ?? null,
-                    };
-                  })
+                ? rawConsumers.map((item) => ({
+                    id: item.id ?? "unknown-consumer",
+                    label: item.label ?? item.id ?? "unknown-consumer",
+                    class: normalizeVaultConsumerClass(item.class),
+                    evidence:
+                      typeof item.evidence === "string" ? item.evidence : "",
+                    plaintext_path_present:
+                      typeof item.plaintext_path_present === "boolean"
+                        ? item.plaintext_path_present
+                        : null,
+                    last_denied:
+                      item.last_denied &&
+                      typeof item.last_denied.outcome === "string"
+                        ? { outcome: item.last_denied.outcome }
+                        : null,
+                  }))
                 : DEFAULT_VAULT_CONSUMERS_REPORT.consumers;
-
-            const masterKeyConsumer = consumers.find(
-              (c) => (c.id ?? c.consumer) === "vault-master-key",
-            );
-            const inferredMasterKeySource =
-              masterKeyConsumer?.class === "env"
-                ? "env"
-                : masterKeyConsumer?.class === "plaintext-file"
-                  ? "key-file"
-                  : masterKeyConsumer?.class === "unconfigured"
-                    ? "missing"
-                    : "unverified";
 
             const rawCustody = raw?.custody;
             const custody: VaultCustodySummary = {
               mode: rawCustody?.mode ?? "same-unix-user",
-              note:
-                rawCustody?.note ??
-                DEFAULT_VAULT_CONSUMERS_REPORT.custody.note,
-              master_key_source:
-                rawCustody?.master_key_source ??
-                rawCustody?.master_key_Source ??
-                inferredMasterKeySource,
-              key_file_mode:
-                rawCustody?.key_file_mode ??
-                rawCustody?.vault_key_mode ??
-                null,
-              vault_key_mode:
-                rawCustody?.vault_key_mode ??
-                rawCustody?.key_file_mode ??
-                null,
+              note: rawCustody?.note ?? DEFAULT_VAULT_CUSTODY_NOTE,
               vault_key_readable_by_group_or_other:
                 typeof rawCustody?.vault_key_readable_by_group_or_other ===
                 "boolean"
                   ? rawCustody.vault_key_readable_by_group_or_other
                   : null,
+              vault_key_mode:
+                typeof rawCustody?.vault_key_mode === "string"
+                  ? rawCustody.vault_key_mode
+                  : null,
             };
 
-            const lastDenied: VaultConsumerDeniedInfo | null =
-              raw?.last_denied ?? raw?.audit?.last_denied ?? null;
+            const rawAudit = raw?.audit;
+            const audit: VaultConsumersAuditSummary = {
+              state:
+                typeof rawAudit?.state === "string" && rawAudit.state.trim()
+                  ? rawAudit.state.trim()
+                  : "ok",
+              last_denied:
+                rawAudit?.last_denied &&
+                typeof rawAudit.last_denied.outcome === "string"
+                  ? { outcome: rawAudit.last_denied.outcome }
+                  : null,
+            };
 
             const disclaimer =
               typeof raw?.disclaimer === "string" &&
@@ -794,11 +737,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               disclaimer,
               custody,
               consumers,
-              audit: raw?.audit ?? {
-                state: "ok",
-                last_denied: lastDenied,
-              },
-              last_denied: lastDenied,
+              audit,
             });
             setVaultConsumersLoaded(true);
             if (!silentOnLoad) {
@@ -2077,7 +2016,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
             </div>
           )}
 
-          {/* Custody & Last Denied Audit Summary */}
+          {/* Custody & Audit Summary */}
           <div
             style={{
               display: "grid",
@@ -2105,46 +2044,41 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 </span>
                 <span
                   className="fd-badge fd-mono"
-                  data-testid="gate-vault-custody-key-source"
+                  data-testid="gate-vault-custody-key-mode"
                 >
-                  master_key_source:{" "}
-                  {vaultConsumersReport.custody.master_key_source ??
-                    vaultConsumersReport.custody.master_key_Source ??
-                    "unverified"}
+                  vault_key_mode:{" "}
+                  {vaultConsumersReport.custody.vault_key_mode ?? "none"}
                 </span>
                 <span
                   className="fd-badge fd-mono"
-                  data-testid="gate-vault-custody-key-mode"
-                >
-                  key_file_mode:{" "}
-                  {vaultConsumersReport.custody.key_file_mode ??
-                    vaultConsumersReport.custody.vault_key_mode ??
-                    "none"}
-                </span>
-                {typeof vaultConsumersReport.custody
-                  .vault_key_readable_by_group_or_other === "boolean" && (
-                  <span
-                    className="fd-badge fd-mono"
-                    style={{
-                      color: vaultConsumersReport.custody
-                        .vault_key_readable_by_group_or_other
-                        ? "#F87171"
-                        : "#34D399",
-                    }}
-                  >
-                    group/other readable:{" "}
-                    {String(
+                  data-testid="gate-vault-custody-readable"
+                  style={{
+                    color:
                       vaultConsumersReport.custody
-                        .vault_key_readable_by_group_or_other,
-                    )}
-                  </span>
-                )}
-              </div>
-              {vaultConsumersReport.custody.note && (
-                <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                  {vaultConsumersReport.custody.note}
+                        .vault_key_readable_by_group_or_other === true
+                        ? "#F87171"
+                        : vaultConsumersReport.custody
+                              .vault_key_readable_by_group_or_other === false
+                          ? "#34D399"
+                          : "var(--text-muted)",
+                  }}
+                >
+                  vault_key_readable_by_group_or_other:{" "}
+                  {vaultConsumersReport.custody
+                    .vault_key_readable_by_group_or_other === null
+                    ? "null"
+                    : String(
+                        vaultConsumersReport.custody
+                          .vault_key_readable_by_group_or_other,
+                      )}
                 </span>
-              )}
+              </div>
+              <span
+                data-testid="gate-vault-custody-note"
+                style={{ fontSize: "11px", color: "var(--text-muted)" }}
+              >
+                {vaultConsumersReport.custody.note}
+              </span>
             </div>
 
             <div
@@ -2157,8 +2091,24 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 fontSize: "12px",
               }}
             >
-              <strong>Last Denied Audit Entry</strong>
-              {vaultConsumersReport.last_denied ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <strong>Audit Tail Summary</strong>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="gate-vault-audit-state"
+                  style={{
+                    color:
+                      vaultConsumersReport.audit.state === "ok"
+                        ? "#34D399"
+                        : vaultConsumersReport.audit.state === "unverified"
+                          ? "#FBBF24"
+                          : "#F87171",
+                  }}
+                >
+                  state: {vaultConsumersReport.audit.state}
+                </span>
+              </div>
+              {vaultConsumersReport.audit.last_denied ? (
                 <div
                   data-testid="gate-vault-last-denied-detail"
                   style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}
@@ -2167,47 +2117,31 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                     className="fd-badge fd-mono"
                     style={{ color: "#F87171" }}
                   >
-                    outcome: {vaultConsumersReport.last_denied.outcome}
+                    outcome: {vaultConsumersReport.audit.last_denied.outcome}
                   </span>
-                  {vaultConsumersReport.last_denied.consumer && (
-                    <span className="fd-badge fd-mono">
-                      consumer: {vaultConsumersReport.last_denied.consumer}
-                    </span>
-                  )}
-                  {vaultConsumersReport.last_denied.action && (
-                    <span className="fd-badge fd-mono">
-                      action: {vaultConsumersReport.last_denied.action}
-                    </span>
-                  )}
-                  {vaultConsumersReport.last_denied.secret && (
-                    <span className="fd-badge fd-mono">
-                      secret: {vaultConsumersReport.last_denied.secret}
-                    </span>
-                  )}
-                  {vaultConsumersReport.last_denied.target_host && (
-                    <span className="fd-badge fd-mono">
-                      target_host: {vaultConsumersReport.last_denied.target_host}
-                    </span>
-                  )}
-                  {vaultConsumersReport.last_denied.ts && (
-                    <span className="fd-badge fd-mono">
-                      ts: {vaultConsumersReport.last_denied.ts}
-                    </span>
-                  )}
                 </div>
               ) : (
                 <span
                   data-testid="gate-vault-last-denied-empty"
-                  style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                  style={{
+                    fontSize: "11px",
+                    color:
+                      vaultConsumersReport.audit.state === "ok" ||
+                      vaultConsumersReport.audit.state === "unverified"
+                        ? "var(--text-muted)"
+                        : "#F87171",
+                  }}
                 >
-                  No refused Vault uses recorded in audit tail (last_denied: none)
+                  {vaultConsumersReport.audit.state === "ok" ||
+                  vaultConsumersReport.audit.state === "unverified"
+                    ? "No refused Vault uses recorded in audit tail (last_denied: null)"
+                    : `Audit log state is ${vaultConsumersReport.audit.state} (last_denied: null)`}
                 </span>
               )}
             </div>
           </div>
 
           {vaultConsumersReport.consumers.map((row) => {
-            const rowKey = row.consumer ?? row.id ?? "unknown-consumer";
             const classColor =
               row.class === "vault-ref"
                 ? "#38BDF8"
@@ -2218,9 +2152,9 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                     : "var(--text-muted)";
             return (
               <div
-                key={rowKey}
+                key={row.id}
                 className="fd-card"
-                data-testid={`gate-vault-consumer-row-${rowKey}`}
+                data-testid={`gate-vault-consumer-row-${row.id}`}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -2233,29 +2167,19 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                   <strong
                     className="fd-mono"
-                    data-testid={`gate-vault-consumer-name-${rowKey}`}
+                    data-testid={`gate-vault-consumer-name-${row.id}`}
                   >
-                    {rowKey}
+                    {row.id}
                   </strong>
-                  {row.label && row.label !== rowKey && (
-                    <span style={{ color: "var(--text-secondary)" }}>
-                      {row.label}
-                    </span>
-                  )}
-                  {row.vault_entry && (
-                    <span
-                      className="fd-badge fd-mono"
-                      data-testid={`gate-vault-consumer-entry-${rowKey}`}
-                    >
-                      vault_entry: {row.vault_entry}
-                      {row.vault_key_field
-                        ? ` (field: ${row.vault_key_field})`
-                        : ""}
-                    </span>
-                  )}
+                  <span
+                    data-testid={`gate-vault-consumer-label-${row.id}`}
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    {row.label}
+                  </span>
                   {row.evidence && (
                     <span
-                      data-testid={`gate-vault-consumer-evidence-${rowKey}`}
+                      data-testid={`gate-vault-consumer-evidence-${row.id}`}
                       style={{ fontSize: "11px", color: "var(--text-muted)" }}
                     >
                       {row.evidence}
@@ -2263,17 +2187,19 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                   )}
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-                  {typeof row.plaintext_path_present === "boolean" && (
-                    <span
-                      className="fd-badge fd-mono"
-                      data-testid={`gate-vault-consumer-plaintext-path-${rowKey}`}
-                    >
-                      plaintext_path_present: {String(row.plaintext_path_present)}
-                    </span>
-                  )}
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`gate-vault-consumer-plaintext-path-${row.id}`}
+                  >
+                    plaintext_path_present:{" "}
+                    {row.plaintext_path_present === null
+                      ? "null"
+                      : String(row.plaintext_path_present)}
+                  </span>
                   {row.last_denied?.outcome && (
                     <span
                       className="fd-badge fd-mono"
+                      data-testid={`gate-vault-consumer-denied-${row.id}`}
                       style={{ color: "#F87171" }}
                     >
                       last_denied: {row.last_denied.outcome}
@@ -2281,7 +2207,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                   )}
                   <span
                     className="fd-badge fd-mono"
-                    data-testid={`gate-vault-consumer-class-${rowKey}`}
+                    data-testid={`gate-vault-consumer-class-${row.id}`}
                     style={{ color: classColor }}
                   >
                     class: {row.class}

@@ -243,7 +243,12 @@ describe("Wave 7, Wave 13 & Wave 14 Item 1 (Record #81 / Gate G5): .fl/mcp.toml 
 });
 
 describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational FerroGate Vault Consumer Status UI (PR #261)", () => {
-  it("fetches GET /api/v1/gate/vault-consumers on load and refresh, renders consumers[], custody, last_denied, and verbatim disclaimer, and never fabricates cutover-complete", async () => {
+  it("fetches GET /api/v1/gate/vault-consumers on load and refresh, renders consumers[], custody, audit.state / audit.last_denied, and verbatim disclaimer, and never fabricates cutover-complete", async () => {
+    const exactDisclaimer =
+      "Configuration facts observed by this hub process: which source each consumer is set to read. A class of vault-ref means a Vault reference is configured, not that it works, and nothing here says a plaintext secret is gone. Verifying a cutover is the Owner-window drill (Gate G6 acceptance); this report does not perform it and never reports it.";
+    const exactCustodyNote =
+      "The Vault master key and the Vault file belong to one Unix user, and every FerroLoop process runs as that user. Any process of that user can read the key and decrypt every secret. Custody is file permission, not a separate signer boundary.";
+
     expect(ReExportedGateConsumers).toEqual(
       DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
     );
@@ -252,7 +257,7 @@ describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational
     );
     expect(
       DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.every(
-        (r) => r.class === "unknown" && r.plaintext_secrets === null,
+        (r) => r.class === "unknown" && r.plaintext_path_present === null,
       ),
     ).toBe(true);
 
@@ -282,9 +287,13 @@ describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational
     ).toContain("Custody: same-unix-user");
     expect(
       screen.getByTestId("gate-vault-consumer-disclaimer").textContent,
-    ).toContain(
-      "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.",
-    );
+    ).toBe(exactDisclaimer);
+    expect(
+      screen.getByTestId("gate-vault-custody-note").textContent,
+    ).toBe(exactCustodyNote);
+    expect(
+      screen.getByTestId("gate-vault-audit-state").textContent,
+    ).toBe("state: unverified");
     expect(screen.getByTestId("gate-vault-last-denied-empty")).toBeTruthy();
 
     for (const row of DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS) {
@@ -305,59 +314,65 @@ describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational
         "Refresh failed: backend /api/v1/gate/vault-consumers unavailable",
       );
       expect(
-        screen.getByTestId("gate-vault-consumer-class-github.reviewer")
-          .textContent,
+        screen.getByTestId(
+          "gate-vault-consumer-class-github-app-private-key",
+        ).textContent,
       ).toBe("class: unknown");
     });
 
-    // 200 OK with PR #261 observational payload renders consumers[], custody, last_denied, and disclaimer without ever claiming cutover-complete
-    const customDisclaimer =
-      "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.";
+    // 1. 200 OK with exact crates/hub/src/vault_consumers_api.rs:544-558 wire payload
     fetchSpy.mockResolvedValueOnce({
       ok: true,
       status: 200,
       json: async () => ({
-        consumers: [
-          {
-            consumer: "github.reviewer",
-            class: "vault-ref",
-            vault_entry: "GITHUB_APP_REVIEWER_PEM",
-            vault_key_field: "pem",
-            evidence:
-              "`[github] private_key_ref` is configured to a secret named GITHUB_APP_REVIEWER_PEM",
-            plaintext_path_present: false,
-          },
-          {
-            consumer: "hub-owner-token",
-            class: "plaintext-file",
-            vault_entry: null,
-            vault_key_field: null,
-            evidence: "`[hub] owner_token_file` names the token file",
-            plaintext_path_present: true,
-          },
-          {
-            consumer: "vendor:openai",
-            class: "unconfigured",
-            vault_entry: null,
-            vault_key_field: null,
-            evidence: "$OPENAI_API_KEY is not set; no Vault secret is named",
-            plaintext_path_present: false,
-          },
-        ],
+        schema_version: 1,
+        disclaimer: exactDisclaimer,
         custody: {
           mode: "same-unix-user",
-          master_key_source: "key-file",
-          key_file_mode: "0600",
+          note: exactCustodyNote,
+          vault_key_readable_by_group_or_other: false,
+          vault_key_mode: "0600",
         },
-        last_denied: {
-          ts: "2026-11-03T13:00:00Z",
-          consumer: "github.reviewer",
-          action: "sign_jwt",
-          secret: "GITHUB_APP_REVIEWER_PEM",
-          target_host: "evil.example.com",
-          outcome: "denied:host_not_allowed",
+        consumers: [
+          {
+            id: "github-app-private-key",
+            label: "GitHub App private key",
+            class: "vault-ref",
+            evidence:
+              "`[github] private_key_ref` is configured to a secret named GITHUB_APP_KEY; the Vault lists a secret of that name",
+            plaintext_path_present: false,
+            last_denied: { outcome: "denied:host" },
+          },
+          {
+            id: "hub-owner-token",
+            label: "Hub owner token",
+            class: "plaintext-file",
+            evidence:
+              "`[hub] owner_token_file` names the token file (an inbound credential callers present to this hub, which the Vault cannot broker)",
+            plaintext_path_present: true,
+            last_denied: null,
+          },
+          {
+            id: "vendor:openai",
+            label: "Vendor API key (openai)",
+            class: "unconfigured",
+            evidence: "$OPENAI_API_KEY is not set; no Vault secret is named",
+            plaintext_path_present: false,
+            last_denied: null,
+          },
+          {
+            id: "vault-master-key",
+            label: "Vault master key",
+            class: "plaintext-file",
+            evidence: "the master key is a file on disk (`vault.key`)",
+            plaintext_path_present: true,
+            last_denied: null,
+          },
+        ],
+        audit: {
+          state: "ok",
+          last_denied: { outcome: "denied:agent" },
         },
-        disclaimer: customDisclaimer,
       }),
     } as Response);
 
@@ -368,39 +383,41 @@ describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational
       ).toBe("Observational Config & Audit Read Only");
       expect(
         screen.getByTestId("gate-vault-consumer-disclaimer").textContent,
-      ).toBe(customDisclaimer);
+      ).toBe(exactDisclaimer);
       expect(
         screen.getByTestId("gate-vault-custody-mode").textContent,
       ).toBe("mode: same-unix-user");
       expect(
-        screen.getByTestId("gate-vault-custody-key-source").textContent,
-      ).toBe("master_key_source: key-file");
-      expect(
         screen.getByTestId("gate-vault-custody-key-mode").textContent,
-      ).toBe("key_file_mode: 0600");
-
-      // Last denied details
-      const deniedDetail = screen.getByTestId("gate-vault-last-denied-detail");
-      expect(deniedDetail.textContent).toContain(
-        "outcome: denied:host_not_allowed",
-      );
-      expect(deniedDetail.textContent).toContain("consumer: github.reviewer");
-      expect(deniedDetail.textContent).toContain(
-        "secret: GITHUB_APP_REVIEWER_PEM",
-      );
-      expect(deniedDetail.textContent).toContain(
-        "target_host: evil.example.com",
-      );
-
-      // Consumers classes & vault_entry / vault_key_field
+      ).toBe("vault_key_mode: 0600");
       expect(
-        screen.getByTestId("gate-vault-consumer-class-github.reviewer")
-          .textContent,
+        screen.getByTestId("gate-vault-custody-readable").textContent,
+      ).toBe("vault_key_readable_by_group_or_other: false");
+
+      // Audit state and last_denied details
+      expect(
+        screen.getByTestId("gate-vault-audit-state").textContent,
+      ).toBe("state: ok");
+      expect(
+        screen.getByTestId("gate-vault-last-denied-detail").textContent,
+      ).toContain("outcome: denied:agent");
+
+      // Consumers classes, evidence, plaintext_path_present, and per-consumer last_denied
+      expect(
+        screen.getByTestId(
+          "gate-vault-consumer-class-github-app-private-key",
+        ).textContent,
       ).toBe("class: vault-ref");
       expect(
-        screen.getByTestId("gate-vault-consumer-entry-github.reviewer")
-          .textContent,
-      ).toBe("vault_entry: GITHUB_APP_REVIEWER_PEM (field: pem)");
+        screen.getByTestId(
+          "gate-vault-consumer-evidence-github-app-private-key",
+        ).textContent,
+      ).toContain("GITHUB_APP_KEY");
+      expect(
+        screen.getByTestId(
+          "gate-vault-consumer-denied-github-app-private-key",
+        ).textContent,
+      ).toBe("last_denied: denied:host");
       expect(
         screen.getByTestId("gate-vault-consumer-class-hub-owner-token")
           .textContent,
@@ -413,6 +430,47 @@ describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational
         screen.getByTestId("gate-vault-consumer-class-vendor:openai")
           .textContent,
       ).toBe("class: unconfigured");
+      expect(
+        screen.getByTestId("gate-vault-consumer-class-vault-master-key")
+          .textContent,
+      ).toBe("class: plaintext-file");
+    });
+
+    // 2. Non-"ok" audit.state (e.g. "symlink" / "unreadable") is surfaced clearly and never looks like a clean audit log
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        schema_version: 1,
+        disclaimer: exactDisclaimer,
+        custody: {
+          mode: "same-unix-user",
+          note: exactCustodyNote,
+          vault_key_readable_by_group_or_other: true,
+          vault_key_mode: "0644",
+        },
+        consumers: DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
+        audit: {
+          state: "symlink",
+          last_denied: null,
+        },
+      }),
+    } as Response);
+
+    fireEvent.click(screen.getByTestId("gate-vault-consumer-verify-btn"));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("gate-vault-audit-state").textContent,
+      ).toBe("state: symlink");
+      expect(
+        screen.getByTestId("gate-vault-last-denied-empty").textContent,
+      ).toContain("Audit log state is symlink (last_denied: null)");
+      expect(
+        screen.getByTestId("gate-vault-custody-readable").textContent,
+      ).toBe("vault_key_readable_by_group_or_other: true");
+      expect(
+        screen.getByTestId("gate-vault-custody-key-mode").textContent,
+      ).toBe("vault_key_mode: 0644");
     });
 
     // Strict No-False-Passes invariant: never renders "cutover-complete"

@@ -1336,49 +1336,45 @@ export type VaultConsumerSourceClass =
   | "unconfigured"
   | "unknown";
 
+export type VaultAuditState =
+  | "ok"
+  | "absent"
+  | "symlink"
+  | "unreadable"
+  | "not-a-regular-file"
+  | "unverified";
+
 export interface VaultConsumerDeniedInfo {
   outcome: string;
-  ts?: string | null;
-  consumer?: string | null;
-  action?: string | null;
-  secret?: string | null;
-  target_host?: string | null;
 }
 
 export interface VaultConsumerReportEntry {
-  id?: string;
-  consumer?: string;
-  label?: string;
+  id: string;
+  label: string;
   class: VaultConsumerSourceClass;
-  evidence?: string;
-  plaintext_path_present?: boolean | null;
-  vault_entry?: string | null;
-  vault_key_field?: string | null;
-  last_denied?: VaultConsumerDeniedInfo | null;
+  evidence: string;
+  plaintext_path_present: boolean | null;
+  last_denied: VaultConsumerDeniedInfo | null;
 }
 
 export interface VaultCustodySummary {
   mode: string;
-  note?: string;
-  master_key_source?: "env" | "key-file" | "missing" | string | null;
-  master_key_Source?: "env" | "key-file" | "missing" | string | null;
-  key_file_mode?: string | null;
-  vault_key_mode?: string | null;
-  vault_key_readable_by_group_or_other?: boolean | null;
+  note: string;
+  vault_key_readable_by_group_or_other: boolean | null;
+  vault_key_mode: string | null;
 }
 
 export interface VaultConsumersAuditSummary {
-  state: string;
+  state: VaultAuditState | string;
   last_denied: VaultConsumerDeniedInfo | null;
 }
 
 export interface VaultConsumersReport {
-  schema_version?: number;
+  schema_version: number;
   disclaimer: string;
   custody: VaultCustodySummary;
   consumers: VaultConsumerReportEntry[];
-  audit?: VaultConsumersAuditSummary | null;
-  last_denied?: VaultConsumerDeniedInfo | null;
+  audit: VaultConsumersAuditSummary;
 }
 
 export interface EnrolledNode {
