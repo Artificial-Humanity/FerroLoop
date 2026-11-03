@@ -264,7 +264,11 @@ describe("RosterSidebar", () => {
     const globalControls = screen.getByTestId("roster-global-controls");
     expect(globalControls).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTestId("settings-modal-btn"));
+    const settingsModalBtn = screen.getByTestId("settings-modal-btn");
+    const gearIcon = settingsModalBtn.querySelector(".fd-gear-icon") as HTMLElement | null;
+    expect(gearIcon).not.toBeNull();
+    expect(gearIcon?.style.fontSize).toBe("20px");
+    fireEvent.click(settingsModalBtn);
     expect(onOpenSettingsModal).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByTestId("context-help-btn"));

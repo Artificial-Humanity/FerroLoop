@@ -392,7 +392,7 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 .fd-gear-icon {
-  font-size: calc(16px * var(--fd-font-scale, 1));
+  font-size: calc(20px * var(--fd-font-scale, 1));
   line-height: 1;
   display: inline-block;
 }
