@@ -453,7 +453,7 @@ fn a_reader_always_sees_a_complete_release_through_current_during_flips() {
     // Flip until a reader has seen two different releases (bounded by time, not by a count of
     // reads: a slow machine only takes longer). A reader that sees an inconsistent release
     // panics, which fails the join below.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
     for m in ms.iter().skip(1).cycle() {
         w.install(m);
         if seen.lock().unwrap().len() >= 2 || std::time::Instant::now() >= deadline {
@@ -1393,6 +1393,93 @@ fn a_stale_lock_record_is_recovered() {
     assert_eq!(r.outcome, Outcome::Installed);
 }
 
+/// Run `n` installers at once, `manifest_of(i)` each, and wait for all of them for at most
+/// `limit` in all. A worker that is still going at the deadline cannot be stopped (it is a
+/// thread): the panic names which ones finished and what the rest were doing, so a hang is a
+/// diagnosis, not a stalled run.
+fn apply_concurrently(
+    w: &std::sync::Arc<World>,
+    n: usize,
+    manifest_of: impl Fn(usize) -> ReleaseManifest,
+    limit: Duration,
+) -> Vec<Result<ApplyReport>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for i in 0..n {
+        let (w, m, tx) = (w.clone(), manifest_of(i), tx.clone());
+        std::thread::Builder::new()
+            .name(format!("installer-{i}"))
+            .spawn(move || {
+                let mut env = w.env();
+                // Far longer than any loaded machine needs: the wait is the lock's job and is
+                // not what this test measures.
+                env.lock_timeout = Duration::from_secs(600);
+                let _ = tx.send((i, w.apply_with(&m, None, &Decisions::default(), &env)));
+            })
+            .unwrap();
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + limit;
+    let mut done: Vec<Option<Result<ApplyReport>>> = (0..n).map(|_| None).collect();
+    while done.iter().any(Option::is_none) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((i, r)) => done[i] = Some(r),
+            Err(_) => {
+                let state: Vec<String> = done
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| match d {
+                        None => format!("installer-{i}: still running"),
+                        Some(Ok(r)) => format!("installer-{i}: {:?}", r.outcome),
+                        Some(Err(e)) => format!("installer-{i}: {e}"),
+                    })
+                    .collect();
+                panic!(
+                    "the installers did not all finish within {limit:?} (journal present: {}, \
+                     lock record: {:?})\n{}",
+                    w.prefix().join("journal.jsonl").exists(),
+                    fs::read_to_string(w.prefix().join("install.lock")).ok(),
+                    state.join("\n")
+                );
+            }
+        }
+    }
+    done.into_iter().map(Option::unwrap).collect()
+}
+
+/// What must hold however the installers were scheduled: every one of them exits 0 (the only
+/// other documented exit is 3, a refusal or `Busy`, and neither is right here: no conflict
+/// exists and the lock wait is long), the install is one complete release, and the receipt, the
+/// `current` link, the launcher and the journal agree.
+fn assert_install_is_whole(
+    w: &World,
+    results: &[Result<ApplyReport>],
+    names: &[String],
+) -> InstallReceipt {
+    for (i, r) in results.iter().enumerate() {
+        if let Err(e) = r {
+            panic!("installer-{i} failed with exit code {}: {e}", e.exit_code());
+        }
+    }
+    let rc = w.receipt();
+    assert!(names.contains(&rc.release.name), "{}", rc.release.name);
+    let cur = fs::read_link(w.prefix().join("current")).unwrap();
+    assert_eq!(cur, PathBuf::from(format!("releases/{}", rc.release.name)));
+    assert!(w.bin().join("fl").is_file());
+    assert!(w.prefix().join("current/bin/fl").is_file());
+    assert!(!w.prefix().join("journal.jsonl").exists());
+    let seqs: Vec<u64> = rc.journal.iter().map(|j| j.seq).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    for p in &rc.paths {
+        assert!(
+            fs::symlink_metadata(&p.path).is_ok(),
+            "{} owned but missing",
+            p.path
+        );
+    }
+    rc
+}
+
 #[test]
 fn concurrent_installers_never_corrupt_the_install() {
     for same in [true, false] {
@@ -1400,47 +1487,80 @@ fn concurrent_installers_never_corrupt_the_install() {
         let ms: Vec<_> = (0..4)
             .map(|i| w.release(&format!("0.{}.0", if same { 1 } else { i + 1 }), "x"))
             .collect();
-        let handles: Vec<_> = (0..8)
-            .map(|i| {
-                let w = w.clone();
-                let m = ms[i % ms.len()].clone();
-                std::thread::spawn(move || {
-                    let mut env = w.env();
-                    env.lock_timeout = Duration::from_secs(60);
-                    w.apply_with(&m, None, &Decisions::default(), &env)
-                })
-            })
-            .collect();
-        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        for r in &results {
-            assert!(r.is_ok(), "{:?}", r.as_ref().err());
-        }
+        let names: Vec<String> = ms.iter().map(fixture::release_name).collect();
+        let results = apply_concurrently(
+            &w,
+            8,
+            |i| ms[i % ms.len()].clone(),
+            Duration::from_secs(300),
+        );
+        let rc = assert_install_is_whole(&w, &results, &names);
         let installed = results
             .iter()
             .filter(|r| r.as_ref().unwrap().outcome == Outcome::Installed)
             .count();
-        let rc = w.receipt();
         if same {
+            // one release, eight takers: exactly one transaction did the work
             assert_eq!(installed, 1, "exactly one transaction did the work");
             assert_eq!(rc.journal.len(), 1);
         } else {
+            // every transaction that changed anything is in the journal, and no other is
             assert_eq!(installed, rc.journal.len());
-        }
-        // consistent: receipt, current and launcher agree; the journal is closed
-        let cur = fs::read_link(w.prefix().join("current")).unwrap();
-        assert_eq!(cur, PathBuf::from(format!("releases/{}", rc.release.name)));
-        assert!(w.bin().join("fl").is_file());
-        assert!(!w.prefix().join("journal.jsonl").exists());
-        let seqs: Vec<u64> = rc.journal.iter().map(|j| j.seq).collect();
-        assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
-        for p in &rc.paths {
-            assert!(
-                fs::symlink_metadata(&p.path).is_ok(),
-                "{} owned but missing",
-                p.path
-            );
+            assert!(installed >= 1);
         }
     }
+}
+
+#[test]
+fn a_conflict_seen_while_another_installer_holds_the_lock_is_not_final() {
+    // The look an installer takes before it has the lock can land in the middle of another
+    // installer's transaction (links made, receipt not yet written) and see a conflict that is
+    // gone by the time the lock is free. The refusal comes from the plan made under the lock.
+    let w = std::sync::Arc::new(World::new(Kind::Explicit));
+    let m = w.release("0.1.0", "a");
+    fs::create_dir_all(w.prefix()).unwrap();
+    let guard = acquire_lock(&w.prefix().join("install.lock"), Duration::ZERO, || Ok(())).unwrap();
+    let current = w.prefix().join("current");
+    symlink("elsewhere", &current).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            let mut env = w.env();
+            env.lock_timeout = Duration::from_secs(300);
+            let _ = tx.send(w.apply_with(&m, None, &Decisions::default(), &env));
+        })
+    };
+    // It waits for the lock; it does not refuse on the conflict it can see meanwhile.
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    fs::remove_file(&current).unwrap();
+    drop(guard);
+    let r = rx
+        .recv_timeout(Duration::from_secs(300))
+        .expect("the installer finishes once the lock is free")
+        .expect("no conflict is left");
+    assert_eq!(r.outcome, Outcome::Installed);
+    worker.join().unwrap();
+
+    // A conflict that is still there under the lock is refused, and nothing is changed.
+    let w2 = World::new(Kind::Explicit);
+    fs::create_dir_all(w2.prefix()).unwrap();
+    symlink("elsewhere", w2.prefix().join("current")).unwrap();
+    let e = w2
+        .apply_with(
+            &w2.release("0.1.0", "a"),
+            None,
+            &Decisions::default(),
+            &w2.env(),
+        )
+        .unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert!(e.to_string().contains("conflict"), "{e}");
+    assert_eq!(
+        fs::read_link(w2.prefix().join("current")).unwrap(),
+        PathBuf::from("elsewhere")
+    );
+    assert!(!w2.prefix().join("journal.jsonl").exists());
 }
 
 #[test]

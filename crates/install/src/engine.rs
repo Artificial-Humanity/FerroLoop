@@ -1987,21 +1987,33 @@ fn apply_trusted(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
     // recovery that runs under the lock.)
     let mut source = None;
     if lstat(&paths.journal)?.is_none() {
-        let pre = make_plan(env, &paths, args, &probe)?;
-        resolve_decisions(&pre.plan, args.decisions, &safe)?;
-        let will_stage = {
-            let rd = pre.plan.paths.iter().find(|p| p.role == PathRole::Release);
-            rd.is_some_and(|p| {
-                p.disposition == Disposition::Create
-                    || args
-                        .decisions
-                        .replace
-                        .iter()
-                        .any(|r| safe.lexical(r).ok() == safe.lexical(&p.path).ok())
-            })
-        };
-        if will_stage {
-            source = Some(prepare_source(args, &pre.plan)?);
+        // This look is taken without the lock, so it can land in the middle of another
+        // installer's transaction (its links made, its receipt not yet written) and read that
+        // as a conflict. A refusal is therefore not final here: the plan is made again under
+        // the lock, which is the one that decides. Any other error is not about what is on disk.
+        let pre = make_plan(env, &paths, args, &probe).and_then(|pre| {
+            resolve_decisions(&pre.plan, args.decisions, &safe)?;
+            Ok(pre)
+        });
+        match pre {
+            Ok(pre) => {
+                let will_stage = {
+                    let rd = pre.plan.paths.iter().find(|p| p.role == PathRole::Release);
+                    rd.is_some_and(|p| {
+                        p.disposition == Disposition::Create
+                            || args
+                                .decisions
+                                .replace
+                                .iter()
+                                .any(|r| safe.lexical(r).ok() == safe.lexical(&p.path).ok())
+                    })
+                };
+                if will_stage {
+                    source = Some(prepare_source(args, &pre.plan)?);
+                }
+            }
+            Err(InstallError::Refused(_)) => {}
+            Err(e) => return Err(e),
         }
     }
 
