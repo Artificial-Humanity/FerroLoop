@@ -40,6 +40,9 @@ File naming in this directory follows
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.
+* [vendor-child-env.md](vendor-child-env.md) — the environment a spawned vendor CLI sees: the
+  allow-list, each dialect's own credential variables, what is denied, and how to add a variable
+  with `[adapters.<name>] env_pass` (corporate proxy and Bedrock examples).
 
 ## CLI & Hub capabilities overview
 

@@ -52,6 +52,12 @@ impl AntigravityAdapter {
         self
     }
 
+    /// Names parent variables to copy to the child (see [`crate::child_env`]).
+    pub fn with_env_pass(mut self, names: Vec<String>) -> Self {
+        self.harness = self.harness.with_env_pass(names);
+        self
+    }
+
     pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.harness = self.harness.with_heartbeat_interval(interval);
         self

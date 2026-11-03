@@ -6183,6 +6183,7 @@ fn handle_post_workflow_step(
         step_id: payload.step_id,
         adapter_override: payload.adapter,
         binary_override: payload.binary,
+        env_pass: Vec::new(),
         rate_card: None,
         timeout_secs: payload.timeout_secs.unwrap_or(900),
         budget_usd_micros: 1_000_000,

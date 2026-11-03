@@ -147,11 +147,14 @@ pub(crate) fn build_adapter(
         Target::Kind(kind) => {
             let binary = binary.or_else(|| adapters.get(kind).and_then(|c| c.binary.clone()));
             let rate_card = adapters.get(kind).and_then(|c| c.rate_card());
+            let env_pass = adapters
+                .get(kind)
+                .map(|c| c.env_pass.clone())
+                .unwrap_or_default();
             let (entry, project, agent, sink) = liveness;
-            Ok(
-                AnyAdapter::new(*kind, binary, rate_card)
-                    .with_liveness(entry, project, agent, sink),
-            )
+            Ok(AnyAdapter::new(*kind, binary, rate_card)
+                .with_env_pass(env_pass)
+                .with_liveness(entry, project, agent, sink))
         }
         Target::Vendor(id) => {
             let cfg = vendors.get(id).cloned().unwrap_or_default();
