@@ -62,6 +62,23 @@ pub enum VendorRoute {
     Webhook { socket_path: PathBuf },
 }
 
+impl VendorRoute {
+    pub fn session_identity(&self) -> Option<(&'static str, &str)> {
+        let (kind, raw_id) = match self {
+            Self::Claude { session_id, .. } => ("claude", session_id.as_str()),
+            Self::Agy {
+                conversation_id, ..
+            } => ("agy", conversation_id.as_str()),
+            Self::Codex { thread_id, .. } => ("codex", thread_id.as_str()),
+            Self::Muse { session_id, .. } => ("muse", session_id.as_str()),
+            Self::Grok { session_id, .. } => ("grok", session_id.as_str()),
+            Self::Webhook { .. } => return None,
+        };
+        let id = raw_id.trim();
+        (!id.is_empty()).then_some((kind, id))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub persona: String,
@@ -294,6 +311,39 @@ impl RouteTable {
 
     pub fn merge_newer(&mut self, other: Self) {
         for (k, mut v) in other.entries {
+            if let Some((target_kind, target_id)) = v
+                .route
+                .session_identity()
+                .map(|(kind, id)| (kind, id.to_string()))
+            {
+                let target_sid = (target_kind, target_id.as_str());
+                let mut beaten_by_same_sid = false;
+                for existing in self.entries.values_mut() {
+                    if existing.route.session_identity() == Some(target_sid)
+                        && existing.updated_at.unix_millis() >= v.updated_at.unix_millis()
+                    {
+                        preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                        beaten_by_same_sid = true;
+                    }
+                }
+                if beaten_by_same_sid {
+                    continue;
+                }
+                if let Some(existing) = self.entries.get_mut(&k)
+                    && existing.updated_at.unix_millis() >= v.updated_at.unix_millis()
+                {
+                    preserve_muse_tmux_fields(&mut existing.route, &v.route);
+                    continue;
+                }
+                self.entries.retain(|existing_k, old| {
+                    if old.route.session_identity() == Some(target_sid) {
+                        preserve_muse_tmux_fields(&mut v.route, &old.route);
+                        existing_k == &k
+                    } else {
+                        true
+                    }
+                });
+            }
             match self.entries.get_mut(&k) {
                 Some(existing)
                     if existing.updated_at.unix_millis() >= v.updated_at.unix_millis() =>
@@ -417,6 +467,20 @@ impl RouteTable {
             if let Some(existing) = self.entries.get(&norm) {
                 preserve_muse_tmux_fields(&mut route, &existing.route);
             }
+            if let Some((target_kind, target_id)) = route
+                .session_identity()
+                .map(|(kind, id)| (kind, id.to_string()))
+            {
+                let target_sid = (target_kind, target_id.as_str());
+                self.entries.retain(|k, existing| {
+                    if existing.route.session_identity() == Some(target_sid) {
+                        preserve_muse_tmux_fields(&mut route, &existing.route);
+                        k == &norm
+                    } else {
+                        true
+                    }
+                });
+            }
             self.entries.insert(
                 norm.clone(),
                 RouteEntry {
@@ -438,15 +502,25 @@ impl RouteTable {
         } else {
             now.clone()
         };
-        if let Some(norm) = normalize_persona(persona)
-            && self
-                .entries
-                .get(&norm)
-                .is_some_and(|existing| existing.updated_at.unix_millis() > file_at.unix_millis())
+        let Some(norm) = normalize_persona(persona) else {
+            return;
+        };
+        if self
+            .entries
+            .get(&norm)
+            .is_some_and(|existing| existing.updated_at.unix_millis() > file_at.unix_millis())
         {
             return;
         }
-        self.upsert(persona, route, file_at);
+        if let Some(target_sid) = route.session_identity()
+            && self.entries.values().any(|existing| {
+                existing.route.session_identity() == Some(target_sid)
+                    && existing.updated_at.unix_millis() > file_at.unix_millis()
+            })
+        {
+            return;
+        }
+        self.upsert(&norm, route, file_at);
     }
 
     pub fn get(&self, persona: &str) -> Option<&RouteEntry> {
@@ -865,8 +939,6 @@ impl RouteTable {
                 let persona_raw = val
                     .get("agentName")
                     .or_else(|| val.get("persona"))
-                    .or_else(|| val.get("thread_name"))
-                    .or_else(|| val.get("title"))
                     .and_then(|v| v.as_str());
                 let Some(persona) = persona_raw.and_then(normalize_persona) else {
                     continue;
@@ -2173,6 +2245,9 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
     if first_system_message_is_grok_subagent(text) {
         return None;
     }
+    let mut latest_field: Option<String> = None;
+    let mut latest_registered: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
     for line in text.lines().take(max_lines) {
         if line.trim().is_empty() {
             continue;
@@ -2183,7 +2258,7 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
                     if let Some(s) = val.get(field).and_then(|v| v.as_str())
                         && let Some(norm) = normalize_claude_session_name(s)
                     {
-                        return Some(norm);
+                        latest_field = Some(norm);
                     }
                 }
                 if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
@@ -2266,12 +2341,20 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
             };
         let lower = candidate_text.to_ascii_lowercase();
         for marker in [
-            "take the name of ",
             "agent-msg register ",
             "fl wire register ",
+            "fl agent register ",
+            "take the name of ",
             "you will be ",
             "you are ",
         ] {
+            let is_reg = matches!(
+                marker,
+                "agent-msg register " | "fl wire register " | "fl agent register "
+            );
+            if !is_reg && first_prompt.is_some() {
+                continue;
+            }
             if let Some(idx) = lower.find(marker) {
                 let after = &candidate_text[idx + marker.len()..];
                 let token: String = after
@@ -2289,6 +2372,7 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
                     token_lower.as_str(),
                     "a" | "an"
                         | "the"
+                        | "highly"
                         | "now"
                         | "in"
                         | "on"
@@ -2320,12 +2404,16 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
                     continue;
                 }
                 if let Some(norm) = normalize_claude_session_name(&token) {
-                    return Some(norm);
+                    if is_reg {
+                        latest_registered = Some(norm);
+                    } else {
+                        first_prompt = Some(norm);
+                    }
                 }
             }
         }
     }
-    None
+    latest_field.or(latest_registered).or(first_prompt)
 }
 
 /// The Grok route for the environment's `GROK_SESSION_ID`, or `None` when that session is a
@@ -2566,58 +2654,37 @@ fn resolve_persona_traced(
     }
 
     let routes = load_routes();
-    if let Some(claude_sid) = get_str("CLAUDE_SESSION_ID")
-        && !claude_sid.is_empty()
-    {
-        for entry in routes.entries.values() {
-            if let VendorRoute::Claude { session_id, .. } = &entry.route
-                && session_id == &claude_sid
-            {
-                return inferred(entry.persona.clone());
-            }
-        }
-    }
-    if let Some(agy_cid) = get_str("ANTIGRAVITY_CONVERSATION_ID")
-        && !agy_cid.is_empty()
-    {
-        for entry in routes.entries.values() {
-            if let VendorRoute::Agy {
-                conversation_id, ..
-            } = &entry.route
-                && conversation_id == &agy_cid
-            {
-                return inferred(entry.persona.clone());
-            }
-        }
-    }
-    if let Some(codex_tid) = get_str("CODEX_THREAD_ID")
-        && !codex_tid.is_empty()
-    {
-        for entry in routes.entries.values() {
-            if let VendorRoute::Codex { thread_id, .. } = &entry.route
-                && thread_id == &codex_tid
-            {
-                return inferred(entry.persona.clone());
-            }
-        }
-    }
-    if let Some(muse_sid) = get_str("MUSE_SESSION_ID")
-        && !muse_sid.is_empty()
-    {
-        for entry in routes.entries.values() {
-            if let VendorRoute::Muse { session_id, .. } = &entry.route
-                && session_id == &muse_sid
-            {
-                return inferred(entry.persona.clone());
-            }
-        }
-    }
-    if let Some(grok_sid) = get_str("GROK_SESSION_ID")
-        && !grok_sid.is_empty()
-    {
-        for entry in routes.entries.values() {
-            if let VendorRoute::Grok { session_id, .. } = &entry.route
-                && session_id == &grok_sid
+    for (env_var, kind) in [
+        ("CLAUDE_SESSION_ID", "claude"),
+        ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
+        ("CODEX_THREAD_ID", "codex"),
+        ("MUSE_SESSION_ID", "muse"),
+        ("GROK_SESSION_ID", "grok"),
+    ] {
+        if let Some(sid) = get_str(env_var)
+            && !sid.trim().is_empty()
+        {
+            let target = (kind, sid.trim());
+            let registered_active: BTreeSet<String> = registry
+                .and_then(|reg| reg.list_agents(None, false).ok())
+                .map(|agents| {
+                    agents
+                        .into_iter()
+                        .filter(|a| a.status == AgentStatus::Active)
+                        .map(|a| a.name_key.to_ascii_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(entry) = routes
+                .entries
+                .values()
+                .filter(|entry| entry.route.session_identity() == Some(target))
+                .max_by_key(|entry| {
+                    (
+                        registered_active.contains(&entry.persona.to_ascii_lowercase()),
+                        entry.updated_at.unix_millis(),
+                    )
+                })
             {
                 return inferred(entry.persona.clone());
             }
@@ -2825,11 +2892,29 @@ fn resolve_cwd_persona_md(cwd: &Path) -> Option<String> {
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                     .collect();
-                if !candidate.eq_ignore_ascii_case("the")
-                    && !candidate.eq_ignore_ascii_case("a")
-                    && !candidate.eq_ignore_ascii_case("an")
-                    && let Some(norm) = normalize_persona(&candidate)
+                if !candidate
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
                 {
+                    continue;
+                }
+                let lower = candidate.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "the"
+                        | "a"
+                        | "an"
+                        | "highly"
+                        | "resident"
+                        | "senior"
+                        | "working"
+                        | "running"
+                        | "interactive"
+                ) {
+                    continue;
+                }
+                if let Some(norm) = normalize_persona(&candidate) {
                     return Some(norm);
                 }
             }
@@ -4653,8 +4738,8 @@ mod tests {
     #[test]
     fn upsert_ignores_names_that_are_not_valid_personas() {
         let mut table = RouteTable::default();
-        let route = || VendorRoute::Codex {
-            thread_id: "t".into(),
+        let route = |id: &str| VendorRoute::Codex {
+            thread_id: id.into(),
             cwd: None,
         };
         for bad in [
@@ -4666,11 +4751,11 @@ mod tests {
             "../etc",
             "x".repeat(65).as_str(),
         ] {
-            table.upsert(bad, route(), At::from_unix_millis(1));
+            table.upsert(bad, route("t"), At::from_unix_millis(1));
         }
         assert!(table.entries.is_empty());
-        table.upsert("  Mixed_Case-9  ", route(), At::from_unix_millis(1));
-        table.upsert(&"a".repeat(64), route(), At::from_unix_millis(1));
+        table.upsert("  Mixed_Case-9  ", route("t1"), At::from_unix_millis(1));
+        table.upsert(&"a".repeat(64), route("t2"), At::from_unix_millis(1));
         assert!(table.get("mixed_case-9").is_some());
         assert!(table.get("MIXED_CASE-9").is_some());
         assert_eq!(table.entries.len(), 2);
@@ -5644,5 +5729,184 @@ mod tests {
             parse_tmux_windows("Kacey:muse\nFelix:a:b\n\nnocolon\n:x\ny:\n"),
             windows(&[("Kacey", "muse"), ("Felix", "a:b")])
         );
+    }
+
+    #[test]
+    fn resolve_cwd_persona_md_ignores_name_agnostic_prose_and_accepts_proper_names() {
+        let tmp = TempDir::new().unwrap();
+        let competitive_dir = tmp.path().join("kaggle-gemma4");
+        fs::create_dir_all(&competitive_dir).unwrap();
+        fs::write(
+            competitive_dir.join("PERSONA.md"),
+            "# Kaggle Persona\n\nYou are highly competitive and rigorous.\nYou are a resident engineer.\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_cwd_persona_md(&competitive_dir), None);
+
+        let named_dir = tmp.path().join("ai-lab");
+        fs::create_dir_all(&named_dir).unwrap();
+        fs::write(
+            named_dir.join("PERSONA.md"),
+            "# Lab Manager\n\nYou are Jarvis, the lab manager for AI-Lab-0.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_cwd_persona_md(&named_dir).as_deref(),
+            Some("jarvis")
+        );
+    }
+
+    #[test]
+    fn scan_text_for_persona_prefers_later_registration_and_latest_field_over_early_typo() {
+        let prompt_then_reg = [
+            serde_json::json!({
+                "type": "USER_INPUT",
+                "content": "You are Kayce, take up residence in Kaggle-Gemma4."
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "arguments": {"cmd": "agent-msg register Kacey --project Kaggle-Gemma4 --role journalist"}
+                }]
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            scan_text_for_persona(&prompt_then_reg, 50).as_deref(),
+            Some("kacey")
+        );
+
+        let typo_then_rename = [
+            serde_json::json!({"type": "custom-title", "customTitle": "Ferrisd"}).to_string(),
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": "You are Ferrisd"}}).to_string(),
+            serde_json::json!({"type": "agent-name", "agentName": "Ferris"}).to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            scan_text_for_persona(&typo_then_rename, 50).as_deref(),
+            Some("ferris")
+        );
+    }
+
+    #[test]
+    fn discover_codex_routes_ignores_thread_name_and_title_in_session_index() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            [
+                serde_json::json!({
+                    "id": "thread-update",
+                    "thread_name": "Update",
+                    "title": "Update",
+                    "cwd": "/tmp"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "id": "thread-kage",
+                    "agentName": "Kage",
+                    "thread_name": "Update",
+                    "cwd": "/tmp"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::from_unix_millis(100));
+        assert!(table.get("update").is_none(), "{:?}", table.entries);
+        assert!(matches!(
+            table.get("kage").map(|e| &e.route),
+            Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "thread-kage"
+        ));
+    }
+
+    #[test]
+    fn route_table_deduplicates_session_ids_and_resolve_persona_prefers_registered_newest() {
+        let agy = |cid: &str| VendorRoute::Agy {
+            conversation_id: cid.into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        let mut table = RouteTable::default();
+        table.upsert("highly", agy("conv-kayla"), At::from_unix_millis(100));
+        table.upsert("kayla", agy("conv-kayla"), At::from_unix_millis(200));
+        assert!(table.get("highly").is_none(), "stale alias must be evicted");
+        assert!(table.get("kayla").is_some());
+
+        // Merging an older alias with the same conversation_id must be ignored;
+        // merging a newer canonical persona must evict the older alias.
+        let mut stale_other = RouteTable::default();
+        stale_other.upsert("highly", agy("conv-kayla"), At::from_unix_millis(150));
+        stale_other.upsert("sonya", agy("conv-sonya"), At::from_unix_millis(300));
+        table.upsert("github-44", agy("conv-sonya"), At::from_unix_millis(100));
+        table.merge_newer(stale_other);
+        assert!(table.get("highly").is_none());
+        assert!(table.get("kayla").is_some());
+        assert!(table.get("github-44").is_none());
+        assert!(table.get("sonya").is_some());
+
+        // When routes loaded from disk contain both an alphabetically earlier alias and the
+        // canonical persona for the same session ID, resolve_persona_traced prefers the
+        // registered active agent (and newest timestamp when neither is registered).
+        let mut raw_routes = RouteTable::default();
+        raw_routes.entries.insert(
+            "highly".into(),
+            RouteEntry {
+                persona: "highly".into(),
+                route: agy("conv-shared"),
+                updated_at: At::from_unix_millis(500),
+            },
+        );
+        raw_routes.entries.insert(
+            "kayla".into(),
+            RouteEntry {
+                persona: "kayla".into(),
+                route: agy("conv-shared"),
+                updated_at: At::from_unix_millis(200),
+            },
+        );
+        let store = MemStore::default();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Kayla".into(),
+                email: None,
+                project: "kaggle-gemma4".into(),
+                role: AgentRole::Lead,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: At::from_unix_millis(10),
+                by: "owner".into(),
+            })
+            .unwrap();
+        let env = |k: &str| {
+            (k == "ANTIGRAVITY_CONVERSATION_ID").then(|| std::ffi::OsString::from("conv-shared"))
+        };
+        let tmp = TempDir::new().unwrap();
+        let (resolved_reg, _) = resolve_persona_traced(
+            None,
+            None,
+            tmp.path(),
+            Some(&store),
+            || raw_routes.clone(),
+            &env,
+        );
+        assert_eq!(resolved_reg, "kayla");
+
+        // Without registry, the newer updated_at wins over alphabetical order.
+        raw_routes.entries.get_mut("kayla").unwrap().updated_at = At::from_unix_millis(600);
+        let (resolved_newer, _) =
+            resolve_persona_traced(None, None, tmp.path(), None, || raw_routes, &env);
+        assert_eq!(resolved_newer, "kayla");
     }
 }
