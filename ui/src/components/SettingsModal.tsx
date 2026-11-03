@@ -124,16 +124,31 @@ export const RECAST_ROLE_OPTIONS = [
   { value: "lead", label: "lead" },
   { value: "assistant", label: "assistant" },
   { value: "lab_manager", label: "lab_manager" },
-  { value: "custom:ui-developer", label: "custom:ui-developer" },
-  { value: "custom:web-developer", label: "custom:web-developer" },
-  { value: "custom:mobile-developer", label: "custom:mobile-developer" },
-  { value: "custom:system-developer", label: "custom:system-developer" },
-  { value: "custom:data-engineer", label: "custom:data-engineer" },
-  { value: "custom:tester", label: "custom:tester" },
-  { value: "custom:strategist", label: "custom:strategist" },
-  { value: "custom:journalist", label: "custom:journalist" },
-  { value: "custom:scribe", label: "custom:scribe" },
+  { value: "ui-developer", label: "ui-developer" },
+  { value: "web-developer", label: "web-developer" },
+  { value: "mobile-developer", label: "mobile-developer" },
+  { value: "system-developer", label: "system-developer" },
+  { value: "data-engineer", label: "data-engineer" },
+  { value: "tester", label: "tester" },
+  { value: "strategist", label: "strategist" },
+  { value: "journalist", label: "journalist" },
 ];
+
+export function canonicalizeDefaultRole(rawRole: string): string {
+  const trimmed = (rawRole ?? "").trim();
+  if (!trimmed) return "assistant";
+  if (trimmed === CREATE_CUSTOM_ROLE_VALUE) return CREATE_CUSTOM_ROLE_VALUE;
+  const stripped = trimmed.toLowerCase().startsWith("custom:")
+    ? trimmed.slice(7).trim()
+    : trimmed;
+  const lower = stripped.toLowerCase();
+  if (lower === "scribe") return "journalist";
+  if (lower === "lab-manager" || lower === "lab_manager") return "lab_manager";
+  if (RECAST_ROLE_OPTIONS.some((opt) => opt.value === lower)) {
+    return lower;
+  }
+  return trimmed;
+}
 
 export function normalizeRecastRole(
   selectedRole: string,
@@ -142,9 +157,13 @@ export function normalizeRecastRole(
   if (selectedRole === CREATE_CUSTOM_ROLE_VALUE) {
     const clean = customRoleInput.trim();
     if (!clean) return "assistant";
-    return clean.startsWith("custom:") ? clean : `custom:${clean}`;
+    const canonical = canonicalizeDefaultRole(clean);
+    if (RECAST_ROLE_OPTIONS.some((opt) => opt.value === canonical)) {
+      return canonical;
+    }
+    return canonical.startsWith("custom:") ? canonical : `custom:${canonical}`;
   }
-  return selectedRole;
+  return canonicalizeDefaultRole(selectedRole);
 }
 
 export interface RecastConflictState {
@@ -704,7 +723,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return (
       recastDrafts[key] ?? {
         project: ag.project || "Workspace",
-        role: ag.role || "assistant",
+        role: canonicalizeDefaultRole(ag.role || "assistant"),
       }
     );
   };
@@ -761,7 +780,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       );
       setRecastDrafts((prev) => ({
         ...prev,
-        [key]: { project: updatedAgent.project, role: updatedAgent.role },
+        [key]: {
+          project: updatedAgent.project,
+          role: canonicalizeDefaultRole(updatedAgent.role),
+        },
       }));
       setRecastReplaceLeadArmed((prev) => {
         const next = { ...prev };
@@ -1869,7 +1891,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           className="fd-badge fd-mono"
                           style={{ fontSize: "10.5px" }}
                         >
-                          {ag.role}
+                          {canonicalizeDefaultRole(ag.role)}
                         </span>
                       </div>
 
@@ -1893,7 +1915,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               ...prev,
                               [key]: prev[key] ?? {
                                 project: ag.project || "Workspace",
-                                role: ag.role || "assistant",
+                                role: canonicalizeDefaultRole(ag.role || "assistant"),
                               },
                             }));
                             setRecastReplaceLeadArmed((prev) => {

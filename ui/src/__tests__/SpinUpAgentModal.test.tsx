@@ -4,7 +4,12 @@ import { App } from "../App";
 import { HubApiClient } from "../lib/api";
 import type { HubWsClient } from "../api/ws";
 import { SpinUpAgentModal, SPIN_UP_ROLES } from "../components/SpinUpAgentModal";
-import { RECAST_ROLE_OPTIONS } from "../components/SettingsModal";
+import {
+  canonicalizeDefaultRole,
+  CREATE_CUSTOM_ROLE_VALUE,
+  normalizeRecastRole,
+  RECAST_ROLE_OPTIONS,
+} from "../components/SettingsModal";
 import type { SpinUpSessionRequest, SpinUpSessionResponse } from "../types/api";
 
 describe("SpinUpAgentModal", () => {
@@ -145,20 +150,37 @@ describe("SpinUpAgentModal", () => {
       })),
     ).toEqual([...SPIN_UP_ROLES]);
 
-    expect(RECAST_ROLE_OPTIONS.map((r) => r.value)).toEqual([
-      "lead",
-      "assistant",
-      "lab_manager",
-      "custom:ui-developer",
-      "custom:web-developer",
-      "custom:mobile-developer",
-      "custom:system-developer",
-      "custom:data-engineer",
-      "custom:tester",
-      "custom:strategist",
-      "custom:journalist",
-      "custom:scribe",
+    expect(RECAST_ROLE_OPTIONS).toEqual([
+      { value: "lead", label: "lead" },
+      { value: "assistant", label: "assistant" },
+      { value: "lab_manager", label: "lab_manager" },
+      { value: "ui-developer", label: "ui-developer" },
+      { value: "web-developer", label: "web-developer" },
+      { value: "mobile-developer", label: "mobile-developer" },
+      { value: "system-developer", label: "system-developer" },
+      { value: "data-engineer", label: "data-engineer" },
+      { value: "tester", label: "tester" },
+      { value: "strategist", label: "strategist" },
+      { value: "journalist", label: "journalist" },
     ]);
+
+    expect(canonicalizeDefaultRole("custom:strategist")).toBe("strategist");
+    expect(canonicalizeDefaultRole("custom:ui-developer")).toBe("ui-developer");
+    expect(canonicalizeDefaultRole("scribe")).toBe("journalist");
+    expect(canonicalizeDefaultRole("custom:scribe")).toBe("journalist");
+    expect(canonicalizeDefaultRole("lab-manager")).toBe("lab_manager");
+    expect(canonicalizeDefaultRole("custom:reviewer")).toBe("custom:reviewer");
+    expect(normalizeRecastRole("custom:strategist", "")).toBe("strategist");
+    expect(normalizeRecastRole("scribe", "")).toBe("journalist");
+    expect(normalizeRecastRole(CREATE_CUSTOM_ROLE_VALUE, "reviewer")).toBe(
+      "custom:reviewer",
+    );
+    expect(normalizeRecastRole(CREATE_CUSTOM_ROLE_VALUE, "scribe")).toBe(
+      "journalist",
+    );
+    expect(normalizeRecastRole(CREATE_CUSTOM_ROLE_VALUE, "strategist")).toBe(
+      "strategist",
+    );
 
     const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
     fireEvent.change(vendorSelect, { target: { value: "codex" } });
