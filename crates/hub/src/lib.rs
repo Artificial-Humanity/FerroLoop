@@ -3085,7 +3085,7 @@ mod tests {
             assert!(store.get_area("ferroloop").unwrap().is_some());
         }
 
-        // A Peer may spin up too (same gate as the session clear endpoint); the override fields stick.
+        // A Peer may spin up a hosted session (spin-up has its own gate); the override fields stick.
         let peer = handle_http_request(
             &state,
             &authed(
@@ -3454,7 +3454,9 @@ mod tests {
         assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
         assert_eq!(hosted_count(), 0);
 
-        // The refused spin-up did not make it hosted, so the Peer still cannot retire it.
+        // The refused spin-up did not make it hosted, and a Peer cannot decommission at all:
+        // the API's Owner gate answers first; the lifecycle gate itself is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         for mode in ["prepare", "teardown"] {
             let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
             assert_eq!(
@@ -3490,6 +3492,9 @@ mod tests {
 
     #[test]
     fn peer_cannot_reach_a_reregistered_agent_through_its_stale_decommissioned_record() {
+        // The spin-up half asserts the lifecycle's spin-up gate. The decommission half asserts the
+        // API's Owner 403 and no side effect; the lifecycle gate itself is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         use fl_core::agent::{AgentRole, AgentStatus, RegisterAgentArgs};
         use fl_core::store::AgentRegistry;
 
@@ -3570,7 +3575,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_teardown_needs_a_hosted_record_and_malformed_ids_are_400_without_side_effects() {
+    fn peer_decommission_is_403_and_malformed_ids_are_400_without_side_effects() {
         use fl_core::agent::{AgentRole, AgentStatus};
         use fl_core::store::AgentRegistry;
 
@@ -3615,7 +3620,9 @@ mod tests {
             assert!(listed["sessions"].as_array().unwrap().is_empty());
         };
 
-        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id.
+        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id. This asserts
+        // the API's Owner 403 and no side effect; the lifecycle gate is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", "teardown");
         assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
         jarvis_is_untouched();
@@ -3736,6 +3743,8 @@ mod tests {
 
     #[test]
     fn peer_prepare_of_an_unmanaged_session_is_403_and_cannot_unlock_teardown() {
+        // Asserts the API's Owner 403 and no side effect; the lifecycle gate is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         use fl_core::agent::{AgentRole, AgentStatus};
         use fl_core::store::AgentRegistry;
 
@@ -7670,8 +7679,8 @@ default_target = "wire:felicity"
             decommission_as(&state, OWNER, "claude%3Aada", "teardown").status,
             200
         );
-        // The persona registers again outside the lifecycle: a Peer may not retire it, but the
-        // stale record still names the worktree.
+        // The persona registers again outside the lifecycle: the API's Owner gate refuses a Peer,
+        // and the stale record still names the worktree.
         state
             .open_store()
             .unwrap()
