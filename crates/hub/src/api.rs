@@ -1389,17 +1389,18 @@ fn handle_static_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         let rel = decoded.trim_start_matches('/');
         let target_rel = if rel.is_empty() { "index.html" } else { rel };
         let candidate = ui_dir.join(target_rel);
-        if candidate.is_file()
-            && let Ok(bytes) = fs::read(&candidate)
-        {
-            return HttpResponse::bytes(200, mime_type_for_path(&candidate), bytes);
+        match crate::attachment_policy::read_static_file(ui_dir, &candidate) {
+            Ok(Some(bytes)) => {
+                return HttpResponse::bytes(200, mime_type_for_path(&candidate), bytes);
+            }
+            Ok(None) => {}
+            Err(refusal) => return refusal,
         }
 
-        let index_path = ui_dir.join("index.html");
-        if index_path.is_file()
-            && let Ok(bytes) = fs::read(&index_path)
-        {
-            return HttpResponse::bytes(200, "text/html; charset=utf-8", bytes);
+        match crate::attachment_policy::read_static_file(ui_dir, &ui_dir.join("index.html")) {
+            Ok(Some(bytes)) => return HttpResponse::bytes(200, "text/html; charset=utf-8", bytes),
+            Ok(None) => {}
+            Err(refusal) => return refusal,
         }
 
         return HttpResponse::json(404, json!({ "error": "not found" }));
@@ -4102,13 +4103,7 @@ fn handle_dynamic_api_routes(
         {
             return HttpResponse::json(400, json!({ "error": "invalid attachment filename" }));
         }
-        let path = attachments_dir(state).join(&filename);
-        if path.is_file()
-            && let Ok(bytes) = fs::read(&path)
-        {
-            return HttpResponse::bytes(200, mime_type_for_path(&path), bytes);
-        }
-        return HttpResponse::json(404, json!({ "error": "attachment not found" }));
+        return crate::attachment_policy::serve_attachment(&attachments_dir(state), &filename);
     }
 
     // /api/v1/auth/operators/:id
@@ -4789,8 +4784,10 @@ fn handle_post_session_prompt(
     #[derive(Deserialize)]
     struct PromptAttachmentInput {
         name: String,
-        #[serde(default, alias = "mime_type")]
-        media_type: String,
+        /// Accepted so existing clients still parse; the hub does not store it (see
+        /// `attachment_policy::stored_media_type`).
+        #[serde(default, rename = "media_type", alias = "mime_type")]
+        _client_media_type: String,
         data_base64: String,
     }
 
@@ -4818,24 +4815,35 @@ fn handle_post_session_prompt(
         );
     }
 
-    let mut saved_attachments = Vec::with_capacity(payload.attachments.len());
+    let mut saved_attachments: Vec<SavedPromptAttachment> =
+        Vec::with_capacity(payload.attachments.len());
     if !payload.attachments.is_empty() {
-        let dir = attachments_dir(state);
-        if let Err(e) = fs::create_dir_all(&dir) {
-            return HttpResponse::json(
-                500,
-                json!({ "error": format!("failed to create attachments dir: {e}") }),
-            );
+        use crate::attachment_policy as policy;
+
+        // Everything is checked and decoded before the first byte is written, so a refused
+        // prompt leaves nothing in the attachments directory.
+        if let Err(refusal) =
+            policy::check_attachment_names(payload.attachments.iter().map(|att| att.name.as_str()))
+        {
+            return refusal.into_response();
         }
-        let now_ms = stamp::now().unix_millis();
-        for (idx, att) in payload.attachments.iter().enumerate() {
+        let mut total_bytes = 0usize;
+        let mut decoded_files = Vec::with_capacity(payload.attachments.len());
+        for att in &payload.attachments {
             let raw_b64 = match att.data_base64.find(";base64,") {
                 Some(pos) if att.data_base64.trim_start().starts_with("data:") => {
                     &att.data_base64[pos + ";base64,".len()..]
                 }
                 _ => att.data_base64.as_str(),
-            };
-            let decoded = match base64::engine::general_purpose::STANDARD.decode(raw_b64.trim()) {
+            }
+            .trim();
+            if raw_b64.len() > policy::MAX_ATTACHMENT_BASE64_CHARS {
+                return policy::AttachmentRefusal::FileTooLarge {
+                    name: att.name.clone(),
+                }
+                .into_response();
+            }
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
                 Ok(b) => b,
                 Err(e) => {
                     return HttpResponse::json(
@@ -4844,6 +4852,23 @@ fn handle_post_session_prompt(
                     );
                 }
             };
+            if let Err(refusal) =
+                policy::check_attachment_size(&att.name, decoded.len(), &mut total_bytes)
+            {
+                return refusal.into_response();
+            }
+            decoded_files.push(decoded);
+        }
+
+        let dir = attachments_dir(state);
+        if let Err(e) = fs::create_dir_all(&dir) {
+            return HttpResponse::json(
+                500,
+                json!({ "error": format!("failed to create attachments dir: {e}") }),
+            );
+        }
+        let now_ms = stamp::now().unix_millis();
+        for (idx, (att, decoded)) in payload.attachments.iter().zip(&decoded_files).enumerate() {
             let mut sanitized: String = att
                 .name
                 .chars()
@@ -4861,17 +4886,19 @@ fn handle_post_session_prompt(
             }
             let saved_name = format!("{now_ms}-{idx}-{sanitized}");
             let saved_path = dir.join(&saved_name);
-            if let Err(e) = fs::write(&saved_path, &decoded) {
+            if let Err(e) = fs::write(&saved_path, decoded) {
+                // Do not leave the files of a failed prompt behind.
+                let _ = fs::remove_file(&saved_path);
+                for saved in &saved_attachments {
+                    let _ = fs::remove_file(&saved.path);
+                }
                 return HttpResponse::json(
                     500,
                     json!({ "error": format!("failed to write attachment: {e}") }),
                 );
             }
-            let media_type = if att.media_type.trim().is_empty() {
-                mime_type_for_path(&saved_path).to_string()
-            } else {
-                att.media_type.trim().to_string()
-            };
+            // The client's `media_type` is not stored: the hub derives it from the file.
+            let media_type = policy::stored_media_type(&sanitized, decoded);
             saved_attachments.push(SavedPromptAttachment {
                 name: sanitized,
                 media_type,

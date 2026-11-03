@@ -6,6 +6,7 @@ mod agents;
 pub mod api;
 mod artifact_dirs;
 mod artifacts;
+mod attachment_policy;
 mod attachments;
 pub mod auth;
 mod balance_api;
@@ -729,6 +730,9 @@ mod remodel_api_tests;
 /// while it is set.
 #[cfg(test)]
 pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod attachment_policy_tests;
 
 #[cfg(test)]
 mod tests {
