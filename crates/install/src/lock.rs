@@ -86,7 +86,18 @@ fn try_flock(file: &File) -> std::io::Result<bool> {
 pub fn acquire(
     path: &Path,
     timeout: Duration,
+    prepare: impl FnMut() -> Result<()>,
+) -> Result<LockGuard> {
+    acquire_with(path, timeout, prepare, || {})
+}
+
+/// [`acquire`], calling `after_open` between opening the file and locking it (tests use it to
+/// unlink the file in exactly that window).
+fn acquire_with(
+    path: &Path,
+    timeout: Duration,
     mut prepare: impl FnMut() -> Result<()>,
+    mut after_open: impl FnMut(),
 ) -> Result<LockGuard> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -119,6 +130,7 @@ pub fn acquire(
             }
         };
         let mut file = file;
+        after_open();
         let meta = file
             .metadata()
             .ctx(|| format!("cannot stat {}", path.display()))?;
@@ -251,5 +263,31 @@ mod tests {
             p.exists(),
             "the waiter made a fresh file and holds that one"
         );
+    }
+
+    #[test]
+    fn a_file_unlinked_between_open_and_lock_is_not_a_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let p = lock_path(&d);
+        let first = acquire(&p, Duration::ZERO, || Ok(())).unwrap();
+        let mut first = Some(first);
+        let mut calls = 0;
+        // The waiter has opened the file; before it locks, the holder unlinks and releases it.
+        let g = acquire_with(
+            &p,
+            Duration::from_secs(5),
+            || Ok(()),
+            || {
+                calls += 1;
+                if let Some(f) = first.take() {
+                    f.unlink().unwrap();
+                    drop(f);
+                }
+            },
+        )
+        .unwrap();
+        assert!(calls >= 2, "the waiter started over ({calls})");
+        assert!(p.exists(), "it holds the file at the path, not an orphan");
+        drop(g);
     }
 }
