@@ -80,7 +80,9 @@ pub enum AgentCmd {
         /// Project / area the agent works in.
         #[arg(long)]
         project: String,
-        /// Role (`lead`, `assistant`, `ui-developer`, `strategist`, or `lab-manager`).
+        /// Role: `lead`, `assistant`, `ui-developer`, `web-developer`, `mobile-developer`,
+        /// `system-developer`, `data-engineer`, `tester`, `strategist`, `journalist`, or
+        /// `lab-manager`.
         #[arg(long)]
         role: String,
         /// Vendor runtime (`claude`, `antigravity`, `codex`, `grok`, or `muse`).

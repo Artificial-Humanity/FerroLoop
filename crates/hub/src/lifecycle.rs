@@ -29,11 +29,17 @@ use crate::api::{
 };
 
 /// Roles `spin-up` accepts (the FerroDeck role list).
-pub const SPIN_UP_ROLES: [&str; 5] = [
+pub const SPIN_UP_ROLES: [&str; 11] = [
     "lead",
     "assistant",
     "ui-developer",
+    "web-developer",
+    "mobile-developer",
+    "system-developer",
+    "data-engineer",
+    "tester",
     "strategist",
+    "journalist",
     "lab-manager",
 ];
 /// The five subscription-CLI vendors. Not the list `spin-up` accepts: every decision about a
@@ -1162,7 +1168,8 @@ fn capitalize(persona: &str) -> String {
     }
 }
 
-/// `AgentRole` for a spin-up role string; `ui-developer` and `strategist` are custom roles.
+/// `AgentRole` for a spin-up role string; every role but `lead`, `assistant` and `lab-manager`
+/// is a custom role (a label only: it carries no authority).
 fn agent_role_from_label(label: &str) -> AgentRole {
     match label.trim().to_ascii_lowercase().as_str() {
         "lead" => AgentRole::Lead,
@@ -3414,10 +3421,24 @@ mod tests {
         r.project = "no spaces".into();
         assert_eq!(r.validate().unwrap_err().status(), 400);
 
-        for role in ["", "owner", "lab_manager", "custom:x"] {
+        let all_roles = format!("role must be one of: {}", SPIN_UP_ROLES.join(", "));
+        assert_eq!(SPIN_UP_ROLES.len(), 11);
+        for role in [
+            "",
+            "owner",
+            "lab_manager",
+            "custom:x",
+            "custom:web-developer",
+            "web developer",
+            "web-developer\u{0}",
+            "web/developer",
+            "tester!",
+            "journalist:lead",
+        ] {
             let e = req("felicity", role, "claude").validate().unwrap_err();
+            assert_eq!(e.status(), 400, "{role}");
             assert!(
-                matches!(e, LifecycleError::Invalid(m) if m.starts_with("role")),
+                matches!(&e, LifecycleError::Invalid(m) if *m == all_roles),
                 "{role}"
             );
         }
@@ -3471,6 +3492,29 @@ mod tests {
         );
         assert!(prompt_for("Faye", "FerroLoop", "strategist").contains("as the strategist."));
         assert_eq!(agent_role_from_label("lab-manager"), AgentRole::LabManager);
+    }
+
+    #[test]
+    fn new_roles_are_custom_labels_that_round_trip_the_registry_wire_form() {
+        for label in [
+            "web-developer",
+            "mobile-developer",
+            "system-developer",
+            "data-engineer",
+            "tester",
+            "journalist",
+        ] {
+            assert!(SPIN_UP_ROLES.contains(&label), "{label}");
+            let role = agent_role_from_label(label);
+            assert_eq!(role, AgentRole::Custom(label.into()), "{label}");
+            assert_eq!(role_label_of(&role), label);
+            // The `custom:` spelling the registry stores maps back to the same role.
+            assert_eq!(agent_role_from_label(&role.as_wire()), role, "{label}");
+            assert_eq!(AgentRole::from_wire(&role.as_wire()).unwrap(), role);
+            assert_ne!(role, AgentRole::Lead);
+            assert_ne!(role, AgentRole::LabManager);
+            assert!(prompt_for("Faye", "FerroLoop", label).contains(&format!("as the {label}.")));
+        }
     }
 
     #[test]
@@ -3564,6 +3608,44 @@ mod tests {
         .unwrap();
         assert_eq!(again.session_id, out.session_id);
         assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn every_listed_role_spins_up_and_registers_its_agent_role() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        for (i, role) in SPIN_UP_ROLES.iter().enumerate() {
+            // `lead` and `lab-manager` are distinct personas in one project: only one Lead sits.
+            let persona = format!("agent-{i}");
+            let out = spin_up(
+                &store,
+                &env,
+                &req(&persona, role, "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            assert_eq!(out.role, *role);
+            let agent = store.agent_by_name(&persona).unwrap().unwrap();
+            assert_eq!(agent.status, AgentStatus::Active);
+            assert_eq!(agent.role, agent_role_from_label(role), "{role}");
+            let expected = match *role {
+                "lead" => AgentRole::Lead,
+                "assistant" => AgentRole::Assistant,
+                "lab-manager" => AgentRole::LabManager,
+                other => AgentRole::Custom(other.into()),
+            };
+            assert_eq!(agent.role, expected, "{role}");
+        }
+        // The new labels did not displace the one Lead.
+        let leads = store
+            .list_agents(Some("ferroloop"), false)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.role == AgentRole::Lead)
+            .count();
+        assert_eq!(leads, 1);
     }
 
     #[test]
