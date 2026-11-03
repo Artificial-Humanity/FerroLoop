@@ -674,6 +674,31 @@ fn sign_app_jwt_refuses_values_that_are_not_rsa_keys_without_echoing_them() {
     }
 }
 
+#[test]
+fn sign_app_jwt_checks_policy_before_it_looks_at_the_key() {
+    // The stored value is not a key at all. If the key were decrypted and parsed first, every
+    // refusal below would be `denied:bad_key`; it is the policy that answers.
+    let mut f = Fixture::new();
+    f.set(SetSecretArgs {
+        value: "SENTINEL_not_a_key_value_123".into(),
+        ..sign_secret("unused")
+    });
+    let secret = parse_vault_ref("vault://GITHUB_APP_KEY").unwrap();
+    f.vault
+        .sign_app_jwt(&secret, "42", "ferris", "evil.example.com", now())
+        .unwrap_err();
+    assert_eq!(f.last_audit()["outcome"], "denied:host");
+    f.vault
+        .sign_app_jwt(&secret, "42", "mallory", HOST, now())
+        .unwrap_err();
+    assert_eq!(f.last_audit()["outcome"], "denied:agent");
+    // The policy passes, so the key is read and found wanting.
+    f.vault
+        .sign_app_jwt(&secret, "42", "ferris", HOST, now())
+        .unwrap_err();
+    assert_eq!(f.last_audit()["outcome"], "denied:bad_key");
+}
+
 #[cfg(unix)]
 #[test]
 fn sign_app_jwt_returns_no_jwt_when_its_allowed_entry_cannot_be_written() {
