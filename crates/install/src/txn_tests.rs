@@ -2067,7 +2067,8 @@ fn a_deep_prefix_with_a_failing_step_leaves_no_ancestor_behind() {
 
 #[test]
 fn forged_created_dirs_are_refused_or_cannot_remove_anything_non_empty() {
-    let cases: Vec<(&str, fn(&World) -> String)> = vec![
+    type Entry = fn(&World) -> String;
+    let cases: Vec<(&str, Entry)> = vec![
         ("the filesystem root", |_| "/".to_string()),
         ("a system directory", |_| "/usr".to_string()),
         ("the home directory", |w| {
