@@ -568,21 +568,69 @@ export const EncapsulatedWorkBlock: React.FC<EncapsulatedWorkBlockProps> = ({
   );
 };
 
+export const MUSE_MODEL_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+}> = [
+  {
+    value: "muse-wonder-full-1.0",
+    label: "Muse Wonder Full (muse-wonder-full-1.0)",
+  },
+  {
+    value: "muse-wonder-1.0",
+    label: "Muse Wonder (muse-wonder-1.0)",
+  },
+  {
+    value: "muse-spark-1.3",
+    label: "Muse Spark (muse-spark-1.3)",
+  },
+];
+
+export function formatModelOptionLabel(modelId: string): string {
+  const trimmed = (modelId ?? "").trim();
+  const match = MUSE_MODEL_OPTIONS.find((m) => m.value === trimmed);
+  return match ? match.label : trimmed;
+}
+
+export function isAntigravityAdapter(adapter?: string | null): boolean {
+  const normalized = (adapter ?? "").trim().toLowerCase();
+  return (
+    normalized === "antigravity" ||
+    normalized === "agy" ||
+    normalized === "argon" ||
+    normalized === "gemini"
+  );
+}
+
+export function inferVendorFromModel(modelId?: string | null): string | null {
+  const lower = (modelId ?? "").trim().toLowerCase();
+  if (!lower) return null;
+  if (lower.startsWith("muse-")) return "muse";
+  if (lower.startsWith("claude-")) return "claude";
+  if (lower.startsWith("gpt-oss-")) return null;
+  if (lower.startsWith("gpt-") || lower.startsWith("codex-")) return "codex";
+  if (lower.startsWith("grok-")) return "grok";
+  return null;
+}
+
 export function getVendorModelOptions(
   adapter?: string | null,
   currentModel?: string | null,
   availableModels?: string[] | null,
 ): string[] {
-  const normalized = (adapter ?? "").trim().toLowerCase();
+  const rawAdapter = (adapter ?? "").trim().toLowerCase();
+  const trimmedCurrent = (currentModel ?? "").trim();
+  const inferred =
+    !rawAdapter || rawAdapter === "unknown"
+      ? (inferVendorFromModel(trimmedCurrent) ?? "")
+      : "";
+  const normalized =
+    rawAdapter && rawAdapter !== "unknown" ? rawAdapter : inferred;
+
   let base: string[];
   if (Array.isArray(availableModels) && availableModels.length > 0) {
     base = [...availableModels];
-  } else if (
-    normalized === "antigravity" ||
-    normalized === "agy" ||
-    normalized === "argon" ||
-    normalized === "gemini"
-  ) {
+  } else if (isAntigravityAdapter(normalized)) {
     base = [
       "gemini-4-argon",
       "gemini-3.8-flash",
@@ -603,20 +651,21 @@ export function getVendorModelOptions(
   } else if (normalized === "grok" || normalized.startsWith("grok-")) {
     base = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
   } else if (normalized === "muse" || normalized.startsWith("muse-")) {
-    base = ["muse-spark"];
+    base = MUSE_MODEL_OPTIONS.map((m) => m.value);
   } else {
-    base = [
-      "gemini-4-argon",
-      "gemini-3.8-flash",
-      "claude-opus-5-5",
-      "claude-sonnet-5-5",
-      "gpt-6.1-terra",
-      "grok-4.7",
-      "muse-spark",
-    ];
+    base = [];
   }
-  const trimmedCurrent = (currentModel ?? "").trim();
-  if (trimmedCurrent && !base.includes(trimmedCurrent)) {
+
+  const isStaleAntigravityFallback =
+    !isAntigravityAdapter(normalized) &&
+    trimmedCurrent.toLowerCase().startsWith("gemini-") &&
+    (!Array.isArray(availableModels) || !availableModels.includes(trimmedCurrent));
+
+  if (
+    trimmedCurrent &&
+    !isStaleAntigravityFallback &&
+    !base.includes(trimmedCurrent)
+  ) {
     return [trimmedCurrent, ...base];
   }
   return base;

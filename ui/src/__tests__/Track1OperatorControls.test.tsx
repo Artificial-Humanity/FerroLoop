@@ -4,7 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import { HubWsClient } from "../api/ws";
-import { ChatPane, getVendorModelOptions } from "../components/ChatPane";
+import {
+  ChatPane,
+  formatModelOptionLabel,
+  getVendorModelOptions,
+  MUSE_MODEL_OPTIONS,
+} from "../components/ChatPane";
 import { SettingsModal } from "../components/SettingsModal";
 
 describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () => {
@@ -115,7 +120,47 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         "grok-4.6",
         "grok-4.5",
       ]);
-      expect(getVendorModelOptions("muse")).toEqual(["muse-spark"]);
+      expect(getVendorModelOptions("muse")).toEqual([
+        "muse-wonder-full-1.0",
+        "muse-wonder-1.0",
+        "muse-spark-1.3",
+      ]);
+      expect(MUSE_MODEL_OPTIONS).toEqual([
+        {
+          value: "muse-wonder-full-1.0",
+          label: "Muse Wonder Full (muse-wonder-full-1.0)",
+        },
+        {
+          value: "muse-wonder-1.0",
+          label: "Muse Wonder (muse-wonder-1.0)",
+        },
+        {
+          value: "muse-spark-1.3",
+          label: "Muse Spark (muse-spark-1.3)",
+        },
+      ]);
+      expect(formatModelOptionLabel("muse-wonder-full-1.0")).toBe(
+        "Muse Wonder Full (muse-wonder-full-1.0)",
+      );
+      expect(formatModelOptionLabel("muse-wonder-1.0")).toBe(
+        "Muse Wonder (muse-wonder-1.0)",
+      );
+      expect(formatModelOptionLabel("muse-spark-1.3")).toBe(
+        "Muse Spark (muse-spark-1.3)",
+      );
+      expect(getVendorModelOptions("unknown")).toEqual([]);
+      expect(getVendorModelOptions(null)).toEqual([]);
+      expect(getVendorModelOptions("unknown", "gemini-4-argon")).toEqual([]);
+      expect(getVendorModelOptions("muse", "gemini-4-argon")).toEqual([
+        "muse-wonder-full-1.0",
+        "muse-wonder-1.0",
+        "muse-spark-1.3",
+      ]);
+      expect(getVendorModelOptions("unknown", "muse-spark-1.3")).toEqual([
+        "muse-wonder-full-1.0",
+        "muse-wonder-1.0",
+        "muse-spark-1.3",
+      ]);
       expect(getVendorModelOptions("claude", "claude-custom-preview")).toEqual([
         "claude-custom-preview",
         "claude-opus-5-5",
@@ -128,6 +173,97 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
           "gpt-6.1-sol",
         ]),
       ).toEqual(["gpt-6.1-terra", "gpt-6.1-sol"]);
+    });
+
+    it("never falls back to gemini-4-argon in AgentSettingsModal for unknown or muse adapters and renders Muse 1.4.14 option labels", () => {
+      const { rerender } = render(
+        <ChatPane
+          agentName="fenris"
+          agentDisplayName="Fenris"
+          adapter="unknown"
+          model={null}
+          thinkingLevel="high"
+          sessionId="sess-fenris-01"
+          turns={[]}
+          agentSettingsOpen={true}
+        />,
+      );
+
+      expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "default (high)",
+      );
+      expect(screen.getByTestId("chat-active-model-badge")).not.toHaveTextContent(
+        "gemini-4-argon",
+      );
+      const unknownSelect = screen.getByTestId(
+        "session-model-select",
+      ) as HTMLSelectElement;
+      expect(unknownSelect.value).toBe("");
+      expect(
+        Array.from(unknownSelect.options).map((o) => o.value),
+      ).not.toContain("gemini-4-argon");
+
+      // When adapter resolves to muse (with model={null}), selects muse-wonder-full-1.0 and renders Muse 1.4.14 labels
+      rerender(
+        <ChatPane
+          agentName="fenris"
+          agentDisplayName="Fenris"
+          adapter="muse"
+          model={null}
+          thinkingLevel="high"
+          sessionId="sess-fenris-01"
+          turns={[]}
+          agentSettingsOpen={true}
+        />,
+      );
+
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "muse · muse-wonder-full-1.0 (high)",
+      );
+      const museSelect = screen.getByTestId(
+        "session-model-select",
+      ) as HTMLSelectElement;
+      expect(museSelect.value).toBe("muse-wonder-full-1.0");
+      expect(
+        Array.from(museSelect.options).map((o) => ({
+          value: o.value,
+          label: o.textContent,
+        })),
+      ).toEqual([
+        {
+          value: "muse-wonder-full-1.0",
+          label: "Muse Wonder Full (muse-wonder-full-1.0)",
+        },
+        {
+          value: "muse-wonder-1.0",
+          label: "Muse Wonder (muse-wonder-1.0)",
+        },
+        {
+          value: "muse-spark-1.3",
+          label: "Muse Spark (muse-spark-1.3)",
+        },
+      ]);
+
+      // Preserves explicit session.model on Muse agent
+      rerender(
+        <ChatPane
+          agentName="fenris"
+          agentDisplayName="Fenris"
+          adapter="muse"
+          model="muse-spark-1.3"
+          thinkingLevel="high"
+          sessionId="sess-fenris-01"
+          turns={[]}
+          agentSettingsOpen={true}
+        />,
+      );
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "muse · muse-spark-1.3 (high)",
+      );
+      expect(
+        (screen.getByTestId("session-model-select") as HTMLSelectElement).value,
+      ).toBe("muse-spark-1.3");
     });
 
     it("renders session-model-select and session-thinking-select inside AgentSettingsModal and calls onSetSessionModel on change", async () => {

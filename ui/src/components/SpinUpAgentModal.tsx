@@ -1,6 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient } from "../api/client";
-import { getVendorModelOptions } from "./ChatPane";
+import {
+  formatModelOptionLabel,
+  getVendorModelOptions,
+} from "./ChatPane";
 import type {
   EnrolledNode,
   SpinUpSessionRequest,
@@ -331,7 +334,14 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 data-testid="spin-up-vendor-select"
                 className="fd-select fd-mono"
                 value={vendor}
-                onChange={(e) => setVendor(e.target.value)}
+                onChange={(e) => {
+                  const nextVendor = e.target.value;
+                  setVendor(nextVendor);
+                  const nextOpts = getVendorModelOptions(nextVendor);
+                  if (model.trim() && nextOpts.length > 0 && !nextOpts.includes(model.trim())) {
+                    setModel("");
+                  }
+                }}
                 disabled={submitting}
                 style={{ width: "100%" }}
               >
@@ -371,16 +381,25 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 data-form-type="other"
                 data-testid="spin-up-model-input"
                 className="fd-input fd-mono"
-                placeholder="e.g. gemini-4-argon, claude-opus-5-5"
+                placeholder={
+                  getVendorModelOptions(vendor)[0]
+                    ? `e.g. ${getVendorModelOptions(vendor)[0]}`
+                    : "e.g. claude-opus-5-5"
+                }
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 disabled={submitting}
                 style={{ width: "100%" }}
               />
-              <datalist id="fd-spin-up-model-options">
-                {getVendorModelOptions(vendor).map((opt) => (
-                  <option key={opt} value={opt} />
-                ))}
+              <datalist id="fd-spin-up-model-options" data-testid="spin-up-model-options">
+                {getVendorModelOptions(vendor).map((opt) => {
+                  const label = formatModelOptionLabel(opt);
+                  return (
+                    <option key={opt} value={opt} label={label}>
+                      {label}
+                    </option>
+                  );
+                })}
               </datalist>
             </div>
           </div>

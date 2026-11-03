@@ -11,8 +11,11 @@ import {
   type RecastConflictState,
 } from "./SettingsModal";
 import {
+  formatModelOptionLabel,
   formatTokenCount,
   getVendorModelOptions,
+  inferVendorFromModel,
+  isAntigravityAdapter,
   type EstimatedContextUsage,
 } from "./ChatPane";
 
@@ -126,13 +129,20 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastModalOpen(false);
   }, [isOpen, agentName, agentProject, agentRole]);
   const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
+  const [fetchedAdapter, setFetchedAdapter] = useState<string | null>(null);
+  const [fetchedModel, setFetchedModel] = useState<string | null>(null);
+  const [fetchedAvailableModels, setFetchedAvailableModels] = useState<string[] | null>(null);
   useEffect(() => {
     setFetchedExecutionMode(null);
+    setFetchedAdapter(null);
+    setFetchedModel(null);
+    setFetchedAvailableModels(null);
+    const needsAdapter = !adapter || adapter.trim().toLowerCase() === "unknown";
     if (
       !isOpen ||
-      executionMode !== undefined ||
+      (executionMode !== undefined && !needsAdapter) ||
       !apiClient ||
-      !sessionId ||
+      (!sessionId && !agentName) ||
       typeof apiClient.getSessions !== "function"
     ) {
       return;
@@ -145,15 +155,18 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         const sessions = res?.sessions ?? [];
         const wanted = agentName?.trim().toLowerCase();
         const match =
-          sessions.find((s) => s.id === sessionId) ??
+          (sessionId ? sessions.find((s) => s.id === sessionId) : undefined) ??
           (wanted ? sessions.find((s) => s.persona?.trim().toLowerCase() === wanted) : undefined);
         setFetchedExecutionMode(match?.execution_mode ?? null);
+        setFetchedAdapter(match?.adapter ?? null);
+        setFetchedModel(match?.model ?? null);
+        setFetchedAvailableModels(match?.available_models ?? null);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [isOpen, executionMode, apiClient, sessionId, agentName]);
+  }, [isOpen, executionMode, adapter, apiClient, sessionId, agentName]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -178,7 +191,34 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
   const agentKey = (agentName || displayTarget).trim().toLowerCase();
   const targetSessionOrAgent = sessionId || agentName || "";
-  const modelOptions = getVendorModelOptions(adapter, selectedModel, availableModels);
+  const rawPropAdapter = (adapter ?? "").trim();
+  const rawFetchedAdapter = (fetchedAdapter ?? "").trim();
+  const rawSelectedModel = (selectedModel ?? "").trim();
+  const rawFetchedModel = (fetchedModel ?? "").trim();
+  const knownAdapter =
+    rawPropAdapter && rawPropAdapter.toLowerCase() !== "unknown"
+      ? rawPropAdapter
+      : rawFetchedAdapter && rawFetchedAdapter.toLowerCase() !== "unknown"
+        ? rawFetchedAdapter
+        : inferVendorFromModel(rawSelectedModel || rawFetchedModel) ?? "";
+  const effectiveAdapter = knownAdapter || rawPropAdapter || rawFetchedAdapter || null;
+  const effectiveAvailableModels =
+    Array.isArray(availableModels) && availableModels.length > 0
+      ? availableModels
+      : fetchedAvailableModels;
+  const candidateModel = rawSelectedModel || rawFetchedModel;
+  const isStaleAntigravityModel =
+    !isAntigravityAdapter(knownAdapter) &&
+    candidateModel.toLowerCase().startsWith("gemini-") &&
+    (!Array.isArray(effectiveAvailableModels) ||
+      !effectiveAvailableModels.includes(candidateModel));
+  const sanitizedCurrentModel = isStaleAntigravityModel ? "" : candidateModel;
+  const modelOptions = getVendorModelOptions(
+    knownAdapter || effectiveAdapter,
+    sanitizedCurrentModel,
+    effectiveAvailableModels,
+  );
+  const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
   const effectiveThinking = (selectedThinkingLevel || "high").trim().toLowerCase();
 
   const handleRecastSubmit = async (confirmOverrides = false) => {
@@ -364,7 +404,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
               Harness / Adapter
             </div>
-            <div className="fd-mono">{adapter || "unknown"}</div>
+            <div className="fd-mono">{effectiveAdapter || "unknown"}</div>
           </div>
           <div>
             <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
@@ -406,8 +446,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               Active Model
             </div>
             <span className="fd-badge fd-mono" data-testid="chat-active-model-badge">
-              {adapter ? `${adapter} · ` : ""}
-              {selectedModel}
+              {effectiveAdapter && effectiveAdapter.toLowerCase() !== "unknown"
+                ? `${effectiveAdapter} · `
+                : ""}
+              {effectiveModel || "default"}
               {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
             </span>
           </div>
@@ -451,13 +493,16 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               data-testid="session-model-select"
               className="fd-select fd-mono"
               disabled={!targetSessionOrAgent || switchingModel}
-              value={selectedModel}
+              value={effectiveModel}
               onChange={(e) => onChangeModelAndThinking(e.target.value, effectiveThinking)}
               style={{ width: "100%" }}
             >
+              {modelOptions.length === 0 && (
+                <option value="">Default (runtime default)</option>
+              )}
               {modelOptions.map((opt) => (
                 <option key={opt} value={opt}>
-                  {opt}
+                  {formatModelOptionLabel(opt)}
                 </option>
               ))}
             </select>
@@ -484,7 +529,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               className="fd-select fd-mono"
               disabled={!targetSessionOrAgent || switchingModel}
               value={effectiveThinking}
-              onChange={(e) => onChangeModelAndThinking(selectedModel, e.target.value)}
+              onChange={(e) => onChangeModelAndThinking(effectiveModel, e.target.value)}
               style={{ width: "100%" }}
             >
               {thinkingOptions.map((opt) => (
