@@ -46,7 +46,9 @@ pub mod workflow;
 
 pub use agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
-    RegistryEventKind, reports_to, validate_agent_identity,
+    RegistryEventKind, RoleError, RoleRecord, RoleReviewPolicy, builtin_role_records, delete_role,
+    get_role, is_builtin_role, list_roles, normalize_role_slug, reports_to, upsert_role,
+    validate_agent_identity,
 };
 pub use arch::{
     ArchComponent, ArchComponentKind, ArchConformanceReport, ArchEdge, ArchError, ArchViolation,

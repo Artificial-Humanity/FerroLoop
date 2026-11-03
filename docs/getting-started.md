@@ -69,6 +69,7 @@ Commands:
   routing     Route a project's new items between its local store and GitHub
   mcp         A project's MCP servers: one committed catalog, written into each agent CLI's file
   agent       Manage the workspace agent and coverage-area registry
+  role        Manage the configurable role registry (builtins plus custom roles)
   state       Manage durable memories, handoffs, runtime state, and git state sync
   wire        Send, read, acknowledge, and relay FerroWire agent messages
   flow        Author, inspect, and execute directed workflow graphs
