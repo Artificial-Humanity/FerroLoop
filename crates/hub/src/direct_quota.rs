@@ -15,6 +15,8 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fl_core::telemetry::AdapterKind;
+use fl_exec::child_env::{child_env, helper_env};
 use serde_json::Value;
 
 use crate::discovery::{QuotaWindowUsage, SessionQuotaUsage, json_f64, parse_iso8601_unix_millis};
@@ -146,7 +148,12 @@ pub(crate) fn muse_account_quota(home_override: Option<&Path>) -> Option<Session
     let bin = probe_bin(home_override, "FL_HUB_MUSE_BIN", "muse")?;
     let key = format!("muse:{}:{}", home_key(home_override), bin.display());
     cached(ProbeKind::Muse, &key, || {
-        let raw = command_stdout(&bin, &["usage", "--json"], PROBE_TIMEOUT)?;
+        let raw = command_stdout(
+            &bin,
+            &["usage", "--json"],
+            Some(AdapterKind::Muse),
+            PROBE_TIMEOUT,
+        )?;
         let value = parse_json_document(&raw)?;
         muse_allowance(&value)
     })
@@ -183,7 +190,12 @@ fn claude_quota_uncached(
     override_json: Option<Value>,
 ) -> Option<SessionQuotaUsage> {
     let auth = bin.and_then(|path| {
-        let raw = command_stdout(path, &["auth", "status", "--json"], PROBE_TIMEOUT)?;
+        let raw = command_stdout(
+            path,
+            &["auth", "status", "--json"],
+            Some(AdapterKind::Claude),
+            PROBE_TIMEOUT,
+        )?;
         parse_json_document(&raw)
     });
     let auth_tier = auth.as_ref().and_then(subscription_type);
@@ -795,9 +807,24 @@ fn load_json_override(raw: &str) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
-fn command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+/// Runs `bin` and returns its stdout. The child gets a scrubbed environment (see
+/// [`fl_exec::child_env`]): the baseline plus `kind`'s own vendor variables, or the baseline alone
+/// when `kind` is `None` (`curl`). It never sees `FL_VAULT_MASTER_KEY`, `FL_HUB_*`, GitHub
+/// credentials, another vendor's keys or a proxy.
+pub(crate) fn command_stdout(
+    bin: &Path,
+    args: &[&str],
+    kind: Option<AdapterKind>,
+    timeout: Duration,
+) -> Option<String> {
+    let env = match kind {
+        Some(kind) => child_env(kind, &[], &[]),
+        None => helper_env(&[], &[]),
+    };
     let mut child = Command::new(bin)
         .args(args)
+        .env_clear()
+        .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1156,6 +1183,7 @@ fn fetch_claude_oauth_unix(token: &str, endpoint: &str) -> Option<Value> {
             "--config",
             &path.to_string_lossy(),
         ],
+        None,
         PROBE_TIMEOUT,
     )?;
     parse_json_document(&raw)

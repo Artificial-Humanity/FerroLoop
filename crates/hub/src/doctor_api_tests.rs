@@ -44,14 +44,15 @@ struct CleanEnv {
 }
 
 fn clean_env() -> CleanEnv {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let lock = crate::SECRET_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let saved = DOCTOR_ENV
         .iter()
         .map(|k| (*k, std::env::var_os(k)))
         .collect();
     for k in DOCTOR_ENV {
-        // SAFETY: every test that reads these variables through the doctor holds LOCK.
+        // SAFETY: every test that reads or sets these variables holds SECRET_ENV_LOCK.
         unsafe { std::env::remove_var(k) };
     }
     CleanEnv { saved, _lock: lock }
@@ -60,7 +61,7 @@ fn clean_env() -> CleanEnv {
 impl Drop for CleanEnv {
     fn drop(&mut self) {
         for (k, v) in self.saved.drain(..) {
-            // SAFETY: still holding LOCK.
+            // SAFETY: still holding SECRET_ENV_LOCK.
             unsafe {
                 match v {
                     Some(v) => std::env::set_var(k, v),

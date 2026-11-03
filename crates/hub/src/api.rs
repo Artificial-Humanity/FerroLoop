@@ -6108,9 +6108,27 @@ fn hydrate_bin(home_override: Option<&Path>) -> Option<PathBuf> {
     local.is_file().then_some(local)
 }
 
-fn read_command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+/// Variables `agent-hydrate` (a `uv run` script) reads beyond the baseline: where `uv` keeps its
+/// cache, its interpreters and its project environment. Paths, not secrets.
+const HYDRATE_ENV_PASS: [&str; 4] = [
+    "UV_CACHE_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "UV_PYTHON",
+    "UV_PROJECT_ENVIRONMENT",
+];
+
+/// The environment of the hydrate helper: the baseline (`PATH`, `HOME`, `XDG_*`, `AGENT_PERSONA`)
+/// and [`HYDRATE_ENV_PASS`], with no vendor credential, no `FL_*` and no GitHub token.
+fn hydrate_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let pass: Vec<String> = HYDRATE_ENV_PASS.iter().map(|n| n.to_string()).collect();
+    fl_exec::child_env::helper_env(&pass, &[])
+}
+
+pub(crate) fn read_command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(bin)
         .args(args)
+        .env_clear()
+        .envs(hydrate_env())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

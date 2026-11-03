@@ -28,7 +28,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+use fl_core::telemetry::AdapterKind;
 use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport};
+use fl_exec::child_env::{child_env, helper_env};
 use fl_exec::stamp;
 use fl_gate::{MASTER_KEY_LEN, Vault, VaultSecretMetadata, resolve_vault_path};
 use serde::Serialize;
@@ -46,6 +48,14 @@ use crate::runtime_update::update_command;
 
 /// Subscription CLI runtimes, in display order.
 pub const CLI_RUNTIMES: [&str; 5] = ["claude", "codex", "grok", "agy", "muse"];
+/// The adapter dialect of each [`CLI_RUNTIMES`] name.
+const CLI_KINDS: [(&str, AdapterKind); 5] = [
+    ("claude", AdapterKind::Claude),
+    ("codex", AdapterKind::Codex),
+    ("grok", AdapterKind::Grok),
+    ("agy", AdapterKind::Antigravity),
+    ("muse", AdapterKind::Muse),
+];
 /// `(provider, vault secret name)` pairs.
 pub const VAULT_PROVIDERS: [(&str, &str); 6] = [
     ("anthropic", "ANTHROPIC_API_KEY"),
@@ -751,12 +761,28 @@ fn probe_cli(name: &str, inputs: &ProbeInputs, timeout: Duration) -> CliRuntimeS
     status
 }
 
+/// The environment of a `--version` probe of `path`, by the vendor its file name stands for.
+fn version_env(path: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let name = path.file_name().and_then(|n| n.to_str());
+    match CLI_KINDS.iter().find(|(n, _)| Some(*n) == name) {
+        Some((_, kind)) => child_env(*kind, &[], &[]),
+        None => helper_env(&[], &[]),
+    }
+}
+
 /// `<path> --version` with a hard deadline. The child leads its own process group, and the whole
 /// group is killed on timeout and after exit, so a wrapper script cannot leave a grandchild behind.
 /// The group is only signalled while the leader is still unreaped (see [`exited_unreaped`]).
+///
+/// The child gets a scrubbed environment (see [`fl_exec::child_env`]): the baseline plus the
+/// vendor variables of the CLI the file name stands for (`claude`, `codex`, `agy`, `muse`,
+/// `grok`), or the baseline alone for any other name. It never sees `FL_VAULT_MASTER_KEY`,
+/// `FL_HUB_*`, GitHub credentials, another vendor's keys or a proxy.
 pub fn run_version(path: &Path, timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(path);
     cmd.arg("--version")
+        .env_clear()
+        .envs(version_env(path))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1337,6 +1363,11 @@ mod tests {
     #[test]
     fn matrix_tables_match_the_spec() {
         assert_eq!(CLI_RUNTIMES, ["claude", "codex", "grok", "agy", "muse"]);
+        let kinds: Vec<_> = CLI_KINDS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(kinds, CLI_RUNTIMES);
+        for (name, kind) in CLI_KINDS {
+            assert_eq!(kind.default_binary(), name);
+        }
         let secrets: Vec<_> = VAULT_PROVIDERS.iter().map(|(_, s)| *s).collect();
         assert_eq!(
             secrets,
