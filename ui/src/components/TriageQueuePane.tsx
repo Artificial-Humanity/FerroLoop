@@ -113,6 +113,46 @@ export const DEFAULT_ROUTED_CI_PR_EVENTS: RoutedCiPrFeedbackEvent[] = [
   },
 ];
 
+// Record #103: Live Permission Prompt Interception & Remote Approval
+export type PermissionResponseDecision =
+  | "approve_once"
+  | "approve_session"
+  | "always_allow_rule"
+  | "deny";
+
+export interface PendingPermissionPromptItem {
+  id: string;
+  session_id: string;
+  agent: string;
+  vendor: string;
+  capability: string;
+  command_or_target: string;
+  status: "pending" | PermissionResponseDecision;
+}
+
+export const DEFAULT_PENDING_PERMISSION_PROMPTS: PendingPermissionPromptItem[] =
+  [
+    {
+      id: "perm-req-01",
+      session_id: "sess-felix-ui",
+      agent: "felix",
+      vendor: "claude",
+      capability: "fs_read_external",
+      command_or_target:
+        "Read /tmp/ferrodeck-repo/ui/src/components/SettingsModal.tsx",
+      status: "pending",
+    },
+    {
+      id: "perm-req-02",
+      session_id: "sess-feira-sys",
+      agent: "feira",
+      vendor: "codex",
+      capability: "shell_exec",
+      command_or_target: "cargo test -p fl-core --test install_plan",
+      status: "pending",
+    },
+  ];
+
 const SEVERITY_RANK: Record<TriageIncidentSeverity, number> = {
   critical: 0,
   warning: 1,
@@ -555,6 +595,44 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
     setRoutedActionStatus(
       `Acknowledged ${ev.kind} event for PR #${ev.pr_number}.`,
     );
+  };
+
+  // Record #103: Live Permission Prompt Interception & Remote Approval state
+  const [permissionPrompts, setPermissionPrompts] = useState<
+    PendingPermissionPromptItem[]
+  >(DEFAULT_PENDING_PERMISSION_PROMPTS);
+  const [permissionPromptBanner, setPermissionPromptBanner] = useState<
+    string | null
+  >(null);
+
+  const handleRespondPermissionPrompt = async (
+    item: PendingPermissionPromptItem,
+    decision: PermissionResponseDecision,
+  ) => {
+    setPermissionPrompts((prev) =>
+      prev.map((p) => (p.id === item.id ? { ...p, status: decision } : p)),
+    );
+    setPermissionPromptBanner(
+      `Sent ${decision} for @${item.agent} (${item.capability}: ${item.command_or_target}).`,
+    );
+    try {
+      if (typeof globalThis.fetch === "function") {
+        await globalThis.fetch(
+          `/api/v1/sessions/${encodeURIComponent(item.session_id)}/permissions/respond`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt_id: item.id,
+              capability: item.capability,
+              decision,
+            }),
+          },
+        );
+      }
+    } catch {
+      // Client-side state already updated when endpoint is offline
+    }
   };
   const [categoryFilter, setCategoryFilter] =
     useState<TriageCategoryFilter>("all");
@@ -1109,6 +1187,152 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
               </div>
               <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
                 {ev.failing_step_or_summary}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Record #103: Live Permission Prompt Interception & Remote Approval */}
+        <div
+          data-testid="triage-permission-prompts-section"
+          style={{
+            marginTop: "6px",
+            padding: "8px 10px",
+            borderRadius: "6px",
+            backgroundColor: "var(--bg-elevated)",
+            border: "1px solid var(--border-subtle)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <span
+              style={{
+                fontSize: "11.5px",
+                fontWeight: 700,
+                color: "var(--text-primary)",
+              }}
+            >
+              Live Permission Prompts &amp; Remote Approval
+            </span>
+            <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+              1-Click Remote Approval (#103)
+            </span>
+          </div>
+
+          {permissionPromptBanner && (
+            <div
+              role="status"
+              data-testid="triage-permission-prompt-banner"
+              className="fd-mono"
+              style={{ fontSize: "11px", color: "#34D399" }}
+            >
+              {permissionPromptBanner}
+            </div>
+          )}
+
+          {permissionPrompts.map((item) => (
+            <div
+              key={item.id}
+              data-testid={`perm-prompt-card-${item.id}`}
+              data-status={item.status}
+              className="fd-card"
+              style={{
+                padding: "8px 10px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  <span className="fd-badge fd-mono">@{item.agent}</span>
+                  <span className="fd-badge fd-mono">{item.vendor}</span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`perm-prompt-capability-${item.id}`}
+                  >
+                    {item.capability}
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`perm-prompt-status-${item.id}`}
+                  >
+                    {item.status}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid={`perm-prompt-approve-once-btn-${item.id}`}
+                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    onClick={() =>
+                      void handleRespondPermissionPrompt(item, "approve_once")
+                    }
+                  >
+                    Approve Once
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid={`perm-prompt-approve-session-btn-${item.id}`}
+                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    onClick={() =>
+                      void handleRespondPermissionPrompt(
+                        item,
+                        "approve_session",
+                      )
+                    }
+                  >
+                    Approve for Session
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid={`perm-prompt-always-allow-btn-${item.id}`}
+                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    onClick={() =>
+                      void handleRespondPermissionPrompt(
+                        item,
+                        "always_allow_rule",
+                      )
+                    }
+                  >
+                    Always Allow Rule
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-danger"
+                    data-testid={`perm-prompt-deny-btn-${item.id}`}
+                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                    onClick={() =>
+                      void handleRespondPermissionPrompt(item, "deny")
+                    }
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+              <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                {item.command_or_target}
               </div>
             </div>
           ))}
