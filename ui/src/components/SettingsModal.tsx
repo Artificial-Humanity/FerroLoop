@@ -5900,6 +5900,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -5908,10 +5910,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferroloop-icon.jpg"
                       alt="FerroLoop icon"
@@ -5924,13 +5935,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroLoop
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl · Core Engine &amp; DAG Workflows
                       </code>
@@ -5941,6 +5957,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       opacity: 0.7,
@@ -6019,6 +6038,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   style={{
                     display: "inline-flex",
                     alignItems: "center",
+                    flexWrap: "wrap",
+                    minWidth: 0,
                     gap: "6px",
                     color: "var(--text-muted)",
                     fontSize: "11px",
@@ -6030,9 +6051,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     width="14"
                     height="14"
                     aria-hidden="true"
-                    style={{ borderRadius: "3px", objectFit: "cover" }}
+                    style={{ borderRadius: "3px", objectFit: "cover", flexShrink: 0 }}
                   />
-                  <span>
+                  <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
                     {labProfilePreferred
                       ? "Storage Engine: FerroStore (ai-lab-0 ferrostore@ socket daemon)"
                       : "Storage Engine: FerroStore (.fls / FERRSTR1 embedded default dependency)"}
@@ -6050,6 +6071,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6058,10 +6081,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrodeck-icon.jpg"
                       alt="FerroDeck icon"
@@ -6074,13 +6106,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroDeck
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl hub · Command-Center Web App
                       </code>
@@ -6090,6 +6127,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",
@@ -6179,6 +6219,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6187,10 +6229,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrowire-icon.jpg"
                       alt="FerroWire icon"
@@ -6203,13 +6254,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroWire
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl wire · Agent Messaging &amp; Relay
                       </code>
@@ -6219,6 +6275,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",
@@ -6331,6 +6390,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6339,10 +6400,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrostate-icon.jpg"
                       alt="FerroState icon"
@@ -6355,13 +6425,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroState
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl state · Memory &amp; Code Index
                       </code>
@@ -6371,6 +6446,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",
@@ -6443,6 +6521,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6451,10 +6531,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrogate-icon.jpg"
                       alt="FerroGate icon"
@@ -6467,13 +6556,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroGate
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl vault / fl auth · Vault &amp; Proxy
                       </code>
@@ -6483,6 +6577,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",
@@ -6563,6 +6660,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6571,10 +6670,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrotrack-icon.jpg"
                       alt="FerroTrack icon"
@@ -6587,13 +6695,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroTrack
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl github · Issue Tracker &amp; Ledger
                       </code>
@@ -6603,6 +6716,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",
@@ -6694,6 +6810,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 flexDirection: "column",
                 justifyContent: "space-between",
                 gap: "10px",
+                minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
@@ -6702,10 +6820,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     alignItems: "flex-start",
                     justifyContent: "space-between",
-                    gap: "10px",
+                    flexWrap: "wrap",
+                    gap: "8px",
                   }}
                 >
-                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "10px",
+                      minWidth: 0,
+                      flex: "1 1 170px",
+                    }}
+                  >
                     <img
                       src="/brand/ferrowatch-icon.jpg"
                       alt="FerroWatch icon"
@@ -6718,13 +6845,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         flexShrink: 0,
                       }}
                     />
-                    <div>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
                         FerroWatch
                       </div>
                       <code
                         className="fd-mono"
-                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                        style={{
+                          display: "block",
+                          fontSize: "11px",
+                          color: "var(--text-muted)",
+                          overflowWrap: "anywhere",
+                        }}
                       >
                         fl stats · Observability &amp; Quotas
                       </code>
@@ -6734,6 +6866,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      maxWidth: "100%",
                       gap: "6px",
                       fontSize: "11.5px",
                       cursor: "pointer",

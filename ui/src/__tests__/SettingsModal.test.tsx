@@ -793,11 +793,16 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     ]) {
       const card = within(panel).getByTestId(`product-card-${slug}`);
       expect(card).toBeInTheDocument();
+      expect(card).toHaveStyle({ minWidth: "0", overflow: "hidden" });
       expect(
         within(card).getByTestId(`product-config-${slug}`),
       ).toBeInTheDocument();
       const img = card.querySelector("img");
       expect(img?.getAttribute("src")).toBe(`/brand/${slug}-icon.jpg`);
+      const headerRow = img?.parentElement?.parentElement;
+      expect(headerRow).toHaveStyle({ flexWrap: "wrap" });
+      const toggleLabel = card.querySelector("label");
+      expect(toggleLabel).toHaveStyle({ flexWrap: "wrap", maxWidth: "100%" });
     }
 
     // FerroLoop core engine toggle is required / locked on

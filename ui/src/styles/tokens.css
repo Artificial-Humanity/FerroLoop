@@ -519,9 +519,12 @@ button.fd-badge:hover:not(:disabled) {
 
 .fd-modal-header {
   position: sticky;
-  top: 0;
-  z-index: 5;
+  top: -20px;
+  margin: -20px -20px 0 -20px;
+  padding: 20px 20px 10px 20px;
+  z-index: 10;
   background-color: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 .fd-help-icon-btn {
@@ -814,6 +817,12 @@ button.fd-badge:hover:not(:disabled) {
     display: flex !important;
     flex-direction: column !important;
     box-sizing: border-box !important;
+  }
+
+  .fd-modal-header {
+    top: -14px;
+    margin: -14px -14px 0 -14px;
+    padding: 14px 14px 10px 14px;
   }
 
   .fd-input,
