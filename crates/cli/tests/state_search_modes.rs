@@ -98,6 +98,25 @@ fn search(cfg: &TempDir, db: &Path, backend: Option<&str>, args: &[&str]) -> Val
     serde_json::from_slice(&out).unwrap()
 }
 
+/// `(slug, score_millis)` of every hit, best first.
+fn scored(v: &Value) -> Vec<(String, u64)> {
+    v["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["entry"]["slug"].as_str().unwrap().to_string(),
+                h["score_millis"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn lit(items: &[(&str, u64)]) -> Vec<(String, u64)> {
+    items.iter().map(|(s, m)| (s.to_string(), *m)).collect()
+}
+
 fn slugs(v: &Value) -> Vec<String> {
     v["hits"]
         .as_array()
@@ -302,6 +321,9 @@ fn default_output_is_unchanged_golden() {
     assert_eq!(keys, ["hits", "query", "total_hits"], "{plain}");
     assert_eq!(plain["query"], "checkpointing");
     assert_eq!(slugs(&plain), ["exact-term"]);
+    // Literal scores captured from `rank_state_entries` (which `--mode auto`
+    // delegates to unchanged) on this deterministic corpus.
+    assert_eq!(scored(&plain), lit(&[("exact-term", 1124)]), "{plain}");
     let hit_keys: Vec<String> = {
         let mut k: Vec<String> = plain["hits"][0]
             .as_object()
@@ -336,6 +358,11 @@ fn default_output_is_unchanged_golden() {
     // ferro: the fused ranking it always had, reported as `knowledge`.
     let fused = search(&cfg, &ferro_db, None, &["checkpointing"]);
     assert_eq!(fused["mode"], "knowledge", "{fused}");
+    assert_eq!(
+        scored(&fused),
+        lit(&[("exact-term", 33), ("build-cache", 16)]),
+        "{fused}"
+    );
     assert_eq!(
         fused,
         search(&cfg, &ferro_db, None, &["checkpointing", "--mode", "auto"])
@@ -384,6 +411,26 @@ fn vector_and_hybrid_are_refused_on_redb_and_lexical_still_works() {
     );
     assert_eq!(lex["mode"], "lexical");
     assert_eq!(slugs(&lex), ["exact-term"]);
+}
+
+#[test]
+fn vector_and_hybrid_refuse_a_query_with_nothing_to_embed() {
+    let cfg = TempDir::new().unwrap();
+    let db = cfg.path().join("s.redb");
+    seed(&cfg, &db, None);
+    for mode in ["vector", "hybrid"] {
+        let assert = fl(&cfg, &db, None)
+            .args(["state", "search", "!!!", "--mode", mode])
+            .assert()
+            .failure();
+        let err = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+        assert!(err.contains("query has nothing to embed"), "{mode}: {err}");
+    }
+    // The default and lexical modes still answer an empty result.
+    for mode in ["auto", "lexical"] {
+        let v = search(&cfg, &db, None, &["!!!", "--mode", mode]);
+        assert_eq!(v["total_hits"], 0, "{mode}: {v}");
+    }
 }
 
 #[test]

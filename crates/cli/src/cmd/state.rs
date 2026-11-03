@@ -90,26 +90,36 @@ pub fn ranked_result_json(query: &str, ranked: &RankedHits) -> serde_json::Value
 }
 
 /// [`ranked_result_json`] for a search that named its [`RankMode`]. `Auto`
-/// keeps the shape above; any other mode adds `"mode": "<mode>"`, the legs
-/// that ran (an explicit `vector` or `hybrid` request never falls back to
-/// BM25, so the name is exact).
+/// keeps the shape above; any other mode adds `"mode": "<mode>"`, the mode
+/// that was requested and ran (an explicit `vector` or `hybrid` request never
+/// falls back to BM25). A `vector` or `hybrid` result whose index was still
+/// being built adds `"partial": true` and `"pending_index": <entries>`.
 pub fn ranked_result_json_for(
     query: &str,
     ranked: &RankedHits,
     mode: RankMode,
 ) -> serde_json::Value {
     let mut out = ranked_result_json(query, ranked);
-    if mode != RankMode::Auto
-        && let Some(map) = out.as_object_mut()
-    {
-        map.insert("mode".into(), mode.as_str().into());
+    if let Some(map) = out.as_object_mut() {
+        if mode != RankMode::Auto {
+            map.insert("mode".into(), mode.as_str().into());
+        }
+        if ranked.pending_index > 0 {
+            map.insert("partial".into(), true.into());
+            map.insert("pending_index".into(), ranked.pending_index.into());
+        }
     }
     out
 }
 
-/// Parse a `--mode` / `mode` value for a state search.
-pub fn parse_rank_mode(raw: &str) -> Result<RankMode, String> {
-    RankMode::parse(raw)
+/// The stderr line for a partial `vector` or `hybrid` result, or `None`.
+pub fn partial_index_line(ranked: &RankedHits) -> Option<String> {
+    (ranked.pending_index > 0).then(|| {
+        format!(
+            "fl: {} entries not yet indexed; results may be partial, re-run",
+            ranked.pending_index
+        )
+    })
 }
 
 /// Rank `entries` for `mode` with the deterministic local embedder, indexing
@@ -327,7 +337,9 @@ pub enum StateCmd {
     /// BM25 fused with the vector index when the store has one, `lexical` is
     /// BM25 only, `vector` is the local hashing-embedding index only, `hybrid`
     /// is BM25 + vector fused by reciprocal rank (k=60). `vector` and `hybrid`
-    /// need the FerroStore engine and make no network call.
+    /// need the FerroStore engine and make no network call. With a mode other
+    /// than `auto`, the JSON `mode` key is the requested mode (under `auto` it
+    /// names the ranker that answered).
     Search {
         /// Search query text.
         query: String,
@@ -338,7 +350,7 @@ pub enum StateCmd {
         #[arg(long)]
         limit: Option<usize>,
         /// Ranking legs: auto, lexical, vector, or hybrid.
-        #[arg(long, default_value = "auto", value_parser = parse_rank_mode)]
+        #[arg(long, default_value = "auto", value_parser = RankMode::parse)]
         mode: RankMode,
         #[arg(long)]
         json: bool,
@@ -1242,6 +1254,9 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             if let Some(line) = index_unavailable_line(&ranked) {
                 eprintln!("{line}");
             }
+            if let Some(line) = partial_index_line(&ranked) {
+                eprintln!("{line}");
+            }
             if json {
                 let out = ranked_result_json_for(&query, &ranked, mode);
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -2039,6 +2054,7 @@ mod tests {
             mode: SearchMode::Bm25,
             note: None,
             cause: None,
+            pending_index: 0,
         };
         assert_eq!(
             ranked_result_json("q", &plain),
@@ -2066,6 +2082,7 @@ mod tests {
             mode: SearchMode::Bm25,
             note: None,
             cause: None,
+            pending_index: 0,
         };
         assert_eq!(
             ranked_result_json_for("q", &plain, RankMode::Auto),
@@ -2077,9 +2094,31 @@ mod tests {
             (RankMode::Hybrid, "hybrid"),
         ] {
             assert_eq!(ranked_result_json_for("q", &plain, mode)["mode"], name);
-            assert_eq!(parse_rank_mode(name), Ok(mode));
+            assert_eq!(RankMode::parse(name), Ok(mode));
         }
-        assert!(parse_rank_mode("bm25").is_err());
+        assert!(RankMode::parse("bm25").is_err());
+    }
+
+    #[test]
+    fn a_partly_indexed_vector_result_is_flagged_in_json_and_on_stderr() {
+        let mut ranked = RankedHits {
+            hits: Vec::new(),
+            total_hits: 0,
+            mode: SearchMode::Knowledge,
+            note: None,
+            cause: None,
+            pending_index: 0,
+        };
+        assert_eq!(partial_index_line(&ranked), None);
+        let whole = ranked_result_json_for("q", &ranked, RankMode::Vector);
+        assert!(whole.get("partial").is_none() && whole.get("pending_index").is_none());
+        ranked.pending_index = 7;
+        let value = ranked_result_json_for("q", &ranked, RankMode::Hybrid);
+        assert_eq!(value["partial"], true);
+        assert_eq!(value["pending_index"], 7);
+        assert_eq!(value["mode"], "hybrid");
+        let line = partial_index_line(&ranked).unwrap();
+        assert!(line.contains("7 entries not yet indexed"), "{line}");
     }
 
     #[test]
@@ -2090,11 +2129,13 @@ mod tests {
             mode: SearchMode::Bm25,
             note: None,
             cause: None,
+            pending_index: 0,
         };
         assert_eq!(index_unavailable_line(&plain), None);
         let failed = RankedHits {
             note: Some("why".into()),
             cause: Some("backend: disk\non fire".into()),
+            pending_index: 0,
             ..plain.clone()
         };
         assert_eq!(

@@ -32,7 +32,7 @@ use crate::cmd::agent::now_at;
 use crate::cmd::state::{
     DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, effective_code_limit,
     effective_search_limit, index_unavailable_line, parse_concern, parse_memory_basis,
-    parse_memory_category, parse_merge_mode, parse_rank_mode, rank_for_mode,
+    parse_memory_category, parse_merge_mode, partial_index_line, rank_for_mode,
     ranked_result_json_for, render_state_markdown, resolve_state_in_store, search_and_record,
     search_and_record_in,
 };
@@ -229,7 +229,7 @@ fn parse_search_limit(args: &Value) -> Result<usize, String> {
 /// The optional `mode` argument of `fl_memory_search`; absent means `auto`.
 fn parse_search_mode(args: &Value) -> Result<RankMode, String> {
     match opt_str(args, "mode")? {
-        Some(raw) => parse_rank_mode(&raw),
+        Some(raw) => RankMode::parse(&raw),
         None => Ok(RankMode::Auto),
     }
 }
@@ -776,6 +776,9 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 limit,
             )?;
             if let Some(line) = index_unavailable_line(&ranked) {
+                eprintln!("{line}");
+            }
+            if let Some(line) = partial_index_line(&ranked) {
                 eprintln!("{line}");
             }
             Ok(
@@ -1462,7 +1465,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_memory_search",
-            "description": "Search state entries. `mode` picks the ranking legs: auto (default; BM25 fused with the local vector index when the store has one), lexical (BM25 only), vector (local hashing-embedding index only), hybrid (BM25 + vector, reciprocal-rank fusion k=60). vector and hybrid need the FerroStore engine. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation; a non-auto mode adds `mode`.",
+            "description": "Search state entries. `mode` picks the ranking legs: auto (default; BM25 fused with the local vector index when the store has one), lexical (BM25 only), vector (local hashing-embedding index only), hybrid (BM25 + vector, reciprocal-rank fusion k=60). vector and hybrid need the FerroStore engine. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation; a non-auto mode adds `mode` (the requested mode); a vector/hybrid result whose index was still being built adds `partial: true` and `pending_index`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],

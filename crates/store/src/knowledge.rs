@@ -109,6 +109,9 @@ const PENDING_REV: u64 = 1 << 53;
 /// Index-document `rev` meaning "this entry is not indexable and was probed:
 /// it has no vector". Also outside the range of [`stamp`].
 const CLEAN_REV: u64 = (1 << 53) + 2;
+/// Most sync rounds an explicit `Vector` or `Hybrid` search runs to finish
+/// building the index before it reports the rest as pending.
+pub const MAX_SYNC_ROUNDS: usize = 16;
 /// Most vectors written in one commit.
 pub(crate) const UPSERT_BATCH: usize = 256;
 
@@ -197,6 +200,11 @@ pub struct RankedHits {
     /// The engine's own error behind `note`, for diagnosis. It is never part of
     /// any JSON output: callers show it on stderr at most.
     pub cause: Option<String>,
+    /// Entries the vector index still lacked when an explicit `Vector` or
+    /// `Hybrid` search stopped syncing ([`MAX_SYNC_ROUNDS`] reached). Non-zero
+    /// means the result may be partial: run the search again. Always 0 for
+    /// `Auto` and `Lexical`.
+    pub pending_index: usize,
 }
 
 /// What an indexing pass did.
@@ -232,6 +240,7 @@ fn bm25_ranked(all: Vec<StateSearchHit>, limit: usize) -> RankedHits {
         mode: SearchMode::Bm25,
         note: None,
         cause: None,
+        pending_index: 0,
     }
 }
 
@@ -326,32 +335,93 @@ pub fn rank_state_entries_mode(
             store, embedder, policy, entries, query, scope, concern, limit,
         )),
         RankMode::Lexical => Ok(rank_bm25(entries, query, scope, concern, limit)),
-        RankMode::Vector | RankMode::Hybrid => {
-            let ferro = store.as_ferro().ok_or_else(|| {
-                crate::backend(format!(
-                    "{} search needs the FerroStore engine; this store is redb",
-                    mode.as_str()
-                ))
-            })?;
-            let vector_only = mode == RankMode::Vector;
-            let lexical = if vector_only {
-                Vec::new()
-            } else {
-                search_state_entries(entries, query, scope, concern, usize::MAX)
-            };
-            let mut stats = IndexStats::default();
-            let ranked = rank_knowledge(
-                ferro, embedder, policy, entries, query, scope, concern, limit, &lexical,
-                &mut stats,
-            )?;
-            Ok(ranked.unwrap_or_else(|| {
-                // Nothing to embed: the vector leg is empty.
-                let mut out = bm25_ranked(lexical, limit);
-                out.mode = SearchMode::Knowledge;
-                out
-            }))
+        RankMode::Vector | RankMode::Hybrid => rank_explicit(
+            store,
+            embedder,
+            policy,
+            mode,
+            entries,
+            query,
+            scope,
+            concern,
+            limit,
+            MAX_SYNC_ROUNDS,
+        ),
+    }
+}
+
+/// An explicit `Vector` or `Hybrid` search. Unlike `Auto` it never answers
+/// from a partly built index without saying so: it syncs round after round
+/// (each bounded by the policy's budget) until nothing is pending, at most
+/// `max_rounds` times, and reports what is still pending in
+/// [`RankedHits::pending_index`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rank_explicit(
+    store: &AnyStore,
+    embedder: &dyn Embedder,
+    policy: IndexPolicy,
+    mode: RankMode,
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+    max_rounds: usize,
+) -> Result<RankedHits, StoreError> {
+    let ferro = store.as_ferro().ok_or_else(|| {
+        crate::backend(format!(
+            "{} search needs the FerroStore engine; this store is redb",
+            mode.as_str()
+        ))
+    })?;
+    let nothing = || {
+        crate::backend(format!(
+            "{} search: query has nothing to embed",
+            mode.as_str()
+        ))
+    };
+    if query.trim().is_empty() || is_zero(&embedder.embed(query)) {
+        return Err(nothing());
+    }
+    let mut pending = 0;
+    if let IndexPolicy::Sync { budget } = policy {
+        let eligible: Vec<&StateEntry> = entries
+            .iter()
+            .filter(|e| scope.is_none_or(|s| &e.scope == s))
+            .filter(|e| concern.is_none_or(|c| e.concern == c))
+            .collect();
+        if !eligible.is_empty() {
+            let collection = vector_collection_name(embedder);
+            for _ in 0..max_rounds {
+                pending = sync_index(ferro, embedder, &collection, &eligible, budget)?.pending;
+                if pending == 0 {
+                    break;
+                }
+            }
         }
     }
+    let lexical = if mode == RankMode::Vector {
+        Vec::new()
+    } else {
+        search_state_entries(entries, query, scope, concern, usize::MAX)
+    };
+    // The index is as current as it will get: rank without syncing again.
+    let mut stats = IndexStats::default();
+    let mut ranked = rank_knowledge(
+        ferro,
+        embedder,
+        IndexPolicy::ReadOnly,
+        entries,
+        query,
+        scope,
+        concern,
+        limit,
+        &lexical,
+        &mut stats,
+    )?
+    .ok_or_else(nothing)?;
+    ranked.pending_index = pending;
+    Ok(ranked)
 }
 
 /// The vector collection for an embedding space: another space or dimension
@@ -427,6 +497,7 @@ fn rank_knowledge(
             mode: SearchMode::Knowledge,
             note: None,
             cause: None,
+            pending_index: 0,
         }));
     }
     let collection = vector_collection_name(embedder);
@@ -499,6 +570,7 @@ fn rank_knowledge(
         mode: SearchMode::Knowledge,
         note: None,
         cause: None,
+        pending_index: 0,
     }))
 }
 
@@ -2085,18 +2157,53 @@ mod tests {
         );
     }
 
+    /// `(slug, score_millis)` of every hit, best first.
+    fn pairs(r: &RankedHits) -> Vec<(String, u64)> {
+        r.hits
+            .iter()
+            .map(|h| (h.entry.slug.clone(), h.score_millis))
+            .collect()
+    }
+
+    fn lit(items: &[(&str, u64)]) -> Vec<(String, u64)> {
+        items.iter().map(|(s, m)| (s.to_string(), *m)).collect()
+    }
+
     #[test]
     fn auto_is_exactly_the_pre_mode_behaviour_on_both_engines() {
         let (_rd, redb, _fd, ferro) = pair();
         let redb_entries = mode_fixture(&redb);
         let ferro_entries = mode_fixture(&ferro);
-        for q in ["checkpointing", "build cache", "sandwiches", "chekpoint"] {
+        // The literals below were captured from `rank_state_entries` (the
+        // pre-mode entry point, which `Auto` delegates to unchanged) on this
+        // deterministic fixture. They pin the ranking and the score scale.
+        let ferro_golden: [(&str, Vec<(String, u64)>); 4] = [
+            (
+                "checkpointing",
+                lit(&[("exact-term", 33), ("build-cache", 16)]),
+            ),
+            ("build cache", lit(&[("build-cache", 33)])),
+            ("sandwiches", lit(&[("lunch-notes", 33)])),
+            ("chekpoint", lit(&[("build-cache", 16)])),
+        ];
+        let redb_golden: [(&str, Vec<(String, u64)>); 4] = [
+            ("checkpointing", lit(&[("exact-term", 1614)])),
+            ("build cache", lit(&[("build-cache", 4978)])),
+            ("sandwiches", lit(&[("lunch-notes", 1370)])),
+            ("chekpoint", lit(&[])),
+        ];
+        for (q, want) in &ferro_golden {
             let old = rank_state_entries(&ferro, &ferro_entries, q, None, None, 10);
             let new = mode_run(&ferro, RankMode::Auto, &ferro_entries, q).unwrap();
             assert_eq!(old, new, "ferro `{q}`");
+            assert_eq!(&pairs(&new), want, "ferro `{q}`");
+            assert_eq!(new.mode, SearchMode::Knowledge, "ferro `{q}`");
+        }
+        for (q, want) in &redb_golden {
             let old = rank_state_entries(&redb, &redb_entries, q, None, None, 10);
             let new = mode_run(&redb, RankMode::Auto, &redb_entries, q).unwrap();
             assert_eq!(old, new, "redb `{q}`");
+            assert_eq!(&pairs(&new), want, "redb `{q}`");
             assert_eq!(new.mode, SearchMode::Bm25);
         }
         // Auto is hybrid on ferro, so it equals the explicit hybrid ranking.
@@ -2366,5 +2473,136 @@ mod tests {
         .unwrap();
         let stats = sync_index(ferro, default_embedder(), &default_col, &refs, 100).unwrap();
         assert_eq!(stats.written, refs.len(), "a mismatch reindexes all");
+    }
+
+    #[test]
+    fn explicit_search_syncs_until_the_index_is_complete_or_reports_the_rest() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        let n = entries.len();
+        let full = mode_run(&store, RankMode::Vector, &entries, "checkpointing").unwrap();
+        assert_eq!(full.pending_index, 0);
+
+        for mode in [RankMode::Vector, RankMode::Hybrid] {
+            // A one-vector budget needs one round per entry: with enough
+            // rounds the result is complete and equals the big-budget one.
+            let d2 = TempDir::new().unwrap();
+            let tiny = open_ferro(&d2);
+            let tiny_entries = mode_fixture(&tiny);
+            let done = rank_explicit(
+                &tiny,
+                default_embedder(),
+                IndexPolicy::Sync { budget: 1 },
+                mode,
+                &tiny_entries,
+                "checkpointing",
+                None,
+                None,
+                10,
+                n + 1,
+            )
+            .unwrap();
+            assert_eq!(done.pending_index, 0, "{mode:?}");
+            let want = mode_run(&store, mode, &entries, "checkpointing").unwrap();
+            assert_eq!(pairs(&done), pairs(&want), "{mode:?} complete after rounds");
+
+            // Too few rounds: the result says how many entries are missing.
+            let d3 = TempDir::new().unwrap();
+            let cut = open_ferro(&d3);
+            let cut_entries = mode_fixture(&cut);
+            let partial = rank_explicit(
+                &cut,
+                default_embedder(),
+                IndexPolicy::Sync { budget: 1 },
+                mode,
+                &cut_entries,
+                "checkpointing",
+                None,
+                None,
+                10,
+                2,
+            )
+            .unwrap();
+            assert_eq!(partial.pending_index, n - 2, "{mode:?} partial");
+        }
+    }
+
+    #[test]
+    fn sensitive_and_ever_sensitive_entries_never_appear_in_vector_or_hybrid() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        // Index everything while the entry is still public.
+        let r = mode_run(&store, RankMode::Vector, &entries, "checkpointing").unwrap();
+        assert!(slugs(&r).contains(&"build-cache"));
+
+        let flipped = flip_sensitive(&store, &entries[0]);
+        assert_eq!(flipped.slug, "build-cache");
+        let check = |label: &str| {
+            let entries = store.list_state(None, None).unwrap();
+            for mode in [RankMode::Vector, RankMode::Hybrid] {
+                for policy in [SYNC, IndexPolicy::ReadOnly, IndexPolicy::Sync { budget: 1 }] {
+                    let r = ranked_with(&store, mode, policy, &entries, "checkpointing");
+                    assert!(
+                        r.hits.iter().all(|h| h.entry.slug != "build-cache"),
+                        "{label} {mode:?} {policy:?} leaked {:?}",
+                        slugs(&r)
+                    );
+                    assert!(
+                        slugs(&r).contains(&"exact-term") || mode == RankMode::Vector,
+                        "{label} {mode:?}: other entries still found"
+                    );
+                }
+            }
+        };
+        check("sensitive");
+
+        // Clearing `sensitive` keeps `ever_sensitive`: still never indexed.
+        let StatePayload::Memory(m) = &flipped.payload else {
+            panic!("memory fixture");
+        };
+        let cleared = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "build-cache".into(),
+                sensitivity: SensitivityPatch::ClearSensitive,
+                payload: StatePayload::Memory(m.clone()),
+                at: At::from_unix_millis(60_000),
+                by: "tester".into(),
+            })
+            .unwrap();
+        assert!(!cleared.sensitive && cleared.ever_sensitive);
+        check("ever-sensitive");
+    }
+
+    fn ranked_with(
+        store: &AnyStore,
+        mode: RankMode,
+        policy: IndexPolicy,
+        entries: &[StateEntry],
+        query: &str,
+    ) -> RankedHits {
+        ranked(store, mode, policy, entries, query, None, None).unwrap()
+    }
+
+    #[test]
+    fn explicit_vector_and_hybrid_refuse_a_query_with_nothing_to_embed() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        for q in ["", "   ", "!!!"] {
+            for mode in [RankMode::Vector, RankMode::Hybrid] {
+                let err = mode_run(&store, mode, &entries, q).unwrap_err();
+                assert!(
+                    err.to_string().contains("query has nothing to embed"),
+                    "{mode:?} `{q}`: {err}"
+                );
+            }
+            // The implicit and lexical modes keep answering (with nothing).
+            for mode in [RankMode::Auto, RankMode::Lexical] {
+                assert!(mode_run(&store, mode, &entries, q).unwrap().hits.is_empty());
+            }
+        }
     }
 }
