@@ -88,6 +88,7 @@ impl HubServer {
 
     /// Run the accept loop until shutdown is signaled or an unrecoverable accept error occurs.
     pub async fn serve(mut self) -> io::Result<()> {
+        crate::artifact_dirs::ensure_startup_dirs(&self.state);
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.

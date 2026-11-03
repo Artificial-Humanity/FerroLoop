@@ -218,7 +218,7 @@ fn open_project_store<'a>(
 ///
 /// Under FerroStore a project that still has only its `<slug>.redb` is not listed (its records
 /// answer `409`) until a `fl` command, or `fl store migrate`, opens it and makes the `.fls`.
-fn available_projects(state: &HubState, home: Option<&Path>) -> Vec<String> {
+pub(crate) fn available_projects(state: &HubState, home: Option<&Path>) -> Vec<String> {
     available_projects_with(home, engine_env(state).as_deref())
 }
 
