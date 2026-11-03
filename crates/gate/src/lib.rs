@@ -10,7 +10,9 @@ pub mod connector;
 pub mod mcp;
 pub mod proxy;
 pub mod registry;
+pub mod sign;
 pub mod vault;
+pub mod vaultref;
 pub mod warrant;
 
 pub use adapter::{
@@ -39,11 +41,14 @@ pub use proxy::{
     verify_host_ssrf,
 };
 pub use registry::{connector_to_registry_entry, handle_registry_v01_get};
+pub use sign::SIGN_AUDIT_METHOD;
 pub use vault::{
     EncryptedSecretRecord, MASTER_KEY_LEN, NONCE_LEN, SetSecretArgs, VAULT_SCHEMA_VERSION, Vault,
     VaultSecretMetadata, canonical_aad, load_or_init_master_key, normalize_secret_name,
     resolve_master_key_path, resolve_vault_path,
 };
+
+pub use vaultref::{VaultField, VaultRef, VaultRefError, parse_vault_ref};
 
 pub use warrant::{
     DEFAULT_ISSUER, DEFAULT_TTL_SECS, IssueGrantArgs, MAX_TTL_SECS, OwnerGrant, OwnerWarrantLedger,
