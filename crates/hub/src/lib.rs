@@ -26,6 +26,7 @@ pub mod runtime_update;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
+mod vault_consumers_api;
 mod version_api;
 mod warrants;
 mod watch_api;
@@ -78,6 +79,7 @@ pub use nodes::{
     touch_node,
 };
 pub use terminal::{TerminalManager, TerminalSession};
+pub use vault_consumers_api::{GithubAppKeys, VaultConsumerConfig};
 pub use ws::{ConnectionLimits, HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
 
 /// Default listen address for `fl hub serve` (`127.0.0.1:8420`, spec §2.1).
@@ -212,6 +214,8 @@ pub struct HubState {
     pub(crate) watch_caches: Arc<watch_api::WatchCaches>,
     /// The MCP catalog endpoints' sync gate and settings (see [`mcp_api`]).
     pub(crate) mcp: Arc<mcp_api::McpHub>,
+    /// What `fl hub serve` told the hub about its credential sources (see [`vault_consumers_api`]).
+    pub(crate) vault_consumers: Arc<Mutex<Option<Arc<VaultConsumerConfig>>>>,
 }
 
 /// How long the read-only discovery endpoints reuse one store snapshot. A snapshot costs
@@ -330,6 +334,7 @@ impl HubState {
             discovery_snapshots: Arc::new(discovery::TtlCache::new(DISCOVERY_SNAPSHOT_TTL)),
             watch_caches: Arc::new(watch_api::WatchCaches::default()),
             mcp: Arc::default(),
+            vault_consumers: Arc::default(),
         }
     }
 
@@ -340,6 +345,16 @@ impl HubState {
         F: Fn(&Path) -> Result<fl_mcp::sync::Switches, String> + Send + Sync + 'static,
     {
         self.mcp.set_switches(Arc::new(resolver));
+    }
+
+    /// Tells the hub which sources its credentials are configured to come from, for
+    /// `GET /api/v1/gate/vault-consumers` (see [`vault_consumers_api`]). Without it the
+    /// configuration-derived consumers report `unknown`.
+    pub fn set_vault_consumer_config(&self, config: VaultConsumerConfig) {
+        *self
+            .vault_consumers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(config));
     }
 
     /// The discovery snapshot for a read-only endpoint: shared for [`DISCOVERY_SNAPSHOT_TTL`],

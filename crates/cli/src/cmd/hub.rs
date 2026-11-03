@@ -463,10 +463,12 @@ fn cmd_serve(
         eprintln!("warning: the Hub's MCP endpoints leave out registered vendors: {e:#}");
     }
     let mcp_switches = env.cfg.mcp.clone();
+    let vault_consumers = vault_consumer_config(env.cfg, owner_token_file.as_deref());
     rt.block_on(async move {
         let server = HubServer::bind(server_config)
             .await
             .map_err(|e| (2, format!("failed to bind Hub server: {e}")))?;
+        server.state().set_vault_consumer_config(vault_consumers);
         server.state().set_mcp_switches(move |project| {
             let entry =
                 crate::config::mcp_entry(&mcp_switches, project).map_err(|e| e.to_string())?;
@@ -486,6 +488,35 @@ fn cmd_serve(
             .map_err(|e| (2, format!("Hub server error: {e}")))?;
         Ok(0)
     })
+}
+
+/// What `GET /api/v1/gate/vault-consumers` is told about where this hub's credentials are
+/// configured to come from: paths and secret NAMES only, never a value.
+fn vault_consumer_config(
+    cfg: &crate::config::Config,
+    owner_token_file: Option<&Path>,
+) -> fl_hub::VaultConsumerConfig {
+    fl_hub::VaultConsumerConfig {
+        github_app: cfg.github.as_ref().map(|app| fl_hub::GithubAppKeys {
+            private_key_file: app.private_key.clone(),
+            private_key_ref: app.private_key_ref.as_deref().and_then(|raw| {
+                fl_gate::parse_vault_ref(raw)
+                    .ok()
+                    .map(|r| r.name().to_string())
+            }),
+        }),
+        github_env_credential_bindings: cfg
+            .projects
+            .iter()
+            .filter(|p| {
+                p.tracker
+                    .as_ref()
+                    .is_some_and(|t| t.credential == crate::config::Credential::Env)
+            })
+            .count(),
+        owner_token_file: owner_token_file.map(Path::to_path_buf),
+        wire_token_file: cfg.wire.as_ref().and_then(|w| w.token_file.clone()),
+    }
 }
 
 fn cmd_pair(

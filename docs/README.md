@@ -36,8 +36,9 @@ File naming in this directory follows
   transaction: lock, stage, verify, switch `current`, receipt last; resume and rollback),
   the exit codes, and what the installer does not do.
 * [ferrogate.md](ferrogate.md) — what FerroGate writes to its audit log (every refusal and every
-  allow), the `vault://NAME[#pem]` reference syntax, the policy-checked RS256 JWT signer, and where
-  the protection ends.
+  allow), the `vault://NAME[#pem]` reference syntax, the policy-checked RS256 JWT signer, the
+  observational `GET /api/v1/gate/vault-consumers` (configuration facts only), and where the
+  protection ends.
 * [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the six observational
   `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
