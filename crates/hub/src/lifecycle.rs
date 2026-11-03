@@ -3728,8 +3728,8 @@ mod tests {
         let p = synthesize_decommission_prompt("Felicity", "FerroLoop", "assistant");
         for needle in [
             "Felicity",
-            "fl state handoff set --scope FerroLoop",
-            "fl state checkpoint --scope FerroLoop",
+            "fl state handoff set --scope project:ferroloop",
+            "fl state checkpoint --scope project:ferroloop",
             "worktrees",
             "fl wire send <lead> \"Felicity decommission handoff\"",
             "agent-msg read --ack",
@@ -3752,6 +3752,14 @@ mod tests {
             // One ack command only, and the prompt counts four steps.
             assert_eq!(p.matches("read --ack").count(), 1, "{role}: {p}");
             assert!(p.contains("all four steps"), "{role}: {p}");
+            let numbered = p
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.len() > 2 && t.as_bytes()[0].is_ascii_digit() && t[1..].starts_with(". ")
+                })
+                .count();
+            assert_eq!(numbered, 4, "{role}: {p}");
         }
     }
 
@@ -3788,8 +3796,14 @@ mod tests {
     #[test]
     fn reforge_prompt_reads_ferrostate_first_and_state_md_only_as_legacy() {
         let p = canonical_reforge_prompt("Felicity", "FerroLoop", "assistant");
-        assert!(p.contains("fl state render --scope FerroLoop"), "{p}");
-        assert!(p.contains("fl state get current --scope FerroLoop"), "{p}");
+        assert!(
+            p.contains("fl state render --scope workspace --scope project:ferroloop"),
+            "{p}"
+        );
+        assert!(
+            p.contains("fl state get current --scope project:ferroloop"),
+            "{p}"
+        );
         assert!(p.contains("primary state source"), "{p}");
         let state_md: Vec<&str> = p.lines().filter(|l| l.contains("STATE.md")).collect();
         assert_eq!(state_md.len(), 1, "{p}");
@@ -3804,6 +3818,45 @@ mod tests {
             "agent-msg register Felicity --project FerroLoop --role assistant --replace"
         ));
         assert!(p.contains("AGENT_PERSONA=felicity agent-msg read --ack"));
+    }
+
+    /// Every `--scope <token>` in the generated prompts must be a token the `fl state` parser
+    /// accepts, whatever the project name looks like.
+    #[test]
+    fn prompt_scope_tokens_parse_as_state_scopes() {
+        use fl_core::state::StateScope;
+        for project in ["FerroLoop", "ArtificialHumanity.io", "!!!", ""] {
+            let prompts = [
+                canonical_reforge_prompt("Felicity", project, "assistant"),
+                synthesize_decommission_prompt("Felicity", project, "assistant"),
+            ];
+            for p in prompts {
+                let tokens: Vec<&str> = p
+                    .split("--scope ")
+                    .skip(1)
+                    .map(|rest| rest.split([' ', '`']).next().unwrap())
+                    .collect();
+                assert!(tokens.len() >= 2, "{project}: {p}");
+                for t in tokens {
+                    StateScope::from_wire(t)
+                        .unwrap_or_else(|e| panic!("{project}: scope {t:?} rejected: {e}"));
+                }
+            }
+        }
+        let p = synthesize_decommission_prompt("Ada", "ArtificialHumanity.io", "assistant");
+        assert!(p.contains("--scope project:artificialhumanity-io"), "{p}");
+        let p = synthesize_decommission_prompt("Ada", "!!!", "assistant");
+        assert!(p.contains("--scope workspace"), "{p}");
+        assert!(!p.contains("project:"), "{p}");
+    }
+
+    #[test]
+    fn decommission_prompt_bounds_the_handoff_summary() {
+        let p = synthesize_decommission_prompt("Felicity", "FerroLoop", "assistant");
+        assert!(p.contains("ONE line of at most 240 characters"), "{p}");
+        for flag in ["--shipped", "--in-flight", "--blocker", "--next", "--notes"] {
+            assert!(p.contains(flag), "missing {flag}: {p}");
+        }
     }
 
     #[test]
