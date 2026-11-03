@@ -24,6 +24,7 @@ pub mod ferrowire;
 pub mod finding;
 pub mod ids;
 pub mod install;
+pub mod intent;
 pub mod iri;
 pub mod local_providers;
 pub mod log;
@@ -104,6 +105,12 @@ pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{
     AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
     WorkflowId, WorkflowRunId,
+};
+pub use intent::{
+    AllocationAmount, AllocationCarve, AllocationPool, Binding, CarveRequest, CommitteeCounts,
+    CommitteeIntent, CommitteeOutcome, CommitteeTally, CommitteeVerdict, DelegateIntent,
+    DelegateTarget, IntentError, IntentResult, QuorumRule, ResultSchema, TypedResult,
+    validate_ancestry,
 };
 pub use iri::{Iri, IriError};
 pub use local_providers::{
