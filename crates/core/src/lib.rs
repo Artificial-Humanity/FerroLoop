@@ -50,6 +50,7 @@ pub mod ui_bundle;
 pub mod vendor;
 pub mod verdict;
 pub mod workflow;
+pub mod workspace;
 
 pub use agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
@@ -184,6 +185,14 @@ pub use workflow::{
     StepInstance, StepOutcome, WorkflowDef, WorkflowError, WorkflowRun, WorkflowRunStatus,
     advance_workflow, authorize_step_sign_off, select_step_agent, validate_reviewer_independence,
     validate_workflow_def,
+};
+pub use workspace::{
+    ContentEvidence, ExclusionPlan, ExclusionReceipt, HookExecution, HookPlan, HookRun,
+    HookRunState, HookSpec, InRepoIsolation, PlanInputs, PlanRefusal, PortLease, PortRange,
+    ResolvedWorkspacePaths, ServiceSpec, TeardownPolicy, WorkspaceApproval, WorkspaceError,
+    WorkspaceOperation, WorkspacePlan, WorkspacePolicy, WorktreeConfig, WorktreeMode,
+    WorktreeRecord, executable_digest, plan_workspace, resolve_worktree_paths,
+    workspace_policy_digest,
 };
 
 /// Where a project's committed manifest lives, relative to the project root
