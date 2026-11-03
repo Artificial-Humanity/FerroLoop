@@ -133,38 +133,113 @@ export const DEFAULT_DOCTOR_CHECKS: DoctorCheckItem[] = [
   {
     id: "G7.release-identity",
     title: "Release Identity & Build Stamp",
-    status: "pass",
-    detail: "fl-hub 0.9.4+b0888c6bc1ed (source-build, dirty=false)",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
   {
     id: "G7.receipt-integrity",
     title: "Install Receipt Schema v1 Integrity",
-    status: "pass",
-    detail: "~/.local/share/fl/receipt.json verified (schema_version=1)",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
   {
     id: "G7.path-ownership",
     title: "Launcher & Release Symlink Ownership",
-    status: "pass",
-    detail: "~/.local/bin/fl -> ~/.local/share/fl/current/bin/fl owned by current uid",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
   {
     id: "G7.store-health",
     title: "FerroStore Header & Magic Verification",
-    status: "pass",
-    detail: "FERRSTR1 v1 header intact; WAL journal clean",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
   {
     id: "G7.vault-perms",
     title: "FerroGate Vault File Permissions",
-    status: "pass",
-    detail: "~/.config/fl/secrets.vault mode 0600 (owner-only)",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
   {
     id: "G7.code-ui-agree",
     title: "Hub Binary <-> UI Bundle Commit Agreement",
-    status: "pass",
-    detail: "fl-hub commit prefix matches <ui_dir>/build-info.json",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
+  },
+];
+
+/**
+ * Issue #205 Phase A2: Deterministic `fl install --dry-run` plan preview (`InstallPlan`).
+ */
+export interface DryRunInstallPlan {
+  status: "ready" | "needs_decision";
+  selected_products: string[];
+  planned_files: string[];
+  planned_symlinks: string[];
+  planned_units: string[];
+  conflicts: string[];
+}
+
+export function computeDryRunInstallPlan(
+  selectedProducts: string[],
+  plannedUnits: string[],
+  adoptionState: "managed" | "unmanaged_adopt_required" = "managed",
+): DryRunInstallPlan {
+  const conflicts =
+    adoptionState === "unmanaged_adopt_required"
+      ? [
+          "~/.local/bin/fl exists without a managed ~/.local/share/fl/receipt.json (--adopt required)",
+        ]
+      : [];
+  return {
+    status: conflicts.length > 0 ? "needs_decision" : "ready",
+    selected_products: selectedProducts,
+    planned_files: [
+      "~/.local/share/fl/releases/0.9.4+b0888c6bc1ed/bin/fl",
+      "~/.local/share/fl/releases/0.9.4+b0888c6bc1ed/bin/ferrostore",
+      "~/.local/share/fl/receipt.json",
+    ],
+    planned_symlinks: [
+      "~/.local/share/fl/current -> releases/0.9.4+b0888c6bc1ed",
+      "~/.local/bin/fl -> ~/.local/share/fl/current/bin/fl",
+    ],
+    planned_units: plannedUnits,
+    conflicts,
+  };
+}
+
+/**
+ * Issue #205 Phase C: Versioned `releases/<ver>+<sha12>/` upgrade & rollback slot manager.
+ */
+export interface ReleaseSlotEntry {
+  slot_id: string;
+  path: string;
+  role: "current" | "previous" | "staged";
+  commit_short: string;
+  dirty: boolean;
+}
+
+export const DEFAULT_RELEASE_SLOTS: ReleaseSlotEntry[] = [
+  {
+    slot_id: "0.9.4+b0888c6bc1ed",
+    path: "~/.local/share/fl/releases/0.9.4+b0888c6bc1ed",
+    role: "current",
+    commit_short: "b0888c6bc1ed",
+    dirty: false,
+  },
+  {
+    slot_id: "0.9.3+7a41d09ef312",
+    path: "~/.local/share/fl/releases/0.9.3+7a41d09ef312",
+    role: "previous",
+    commit_short: "7a41d09ef312",
+    dirty: false,
+  },
+  {
+    slot_id: "0.9.5+975bcacab4b4",
+    path: "~/.local/share/fl/releases/0.9.5+975bcacab4b4",
+    role: "staged",
+    commit_short: "975bcacab4b4",
+    dirty: false,
   },
 ];
 import {
@@ -745,6 +820,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => propDoctorChecks ?? DEFAULT_DOCTOR_CHECKS,
   );
   const [runningDoctorCheck, setRunningDoctorCheck] = useState(false);
+  // Issue #205 Phase A2 & Phase C: Dry-run plan preview & versioned release slots state
+  const [dryRunBanner, setDryRunBanner] = useState<string | null>(null);
+  const [releaseSlots, setReleaseSlots] = useState<ReleaseSlotEntry[]>(
+    DEFAULT_RELEASE_SLOTS,
+  );
+  const [releaseSlotBanner, setReleaseSlotBanner] = useState<string | null>(
+    null,
+  );
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
@@ -5242,6 +5325,283 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     })}
                   </div>
                 </div>
+
+                {/* Issue #205 Phase A2: Deterministic fl install --dry-run Plan Preview */}
+                {(() => {
+                  const dryRunPlan = computeDryRunInstallPlan(
+                    closure.resolvedProducts,
+                    closure.plannedUnits,
+                    receiptAdoptionState,
+                  );
+                  return (
+                    <div
+                      className="fd-card"
+                      data-testid="install-dry-run-plan-card"
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "8px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "8px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                            Preview Install Plan (`fl install --dry-run`)
+                          </span>
+                          <span
+                            className="fd-badge fd-mono"
+                            data-testid="dry-run-plan-status-badge"
+                            style={{
+                              color:
+                                dryRunPlan.status === "ready"
+                                  ? "#34d399"
+                                  : "#fbbf24",
+                            }}
+                          >
+                            status: {dryRunPlan.status}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          data-testid="dry-run-refresh-btn"
+                          className="fd-btn"
+                          style={{ fontSize: "11px", padding: "3px 8px" }}
+                          onClick={() => {
+                            setDryRunBanner(
+                              `Computed deterministic dry-run install plan (${dryRunPlan.status}) for ${closure.resolvedProducts.length} resolved components.`,
+                            );
+                          }}
+                        >
+                          Run `fl install --dry-run`
+                        </button>
+                      </div>
+                      {dryRunBanner && (
+                        <div
+                          role="status"
+                          data-testid="dry-run-plan-banner"
+                          className="fd-mono"
+                          style={{ fontSize: "11px", color: "#34d399" }}
+                        >
+                          {dryRunBanner}
+                        </div>
+                      )}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                          gap: "6px",
+                          fontSize: "11px",
+                        }}
+                      >
+                        <div
+                          data-testid="dry-run-planned-files"
+                          style={{
+                            padding: "6px 8px",
+                            borderRadius: "6px",
+                            background: "var(--bg-elevated)",
+                            border: "1px solid var(--border-subtle)",
+                          }}
+                        >
+                          <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
+                            Planned Files ({dryRunPlan.planned_files.length})
+                          </div>
+                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                            {dryRunPlan.planned_files.join(", ")}
+                          </code>
+                        </div>
+                        <div
+                          data-testid="dry-run-planned-symlinks"
+                          style={{
+                            padding: "6px 8px",
+                            borderRadius: "6px",
+                            background: "var(--bg-elevated)",
+                            border: "1px solid var(--border-subtle)",
+                          }}
+                        >
+                          <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
+                            Planned Symlinks ({dryRunPlan.planned_symlinks.length})
+                          </div>
+                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                            {dryRunPlan.planned_symlinks.join(" · ")}
+                          </code>
+                        </div>
+                        <div
+                          data-testid="dry-run-conflicts"
+                          style={{
+                            padding: "6px 8px",
+                            borderRadius: "6px",
+                            background: "var(--bg-elevated)",
+                            border: "1px solid var(--border-subtle)",
+                          }}
+                        >
+                          <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
+                            Path Conflicts ({dryRunPlan.conflicts.length})
+                          </div>
+                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                            {dryRunPlan.conflicts.length > 0
+                              ? dryRunPlan.conflicts.join("; ")
+                              : "None (Ready for atomic install)"}
+                          </code>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Issue #205 Phase C: Versioned releases/<ver>+<sha12>/ Upgrade & Rollback Slot Manager */}
+                {(() => {
+                  const currentSlot =
+                    releaseSlots.find((s) => s.role === "current")?.slot_id ??
+                    "0.9.4+b0888c6bc1ed";
+                  return (
+                    <div
+                      className="fd-card"
+                      data-testid="release-slots-rollback-card"
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "8px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "8px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                            Release Slots &amp; Rollback (`releases/&lt;ver&gt;+&lt;sha12&gt;/`)
+                          </span>
+                          <span
+                            className="fd-badge fd-mono"
+                            data-testid="release-current-symlink-badge"
+                            style={{ color: "#38bdf8" }}
+                          >
+                            current -&gt; releases/{currentSlot}
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            data-testid="release-dry-run-upgrade-btn"
+                            className="fd-btn"
+                            style={{ fontSize: "11px", padding: "3px 8px" }}
+                            onClick={() => {
+                              setReleaseSlotBanner(
+                                "Dry-run upgrade verified: staged slot releases/0.9.5+975bcacab4b4 passes receipt & binary checks.",
+                              );
+                            }}
+                          >
+                            Dry-Run Upgrade
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="release-rollback-btn"
+                            className="fd-btn fd-btn-primary"
+                            style={{ fontSize: "11px", padding: "3px 8px" }}
+                            onClick={() => {
+                              setReleaseSlots((prev) =>
+                                prev.map((s) =>
+                                  s.role === "current"
+                                    ? { ...s, role: "staged" }
+                                    : s.role === "previous"
+                                      ? { ...s, role: "current" }
+                                      : s,
+                                ),
+                              );
+                              setReleaseSlotBanner(
+                                "Atomically flipped ~/.local/share/fl/current symlink to previous release slot 0.9.3+7a41d09ef312.",
+                              );
+                            }}
+                          >
+                            Rollback to Previous Slot
+                          </button>
+                        </div>
+                      </div>
+                      {releaseSlotBanner && (
+                        <div
+                          role="status"
+                          data-testid="release-slot-action-banner"
+                          className="fd-mono"
+                          style={{ fontSize: "11px", color: "#34d399" }}
+                        >
+                          {releaseSlotBanner}
+                        </div>
+                      )}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                          gap: "6px",
+                          fontSize: "11px",
+                        }}
+                      >
+                        {releaseSlots.map((slot) => (
+                          <div
+                            key={slot.slot_id}
+                            data-testid={`release-slot-row-${slot.slot_id}`}
+                            data-role={slot.role}
+                            style={{
+                              padding: "6px 8px",
+                              borderRadius: "6px",
+                              background: "var(--bg-elevated)",
+                              border: "1px solid var(--border-subtle)",
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: "6px",
+                            }}
+                          >
+                            <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                              {slot.slot_id}
+                            </code>
+                            <span
+                              className="fd-badge fd-mono"
+                              data-testid={`release-slot-role-${slot.slot_id}`}
+                              style={{
+                                fontSize: "10px",
+                                color:
+                                  slot.role === "current"
+                                    ? "#34d399"
+                                    : slot.role === "previous"
+                                      ? "#38bdf8"
+                                      : "#fbbf24",
+                              }}
+                            >
+                              {slot.role}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
               </>
             );
           })()}

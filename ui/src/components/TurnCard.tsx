@@ -6,6 +6,17 @@ import { dispatchOpenArtifact, MermaidDiagram, RichMarkdown } from "./RichMarkdo
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { parseWireIntentMetadata } from "./WireMailPane";
+import {
+  DEFAULT_PENDING_PERMISSION_PROMPTS,
+  type PendingPermissionPromptItem,
+  type PermissionResponseDecision,
+} from "./TriageQueuePane";
+
+export {
+  DEFAULT_PENDING_PERMISSION_PROMPTS,
+  type PendingPermissionPromptItem,
+  type PermissionResponseDecision,
+};
 
 export const EXPAND_TURN_EVENT = "ferrodeck:expand-turn";
 

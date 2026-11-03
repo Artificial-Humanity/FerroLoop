@@ -49,7 +49,7 @@ describe("Wave 6 Item 1 (Record #220 / Issue #205 Phase A3): Observational Syste
       expect(screen.getByTestId(`doctor-check-row-${checkId}`)).toBeTruthy();
       expect(
         screen.getByTestId(`doctor-check-status-${checkId}`).textContent,
-      ).toBe("pass");
+      ).toBe("not-installed");
     }
   });
 

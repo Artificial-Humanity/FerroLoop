@@ -116,6 +116,110 @@ export function computeWorktreeBootstrapPreview(
   };
 }
 
+// Record #103: Universal Agent Permission & Auto-Accept Management
+export type UniversalPermissionMode =
+  | "auto-accept"
+  | "workspace-write"
+  | "granular";
+
+export type PermissionRuleAction = "allow" | "ask" | "deny";
+
+export type UniversalPermissionCapability =
+  | "fs_read_workspace"
+  | "fs_read_external"
+  | "fs_write_workspace"
+  | "fs_write_external"
+  | "fs_write_protected"
+  | "shell_exec"
+  | "network_web"
+  | "mcp_tool_call";
+
+export const UNIVERSAL_PERMISSION_CAPABILITIES: readonly UniversalPermissionCapability[] =
+  [
+    "fs_read_workspace",
+    "fs_read_external",
+    "fs_write_workspace",
+    "fs_write_external",
+    "fs_write_protected",
+    "shell_exec",
+    "network_web",
+    "mcp_tool_call",
+  ] as const;
+
+export type UniversalPermissionMatrix = Record<
+  UniversalPermissionCapability,
+  PermissionRuleAction
+>;
+
+export const DEFAULT_UNIVERSAL_PERMISSION_MATRICES: Record<
+  UniversalPermissionMode,
+  UniversalPermissionMatrix
+> = {
+  "auto-accept": {
+    fs_read_workspace: "allow",
+    fs_read_external: "allow",
+    fs_write_workspace: "allow",
+    fs_write_external: "allow",
+    fs_write_protected: "ask",
+    shell_exec: "allow",
+    network_web: "allow",
+    mcp_tool_call: "allow",
+  },
+  "workspace-write": {
+    fs_read_workspace: "allow",
+    fs_read_external: "ask",
+    fs_write_workspace: "allow",
+    fs_write_external: "ask",
+    fs_write_protected: "deny",
+    shell_exec: "ask",
+    network_web: "ask",
+    mcp_tool_call: "allow",
+  },
+  granular: {
+    fs_read_workspace: "allow",
+    fs_read_external: "allow",
+    fs_write_workspace: "allow",
+    fs_write_external: "ask",
+    fs_write_protected: "deny",
+    shell_exec: "ask",
+    network_web: "allow",
+    mcp_tool_call: "allow",
+  },
+};
+
+export function resolveVendorPermissionPreview(
+  vendor?: string | null,
+  mode: UniversalPermissionMode = "auto-accept",
+): string {
+  const v = (vendor ?? "claude").trim().toLowerCase();
+  if (mode === "auto-accept") {
+    if (v.includes("claude")) return "--dangerously-skip-permissions";
+    if (v.includes("codex")) {
+      return "--dangerously-bypass-approvals-and-sandbox";
+    }
+    if (v.includes("antigravity") || v.includes("agy")) {
+      return "--yolo (auto-accept)";
+    }
+    return "--auto-approve";
+  }
+  if (mode === "workspace-write") {
+    if (v.includes("claude")) {
+      return "--permission-mode acceptEdits (.claude/settings.local.json)";
+    }
+    if (v.includes("codex")) {
+      return "--ask-for-approval on-request --sandbox workspace-write";
+    }
+    return "workspace-write (prompt on external/shell)";
+  }
+  if (v.includes("claude")) {
+    return ".claude/settings.local.json (8-capability granular rules)";
+  }
+  if (v.includes("codex")) {
+    return "~/.codex/config.toml (8-capability granular rules)";
+  }
+  return ".fl/permissions.toml (8-capability granular matrix)";
+}
+
 export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   isOpen,
   onClose,
@@ -137,6 +241,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [worktreePolicy, setWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
   const [worktreePolicyTouched, setWorktreePolicyTouched] = useState(false);
+  const [permissionMode, setPermissionMode] =
+    useState<UniversalPermissionMode>("auto-accept");
+  const [permissionMatrix, setPermissionMatrix] =
+    useState<UniversalPermissionMatrix>(
+      () => DEFAULT_UNIVERSAL_PERMISSION_MATRICES["auto-accept"],
+    );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -614,6 +724,123 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               </div>
             );
           })()}
+
+          {/* Record #103: Universal Agent Permission & Auto-Accept Management */}
+          <div
+            data-testid="spin-up-permissions-section"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              padding: "8px 10px",
+              borderRadius: "6px",
+              backgroundColor: "var(--bg-elevated)",
+              border: "1px solid var(--border-subtle)",
+              fontSize: "11.5px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <label
+                htmlFor="fd-spin-up-permission-mode"
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  color: "var(--text-muted)",
+                  textTransform: "uppercase",
+                }}
+              >
+                Permission &amp; Approval Mode
+              </label>
+              <code
+                className="fd-mono"
+                data-testid="spin-up-permission-vendor-preview"
+                style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+              >
+                {resolveVendorPermissionPreview(vendor, permissionMode)}
+              </code>
+            </div>
+            <select
+              id="fd-spin-up-permission-mode"
+              aria-label="Permission & Approval Mode"
+              data-testid="spin-up-permission-mode-select"
+              className="fd-select fd-mono"
+              value={permissionMode}
+              disabled={submitting}
+              onChange={(e) => {
+                const nextMode = e.target.value as UniversalPermissionMode;
+                setPermissionMode(nextMode);
+                setPermissionMatrix({
+                  ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
+                });
+              }}
+              style={{ width: "100%" }}
+            >
+              <option value="auto-accept">
+                auto-accept (Full autonomous bypass)
+              </option>
+              <option value="workspace-write">
+                workspace-write (Auto-allow workspace, prompt external/shell)
+              </option>
+              <option value="granular">
+                granular (Per-capability allow / ask / deny matrix)
+              </option>
+            </select>
+            <div
+              data-testid="spin-up-permission-matrix"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                gap: "4px",
+                marginTop: "2px",
+              }}
+            >
+              {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => (
+                <div
+                  key={cap}
+                  data-testid={`spin-up-perm-cap-${cap}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "4px",
+                    padding: "3px 6px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "10.5px",
+                  }}
+                >
+                  <code className="fd-mono">{cap}</code>
+                  <select
+                    aria-label={`Permission for ${cap}`}
+                    data-testid={`spin-up-perm-select-${cap}`}
+                    className="fd-select fd-mono"
+                    style={{ fontSize: "10px", padding: "1px 4px" }}
+                    value={permissionMatrix[cap]}
+                    onChange={(e) => {
+                      const nextAction = e.target.value as PermissionRuleAction;
+                      setPermissionMode("granular");
+                      setPermissionMatrix((prev) => ({
+                        ...prev,
+                        [cap]: nextAction,
+                      }));
+                    }}
+                  >
+                    <option value="allow">allow</option>
+                    <option value="ask">ask</option>
+                    <option value="deny">deny</option>
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
 
           <label
             style={{
