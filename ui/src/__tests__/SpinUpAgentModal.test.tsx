@@ -87,6 +87,38 @@ describe("SpinUpAgentModal", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("offers the three real Muse 1.4.14 model IDs and labels when muse vendor is selected", () => {
+    render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+
+    const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
+    fireEvent.change(vendorSelect, { target: { value: "muse" } });
+
+    const datalist = screen.getByTestId("spin-up-model-options");
+    const options = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+      value: opt.getAttribute("value"),
+      label: opt.getAttribute("label"),
+      text: opt.textContent,
+    }));
+
+    expect(options).toEqual([
+      {
+        value: "muse-wonder-full-1.0",
+        label: "Muse Wonder Full (muse-wonder-full-1.0)",
+        text: "Muse Wonder Full (muse-wonder-full-1.0)",
+      },
+      {
+        value: "muse-wonder-1.0",
+        label: "Muse Wonder (muse-wonder-1.0)",
+        text: "Muse Wonder (muse-wonder-1.0)",
+      },
+      {
+        value: "muse-spark-1.3",
+        label: "Muse Spark (muse-spark-1.3)",
+        text: "Muse Spark (muse-spark-1.3)",
+      },
+    ]);
+  });
+
   it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
     const transcriptFetches: string[] = [];
 

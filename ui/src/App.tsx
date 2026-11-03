@@ -1401,12 +1401,24 @@ export const App: React.FC<AppProps> = ({
     );
   }, [agents, selectedAgentName]);
 
+  const [spunUpByAgent, setSpunUpByAgent] = useState<
+    Record<
+      string,
+      { adapter: string; model: string | null; sessionId: string | null }
+    >
+  >({});
+
   const activeSession = useMemo(() => {
+    const key = (selectedAgent?.name_key ?? "").toLowerCase();
     if (selectedSessionId) {
       const explicit = sessions.find((s) => s.id === selectedSessionId);
-      if (explicit) return explicit;
+      if (
+        explicit &&
+        (!key || !explicit.persona || explicit.persona.toLowerCase() === key)
+      ) {
+        return explicit;
+      }
     }
-    const key = (selectedAgent?.name_key ?? "").toLowerCase();
     if (!key) {
       return null;
     }
@@ -1416,6 +1428,59 @@ export const App: React.FC<AppProps> = ({
       null
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
+
+  const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
+  const activeRoute = useMemo(
+    () =>
+      activeAgentKey
+        ? (routes.find((r) => (r.persona ?? "").toLowerCase() === activeAgentKey) ??
+          null)
+        : null,
+    [routes, activeAgentKey],
+  );
+  const activeLiveness = useMemo(
+    () =>
+      activeAgentKey
+        ? (liveness.find((l) => l.agent.toLowerCase() === activeAgentKey) ??
+          null)
+        : null,
+    [liveness, activeAgentKey],
+  );
+  const activeSpunUp = activeAgentKey ? spunUpByAgent[activeAgentKey] : undefined;
+  const activeAdapter = useMemo(() => {
+    const candidates = [
+      activeSession?.adapter,
+      activeRoute?.adapter,
+      activeLiveness?.adapter,
+      activeSpunUp?.adapter,
+    ];
+    for (const candidate of candidates) {
+      const trimmed = (candidate ?? "").trim();
+      if (trimmed && trimmed.toLowerCase() !== "unknown") {
+        return trimmed;
+      }
+    }
+    return (
+      activeSession?.adapter ??
+      activeRoute?.adapter ??
+      activeSpunUp?.adapter ??
+      null
+    );
+  }, [activeSession, activeRoute, activeLiveness, activeSpunUp]);
+  const activeModel = useMemo(() => {
+    const candidates = [
+      activeSession?.model,
+      activeRoute?.model,
+      activeSpunUp?.model,
+    ];
+    for (const candidate of candidates) {
+      const trimmed = (candidate ?? "").trim();
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+    return null;
+  }, [activeSession, activeRoute, activeSpunUp]);
 
   const prevLoadedAgentKeyRef = useRef<string>("");
 
@@ -1744,6 +1809,17 @@ export const App: React.FC<AppProps> = ({
 
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
     const res = await apiClient.spinUpSession(req);
+    const personaKey = (res.persona || req.persona || "").trim().toLowerCase();
+    if (personaKey) {
+      setSpunUpByAgent((prev) => ({
+        ...prev,
+        [personaKey]: {
+          adapter: res.vendor || req.vendor,
+          model: res.model ?? req.model ?? null,
+          sessionId: res.session_id || null,
+        },
+      }));
+    }
     if (req.persona) {
       tornDownTargetsRef.current.delete(req.persona.trim().toLowerCase());
     }
@@ -2012,12 +2088,18 @@ export const App: React.FC<AppProps> = ({
             agentDisplayName={selectedAgent?.display_name ?? null}
             agentRole={selectedAgent?.role ?? null}
             agentProject={selectedAgent?.project ?? null}
-            adapter={activeSession?.adapter ?? null}
-            model={activeSession?.model ?? null}
+            adapter={activeAdapter}
+            model={activeModel}
             thinkingLevel={activeSession?.thinking_level ?? null}
-            availableModels={activeSession?.available_models ?? null}
-            executionMode={activeSession?.execution_mode}
-            sessionId={activeSession?.id ?? null}
+            availableModels={
+              activeSession?.available_models ??
+              activeRoute?.available_models ??
+              null
+            }
+            executionMode={
+              activeSession?.execution_mode ?? activeRoute?.execution_mode
+            }
+            sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
             turns={transcriptTurns}
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
@@ -2338,12 +2420,18 @@ export const App: React.FC<AppProps> = ({
             agentDisplayName={selectedAgent?.display_name ?? null}
             agentRole={selectedAgent?.role ?? null}
             agentProject={selectedAgent?.project ?? null}
-            adapter={activeSession?.adapter ?? null}
-            model={activeSession?.model ?? null}
+            adapter={activeAdapter}
+            model={activeModel}
             thinkingLevel={activeSession?.thinking_level ?? null}
-            availableModels={activeSession?.available_models ?? null}
-            executionMode={activeSession?.execution_mode}
-            sessionId={activeSession?.id ?? null}
+            availableModels={
+              activeSession?.available_models ??
+              activeRoute?.available_models ??
+              null
+            }
+            executionMode={
+              activeSession?.execution_mode ?? activeRoute?.execution_mode
+            }
+            sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
             turns={transcriptTurns}
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
