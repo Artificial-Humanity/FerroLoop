@@ -487,8 +487,7 @@ fn a_sync_writes_only_the_project_files_and_leaves_the_home_directory_alone() {
     for key in new {
         let in_state = key == "state" || key.starts_with("state/");
         let in_repo_vendor = key.strip_prefix(repo_rel).is_some_and(|rel| {
-            VENDOR_FILES.iter().any(|v| *v == rel)
-                || [".codex", ".agents", ".muse", ".grok"].contains(&rel)
+            VENDOR_FILES.contains(&rel) || [".codex", ".agents", ".muse", ".grok"].contains(&rel)
         });
         assert!(in_state || in_repo_vendor, "unexpected write: {key}");
     }
