@@ -145,12 +145,56 @@ pub fn verify_redb_vs_ferrostore(
 /// is still the file this call linked (an `fls_path` some other file now holds
 /// is left alone), removes its own temp file, and leaves the `.redb`
 /// unchanged and writable, so nothing written to it is lost and a retry can
-/// migrate again. `Ok(report)` with a clean report means the `.fls` entry was
-/// synced and the `.redb` is 0400. A temp file that cannot be removed after
+/// migrate again. If the unpublish's own unlink fails, `fls_path` stays beside
+/// the writable `.redb` and the `Err` names it and says to remove it.
+/// `Ok(report)` with a clean report means the `.fls` entry was synced and the
+/// `.redb` is 0400. A temp file that cannot be removed after
 /// the link is the one failure that is only a warning on stderr: it is left
 /// behind, a second name for the published file.
 pub fn migrate_verified(redb_path: &Path, fls_path: &Path) -> Result<ParityReport, StoreError> {
-    migrate_verified_with(redb_path, fls_path, |_| Ok(()))
+    migrate_verified_checked(redb_path, fls_path).map_err(|failure| failure.error)
+}
+
+/// A [`migrate_verified`] that failed: the error, and whether the call left
+/// `fls_path` published.
+#[derive(Debug)]
+pub(crate) struct MigrateFailure {
+    pub(crate) error: StoreError,
+    /// The call linked `fls_path`, a later step failed, and the unlink that
+    /// takes the link back failed too: `fls_path` is this call's file, beside
+    /// a `.redb` that was not made read-only. An open must refuse it, not
+    /// open it as a store another process migrated.
+    pub(crate) left_published: bool,
+}
+
+impl From<StoreError> for MigrateFailure {
+    fn from(error: StoreError) -> Self {
+        Self {
+            error,
+            left_published: false,
+        }
+    }
+}
+
+/// [`migrate_verified`] that says, on an `Err`, whether `fls_path` was left
+/// published ([`MigrateFailure`]).
+pub(crate) fn migrate_verified_checked(
+    redb_path: &Path,
+    fls_path: &Path,
+) -> Result<ParityReport, MigrateFailure> {
+    migrate_verified_hooked(
+        redb_path,
+        fls_path,
+        |_| Ok(()),
+        super::sync_dir,
+        chmod_read_only,
+        remove_file,
+    )
+}
+
+/// The unlink an unpublish runs (a fn, so tests can pass another).
+fn remove_file(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 /// The device and inode of a file: what a path names at one moment.
@@ -322,6 +366,7 @@ fn chmod_read_only(redb_path: &Path) -> std::io::Result<()> {
 /// [`migrate_verified`] with `after_copy` run on the new store between the
 /// copy and the verify. Production passes a no-op; tests use it to make the
 /// two stores differ.
+#[cfg(test)]
 pub(super) fn migrate_verified_with(
     redb_path: &Path,
     fls_path: &Path,
@@ -333,7 +378,9 @@ pub(super) fn migrate_verified_with(
         after_copy,
         super::sync_dir,
         chmod_read_only,
+        remove_file,
     )
+    .map_err(|failure| failure.error)
 }
 
 /// [`migrate_verified_with`] with `before_chmod` also run after the link and
@@ -346,10 +393,18 @@ pub(super) fn migrate_verified_with_before_chmod(
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
     before_chmod: impl FnOnce(),
 ) -> Result<ParityReport, StoreError> {
-    migrate_verified_hooked(redb_path, fls_path, after_copy, super::sync_dir, |redb| {
-        before_chmod();
-        chmod_read_only(redb)
-    })
+    migrate_verified_hooked(
+        redb_path,
+        fls_path,
+        after_copy,
+        super::sync_dir,
+        |redb| {
+            before_chmod();
+            chmod_read_only(redb)
+        },
+        remove_file,
+    )
+    .map_err(|failure| failure.error)
 }
 
 /// [`migrate_verified`] with the directory `fsync` (step 5) and the `chmod`
@@ -361,7 +416,21 @@ pub(super) fn migrate_verified_with_steps(
     sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
     chmod: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<ParityReport, StoreError> {
-    migrate_verified_hooked(redb_path, fls_path, |_| Ok(()), sync_dir, chmod)
+    migrate_verified_with_faults(redb_path, fls_path, sync_dir, chmod, remove_file)
+        .map_err(|failure| failure.error)
+}
+
+/// [`migrate_verified_with_steps`] with the unpublish's unlink replaced too,
+/// and the [`MigrateFailure`] kept: tests use it to make the unpublish fail.
+#[cfg(test)]
+pub(crate) fn migrate_verified_with_faults(
+    redb_path: &Path,
+    fls_path: &Path,
+    sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
+    chmod: impl FnOnce(&Path) -> std::io::Result<()>,
+    unlink: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<ParityReport, MigrateFailure> {
+    migrate_verified_hooked(redb_path, fls_path, |_| Ok(()), sync_dir, chmod, unlink)
 }
 
 fn migrate_verified_hooked(
@@ -370,22 +439,27 @@ fn migrate_verified_hooked(
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
     sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
     chmod: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> Result<ParityReport, StoreError> {
+    unlink: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<ParityReport, MigrateFailure> {
     sweep_stale_temps(fls_path);
     if std::fs::symlink_metadata(fls_path).is_ok() {
         return Err(backend(format!(
             "{} already exists: a verified migration only creates a new store",
             fls_path.display()
-        )));
+        ))
+        .into());
     }
     if !redb_path.is_file() {
         return Err(backend(format!(
             "{} is not a redb store file: nothing to migrate",
             redb_path.display()
-        )));
+        ))
+        .into());
     }
     let temp = temp_path(fls_path)?;
-    migrate_into(redb_path, fls_path, &temp, after_copy, sync_dir, chmod)
+    migrate_into(
+        redb_path, fls_path, &temp, after_copy, sync_dir, chmod, unlink,
+    )
 }
 
 /// [`migrate_verified`] through the temp file `temp`, for a test that must
@@ -403,12 +477,14 @@ pub(super) fn migrate_verified_with_temp(
         |_| Ok(()),
         super::sync_dir,
         chmod_read_only,
+        remove_file,
     )
+    .map_err(|failure| failure.error)
 }
 
 /// Steps 1 to 6 of [`migrate_verified`], through `temp`, once the checks on
-/// `redb_path` and `fls_path` have passed. `sync_dir` is step 5 and `chmod`
-/// step 6.
+/// `redb_path` and `fls_path` have passed. `sync_dir` is step 5, `chmod`
+/// step 6, and `unlink` what an unpublish runs.
 fn migrate_into(
     redb_path: &Path,
     fls_path: &Path,
@@ -416,7 +492,8 @@ fn migrate_into(
     after_copy: impl FnOnce(&FerroStore) -> Result<(), StoreError>,
     sync_dir: impl FnOnce(&Path) -> Result<(), StoreError>,
     chmod: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> Result<ParityReport, StoreError> {
+    unlink: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<ParityReport, MigrateFailure> {
     // `create_new` is `O_EXCL`: a taken name fails here and is not touched.
     let held = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -444,7 +521,7 @@ fn migrate_into(
     // done, so no other process can write the `.redb` after it was copied
     // while the `.fls` it was copied into is published.
     let src = RedbStore::open(redb_path).map_err(cleanup)?;
-    let result = (|| {
+    let result = (|| -> Result<ParityReport, MigrateFailure> {
         let report = {
             let dst = FerroStore::open(temp).map_err(cleanup)?;
             let outcome = super::migrate_redb_to_ferrostore(&src, &dst)
@@ -458,7 +535,7 @@ fn migrate_into(
                         .map_err(|err| backend(format!("remove {}: {err}", temp.display())))?;
                     return Ok(report);
                 }
-                Err(err) => return Err(cleanup(err)),
+                Err(err) => return Err(cleanup(err).into()),
             }
         };
 
@@ -470,7 +547,7 @@ fn migrate_into(
             ))
         };
         if id_at(temp) != Some(ours) {
-            return Err(cleanup(replaced("before the link")));
+            return Err(cleanup(replaced("before the link")).into());
         }
         held.sync_all()
             .map_err(|err| cleanup(backend(format!("sync {}: {err}", temp.display()))))?;
@@ -490,7 +567,7 @@ fn migrate_into(
             if linked.is_some() && linked == id_at(temp) {
                 let _ = std::fs::remove_file(fls_path);
             }
-            return Err(cleanup(replaced("after the link")));
+            return Err(cleanup(replaced("after the link")).into());
         }
         drop(held);
 
@@ -508,21 +585,29 @@ fn migrate_into(
         // failure from here on unpublishes and is an `Err`, and the `.redb`,
         // still locked by `src`, is left unchanged and writable.
         if let Err(err) = sync_dir(&super::parent_dir(fls_path)) {
-            let undone = unpublish(fls_path, redb_path, ours);
-            return Err(cleanup(backend(format!(
-                "the directory of {} was not synced after the link, so a crash could lose \
-                 it while {} is frozen ({err}); {undone}",
-                fls_path.display(),
-                redb_path.display()
-            ))));
+            let (undone, left_published) = unpublish(fls_path, redb_path, ours, unlink);
+            return Err(MigrateFailure {
+                error: cleanup(backend(format!(
+                    "the directory of {} was not synced after the link, so a crash could lose \
+                     it ({err}); {} was not made read-only and is still the store; {undone}",
+                    fls_path.display(),
+                    redb_path.display()
+                ))),
+                left_published,
+            });
         }
         if let Err(err) = chmod(redb_path) {
-            let undone = unpublish(fls_path, redb_path, ours);
-            return Err(cleanup(backend(format!(
-                "chmod 0400 {} failed after {} was linked ({err}); {undone}",
-                redb_path.display(),
-                fls_path.display()
-            ))));
+            let (undone, left_published) = unpublish(fls_path, redb_path, ours, unlink);
+            return Err(MigrateFailure {
+                error: cleanup(backend(format!(
+                    "chmod 0400 {} failed after {} was linked ({err}); {undone}. Fix the \
+                     file's owner or permissions, or set {}=redb to keep using the redb store",
+                    redb_path.display(),
+                    fls_path.display(),
+                    crate::BACKEND_ENV
+                ))),
+                left_published,
+            });
         }
         Ok(report)
     })();
@@ -531,30 +616,40 @@ fn migrate_into(
     result
 }
 
-/// Take back the link [`migrate_into`] made at `fls_path`: remove it only while
-/// it is still the file this call linked (`ours`), then sync its directory so
-/// the removal is durable (best effort). Says what was done, for the error.
-fn unpublish(fls_path: &Path, redb_path: &Path, ours: FileId) -> String {
+/// Take back the link [`migrate_into`] made at `fls_path` with `unlink`:
+/// remove it only while it is still the file this call linked (`ours`), then
+/// sync its directory so the removal is durable (best effort). Says what was
+/// done, for the error, and whether `fls_path` is still this call's file (the
+/// unlink failed).
+fn unpublish(
+    fls_path: &Path,
+    redb_path: &Path,
+    ours: FileId,
+    unlink: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> (String, bool) {
     let (fls, redb) = (fls_path.display(), redb_path.display());
     if id_at(fls_path) != Some(ours) {
-        return format!(
+        let text = format!(
             "{fls} is no longer the file this migration linked and was left alone; {redb} is \
              unchanged and still writable"
         );
+        return (text, false);
     }
-    if let Err(err) = std::fs::remove_file(fls_path) {
-        return format!(
+    if let Err(err) = unlink(fls_path) {
+        let text = format!(
             "{fls} could not be unpublished ({err}): remove it before running on {redb}, which \
              is unchanged and still writable"
         );
+        return (text, true);
     }
-    match super::sync_dir(&super::parent_dir(fls_path)) {
+    let text = match super::sync_dir(&super::parent_dir(fls_path)) {
         Ok(()) => format!("{fls} was unpublished; {redb} is unchanged and still writable"),
         Err(err) => format!(
             "{fls} was unpublished, but the removal was not synced ({err}); {redb} is \
              unchanged and still writable"
         ),
-    }
+    };
+    (text, false)
 }
 
 /// One line on stderr, as the store's other warnings print: a closed stderr is
