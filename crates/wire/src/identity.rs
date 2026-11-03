@@ -2372,6 +2372,15 @@ fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
                     token_lower.as_str(),
                     "a" | "an"
                         | "the"
+                        | "and"
+                        | "or"
+                        | "to"
+                        | "with"
+                        | "for"
+                        | "by"
+                        | "from"
+                        | "of"
+                        | "as"
                         | "highly"
                         | "now"
                         | "in"
@@ -5788,6 +5797,16 @@ mod tests {
         assert_eq!(
             scan_text_for_persona(&typo_then_rename, 50).as_deref(),
             Some("ferris")
+        );
+
+        let prose_register_conjunction = serde_json::json!({
+            "type": "USER_INPUT",
+            "content": "Please take the name of Fenris and take up residence in FerroLoop. Register with fl agent register and agent-msg register, and check in with Ferris."
+        })
+        .to_string();
+        assert_eq!(
+            scan_text_for_persona(&prose_register_conjunction, 50).as_deref(),
+            Some("fenris")
         );
     }
 
