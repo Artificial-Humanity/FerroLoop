@@ -2018,6 +2018,19 @@ export const App: React.FC<AppProps> = ({
             onRefreshWorktrees={() => void loadAllInitialState()}
             onReviewPr={handleReviewPr}
             onMergePr={handleMergePr}
+            sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
+            agentName={selectedAgent?.name_key ?? null}
+            onSubmitDiffReview={async (batch) => {
+              const targetId =
+                activeSession?.id ??
+                activeSpunUp?.sessionId ??
+                selectedAgent?.name_key ??
+                "";
+              if (!targetId) {
+                throw new Error("No active agent session selected to receive the review.");
+              }
+              return handleSendPrompt(targetId, { prompt: batch.formattedPrompt });
+            }}
             loading={loading}
             apiClient={apiClient}
           />
