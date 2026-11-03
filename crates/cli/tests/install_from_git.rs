@@ -659,10 +659,20 @@ fn a_binary_that_reports_another_commit_is_refused() {
 }
 
 #[test]
+fn a_binary_that_reports_a_dirty_tree_is_refused() {
+    let w = World::new(FakeCargo::Dirty);
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes"]));
+    assert_eq!(c, 3, "{so}{se}");
+    assert!(se.contains("dirty"), "{se}");
+    assert_nothing_installed(&w);
+}
+
+#[test]
 fn a_build_that_outlives_its_timeout_is_killed_with_everything_it_started() {
     let w = World::new(FakeCargo::Hang);
     let t0 = std::time::Instant::now();
-    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes", "--build-timeout", "1"]));
+    let (c, so, se) =
+        run(&mut w.install_git(&w.repo.commits[1], &["--yes", "--build-timeout", "1"]));
     assert_eq!(c, 1, "{so}{se}");
     assert!(t0.elapsed().as_secs() < 60);
     assert!(se.contains("timed out and was killed"), "{se}");

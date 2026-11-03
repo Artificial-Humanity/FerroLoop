@@ -219,20 +219,27 @@ fn narrowed_manifest(
         });
         let kept: Vec<String> = p.files.iter().map(|f| f.path.clone()).collect();
         let id = p.id.clone();
+        let mut dropped: std::collections::BTreeMap<String, Vec<&'static str>> =
+            std::collections::BTreeMap::new();
         p.actions.retain(|a| {
             let ok = !a.kind.names_a_unit()
                 || kept
                     .iter()
                     .any(|f| f == &format!("contrib/units/{}", a.subject));
             if !ok {
-                notes.push(format!(
-                    "the commit ships no contrib/units/{}: {id} offers no {} action for it",
-                    a.subject,
-                    a.kind.as_wire()
-                ));
+                dropped
+                    .entry(a.subject.clone())
+                    .or_default()
+                    .push(a.kind.as_wire());
             }
             ok
         });
+        for (unit, kinds) in dropped {
+            notes.push(format!(
+                "the commit ships no contrib/units/{unit}: {id} does not offer {}",
+                kinds.join(", ")
+            ));
+        }
     }
     m
 }

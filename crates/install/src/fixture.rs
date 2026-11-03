@@ -249,6 +249,8 @@ pub mod gitrepo {
         Hang,
         /// Builds stubs that report a different commit.
         WrongCommit,
+        /// Builds stubs that report a dirty tree.
+        Dirty,
     }
 
     /// The fake toolchain on disk and the files it leaves evidence in.
@@ -308,16 +310,21 @@ pub mod gitrepo {
         let build = match mode {
             FakeCargo::Fail => "echo 'boom: could not compile' >&2\nexit 101\n".to_string(),
             FakeCargo::Hang => format!("sleep 300 &\necho $! > '{}'\nwait\n", q(t.pid_file())),
-            FakeCargo::Ok | FakeCargo::WrongCommit => {
+            FakeCargo::Ok | FakeCargo::WrongCommit | FakeCargo::Dirty => {
                 let sha = if mode == FakeCargo::WrongCommit {
                     "echo 0000000000000000000000000000000000000000".to_string()
                 } else {
                     "git rev-parse HEAD".to_string()
                 };
+                let dirty = if mode == FakeCargo::Dirty {
+                    "true"
+                } else {
+                    "false"
+                };
                 format!(
                     r#"sha=$({sha})
 ct=$(git log -1 --format=%ct HEAD)
-dirty=false
+dirty={dirty}
 [ -n "$(git status --porcelain)" ] && dirty=true
 mkdir -p target/release
 for name in fl ferrostore; do
