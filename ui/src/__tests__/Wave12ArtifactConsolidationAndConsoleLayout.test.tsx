@@ -109,11 +109,91 @@ describe("Wave 12 Item 1 (Record #186 & Record #77): Dedicated FerroDeck Artifac
     const client = new HubApiClient();
     render(<ArtifactPreviewPane apiClient={client} />);
 
+    expect(
+      screen.getByTestId("artifact-hierarchy-path-badge").textContent,
+    ).toContain("[home]/artifacts → [home]/artifacts/[project-name]");
+
     fireEvent.click(screen.getByTestId("artifact-cleanup-btn"));
     expect(
       screen.getByTestId("artifact-cleanup-canonical-layout-summary")
         .textContent,
+    ).toContain("[home]/artifacts");
+    expect(
+      screen.getByTestId("artifact-cleanup-canonical-layout-summary")
+        .textContent,
     ).toContain("[home]/artifacts/[project-name]/[session-id]/");
+  });
+
+  it("renders filtered artifact cleanup controls in SettingsModal Storage & Artifacts sub-tab and project hierarchy badge in Project Overview", async () => {
+    const client = new HubApiClient();
+    const pruneSpy = vi.spyOn(client, "pruneArtifacts").mockResolvedValue({
+      ok: true,
+      dry_run: true,
+      removed_entries: 4,
+      removed_versions: 7,
+      bytes_freed: 4096,
+      pruned_paths: [],
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={() => {}}
+        initialTab="system"
+        apiClient={client}
+      />,
+    );
+
+    expect(
+      screen.getByTestId("settings-filtered-artifact-cleanup-card"),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("settings-artifact-cleanup-hierarchy-badge")
+        .textContent,
+    ).toContain("[home]/artifacts → [home]/artifacts/[project-name]");
+
+    fireEvent.change(screen.getByTestId("settings-artifact-cleanup-scope"), {
+      target: { value: "live" },
+    });
+    fireEvent.change(screen.getByTestId("settings-artifact-cleanup-kind"), {
+      target: { value: "docs" },
+    });
+    fireEvent.change(screen.getByTestId("settings-artifact-cleanup-age"), {
+      target: { value: "7d" },
+    });
+    fireEvent.change(
+      screen.getByTestId("settings-artifact-cleanup-versions-keep"),
+      { target: { value: "3" } },
+    );
+
+    fireEvent.click(screen.getByTestId("settings-artifact-cleanup-dryrun-btn"));
+    expect(pruneSpy).toHaveBeenCalledWith({
+      dry_run: true,
+      status: "live",
+      max_age_days: 7,
+      kinds: ["markdown", "pdf"],
+      prune_versions_keep: 3,
+    });
+    const banner = await screen.findByTestId(
+      "settings-artifact-cleanup-banner",
+    );
+    expect(banner.textContent).toContain(
+      "Dry run preview: 4 entries, 7 versions (4096 bytes) eligible for cleanup under [home]/artifacts/[project-name].",
+    );
+  });
+
+  it("exposes the [home]/artifacts/[project-name] hierarchy badge in Project Settings Overview", () => {
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={() => {}}
+        initialProject="FerroLoop"
+      />,
+    );
+    expect(
+      screen.getByTestId("settings-project-artifacts-hierarchy-badge")
+        .textContent,
+    ).toBe("[home]/artifacts/[project-name]");
   });
 });
 
