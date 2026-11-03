@@ -48,6 +48,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         .map(|p| (p, ProfileCeiling::Workspace))
         .or_else(|| ro_profile.clone().map(|p| (p, ProfileCeiling::ReadOnly)));
     let read_only_selected = matches!(profile, Some((_, ProfileCeiling::ReadOnly)));
+    // The read-only profile is a boundary only while the sandbox is on: `--disable-sandbox`
+    // removes it (see the plan and external-path branches).
+    let boundary = read_only_selected && !off;
     if posture == Posture::Plan && !read_only_selected {
         return Err(CompileRefusal::PostureNotEnforceable {
             vendor,
@@ -62,6 +65,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             reason: "plan is carried by the read-only profile and the sandbox, which sandbox off removes".into(),
         });
     }
+
+    // A shell ask has no pattern-scoped form: the strictest prompting mode is the only way it
+    // prompts. `on-request` runs sandboxed commands without a prompt, so it is tightened.
+    let shell_ask = cx
+        .rules(Capability::ShellExec)
+        .iter()
+        .any(|r| r.effect == Effect::Ask);
 
     // Posture.
     let mut args: Vec<String> = Vec::new();
@@ -81,11 +91,25 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             args.extend(["--approval-mode".to_owned(), "untrusted".to_owned()]);
             ("ask for everything not trusted", ReceiptClass::Exact)
         }
+        Posture::AcceptEdits if shell_ask => {
+            args.extend(["--approval-mode".to_owned(), "untrusted".to_owned()]);
+            (
+                "tightened by a shell ask: on-request would run sandboxed commands without a prompt",
+                ReceiptClass::StricterDowngrade,
+            )
+        }
         Posture::AcceptEdits => {
             args.extend(["--approval-mode".to_owned(), "on-request".to_owned()]);
             (
                 "edits proceed under the profile; the model asks to escalate",
                 ReceiptClass::Exact,
+            )
+        }
+        Posture::Auto if shell_ask => {
+            args.extend(["--approval-mode".to_owned(), "untrusted".to_owned()]);
+            (
+                "tightened by a shell ask; the approval judge stays off: a reviewer spends tokens and needs admission",
+                ReceiptClass::StricterDowngrade,
             )
         }
         Posture::Auto => {
@@ -178,7 +202,14 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         "the canonical ask default is carried by the strictest network mode",
                     );
                 }
-                Capability::FsWriteProtected if read_only_selected => cx.default_line(
+                Capability::NetworkWeb => cx.default_line(
+                    cap,
+                    surface,
+                    vec![],
+                    ReceiptClass::Unsupported,
+                    "sandbox off leaves the network open; the ask default is not enforced",
+                ),
+                Capability::FsWriteProtected if boundary => cx.default_line(
                     cap,
                     surface,
                     vec![],
@@ -190,7 +221,11 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                     surface,
                     vec![],
                     ReceiptClass::Unsupported,
-                    "the vendor has no protected-path concept; the deny default is not enforced",
+                    if read_only_selected {
+                        "sandbox off removes the read-only profile's boundary; the deny default is not enforced"
+                    } else {
+                        "the vendor has no protected-path concept; the deny default is not enforced"
+                    },
                 ),
                 _ => cx.default_line(
                     cap,
@@ -232,16 +267,24 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                 (Capability::FsReadWorkspace, Effect::Ask) => return Err(CompileRefusal::UnenforceableAsk {
                     vendor, rule: r.describe(), reason: "workspace reads are not prompted".into() }),
                 (Capability::FsWriteWorkspace | Capability::FsWriteProtected, Effect::Deny | Effect::Ask) => {
-                    if read_only_selected {
+                    if boundary {
                         let exact = cap == Capability::FsWriteWorkspace && r.effect == Effect::Deny && r.pattern.is_none();
                         cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![],
                             if exact { ReceiptClass::Exact } else { ReceiptClass::StricterDowngrade }, surface,
                             "the read-only profile blocks every workspace write (stricter for a pattern, a class or an ask)");
                     } else if r.effect == Effect::Deny {
-                        refuse_unless_hard(cx, r, "no verified read-only profile can stand in for a scoped write deny")?;
+                        refuse_unless_hard(cx, r, if off {
+                            "sandbox off removes the boundary the read-only profile relies on"
+                        } else {
+                            "no verified read-only profile can stand in for a scoped write deny"
+                        })?;
                     } else {
                         return Err(CompileRefusal::UnenforceableAsk { vendor, rule: r.describe(),
-                            reason: "no verified read-only profile to make writes prompt".into() });
+                            reason: if off {
+                                "sandbox off removes the boundary the read-only profile relies on, so the write would run"
+                            } else {
+                                "no verified read-only profile to make writes prompt"
+                            }.into() });
                     }
                 }
                 (Capability::FsWriteWorkspace, Effect::Allow) => {
@@ -285,11 +328,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                     if restricted { cx.withdrawn_allow(r, surface) } else { cx.dropped_allow(r, surface, "profiles have no external-path grant") }
                 }
                 (Capability::ShellExec, Effect::Deny) => refuse_unless_hard(cx, r, "profiles carry no command grammar and no proven shell deny")?,
-                (Capability::ShellExec | Capability::McpToolCall, Effect::Ask) => {
+                (Capability::ShellExec, Effect::Ask) => {
                     ask_seen = true;
-                    cx.push(sub, Origin::Rule, Some(Effect::Ask), r.describe(), vec![], ReceiptClass::StricterDowngrade, surface,
-                        "no pattern-scoped ask: the approval mode decides and allows of this capability are withdrawn");
+                    cx.push(sub, Origin::Rule, Some(Effect::Ask), r.describe(), vec!["--approval-mode untrusted".to_owned()], ReceiptClass::StricterDowngrade, surface,
+                        "no pattern-scoped ask: the approval mode is tightened to untrusted (every command prompts) and allows of shell are withdrawn");
                 }
+                (Capability::McpToolCall, Effect::Ask) => return Err(CompileRefusal::UnenforceableAsk {
+                    vendor, rule: r.describe(), reason: "no proven MCP prompt control: Muse's approval mode does not gate MCP calls, so the ask would run".into() }),
                 (Capability::ShellExec | Capability::McpToolCall, Effect::Allow) => {
                     if ask_seen { cx.withdrawn_allow(r, surface) } else { cx.dropped_allow(r, surface, "profiles carry no grammar for this capability") }
                 }
@@ -298,14 +343,18 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             }
         }
         if cap == Capability::FsWriteProtected {
-            if read_only_selected {
+            if boundary {
                 cx.protected_class_defaults(ReceiptClass::StricterDowngrade, vec![],
                     "no protected-path concept: the read-only profile blocks every workspace write (stricter)");
             } else {
                 cx.protected_class_defaults(
                     ReceiptClass::Unsupported,
                     vec![],
-                    "the vendor has no protected-path concept; the deny default is not enforced",
+                    if read_only_selected {
+                        "sandbox off removes the read-only profile's boundary; the deny default is not enforced"
+                    } else {
+                        "the vendor has no protected-path concept; the deny default is not enforced"
+                    },
                 );
             }
         }
@@ -345,11 +394,30 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         Origin::Rule,
                         Some(Effect::Allow),
                         r.describe(),
-                        vec!["--sandbox-network enabled".to_owned()],
+                        if off {
+                            vec![]
+                        } else {
+                            vec!["--sandbox-network enabled".to_owned()]
+                        },
                         ReceiptClass::Exact,
                         surface,
-                        "network mode enabled",
+                        if off {
+                            "sandbox off: the network is already open; no flag is emitted"
+                        } else {
+                            "network mode enabled"
+                        },
                     );
+                }
+            } else if off {
+                // `--sandbox-network` is not emitted under `--disable-sandbox`: the network is open
+                // to every host, so the domain scope is not enforced.
+                for r in &rules {
+                    cx.push(sub, Origin::Rule, Some(Effect::Allow), r.describe(), vec![], ReceiptClass::Unsupported, surface,
+                        "sandbox off leaves the network open to every host; the domain scope is not enforced and no flag is emitted");
+                }
+                if !bypass {
+                    cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
+                        "sandbox off leaves the network open; the ask default for every other host is not enforced");
                 }
             } else {
                 net = Some(("proxy-only", ReceiptClass::StricterDowngrade));

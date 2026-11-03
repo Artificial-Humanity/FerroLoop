@@ -88,17 +88,31 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     let posture = cx.policy.posture;
     let bypass = posture == Posture::Bypass;
 
-    let (args, note): (Vec<String>, &str) = match posture {
+    let (args, note, posture_class): (Vec<String>, &str, ReceiptClass) = match posture {
         Posture::Ask => (
             vec![],
-            "no flag: the vendor prompts by default (no explicit ask mode exists)",
+            "no flag: no explicit ask mode exists, so the vendor's default mode governs and is not pinned by this plan",
+            ReceiptClass::Unsupported,
         ),
-        Posture::AcceptEdits => (vec!["--mode".into(), "accept-edits".into()], "launch flag"),
-        Posture::Auto => (vec!["--mode".into(), "auto".into()], "launch flag"),
-        Posture::Plan => (vec!["--mode".into(), "plan".into()], "launch flag"),
+        Posture::AcceptEdits => (
+            vec!["--mode".into(), "accept-edits".into()],
+            "launch flag",
+            ReceiptClass::Exact,
+        ),
+        Posture::Auto => (
+            vec!["--mode".into(), "auto".into()],
+            "launch flag",
+            ReceiptClass::Exact,
+        ),
+        Posture::Plan => (
+            vec!["--mode".into(), "plan".into()],
+            "launch flag",
+            ReceiptClass::Exact,
+        ),
         Posture::Bypass => (
             vec!["--dangerously-skip-permissions".into()],
             "bypass; restart required",
+            ReceiptClass::Exact,
         ),
     };
     cx.args.extend(args.iter().cloned());
@@ -108,26 +122,28 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         None,
         format!("posture {posture:?}"),
         args,
-        ReceiptClass::Exact,
+        posture_class,
         Surface::Posture,
         note,
     );
+    let sandbox_off = cx.policy.sandbox == crate::permissions::policy::SandboxChoice::Off;
     cx.push(
         ReceiptSubject::Sandbox,
         Origin::Axis,
         None,
-        format!(
-            "sandbox {}",
-            if cx.policy.sandbox == crate::permissions::policy::SandboxChoice::Off {
-                "off"
-            } else {
-                "vendor-default"
-            }
-        ),
+        format!("sandbox {}", if sandbox_off { "off" } else { "vendor-default" }),
         vec![],
-        ReceiptClass::Exact,
+        if sandbox_off {
+            ReceiptClass::Unsupported
+        } else {
+            ReceiptClass::Exact
+        },
         Surface::Sandbox,
-        "no --sandbox flag is compiled; terminal restrictions stay as the vendor ships them",
+        if sandbox_off {
+            "no sandbox-off flag exists: nothing is emitted and terminal restrictions stay as the vendor ships them"
+        } else {
+            "no --sandbox flag is compiled; terminal restrictions stay as the vendor ships them"
+        },
     );
     cx.push(
         ReceiptSubject::Posture,

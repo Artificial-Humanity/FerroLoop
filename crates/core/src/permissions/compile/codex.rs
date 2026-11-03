@@ -144,6 +144,23 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         }
     }
 
+    // `workspace-write` keeps `/tmp` and `$TMPDIR` writable by default; an external write
+    // restriction (deny or ask) would be silently open there unless both are excluded.
+    let exclude_tmp = mode == Mode::WorkspaceWrite
+        && cx
+            .rules(Capability::FsWriteExternal)
+            .iter()
+            .any(|r| r.effect != Effect::Allow);
+    let tmp_native = |on: bool| -> Vec<String> {
+        if on {
+            vec![
+                "sandbox_workspace_write.exclude_slash_tmp=true".to_owned(),
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true".to_owned(),
+            ]
+        } else {
+            vec![]
+        }
+    };
     let mut roots: Vec<String> = Vec::new();
     let mut net_access = false;
     let mut search: Option<&'static str> = None; // Some("live" | "disabled")
@@ -310,10 +327,10 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 CompileRefusal::UnenforceableAsk { vendor, rule: r.describe(), reason: "sandbox off writes anywhere".into() }
                             });
                         }
-                        Effect::Deny => cx.push(sub, Origin::Rule, Some(Effect::Deny), r.describe(), vec![], ReceiptClass::Exact, surface,
-                            "writes outside the workspace and the writable roots are blocked by the sandbox"),
-                        Effect::Ask => cx.push(sub, Origin::Rule, Some(Effect::Ask), r.describe(), vec![], ReceiptClass::StricterDowngrade, surface,
-                            "writes outside the writable roots are blocked and escalate to a prompt"),
+                        Effect::Deny => cx.push(sub, Origin::Rule, Some(Effect::Deny), r.describe(), tmp_native(exclude_tmp), ReceiptClass::Exact, surface,
+                            "writes outside the workspace and the writable roots are blocked by the sandbox; /tmp and $TMPDIR are excluded from the default writable set"),
+                        Effect::Ask => cx.push(sub, Origin::Rule, Some(Effect::Ask), r.describe(), tmp_native(exclude_tmp), ReceiptClass::StricterDowngrade, surface,
+                            "writes outside the writable roots are blocked and escalate to a prompt; /tmp and $TMPDIR are excluded from the default writable set"),
                         Effect::Allow => {
                             if mode == Mode::DangerFullAccess {
                                 cx.push(sub, Origin::Rule, Some(Effect::Allow), r.describe(), vec![], ReceiptClass::Exact, surface,
@@ -425,6 +442,7 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         }
                     });
                 }
+                let mut open_scoped_net = false;
                 for r in &rules {
                     let d = r.describe();
                     let lines =
@@ -476,6 +494,14 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 (vec![], ReceiptClass::Unsupported, "search tool not managed under sandbox off"));
                         }
                         Effect::Allow if r.pattern.is_none() => cx.dropped_allow(r, surface, "network needs the workspace-write sandbox, which this policy does not select"),
+                        Effect::Allow if mode == Mode::DangerFullAccess => {
+                            // Sandbox off leaves every host open: the domain scope is not enforced.
+                            lines(cx, Effect::Allow,
+                                (vec![], ReceiptClass::Unsupported, "sandbox off: the network is open to every host, so the domain scope is not enforced"),
+                                (vec![], ReceiptClass::Unsupported, "host approvals are decisions answered at runtime, not pre-seedable config; complete domain enforcement is unproven"),
+                                (vec![], ReceiptClass::Unsupported, "search tool not managed under sandbox off"));
+                            open_scoped_net = true;
+                        }
                         Effect::Allow => {
                             lines(cx, Effect::Allow,
                                 (vec![], ReceiptClass::StricterDowngrade, "transport stays off: a domain allow is not granted"),
@@ -484,9 +510,12 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         }
                     }
                 }
+                if open_scoped_net && posture != Posture::Bypass {
+                    cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
+                        "sandbox off leaves the network open; the ask default for every other host is not enforced");
+                }
             }
             Capability::McpToolCall => {
-                let mut ask_unsupported = false;
                 for r in &rules {
                     match r.effect {
                         Effect::Deny => {
@@ -502,12 +531,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                                 _ => return Err(cx.refuse_deny(r, "per-tool controls exist for app/connector tools only (AppToolConfig); arbitrary MCP servers have no proven native deny")),
                             }
                         }
-                        Effect::Ask => {
-                            ask_unsupported = true;
-                            cx.push(sub, Origin::Rule, Some(Effect::Ask), r.describe(), vec![], ReceiptClass::StricterDowngrade, surface,
-                                "no proven MCP prompt control: the approval policy decides and allows of MCP are withdrawn");
-                        }
-                        Effect::Allow if ask_unsupported => cx.withdrawn_allow(r, surface),
+                        Effect::Ask => return Err(CompileRefusal::UnenforceableAsk {
+                            vendor, rule: r.describe(),
+                            reason: "no proven MCP prompt control: the approval policy does not gate arbitrary MCP servers, so the ask would run".into() }),
                         Effect::Allow => cx.dropped_allow(r, surface, "per-tool approval config covers app/connector tools, not arbitrary MCP servers"),
                     }
                 }
@@ -598,6 +624,9 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         toml.push_str(&format!("network_access = {net_access}\n"));
         let r: Vec<String> = roots.iter().map(|r| q(r)).collect();
         toml.push_str(&format!("writable_roots = [{}]\n", r.join(", ")));
+        if exclude_tmp {
+            toml.push_str("exclude_slash_tmp = true\nexclude_tmpdir_env_var = true\n");
+        }
         any = true;
     }
     for s in &disabled_mcp {

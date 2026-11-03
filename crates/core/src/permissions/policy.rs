@@ -375,6 +375,9 @@ fn validate_segments(glob: &str, absolute: bool) -> Result<(), String> {
         return Err("too many path segments".into());
     }
     for seg in segments {
+        if seg.contains('?') {
+            return Err("`?` is a wildcard in some vendors and a literal in others; it is not allowed in a path glob".into());
+        }
         match seg {
             "" => return Err("empty path segment (`//` or trailing `/`)".into()),
             "." => return Err("`.` segment".into()),

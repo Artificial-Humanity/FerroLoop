@@ -2,7 +2,7 @@
 --settings
 {"allowNonWorkspaceAccess":false}
 == receipts ==
-[Exact/Documented] Posture Axis: posture Ask ->  | no flag: the vendor prompts by default (no explicit ask mode exists)
+[Unsupported/Documented] Posture Axis: posture Ask ->  | no flag: no explicit ask mode exists, so the vendor's default mode governs and is not pinned by this plan
 [Exact/Documented] Sandbox Axis: sandbox vendor-default ->  | no --sandbox flag is compiled; terminal restrictions stay as the vendor ships them
 [Unsupported/Documented] Posture Axis: artifactReviewPolicy ->  | a vendor-local review posture with no canonical counterpart: left unmanaged
 [Exact/Documented] Capability(FsReadWorkspace) Rule: allow fs_read_workspace ->  | the workspace is readable

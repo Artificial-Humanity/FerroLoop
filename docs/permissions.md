@@ -60,7 +60,7 @@ capabilities, every path outside the workspace; for `network_web`, every domain)
 
 | Capability | Pattern `kind` | Grammar |
 |---|---|---|
-| `fs_read_workspace`, `fs_write_workspace` | `path_glob` | Relative to the workspace. No `..`, `.`, empty segment, trailing `/`, leading `/` or `~`, backslash, `[ ] { } ( )`, leading `!` or `#`, partial `**`. |
+| `fs_read_workspace`, `fs_write_workspace` | `path_glob` | Relative to the workspace. No `..`, `.`, empty segment, trailing `/`, leading `/` or `~`, backslash, `?` (a wildcard in some vendors and a literal in others), `[ ] { } ( )`, leading `!` or `#`, partial `**`. |
 | `fs_read_external`, `fs_write_external` | `abs_path_glob` | Absolute. The same rules. |
 | `fs_write_protected` | `path_class` | `settings`, `git` or `tool-config`. |
 | `shell_exec` | `argv_prefix` | 1 to 32 tokens compared exactly; the command name does not start with `-`. |
@@ -130,6 +130,11 @@ and content; no `~` is resolved), `env` (always empty today; never a secret), `r
 `respawn` class), `unenforced` (the acknowledged unenforceable denies, kind `deny`, and the ask defaults the vendor does not gate, kind `ask`, which are listed under either setting and never refuse; an older plan without the field reads as empty) and the `key` (vendor,
 transport, version) it was compiled for.
 
+`transport` gates `Vendor::supports` and is part of the change key; it does not change what is
+compiled. Codex `app_server`/`print`, Muse `msp` and Claude `print` get the same CLI flags as
+`pty`, although an app-server takes policy per thread. Until the wiring PR, `launch_args` are
+meaningful only for the `pty` transport.
+
 ### Native forms
 
 | Vendor | Posture and sandbox | Rules |
@@ -162,19 +167,34 @@ Notes on what degrades:
   shell rule compiles to `prompt` unless the facts prove `execpolicy_allow_keeps_sandbox`, and is
   never emitted under the read-only sandbox. `network_web` has three receipt lines (sandbox
   transport, host approvals, WebSearch tool). Arbitrary MCP servers have no proven per-tool
-  control, so an MCP deny is refused unless the facts prove `hard_deny(mcp_tool_call)`.
+  control, so an MCP deny is refused unless the facts prove `hard_deny(mcp_tool_call)`, and an
+  MCP ask is refused (`UnenforceableAsk`): the approval policy does not gate MCP calls. A shell
+  ask tightens `-a` to `untrusted`. In `workspace-write`, `/tmp` and `$TMPDIR` stay writable by
+  default, so an external write deny or ask also emits `exclude_slash_tmp = true` and
+  `exclude_tmpdir_env_var = true` in `[sandbox_workspace_write]` and lists both in the receipt.
+  A domain allow under `sandbox: off` is `unsupported` (the network is open to every host) and
+  lists the network ask default in `plan.unenforced`.
+  *Assumption:* an external-read deny or ask relies on the sandbox read scope excluding
+  external paths. That is unverified against a live Codex.
 * **Muse.** A profile carries no glob grammar. The compiler picks the strongest verified profile
   that does not exceed the policy and reports the rest as a downgrade. A deny or ask on an
   external path needs a selected verified profile plus `profile_confines_external`, or a proven
-  `hard_deny`, and is refused otherwise or under sandbox off. A domain allow degrades to
-  `proxy-only`; the proxy's own allowlist governs and may be broader than the domains. `--yolo` and `--disable-approval` come only from `bypass`.
+  `hard_deny`, and is refused otherwise or under sandbox off. Under `sandbox: off` the read-only
+  profile is no boundary either: a workspace or protected-path write deny or ask is refused
+  unless the facts prove `hard_deny`, and the protected-path default is `unsupported`. A shell
+  ask tightens `--approval-mode` to `untrusted` (`on-request` would run sandboxed commands
+  unprompted); an MCP ask is refused, since the approval mode does not gate MCP calls. A domain
+  allow degrades to `proxy-only`; the proxy's own allowlist governs and may be broader than the
+  domains. Under `sandbox: off` no `--sandbox-network` is emitted: a domain allow is
+  `unsupported` and the network ask default is listed in `plan.unenforced`. `--yolo` and `--disable-approval` come only from `bypass`.
 * **Antigravity.** A shell prefix or glob compiles by enumeration: only exact commands the caller
   lists in `exact_commands` and that no deny or ask rule matches become `command(...)` entries
   (matching work is capped in byte steps, and a request over the cap is refused as invalid facts);
   everything else stays ask. One boolean stands for both external read and external write; it
   is `true` only when both are allowed without a pattern. `artifactReviewPolicy` is left
   unmanaged. The vendor has no native deny, so a deny is refused unless the facts prove
-  `hard_deny` for that capability.
+  `hard_deny` for that capability. Posture `ask` emits no flag and `sandbox: off` has no flag,
+  so both receipts are `unsupported`: the vendor's default mode and sandbox govern.
 
 ## The fail-closed rules
 
@@ -214,7 +234,7 @@ Each plan lists a change class for the posture, the sandbox and each capability'
 | `respawn` | The process must be replaced. |
 
 Without a proof, rules in a file are `pending_next_start` and everything else, including every
-sandbox change, is `respawn`. `requires_respawn` is true when any class is `respawn`.
+sandbox change, is `respawn`. `requires_respawn` is true when a field the plan actually sets has the `respawn` class.
 
 ## Refusals
 

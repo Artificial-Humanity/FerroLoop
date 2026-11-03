@@ -282,6 +282,7 @@ fn pattern_grammars_are_strict() {
     let bad_paths = [
         "", "../x", "a/../b", "a/..", "/abs", "~/x", "C:/x", "a//b", "a/", "./a", "a/./b", "a\\b",
         "a\0b", "a\nb", "a/[b]", "a/{b,c}", "a**b", "!a", "#a", " a", "a ", &long, "a/***",
+        "data?/**", "?", "a/b?.rs",
     ];
     for g in bad_paths {
         for cap in [FsReadWorkspace, FsWriteWorkspace] {
@@ -292,7 +293,17 @@ fn pattern_grammars_are_strict() {
         }
     }
     let bad_abs = [
-        "", "/", "rel/x", "/a/../b", "/a//b", "/a/", "~/x", "/a\0", "/a/[x]", "/a**",
+        "",
+        "/",
+        "rel/x",
+        "/a/../b",
+        "/a//b",
+        "/a/",
+        "~/x",
+        "/a\0",
+        "/a/[x]",
+        "/a**",
+        "/opt/d?ta/**",
     ];
     for g in bad_abs {
         assert!(
@@ -3427,4 +3438,312 @@ fn antigravity_match_work_is_bounded_in_byte_steps() {
     // A modest set is fine.
     f.exact_commands.truncate(8);
     assert!(compile(Vendor::Antigravity, &f, &p).is_ok());
+}
+
+// ---------------------------------------------------------------- review round: ask and boundary gaps
+
+fn muse_arg_pair(plan: &CompiledPlan, k: &str) -> Option<String> {
+    plan.launch_args
+        .windows(2)
+        .find(|w| w[0] == k)
+        .map(|w| w[1].clone())
+}
+
+#[test]
+fn a_shell_ask_tightens_the_muse_approval_mode() {
+    let rule = r(Capability::ShellExec, Effect::Ask, argv(&["git", "push"]));
+    // `auto` refuses an ask rule outright, so accept-edits is the posture that reaches here.
+    {
+        let posture = Posture::AcceptEdits;
+        let x = ok(Vendor::Muse, &pol(posture, std::slice::from_ref(&rule)));
+        assert_eq!(
+            muse_arg_pair(&x, "--approval-mode").as_deref(),
+            Some("untrusted"),
+            "{posture:?}: on-request would run the ask without a prompt"
+        );
+        assert!(!pair(&x, "--approval-mode", "on-request"));
+        let l = line_for(&x, "ask shell_exec");
+        assert_eq!(l.class, ReceiptClass::StricterDowngrade);
+        assert!(l.native.iter().any(|n| n.contains("untrusted")), "{l:?}");
+        let p = x
+            .receipts
+            .iter()
+            .find(|l| l.subject == ReceiptSubject::Posture && l.requested.starts_with("posture"))
+            .unwrap();
+        assert_eq!(p.class, ReceiptClass::StricterDowngrade);
+        assert!(p.native.iter().any(|n| n == "untrusted"), "{p:?}");
+    }
+    // Without a shell ask, accept-edits keeps on-request.
+    let x = ok(Vendor::Muse, &pol(Posture::AcceptEdits, &[]));
+    assert!(pair(&x, "--approval-mode", "on-request"));
+    // The ask posture is already the strictest mode.
+    let x = ok(Vendor::Muse, &pol(Posture::Ask, &[rule]));
+    assert!(pair(&x, "--approval-mode", "untrusted"));
+}
+
+#[test]
+fn an_mcp_ask_is_refused_where_the_vendor_does_not_gate_mcp() {
+    let rule = r(Capability::McpToolCall, Effect::Ask, mcp("srv", None));
+    for v in [Vendor::Codex, Vendor::Muse] {
+        for posture in [Posture::Ask, Posture::AcceptEdits] {
+            assert!(
+                matches!(
+                    refusal(v, &pol(posture, std::slice::from_ref(&rule))),
+                    CompileRefusal::UnenforceableAsk { .. }
+                ),
+                "{v:?} {posture:?}: an MCP ask would run without a prompt"
+            );
+        }
+    }
+}
+
+#[test]
+fn muse_sandbox_off_removes_the_read_only_profile_boundary() {
+    let off = |rules: &[Rule]| {
+        let mut p = pol(Posture::Ask, rules);
+        p.sandbox = SandboxChoice::Off;
+        p
+    };
+    let f = facts(Vendor::Muse);
+    for (cap, pat) in [
+        (Capability::FsWriteWorkspace, None),
+        (Capability::FsWriteWorkspace, pg("src/**")),
+        (Capability::FsWriteProtected, class(PathClass::Git)),
+        (Capability::FsWriteProtected, None),
+    ] {
+        let d = compile(Vendor::Muse, &f, &off(&[r(cap, Effect::Deny, pat.clone())]));
+        assert!(
+            matches!(d, Err(CompileRefusal::UnenforceableDeny { .. })),
+            "{cap:?} {pat:?} deny with sandbox off: {d:?}"
+        );
+        let a = compile(Vendor::Muse, &f, &off(&[r(cap, Effect::Ask, pat.clone())]));
+        assert!(
+            matches!(a, Err(CompileRefusal::UnenforceableAsk { .. })),
+            "{cap:?} {pat:?} ask with sandbox off: {a:?}"
+        );
+    }
+    // The same deny with the sandbox on still compiles Exact.
+    let on = compile(
+        Vendor::Muse,
+        &f,
+        &pol(
+            Posture::Ask,
+            &[r(Capability::FsWriteWorkspace, Effect::Deny, None)],
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        line_for(&on, "deny fs_write_workspace").class,
+        ReceiptClass::Exact
+    );
+    // A proven hard deny still carries it.
+    let hard = f
+        .clone()
+        .with(ProvenFact::HardDeny(Capability::FsWriteWorkspace));
+    let x = compile(
+        Vendor::Muse,
+        &hard,
+        &off(&[r(Capability::FsWriteWorkspace, Effect::Deny, None)]),
+    )
+    .unwrap();
+    assert_eq!(
+        line_for(&x, "deny fs_write_workspace").class,
+        ReceiptClass::Exact
+    );
+    // The protected-path default is no longer credited to the profile: it is unenforced.
+    let rules = [r(Capability::FsReadWorkspace, Effect::Allow, None)];
+    let mut p = off(&rules);
+    assert!(matches!(
+        compile(Vendor::Muse, &f, &{
+            p.unenforced_defaults = UnenforcedDefaults::Refuse;
+            p.clone()
+        }),
+        Err(CompileRefusal::UnenforcedRequest { .. })
+    ));
+    p.unenforced_defaults = UnenforcedDefaults::Acknowledge;
+    let x = compile(Vendor::Muse, &f, &p).unwrap();
+    let l = line_for(&x, "deny fs_write_protected");
+    assert_eq!(l.class, ReceiptClass::Unsupported, "{l:?}");
+    assert!(
+        x.unenforced
+            .iter()
+            .any(|u| u.capability == Capability::FsWriteProtected && u.kind == Effect::Deny)
+    );
+    // A partial protected-path rule leaves the other classes at the unenforced default.
+    let part = [r(
+        Capability::FsWriteProtected,
+        Effect::Allow,
+        class(PathClass::Git),
+    )];
+    let mut p = off(&part);
+    p.unenforced_defaults = UnenforcedDefaults::Acknowledge;
+    let x = compile(Vendor::Muse, &f, &p).unwrap();
+    assert!(
+        x.receipts
+            .iter()
+            .filter(|l| l.origin == Origin::Default && l.requested.contains("fs_write_protected"))
+            .all(|l| l.class == ReceiptClass::Unsupported)
+    );
+}
+
+#[test]
+fn codex_excludes_the_default_tmp_writes_when_external_writes_are_restricted() {
+    let sandbox_table = |x: &CompiledPlan| {
+        file(x, ConfigTarget::CodexConfig)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for eff in [Effect::Deny, Effect::Ask] {
+        for pat in [None, ag("/tmp/**")] {
+            // Workspace-write: a workspace allow with no write restriction selects it.
+            let rules = [
+                r(Capability::FsWriteWorkspace, Effect::Allow, None),
+                r(Capability::FsWriteExternal, eff, pat.clone()),
+            ];
+            let x = ok(Vendor::Codex, &pol(Posture::Ask, &rules));
+            assert!(pair(&x, "-s", "workspace-write"), "{eff:?} {pat:?}");
+            let t = sandbox_table(&x);
+            assert!(t.contains("exclude_slash_tmp = true"), "{t}");
+            assert!(t.contains("exclude_tmpdir_env_var = true"), "{t}");
+            let l = x
+                .receipts
+                .iter()
+                .find(|l| {
+                    l.origin == Origin::Rule
+                        && l.effect == Some(eff)
+                        && l.requested.contains("fs_write_external")
+                })
+                .unwrap();
+            assert!(
+                l.native.iter().any(|n| n.contains("exclude_slash_tmp"))
+                    && l.native
+                        .iter()
+                        .any(|n| n.contains("exclude_tmpdir_env_var")),
+                "{l:?}"
+            );
+        }
+    }
+    // No external write restriction: the sandbox table is unchanged.
+    let x = ok(
+        Vendor::Codex,
+        &pol(
+            Posture::AcceptEdits,
+            &[r(Capability::FsWriteWorkspace, Effect::Allow, None)],
+        ),
+    );
+    let t = sandbox_table(&x);
+    assert!(
+        t.contains("[sandbox_workspace_write]") && !t.contains("exclude_"),
+        "{t}"
+    );
+    // Read-only already blocks /tmp: nothing to exclude.
+    let x = ok(
+        Vendor::Codex,
+        &pol(
+            Posture::Ask,
+            &[r(Capability::FsWriteExternal, Effect::Deny, None)],
+        ),
+    );
+    assert!(!sandbox_table(&x).contains("exclude_"));
+}
+
+#[test]
+fn a_scoped_network_allow_under_sandbox_off_is_reported_unenforced() {
+    let scoped = r(Capability::NetworkWeb, Effect::Allow, dom("example.com"));
+    for v in [Vendor::Muse, Vendor::Codex] {
+        let mut p = pol(Posture::Ask, std::slice::from_ref(&scoped));
+        p.sandbox = SandboxChoice::Off;
+        let x = ok(v, &p);
+        let allow = x
+            .receipts
+            .iter()
+            .filter(|l| l.origin == Origin::Rule && l.requested.starts_with("allow network_web"))
+            .collect::<Vec<_>>();
+        assert!(!allow.is_empty());
+        assert!(
+            allow.iter().all(|l| l.class == ReceiptClass::Unsupported),
+            "{v:?}: {allow:?}"
+        );
+        // Nothing is receipted as native that the plan does not emit.
+        assert!(!has_arg(&x, "--sandbox-network"));
+        for l in x
+            .receipts
+            .iter()
+            .filter(|l| l.requested.contains("network_web"))
+        {
+            assert!(
+                l.native.iter().all(|n| !n.contains("sandbox-network")),
+                "{v:?}: {l:?}"
+            );
+        }
+        assert!(
+            x.unenforced
+                .iter()
+                .any(|u| u.capability == Capability::NetworkWeb && u.kind == Effect::Ask),
+            "{v:?}: {:?}",
+            x.unenforced
+        );
+    }
+    // An all-domain allow under sandbox off lists no flag it does not emit.
+    let mut p = pol(
+        Posture::Ask,
+        &[r(Capability::NetworkWeb, Effect::Allow, None)],
+    );
+    p.sandbox = SandboxChoice::Off;
+    let x = ok(Vendor::Muse, &p);
+    assert!(!has_arg(&x, "--sandbox-network"));
+    assert!(
+        x.receipts
+            .iter()
+            .filter(|l| l.requested.contains("network_web"))
+            .all(|l| l.native.is_empty())
+    );
+    // With the sandbox on, Muse still emits and receipts the flag.
+    let x = ok(Vendor::Muse, &pol(Posture::Ask, &[scoped]));
+    assert!(pair(&x, "--sandbox-network", "proxy-only"));
+    // Muse without rules and the sandbox off does not call the open network enforced.
+    let mut p = pol(Posture::Ask, &[]);
+    p.sandbox = SandboxChoice::Off;
+    let x = ok(Vendor::Muse, &p);
+    assert_eq!(
+        line_for(&x, "ask network_web").class,
+        ReceiptClass::Unsupported
+    );
+}
+
+#[test]
+fn antigravity_does_not_claim_an_unemitted_posture_or_sandbox_off() {
+    let x = ok(Vendor::Antigravity, &pol(Posture::Ask, &[]));
+    assert!(x.launch_args.iter().all(|a| a != "--mode"));
+    let p = x
+        .receipts
+        .iter()
+        .find(|l| l.subject == ReceiptSubject::Posture && l.requested.starts_with("posture"))
+        .unwrap();
+    assert_eq!(p.class, ReceiptClass::Unsupported, "{p:?}");
+    let mut off = pol(Posture::AcceptEdits, &[]);
+    off.sandbox = SandboxChoice::Off;
+    let x = ok(Vendor::Antigravity, &off);
+    let s = x
+        .receipts
+        .iter()
+        .find(|l| l.subject == ReceiptSubject::Sandbox)
+        .unwrap();
+    assert_eq!(s.class, ReceiptClass::Unsupported, "{s:?}");
+    assert!(s.native.is_empty());
+    // A posture the vendor does emit stays exact.
+    let p = x
+        .receipts
+        .iter()
+        .find(|l| l.subject == ReceiptSubject::Posture && l.requested.starts_with("posture"))
+        .unwrap();
+    assert_eq!(p.class, ReceiptClass::Exact);
+    // The default sandbox is a vendor default: unchanged.
+    let x = ok(Vendor::Antigravity, &pol(Posture::AcceptEdits, &[]));
+    let s = x
+        .receipts
+        .iter()
+        .find(|l| l.subject == ReceiptSubject::Sandbox)
+        .unwrap();
+    assert_eq!(s.class, ReceiptClass::Exact);
 }
