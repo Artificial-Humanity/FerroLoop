@@ -125,7 +125,13 @@ export const RECAST_ROLE_OPTIONS = [
   { value: "assistant", label: "assistant" },
   { value: "lab_manager", label: "lab_manager" },
   { value: "custom:ui-developer", label: "custom:ui-developer" },
+  { value: "custom:web-developer", label: "custom:web-developer" },
+  { value: "custom:mobile-developer", label: "custom:mobile-developer" },
+  { value: "custom:system-developer", label: "custom:system-developer" },
+  { value: "custom:data-engineer", label: "custom:data-engineer" },
+  { value: "custom:tester", label: "custom:tester" },
   { value: "custom:strategist", label: "custom:strategist" },
+  { value: "custom:journalist", label: "custom:journalist" },
   { value: "custom:scribe", label: "custom:scribe" },
 ];
 

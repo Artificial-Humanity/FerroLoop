@@ -23,7 +23,13 @@ export const SPIN_UP_PROJECTS = [
 export const SPIN_UP_ROLES = [
   { value: "assistant", label: "assistant (Assisting Engineer)" },
   { value: "ui-developer", label: "ui-developer (UI & Full-Stack)" },
+  { value: "web-developer", label: "web-developer (Web Developer)" },
+  { value: "mobile-developer", label: "mobile-developer (Mobile Developer)" },
+  { value: "system-developer", label: "system-developer (System / Backend Developer)" },
+  { value: "data-engineer", label: "data-engineer (Data Engineer)" },
+  { value: "tester", label: "tester (QA & Tester)" },
   { value: "strategist", label: "strategist (Research & Architecture Strategist)" },
+  { value: "journalist", label: "journalist (Journalist / Technical Scribe)" },
   { value: "lead", label: "lead (Project Lead)" },
   { value: "lab-manager", label: "lab-manager (Lab Manager)" },
 ] as const;
