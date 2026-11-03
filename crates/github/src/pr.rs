@@ -325,7 +325,14 @@ pub fn list_pr_commits(
                 ))
             })?
             .to_string();
+        // `parents` is absent only on a hand-made payload; read as one parent, so the commit is
+        // still checked.
+        let parent_count = item
+            .get("parents")
+            .and_then(Value::as_array)
+            .map_or(1, Vec::len);
         commits.push(PrCommitSummary {
+            parent_count,
             sha,
             author_login,
             message,
@@ -575,6 +582,43 @@ mod tests {
     }
 
     #[test]
+    fn list_pr_commits_reports_each_commits_parent_count() {
+        let repo = "acme/widgets";
+        let fake = FakeGithub::start(repo);
+        let author = user_client(&fake);
+        // A uat -> main promotion: the agent commit and the 2-parent commit GitHub made merging
+        // an earlier pull request into uat.
+        fake.seed_branch(
+            "uat",
+            "sha-merge",
+            vec![
+                PrCommitSummary {
+                    parent_count: 1,
+                    sha: "sha-agent".into(),
+                    author_login: Some(USER_LOGIN.into()),
+                    message: "feat: page\n\nCo-authored-by: Wesley <wesley@artificialhumanity.io>"
+                        .into(),
+                },
+                PrCommitSummary {
+                    parent_count: 2,
+                    sha: "sha-merge".into(),
+                    author_login: Some(USER_LOGIN.into()),
+                    message: "Merge pull request #43 from acme/wesley/feature".into(),
+                },
+            ],
+            vec!["src/a.rs".into()],
+        );
+        create_pr(&author, repo, "Promote uat", "", "uat", "main").unwrap();
+
+        let commits = list_pr_commits(&author, repo, 1).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].parent_count, 1);
+        assert!(!commits[0].is_merge());
+        assert_eq!(commits[1].parent_count, 2);
+        assert!(commits[1].is_merge());
+    }
+
+    #[test]
     fn pr_lifecycle_over_fake_github_enforces_self_review_and_head_sha_guards() {
         let repo = "acme/widgets";
         let fake = FakeGithub::start(repo);
@@ -586,6 +630,7 @@ mod tests {
             "sha-111",
             vec![
                 PrCommitSummary {
+                    parent_count: 1,
                     sha: "sha-100".into(),
                     author_login: Some(USER_LOGIN.into()),
                     message:
@@ -593,6 +638,7 @@ mod tests {
                             .into(),
                 },
                 PrCommitSummary {
+                    parent_count: 1,
                     sha: "sha-111".into(),
                     author_login: Some(USER_LOGIN.into()),
                     message:
