@@ -15,6 +15,7 @@
 //! - [`runtime`]: the workspace runtime entries the other modules read, decoded in one pass.
 //! - [`balance`]: the pure subscription usage balancing planner ([`plan_balance`]).
 //! - [`balance_store`]: the balancing policy, history and audit entries in the store.
+//! - [`otlp`]: OTLP/JSON trace and metric export ([`export_report`]) over a telemetry report.
 //!
 //! [`build_summary`] runs all of them over one store: [`read_store_snapshot`] reads it once and
 //! [`summarize`] evaluates health and alerts from that read, so a caller can cache the read.
@@ -23,6 +24,7 @@ pub mod alerts;
 pub mod balance;
 pub mod balance_store;
 pub mod liveness;
+pub mod otlp;
 pub mod rollups;
 pub mod runtime;
 
@@ -46,6 +48,10 @@ pub use balance_store::{BalanceAudit, SwitchResult, SwitchStatus};
 pub use liveness::{
     LivenessOptions, WatchAgentHealth, WatchGroupHealth, WatchHealthReport, WatchLiveness,
     WatchLivenessCounts, build_health, classify_liveness, evaluate_health,
+};
+pub use otlp::{
+    MemoryTransport, NoopTransport, OtlpConfig, OtlpError, OtlpTransport, build_metrics_payload,
+    build_traces_payload, export_report,
 };
 pub use rollups::{
     WatchAttemptCounts, WatchBreakdown, WatchFailureStreak, WatchGateTotals, WatchProjectRollup,
