@@ -21,8 +21,11 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Wave 7 & Wave 13 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace Catalog & Vendor Session MCP Deduplication UI", () => {
-  it("defaults to honest unverified not-checked state, refuses to fabricate synced on non-2xx responses, and transitions to synced only on 2xx backend responses", async () => {
+describe("Wave 7, Wave 13 & Wave 14 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace Catalog & Compare-And-Swap Sync UI", () => {
+  it("defaults to honest unverified not-checked state, enforces CAS expect_digest on POST /api/v1/mcp/sync, rejects 200 ok:false / repo errors, and re-fetches GET /api/v1/mcp/catalog on success", async () => {
+    const digestA = "a".repeat(64);
+    const digestB = "b".repeat(64);
+
     expect(ReExportedGateCatalog).toEqual(DEFAULT_MCP_CATALOG_REPOS);
     expect(ReExportedSettingsCatalog).toEqual(DEFAULT_MCP_CATALOG_REPOS);
     expect(DEFAULT_MCP_CATALOG_REPOS.every((r) => r.status === "not-checked")).toBe(
@@ -33,11 +36,12 @@ describe("Wave 7 & Wave 13 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace
         (r) =>
           r.deduplicated_daemons.length === 0 &&
           r.active_vendor_sessions === null &&
-          r.spawned_mcp_processes === null,
+          r.spawned_mcp_processes === null &&
+          r.catalog_digest === null,
       ),
     ).toBe(true);
 
-    // 1. Offline / 404 responses must NOT fabricate synced status
+    // 1. Offline / 404 responses must NOT fabricate synced status, and Sync button is disabled without a catalog_digest
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: false,
       status: 404,
@@ -49,6 +53,9 @@ describe("Wave 7 & Wave 13 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace
     expect(screen.getByTestId("mcp-catalog-dedup-badge").textContent).toContain(
       "Unverified (offline preview — run fl mcp check)",
     );
+    expect(
+      (screen.getByTestId("mcp-catalog-sync-btn") as HTMLButtonElement).disabled,
+    ).toBe(true);
 
     expect(
       screen.getByTestId("mcp-catalog-repo-status-FerroLoop").textContent,
@@ -73,39 +80,154 @@ describe("Wave 7 & Wave 13 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace
       ).toBe("not-checked");
     });
 
-    fireEvent.click(screen.getByTestId("mcp-catalog-sync-btn"));
-    await waitFor(() => {
-      expect(fetchSpy).toHaveBeenCalledWith(
-        "/api/v1/mcp/sync",
-        expect.objectContaining({ method: "POST" }),
-      );
-      expect(
-        screen.getByTestId("mcp-catalog-status-banner").textContent,
-      ).toBe("Sync failed: backend /api/v1/mcp/sync unavailable");
-      expect(
-        screen.getByTestId("mcp-catalog-repo-status-Sonora").textContent,
-      ).toBe("not-checked");
-    });
-
-    // 2. Live 200 OK response transitions rows to verified synced state
-    fetchSpy.mockResolvedValue({
+    // 2. GET /api/v1/mcp/catalog returns drift (with catalog_digest, enabled_servers, changes) and error (with error + refusals)
+    fetchSpy.mockResolvedValueOnce({
       ok: true,
       status: 200,
       json: async () => ({
-        repos: DEFAULT_MCP_CATALOG_REPOS.map((r) => ({
-          ...r,
-          status: "synced",
-          deduplicated_daemons: ["fl-state", "agent-bus", "research-papers"],
-          active_vendor_sessions: 3,
-          spawned_mcp_processes: 3,
-        })),
+        repos: [
+          {
+            repo: "FerroLoop",
+            catalog_path: "FerroLoop/.fl/mcp.toml",
+            status: "drift",
+            deduplicated_daemons: null,
+            active_vendor_sessions: null,
+            spawned_mcp_processes: null,
+            enabled_servers: ["fl-state", "agent-bus"],
+            changes: [
+              { vendor: "claude", server: "fl-state", action: "add" },
+              { vendor: "codex", server: "agent-bus", action: "update" },
+            ],
+            catalog_digest: digestA,
+          },
+          {
+            repo: "Sonora",
+            catalog_path: "Sonora/.fl/mcp.toml",
+            status: "error",
+            deduplicated_daemons: null,
+            active_vendor_sessions: null,
+            spawned_mcp_processes: null,
+            enabled_servers: ["sonora-tts"],
+            changes: null,
+            catalog_digest: null,
+            error: "1 entries were refused; nothing would be written",
+            refusals: ["claude: unmanaged server entry refused"],
+          },
+        ],
+      }),
+    } as Response);
+
+    fireEvent.click(screen.getByTestId("mcp-catalog-check-btn"));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("mcp-catalog-repo-status-FerroLoop").textContent,
+      ).toBe("drift");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-enabled-FerroLoop").textContent,
+      ).toContain("fl-state, agent-bus");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-changes-FerroLoop").textContent,
+      ).toContain("claude:fl-state (add)");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-status-Sonora").textContent,
+      ).toBe("error");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-error-Sonora").textContent,
+      ).toContain("1 entries were refused; nothing would be written");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-refusals-Sonora").textContent,
+      ).toContain("claude: unmanaged server entry refused");
+      expect(
+        screen.getByTestId("mcp-catalog-dedup-badge").textContent,
+      ).toContain("Catalog Error / Refusal Detected");
+    });
+
+    // Sync button is now enabled because FerroLoop has a valid catalog_digest
+    expect(
+      (screen.getByTestId("mcp-catalog-sync-btn") as HTMLButtonElement).disabled,
+    ).toBe(false);
+
+    // 3. HTTP 200 with ok: false / stale digest error must be treated as a failure and never flip rows to synced
+    fetchSpy.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: false,
+        repos: [
+          {
+            repo: "FerroLoop",
+            status_before: "drift",
+            status_after: "drift",
+            written: [],
+            error: "catalog changed since you looked; reload and review it again",
+          },
+        ],
       }),
     } as Response);
 
     fireEvent.click(screen.getByTestId("mcp-catalog-sync-btn"));
     await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/v1/mcp/sync",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            repo: "FerroLoop",
+            expect_digest: digestA,
+          }),
+        }),
+      );
       expect(
-        screen.getByTestId("mcp-catalog-repo-status-Sonora").textContent,
+        screen.getByTestId("mcp-catalog-status-banner").textContent,
+      ).toBe(
+        "Sync failed: catalog changed since you looked; reload and review it again",
+      );
+      expect(
+        screen.getByTestId("mcp-catalog-repo-status-FerroLoop").textContent,
+      ).toBe("drift");
+    });
+
+    // 4. Successful CAS POST /api/v1/mcp/sync (ok: true) triggers follow-up GET /api/v1/mcp/catalog and transitions to synced
+    fetchSpy
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          repos: [
+            {
+              repo: "FerroLoop",
+              status_before: "drift",
+              status_after: "synced",
+              written: [".mcp.json", ".codex/config.toml"],
+            },
+          ],
+        }),
+      } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          repos: [
+            {
+              repo: "FerroLoop",
+              catalog_path: "FerroLoop/.fl/mcp.toml",
+              status: "synced",
+              deduplicated_daemons: ["fl-state", "agent-bus"],
+              active_vendor_sessions: 3,
+              spawned_mcp_processes: 3,
+              enabled_servers: ["fl-state", "agent-bus"],
+              changes: [],
+              catalog_digest: digestB,
+            },
+          ],
+        }),
+      } as Response);
+
+    fireEvent.click(screen.getByTestId("mcp-catalog-sync-btn"));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("mcp-catalog-repo-status-FerroLoop").textContent,
       ).toBe("synced");
       expect(
         screen.getByTestId("mcp-catalog-dedup-badge").textContent,
@@ -113,6 +235,9 @@ describe("Wave 7 & Wave 13 Item 1 (Record #81 / Gate G5): .fl/mcp.toml Workspace
       expect(
         screen.getByTestId("mcp-catalog-repo-dedup-stats-FerroLoop").textContent,
       ).toBe("sessions: 3 · shared procs: 3");
+      expect(
+        screen.getByTestId("mcp-catalog-repo-digest-FerroLoop").textContent,
+      ).toContain(`digest: ${digestB.slice(0, 12)}`);
     });
   });
 });
