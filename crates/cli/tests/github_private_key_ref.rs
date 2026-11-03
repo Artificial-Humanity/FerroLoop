@@ -182,7 +182,7 @@ fn the_vault_signs_the_apps_jwt_and_the_audit_log_holds_the_name_only() {
         return;
     };
     let g = G::with_ref();
-    g.store(&pem, &["api.github.com"], &["ferris"]);
+    g.store(&pem, &["127.0.0.1"], &["ferris"]);
     g.whoami().success().stdout(
         contains(format!("{APP_SLUG}[bot]")).and(contains("GitHub App 42 (installation token)")),
     );
@@ -211,7 +211,8 @@ fn the_vault_signs_the_apps_jwt_and_the_audit_log_holds_the_name_only() {
     for entry in &log {
         assert_eq!(entry["outcome"], "allowed");
         assert_eq!(entry["method"], "SIGN_RS256_JWT");
-        assert_eq!(entry["host"], "api.github.com");
+        // The host of the API URL the JWT is sent to (the stub), not a fixed label.
+        assert_eq!(entry["host"], "127.0.0.1");
         assert_eq!(entry["caller"], "ferris");
         assert_eq!(entry["secrets"], json!([SECRET]));
     }
@@ -226,9 +227,10 @@ fn a_policy_denial_fails_the_command_audits_it_and_sends_nothing_to_github() {
     let Some(pem) = throwaway_pem() else {
         return;
     };
-    // allowed_hosts does not name GitHub.
+    // The API URL is not GitHub's (it is the stub on 127.0.0.1) and allowed_hosts names only
+    // GitHub: the JWT may not go there.
     let g = G::with_ref();
-    g.store(&pem, &["api.example.com"], &[]);
+    g.store(&pem, &["api.github.com"], &[]);
     g.whoami()
         .failure()
         .stderr(contains(SECRET).and(contains("allowed_hosts")))
@@ -238,14 +240,56 @@ fn a_policy_denial_fails_the_command_audits_it_and_sends_nothing_to_github() {
     let log = g.audit();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0]["outcome"], "denied:host");
+    assert_eq!(
+        log[0]["host"], "127.0.0.1",
+        "audited under the host it would have gone to"
+    );
     assert_eq!(log[0]["secrets"], json!([SECRET]));
 
     // allowed_agents names someone else: refused on the caller, audited, nothing sent.
     let g = G::with_ref();
-    g.store(&pem, &["api.github.com"], &["somebody-else"]);
+    g.store(&pem, &["127.0.0.1"], &["somebody-else"]);
     g.whoami().failure().stderr(contains("allowed_agents"));
     g.nothing_reached_github();
     assert_eq!(g.audit()[0]["outcome"], "denied:agent");
+}
+
+#[test]
+fn the_host_the_vault_is_asked_about_is_the_apis_own_and_a_port_is_not_part_of_it() {
+    let Some(pem) = throwaway_pem() else {
+        return;
+    };
+    // An enterprise-style host (`localhost` here, reached through the same stub) listed in
+    // allowed_hosts works, and the audit names that host with no port.
+    let g = G::with_ref();
+    g.store(&pem, &["localhost"], &[]);
+    let url = g.fake.url().replace("127.0.0.1", "localhost");
+    g.fl()
+        .env("FL_GITHUB_API_URL", &url)
+        .args(["github", "whoami"])
+        .assert()
+        .success()
+        .stderr(contains("talking to"));
+    let log = g.audit();
+    assert!(!log.is_empty());
+    assert!(
+        log.iter()
+            .all(|e| e["host"] == "localhost" && e["outcome"] == "allowed")
+    );
+    assert!(g.fake.state().jwts.iter().all(|j| verifies(&pem, j)));
+
+    // A secret that lists only `127.0.0.1` does not admit `localhost`: nothing is sent.
+    let g = G::with_ref();
+    g.store(&pem, &["127.0.0.1"], &[]);
+    let url = g.fake.url().replace("127.0.0.1", "localhost");
+    g.fl()
+        .env("FL_GITHUB_API_URL", &url)
+        .args(["github", "whoami"])
+        .assert()
+        .failure()
+        .stderr(contains("allowed_hosts"));
+    g.nothing_reached_github();
+    assert_eq!(g.audit()[0]["outcome"], "denied:host");
 }
 
 #[test]
@@ -263,7 +307,7 @@ fn an_absent_vault_or_secret_fails_naming_the_secret_and_creates_nothing() {
         return;
     };
     let g = G::with_ref();
-    g.store(&pem, &["api.github.com"], &[]);
+    g.store(&pem, &["127.0.0.1"], &[]);
     let other = G::new("private_key_ref = \"vault://SOME_OTHER_KEY\"\n");
     fs::create_dir_all(&other.vault_dir).unwrap();
     fs::copy(g.vault_path(), other.vault_path()).unwrap();
@@ -301,7 +345,7 @@ fn a_private_key_ref_never_falls_back_to_the_environments_key_file() {
 
     // The same with a working Vault: still refused, and the Vault is not asked.
     let g = G::with_ref();
-    g.store(&pem, &["api.github.com"], &[]);
+    g.store(&pem, &["127.0.0.1"], &[]);
     let legacy = g.home.path().join("legacy.pem");
     fs::write(&legacy, &pem).unwrap();
     g.fl()

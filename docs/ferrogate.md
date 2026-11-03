@@ -145,17 +145,25 @@ now)`. fl holds no PEM: the JWT comes back, the key does not. The installation t
 returns is a different credential and is cached for fifty minutes as before. A JWT is never kept.
 
 * The caller is `$AGENT_PERSONA` when it is set and not blank, else `fl`. The Hub signs as
-  `fl-hub`. A secret with a non-empty `allowed_agents` must list the caller (or `*`).
-* The host is the label `api.github.com`, whatever `$FL_GITHUB_API_URL` says. The secret's
-  `allowed_hosts` must match it.
+  `fl-hub`. A secret with a non-empty `allowed_agents` must list the caller (or `*`). The Hub
+  signs as `fl-hub` for every Hub-authorized request that reaches the merge and review endpoints,
+  so listing `fl-hub` in `allowed_agents` grants signing to all of them; and it is advisory
+  locally, because a local process can set `AGENT_PERSONA=fl-hub`.
+* The host is the host of the API URL the command sends the JWT to: `api.github.com` by default,
+  else the host of `$FL_GITHUB_API_URL` (or the Hub's API URL), lower-case, with no port. So a
+  GitHub Enterprise host must be in the secret's `allowed_hosts`, and `allowed_hosts` constrains
+  where fl sends the JWT: pointing `$FL_GITHUB_API_URL` at a host the secret does not list is
+  denied (`denied:host`) before the key is decrypted, and nothing is sent. A host the Vault cannot
+  read as a host name (a bracketed IPv6 address) is denied too. The check is made by fl's own
+  code, from the URL it then uses; a process that skips that code is not constrained.
 * There is no fallback. If the Vault file or its master key is missing, the secret does not
   exist, or the policy denies the call, the command fails with a message that names the secret
   and the reason (for example "the App private key `vault://GITHUB_APP_KEY` could not be used to
   sign: FerroGate policy denied secret `GITHUB_APP_KEY`: the destination host is not in
   allowed_hosts"). It does not read `private_key`, `$FL_GITHUB_PRIVATE_KEY_PATH` or any file. A
   policy denial is audited as above; nothing is sent to GitHub.
-* A read never creates a Vault or a master key: a missing one is refused before
-  `load_or_init_master_key` could generate it.
+* A read never creates a Vault or a master key: the master key is loaded with
+  `load_existing_master_key`, which fails when there is none and cannot generate one.
 
 `fl-github` does not depend on `fl-gate`. It defines the `JwtSigner` trait; `FileKeySigner` (the
 PEM file, read again at every signing) is the `private_key` implementation, and `fl-cli` supplies
@@ -165,7 +173,8 @@ the Vault one.
 
 1. Store the PEM as a secret open to GitHub and to the agents that run fl, for example
    `fl vault set GITHUB_APP_KEY --stdin --host api.github.com --agent ferris --agent fl
-   < app.pem`. List every caller that needs it: `fl` is the caller when `$AGENT_PERSONA` is
+   < app.pem` (`--host` is the API host fl will send the JWT to; for GitHub Enterprise, that
+   host). List every caller that needs it: `fl` is the caller when `$AGENT_PERSONA` is
    unset, `fl-hub` is the Hub.
 2. In `[github]` replace `private_key = "…"` with `private_key_ref = "vault://GITHUB_APP_KEY"`.
 3. Check it: `fl github whoami` prints `<slug>[bot]`, and `gate-audit.jsonl` has an `allowed`

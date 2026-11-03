@@ -321,7 +321,11 @@ fn open_github(
             Box::new(fl_github::AppCredentials::with_signer(
                 &api,
                 app.app_id,
-                gate_signer::signer_for(app, &gate_signer::cli_caller())?,
+                gate_signer::signer_for(
+                    app,
+                    &gate_signer::cli_caller(),
+                    &gate_signer::api_host(&api)?,
+                )?,
                 &b.github,
             ))
         }

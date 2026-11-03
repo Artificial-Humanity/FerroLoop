@@ -9,6 +9,7 @@ use fl_core::pr_policy::{
     FlReviewMarker, PrCommitSummary, ReviewVerdict, extract_review_marker, format_review_body,
 };
 use fl_github::fake::{APP_BOT_ID, APP_SLUG, FakeGithub, LOOKALIKE_ID, USER_LOGIN};
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 use std::fs;
@@ -910,4 +911,153 @@ fn a_lookalike_of_the_reviewer_apps_login_counts_for_nothing_under_reviewer_ids(
         .assert()
         .success();
     assert!(f.fake.pull(1).merged);
+}
+
+/// `[github] private_key_ref`: the Reviewer App's JWT is signed by a temp Vault holding a
+/// throwaway key. Review and merge sign through it, a policy denial stops them with nothing
+/// sent, and the key variable beside the ref is refused on every verdict.
+#[test]
+fn review_and_merge_sign_through_the_vault_with_a_private_key_ref() {
+    use fl_gate::{SetSecretArgs, Vault, load_or_init_master_key};
+
+    let f = PrFixture::new(true);
+    f.seed_roster();
+    let cfg_path = f.home.path().join("config/fl/config.toml");
+    let cfg: String = fs::read_to_string(&cfg_path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            if l.starts_with("private_key = ") {
+                "private_key_ref = \"vault://REVIEWER_APP_KEY\"".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&cfg_path, format!("{cfg}\n")).unwrap();
+
+    let vault_dir = f.home.path().join("vault");
+    fs::create_dir_all(&vault_dir).unwrap();
+    let (vault_path, key_path) = (vault_dir.join("vault.enc"), vault_dir.join("vault.key"));
+    let pem = throwaway_rsa_pem();
+    let store = |hosts: &[&str]| {
+        let master = load_or_init_master_key(&key_path).unwrap();
+        let mut v = Vault::open(&vault_path, master).unwrap();
+        v.set(SetSecretArgs {
+            name: "REVIEWER_APP_KEY".into(),
+            value: pem.clone(),
+            allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            ..SetSecretArgs::default()
+        })
+        .unwrap();
+    };
+    let audit = || -> Vec<Value> {
+        fs::read_to_string(vault_dir.join("gate-audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let fl = || {
+        let mut c = f.fl();
+        c.env("FL_VAULT_PATH", &vault_path)
+            .env("FL_VAULT_KEY_PATH", &key_path)
+            .env_remove("FL_VAULT_MASTER_KEY");
+        c
+    };
+    let review = |verdict: &str| -> Vec<String> {
+        vec![
+            "github".into(),
+            "pr".into(),
+            "review".into(),
+            "1".into(),
+            verdict.into(),
+            "--body".into(),
+            "LGTM".into(),
+            "--by".into(),
+            "ferris".into(),
+        ]
+    };
+
+    f.fake.seed_branch(
+        "felicia/feat-1",
+        "sha-pr1",
+        vec![PrCommitSummary {
+            sha: "sha-pr1".into(),
+            author_login: Some(USER_LOGIN.into()),
+            message: "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>".into(),
+        }],
+        vec!["crates/cli/src/cmd/pr.rs".into()],
+    );
+    fl().args([
+        "github",
+        "pr",
+        "create",
+        "--title",
+        "t",
+        "--body",
+        "b",
+        "--head",
+        "felicia/feat-1",
+        "--by",
+        "felicia",
+    ])
+    .assert()
+    .success();
+
+    // The key variable beside the ref is ambiguous on the App-signed verdicts and on a comment,
+    // which would otherwise fall back to the user token without a word.
+    store(&["127.0.0.1"]);
+    let legacy = f.home.path().join("legacy.pem");
+    fs::write(&legacy, &pem).unwrap();
+    for verdict in ["--approve", "--request-changes", "--comment"] {
+        fl().env("FL_GITHUB_PRIVATE_KEY_PATH", &legacy)
+            .args(review(verdict))
+            .assert()
+            .failure()
+            .stderr(contains("ambiguous"));
+    }
+    assert!(f.fake.pull(1).reviews.is_empty());
+    assert!(audit().is_empty(), "the Vault was not asked to sign");
+
+    // The policy does not name this API host: refused, audited, nothing reaches GitHub.
+    store(&["api.github.com"]);
+    let before = f.fake.state().requests.len();
+    fl().args(review("--approve"))
+        .assert()
+        .failure()
+        .stderr(contains("REVIEWER_APP_KEY").and(contains("allowed_hosts")));
+    assert!(f.fake.pull(1).reviews.is_empty());
+    assert_eq!(audit()[0]["outcome"], "denied:host");
+    assert!(
+        f.fake.state().jwts.is_empty(),
+        "no JWT reached GitHub (requests before: {before})"
+    );
+
+    // Allowed: the Vault signs the review and the merge.
+    store(&["127.0.0.1"]);
+    fl().args(review("--approve")).assert().success();
+    let reviews = f.fake.pull(1).reviews;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].author_login, format!("{APP_SLUG}[bot]"));
+    // The merge builds the same client: the key variable beside the ref refuses it, too.
+    fl().env("FL_GITHUB_PRIVATE_KEY_PATH", &legacy)
+        .env("FL_GITHUB_APP_ID", "42")
+        .args(["github", "pr", "merge", "1", "--by", "felicia"])
+        .assert()
+        .failure()
+        .stderr(contains("ambiguous"));
+    assert!(!f.fake.pull(1).merged);
+    fl().args(["github", "pr", "merge", "1", "--by", "felicia"])
+        .assert()
+        .success();
+    assert!(f.fake.pull(1).merged);
+    let allowed = audit()
+        .into_iter()
+        .filter(|e| e["outcome"] == "allowed")
+        .count();
+    assert!(allowed >= 2, "one signing per client built: {allowed}");
+    let text = fs::read_to_string(vault_dir.join("gate-audit.jsonl")).unwrap();
+    assert!(!text.contains("PRIVATE KEY"));
 }

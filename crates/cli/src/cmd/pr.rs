@@ -98,9 +98,13 @@ pub enum PrCmd {
 }
 
 fn resolve_api_url() -> Result<String> {
-    match std::env::var("FL_GITHUB_API_URL") {
-        Err(_) => Ok(fl_github::DEFAULT_API.to_string()),
-        Ok(url) => {
+    resolve_api_url_with(&|k| std::env::var(k).ok())
+}
+
+fn resolve_api_url_with(get: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    match get("FL_GITHUB_API_URL") {
+        None => Ok(fl_github::DEFAULT_API.to_string()),
+        Some(url) => {
             let _ = crate::api_override_host(&url)?;
             Ok(url)
         }
@@ -114,19 +118,29 @@ fn reviewer_client(
     binding: Option<&config::TrackerBinding>,
     github_app: Option<&config::GithubApp>,
 ) -> Result<Option<Client>> {
+    reviewer_client_with(&gh.repo().full_name, binding, github_app, &|k| {
+        std::env::var(k).ok()
+    })
+}
+
+/// [`reviewer_client`] with the environment passed in and the repository named.
+fn reviewer_client_with(
+    repo: &str,
+    binding: Option<&config::TrackerBinding>,
+    github_app: Option<&config::GithubApp>,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<Client>> {
     if binding.is_some_and(|b| b.credential == config::Credential::App) {
         return Ok(None);
     }
 
-    let env_app_id = std::env::var("FL_GITHUB_APP_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let env_key_path = std::env::var("FL_GITHUB_PRIVATE_KEY_PATH")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let nonblank = |k: &str| get(k).filter(|s| !s.trim().is_empty());
+    let env_app_id = nonblank("FL_GITHUB_APP_ID");
+    let env_key_path = nonblank("FL_GITHUB_PRIVATE_KEY_PATH");
 
     // A `private_key_ref` beside the variable is ambiguous, whatever else is set.
     crate::config::refuse_env_key_path_with_ref(github_app, env_key_path.is_some())?;
+    let api = resolve_api_url_with(get)?;
     let (app_id, signer): (u64, Arc<dyn JwtSigner>) = match (env_app_id, env_key_path) {
         (Some(raw_id), Some(raw_path)) => {
             let id: u64 = raw_id
@@ -141,7 +155,12 @@ fn reviewer_client(
         _ => match github_app {
             Some(app) => (
                 app.app_id,
-                crate::gate_signer::signer_for(app, &crate::gate_signer::cli_caller())?,
+                // The JWT goes to `api`: the Vault is asked about that host.
+                crate::gate_signer::signer_for(
+                    app,
+                    &crate::gate_signer::cli_caller(),
+                    &crate::gate_signer::api_host(&api)?,
+                )?,
             ),
             None => bail!(
                 "agent pull-request review and merge require a GitHub App (`[github]` with \
@@ -151,8 +170,7 @@ fn reviewer_client(
         },
     };
 
-    let api = resolve_api_url()?;
-    let creds = AppCredentials::with_signer(&api, app_id, signer, &gh.repo().full_name);
+    let creds = AppCredentials::with_signer(&api, app_id, signer, repo);
     Ok(Some(Client::new(&api, Box::new(creds))))
 }
 
@@ -549,7 +567,16 @@ pub fn run(
                     &formatted_body,
                 )?
             } else {
-                let owned_app = reviewer_client(gh, binding, github_app).ok().flatten();
+                // A comment review falls back to the tracker's own client when no Reviewer App is
+                // configured. A `private_key_ref` is a configured App: whatever refuses it (the
+                // key variable beside it, a bad API URL) is reported, never hidden by the fallback.
+                let owned_app = match reviewer_client(gh, binding, github_app) {
+                    Ok(app) => app,
+                    Err(e) if github_app.is_some_and(|a| a.private_key_ref.is_some()) => {
+                        return Err(e);
+                    }
+                    Err(_) => None,
+                };
                 let client = owned_app.as_ref().unwrap_or_else(|| gh.client());
                 submit_pr_review(
                     client,
@@ -857,5 +884,73 @@ mod tests {
             resolve_author_token_with(|_| Some(" ".into()), || Some("\n".into())),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_client_tests {
+    use super::*;
+
+    fn app(key: Option<&str>, key_ref: Option<&str>) -> config::GithubApp {
+        config::GithubApp {
+            app_id: 42,
+            private_key: key.map(PathBuf::from),
+            private_key_ref: key_ref.map(str::to_string),
+            reviewer_ids: None,
+            reviewer_logins: None,
+        }
+    }
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn the_reviewer_client_refuses_the_key_variable_beside_a_private_key_ref() {
+        let with_ref = app(None, Some("vault://APP_KEY"));
+        // The variable alone, or with the App id: ambiguous either way.
+        for pairs in [
+            &[("FL_GITHUB_PRIVATE_KEY_PATH", "/env/key.pem")][..],
+            &[
+                ("FL_GITHUB_APP_ID", "9"),
+                ("FL_GITHUB_PRIVATE_KEY_PATH", "/env/key.pem"),
+            ][..],
+        ] {
+            let err = reviewer_client_with("a/b", None, Some(&with_ref), &env(pairs))
+                .err()
+                .expect("refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("FL_GITHUB_PRIVATE_KEY_PATH") && msg.contains("private_key_ref"),
+                "{msg}"
+            );
+        }
+        // A blank variable is unset; with a ref the client is built, and opens no Vault.
+        let ok = reviewer_client_with(
+            "a/b",
+            None,
+            Some(&with_ref),
+            &env(&[("FL_GITHUB_PRIVATE_KEY_PATH", "  ")]),
+        );
+        assert!(ok.unwrap().is_some());
+    }
+
+    #[test]
+    fn a_non_github_api_url_reaches_the_vault_as_that_host() {
+        // The ref's signer is told the host of the API the JWT will go to. A URL that is not
+        // https or loopback is refused before any signer is built.
+        let with_ref = app(None, Some("vault://APP_KEY"));
+        let bad = reviewer_client_with(
+            "a/b",
+            None,
+            Some(&with_ref),
+            &env(&[("FL_GITHUB_API_URL", "http://evil.example")]),
+        );
+        assert!(bad.is_err());
     }
 }

@@ -332,9 +332,15 @@ fn hub_github(
                 crate::config::AppKey::File(path) => (Some(app.app_id), Some(path)),
                 // The Vault is opened when a JWT is signed, never here.
                 crate::config::AppKey::Vault(r) => {
+                    // The host the Hub sends the JWT to: its API URL's, else GitHub's.
+                    let host = crate::gate_signer::api_host(
+                        api_url.as_deref().unwrap_or(fl_github::DEFAULT_API),
+                    )
+                    .map_err(|e| (2, e.to_string()))?;
                     signer = Some(Arc::new(crate::gate_signer::BrokeredSigner::new(
                         r,
                         crate::gate_signer::HUB_CALLER,
+                        host,
                     )) as Arc<dyn fl_github::JwtSigner>);
                     (Some(app.app_id), None)
                 }
@@ -1537,7 +1543,7 @@ mod tests {
         assert!(g.signer.is_some());
         assert_eq!(g.private_key, None, "no fallback key file");
         assert!(format!("{g:?}").contains("<set>"));
-        // The environment pair still replaces `[github]`, with no signer.
+        // `$FL_GITHUB_APP_ID` alone does not replace `[github]`: the key still comes from the ref.
         let env = |k: &str| match k {
             "FL_GITHUB_APP_ID" => Some("9".to_string()),
             _ => None,
