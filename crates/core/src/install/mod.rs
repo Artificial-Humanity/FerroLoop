@@ -282,7 +282,7 @@ pub(crate) const MAX_NAME_LEN: usize = 80;
 /// A single file name or identifier: `[A-Za-z0-9._+@-]`, at most 80 bytes, never
 /// `.` or `..`, never starting with `-`. No separator and no NUL can pass, so a
 /// name joined onto a directory stays inside it.
-pub(crate) fn file_name_ok(s: &str) -> bool {
+pub fn file_name_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_NAME_LEN
         && s != "."
@@ -293,7 +293,7 @@ pub(crate) fn file_name_ok(s: &str) -> bool {
 }
 
 /// A lowercase 64-digit hex SHA-256.
-pub(crate) fn is_sha256_hex(s: &str) -> bool {
+pub fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 

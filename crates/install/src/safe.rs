@@ -73,6 +73,18 @@ fn canonicalise_existing_prefix(p: &Path) -> Result<PathBuf> {
     Ok(canon)
 }
 
+/// Create ONE directory with exactly `mode`: created with that mode (so it is never briefly
+/// wider), then set on the descriptor, because the umask only ever removes bits.
+pub fn make_dir(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    fs::DirBuilder::new().mode(mode).create(path)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)?
+        .set_permissions(fs::Permissions::from_mode(mode))
+}
+
 impl Safe {
     /// `declared_root` is where this install may write (`--prefix`, `$FL_INSTALL_ROOT`, or
     /// `$HOME`). `home` is what a leading `~/` expands to.
@@ -184,6 +196,12 @@ impl Safe {
     /// chain. Returns the directories it created, outermost first. A directory that already
     /// exists is left alone.
     pub fn ensure_dir(&self, dir: &Path) -> Result<Vec<PathBuf>> {
+        self.ensure_dir_mode(dir, 0o755)
+    }
+
+    /// [`Self::ensure_dir`] with an exact mode for every directory it creates, whatever the
+    /// process umask is.
+    pub fn ensure_dir_mode(&self, dir: &Path, mode: u32) -> Result<Vec<PathBuf>> {
         self.check_chain(&dir.join("x"))?; // checks every component of `dir` itself
         if !dir.starts_with(&self.canonical) {
             return Err(InstallError::refused(format!(
@@ -215,7 +233,7 @@ impl Safe {
                     )));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    match fs::create_dir(&cur) {
+                    match make_dir(&cur, mode) {
                         Ok(()) => created.push(cur.clone()),
                         // Raced with another installer: it is a directory now or it is not.
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -429,7 +429,6 @@ fn a_reader_always_sees_a_complete_release_through_current_during_flips() {
         .map(|_| {
             let (cur, stop, seen) = (cur.clone(), stop.clone(), seen.clone());
             std::thread::spawn(move || {
-                let mut reads = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     // `current` always exists, and everything behind it is complete.
                     let target = fs::read_link(&cur).expect("current never disappears");
@@ -444,21 +443,27 @@ fn a_reader_always_sees_a_complete_release_through_current_during_flips() {
                         .unwrap()
                         .insert(target.to_string_lossy().into_owned());
                     let _ = v;
-                    reads += 1;
                 }
-                reads
             })
         })
         .collect();
-    for m in ms.iter().skip(1).cycle().take(10) {
+    // Flip until a reader has seen two different releases (bounded by time, not by a count of
+    // reads: a slow machine only takes longer). A reader that sees an inconsistent release
+    // panics, which fails the join below.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for m in ms.iter().skip(1).cycle() {
         w.install(m);
+        if seen.lock().unwrap().len() >= 2 || std::time::Instant::now() >= deadline {
+            break;
+        }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let reads: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
-    assert!(reads > 10, "the readers actually ran ({reads})");
+    for h in readers {
+        h.join().expect("a reader saw an inconsistent release");
+    }
     assert!(
         seen.lock().unwrap().len() >= 2,
-        "the readers saw the switch"
+        "at least one switch was observed"
     );
 }
 
@@ -1680,4 +1685,324 @@ fn the_selected_release_cannot_be_replaced_while_it_is_selected() {
     assert_eq!(e.exit_code(), 3, "{e}");
     assert!(e.to_string().contains("selected"), "{e}");
     assert_eq!(w.snap(), pre);
+}
+
+// -------------------------------------------------- forged journals (security)
+
+/// Crash a fresh install right after `begin`, then rewrite the journal: `edit` changes the
+/// intent, and a `stage` and a `publish` line are appended so an undo would act on the release.
+fn forged_world(edit: &dyn Fn(&mut serde_json::Value, &World)) -> World {
+    let w = World::new(Kind::Explicit);
+    let m = w.release("0.1.0", "a");
+    let e = w
+        .install_faulty(
+            &m,
+            &Decisions::default(),
+            Faults::crash(FaultPoint::after(Step::Begin)),
+        )
+        .unwrap_err();
+    assert!(matches!(e, InstallError::Crashed(_)));
+    let jp = w.prefix().join("journal.jsonl");
+    let text = fs::read_to_string(&jp).unwrap();
+    let mut first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    edit(&mut first["intent"], &w);
+    let mut out = format!("{first}\n");
+    for (seq, op) in [(1, "stage"), (2, "publish")] {
+        out.push_str(&format!(
+            "{{\"v\":1,\"txn\":1,\"seq\":{seq},\"op\":\"{op}\"}}\n"
+        ));
+    }
+    fs::write(&jp, out).unwrap();
+    // sentinels: one outside the root, one inside the root but outside releases/
+    fs::create_dir_all(w.base.path().join("outside")).unwrap();
+    fs::write(w.prefix().join("sentinel"), "keep me").unwrap();
+    w
+}
+
+#[test]
+fn a_forged_but_parseable_journal_is_refused_and_touches_nothing() {
+    type Edit = fn(&mut serde_json::Value, &World);
+    let root = |w: &World| w.root().to_string_lossy().into_owned();
+    let _ = root;
+    let cases: Vec<(&str, Edit)> = vec![
+        ("empty release name", |i, _| {
+            i["release"]["name"] = "".into();
+            i["release"]["version"] = "".into();
+        }),
+        ("release name ..", |i, _| i["release"]["name"] = "..".into()),
+        ("release name ../x", |i, _| {
+            i["release"]["name"] = "../x".into()
+        }),
+        ("release name absolute", |i, _| {
+            i["release"]["name"] = "/tmp/x".into()
+        }),
+        ("release name leading dash", |i, _| {
+            i["release"]["name"] = "-rf".into()
+        }),
+        ("release name unrelated to its version", |i, _| {
+            i["release"]["name"] = "9.9.9+aaaaaaaaaaaa".into()
+        }),
+        ("created dir with ..", |i, w| {
+            i["created_dirs"] = serde_json::json!([format!("{}/../outside", w.root().display())]);
+        }),
+        ("created dir outside the root", |i, w| {
+            i["created_dirs"] = serde_json::json!([w.base.path().join("outside")]);
+        }),
+        ("created dir relative", |i, _| {
+            i["created_dirs"] = serde_json::json!(["outside"]);
+        }),
+        ("launcher outside the root", |i, w| {
+            i["launcher"] = serde_json::json!({
+                "name": "fl",
+                "path": w.base.path().join("outside/fl"),
+                "target": "x", "write": true
+            });
+        }),
+        ("launcher over the receipt", |i, w| {
+            i["launcher"] = serde_json::json!({
+                "name": "fl",
+                "path": w.prefix().join("receipt.json"),
+                "target": "x", "write": true
+            });
+        }),
+        ("alias named with a slash", |i, w| {
+            i["aliases"] = serde_json::json!([{
+                "name": "../x",
+                "path": format!("{}/../x", w.bin().display()),
+                "target": "fl", "write": true
+            }]);
+        }),
+        ("backup out of the backups directory", |i, w| {
+            i["backups"] = serde_json::json!([{
+                "path": w.prefix().join("sentinel"),
+                "to": w.prefix().join("releases"),
+                "kind": "file", "sha256": "a".repeat(64)
+            }]);
+        }),
+        ("layout of another install", |i, _| {
+            i["layout"]["prefix"] = "/somewhere/else".into()
+        }),
+        ("file path escaping the release", |i, _| {
+            i["files"] = serde_json::json!([{
+                "path": "../evil", "sha256": "a".repeat(64), "size": 1, "exec": false
+            }]);
+        }),
+        ("previous current outside releases", |i, _| {
+            i["prev_current"] = "../../x".into()
+        }),
+    ];
+    for (name, edit) in cases {
+        let w = forged_world(&edit);
+        let before = w.snap();
+        for what in ["resume", "rollback", "apply"] {
+            let e = match what {
+                "resume" => recover(&w.env(), &w.layout(), RecoverMode::Auto).unwrap_err(),
+                "rollback" => recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap_err(),
+                _ => w
+                    .apply_with(
+                        &w.release("0.1.0", "a"),
+                        None,
+                        &Decisions::default(),
+                        &w.env(),
+                    )
+                    .unwrap_err(),
+            };
+            assert_eq!(e.exit_code(), 3, "{name} / {what}: {e}");
+            assert!(
+                e.to_string().contains("not valid") || e.to_string().contains("different layout"),
+                "{name} / {what}: {e}"
+            );
+            assert_eq!(w.snap(), before, "{name} / {what} touched the disk");
+        }
+        assert_eq!(
+            fs::read_to_string(w.prefix().join("sentinel")).unwrap(),
+            "keep me",
+            "{name}"
+        );
+        assert!(w.base.path().join("outside").is_dir(), "{name}");
+        assert!(w.prefix().join("releases").is_dir(), "{name}");
+    }
+}
+
+#[test]
+fn a_genuine_journal_still_recovers_after_validation() {
+    // The same forging helper with no change: the journal is the real one plus two lines the
+    // installer itself writes, so it is valid and the undo runs.
+    let w = forged_world(&|_, _| {});
+    let rep = recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+    assert_eq!(rep.action, RecoverAction::RolledBack);
+    assert_eq!(
+        fs::read_to_string(w.prefix().join("sentinel")).unwrap(),
+        "keep me"
+    );
+}
+
+// ------------------------------------------------ a release dir that is not ours
+
+#[test]
+fn a_refused_publish_never_deletes_a_release_directory_that_is_not_ours() {
+    let w = World::new(Kind::Explicit);
+    w.install(&w.release("0.1.0", "first"));
+    let pre = w.snap();
+    let m2 = w.release("0.2.0", "second");
+    let name2 = fixture::release_name(&m2);
+    let e = w
+        .install_faulty(
+            &m2,
+            &Decisions::default(),
+            Faults::crash(FaultPoint::before(Step::Publish)),
+        )
+        .unwrap_err();
+    assert!(matches!(e, InstallError::Crashed(_)));
+    // After planning, somebody creates the directory the publish would rename onto.
+    let foreign = w.prefix().join("releases").join(&name2);
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("theirs"), "not yours").unwrap();
+    let rep = recover(&w.env(), &w.layout(), RecoverMode::Auto).unwrap();
+    assert_eq!(rep.action, RecoverAction::RolledBack, "{rep:?}");
+    assert_eq!(
+        fs::read_to_string(foreign.join("theirs")).unwrap(),
+        "not yours"
+    );
+    assert!(
+        !w.prefix().join("releases/.stage-2").exists(),
+        "the stage goes"
+    );
+    let mut after = w.snap();
+    after.remove(&format!("prefix/releases/{name2}"));
+    after.remove(&format!("prefix/releases/{name2}/theirs"));
+    assert_eq!(after, pre, "everything else is the pre-state");
+    // The old release is still the selected one.
+    assert!(w.prefix().join("current/bin/fl").is_file());
+}
+
+#[test]
+fn a_rollback_that_finds_its_own_published_release_removes_it() {
+    let w = World::new(Kind::Explicit);
+    w.install(&w.release("0.1.0", "first"));
+    let pre = w.snap();
+    let m2 = w.release("0.2.0", "second");
+    for point in [
+        FaultPoint::after(Step::Publish),
+        FaultPoint::before(Step::LinkCurrent),
+    ] {
+        let e = w
+            .install_faulty(&m2, &Decisions::default(), Faults::crash(point))
+            .unwrap_err();
+        assert!(matches!(e, InstallError::Crashed(_)));
+        recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+        assert_eq!(w.snap(), pre, "{point}");
+    }
+}
+
+// ------------------------------------------------------ hostile pre-existing paths
+
+fn outside() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    fs::write(d.path().join("precious"), "outside the root").unwrap();
+    d
+}
+
+fn untouched(d: &tempfile::TempDir) {
+    assert_eq!(
+        fs::read_dir(d.path()).unwrap().count(),
+        1,
+        "something was written outside the root"
+    );
+    assert_eq!(
+        fs::read_to_string(d.path().join("precious")).unwrap(),
+        "outside the root"
+    );
+}
+
+#[test]
+fn a_hostile_current_is_refused_and_replaced_without_following_it() {
+    for as_link in [true, false] {
+        let out = outside();
+        let w = World::new(Kind::Explicit);
+        fs::create_dir_all(w.prefix()).unwrap();
+        let cur = w.prefix().join("current");
+        if as_link {
+            symlink(out.path(), &cur).unwrap();
+        } else {
+            fs::create_dir(&cur).unwrap();
+            fs::write(cur.join("theirs"), "a real directory").unwrap();
+        }
+        let m = w.release("0.1.0", "a");
+        let pre = w.snap();
+        let e = w
+            .apply_with(&m, None, &Decisions::default(), &w.env())
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{e}");
+        assert_eq!(w.snap(), pre);
+        untouched(&out);
+        let d = Decisions {
+            replace: vec![cur.to_string_lossy().into_owned()],
+            keep: vec![],
+        };
+        w.apply_with(&m, None, &d, &w.env()).unwrap();
+        untouched(&out);
+        let backup = w.prefix().join("backups/1/current-current");
+        if as_link {
+            assert_eq!(fs::read_link(&backup).unwrap(), out.path());
+        } else {
+            assert_eq!(
+                fs::read_to_string(backup.join("theirs")).unwrap(),
+                "a real directory"
+            );
+        }
+        assert!(w.prefix().join("current/bin/fl").is_file());
+    }
+}
+
+#[test]
+fn a_hostile_release_directory_is_refused_and_replaced_without_following_it() {
+    let out = outside();
+    let w = World::new(Kind::Explicit);
+    let m = w.release("0.1.0", "a");
+    let rel = w.prefix().join("releases").join(fixture::release_name(&m));
+    fs::create_dir_all(w.prefix().join("releases")).unwrap();
+    symlink(out.path(), &rel).unwrap();
+    let pre = w.snap();
+    let e = w
+        .apply_with(&m, None, &Decisions::default(), &w.env())
+        .unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert_eq!(w.snap(), pre);
+    untouched(&out);
+    let d = Decisions {
+        replace: vec![rel.to_string_lossy().into_owned()],
+        keep: vec![],
+    };
+    w.apply_with(&m, None, &d, &w.env()).unwrap();
+    untouched(&out);
+    assert!(
+        rel.join("bin/fl").is_file()
+            && !fs::symlink_metadata(&rel).unwrap().file_type().is_symlink()
+    );
+}
+
+#[test]
+fn a_hostile_staging_name_is_refused_not_written_through() {
+    for as_link in [true, false] {
+        let out = outside();
+        let w = World::new(Kind::Explicit);
+        fs::create_dir_all(w.prefix().join("releases")).unwrap();
+        let stage = w.prefix().join("releases/.stage-1");
+        if as_link {
+            symlink(out.path(), &stage).unwrap();
+        } else {
+            fs::create_dir(&stage).unwrap();
+        }
+        let pre = w.snap();
+        let m = w.release("0.1.0", "a");
+        let e = w
+            .apply_with(&m, None, &Decisions::default(), &w.env())
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{e}");
+        assert!(e.to_string().contains("no journal owns it"), "{e}");
+        untouched(&out);
+        // the lock file this attempt made is removed again; everything else is as it was
+        assert_eq!(w.snap(), pre);
+    }
 }

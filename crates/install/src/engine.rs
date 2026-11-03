@@ -26,14 +26,15 @@ use fl_core::install::{
     InstallRequest, IntentFile, JournalOp, Layout, LinkSpec, MAX_RECEIPT_BYTES, Origin,
     OwnedArtifact, OwnedPathKind, PathRole, PathState, PlannedPath, RELEASE_JSON, ReceiptLayout,
     ReceiptRelease, ReleaseKind, ReleaseManifest, Retention, Step, TxnIntent, build_receipt,
-    has_committed, next_txn, plan, release_json, retention, sha256_hex,
+    file_name_ok, has_committed, is_sha256_hex, next_txn, plan, rel_path_problem, release_json,
+    retention, sha256_hex,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 /// How long an installer waits for `install.lock` by default.
@@ -730,7 +731,7 @@ impl Run<'_> {
             )));
         }
         self.safe
-            .ensure_dir(to.parent().expect("backup has a parent"))?;
+            .ensure_dir_mode(to.parent().expect("backup has a parent"), 0o700)?;
         rename_keeping_mode(&from, &to).map_err(|e| {
             InstallError::io(
                 format!(
@@ -750,7 +751,8 @@ impl Run<'_> {
 
     fn do_stage(&self, source: &Source) -> Result<()> {
         let stage = self.paths.stage(self.txn);
-        fs::create_dir(&stage).ctx(|| format!("cannot create {}", stage.display()))?;
+        crate::safe::make_dir(&stage, 0o700)
+            .ctx(|| format!("cannot create {}", stage.display()))?;
         let mut made: BTreeSet<PathBuf> = BTreeSet::new();
         made.insert(stage.clone());
         for (i, f) in self.intent.files.iter().enumerate() {
@@ -770,7 +772,8 @@ impl Run<'_> {
             }
             for d in ancestors.into_iter().rev() {
                 if made.insert(d.clone()) {
-                    fs::create_dir(&d).ctx(|| format!("cannot create {}", d.display()))?;
+                    crate::safe::make_dir(&d, 0o700)
+                        .ctx(|| format!("cannot create {}", d.display()))?;
                 }
             }
             if f.path == RELEASE_JSON {
@@ -801,7 +804,20 @@ impl Run<'_> {
                 "neither the staged nor the published release exists",
             ));
         };
-        let found = tree::read_staged(&dir)?;
+        // A staged tree is sealed through open descriptors (`fchmod`, no path-following
+        // chmod) and the SEALED files are what gets hashed; a published one is only read.
+        let exec: BTreeSet<&str> = self
+            .intent
+            .files
+            .iter()
+            .filter(|f| f.exec)
+            .map(|f| f.path.as_str())
+            .collect();
+        let found = if sealed {
+            tree::read_staged(&dir)?
+        } else {
+            tree::seal_and_read(&dir, &|rel| exec.contains(rel))?
+        };
         let want: BTreeMap<&str, (&str, u64)> = self
             .intent
             .files
@@ -827,16 +843,6 @@ impl Run<'_> {
             if !found.contains_key(*p) {
                 return Err(InstallError::refused(format!("staged tree lacks `{p}`")));
             }
-        }
-        if !sealed {
-            let exec: BTreeSet<&str> = self
-                .intent
-                .files
-                .iter()
-                .filter(|f| f.exec)
-                .map(|f| f.path.as_str())
-                .collect();
-            tree::seal(&dir, &|rel| exec.contains(rel))?;
         }
         Ok(())
     }
@@ -978,10 +984,21 @@ impl Run<'_> {
 
     fn undo_release(&self, p: &Pending) -> Result<()> {
         let announced = |s: Step| p.announced(|o| o.step() == Some(s));
+        let stage = self.paths.stage(self.txn);
+        let stage_present = lstat(&stage)?.is_some();
         if announced(Step::Stage) || announced(Step::Publish) {
-            tree::remove_tree(&self.paths.stage(self.txn))?;
+            tree::remove_tree(&stage)?;
         }
-        if announced(Step::Publish) && !self.intent.release_existed {
+        // `releases/<name>` is removed only when THIS transaction put it there: the journal
+        // says the rename happened, or the publish was announced, the staging directory is
+        // gone and no undo has begun (a crash between the rename and its journal line). A
+        // directory that appeared while the staging directory still exists is somebody
+        // else's (the publish was refused), and an earlier undo may already have removed the
+        // staging directory, so then it is left alone too.
+        let published = p.announced(|o| *o == JournalOp::Published);
+        let undo_begun = p.announced(|o| *o == JournalOp::RollbackBegin);
+        let renamed_unrecorded = announced(Step::Publish) && !undo_begun && !stage_present;
+        if !self.intent.release_existed && (published || renamed_unrecorded) {
             tree::remove_tree(&self.release_path())?;
         }
         Ok(())
@@ -1148,6 +1165,9 @@ impl Tx<'_> {
                 Step::Publish => {
                     self.announce(step, JournalOp::Publish)?;
                     self.run.do_publish()?;
+                    // From here the directory at `releases/<name>` is this transaction's.
+                    self.journal.append(JournalOp::Published)?;
+                    self.announced.push(JournalOp::Published);
                     self.finished(step)?;
                 }
                 Step::LinkCurrent => {
@@ -1202,6 +1222,95 @@ impl Tx<'_> {
 
 // --------------------------------------------------------------- recovery
 
+/// Refuse (exit 3, nothing touched) a journal intent that is not exactly what this installer
+/// writes for THIS layout: it names the directories it removes and the links it moves, so a
+/// forged or damaged journal must not be able to name anything else.
+fn validate_intent(i: &TxnIntent, safe: &Safe, paths: &Paths, layout: &Layout) -> Result<()> {
+    let bad = |what: String| {
+        InstallError::refused(format!(
+            "the journal {} is not valid ({what}); nothing was touched. Inspect it, then remove \
+             it by hand only after checking what the interrupted install left",
+            paths.journal.display()
+        ))
+    };
+    if i.layout.prefix != layout.prefix
+        || i.layout.bin_dir != layout.bin_dir
+        || i.layout.unit_dir != layout.unit_dir
+    {
+        return Err(InstallError::refused(format!(
+            "the journal {} belongs to a different layout (prefix {}); nothing was touched",
+            paths.journal.display(),
+            i.layout.prefix
+        )));
+    }
+    if !file_name_ok(&i.release.name) || !file_name_ok(&i.release.version) {
+        return Err(bad(format!(
+            "release name `{}` is not a plain name",
+            i.release.name.chars().take(60).collect::<String>()
+        )));
+    }
+    if !i
+        .release
+        .name
+        .starts_with(&format!("{}+", i.release.version))
+    {
+        return Err(bad("release name does not extend its version".into()));
+    }
+    for f in &i.files {
+        if let Some(why) = rel_path_problem(&f.path) {
+            return Err(bad(format!("file path `{}` {why}", f.path)));
+        }
+        if !is_sha256_hex(&f.sha256) {
+            return Err(bad(format!("file `{}` has a bad hash", f.path)));
+        }
+    }
+    let plain = |s: &str| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control);
+    for d in &i.created_dirs {
+        let p = Path::new(d);
+        let normal = p.is_absolute()
+            && p.components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+        if !normal || !p.starts_with(safe.canonical_root()) {
+            return Err(bad(format!("created directory `{d}` is outside the root")));
+        }
+    }
+    for (l, want) in std::iter::once((i.launcher.as_ref(), "fl"))
+        .chain(i.aliases.iter().map(|a| (Some(a), a.name.as_str())))
+    {
+        let Some(l) = l else { continue };
+        if !file_name_ok(&l.name)
+            || l.name != want
+            || l.path != shown_join(&layout.bin_dir, &l.name)
+            || !plain(&l.target)
+            || l.prev.as_deref().is_some_and(|p| !plain(p))
+        {
+            return Err(bad(format!(
+                "link `{}` is not in the launcher directory",
+                l.path.chars().take(80).collect::<String>()
+            )));
+        }
+        safe.resolve(&l.path)
+            .map_err(|_| bad(format!("link `{}` is outside the root", l.path)))?;
+    }
+    let backups_dir = shown_join(&layout.prefix, "backups/");
+    for b in &i.backups {
+        let inside = |s: &str| safe.resolve(s).is_ok();
+        if !inside(&b.path) || !inside(&b.to) || !b.to.starts_with(&backups_dir) {
+            return Err(bad(format!(
+                "backup `{}` is outside the root or the backups directory",
+                b.to.chars().take(80).collect::<String>()
+            )));
+        }
+    }
+    if let Some(prev) = &i.prev_current {
+        let ok = prev.strip_prefix("releases/").is_some_and(file_name_ok);
+        if !ok {
+            return Err(bad("previous `current` is not a release".into()));
+        }
+    }
+    Ok(())
+}
+
 /// How `--resume` treats an interrupted transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverMode {
@@ -1215,6 +1324,7 @@ fn recover_locked(
     env: &Env,
     safe: &Safe,
     paths: &Paths,
+    layout: &Layout,
     mode: RecoverMode,
     guard: &LockGuard,
     final_tail: bool,
@@ -1248,6 +1358,8 @@ fn recover_locked(
         }
         Found::Pending(p) => p,
     };
+    // The intent was read back from a file: nothing in it is used before it is checked.
+    validate_intent(&p.intent, safe, paths, layout)?;
     let run = Run {
         env,
         safe,
@@ -1328,7 +1440,7 @@ pub fn recover(env: &Env, layout: &Layout, mode: RecoverMode) -> Result<RecoverR
         return Ok(RecoverReport::nothing());
     }
     let guard = lock::acquire(&paths.lock, env.lock_timeout, || Ok(()))?;
-    recover_locked(env, &safe, &paths, mode, &guard, true)
+    recover_locked(env, &safe, &paths, layout, mode, &guard, true)
 }
 
 // ------------------------------------------------------------------ apply
@@ -1764,7 +1876,15 @@ fn apply_locked(
     }
     // An interrupted transaction is finished or undone before anything else happens.
     let recovered = {
-        let r = recover_locked(env, safe, paths, RecoverMode::Auto, guard, false)?;
+        let r = recover_locked(
+            env,
+            safe,
+            paths,
+            &args.request.layout,
+            RecoverMode::Auto,
+            guard,
+            false,
+        )?;
         (r.action != RecoverAction::NothingToDo).then_some(r)
     };
 

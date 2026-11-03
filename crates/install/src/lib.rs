@@ -11,6 +11,12 @@
 //!   append-only journal, staged and verified releases, an atomic switch of `current`, the
 //!   launcher and aliases, and the receipt written last; see `docs/installer.md`.
 
+// The crash seam reads FL_INSTALL_FAULT. It exists for test builds (debug assertions on); an
+// optimized build with it enabled is refused at compile time. Build releases with
+// `cargo build --release --locked -p fl-cli`, never with `--all-targets` or `--tests`.
+#[cfg(all(feature = "fault-injection", not(debug_assertions)))]
+compile_error!("the `fault-injection` feature must not be enabled in a release build");
+
 mod engine;
 mod error;
 mod fault;

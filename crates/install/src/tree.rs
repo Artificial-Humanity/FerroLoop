@@ -47,6 +47,11 @@ pub fn hash_file(path: &Path, limit: u64) -> Result<(String, u64)> {
 
 fn hash_file_as(path: &Path, limit: u64, shown: &str) -> Result<(String, u64)> {
     let f = open_nofollow(path).ctx(|| format!("cannot open {}", path.display()))?;
+    hash_open(f, path, limit, shown)
+}
+
+/// Hash an already opened file (checked with `fstat` to be a regular file).
+fn hash_open(f: File, path: &Path, limit: u64, shown: &str) -> Result<(String, u64)> {
     let meta = f
         .metadata()
         .ctx(|| format!("cannot stat {}", path.display()))?;
@@ -265,10 +270,21 @@ pub fn read_staged(root: &Path) -> Result<BTreeMap<String, (String, u64)>> {
     Ok(out)
 }
 
-/// Make the staged tree read-only: files `0555` (binaries) or `0444`, directories `0555`,
-/// children before parents.
-pub fn seal(root: &Path, exec: &dyn Fn(&str) -> bool) -> Result<()> {
-    fn walk(dir: &Path, rel: &str, exec: &dyn Fn(&str) -> bool) -> Result<()> {
+/// Make the staged tree read-only (files `0555` for binaries, else `0444`; directories
+/// `0555`; children before parents) and return what the SEALED files hold: relative path to
+/// (hash, size). Every file and directory is opened without following a symlink and changed
+/// with `fchmod` on that descriptor, and a file is hashed through the same descriptor, so
+/// nothing swapped in at a path can be chmodded or hashed in place of a staged file.
+pub fn seal_and_read(
+    root: &Path,
+    exec: &dyn Fn(&str) -> bool,
+) -> Result<BTreeMap<String, (String, u64)>> {
+    fn walk(
+        dir: &Path,
+        rel: &str,
+        exec: &dyn Fn(&str) -> bool,
+        out: &mut BTreeMap<String, (String, u64)>,
+    ) -> Result<()> {
         for e in fs::read_dir(dir).ctx(|| format!("cannot read {}", dir.display()))? {
             let e = e.ctx(|| format!("cannot read {}", dir.display()))?;
             let name = e.file_name().to_string_lossy().into_owned();
@@ -281,17 +297,31 @@ pub fn seal(root: &Path, exec: &dyn Fn(&str) -> bool) -> Result<()> {
             let m =
                 fs::symlink_metadata(&path).ctx(|| format!("cannot inspect {}", path.display()))?;
             if m.is_dir() {
-                walk(&path, &child, exec)?;
+                walk(&path, &child, exec, out)?;
             } else if m.is_file() {
+                let f = open_nofollow(&path).ctx(|| format!("cannot open {}", path.display()))?;
                 let mode = if exec(&child) { 0o555 } else { 0o444 };
-                fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                f.set_permissions(fs::Permissions::from_mode(mode))
                     .ctx(|| format!("cannot seal {}", path.display()))?;
+                let (sha, size) = hash_open(f, &path, u64::MAX / 2, &child)?;
+                out.insert(child, (sha, size));
+            } else {
+                return Err(InstallError::refused(format!(
+                    "staged path `{child}` is a symlink or special file"
+                )));
             }
         }
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o555))
+        let d = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(dir)
+            .ctx(|| format!("cannot open {}", dir.display()))?;
+        d.set_permissions(fs::Permissions::from_mode(0o555))
             .ctx(|| format!("cannot seal {}", dir.display()))
     }
-    walk(root, "", exec)
+    let mut out = BTreeMap::new();
+    walk(root, "", exec, &mut out)?;
+    Ok(out)
 }
 
 /// Make every directory under `root` writable again, without following a symlink, so the
@@ -428,9 +458,11 @@ mod tests {
     fn sealing_makes_a_tree_read_only_and_removal_still_works() {
         let d = tree();
         let root = d.path().join("ui");
-        seal(&root, &|_| false).unwrap();
+        let sealed = seal_and_read(&root, &|rel| rel == "dist/index.html").unwrap();
+        assert_eq!(sealed.len(), 2);
+        assert_eq!(mode_of(&root.join("dist/index.html")).unwrap(), 0o555);
         assert_eq!(mode_of(&root).unwrap(), 0o555);
-        assert_eq!(mode_of(&root.join("dist/index.html")).unwrap(), 0o444);
+        assert_eq!(mode_of(&root.join("dist/assets/a.js")).unwrap(), 0o444);
         assert!(fs::write(root.join("dist/new"), "x").is_err());
         remove_tree(&root).unwrap();
         assert!(!root.exists());

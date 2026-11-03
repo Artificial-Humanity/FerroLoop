@@ -171,7 +171,9 @@ checks it as a link, and one `rename(2)` of `current` moves the launcher, the al
 reader at once. The cost is that `current_exe()` resolves through the links to the versioned
 path, so a generated command never uses `current_exe()`; it names `<bin_dir>/fl`. A link target
 is written with `~` expanded (a symlink cannot hold `~`); the receipt holds the real target.
-Release directories and files are sealed (`0555` binaries and directories, `0444` files).
+Release directories and files are sealed (`0555` binaries and directories, `0444` files). The
+installer creates the prefix, `releases/` and the launcher directory `0755` and `backups/` and
+staging directories `0700`, whatever the umask.
 
 **Steps.** One journal line is written and flushed BEFORE each step runs.
 
@@ -240,6 +242,23 @@ and the result may not be `/` or inside a system tree (`/usr`, `/etc`, `/bin`, `
 symlink the installer did not create (only `$HOME` may be a link). Nothing outside the root is
 created, written or removed.
 
+**Journal checks.** `journal.jsonl` is read back from disk, so nothing in it is trusted before it
+is checked: the release name is a plain file name that extends its version, every file path
+passes the in-release path rules, every created directory and link is absolute, normalised and
+under the declared root (links sit in the launcher directory), backups sit under
+`<prefix>/backups/`, and the layout in the journal equals the layout of this run. A journal
+that fails any check is refused with exit 3 and nothing is touched. A release directory is
+removed by an undo only when the journal records that this transaction renamed the staging
+directory onto it (`published`), or the staging directory is gone with no undo begun; a
+directory that appeared while the staging directory still exists is left alone.
+
+**Known limit.** Paths are walked with `lstat` and then used by path (no `openat` with a
+directory descriptor), so a process of the same user that races the installer can swap a
+directory component for a symlink between the check and the use. The guard defends against
+what is on disk when the install starts, not against a concurrent hostile process of the same
+user; descriptor-relative walking is future work. Staged files are sealed and hashed through
+open descriptors (`O_NOFOLLOW`, `fchmod`).
+
 **Separate actions.** Registering services, enabling at boot, starting listeners, MCP catalogs,
 the `PATH` change, credentials and state migration are listed after the install as
 `not executed: <action> <subject> [not implemented in this release]`, with the commands a
@@ -274,7 +293,9 @@ look at the paths the plan names.
 Every run is confined to a temporary root. The crash seam is `fl_install::Faults`: a `FaultPoint`
 (`before` or `after` any step) makes the transaction return a simulated crash with nothing
 undone; the `fl` binary reads `FL_INSTALL_FAULT` only when `fl-install` is built with the
-`fault-injection` feature, which only fl-cli's tests enable. The tests crash a fresh install, an
+`fault-injection` feature, which only fl-cli's tests enable; an optimized build with it is a
+compile error. Release builds are `cargo build --release --locked -p fl-cli`, never `--all-targets`
+or `--tests`. The tests crash a fresh install, an
 upgrade and a `--replace` at every point and check, by full directory snapshots, that `--resume`,
 `--rollback` and the next install each end in exactly "fully installed" or exactly the
 pre-state.

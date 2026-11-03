@@ -734,3 +734,51 @@ fn a_stale_lock_record_does_not_block() {
     assert_eq!(c, 0, "{so}{se}");
     assert!(so.contains("stale install lock"), "{so}");
 }
+
+#[test]
+fn directories_get_their_modes_whatever_the_umask() {
+    use std::os::unix::process::CommandExt;
+    // `replace`: pre-create a foreign launcher (so the install makes a backup directory).
+    for (mask, replace) in [(0o000, false), (0o077, false), (0o000, true), (0o077, true)] {
+        let w = World::new();
+        let (_, man) = w.release("0.1.0", "a");
+        if replace {
+            std::fs::create_dir_all(w.bin()).unwrap();
+            std::fs::write(w.bin().join("fl"), "mine").unwrap();
+        }
+        let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("fl"));
+        c.env_clear()
+            .env("HOME", w.home.path())
+            .current_dir(w.cwd.path())
+            .args(["install", "--yes", "--profile", "headless", "--prefix"])
+            .arg(w.prefix())
+            .arg("--manifest")
+            .arg(&man)
+            .arg("--artifact-dir")
+            .arg(w.art.path());
+        if replace {
+            c.arg("--replace").arg(w.bin().join("fl"));
+        }
+        // The umask is set in the CHILD only, between fork and exec.
+        // SAFETY: umask is async-signal-safe and touches nothing but the child's own mask.
+        unsafe {
+            c.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+        let o = c.output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tag = format!("umask {mask:o}, replace {replace}");
+        assert_eq!(mode(&w.prefix().join("releases")), 0o755, "{tag}");
+        if replace {
+            // the test made the prefix and bin; the installer made the backup directories
+            assert_eq!(mode(&w.prefix().join("backups")), 0o700, "{tag}");
+            assert_eq!(mode(&w.prefix().join("backups/1")), 0o700, "{tag}");
+        } else {
+            assert_eq!(mode(&w.prefix()), 0o755, "{tag}");
+            assert_eq!(mode(&w.bin()), 0o755, "{tag}");
+        }
+    }
+}

@@ -161,6 +161,8 @@ pub enum JournalOp {
     Stage,
     Verify,
     Publish,
+    /// The rename of the staging directory to `releases/<name>` happened in THIS transaction.
+    Published,
     LinkCurrent,
     WriteLauncher,
     WriteAliases,
@@ -186,7 +188,9 @@ impl JournalOp {
             JournalOp::WriteAliases => Step::WriteAliases,
             JournalOp::WriteReceipt => Step::WriteReceipt,
             JournalOp::Commit => Step::Commit,
-            JournalOp::RollbackBegin | JournalOp::RollbackDone => return None,
+            JournalOp::Published | JournalOp::RollbackBegin | JournalOp::RollbackDone => {
+                return None;
+            }
         })
     }
 }
