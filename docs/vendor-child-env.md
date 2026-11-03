@@ -6,7 +6,10 @@ The child gets an allow-listed environment and nothing it would inherit: the spa
 tokens, GitHub credentials and every vendor's API key in its own environment; a vendor CLI, and
 every tool it starts, never sees them.
 
-The code is `crates/exec/src/child_env.rs`. `ProcessHarness` calls it for every vendor spawn.
+The allow-lists and the filter are pure and live in `crates/core/src/child_env.rs` (`fl_core::child_env`;
+`fl_exec::child_env` re-exports them and adds the wrappers that read the process environment).
+`ProcessHarness` calls it for every vendor spawn, and the wire dispatcher calls it for its headless
+fallbacks (below).
 
 ## What passes
 
@@ -111,22 +114,48 @@ quota probe for a Bedrock or Vertex setup, or for a host behind a proxy, now ret
 `FL_HUB_MUSE_BIN`, `FL_HUB_CLAUDE_BIN` and `FL_HUB_AGENT_HYDRATE_BIN` are read by the hub and are
 not passed to the child.
 
+## The wire dispatcher's headless fallbacks
+
+When a recipient has no live tmux window, `crates/wire/src/dispatcher.rs` delivers a message by
+starting the vendor CLI from the hub process. All four launches go through `run_vendor_cli`, which
+calls `env_clear()` and sets the dialect's environment (`fl_core::child_env::child_env_from` over
+the hub's environment) plus the variables the launch sets itself:
+
+| Launch | Dialect | Explicit variables |
+| --- | --- | --- |
+| `codex queue --thread ... --message ...` (`run_codex_queue`) | Codex | none |
+| `muse exec --session-id ... --json` (`run_muse_exec`) | Muse | `MUSE_NO_AUTO_UPDATE=1` |
+| `grok --always-approve -s ... -p ...` (`run_grok_headless`) | Grok | none |
+| `agy agentapi send-message` (`deliver_to_agy_route`) | Antigravity | `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENTAPI_EXE`, and `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN` when the route or the hub has them |
+
+`grok` runs with `--always-approve`, so it can start any tool; it sees no `FL_*`, `GITHUB_*` or
+other vendor's key. The test seams the hub reads (`FL_WIRE_CODEX_BIN`, `FL_WIRE_MUSE_BIN`,
+`FL_WIRE_GROK_BIN`, `FL_WIRE_AGY_BIN`, `FL_WIRE_TMUX_BIN`) start with `FL_` and are never passed on.
+
+The wire crate has no adapter config, so these launches have no `env_pass`: they run with the
+dialect allow-list and nothing else. A proxy, `AWS_*` or `SSH_AUTH_SOCK` set on the hub does not
+reach them (follow-up: the hub loads `[adapters.*].env_pass` and hands it to the dispatcher). This
+is a behaviour change for a host where a fallback needed a proxy to reach its vendor.
+
+The dispatcher's `tmux` client calls (`list-panes`, `load-buffer`, `paste-buffer`, `send-keys`,
+`capture-pane`, and the same in `identity.rs`) are not vendor launches. They keep the hub's
+environment: tmux finds its server from `TMUX`, `TMUX_TMPDIR` and `XDG_RUNTIME_DIR`, which the
+baseline does not hold, and they start no agent code.
+
 ## Not covered
 
 These still inherit the hub's whole environment:
 
-* The interactive vendor sessions the hub starts in tmux or a PTY (`terminal.rs`, `lifecycle.rs`,
-  the wire dispatcher's tmux launches). They inherit by design: they are the Owner's own session.
-* The wire dispatcher's headless vendor spawns in `crates/wire/src/dispatcher.rs`
-  (`run_codex_queue`, `run_muse_exec`, `run_grok_headless`, and the agy `agentapi send-message`).
-  They run vendor CLIs from the hub with its whole environment, including `FL_VAULT_MASTER_KEY`.
-  `run_grok_headless` passes `--always-approve -p`. Follow-up: P0-3c.
+* The interactive vendor sessions the hub starts in tmux or a PTY (`terminal.rs`, `lifecycle.rs`).
+  They inherit by design: they are the Owner's own session. The wire dispatcher's tmux paste into
+  such a session writes text; it starts no process of its own.
 * The hub's non-vendor `git` and `openssl` spawns (`github_pr.rs`, `discovery.rs`, `lib.rs`)
   inherit everything. The `git` call in `mcp_api.rs` is already hardened.
-* `crates/cli/src/cmd/wire.rs`: the hydrate spawn.
+* `crates/cli/src/cmd/wire.rs`: the operator-shell hydrate spawn.
 * Command gates (`crates/exec/src/command.rs`), which run a project's own programs.
 * The hub's workflow-step endpoint (`crates/hub/src/api.rs`) does not read `[adapters.*]`, so
-  `env_pass` does not apply to it yet.
+  `env_pass` does not apply to it yet. The same gap holds for the quota and version probes and for
+  the wire dispatcher's headless fallbacks above.
 
 The hub's runtime updater (`runtime_update.rs`) clears its environment with its own list, which
 keeps the proxy variables; its `--version` check goes through `run_version` and gets the probe
