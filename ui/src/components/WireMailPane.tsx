@@ -4,10 +4,187 @@ import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentRecord,
+  type CommitteeVoteVerdict,
+  type WireCommitteeMetadata,
+  type WireDelegateMetadata,
   type WireInboxItem,
+  type WireMessage,
   type WireReceipt,
   type WireSendRequest,
 } from "../types/api";
+
+export type WireIntentMode = "mail" | "delegate" | "committee";
+
+export interface ParsedWireIntent {
+  intent: WireIntentMode;
+  delegate?: WireDelegateMetadata;
+  committee?: WireCommitteeMetadata;
+}
+
+export function normalizeCommitteeVerdict(raw: string): CommitteeVoteVerdict {
+  const upper = raw.trim().toUpperCase().replace(/_/g, " ");
+  if (upper === "APPROVE") return "APPROVE";
+  if (
+    upper === "APPROVE WITH AMENDMENTS" ||
+    upper === "AMEND" ||
+    upper === "APPROVE AMENDMENTS"
+  ) {
+    return "APPROVE WITH AMENDMENTS";
+  }
+  if (upper === "BLOCK" || upper === "REJECT") return "BLOCK";
+  return "PENDING";
+}
+
+export function parseCommitteeVotesSpec(
+  rawSpec: string,
+): Record<string, CommitteeVoteVerdict> {
+  const votes: Record<string, CommitteeVoteVerdict> = {};
+  for (const part of rawSpec.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx === -1) {
+      votes[trimmed.toLowerCase()] = "PENDING";
+    } else {
+      const seat = trimmed.slice(0, colonIdx).trim().toLowerCase();
+      const verdict = normalizeCommitteeVerdict(trimmed.slice(colonIdx + 1));
+      if (seat) {
+        votes[seat] = verdict;
+      }
+    }
+  }
+  return votes;
+}
+
+export function formatWireIntentBody(
+  baseBody: string,
+  intent: WireIntentMode,
+  delegate?: WireDelegateMetadata,
+  committee?: WireCommitteeMetadata,
+): string {
+  const cleanBody = baseBody.trim();
+  if (intent === "delegate" && delegate) {
+    const lines = [
+      "[FerroWire Intent: delegate]",
+      `Target-Record: ${delegate.target_record || "#0"}`,
+      `Deliverable: ${delegate.deliverable || "Assigned task"}`,
+      ...(delegate.branch_or_pr
+        ? [`Branch-Or-PR: ${delegate.branch_or_pr}`]
+        : []),
+      `Resume-On-Reply: ${delegate.resume_on_reply ? "true" : "false"}`,
+      "",
+      cleanBody,
+    ];
+    return lines.join("\n").trim();
+  }
+  if (intent === "committee" && committee) {
+    const votesEntries = Object.entries(committee.votes ?? {});
+    const votesLine =
+      votesEntries.length > 0
+        ? votesEntries.map(([seat, v]) => `${seat}:${v}`).join(", ")
+        : "krono:PENDING, kendi:PENDING, kora:PENDING";
+    const lines = [
+      "[FerroWire Intent: committee]",
+      `Council-Track: ${committee.council_track || "Strategy Council"}`,
+      `Quorum: ${committee.quorum || "3/3 unanimous"}`,
+      `Artifact-Path: ${committee.artifact_path || "docs/specs/proposal.md"}`,
+      ...(committee.artifact_sha256
+        ? [`Artifact-SHA256: ${committee.artifact_sha256}`]
+        : []),
+      `Seat-Votes: ${votesLine}`,
+      "",
+      cleanBody,
+    ];
+    return lines.join("\n").trim();
+  }
+  return cleanBody;
+}
+
+export function parseWireIntentMetadata(
+  input: Pick<WireMessage, "kind" | "subject" | "body" | "delegate_meta" | "committee_meta"> | string,
+): ParsedWireIntent {
+  const isString = typeof input === "string";
+  const rawKind = isString ? "" : (input.kind || "").toLowerCase();
+  const rawSubject = isString ? "" : input.subject || "";
+  const rawBody = isString ? input : input.body || "";
+
+  if (!isString && input.delegate_meta) {
+    return {
+      intent: "delegate",
+      delegate: input.delegate_meta,
+    };
+  }
+  if (!isString && input.committee_meta) {
+    return {
+      intent: "committee",
+      committee: input.committee_meta,
+    };
+  }
+
+  const combined = `${rawSubject}\n${rawBody}`;
+  const isDelegateHeader =
+    rawKind === "delegate" ||
+    /\[(?:FerroWire\s+)?Intent:\s*delegate\b/i.test(combined) ||
+    /^\s*Target-Record:\s*\S+/im.test(rawBody);
+  if (isDelegateHeader) {
+    const targetRecord =
+      rawBody.match(/^\s*Target-Record:\s*(.+)$/im)?.[1]?.trim() ||
+      rawSubject.match(/#(\d+)/)?.[0] ||
+      "unassigned";
+    const deliverable =
+      rawBody.match(/^\s*Deliverable:\s*(.+)$/im)?.[1]?.trim() ||
+      rawSubject.trim() ||
+      "Delegated task";
+    const branchOrPr =
+      rawBody.match(/^\s*Branch-Or-PR:\s*(.+)$/im)?.[1]?.trim() ?? null;
+    const resumeRaw = rawBody
+      .match(/^\s*Resume-On-Reply:\s*(.+)$/im)?.[1]
+      ?.trim()
+      .toLowerCase();
+    const resumeOnReply = resumeRaw ? resumeRaw !== "false" : true;
+    return {
+      intent: "delegate",
+      delegate: {
+        target_record: targetRecord,
+        deliverable,
+        branch_or_pr: branchOrPr,
+        resume_on_reply: resumeOnReply,
+      },
+    };
+  }
+
+  const isCommitteeHeader =
+    rawKind === "committee" ||
+    /\[(?:FerroWire\s+)?Intent:\s*committee\b/i.test(combined) ||
+    /^\s*Council-Track:\s*\S+/im.test(rawBody);
+  if (isCommitteeHeader) {
+    const councilTrack =
+      rawBody.match(/^\s*Council-Track:\s*(.+)$/im)?.[1]?.trim() ||
+      "Strategy Council #2";
+    const quorum =
+      rawBody.match(/^\s*Quorum:\s*(.+)$/im)?.[1]?.trim() || "3/3 unanimous";
+    const artifactPath =
+      rawBody.match(/^\s*Artifact-Path:\s*(.+)$/im)?.[1]?.trim() ||
+      "docs/specs/deliberation.md";
+    const artifactSha =
+      rawBody.match(/^\s*Artifact-SHA256:\s*(.+)$/im)?.[1]?.trim() ?? null;
+    const votesRaw =
+      rawBody.match(/^\s*Seat-Votes:\s*(.+)$/im)?.[1]?.trim() ||
+      "krono:PENDING, kendi:PENDING, kora:PENDING";
+    return {
+      intent: "committee",
+      committee: {
+        council_track: councilTrack,
+        quorum,
+        artifact_path: artifactPath,
+        artifact_sha256: artifactSha,
+        votes: parseCommitteeVotesSpec(votesRaw),
+      },
+    };
+  }
+
+  return { intent: "mail" };
+}
 
 export interface WireMailPaneProps {
   messages?: WireInboxItem[];
@@ -96,6 +273,21 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   );
   const [customRecipient, setCustomRecipient] = useState<string>("");
   const [urgency, setUrgency] = useState<"normal" | "urgent">("normal");
+  const [intentMode, setIntentMode] = useState<WireIntentMode>("mail");
+  // Record #101: Typed Delegate & Committee composer state
+  const [delegateTargetRecord, setDelegateTargetRecord] = useState<string>("#101");
+  const [delegateDeliverable, setDelegateDeliverable] = useState<string>("");
+  const [delegateBranchOrPr, setDelegateBranchOrPr] = useState<string>("");
+  const [delegateResumeOnReply, setDelegateResumeOnReply] = useState<boolean>(true);
+  const [committeeTrack, setCommitteeTrack] = useState<string>("Strategy Council #2");
+  const [committeeQuorum, setCommitteeQuorum] = useState<string>("3/3 unanimous");
+  const [committeeArtifactPath, setCommitteeArtifactPath] = useState<string>(
+    "docs/specs/proposal.md",
+  );
+  const [committeeArtifactSha, setCommitteeArtifactSha] = useState<string>("");
+  const [committeeSeatsSpec, setCommitteeSeatsSpec] = useState<string>(
+    "krono:APPROVE, kendi:APPROVE WITH AMENDMENTS, kora:PENDING",
+  );
   const [subject, setSubject] = useState<string>("");
   const [body, setBody] = useState<string>("");
   const [sending, setSending] = useState<boolean>(false);
@@ -239,14 +431,44 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     }
 
     const fromAgent = selectedAgentName?.trim().toLowerCase() || "owner";
+    const delegateMeta: WireDelegateMetadata | undefined =
+      intentMode === "delegate"
+        ? {
+            target_record: delegateTargetRecord.trim() || "#0",
+            deliverable: delegateDeliverable.trim() || trimmedSubject,
+            branch_or_pr: delegateBranchOrPr.trim() || null,
+            resume_on_reply: delegateResumeOnReply,
+          }
+        : undefined;
+    const committeeMeta: WireCommitteeMetadata | undefined =
+      intentMode === "committee"
+        ? {
+            council_track: committeeTrack.trim() || "Strategy Council #2",
+            quorum: committeeQuorum.trim() || "3/3 unanimous",
+            artifact_path: committeeArtifactPath.trim() || "docs/specs/proposal.md",
+            artifact_sha256: committeeArtifactSha.trim() || null,
+            votes: parseCommitteeVotesSpec(committeeSeatsSpec),
+          }
+        : undefined;
+
+    const effectiveBody = formatWireIntentBody(
+      trimmedBody,
+      intentMode,
+      delegateMeta,
+      committeeMeta,
+    );
+
     const payload: WireSendRequest = {
       to: targetTo,
       subject: trimmedSubject,
-      body: trimmedBody,
+      body: effectiveBody,
+      kind: intentMode,
       urgency,
       from: fromAgent,
       sender_name: fromAgent,
       durable: true,
+      ...(delegateMeta ? { delegate_meta: delegateMeta } : {}),
+      ...(committeeMeta ? { committee_meta: committeeMeta } : {}),
     };
 
     setSending(true);
@@ -262,7 +484,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
       setSubject("");
       setBody("");
       setCustomRecipient("");
-      setActionMessage(`Dispatched FerroWire message to ${targetTo}`);
+      setActionMessage(`Dispatched FerroWire ${intentMode} message to ${targetTo}`);
     } catch (err) {
       setActionError(err instanceof Error ? err.message : "Failed to send FerroWire message");
     } finally {
@@ -287,15 +509,204 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     >
       <div
         style={{
-          fontWeight: 700,
-          fontSize: "13px",
-          textTransform: "uppercase",
-          letterSpacing: "0.05em",
-          color: "var(--text-secondary)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "8px",
+          flexWrap: "wrap",
         }}
       >
-        Compose Message
+        <div
+          style={{
+            fontWeight: 700,
+            fontSize: "13px",
+            textTransform: "uppercase",
+            letterSpacing: "0.05em",
+            color: "var(--text-secondary)",
+          }}
+        >
+          Compose Message
+        </div>
+        {intentMode === "delegate" && delegateResumeOnReply && (
+          <span
+            className="fd-badge"
+            data-testid="delegate-composer-status-badge"
+            style={{
+              backgroundColor: "rgba(56, 189, 248, 0.14)",
+              borderColor: "rgba(56, 189, 248, 0.4)",
+              color: "var(--accent-primary)",
+              fontSize: "10.5px",
+            }}
+          >
+            Non-Blocking · Resume on Reply
+          </span>
+        )}
       </div>
+
+      <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
+        <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>FerroWire Intent Mode</span>
+        <select
+          aria-label="FerroWire Intent Mode"
+          data-testid="wire-compose-intent-select"
+          className="fd-select"
+          value={intentMode}
+          onChange={(e) => setIntentMode(e.target.value as WireIntentMode)}
+          style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }}
+        >
+          <option value="mail">mail (Standard Message)</option>
+          <option value="delegate">delegate (Single-Assignee Task Delegation)</option>
+          <option value="committee">committee (Multi-Seat Deliberation Round)</option>
+        </select>
+      </label>
+
+      {intentMode === "delegate" && (
+        <div
+          data-testid="wire-delegate-fields"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+            padding: "8px 10px",
+            borderRadius: "6px",
+            backgroundColor: "var(--bg-elevated)",
+            border: "1px solid var(--border-subtle)",
+          }}
+        >
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Target Record</span>
+              <input
+                type="text"
+                data-testid="delegate-target-record-input"
+                aria-label="Target Record"
+                className="fd-input fd-mono"
+                placeholder="#101"
+                value={delegateTargetRecord}
+                onChange={(e) => setDelegateTargetRecord(e.target.value)}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Branch or PR</span>
+              <input
+                type="text"
+                data-testid="delegate-branch-pr-input"
+                aria-label="Branch or PR"
+                className="fd-input fd-mono"
+                placeholder="felix/record-101"
+                value={delegateBranchOrPr}
+                onChange={(e) => setDelegateBranchOrPr(e.target.value)}
+              />
+            </label>
+          </div>
+          <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Deliverable Summary</span>
+            <input
+              type="text"
+              data-testid="delegate-deliverable-input"
+              aria-label="Deliverable Summary"
+              className="fd-input"
+              placeholder="Implement typed delegate and committee intents"
+              value={delegateDeliverable}
+              onChange={(e) => setDelegateDeliverable(e.target.value)}
+            />
+          </label>
+          <label
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              fontSize: "11.5px",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              data-testid="delegate-resume-on-reply-checkbox"
+              checked={delegateResumeOnReply}
+              onChange={(e) => setDelegateResumeOnReply(e.target.checked)}
+            />
+            <span>Non-Blocking · Resume on Reply (`resume_on_reply`)</span>
+          </label>
+        </div>
+      )}
+
+      {intentMode === "committee" && (
+        <div
+          data-testid="wire-committee-fields"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+            padding: "8px 10px",
+            borderRadius: "6px",
+            backgroundColor: "var(--bg-elevated)",
+            border: "1px solid var(--border-subtle)",
+          }}
+        >
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Council Track</span>
+              <input
+                type="text"
+                data-testid="committee-track-input"
+                aria-label="Council Track"
+                className="fd-input"
+                value={committeeTrack}
+                onChange={(e) => setCommitteeTrack(e.target.value)}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Quorum Rule</span>
+              <input
+                type="text"
+                data-testid="committee-quorum-input"
+                aria-label="Quorum Rule"
+                className="fd-input fd-mono"
+                value={committeeQuorum}
+                onChange={(e) => setCommitteeQuorum(e.target.value)}
+              />
+            </label>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px" }}>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Artifact Path</span>
+              <input
+                type="text"
+                data-testid="committee-artifact-path-input"
+                aria-label="Artifact Path"
+                className="fd-input fd-mono"
+                value={committeeArtifactPath}
+                onChange={(e) => setCommitteeArtifactPath(e.target.value)}
+              />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+              <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Artifact SHA-256</span>
+              <input
+                type="text"
+                data-testid="committee-artifact-sha-input"
+                aria-label="Artifact SHA-256"
+                className="fd-input fd-mono"
+                placeholder="sha256:9f86d08..."
+                value={committeeArtifactSha}
+                onChange={(e) => setCommitteeArtifactSha(e.target.value)}
+              />
+            </label>
+          </div>
+          <label style={{ display: "flex", flexDirection: "column", gap: "3px", fontSize: "11.5px" }}>
+            <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+              Seat Votes (`seat:APPROVE | APPROVE WITH AMENDMENTS | BLOCK | PENDING`)
+            </span>
+            <input
+              type="text"
+              data-testid="committee-seats-input"
+              aria-label="Seat Votes"
+              className="fd-input fd-mono"
+              value={committeeSeatsSpec}
+              onChange={(e) => setCommitteeSeatsSpec(e.target.value)}
+            />
+          </label>
+        </div>
+      )}
 
       <label style={{ display: "flex", flexDirection: "column", gap: "4px", fontSize: "12px", minWidth: 0 }}>
         <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Recipient (To)</span>
@@ -465,12 +876,14 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           const isExpanded = expandedIds.has(msg.id);
           const isMostRecent = index === 0;
           const shouldMountBody = isMostRecent || isExpanded || loadedIds.has(msg.id);
+          const parsedIntent = parseWireIntentMetadata(msg);
 
           return (
             <article
               key={msg.id}
               data-testid={`mail-item-${msg.id}`}
               data-expanded={isExpanded ? "true" : "false"}
+              data-wire-intent={parsedIntent.intent}
               className="fd-card"
               style={{
                 display: "flex",
@@ -597,6 +1010,29 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                       >
                         {msg.urgency}
                       </span>
+
+                      {parsedIntent.intent !== "mail" && (
+                        <span
+                          data-testid={`mail-intent-badge-${msg.id}`}
+                          className="fd-badge fd-mono"
+                          style={{
+                            backgroundColor:
+                              parsedIntent.intent === "delegate"
+                                ? "rgba(56, 189, 248, 0.14)"
+                                : "rgba(168, 85, 247, 0.14)",
+                            borderColor:
+                              parsedIntent.intent === "delegate"
+                                ? "rgba(56, 189, 248, 0.4)"
+                                : "rgba(168, 85, 247, 0.4)",
+                            color:
+                              parsedIntent.intent === "delegate"
+                                ? "var(--accent-primary)"
+                                : "#C084FC",
+                          }}
+                        >
+                          {parsedIntent.intent}
+                        </span>
+                      )}
                     </span>
                   </div>
 
@@ -638,6 +1074,131 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                   {msg.subject}
                 </div>
               </div>
+
+              {parsedIntent.intent === "delegate" && parsedIntent.delegate && (
+                <div
+                  data-testid={`mail-delegate-card-${msg.id}`}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid rgba(56, 189, 248, 0.35)",
+                    fontSize: "12px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span className="fd-mono" style={{ fontWeight: 700, fontSize: "11.5px" }}>
+                      Record: {parsedIntent.delegate.target_record}
+                    </span>
+                    {parsedIntent.delegate.resume_on_reply && (
+                      <span
+                        className="fd-badge"
+                        data-testid={`mail-delegate-resume-badge-${msg.id}`}
+                        style={{
+                          backgroundColor: "rgba(56, 189, 248, 0.14)",
+                          borderColor: "rgba(56, 189, 248, 0.4)",
+                          color: "var(--accent-primary)",
+                        }}
+                      >
+                        Non-Blocking · Resume on Reply
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ color: "var(--text-secondary)" }}>
+                    <strong>Deliverable:</strong> {parsedIntent.delegate.deliverable}
+                  </div>
+                  {parsedIntent.delegate.branch_or_pr && (
+                    <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                      Branch/PR: {parsedIntent.delegate.branch_or_pr}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {parsedIntent.intent === "committee" && parsedIntent.committee && (
+                <div
+                  data-testid={`mail-committee-card-${msg.id}`}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid rgba(168, 85, 247, 0.35)",
+                    fontSize: "12px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span style={{ fontWeight: 700 }}>
+                      {parsedIntent.committee.council_track}
+                    </span>
+                    <span className="fd-badge fd-mono">
+                      Quorum: {parsedIntent.committee.quorum}
+                    </span>
+                  </div>
+                  <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                    Artifact: {parsedIntent.committee.artifact_path}
+                    {parsedIntent.committee.artifact_sha256
+                      ? ` · ${parsedIntent.committee.artifact_sha256}`
+                      : ""}
+                  </div>
+                  <div
+                    data-testid={`mail-committee-votes-${msg.id}`}
+                    style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}
+                  >
+                    {Object.entries(parsedIntent.committee.votes ?? {}).map(
+                      ([seat, verdict]) => (
+                        <span
+                          key={seat}
+                          data-testid={`committee-vote-pill-${msg.id}-${seat}`}
+                          className="fd-badge fd-mono"
+                          style={{
+                            fontSize: "10.5px",
+                            backgroundColor:
+                              verdict === "APPROVE"
+                                ? "rgba(52, 211, 153, 0.14)"
+                                : verdict === "APPROVE WITH AMENDMENTS"
+                                  ? "rgba(251, 191, 36, 0.16)"
+                                  : verdict === "BLOCK"
+                                    ? "rgba(239, 68, 68, 0.16)"
+                                    : "var(--bg-surface)",
+                            color:
+                              verdict === "APPROVE"
+                                ? "#34d399"
+                                : verdict === "APPROVE WITH AMENDMENTS"
+                                  ? "#fbbf24"
+                                  : verdict === "BLOCK"
+                                    ? "#f87171"
+                                    : "var(--text-muted)",
+                          }}
+                        >
+                          {seat}: {verdict}
+                        </span>
+                      ),
+                    )}
+                  </div>
+                </div>
+              )}
 
               {shouldMountBody && (
                 <div
@@ -807,3 +1368,5 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     </section>
   );
 };
+
+export const WireInboxPane = WireMailPane;

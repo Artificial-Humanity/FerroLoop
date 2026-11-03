@@ -63,6 +63,59 @@ export function resolveSpinUpProject(rawProject?: string | null): string {
   return matched ? matched.value : "ferroloop";
 }
 
+// Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation
+export type WorktreePolicyMode = "create" | "reuse" | "shared";
+
+export interface WorktreeBootstrapPreview {
+  policy: WorktreePolicyMode;
+  worktreePath: string;
+  bootstrapConfigPath: string;
+  bootstrapHooks: string[];
+  allocatedPort: number;
+  allocatedVitePort: number;
+}
+
+export function computeWorktreeBootstrapPreview(
+  persona: string,
+  project: string,
+  policy: WorktreePolicyMode = "create",
+): WorktreeBootstrapPreview {
+  const cleanPersona = (persona || "agent").trim().toLowerCase() || "agent";
+  const cleanProject = (project || "ferroloop").trim().toLowerCase() || "ferroloop";
+  const key = `${cleanProject}:${cleanPersona}`;
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) % 800;
+  }
+  const allocatedPort = 4100 + Math.abs(hash);
+  const allocatedVitePort = allocatedPort + 1000;
+
+  const worktreePath =
+    policy === "create"
+      ? `~/Projects/Artificial-Humanity/.worktrees/${cleanProject}/${cleanPersona}`
+      : policy === "reuse"
+        ? `~/Projects/Artificial-Humanity/.worktrees/${cleanProject}/reused-${cleanPersona}`
+        : `~/Projects/Artificial-Humanity/${cleanProject}`;
+
+  const bootstrapHooks =
+    policy === "shared"
+      ? ["fl state sync --shared-checkout"]
+      : [
+          "git submodule update --init",
+          "fl state sync --worktree",
+          `export PORT=${allocatedPort} VITE_PORT=${allocatedVitePort}`,
+        ];
+
+  return {
+    policy,
+    worktreePath,
+    bootstrapConfigPath: ".fl/worktree.toml",
+    bootstrapHooks,
+    allocatedPort,
+    allocatedVitePort,
+  };
+}
+
 export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   isOpen,
   onClose,
@@ -81,12 +134,16 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [model, setModel] = useState("");
   const [nodeId, setNodeId] = useState("ai-lab-0");
   const [hosted, setHosted] = useState(true);
+  const [worktreePolicy, setWorktreePolicy] =
+    useState<WorktreePolicyMode>("create");
+  const [worktreePolicyTouched, setWorktreePolicyTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (isOpen) {
       setProject(resolveSpinUpProject(initialProject));
+      setWorktreePolicyTouched(false);
     }
   }, [initialProject, isOpen]);
 
@@ -121,6 +178,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
     setError(null);
     setSubmitting(true);
 
+    const worktreePreview = computeWorktreeBootstrapPreview(
+      trimmedPersona,
+      project,
+      worktreePolicy,
+    );
+
     const payload: SpinUpSessionRequest = {
       persona: trimmedPersona,
       project,
@@ -129,6 +192,13 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       ...(model.trim() ? { model: model.trim() } : {}),
       node_id: nodeId.trim() || "ai-lab-0",
       hosted,
+      ...(worktreePolicyTouched
+        ? {
+            worktree_policy: worktreePolicy,
+            allocated_port: worktreePreview.allocatedPort,
+            allocated_vite_port: worktreePreview.allocatedVitePort,
+          }
+        : {}),
     };
 
     try {
@@ -449,6 +519,101 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               ))}
             </datalist>
           </div>
+
+          {/* Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Port Allocation */}
+          {(() => {
+            const preview = computeWorktreeBootstrapPreview(
+              persona,
+              project,
+              worktreePolicy,
+            );
+            return (
+              <div
+                data-testid="spin-up-worktree-preview"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  fontSize: "11.5px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    htmlFor="fd-spin-up-worktree-policy"
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      color: "var(--text-muted)",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Worktree Policy
+                  </label>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="spin-up-allocated-ports-badge"
+                    style={{
+                      backgroundColor: "rgba(56, 189, 248, 0.14)",
+                      borderColor: "rgba(56, 189, 248, 0.4)",
+                      color: "var(--accent-primary)",
+                      fontSize: "10.5px",
+                    }}
+                  >
+                    PORT={preview.allocatedPort} · VITE_PORT={preview.allocatedVitePort}
+                  </span>
+                </div>
+                <select
+                  id="fd-spin-up-worktree-policy"
+                  aria-label="Worktree Policy"
+                  data-testid="spin-up-worktree-policy-select"
+                  className="fd-select fd-mono"
+                  value={worktreePolicy}
+                  disabled={submitting}
+                  onChange={(e) => {
+                    setWorktreePolicyTouched(true);
+                    setWorktreePolicy(e.target.value as WorktreePolicyMode);
+                  }}
+                  style={{ width: "100%" }}
+                >
+                  <option value="create">
+                    create (Isolated branch worktree)
+                  </option>
+                  <option value="reuse">
+                    reuse (Existing worktree checkout)
+                  </option>
+                  <option value="shared">
+                    shared (Primary project checkout)
+                  </option>
+                </select>
+                <div
+                  className="fd-mono"
+                  data-testid="spin-up-worktree-path"
+                  style={{ fontSize: "10.5px", color: "var(--text-secondary)" }}
+                >
+                  Path: {preview.worktreePath}
+                </div>
+                <div
+                  className="fd-mono"
+                  data-testid="spin-up-bootstrap-hooks"
+                  style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                >
+                  {preview.bootstrapConfigPath}: {preview.bootstrapHooks.join(" && ")}
+                </div>
+              </div>
+            );
+          })()}
 
           <label
             style={{
