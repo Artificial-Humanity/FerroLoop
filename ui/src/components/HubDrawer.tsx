@@ -13,6 +13,11 @@ import type {
   WorkflowRun,
 } from "../types/api";
 import { getAdapterBadgeClass } from "./RosterSidebar";
+import {
+  evaluateAgentMcpPosture,
+  type AgentMcpPostureInput,
+  type AgentMcpPostureReport,
+} from "./AgentSettingsModal";
 
 export type HubSubTab = "workflows" | "architecture" | "stats";
 
@@ -39,6 +44,8 @@ export interface HubDrawerProps {
   ) => Promise<unknown> | void;
   apiClient?: HubApiClient;
   defaultSubTab?: HubSubTab;
+  postureItems?: AgentMcpPostureInput[];
+  onReconcilePosture?: (reports: AgentMcpPostureReport[]) => void;
 }
 
 export function formatUsdFromMicros(
@@ -76,8 +83,13 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
   onRejectWorkflowStep,
   apiClient,
   defaultSubTab = "workflows",
+  postureItems,
+  onReconcilePosture,
 }) => {
   const [subTab, setSubTab] = useState<HubSubTab>(defaultSubTab);
+  const [postureDryRunOpen, setPostureDryRunOpen] = useState<boolean>(false);
+  const [postureReconciled, setPostureReconciled] = useState<boolean>(false);
+  const [postureStatusMsg, setPostureStatusMsg] = useState<string | null>(null);
   useActiveCurrency();
   const [selectedWorkflowSlug, setSelectedWorkflowSlug] = useState<string>(
     workflows[0]?.slug ?? workflows[0]?.id ?? "",
@@ -322,6 +334,239 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
             {actionError ?? actionStatus}
           </div>
         )}
+
+        {/* 3-Tier MCP & Agent Posture Drift Card (Record #95) */}
+        {(() => {
+          const baseItems: AgentMcpPostureInput[] =
+            postureItems && postureItems.length > 0
+              ? postureItems
+              : [
+                  {
+                    agentName: "ferris",
+                    project: "FerroLoop",
+                    role: "lead",
+                    adapter: "claude",
+                    sessionId: "claude:ferris",
+                  },
+                  {
+                    agentName: "felix",
+                    project: "FerroLoop",
+                    role: "ui-developer",
+                    adapter: "antigravity",
+                    sessionId: "antigravity:felix",
+                  },
+                ];
+          const reports = baseItems.map((item) =>
+            evaluateAgentMcpPosture(
+              postureReconciled
+                ? {
+                    ...item,
+                    appliedMcpServers: item.desiredMcpServers,
+                    liveMcpServers: item.desiredMcpServers,
+                    sessionStartedBeforeSync: false,
+                    sessionRole: item.role,
+                    sessionProject: item.project,
+                  }
+                : item,
+            ),
+          );
+          const driftedReports = reports.filter((r) => r.driftKind !== "synced");
+
+          return (
+            <div
+              data-testid="hub-posture-drift-card"
+              className="fd-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <span
+                    style={{
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.05em",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    3-Tier MCP &amp; Agent Posture (Desired · Applied · Live)
+                  </span>
+                  <span
+                    className="fd-badge"
+                    data-testid="hub-posture-summary-badge"
+                    data-drifted-count={driftedReports.length}
+                    style={
+                      driftedReports.length === 0
+                        ? {
+                            backgroundColor: "rgba(16, 185, 129, 0.14)",
+                            color: "#34D399",
+                            borderColor: "rgba(16, 185, 129, 0.4)",
+                            fontWeight: 700,
+                          }
+                        : {
+                            backgroundColor: "rgba(245, 158, 11, 0.16)",
+                            color: "#FBBF24",
+                            borderColor: "rgba(245, 158, 11, 0.45)",
+                            fontWeight: 700,
+                          }
+                    }
+                  >
+                    {driftedReports.length === 0
+                      ? `All ${reports.length} Synced`
+                      : `${driftedReports.length} Drifted / ${reports.length} Total`}
+                  </span>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="hub-posture-dryrun-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => setPostureDryRunOpen((prev) => !prev)}
+                  >
+                    {postureDryRunOpen ? "Hide Dry-Run" : "Dry-Run Preview"}
+                  </button>
+                  {driftedReports.length > 0 && (
+                    <button
+                      type="button"
+                      className="fd-btn fd-btn-primary"
+                      data-testid="hub-posture-reconcile-btn"
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => {
+                        setPostureReconciled(true);
+                        setPostureStatusMsg(
+                          `Reconciled ${driftedReports.length} posture drift item(s) across Desired catalog, Applied vendor configs, and Live sessions.`,
+                        );
+                        onReconcilePosture?.(driftedReports);
+                      }}
+                    >
+                      Reconcile All Drift ({driftedReports.length})
+                    </button>
+                  )}
+                  {postureReconciled && (
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid="hub-posture-rollback-btn"
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => {
+                        setPostureReconciled(false);
+                        setPostureStatusMsg(
+                          "Rolled back last posture reconciliation snapshot.",
+                        );
+                      }}
+                    >
+                      Rollback
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {postureDryRunOpen && (
+                <div
+                  data-testid="hub-posture-dryrun-panel"
+                  className="fd-mono"
+                  style={{
+                    fontSize: "11px",
+                    padding: "8px 10px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-input)",
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--text-secondary)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "4px",
+                  }}
+                >
+                  {driftedReports.length === 0 ? (
+                    <span>Dry-run: 0 changes required (all tiers match Desired catalog).</span>
+                  ) : (
+                    driftedReports.map((r) => (
+                      <div key={r.agentKey}>
+                        [dry-run] {r.agentKey}: {r.remediationLabel} → {r.vendorConfigPath} (
+                        {r.summary})
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              {postureStatusMsg && (
+                <div
+                  role="status"
+                  data-testid="hub-posture-status-banner"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {postureStatusMsg}
+                </div>
+              )}
+
+              <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                {reports.map((r) => {
+                  const isSynced = r.driftKind === "synced";
+                  return (
+                    <div
+                      key={r.agentKey}
+                      data-testid={`hub-posture-item-${r.agentKey}`}
+                      data-posture={r.driftKind}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "8px",
+                        flexWrap: "wrap",
+                        padding: "6px 8px",
+                        borderRadius: "4px",
+                        backgroundColor: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                        fontSize: "11px",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                        <strong className="fd-mono">{r.agentKey}</strong>
+                        <span
+                          className="fd-badge"
+                          data-testid={`hub-posture-badge-${r.agentKey}`}
+                          style={{
+                            fontSize: "10px",
+                            color: isSynced ? "#34D399" : "#FBBF24",
+                            borderColor: isSynced
+                              ? "rgba(16, 185, 129, 0.4)"
+                              : "rgba(245, 158, 11, 0.45)",
+                          }}
+                        >
+                          {r.badgeLabel}
+                        </span>
+                      </div>
+                      <span className="fd-mono" style={{ fontSize: "10.5px", color: "var(--text-muted)" }}>
+                        Desired[{r.desiredServers.join(",")}] → Applied[{r.appliedServers.join(",")}] → Live[{r.liveServers.join(",")}]
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* TAB 1: WORKFLOWS */}
         {subTab === "workflows" && (

@@ -53,6 +53,167 @@ export function formatUsdFromMicros(
   return formatCurrencyFromMicros(micros, currencyPref);
 }
 
+export interface CanonicalTokenRate {
+  vendor: string;
+  inputUsdPer1M: number;
+  outputUsdPer1M: number;
+  label: string;
+}
+
+/**
+ * Canonical per-1M token reference rates (USD per 1,000,000 tokens) used to compute
+ * virtual API-equivalent spend for $0 subscription CLI sessions (Record #221).
+ */
+export const CANONICAL_API_TOKEN_RATES: Readonly<
+  Record<string, CanonicalTokenRate>
+> = {
+  claude: {
+    vendor: "claude",
+    inputUsdPer1M: 15,
+    outputUsdPer1M: 75,
+    label: "Claude Opus ($15/$75 per 1M)",
+  },
+  codex: {
+    vendor: "codex",
+    inputUsdPer1M: 10,
+    outputUsdPer1M: 30,
+    label: "GPT-5.4 / Codex Pro ($10/$30 per 1M)",
+  },
+  grok: {
+    vendor: "grok",
+    inputUsdPer1M: 3,
+    outputUsdPer1M: 15,
+    label: "Grok 4 ($3/$15 per 1M)",
+  },
+  antigravity: {
+    vendor: "antigravity",
+    inputUsdPer1M: 2.5,
+    outputUsdPer1M: 10,
+    label: "Gemini 3.1 Pro ($2.50/$10 per 1M)",
+  },
+  muse: {
+    vendor: "muse",
+    inputUsdPer1M: 2,
+    outputUsdPer1M: 8,
+    label: "Frontier Reference ($2/$8 per 1M)",
+  },
+  default: {
+    vendor: "default",
+    inputUsdPer1M: 6,
+    outputUsdPer1M: 24,
+    label: "Blended Reference ($6/$24 per 1M)",
+  },
+};
+
+export function resolveCanonicalTokenRate(
+  vendor?: string | null,
+  model?: string | null,
+): CanonicalTokenRate {
+  const m = (model ?? "").trim().toLowerCase();
+  if (m.includes("sonnet")) {
+    return {
+      vendor: "claude",
+      inputUsdPer1M: 3,
+      outputUsdPer1M: 15,
+      label: "Claude Sonnet ($3/$15 per 1M)",
+    };
+  }
+  if (m.includes("haiku")) {
+    return {
+      vendor: "claude",
+      inputUsdPer1M: 0.8,
+      outputUsdPer1M: 4,
+      label: "Claude Haiku ($0.80/$4 per 1M)",
+    };
+  }
+  if (m.includes("opus")) {
+    return CANONICAL_API_TOKEN_RATES.claude;
+  }
+  if (m.includes("gpt-5") || m.includes("codex") || m.includes("o3")) {
+    return CANONICAL_API_TOKEN_RATES.codex;
+  }
+  if (m.includes("grok")) {
+    return CANONICAL_API_TOKEN_RATES.grok;
+  }
+  if (m.includes("gemini")) {
+    return CANONICAL_API_TOKEN_RATES.antigravity;
+  }
+  if (m.includes("muse")) {
+    return CANONICAL_API_TOKEN_RATES.muse;
+  }
+  const vKey = (vendor ?? "").trim().toLowerCase();
+  return CANONICAL_API_TOKEN_RATES[vKey] ?? CANONICAL_API_TOKEN_RATES.default;
+}
+
+export function computeVirtualApiEquivMicros(params: {
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  costUsdMicros?: number | null;
+  vendor?: string | null;
+  model?: string | null;
+}): number {
+  const tokensIn =
+    typeof params.tokensIn === "number" && Number.isFinite(params.tokensIn)
+      ? Math.max(0, params.tokensIn)
+      : 0;
+  const tokensOut =
+    typeof params.tokensOut === "number" && Number.isFinite(params.tokensOut)
+      ? Math.max(0, params.tokensOut)
+      : 0;
+  const billedMicros =
+    typeof params.costUsdMicros === "number" &&
+    Number.isFinite(params.costUsdMicros)
+      ? Math.max(0, params.costUsdMicros)
+      : 0;
+  const rate = resolveCanonicalTokenRate(params.vendor, params.model);
+  // 1M tokens * ($rate / 1M tokens) * 1,000,000 micros/$ = tokens * rate micros
+  const computedMicros = Math.round(
+    tokensIn * rate.inputUsdPer1M + tokensOut * rate.outputUsdPer1M,
+  );
+  return Math.max(billedMicros, computedMicros);
+}
+
+export function computeTelemetryVirtualEquivMicros(
+  telemetry?: WatchTelemetryReport | null,
+  adapterModelsMap?: ReadonlyMap<string, string[]>,
+): number {
+  if (!telemetry) return 0;
+  const adapters = telemetry.by_adapter ?? [];
+  if (adapters.length > 0) {
+    let sumVirtual = 0;
+    let sumIn = 0;
+    let sumOut = 0;
+    for (const item of adapters) {
+      const models = adapterModelsMap?.get(item.key.toLowerCase()) ?? [];
+      sumVirtual += computeVirtualApiEquivMicros({
+        tokensIn: item.tokens_in,
+        tokensOut: item.tokens_out,
+        costUsdMicros: item.cost_usd_micros,
+        vendor: item.key,
+        model: models[0] ?? null,
+      });
+      sumIn += item.tokens_in ?? 0;
+      sumOut += item.tokens_out ?? 0;
+    }
+    const remIn = Math.max(0, (telemetry.totals?.tokens_in ?? 0) - sumIn);
+    const remOut = Math.max(0, (telemetry.totals?.tokens_out ?? 0) - sumOut);
+    if (remIn > 0 || remOut > 0) {
+      sumVirtual += computeVirtualApiEquivMicros({
+        tokensIn: remIn,
+        tokensOut: remOut,
+        vendor: "default",
+      });
+    }
+    return Math.max(telemetry.totals?.cost_usd_micros ?? 0, sumVirtual);
+  }
+  return computeVirtualApiEquivMicros({
+    tokensIn: telemetry.totals?.tokens_in,
+    tokensOut: telemetry.totals?.tokens_out,
+    costUsdMicros: telemetry.totals?.cost_usd_micros,
+    vendor: "default",
+  });
+}
+
 export function formatCompactNumber(value: number | undefined | null): string {
   const safe =
     typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -695,6 +856,55 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
     return map;
   }, [vendorMatrix]);
 
+  // Map adapters to their telemetry breakdown for per-vendor virtual equivalence
+  const adapterBreakdownMap = useMemo(() => {
+    const map = new Map<string, { tokens_in: number; tokens_out: number; cost_usd_micros: number; attempts: number }>();
+    for (const item of activeTelemetry?.by_adapter ?? []) {
+      map.set(item.key.trim().toLowerCase(), {
+        tokens_in: item.tokens_in ?? 0,
+        tokens_out: item.tokens_out ?? 0,
+        cost_usd_micros: item.cost_usd_micros ?? 0,
+        attempts: item.attempts ?? 0,
+      });
+    }
+    return map;
+  }, [activeTelemetry]);
+
+  // Map agent keys to their active vendor and model for per-agent virtual equivalence
+  const agentVendorModelMap = useMemo(() => {
+    const map = new Map<string, { vendor: string | null; model: string | null }>();
+    for (const ag of healthAgents) {
+      const key = ag.agent.trim().toLowerCase();
+      if (key) {
+        map.set(key, {
+          vendor: ag.hosted_session?.vendor ?? ag.adapter ?? null,
+          model: ag.hosted_session?.model ?? null,
+        });
+      }
+    }
+    for (const sess of sessions) {
+      const key = (sess.persona || sess.id).trim().toLowerCase();
+      if (key && !map.has(key)) {
+        map.set(key, {
+          vendor: sess.adapter ?? null,
+          model: sess.model ?? null,
+        });
+      }
+    }
+    return map;
+  }, [healthAgents, sessions]);
+
+  const summaryVirtualEquivMicros = useMemo(
+    () =>
+      computeTelemetryVirtualEquivMicros(summary?.telemetry, adapterModelsMap),
+    [summary, adapterModelsMap],
+  );
+
+  const activeVirtualEquivMicros = useMemo(
+    () => computeTelemetryVirtualEquivMicros(activeTelemetry, adapterModelsMap),
+    [activeTelemetry, adapterModelsMap],
+  );
+
   const showAlerts = sectionFilter === "all" || sectionFilter === "alerts";
   const showQuotas = sectionFilter === "all" || sectionFilter === "quotas";
   const showLiveness = sectionFilter === "all" || sectionFilter === "liveness";
@@ -857,7 +1067,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             }}
           >
             <div style={{ fontSize: "10px", color: "var(--text-muted)" }}>
-              Spend
+              Spend (Billed / API-Eq)
             </div>
             <div
               className="fd-mono"
@@ -870,6 +1080,20 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               }}
             >
               {formatUsdFromMicros(summary?.telemetry?.totals?.cost_usd_micros)}
+            </div>
+            <div
+              className="fd-mono"
+              data-testid="watch-kpi-virtual-equiv"
+              style={{
+                fontSize: "10px",
+                color: "var(--status-ok, #34D399)",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+              title="Virtual API-equivalent value generated by subscription CLI and API runs"
+            >
+              API Eq: {formatUsdFromMicros(summaryVirtualEquivMicros)}
             </div>
           </div>
 
@@ -1321,6 +1545,56 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         ))}
                       </div>
                     )}
+
+                    {/* Virtual Subscription Value Equivalence row (Record #221) */}
+                    {(() => {
+                      const breakdown = adapterBreakdownMap.get(item.vendor.toLowerCase());
+                      const billedMicros = breakdown?.cost_usd_micros ?? 0;
+                      const tokIn = breakdown?.tokens_in ?? 0;
+                      const tokOut = breakdown?.tokens_out ?? 0;
+                      const rate = resolveCanonicalTokenRate(
+                        item.vendor,
+                        item.models[0] ?? null,
+                      );
+                      const virtualMicros = computeVirtualApiEquivMicros({
+                        tokensIn: tokIn,
+                        tokensOut: tokOut,
+                        costUsdMicros: billedMicros,
+                        vendor: item.vendor,
+                        model: item.models[0] ?? null,
+                      });
+                      return (
+                        <div
+                          data-testid={`watch-vendor-virtual-value-${item.vendor}`}
+                          className="fd-mono"
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "6px",
+                            flexWrap: "wrap",
+                            fontSize: "10px",
+                            color: "var(--text-muted)",
+                            paddingTop: "4px",
+                            borderTop: "1px dashed var(--border-subtle)",
+                          }}
+                        >
+                          <span>
+                            Billed:{" "}
+                            <strong style={{ color: "var(--text-secondary)" }}>
+                              {formatUsdFromMicros(billedMicros)}
+                            </strong>{" "}
+                            · API-Eq:{" "}
+                            <strong style={{ color: "var(--status-ok, #34D399)" }}>
+                              {formatUsdFromMicros(virtualMicros)}
+                            </strong>
+                          </span>
+                          <span title="Canonical per-1M token reference rate">
+                            {rate.label}
+                          </span>
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -1915,6 +2189,29 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     {formatUsdFromMicros(activeTelemetry.totals.cost_usd_micros)}
                   </strong>
                 </span>
+                <span data-testid="watch-rollups-virtual-equiv">
+                  Virtual API-Eq:{" "}
+                  <strong
+                    className="fd-mono"
+                    style={{ color: "var(--status-ok, #34D399)" }}
+                  >
+                    {formatUsdFromMicros(activeVirtualEquivMicros)}
+                  </strong>
+                  {activeVirtualEquivMicros >
+                    (activeTelemetry.totals.cost_usd_micros ?? 0) && (
+                    <span
+                      className="fd-mono"
+                      style={{ color: "var(--text-muted)", marginLeft: "4px" }}
+                    >
+                      (saved{" "}
+                      {formatUsdFromMicros(
+                        activeVirtualEquivMicros -
+                          (activeTelemetry.totals.cost_usd_micros ?? 0),
+                      )}
+                      )
+                    </span>
+                  )}
+                </span>
                 <span>
                   Attempts:{" "}
                   <strong className="fd-mono">
@@ -1959,29 +2256,43 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               >
                 By Project
               </div>
-              {(activeTelemetry?.by_project ?? []).map((proj) => (
-                <div
-                  key={proj.project}
-                  data-testid={`watch-rollup-project-${proj.slug}`}
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-elevated)",
-                    border: "1px solid var(--border-subtle)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    fontSize: "11px",
-                  }}
-                >
-                  <span style={{ fontWeight: 600 }}>{proj.slug}</span>
-                  <span className="fd-mono">
-                    {proj.attempts} attempts ·{" "}
-                    {formatCompactNumber(proj.tokens_in + proj.tokens_out)} tok ·{" "}
-                    {formatUsdFromMicros(proj.cost_usd_micros)}
-                  </span>
-                </div>
-              ))}
+              {(activeTelemetry?.by_project ?? []).map((proj) => {
+                const projVirtualMicros = computeVirtualApiEquivMicros({
+                  tokensIn: proj.tokens_in,
+                  tokensOut: proj.tokens_out,
+                  costUsdMicros: proj.cost_usd_micros,
+                  vendor: "default",
+                });
+                return (
+                  <div
+                    key={proj.project}
+                    data-testid={`watch-rollup-project-${proj.slug}`}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "4px",
+                      backgroundColor: "var(--bg-elevated)",
+                      border: "1px solid var(--border-subtle)",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    <span style={{ fontWeight: 600 }}>{proj.slug}</span>
+                    <span className="fd-mono">
+                      {proj.attempts} attempts ·{" "}
+                      {formatCompactNumber(proj.tokens_in + proj.tokens_out)} tok ·{" "}
+                      {formatUsdFromMicros(proj.cost_usd_micros)}{" "}
+                      <span
+                        data-testid={`watch-rollup-project-virtual-${proj.slug}`}
+                        style={{ color: "var(--status-ok, #34D399)" }}
+                      >
+                        (≈ {formatUsdFromMicros(projVirtualMicros)} API-eq)
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
             </div>
 
             {/* By Vendor / Adapter & Model */}
@@ -2005,6 +2316,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               {(activeTelemetry?.by_adapter ?? []).map((item) => {
                 const models =
                   adapterModelsMap.get(item.key.toLowerCase()) ?? [];
+                const adapterVirtualMicros = computeVirtualApiEquivMicros({
+                  tokensIn: item.tokens_in,
+                  tokensOut: item.tokens_out,
+                  costUsdMicros: item.cost_usd_micros,
+                  vendor: item.key,
+                  model: models[0] ?? null,
+                });
                 return (
                   <div
                     key={item.key}
@@ -2027,7 +2345,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     <span className="fd-mono">
                       {item.attempts} attempts ·{" "}
                       {formatCompactNumber(item.tokens_in + item.tokens_out)} tok ·{" "}
-                      {formatUsdFromMicros(item.cost_usd_micros)}
+                      {formatUsdFromMicros(item.cost_usd_micros)}{" "}
+                      <span
+                        data-testid={`watch-rollup-adapter-virtual-${item.key}`}
+                        style={{ color: "var(--status-ok, #34D399)" }}
+                      >
+                        (≈ {formatUsdFromMicros(adapterVirtualMicros)} API-eq)
+                      </span>
                     </span>
                   </div>
                 );
@@ -2052,29 +2376,45 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
               >
                 By Agent
               </div>
-              {(activeTelemetry?.by_agent ?? []).map((item) => (
-                <div
-                  key={item.key}
-                  data-testid={`watch-rollup-agent-${item.key}`}
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-elevated)",
-                    border: "1px solid var(--border-subtle)",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    fontSize: "11px",
-                  }}
-                >
-                  <span style={{ fontWeight: 600 }}>{item.key}</span>
-                  <span className="fd-mono">
-                    {item.attempts} attempts ·{" "}
-                    {formatCompactNumber(item.tokens_in + item.tokens_out)} tok ·{" "}
-                    {formatUsdFromMicros(item.cost_usd_micros)}
-                  </span>
-                </div>
-              ))}
+              {(activeTelemetry?.by_agent ?? []).map((item) => {
+                const agentInfo = agentVendorModelMap.get(item.key.toLowerCase());
+                const agentVirtualMicros = computeVirtualApiEquivMicros({
+                  tokensIn: item.tokens_in,
+                  tokensOut: item.tokens_out,
+                  costUsdMicros: item.cost_usd_micros,
+                  vendor: agentInfo?.vendor ?? "default",
+                  model: agentInfo?.model ?? null,
+                });
+                return (
+                  <div
+                    key={item.key}
+                    data-testid={`watch-rollup-agent-${item.key}`}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "4px",
+                      backgroundColor: "var(--bg-elevated)",
+                      border: "1px solid var(--border-subtle)",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    <span style={{ fontWeight: 600 }}>{item.key}</span>
+                    <span className="fd-mono">
+                      {item.attempts} attempts ·{" "}
+                      {formatCompactNumber(item.tokens_in + item.tokens_out)} tok ·{" "}
+                      {formatUsdFromMicros(item.cost_usd_micros)}{" "}
+                      <span
+                        data-testid={`watch-rollup-agent-virtual-${item.key}`}
+                        style={{ color: "var(--status-ok, #34D399)" }}
+                      >
+                        (≈ {formatUsdFromMicros(agentVirtualMicros)} API-eq)
+                      </span>
+                    </span>
+                  </div>
+                );
+              })}
             </div>
 
             {/* Failure Streaks */}
