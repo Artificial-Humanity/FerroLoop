@@ -642,6 +642,15 @@ fn deliver_to_muse_route(
         }
     }
 
+    // A route made from a live tmux window has no session id until Muse writes a transcript.
+    // `muse exec --session-id ""` would start a stray session, so refuse it.
+    if session_id.trim().is_empty() {
+        return Err(
+            "muse route has no session id yet and its tmux window is not live, so the prompt \
+             cannot be delivered"
+                .to_string(),
+        );
+    }
     let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("muse"));
@@ -1925,6 +1934,12 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     updated
 }
 
+/// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
+/// being unset) must hold this lock for the whole test, including the earlier vendor dispatch that
+/// treats a set tmux bin as permission to use tmux.
+#[cfg(test)]
+pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,11 +1949,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux
-    /// must hold this lock for the whole test, including the earlier vendor
-    /// dispatch that treats a set tmux bin as permission to use tmux.
-    static TMUX_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Antigravity reset reads `FL_WIRE_AGY_BIN`, `ANTIGRAVITY_LS_ADDRESS`, and
     /// `ANTIGRAVITY_CSRF_TOKEN`. Tests that change those variables hold this lock
@@ -2406,6 +2416,73 @@ mod tests {
         );
         assert_eq!(updated.len(), 1);
         updated.into_iter().next().unwrap()
+    }
+
+    /// A `muse` stand-in that records that it ran. A regression that reaches `muse exec` runs
+    /// this script, never the real binary.
+    fn write_marker_muse(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = dir.join("muse-ran");
+        let bin = dir.join("marker-muse.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, marker)
+    }
+
+    fn muse_route_without_session_id() -> VendorRoute {
+        VendorRoute::Muse {
+            session_id: String::new(),
+            cwd: None,
+            tmux_target: Some("Kacey:muse".into()),
+            tmux_pane: None,
+        }
+    }
+
+    #[test]
+    fn a_muse_route_without_a_session_id_is_pasted_into_its_live_window() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (muse_bin, muse_marker) = write_marker_muse(tmp.path());
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let _muse = EnvGuard::set("FL_WIRE_MUSE_BIN", &muse_bin);
+
+        dispatch_operator_prompt_to_route(&muse_route_without_session_id(), "owner", "hello")
+            .unwrap();
+
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("display-message -p -t Kacey:muse"), "{cmds}");
+        assert!(fs::read_to_string(&tmux_stdin).unwrap().contains("hello"));
+        assert!(!muse_marker.exists(), "muse exec ran");
+    }
+
+    #[test]
+    fn a_muse_route_without_a_session_id_never_reaches_muse_exec() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // The window is not live, so the paste fails over to `muse exec --session-id ""`.
+        let (tmux_bin, _, _) = write_fake_tmux(tmp.path(), false);
+        let (muse_bin, muse_marker) = write_marker_muse(tmp.path());
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let _muse = EnvGuard::set("FL_WIRE_MUSE_BIN", &muse_bin);
+
+        let err =
+            dispatch_operator_prompt_to_route(&muse_route_without_session_id(), "owner", "hello")
+                .unwrap_err();
+
+        assert!(err.contains("no session id yet"), "{err}");
+        assert!(
+            !muse_marker.exists(),
+            "muse exec ran with an empty session id"
+        );
     }
 
     #[test]
