@@ -182,15 +182,29 @@ export type McpCatalogRepoStatus =
   | "synced"
   | "drift"
   | "missing"
+  | "error"
   | "not-checked";
+
+export interface McpCatalogChange {
+  vendor: string;
+  server: string;
+  action: "add" | "update" | "remove";
+}
 
 export interface McpCatalogRepoRow {
   repo: string;
+  root?: string;
   catalog_path: string;
   status: McpCatalogRepoStatus;
   deduplicated_daemons: string[];
   active_vendor_sessions: number | null;
   spawned_mcp_processes: number | null;
+  enabled_servers?: string[] | null;
+  vendors?: Record<string, "synced" | "drift" | "refused"> | null;
+  changes?: McpCatalogChange[] | null;
+  catalog_digest?: string | null;
+  error?: string | null;
+  refusals?: string[];
 }
 
 export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
@@ -201,6 +215,11 @@ export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
     deduplicated_daemons: [],
     active_vendor_sessions: null,
     spawned_mcp_processes: null,
+    enabled_servers: null,
+    changes: null,
+    catalog_digest: null,
+    error: null,
+    refusals: [],
   },
   {
     repo: "AI-Lab-AMD",
@@ -209,6 +228,11 @@ export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
     deduplicated_daemons: [],
     active_vendor_sessions: null,
     spawned_mcp_processes: null,
+    enabled_servers: null,
+    changes: null,
+    catalog_digest: null,
+    error: null,
+    refusals: [],
   },
   {
     repo: "Sonora",
@@ -217,6 +241,11 @@ export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
     deduplicated_daemons: [],
     active_vendor_sessions: null,
     spawned_mcp_processes: null,
+    enabled_servers: null,
+    changes: null,
+    catalog_digest: null,
+    error: null,
+    refusals: [],
   },
 ];
 
@@ -379,22 +408,68 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   >(null);
   const [vaultConsumersBusy, setVaultConsumersBusy] = useState(false);
 
+  const normalizeMcpCatalogRow = (
+    raw: Partial<McpCatalogRepoRow> & { repo: string; catalog_path: string },
+  ): McpCatalogRepoRow => ({
+    repo: raw.repo,
+    root: raw.root,
+    catalog_path: raw.catalog_path,
+    status: raw.status ?? "not-checked",
+    deduplicated_daemons: Array.isArray(raw.deduplicated_daemons)
+      ? raw.deduplicated_daemons
+      : [],
+    active_vendor_sessions:
+      typeof raw.active_vendor_sessions === "number"
+        ? raw.active_vendor_sessions
+        : null,
+    spawned_mcp_processes:
+      typeof raw.spawned_mcp_processes === "number"
+        ? raw.spawned_mcp_processes
+        : null,
+    enabled_servers: Array.isArray(raw.enabled_servers)
+      ? raw.enabled_servers
+      : null,
+    vendors:
+      raw.vendors && typeof raw.vendors === "object" ? raw.vendors : null,
+    changes: Array.isArray(raw.changes) ? raw.changes : null,
+    catalog_digest:
+      typeof raw.catalog_digest === "string" &&
+      raw.catalog_digest.trim().length > 0
+        ? raw.catalog_digest.trim()
+        : null,
+    error: typeof raw.error === "string" ? raw.error : null,
+    refusals: Array.isArray(raw.refusals) ? raw.refusals : [],
+  });
+
+  const fetchMcpCatalogFromHub = async (): Promise<boolean> => {
+    if (typeof globalThis.fetch !== "function") {
+      return false;
+    }
+    const res = await globalThis.fetch("/api/v1/mcp/catalog");
+    if (!res || !res.ok) {
+      return false;
+    }
+    const json = (await res.json()) as {
+      repos?: Array<
+        Partial<McpCatalogRepoRow> & { repo: string; catalog_path: string }
+      >;
+    };
+    if (json && Array.isArray(json.repos) && json.repos.length > 0) {
+      setMcpCatalogRepos(json.repos.map(normalizeMcpCatalogRow));
+    }
+    setMcpCatalogVerified(true);
+    return true;
+  };
+
   const handleCheckMcpCatalog = async () => {
     setMcpCatalogBusy(true);
     try {
-      if (typeof globalThis.fetch === "function") {
-        const res = await globalThis.fetch("/api/v1/mcp/catalog");
-        if (res && res.ok) {
-          const json = (await res.json()) as { repos?: McpCatalogRepoRow[] };
-          if (json && Array.isArray(json.repos) && json.repos.length > 0) {
-            setMcpCatalogRepos(json.repos);
-          }
-          setMcpCatalogVerified(true);
-          setMcpCatalogBanner(
-            "Checked committed .fl/mcp.toml catalogs across workspace repositories (fl mcp check).",
-          );
-          return;
-        }
+      const ok = await fetchMcpCatalogFromHub();
+      if (ok) {
+        setMcpCatalogBanner(
+          "Checked committed .fl/mcp.toml catalogs across workspace repositories (fl mcp check).",
+        );
+        return;
       }
       setMcpCatalogBanner(
         "Catalog check failed: backend /api/v1/mcp/catalog unavailable (showing unverified state).",
@@ -408,37 +483,126 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
     }
   };
 
-  const handleSyncMcpCatalog = async () => {
+  const syncableMcpRepos = mcpCatalogRepos.filter(
+    (
+      row,
+    ): row is McpCatalogRepoRow & {
+      catalog_digest: string;
+    } =>
+      typeof row.catalog_digest === "string" &&
+      row.catalog_digest.trim().length > 0,
+  );
+
+  const handleSyncMcpCatalog = async (targetRepo?: string) => {
+    const targets = targetRepo
+      ? syncableMcpRepos.filter((row) => row.repo === targetRepo)
+      : syncableMcpRepos;
+    if (targets.length === 0) {
+      setMcpCatalogBanner(
+        "Sync refused: run Check Catalog (fl mcp check) first to obtain a catalog_digest before syncing.",
+      );
+      return;
+    }
     setMcpCatalogBusy(true);
     try {
-      if (typeof globalThis.fetch === "function") {
+      if (typeof globalThis.fetch !== "function") {
+        setMcpCatalogBanner(
+          "Sync failed: backend /api/v1/mcp/sync unavailable",
+        );
+        return;
+      }
+      for (const row of targets) {
         const res = await globalThis.fetch("/api/v1/mcp/sync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            repo: row.repo,
+            expect_digest: row.catalog_digest,
+          }),
         });
-        if (res && res.ok) {
-          try {
-            const json = (await res.json()) as { repos?: McpCatalogRepoRow[] };
-            if (json && Array.isArray(json.repos) && json.repos.length > 0) {
-              setMcpCatalogRepos(json.repos);
-            } else {
-              setMcpCatalogRepos((prev) =>
-                prev.map((row) => ({ ...row, status: "synced" })),
-              );
+        if (!res || !res.ok) {
+          let errDetail = "backend /api/v1/mcp/sync unavailable";
+          if (res) {
+            try {
+              const errJson = (await res.json()) as { error?: string };
+              if (typeof errJson?.error === "string" && errJson.error.trim()) {
+                errDetail = errJson.error.trim();
+              }
+            } catch {
+              // ignore non-JSON body on non-2xx
             }
-          } catch {
-            setMcpCatalogRepos((prev) =>
-              prev.map((row) => ({ ...row, status: "synced" })),
-            );
           }
-          setMcpCatalogVerified(true);
+          setMcpCatalogBanner(`Sync failed: ${errDetail}`);
+          return;
+        }
+        interface McpSyncRepoEntry {
+          repo?: string;
+          status_before?: McpCatalogRepoStatus;
+          status_after?: McpCatalogRepoStatus;
+          written?: string[];
+          note?: string;
+          error?: string;
+          refusals?: string[];
+        }
+        interface McpSyncResponsePayload {
+          ok?: boolean;
+          error?: string;
+          repos?: McpSyncRepoEntry[];
+        }
+        let data: McpSyncResponsePayload;
+        try {
+          data = (await res.json()) as McpSyncResponsePayload;
+        } catch {
           setMcpCatalogBanner(
-            "Synced all vendor MCP configs to committed .fl/mcp.toml catalogs (fl mcp sync).",
+            "Sync failed: invalid JSON response from /api/v1/mcp/sync",
           );
           return;
         }
+        const repoFailure = Array.isArray(data.repos)
+          ? data.repos.find(
+              (r: McpSyncRepoEntry) =>
+                typeof r.error === "string" && r.error.trim().length > 0,
+            )
+          : undefined;
+        if (
+          data.ok === false ||
+          (typeof data.error === "string" && data.error.trim().length > 0) ||
+          repoFailure
+        ) {
+          const failureReason =
+            (typeof data.error === "string" && data.error.trim()) ||
+            repoFailure?.error?.trim() ||
+            "compare-and-swap sync rejected";
+          if (repoFailure) {
+            setMcpCatalogRepos((prev) =>
+              prev.map((existing) =>
+                existing.repo === (repoFailure.repo ?? row.repo)
+                  ? {
+                      ...existing,
+                      status:
+                        repoFailure.status_after &&
+                        repoFailure.status_after !== "synced"
+                          ? repoFailure.status_after
+                          : existing.status === "synced"
+                            ? "error"
+                            : existing.status,
+                      error: repoFailure.error ?? failureReason,
+                      refusals: Array.isArray(repoFailure.refusals)
+                        ? repoFailure.refusals
+                        : existing.refusals,
+                    }
+                  : existing,
+              ),
+            );
+          }
+          setMcpCatalogBanner(`Sync failed: ${failureReason}`);
+          return;
+        }
       }
-      setMcpCatalogBanner("Sync failed: backend /api/v1/mcp/sync unavailable");
+      await fetchMcpCatalogFromHub();
+      setMcpCatalogBanner(
+        "Synced all vendor MCP configs to committed .fl/mcp.toml catalogs (fl mcp sync).",
+      );
     } catch {
       setMcpCatalogBanner("Sync failed: backend /api/v1/mcp/sync unavailable");
     } finally {
@@ -1458,15 +1622,21 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                     mcpCatalogVerified &&
                     mcpCatalogRepos.every((r) => r.status === "synced")
                       ? "#34D399"
-                      : "#FBBF24",
+                      : mcpCatalogVerified &&
+                          mcpCatalogRepos.some((r) => r.status === "error")
+                        ? "#F87171"
+                        : "#FBBF24",
                 }}
               >
                 {mcpCatalogVerified &&
                 mcpCatalogRepos.every((r) => r.status === "synced")
                   ? "Verified · Committed .fl/mcp.toml Catalogs Synced"
-                  : mcpCatalogVerified
-                    ? "Catalog Drift / Missing Detected"
-                    : "Unverified (offline preview — run fl mcp check)"}
+                  : mcpCatalogVerified &&
+                      mcpCatalogRepos.some((r) => r.status === "error")
+                    ? "Catalog Error / Refusal Detected"
+                    : mcpCatalogVerified
+                      ? "Catalog Drift / Missing Detected"
+                      : "Unverified (offline preview — run fl mcp check)"}
               </span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
@@ -1483,7 +1653,12 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 type="button"
                 className="fd-btn fd-btn-primary"
                 data-testid="mcp-catalog-sync-btn"
-                disabled={mcpCatalogBusy}
+                disabled={mcpCatalogBusy || syncableMcpRepos.length === 0}
+                title={
+                  syncableMcpRepos.length === 0
+                    ? "Run Check Catalog (fl mcp check) first to obtain a catalog_digest for compare-and-swap sync"
+                    : "Sync vendor MCP configs using compare-and-swap catalog_digest"
+                }
                 onClick={() => void handleSyncMcpCatalog()}
               >
                 Sync Configs (`fl mcp sync`)
@@ -1498,9 +1673,11 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               className="fd-card"
               style={{
                 fontSize: "12px",
-                color: mcpCatalogBanner.includes("failed")
-                  ? "#FBBF24"
-                  : "#34D399",
+                color:
+                  mcpCatalogBanner.includes("failed") ||
+                  mcpCatalogBanner.includes("refused")
+                    ? "#FBBF24"
+                    : "#34D399",
                 padding: "6px 10px",
               }}
             >
@@ -1516,50 +1693,136 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               data-status={row.status}
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "10px",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                gap: "8px",
                 fontSize: "12px",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                <strong className="fd-mono">{row.repo}</strong>
-                <code className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                  {row.catalog_path}
-                </code>
-                <span className="fd-badge fd-mono">
-                  daemons:{" "}
-                  {row.deduplicated_daemons.length > 0
-                    ? row.deduplicated_daemons.join(", ")
-                    : "unverified"}
-                </span>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <strong className="fd-mono">{row.repo}</strong>
+                  <code className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    {row.catalog_path}
+                  </code>
+                  <span className="fd-badge fd-mono">
+                    daemons:{" "}
+                    {(row.deduplicated_daemons ?? []).length > 0
+                      ? (row.deduplicated_daemons ?? []).join(", ")
+                      : "unverified"}
+                  </span>
+                  {row.enabled_servers && row.enabled_servers.length > 0 && (
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`mcp-catalog-repo-enabled-${row.repo}`}
+                    >
+                      enabled: {row.enabled_servers.join(", ")}
+                    </span>
+                  )}
+                  {row.catalog_digest && (
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`mcp-catalog-repo-digest-${row.repo}`}
+                      title={row.catalog_digest}
+                    >
+                      digest: {row.catalog_digest.slice(0, 12)}…
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`mcp-catalog-repo-dedup-stats-${row.repo}`}
+                  >
+                    {row.active_vendor_sessions !== null &&
+                    row.spawned_mcp_processes !== null
+                      ? `sessions: ${row.active_vendor_sessions} · shared procs: ${row.spawned_mcp_processes}`
+                      : "sessions: unverified · shared procs: unverified"}
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`mcp-catalog-repo-status-${row.repo}`}
+                    style={{
+                      color:
+                        row.status === "synced"
+                          ? "#34D399"
+                          : row.status === "drift" || row.status === "not-checked"
+                            ? "#FBBF24"
+                            : "#F87171",
+                    }}
+                  >
+                    {row.status}
+                  </span>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid={`mcp-catalog-repo-sync-btn-${row.repo}`}
+                    disabled={mcpCatalogBusy || !row.catalog_digest}
+                    onClick={() => void handleSyncMcpCatalog(row.repo)}
+                    style={{ padding: "2px 8px", fontSize: "11px" }}
+                  >
+                    Sync Repo
+                  </button>
+                </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-                <span
-                  className="fd-badge fd-mono"
-                  data-testid={`mcp-catalog-repo-dedup-stats-${row.repo}`}
-                >
-                  {row.active_vendor_sessions !== null &&
-                  row.spawned_mcp_processes !== null
-                    ? `sessions: ${row.active_vendor_sessions} · shared procs: ${row.spawned_mcp_processes}`
-                    : "sessions: unverified · shared procs: unverified"}
-                </span>
-                <span
-                  className="fd-badge fd-mono"
-                  data-testid={`mcp-catalog-repo-status-${row.repo}`}
+
+              {row.changes && row.changes.length > 0 && (
+                <div
+                  data-testid={`mcp-catalog-repo-changes-${row.repo}`}
                   style={{
-                    color:
-                      row.status === "synced"
-                        ? "#34D399"
-                        : row.status === "drift" || row.status === "not-checked"
-                          ? "#FBBF24"
-                          : "#F87171",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
                   }}
                 >
-                  {row.status}
-                </span>
-              </div>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Planned changes:
+                  </span>
+                  {row.changes.map((chg, idx) => (
+                    <span
+                      key={`${chg.vendor}-${chg.server}-${chg.action}-${idx}`}
+                      className="fd-badge fd-mono"
+                    >
+                      {chg.vendor}:{chg.server} ({chg.action})
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {(row.error || (row.refusals && row.refusals.length > 0)) && (
+                <div
+                  data-testid={`mcp-catalog-repo-error-${row.repo}`}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "4px",
+                    color: "#F87171",
+                    fontSize: "11px",
+                  }}
+                >
+                  {row.error && <span>Error: {row.error}</span>}
+                  {row.refusals && row.refusals.length > 0 && (
+                    <ul
+                      data-testid={`mcp-catalog-repo-refusals-${row.repo}`}
+                      style={{ margin: 0, paddingLeft: "16px" }}
+                    >
+                      {row.refusals.map((refusal, idx) => (
+                        <li key={idx} className="fd-mono">
+                          {refusal}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
           ))}
         </div>
