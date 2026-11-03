@@ -598,6 +598,9 @@ export interface SpinUpSessionRequest {
   node_id?: string;
   hosted?: boolean;
   cwd?: string;
+  worktree_policy?: "create" | "reuse" | "shared";
+  allocated_port?: number;
+  allocated_vite_port?: number;
 }
 
 export interface SpinUpSessionResponse {
@@ -843,6 +846,27 @@ export interface PrMergeResponse {
   policy: unknown;
 }
 
+export type CommitteeVoteVerdict =
+  | "APPROVE"
+  | "APPROVE WITH AMENDMENTS"
+  | "BLOCK"
+  | "PENDING";
+
+export interface WireDelegateMetadata {
+  target_record: string;
+  deliverable: string;
+  branch_or_pr?: string | null;
+  resume_on_reply: boolean;
+}
+
+export interface WireCommitteeMetadata {
+  council_track: string;
+  quorum: string;
+  artifact_path: string;
+  artifact_sha256?: string | null;
+  votes?: Record<string, CommitteeVoteVerdict>;
+}
+
 export interface WireMessage {
   id: string;
   thread_id: string;
@@ -852,13 +876,25 @@ export interface WireMessage {
   sender_name: string;
   sender_host?: string | null;
   to: string;
-  kind: "mail" | "ask" | "reply" | "handoff" | "task_offer" | "approval_request" | "system" | string;
+  kind:
+    | "mail"
+    | "ask"
+    | "reply"
+    | "handoff"
+    | "task_offer"
+    | "approval_request"
+    | "delegate"
+    | "committee"
+    | "system"
+    | string;
   urgency: "normal" | "urgent" | string;
   durable: boolean;
   subject: string;
   body: string;
   created_at: string;
   deadline_at?: string | null;
+  delegate_meta?: WireDelegateMetadata | null;
+  committee_meta?: WireCommitteeMetadata | null;
 }
 
 export interface WireReceipt {
@@ -890,6 +926,8 @@ export interface WireSendRequest {
   durable?: boolean;
   reply_to?: string;
   thread_id?: string;
+  delegate_meta?: WireDelegateMetadata | null;
+  committee_meta?: WireCommitteeMetadata | null;
 }
 
 export interface WireSendResponse {

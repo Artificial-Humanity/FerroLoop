@@ -2809,7 +2809,61 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               )}
             </div>
 
-            {/* System Artifacts Directory (Issue #207) */}
+            {/* Hub Home Directory & System Artifacts Directory (Issue #207) */}
+            <div
+              data-testid="settings-system-home-dir-row"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: "12.5px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Hub Home Directory
+                </h3>
+                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                  Root hub directory (<code className="fd-mono">[home]</code>);
+                  stores state, logs, and default{" "}
+                  <code className="fd-mono">[home]/artifacts/[project-name]</code>{" "}
+                  hierarchy.
+                </span>
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <code
+                  data-testid="settings-system-home-dir-value"
+                  className="fd-badge fd-mono"
+                  style={{ fontSize: "11.5px", padding: "4px 8px" }}
+                >
+                  {settings.home_dir || "~/.local/share/fl"}
+                </code>
+                <span
+                  data-testid="settings-system-home-hierarchy-badge"
+                  className="fd-badge fd-mono"
+                  style={{ fontSize: "10.5px" }}
+                >
+                  [home]/artifacts/[project-name]
+                </span>
+              </div>
+            </div>
+
             <div
               data-testid="settings-system-artifacts-dir-row"
               style={{

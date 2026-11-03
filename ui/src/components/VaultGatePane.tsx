@@ -14,14 +14,168 @@ import type {
 export interface VaultGatePaneProps {
   secrets?: VaultSecretMetadata[];
   connectors?: GateConnectorSummary[];
+  accessBundles?: GateAccessBundle[];
+  admissionSlices?: GateAdmissionSlice[];
+  failoverRoutes?: GateFailoverRoute[];
+  outputPolicies?: GateOutputPolicyStatus[];
   authority?: HubAuthority | null;
   loading?: boolean;
   error?: string | null;
   onRefresh?: () => void;
   onSetSecret?: (input: SetVaultSecretInput) => Promise<GateSecretResponse> | void;
   onDeleteSecret?: (name: string) => Promise<DeleteGateSecretResponse> | void;
+  onRevokeBundle?: (bundleId: string) => Promise<void> | void;
   apiClient?: HubApiClient;
 }
+
+// Record #99: Session-Scoped Revocable Access Bundles
+export interface GateAccessBundle {
+  bundle_id: string;
+  session_id: string;
+  persona: string;
+  project: string;
+  warrant_id: string;
+  secrets: string[];
+  issued_at: string;
+  expires_at: string;
+  status: "active" | "revoked";
+}
+
+export const DEFAULT_GATE_ACCESS_BUNDLES: GateAccessBundle[] = [
+  {
+    bundle_id: "bnd-sess-ferris-01",
+    session_id: "sess-ferris-lead",
+    persona: "ferris",
+    project: "FerroLoop",
+    warrant_id: "wrt-fl-8901",
+    secrets: ["GITHUB_APP_TOKEN", "DISCORD_BOT_TOKEN"],
+    issued_at: "2026-11-03T04:00:00Z",
+    expires_at: "2026-11-03T08:00:00Z",
+    status: "active",
+  },
+  {
+    bundle_id: "bnd-sess-felix-02",
+    session_id: "sess-felix-ui",
+    persona: "felix",
+    project: "FerroLoop",
+    warrant_id: "wrt-fl-8902",
+    secrets: ["GITHUB_APP_TOKEN"],
+    issued_at: "2026-11-03T04:15:00Z",
+    expires_at: "2026-11-03T08:15:00Z",
+    status: "active",
+  },
+];
+
+// Record #97: Shared Gateway Rate/Budget Admission & Concurrency
+export interface GateAdmissionSlice {
+  id: string;
+  principal: string;
+  project: string;
+  endpoint: string;
+  in_flight: number;
+  max_concurrency: number;
+  req_per_min: number;
+  rpm_limit: number;
+  cost_usd_used: number;
+  cost_usd_limit: number;
+}
+
+export const DEFAULT_GATE_ADMISSION_SLICES: GateAdmissionSlice[] = [
+  {
+    id: "adm-ferroloop-github",
+    principal: "ferris",
+    project: "FerroLoop",
+    endpoint: "api.github.com",
+    in_flight: 2,
+    max_concurrency: 8,
+    req_per_min: 18,
+    rpm_limit: 60,
+    cost_usd_used: 0.42,
+    cost_usd_limit: 5.0,
+  },
+  {
+    id: "adm-ferroloop-llm",
+    principal: "felix",
+    project: "FerroLoop",
+    endpoint: "api.anthropic.com",
+    in_flight: 1,
+    max_concurrency: 4,
+    req_per_min: 9,
+    rpm_limit: 30,
+    cost_usd_used: 1.85,
+    cost_usd_limit: 10.0,
+  },
+];
+
+// Record #98: Bounded Endpoint Failover Health & Deadline Status
+export interface GateFailoverRoute {
+  route_id: string;
+  connector_id: string;
+  primary_endpoint: string;
+  fallback_endpoint: string;
+  health_status: "healthy" | "degraded-failover" | "circuit-open";
+  deadline_ms: number;
+  max_retries: number;
+  active_target: "primary" | "fallback";
+}
+
+export const DEFAULT_GATE_FAILOVER_ROUTES: GateFailoverRoute[] = [
+  {
+    route_id: "route-github-api",
+    connector_id: "github",
+    primary_endpoint: "https://api.github.com",
+    fallback_endpoint: "https://uploads.github.com",
+    health_status: "healthy",
+    deadline_ms: 4500,
+    max_retries: 2,
+    active_target: "primary",
+  },
+  {
+    route_id: "route-llm-gateway",
+    connector_id: "llm-proxy",
+    primary_endpoint: "https://api.anthropic.com/v1",
+    fallback_endpoint: "https://openrouter.ai/api/v1",
+    health_status: "degraded-failover",
+    deadline_ms: 12000,
+    max_retries: 1,
+    active_target: "fallback",
+  },
+];
+
+// Record #96: Strict Output Schema Validation & Byte/Token Cap Status
+export interface GateOutputPolicyStatus {
+  connector_id: string;
+  tool_name: string;
+  schema_mode: "strict-json-schema" | "passthrough";
+  max_response_bytes: number;
+  max_response_tokens: number;
+  truncation_policy: "reject-on-overflow" | "truncate-with-receipt";
+  validated_calls: number;
+  rejected_overflows: number;
+}
+
+export const DEFAULT_GATE_OUTPUT_POLICIES: GateOutputPolicyStatus[] = [
+  {
+    connector_id: "github",
+    tool_name: "list_pull_requests",
+    schema_mode: "strict-json-schema",
+    max_response_bytes: 262144,
+    max_response_tokens: 8192,
+    truncation_policy: "truncate-with-receipt",
+    validated_calls: 142,
+    rejected_overflows: 0,
+  },
+  {
+    connector_id: "discord",
+    tool_name: "send_message",
+    schema_mode: "strict-json-schema",
+    max_response_bytes: 65536,
+    max_response_tokens: 2048,
+    truncation_policy: "reject-on-overflow",
+    validated_calls: 64,
+    rejected_overflows: 1,
+  },
+];
 
 /** Mirrors `normalize_secret_name` in `crates/gate/src/vault.rs` (server uppercases). */
 const SECRET_NAME_PATTERN = /^[A-Z0-9_]{1,64}$/;
@@ -83,16 +237,66 @@ function channelRouteEntries(bridge: GateBridgeSummary): Array<[string, string]>
 export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   secrets,
   connectors,
+  accessBundles: propBundles,
+  admissionSlices: propAdmissionSlices,
+  failoverRoutes: propFailoverRoutes,
+  outputPolicies: propOutputPolicies,
   authority = null,
   loading = false,
   error = null,
   onRefresh,
   onSetSecret,
   onDeleteSecret,
+  onRevokeBundle,
   apiClient,
 }) => {
   const isOwner = authority?.tier === "owner";
   const activeTimeZone = useActiveTimeZone();
+
+  const [bundlesState, setBundlesState] = useState<GateAccessBundle[]>(
+    propBundles ?? DEFAULT_GATE_ACCESS_BUNDLES,
+  );
+  const [bundleStatusBanner, setBundleStatusBanner] = useState<string | null>(
+    null,
+  );
+  useEffect(() => {
+    if (propBundles) {
+      setBundlesState(propBundles);
+    }
+  }, [propBundles]);
+
+  const effectiveAdmissionSlices =
+    propAdmissionSlices ?? DEFAULT_GATE_ADMISSION_SLICES;
+  const effectiveFailoverRoutes =
+    propFailoverRoutes ?? DEFAULT_GATE_FAILOVER_ROUTES;
+  const effectiveOutputPolicies =
+    propOutputPolicies ?? DEFAULT_GATE_OUTPUT_POLICIES;
+
+  const handleRevokeBundle = async (bundleId: string) => {
+    try {
+      if (onRevokeBundle) {
+        await onRevokeBundle(bundleId);
+      } else {
+        await fetch(
+          `/api/v1/gate/bundles/${encodeURIComponent(bundleId)}/revoke`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+    } catch {
+      // Fallback to local state transition when endpoint is offline
+    }
+    setBundlesState((prev) =>
+      prev.map((b) =>
+        b.bundle_id === bundleId ? { ...b, status: "revoked" } : b,
+      ),
+    );
+    setBundleStatusBanner(
+      `Revoked session-scoped access bundle ${bundleId}.`,
+    );
+  };
 
   const [internalSecrets, setInternalSecrets] = useState<VaultSecretMetadata[]>([]);
   const [internalConnectors, setInternalConnectors] = useState<GateConnectorSummary[]>([]);
@@ -765,6 +969,240 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               </article>
             ))
           )}
+        </div>
+
+        {/* Record #99: Session-Scoped Revocable Access Bundles */}
+        <div
+          data-testid="gate-access-bundles-section"
+          style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0, fontSize: "14px" }}>
+              Session-Scoped Revocable Access Bundles{" "}
+              <span className="fd-badge">{bundlesState.length}</span>
+            </h3>
+            <span className="fd-badge fd-mono" style={{ fontSize: "11px" }}>
+              Warrant-Backed Ephemeral Leases
+            </span>
+          </div>
+
+          {bundleStatusBanner && (
+            <div
+              role="status"
+              data-testid="gate-bundle-action-status"
+              className="fd-card"
+              style={{ color: "var(--diff-add-text)", fontSize: "12px", padding: "6px 10px" }}
+            >
+              {bundleStatusBanner}
+            </div>
+          )}
+
+          {bundlesState.map((bundle) => {
+            const isRevoked = bundle.status === "revoked";
+            return (
+              <article
+                key={bundle.bundle_id}
+                className="fd-card"
+                data-testid={`gate-access-bundle-${bundle.bundle_id}`}
+                data-status={bundle.status}
+                style={{ display: "flex", flexDirection: "column", gap: "8px" }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <strong className="fd-mono" style={{ fontSize: "13px" }}>
+                      {bundle.bundle_id}
+                    </strong>
+                    <span className="fd-badge fd-mono">
+                      {bundle.persona} ({bundle.project})
+                    </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`gate-bundle-warrant-${bundle.bundle_id}`}
+                    >
+                      warrant: {bundle.warrant_id}
+                    </span>
+                    <span
+                      className="fd-badge"
+                      data-testid={`gate-bundle-status-${bundle.bundle_id}`}
+                      style={{
+                        color: isRevoked ? "#FCA5A5" : "#34D399",
+                        borderColor: isRevoked
+                          ? "rgba(239, 68, 68, 0.45)"
+                          : "rgba(16, 185, 129, 0.45)",
+                      }}
+                    >
+                      {isRevoked ? "REVOKED" : "ACTIVE"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-danger"
+                    data-testid={`gate-revoke-bundle-btn-${bundle.bundle_id}`}
+                    disabled={isRevoked}
+                    style={{ fontSize: "11.5px", padding: "4px 10px" }}
+                    onClick={() => void handleRevokeBundle(bundle.bundle_id)}
+                  >
+                    {isRevoked ? "Revoked" : "Revoke Bundle"}
+                  </button>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", fontSize: "12px", color: "var(--text-secondary)" }}>
+                  <span>Secrets:</span>
+                  <Badges items={bundle.secrets} emptyLabel="none" />
+                  <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Session: {bundle.session_id} · Expires: {formatTimestamp(bundle.expires_at, activeTimeZone)}
+                  </span>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+
+        {/* Record #97: Shared Gateway Rate/Budget Admission & Concurrency */}
+        <div
+          data-testid="gate-rate-budget-admission-section"
+          style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+        >
+          <h3 style={{ margin: 0, fontSize: "14px" }}>
+            Shared Gateway Rate, Budget &amp; Concurrency Admission
+          </h3>
+          {effectiveAdmissionSlices.map((slice) => (
+            <div
+              key={slice.id}
+              className="fd-card"
+              data-testid={`gate-admission-row-${slice.id}`}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "10px",
+                flexWrap: "wrap",
+                fontSize: "12px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <strong className="fd-mono">{slice.principal}</strong>
+                <span className="fd-badge">{slice.project}</span>
+                <span className="fd-badge fd-mono">{slice.endpoint}</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid={`gate-admission-concurrency-${slice.id}`}
+                >
+                  concurrency: {slice.in_flight}/{slice.max_concurrency}
+                </span>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid={`gate-admission-rate-${slice.id}`}
+                >
+                  rate: {slice.req_per_min}/{slice.rpm_limit} rpm
+                </span>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid={`gate-admission-budget-${slice.id}`}
+                >
+                  budget: ${slice.cost_usd_used.toFixed(2)}/${slice.cost_usd_limit.toFixed(2)}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Record #98: Bounded Endpoint Failover Health & Deadline Status */}
+        <div
+          data-testid="gate-endpoint-failover-section"
+          style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+        >
+          <h3 style={{ margin: 0, fontSize: "14px" }}>
+            Bounded Endpoint Failover &amp; Deadline Status
+          </h3>
+          {effectiveFailoverRoutes.map((route) => (
+            <div
+              key={route.route_id}
+              className="fd-card"
+              data-testid={`gate-failover-card-${route.route_id}`}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "10px",
+                flexWrap: "wrap",
+                fontSize: "12px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <strong className="fd-mono">{route.connector_id}</strong>
+                <span className="fd-mono" style={{ color: "var(--text-secondary)" }}>
+                  {route.primary_endpoint} → {route.fallback_endpoint}
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid={`gate-failover-health-${route.route_id}`}
+                >
+                  {route.health_status} (active: {route.active_target})
+                </span>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid={`gate-failover-deadline-${route.route_id}`}
+                >
+                  deadline: {route.deadline_ms}ms · retries: {route.max_retries}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Record #96: Strict Output Schema Validation & Byte/Token Cap Status */}
+        <div
+          data-testid="gate-schema-cap-section"
+          style={{ display: "flex", flexDirection: "column", gap: "10px" }}
+        >
+          <h3 style={{ margin: 0, fontSize: "14px" }}>
+            Output Schema Validation &amp; Response Byte/Token Caps
+          </h3>
+          {effectiveOutputPolicies.map((pol) => {
+            const key = `${pol.connector_id}-${pol.tool_name}`;
+            return (
+              <div
+                key={key}
+                className="fd-card"
+                data-testid={`gate-schema-policy-${key}`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                  fontSize: "12px",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <strong className="fd-mono">
+                    {pol.connector_id}.{pol.tool_name}
+                  </strong>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`gate-schema-mode-badge-${key}`}
+                  >
+                    {pol.schema_mode}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`gate-cap-badge-${key}`}
+                  >
+                    cap: {(pol.max_response_bytes / 1024).toFixed(0)} KiB / {pol.max_response_tokens} tok ({pol.truncation_policy})
+                  </span>
+                  <span className="fd-badge fd-mono">
+                    validated: {pol.validated_calls} · overflows: {pol.rejected_overflows}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     </section>

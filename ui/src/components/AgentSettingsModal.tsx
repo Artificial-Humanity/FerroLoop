@@ -19,6 +19,10 @@ import {
   isAntigravityAdapter,
   type EstimatedContextUsage,
 } from "./ChatPane";
+import {
+  computeWorktreeBootstrapPreview,
+  type WorktreePolicyMode,
+} from "./SpinUpAgentModal";
 
 const EXECUTION_MODE_LABELS: Readonly<Record<string, string>> = {
   auto: "Auto",
@@ -312,6 +316,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   onRemediatePosture,
 }) => {
   const { pinnedAgents } = usePinnedState();
+  const [agentWorktreePolicy, setAgentWorktreePolicy] =
+    useState<WorktreePolicyMode>("create");
   const [recastModalOpen, setRecastModalOpen] = useState(false);
   const [recastProject, setRecastProject] = useState(agentProject || "Workspace");
   const [recastRole, setRecastRole] = useState(
@@ -1134,6 +1140,83 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
           >
             Session Lifecycle Actions
           </div>
+          {/* Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation */}
+          {(() => {
+            const wtPreview = computeWorktreeBootstrapPreview(
+              agentKey,
+              agentProject || "FerroLoop",
+              agentWorktreePolicy,
+            );
+            return (
+              <div
+                data-testid="agent-worktree-policy-section"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  padding: "8px 10px",
+                  marginBottom: "8px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  fontSize: "11.5px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                    Worktree Policy &amp; Dev-Server Ports
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="agent-allocated-ports-badge"
+                    style={{
+                      backgroundColor: "rgba(56, 189, 248, 0.14)",
+                      borderColor: "rgba(56, 189, 248, 0.4)",
+                      color: "var(--accent-primary)",
+                      fontSize: "10.5px",
+                    }}
+                  >
+                    PORT={wtPreview.allocatedPort} · VITE_PORT={wtPreview.allocatedVitePort}
+                  </span>
+                </div>
+                <select
+                  aria-label="Agent Worktree Policy"
+                  data-testid="agent-worktree-policy-select"
+                  className="fd-select fd-mono"
+                  value={agentWorktreePolicy}
+                  onChange={(e) =>
+                    setAgentWorktreePolicy(e.target.value as WorktreePolicyMode)
+                  }
+                  style={{ width: "100%", fontSize: "11.5px" }}
+                >
+                  <option value="create">
+                    create (Isolated branch worktree)
+                  </option>
+                  <option value="reuse">
+                    reuse (Existing worktree checkout)
+                  </option>
+                  <option value="shared">
+                    shared (Primary project checkout)
+                  </option>
+                </select>
+                <div
+                  className="fd-mono"
+                  data-testid="agent-bootstrap-hooks-preview"
+                  style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                >
+                  {wtPreview.bootstrapConfigPath}: {wtPreview.bootstrapHooks.join(" && ")}
+                </div>
+              </div>
+            );
+          })()}
           <div
             style={{
               display: "flex",

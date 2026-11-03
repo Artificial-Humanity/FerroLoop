@@ -5,6 +5,7 @@ import type { TranscriptTurn } from "../types/api";
 import { dispatchOpenArtifact, MermaidDiagram, RichMarkdown } from "./RichMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
+import { parseWireIntentMetadata } from "./WireMailPane";
 
 export const EXPAND_TURN_EVENT = "ferrodeck:expand-turn";
 
@@ -499,6 +500,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
     return summarizeWireContent(cleanedContent || turn.content || "", wireSender);
   }, [isWire, cleanedContent, turn.content, wireSender]);
 
+  const parsedWireIntent = React.useMemo(() => {
+    if (!isWire) return { intent: "mail" as const };
+    return parseWireIntentMetadata(cleanedContent || turn.content || "");
+  }, [isWire, cleanedContent, turn.content]);
+
   const systemOutputSummary = React.useMemo(() => {
     if (!isSystem) return "";
     const raw = cleanedContent || turn.content || "";
@@ -543,10 +549,32 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           flexWrap: "wrap",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <span className="fd-badge" style={roleBadgeStyle}>
             {roleLabel}
           </span>
+          {isWire && parsedWireIntent.intent !== "mail" && (
+            <span
+              className="fd-badge fd-mono"
+              data-testid={`turn-wire-intent-badge-${turn.index}`}
+              style={{
+                backgroundColor:
+                  parsedWireIntent.intent === "delegate"
+                    ? "rgba(56, 189, 248, 0.14)"
+                    : "rgba(168, 85, 247, 0.14)",
+                borderColor:
+                  parsedWireIntent.intent === "delegate"
+                    ? "rgba(56, 189, 248, 0.4)"
+                    : "rgba(168, 85, 247, 0.4)",
+                color:
+                  parsedWireIntent.intent === "delegate"
+                    ? "var(--accent-primary)"
+                    : "#C084FC",
+              }}
+            >
+              {parsedWireIntent.intent}
+            </span>
+          )}
           <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-dim)" }}>
             #{turn.index}
           </span>
@@ -911,6 +939,128 @@ export const TurnCard: React.FC<TurnCardProps> = ({
               {wireExpanded ? "Hide message" : "Show message"}
             </span>
           </button>
+        </div>
+      )}
+
+      {isWire && parsedWireIntent.intent === "delegate" && parsedWireIntent.delegate && (
+        <div
+          data-testid={`turn-wire-delegate-card-${turn.index}`}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px",
+            padding: "8px 10px",
+            borderRadius: "6px",
+            backgroundColor: "var(--bg-elevated)",
+            border: "1px solid rgba(56, 189, 248, 0.35)",
+            fontSize: "12px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <span className="fd-mono" style={{ fontWeight: 700, fontSize: "11.5px" }}>
+              Record: {parsedWireIntent.delegate.target_record}
+            </span>
+            {parsedWireIntent.delegate.resume_on_reply && (
+              <span
+                className="fd-badge"
+                data-testid={`turn-wire-delegate-resume-${turn.index}`}
+                style={{
+                  backgroundColor: "rgba(56, 189, 248, 0.14)",
+                  borderColor: "rgba(56, 189, 248, 0.4)",
+                  color: "var(--accent-primary)",
+                }}
+              >
+                Non-Blocking · Resume on Reply
+              </span>
+            )}
+          </div>
+          <div style={{ color: "var(--text-secondary)" }}>
+            <strong>Deliverable:</strong> {parsedWireIntent.delegate.deliverable}
+          </div>
+          {parsedWireIntent.delegate.branch_or_pr && (
+            <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+              Branch/PR: {parsedWireIntent.delegate.branch_or_pr}
+            </div>
+          )}
+        </div>
+      )}
+
+      {isWire && parsedWireIntent.intent === "committee" && parsedWireIntent.committee && (
+        <div
+          data-testid={`turn-wire-committee-card-${turn.index}`}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px",
+            padding: "8px 10px",
+            borderRadius: "6px",
+            backgroundColor: "var(--bg-elevated)",
+            border: "1px solid rgba(168, 85, 247, 0.35)",
+            fontSize: "12px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <span style={{ fontWeight: 700 }}>
+              {parsedWireIntent.committee.council_track}
+            </span>
+            <span className="fd-badge fd-mono">
+              Quorum: {parsedWireIntent.committee.quorum}
+            </span>
+          </div>
+          <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+            Artifact: {parsedWireIntent.committee.artifact_path}
+            {parsedWireIntent.committee.artifact_sha256
+              ? ` · ${parsedWireIntent.committee.artifact_sha256}`
+              : ""}
+          </div>
+          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+            {Object.entries(parsedWireIntent.committee.votes ?? {}).map(
+              ([seat, verdict]) => (
+                <span
+                  key={seat}
+                  data-testid={`turn-committee-vote-pill-${turn.index}-${seat}`}
+                  className="fd-badge fd-mono"
+                  style={{
+                    fontSize: "10.5px",
+                    backgroundColor:
+                      verdict === "APPROVE"
+                        ? "rgba(52, 211, 153, 0.14)"
+                        : verdict === "APPROVE WITH AMENDMENTS"
+                          ? "rgba(251, 191, 36, 0.16)"
+                          : verdict === "BLOCK"
+                            ? "rgba(239, 68, 68, 0.16)"
+                            : "var(--bg-surface)",
+                    color:
+                      verdict === "APPROVE"
+                        ? "#34d399"
+                        : verdict === "APPROVE WITH AMENDMENTS"
+                          ? "#fbbf24"
+                          : verdict === "BLOCK"
+                            ? "#f87171"
+                            : "var(--text-muted)",
+                  }}
+                >
+                  {seat}: {verdict}
+                </span>
+              ),
+            )}
+          </div>
         </div>
       )}
 
