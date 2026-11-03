@@ -32,6 +32,9 @@ pub struct Spec<'a> {
     pub log: Option<&'a Path>,
     /// Keep this many bytes of the output in memory.
     pub capture_cap: usize,
+    /// Keep only STDOUT in `Outcome::output` (stderr still goes to the log and, bounded, to
+    /// `Outcome::errtext`), so a warning on stderr cannot break a parse of stdout.
+    pub stdout_only: bool,
 }
 
 /// How a run ended.
@@ -41,6 +44,8 @@ pub struct Outcome {
     pub signal: Option<i32>,
     pub timed_out: bool,
     pub output: Vec<u8>,
+    /// The first bytes of stderr, always kept separately (for error messages).
+    pub errtext: Vec<u8>,
     /// Output beyond [`MAX_LOG_BYTES`] was dropped from the log.
     pub log_truncated: bool,
 }
@@ -74,10 +79,14 @@ struct Sink {
     truncated: bool,
     mem: Vec<u8>,
     mem_cap: usize,
+    stdout_only: bool,
+    err_mem: Vec<u8>,
 }
 
+const ERR_CAP: usize = 4096;
+
 impl Sink {
-    fn push(&mut self, data: &[u8]) {
+    fn push(&mut self, data: &[u8], is_err: bool) {
         if let Some(f) = &mut self.file {
             let room = MAX_LOG_BYTES.saturating_sub(self.written) as usize;
             let n = room.min(data.len());
@@ -88,12 +97,25 @@ impl Sink {
                 self.truncated = true;
             }
         }
+        if is_err {
+            let room = ERR_CAP.saturating_sub(self.err_mem.len());
+            self.err_mem
+                .extend_from_slice(&data[..room.min(data.len())]);
+            if self.stdout_only {
+                return;
+            }
+        }
         let room = self.mem_cap.saturating_sub(self.mem.len());
         self.mem.extend_from_slice(&data[..room.min(data.len())]);
     }
 }
 
-fn pump(mut r: impl Read + Send + 'static, sink: Arc<Mutex<Sink>>, done: mpsc::Sender<()>) {
+fn pump(
+    mut r: impl Read + Send + 'static,
+    sink: Arc<Mutex<Sink>>,
+    done: mpsc::Sender<()>,
+    is_err: bool,
+) {
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -101,7 +123,7 @@ fn pump(mut r: impl Read + Send + 'static, sink: Arc<Mutex<Sink>>, done: mpsc::S
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if let Ok(mut s) = sink.lock() {
-                        s.push(&buf[..n]);
+                        s.push(&buf[..n], is_err);
                     }
                 }
             }
@@ -162,15 +184,17 @@ pub fn run(spec: &Spec<'_>) -> io::Result<Outcome> {
         truncated: false,
         mem: Vec::new(),
         mem_cap: spec.capture_cap,
+        stdout_only: spec.stdout_only,
+        err_mem: Vec::new(),
     }));
     let (tx, rx) = mpsc::channel();
     let mut readers = 0;
     if let Some(o) = child.stdout.take() {
-        pump(o, sink.clone(), tx.clone());
+        pump(o, sink.clone(), tx.clone(), false);
         readers += 1;
     }
     if let Some(e) = child.stderr.take() {
-        pump(e, sink.clone(), tx.clone());
+        pump(e, sink.clone(), tx.clone(), true);
         readers += 1;
     }
     drop(tx);
@@ -194,15 +218,20 @@ pub fn run(spec: &Spec<'_>) -> io::Result<Outcome> {
             break;
         }
     }
-    let (output, truncated) = match sink.lock() {
-        Ok(mut s) => (std::mem::take(&mut s.mem), s.truncated),
-        Err(_) => (Vec::new(), false),
+    let (output, errtext, truncated) = match sink.lock() {
+        Ok(mut s) => (
+            std::mem::take(&mut s.mem),
+            std::mem::take(&mut s.err_mem),
+            s.truncated,
+        ),
+        Err(_) => (Vec::new(), Vec::new(), false),
     };
     Ok(Outcome {
         code: status.code(),
         signal: status.signal(),
         timed_out,
         output,
+        errtext,
         log_truncated: truncated,
     })
 }
@@ -243,6 +272,7 @@ mod tests {
             timeout,
             log: None,
             capture_cap: 1024,
+            stdout_only: false,
         })
     }
 
@@ -258,10 +288,29 @@ mod tests {
             timeout: Duration::from_secs(10),
             log: None,
             capture_cap: 1024,
+            stdout_only: false,
         })
         .unwrap();
         assert!(o.success());
         assert_eq!(o.text().trim(), "ONLY=this");
+    }
+
+    #[test]
+    fn stdout_only_keeps_a_stderr_warning_out_of_the_parsed_output() {
+        let d = tempfile::tempdir().unwrap();
+        let o = run(&Spec {
+            program: Path::new("/bin/sh"),
+            args: vec!["-c".into(), "echo warning >&2; echo '{\"a\":1}'".into()],
+            cwd: d.path(),
+            env: &[],
+            timeout: Duration::from_secs(10),
+            log: None,
+            capture_cap: 1024,
+            stdout_only: true,
+        })
+        .unwrap();
+        assert_eq!(o.text().trim(), "{\"a\":1}");
+        assert_eq!(String::from_utf8_lossy(&o.errtext).trim(), "warning");
     }
 
     #[test]
@@ -276,6 +325,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             log: Some(&log),
             capture_cap: 100,
+            stdout_only: false,
         })
         .unwrap();
         assert!(o.success());

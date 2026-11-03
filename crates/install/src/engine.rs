@@ -25,9 +25,9 @@ use fl_core::install::{
     Artifact, BackupSpec, Disposition, FileKind, HostInfo, HostProbe, InstallPlan, InstallReceipt,
     InstallRequest, IntentFile, JournalOp, Layout, LinkSpec, MAX_RECEIPT_BYTES, Origin,
     OwnedArtifact, OwnedPathKind, PathRole, PathState, PlannedPath, RELEASE_JSON, ReceiptLayout,
-    ReceiptRelease, ReleaseManifest, Retention, Step, TxnIntent, build_receipt, file_name_ok,
-    has_committed, is_forbidden_install_root, is_sha256_hex, next_txn, plan, rel_path_problem,
-    release_json, retention, sha256_hex,
+    ReceiptRelease, ReleaseKind, ReleaseManifest, Retention, Step, TxnIntent, build_receipt,
+    file_name_ok, has_committed, is_forbidden_install_root, is_sha256_hex, next_txn, plan,
+    rel_path_problem, release_json, retention, sha256_hex,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1944,7 +1944,32 @@ pub fn installed_receipt(env: &Env, layout: &Layout) -> Result<Option<InstallRec
 
 /// Apply the install the planner printed. Takes `install.lock`, finishes or undoes any
 /// interrupted transaction first, re-plans under the lock, and then runs the transaction.
+///
+/// A manifest that claims a source build with artifacts, or carries `release.build`, is
+/// refused: that provenance (reviewed or not, the toolchain) is recorded in the receipt, and
+/// only `fl install --from-git` (which produced the artifact and made the claim) may write it,
+/// through [`apply_from_source_build`]. A hand-written manifest cannot.
 pub fn apply(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
+    let r = &args.manifest.release;
+    if r.build.is_some()
+        || (r.kind == ReleaseKind::SourceBuild && !args.manifest.artifacts.is_empty())
+    {
+        return Err(InstallError::refused(
+            "the manifest claims a source build (`release.build`, or kind `source_build` with \
+             artifacts); only `fl install --from-git` records that provenance, and it builds \
+             the artifact itself",
+        ));
+    }
+    apply_trusted(env, args)
+}
+
+/// [`apply`] for the manifest `--from-git` made in memory from its own build. Not public:
+/// only the crate's source-build path can reach it.
+pub(crate) fn apply_from_source_build(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
+    apply_trusted(env, args)
+}
+
+fn apply_trusted(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
     if args.manifest.artifacts.is_empty() {
         return Err(InstallError::refused(
             "this manifest lists no artifacts (a plan-only source build): build one from a \
@@ -2155,7 +2180,7 @@ fn apply_locked(
 #[cfg(test)]
 mod publish_tests {
     use super::*;
-    use fl_core::install::{Product, Profile, ReleaseKind};
+    use fl_core::install::{Product, Profile};
     use std::os::unix::fs::PermissionsExt;
 
     /// A `Run` over a temp root whose intent stages exactly one file, `bin/fl` = "ours".

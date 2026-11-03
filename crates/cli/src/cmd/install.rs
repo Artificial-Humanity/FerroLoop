@@ -80,6 +80,10 @@ pub struct Cmd {
     /// With --from-git: also build the UI (`npm ci && npm run build` in ui/).
     #[arg(long)]
     pub with_ui: bool,
+    /// With --from-git --with-ui: also run the npm dependencies' lifecycle scripts
+    /// (`npm ci` without --ignore-scripts). Those scripts run arbitrary code from the registry.
+    #[arg(long)]
+    pub npm_scripts: bool,
     /// With --from-git: kill the build after this many seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = fl_install::DEFAULT_BUILD_TIMEOUT_SECS)]
     pub build_timeout: u64,
@@ -138,8 +142,13 @@ fn execute(cmd: &Cmd) -> Done {
             format!("{what} is not implemented in this release"),
         )
     };
-    if cmd.from_git.is_none() && (cmd.repo.is_some() || cmd.allow_unreviewed || cmd.with_ui) {
-        return usage("--repo, --allow-unreviewed and --with-ui go with --from-git");
+    if cmd.from_git.is_none()
+        && (cmd.repo.is_some() || cmd.allow_unreviewed || cmd.with_ui || cmd.npm_scripts)
+    {
+        return usage("--repo, --allow-unreviewed, --with-ui and --npm-scripts go with --from-git");
+    }
+    if cmd.npm_scripts && !cmd.with_ui {
+        return usage("--npm-scripts goes with --with-ui");
     }
     if cmd.from_git.is_some() {
         if cmd.artifact_dir.is_some() || cmd.manifest.is_some() {
@@ -340,6 +349,8 @@ fn from_git(
         cwd: &cwd,
         allow_unreviewed: cmd.allow_unreviewed,
         with_ui: cmd.with_ui,
+        npm_scripts: cmd.npm_scripts,
+        on_warning: &|m| eprintln!("{m}"),
         build_timeout: Duration::from_secs(cmd.build_timeout),
         parent_env: &parent_env,
         request,
@@ -409,7 +420,7 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifest, (i32, String)> {
     let raw = read_bounded(path, MAX_MANIFEST_BYTES)
         .map_err(|e| (EXIT_REFUSED, format!("manifest {shown}: {e}")))?
         .ok_or_else(|| (EXIT_REFUSED, format!("manifest {shown} does not exist")))?;
-    ReleaseManifest::parse(&raw).map_err(|errs| {
+    let manifest = ReleaseManifest::parse(&raw).map_err(|errs| {
         (
             EXIT_REFUSED,
             format!(
@@ -420,7 +431,19 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifest, (i32, String)> {
                     .join("; ")
             ),
         )
-    })
+    })?;
+    // The build record says "this was built from a reviewed (or unreviewed) commit with this
+    // toolchain". Only `--from-git`, which does the build, may write it.
+    if manifest.release.build.is_some() {
+        return Err((
+            EXIT_REFUSED,
+            format!(
+                "manifest {shown} carries `release.build`, which only `fl install --from-git` \
+                 may record; remove it"
+            ),
+        ));
+    }
+    Ok(manifest)
 }
 
 /// The receipt at `display` (the unexpanded path), if there is one. A receipt

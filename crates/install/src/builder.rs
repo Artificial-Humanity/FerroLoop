@@ -40,6 +40,7 @@ pub const ENV_FIXED: &[&str] = &[
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_GLOBAL",
     "GIT_TERMINAL_PROMPT",
+    "GIT_NO_REPLACE_OBJECTS",
     "GIT_CEILING_DIRECTORIES",
 ];
 
@@ -110,6 +111,7 @@ pub fn sandbox_env(
     env.push(kv("GIT_CONFIG_NOSYSTEM", "1".into()));
     env.push(kv("GIT_CONFIG_GLOBAL", "/dev/null".into()));
     env.push(kv("GIT_TERMINAL_PROMPT", "0".into()));
+    env.push(kv("GIT_NO_REPLACE_OBJECTS", "1".into()));
     // Never look for a repository above the build directory.
     env.push(kv(
         "GIT_CEILING_DIRECTORIES",
@@ -143,6 +145,21 @@ pub struct BuildJob {
     pub bins: Vec<String>,
     /// Also build `ui/dist` (`npm ci && npm run build`).
     pub with_ui: bool,
+    /// With the UI: let the npm dependencies' lifecycle scripts run.
+    pub npm_scripts: bool,
+}
+
+/// The `npm ci` argument vector. Dependency lifecycle scripts (arbitrary code from the
+/// registry) are off unless asked for.
+pub fn npm_ci_args(scripts: bool) -> Vec<OsString> {
+    let mut a: Vec<OsString> = ["ci", "--no-audit", "--no-fund", "--no-update-notifier"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    if !scripts {
+        a.push("--ignore-scripts".into());
+    }
+    a
 }
 
 /// `rustc -V` and `cargo -V`.
@@ -213,6 +230,7 @@ fn tool_line(
         timeout: Duration::from_secs(60),
         log: None,
         capture_cap: 4096,
+        stdout_only: false,
     })
     .map_err(|e| BuildError::Unavailable(format!("cannot run {what}: {e}")))?;
     let line = o.text().lines().next().unwrap_or("").trim().to_string();
@@ -252,6 +270,7 @@ impl ProcessBuilder {
             timeout: remaining(deadline),
             log: Some(ctx.log),
             capture_cap: 0,
+            stdout_only: false,
         })
         .map_err(|e| BuildError::Failed(format!("{label}: cannot start: {e}")))?;
         if o.log_truncated
@@ -298,7 +317,7 @@ impl Builder for ProcessBuilder {
             self.step(
                 ctx,
                 &npm,
-                words(&["ci", "--no-audit", "--no-fund", "--no-update-notifier"]),
+                npm_ci_args(job.npm_scripts),
                 &ui,
                 deadline,
                 "npm ci",
@@ -384,6 +403,16 @@ mod tests {
         assert_eq!(get("RUSTUP_TOOLCHAIN").as_deref(), Some("stable"));
         assert_eq!(get("SOURCE_DATE_EPOCH").as_deref(), Some("1700000000"));
         assert_eq!(get("GIT_CONFIG_GLOBAL").as_deref(), Some("/dev/null"));
+    }
+
+    #[test]
+    fn npm_ci_ignores_dependency_scripts_unless_asked() {
+        let s = |v: Vec<OsString>| -> Vec<String> {
+            v.iter().map(|x| x.to_string_lossy().into_owned()).collect()
+        };
+        assert!(s(npm_ci_args(false)).contains(&"--ignore-scripts".to_string()));
+        assert!(!s(npm_ci_args(true)).contains(&"--ignore-scripts".to_string()));
+        assert_eq!(s(npm_ci_args(true))[0], "ci");
     }
 
     #[test]

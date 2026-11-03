@@ -25,8 +25,8 @@ use crate::builder::{
     BuildCtx, BuildError, BuildJob, Builder, Toolchain, package_for, sandbox_env,
 };
 use crate::engine::{
-    ApplyArgs, ApplyReport, Decisions, Env, apply, installed_receipt, is_installed, plan_only,
-    preflight,
+    ApplyArgs, ApplyReport, Decisions, Env, apply_from_source_build, installed_receipt,
+    is_installed, plan_only, preflight,
 };
 use crate::error::{Ctx, InstallError, Result};
 use crate::fsprobe::read_bounded;
@@ -68,6 +68,11 @@ pub struct FromGitArgs<'a> {
     pub cwd: &'a Path,
     pub allow_unreviewed: bool,
     pub with_ui: bool,
+    /// With the UI: run the npm dependencies' lifecycle scripts (`npm ci` without
+    /// `--ignore-scripts`).
+    pub npm_scripts: bool,
+    /// Where warnings go. They are given BEFORE the build starts.
+    pub on_warning: &'a dyn Fn(&str),
     pub build_timeout: Duration,
     /// The installer's own environment (only the allow-listed names are ever used).
     pub parent_env: &'a [(OsString, OsString)],
@@ -582,6 +587,7 @@ fn version_json(bin: &Path, cwd: &Path, env: &[(OsString, OsString)]) -> Result<
         timeout: VERSION_TIMEOUT,
         log: None,
         capture_cap: 64 * 1024,
+        stdout_only: true,
     })
     .ctx(|| format!("cannot run {}", bin.display()))?;
     if !o.success() {
@@ -845,7 +851,7 @@ pub fn install(
             ..aargs
         };
         if is_installed(env, &again)? {
-            let mut report = apply(env, &again)?;
+            let mut report = apply_from_source_build(env, &again)?;
             report
                 .notes
                 .push("not rebuilt: the receipt already records this commit's build".into());
@@ -857,6 +863,34 @@ pub fn install(
                 },
             ));
         }
+    }
+
+    // A release directory is immutable and its `release.json` says how it was built. The same
+    // commit with another review status is not "the same install", and it cannot be written
+    // over the directory: it is refused.
+    if let Some(r) = installed_receipt(env, &args.request.layout)?
+        && r.release.name == planned.release.name
+        && r.release
+            .build
+            .as_ref()
+            .is_some_and(|b| b.reviewed != p.review.reviewed)
+    {
+        return Err(InstallError::refused(format!(
+            "release {} is installed with reviewed: {}, and this commit is now reviewed: {}; a \
+             release directory is not changed in place, because its review status is part of \
+             what was built (removing a release is not implemented in this release: use \
+             another --prefix)",
+            planned.release.name, !p.review.reviewed, p.review.reviewed
+        )));
+    }
+
+    if !p.review.reviewed {
+        (args.on_warning)(&format!(
+            "WARNING: --allow-unreviewed: commit {} is NOT an ancestor of origin/main. It will \
+             be built (its build scripts run as you) and installed unreviewed; the receipt \
+             records reviewed: false.",
+            p.sha
+        ));
     }
 
     // ---- from here on, files are written
@@ -897,6 +931,7 @@ pub fn install(
                 &BuildJob {
                     bins: bins.clone(),
                     with_ui: args.with_ui,
+                    npm_scripts: args.npm_scripts,
                 },
             )
             .map_err(|e| build_err(e, &log))?;
@@ -908,7 +943,7 @@ pub fn install(
             artifact_dir: Some(&a.out),
             decisions: args.decisions,
         };
-        apply(env, &final_args)
+        apply_from_source_build(env, &final_args)
     })();
 
     match result {

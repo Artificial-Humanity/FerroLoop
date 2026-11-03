@@ -2,7 +2,10 @@
 //! black-box tests in `crates/cli/tests/install_from_git.rs` run a fake `cargo` executable
 //! through the real process-spawn path.)
 
-use crate::fixture::gitrepo::{self, Repo};
+use crate::fixture::{
+    self,
+    gitrepo::{self, Repo},
+};
 use crate::*;
 use fl_core::install::{HostInfo, InstallReceipt, InstallRequest, Layout, Profile};
 use std::cell::RefCell;
@@ -10,6 +13,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +28,9 @@ enum Mode {
 }
 
 struct Fake {
+    warnings: Rc<RefCell<Vec<String>>>,
+    /// How many warnings had been given when the toolchain was queried (the build's start).
+    warned_at_start: RefCell<Option<usize>>,
     mode: Mode,
     seen_env: RefCell<Vec<(OsString, OsString)>>,
     seen_src: RefCell<Option<PathBuf>>,
@@ -32,6 +39,8 @@ struct Fake {
 impl Fake {
     fn new(mode: Mode) -> Self {
         Self {
+            warnings: Rc::new(RefCell::new(Vec::new())),
+            warned_at_start: RefCell::new(None),
             mode,
             seen_env: RefCell::new(Vec::new()),
             seen_src: RefCell::new(None),
@@ -50,6 +59,7 @@ fn stub(path: &Path, name: &str, commit: &str, time: &str) {
 
 impl Builder for Fake {
     fn toolchain(&self, ctx: &BuildCtx<'_>) -> std::result::Result<Toolchain, BuildError> {
+        *self.warned_at_start.borrow_mut() = Some(self.warnings.borrow().len());
         *self.seen_env.borrow_mut() = ctx.env.to_vec();
         *self.seen_src.borrow_mut() = Some(ctx.src.to_path_buf());
         if self.mode == Mode::ToolchainMissing {
@@ -131,19 +141,22 @@ impl W {
             ("GITHUB_TOKEN".into(), "secret".into()),
             ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
         ];
+        let fake = Fake::new(mode);
+        let warnings = fake.warnings.clone();
         let args = FromGitArgs {
             rev,
             repo: Some(&self.repo.dir),
             cwd: self.base.path(),
             allow_unreviewed,
             with_ui: false,
+            npm_scripts: false,
+            on_warning: &|m| warnings.borrow_mut().push(m.to_string()),
             build_timeout: Duration::from_secs(60),
             parent_env: &parent_env,
             request: &request,
             host,
             decisions: &decisions,
         };
-        let fake = Fake::new(mode);
         let r = if yes {
             install_from_git(&env, &args, &fake)
         } else {
@@ -272,4 +285,81 @@ fn the_review_rule_is_checked_before_the_builder_exists() {
     let receipt =
         InstallReceipt::parse(&fs::read_to_string(w.prefix.join("receipt.json")).unwrap()).unwrap();
     assert!(!receipt.release.build.unwrap().reviewed);
+}
+
+#[test]
+fn the_unreviewed_warning_is_given_before_the_build_starts() {
+    let w = W::new();
+    let (fake, r) = w.run(&w.repo.commits[2], true, true, Mode::Ok);
+    r.unwrap();
+    let w_at_start = fake.warned_at_start.borrow().unwrap();
+    assert_eq!(
+        w_at_start, 1,
+        "the warning must precede the toolchain query and the build"
+    );
+    assert!(fake.warnings.borrow()[0].contains("NOT an ancestor of origin/main"));
+    // a reviewed commit warns about nothing
+    let w = W::new();
+    let (fake, r) = w.run(&w.repo.commits[1], true, true, Mode::Ok);
+    r.unwrap();
+    assert!(fake.warnings.borrow().is_empty());
+}
+
+#[test]
+fn the_engine_refuses_a_manifest_that_claims_a_source_build() {
+    use fl_core::install::{BuildProvenance, ReleaseKind};
+    let w = W::new();
+    let art = tempfile::tempdir().unwrap();
+    let mut m = fixture::release(art.path(), "0.1.0", "a");
+    m.release.kind = ReleaseKind::SourceBuild;
+    m.release.build = Some(BuildProvenance {
+        reviewed: true,
+        rustc: "rustc".into(),
+        cargo: "cargo".into(),
+        build_id: "forged".into(),
+        build_time_unix: 1,
+    });
+    m.validate().expect("valid, so only the rule can refuse it");
+    let request = InstallRequest {
+        profile: Some(Profile::Minimal),
+        add: vec![],
+        remove: vec![],
+        layout: Layout::explicit(w.prefix.to_str().unwrap()).unwrap(),
+        adopt: false,
+    };
+    let env = Env::new(w.prefix.clone(), None);
+    let host = HostInfo::from_consts(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+    let decisions = Decisions::default();
+    let args = ApplyArgs {
+        request: &request,
+        manifest: &m,
+        host,
+        artifact_dir: Some(art.path()),
+        decisions: &decisions,
+    };
+    let e = apply(&env, &args).unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    assert!(
+        e.to_string().contains("only `fl install --from-git`"),
+        "{e}"
+    );
+    assert!(!w.prefix.exists(), "a refusal writes nothing");
+    // without the claim the same artifact installs
+    let mut ok = m.clone();
+    ok.release.kind = ReleaseKind::Release;
+    ok.release.build = None;
+    let args = ApplyArgs {
+        manifest: &ok,
+        ..args
+    };
+    apply(&env, &args).unwrap();
+    assert!(w.prefix.join("receipt.json").exists());
+}
+
+#[test]
+fn text_from_a_repository_is_shown_escaped() {
+    let s = crate::git::shown("a\x1b[31mred\nline\u{7}", 100);
+    assert!(!s.chars().any(|c| c.is_control()), "{s:?}");
+    assert!(s.contains("\\u{1b}") && s.contains("\\n"), "{s}");
+    assert_eq!(crate::git::shown("abcdef", 3), "abc");
 }

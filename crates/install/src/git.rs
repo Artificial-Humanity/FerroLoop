@@ -33,6 +33,8 @@ pub const MAX_SOURCE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_SOURCE_TREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_LISTING_BYTES: usize = 32 * 1024 * 1024;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// The most time one `git cat-file --batch` over a whole commit may take.
+const CAT_FILE_TIMEOUT: Duration = Duration::from_secs(600);
 /// A `refs/remotes/origin/main` older than this many days gets a "may be stale" note.
 pub const STALE_DAYS: u64 = 7;
 
@@ -43,6 +45,10 @@ pub const HARDENING: &[&str] = &[
     "core.fsmonitor=false",
     "core.attributesFile=/dev/null",
     "core.untrackedCache=false",
+    "core.useReplaceRefs=false",
+    // A commit-graph file is not authenticated: a forged one can lie about parentage.
+    "core.commitGraph=false",
+    "advice.graftFileDeprecated=false",
     "log.showSignature=false",
     "protocol.ext.allow=never",
     "protocol.allow=never",
@@ -61,6 +67,17 @@ pub fn hardened_env(path_var: &OsStr) -> Vec<(OsString, OsString)> {
         kv("GIT_TERMINAL_PROMPT", "0"),
         kv("GIT_OPTIONAL_LOCKS", "0"),
         kv("GIT_PAGER", "cat"),
+        // `refs/replace/*` and grafts would change what a sha means; a promisor remote would
+        // make a missing object a network fetch; GIT_ALLOW_PROTOCOL overrides every
+        // `protocol.*.allow` in a repository's config (git-config(1): it makes each listed
+        // protocol `always` and everything else `never`), and `none` lists nothing.
+        kv("GIT_NO_REPLACE_OBJECTS", "1"),
+        kv("GIT_NO_LAZY_FETCH", "1"),
+        // `info/grafts` can ADD parents (making any commit an "ancestor" of origin/main) and
+        // `shallow` can remove them; `--no-replace-objects` does not cover either.
+        kv("GIT_GRAFT_FILE", "/dev/null"),
+        kv("GIT_SHALLOW_FILE", "/dev/null"),
+        kv("GIT_ALLOW_PROTOCOL", "none"),
         kv("LC_ALL", "C"),
     ]
 }
@@ -106,14 +123,33 @@ pub fn tree_path_problem(path: &str) -> Option<&'static str> {
         if seg.is_empty() || seg == "." || seg == ".." {
             return Some("has an empty, `.` or `..` segment");
         }
-        if seg.eq_ignore_ascii_case(".git") {
-            return Some("names a `.git` directory");
+        if names_dot_git(seg) {
+            return Some(
+                "names a `.git` directory (or a spelling of it some file systems treat as one)",
+            );
         }
         if seg.len() > 255 {
             return Some("has a segment that is too long");
         }
     }
     None
+}
+
+/// Whether a path segment is `.git` under any spelling a file system may fold into it: case,
+/// trailing dots or spaces and `::$INDEX_ALLOCATION` streams (NTFS), the `git~1` short name,
+/// and HFS+ ignorable code points.
+pub fn names_dot_git(seg: &str) -> bool {
+    let hfs_ignorable = |c: char| matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}');
+    let clean: String = seg.chars().filter(|c| !hfs_ignorable(*c)).collect();
+    let lower = clean.to_lowercase();
+    let trimmed = lower.trim_end_matches(['.', ' ']);
+    if trimmed == ".git" || trimmed.starts_with(".git:") {
+        return true;
+    }
+    // `git~1` .. `git~9...`: the 8.3 short name of `.git`
+    trimmed
+        .strip_prefix("git~")
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// One entry of a commit's tree.
@@ -166,8 +202,19 @@ pub struct Repo {
     pub objects: PathBuf,
 }
 
+/// `s` shortened to `max` characters, with every control character escaped (a path or a git
+/// message is attacker-chosen text; it must not be able to drive a terminal).
+pub fn shown(s: &str, max: usize) -> String {
+    s.chars()
+        .take(max)
+        .collect::<String>()
+        .escape_debug()
+        .to_string()
+}
+
 fn git_err(what: &str, o: &process::Outcome) -> InstallError {
-    let tail: String = o.text().trim().chars().take(300).collect();
+    let err = String::from_utf8_lossy(&o.errtext);
+    let tail = shown(err.trim(), 300);
     InstallError::refused(format!("git {what} failed ({}): {tail}", o.describe()))
 }
 
@@ -184,7 +231,11 @@ impl Git {
 
     /// The arguments every command starts with: `-c` overrides, then nothing else.
     pub fn base_args() -> Vec<OsString> {
-        let mut a: Vec<OsString> = vec!["--no-pager".into(), "--no-optional-locks".into()];
+        let mut a: Vec<OsString> = vec![
+            "--no-pager".into(),
+            "--no-optional-locks".into(),
+            "--no-replace-objects".into(),
+        ];
         for kv in HARDENING {
             a.push("-c".into());
             a.push((*kv).into());
@@ -214,6 +265,7 @@ impl Git {
             timeout: GIT_TIMEOUT,
             log: None,
             capture_cap: cap,
+            stdout_only: true,
         })
         .ctx(|| format!("cannot run git {}", args.first().copied().unwrap_or("")))
     }
@@ -441,7 +493,27 @@ impl Repo {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
         let mut child = c.spawn().ctx(|| "cannot run git cat-file".to_string())?;
+        // A deadline and a process group: a wedged git (or anything it started) is killed.
+        let pid = child.id() as i32;
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                let end = std::time::Instant::now() + CAT_FILE_TIMEOUT;
+                while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::time::Instant::now() >= end {
+                        // SAFETY: signalling the child's own process group; the child is
+                        // reaped only after `finished` is set, so the number is still ours.
+                        unsafe { libc::kill(-pid, libc::SIGKILL) };
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            })
+        };
         let mut stdin = child.stdin.take().expect("piped");
         let want: Vec<String> = oids.to_vec();
         let feeder = std::thread::spawn(move || {
@@ -493,7 +565,10 @@ impl Repo {
             }
         }
         drop(rd);
-        let _ = child.kill();
+        // SAFETY: as above; the child is still unreaped.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = watchdog.join();
         let _ = child.wait();
         let _ = feeder.join();
         result
@@ -526,7 +601,7 @@ pub fn extract_tree(repo: &Repo, entries: &[TreeEntry], dest: &Path) -> Result<E
         if let Some(why) = tree_path_problem(&e.path) {
             return Err(InstallError::refused(format!(
                 "the commit holds the path `{}` which {why}; it is not built",
-                e.path.chars().take(120).collect::<String>()
+                shown(&e.path, 120)
             )));
         }
         if e.is_blob() {
@@ -538,11 +613,12 @@ pub fn extract_tree(repo: &Repo, entries: &[TreeEntry], dest: &Path) -> Result<E
         } else {
             return Err(InstallError::refused(format!(
                 "the commit holds `{}` with mode {:o}, which is not a file, symlink or submodule",
-                e.path, e.mode
+                shown(&e.path, 120),
+                e.mode
             )));
         }
     }
-    if blobs.len() > MAX_SOURCE_FILES {
+    if entries.len() > MAX_SOURCE_FILES {
         return Err(InstallError::refused(format!(
             "the commit holds more than {MAX_SOURCE_FILES} files"
         )));
@@ -617,6 +693,7 @@ pub fn init_stamp_repo(repo: &Repo, dest: &Path, sha: &str, unwritten: &[String]
             timeout: GIT_TIMEOUT,
             log: None,
             capture_cap: 4096,
+            stdout_only: true,
         })
         .ctx(|| format!("cannot run git {}", args.first().copied().unwrap_or("")))?;
         if o.success() {
@@ -693,6 +770,16 @@ mod tests {
             "a\\b",
             "a\nb",
             "a/",
+            "a/.GIT",
+            "x/.git.",
+            "x/.git ",
+            "x/.git. .",
+            "GIT~1/config",
+            "git~12",
+            ".git::$INDEX_ALLOCATION",
+            ".g\u{200c}it/hooks",
+            ".gi\u{200d}t",
+            "\u{feff}.git",
         ] {
             assert!(tree_path_problem(bad).is_some(), "{bad:?}");
         }
@@ -702,6 +789,11 @@ mod tests {
             ".github/x.yml",
             "a b/c",
             ".gitignore",
+            ".github/x",
+            "git~x",
+            "digit",
+            "git~",
+            "a.git",
         ] {
             assert_eq!(tree_path_problem(ok), None, "{ok}");
         }
@@ -715,6 +807,8 @@ mod tests {
             "core.fsmonitor",
             "log.showSignature",
             "protocol.ext.allow",
+            "core.useReplaceRefs",
+            "core.commitGraph",
         ] {
             assert!(all.contains(key), "{key}");
         }
@@ -728,5 +822,19 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
         assert_eq!(get("PATH").as_deref(), Some("/usr/bin"));
         assert!(get("GIT_DIR").is_none());
+        for (k, v) in [
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_ALLOW_PROTOCOL", "none"),
+            ("GIT_GRAFT_FILE", "/dev/null"),
+            ("GIT_SHALLOW_FILE", "/dev/null"),
+        ] {
+            assert_eq!(get(k).as_deref(), Some(v), "{k}");
+        }
+        let args: Vec<String> = Git::base_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"--no-replace-objects".to_string()));
     }
 }

@@ -1011,3 +1011,422 @@ fn with_ui_needs_a_ui_in_the_commit() {
     assert!(se.contains("package-lock.json"), "{se}");
     assert_eq!(w.tools.builds(), 0);
 }
+
+// ------------------------------------- what a sha means, and what may fetch
+
+#[test]
+fn replace_refs_and_grafts_cannot_change_what_a_commit_is() {
+    let w = World::new(FakeCargo::Ok);
+    let r = &w.repo;
+    // Replace the reviewed tip with a parentless commit that holds the NEXT commit's tree.
+    let tree3 = gitrepo::git(
+        &r.dir,
+        &["rev-parse", &format!("{}^{{tree}}", r.commits[2])],
+    );
+    let orphan = gitrepo::git(&r.dir, &["commit-tree", &tree3, "-m", "orphan"]);
+    gitrepo::git(&r.dir, &["replace", &r.commits[1], &orphan]);
+    // a graft that ADDS a parent: the unreviewed tip's tree, as an unrelated commit, becomes an
+    // "ancestor" of origin/main
+    let unrelated = gitrepo::git(&r.dir, &["commit-tree", &tree3, "-m", "unrelated"]);
+    fs::write(
+        r.dir.join(".git/info/grafts"),
+        format!("{} {} {}\n", r.commits[1], r.commits[0], unrelated),
+    )
+    .unwrap();
+    // control: an unprotected git really does see the replacement
+    let seen = gitrepo::git(
+        &r.dir,
+        &["rev-parse", &format!("{}^{{tree}}", r.commits[1])],
+    );
+    assert_eq!(
+        seen, tree3,
+        "the replacement must be live for this test to mean anything"
+    );
+    let anc = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&r.dir)
+        .args(["merge-base", "--is-ancestor", &r.commits[0], &r.commits[1]])
+        .env_clear()
+        .env("PATH", gitrepo::system_path())
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .output()
+        .unwrap();
+    assert_eq!(
+        anc.status.code(),
+        Some(1),
+        "control: replaced history has no parent"
+    );
+
+    let forged = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&r.dir)
+        .args(["merge-base", "--is-ancestor", &unrelated, &r.commits[1]])
+        .env_clear()
+        .env("PATH", gitrepo::system_path())
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        forged.status.code(),
+        Some(0),
+        "control: the graft really adds an ancestor"
+    );
+    let (c, _, se) = run(&mut w.install_git(&unrelated, &["--yes"]));
+    assert_eq!(c, 3, "a graft must not make a commit reviewed: {se}");
+    assert!(se.contains("is not an ancestor of origin/main"), "{se}");
+
+    // the tip builds the tree it really holds ("two"), not the replacement's ("three")
+    let (c, so, se) = run(&mut w.install_git(&r.commits[1], &["--yes"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert_eq!(
+        fs::read_to_string(w.tools.src_dump().join("README.md")).unwrap(),
+        "two\n"
+    );
+    // and the ancestor rule still sees the real history
+    let (c, so, se) = run(&mut w.install_git(&r.commits[0], &["--yes"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert_eq!(w.receipt()["release"]["build"]["reviewed"], true);
+    assert_eq!(
+        fs::read_to_string(w.tools.src_dump().join("README.md")).unwrap(),
+        "one\n"
+    );
+}
+
+#[test]
+fn a_partial_clone_config_never_makes_a_command_fetch() {
+    let w = World::new(FakeCargo::Ok);
+    let s = w.base.path().join("sentinels");
+    fs::create_dir_all(&s).unwrap();
+    let script = w.base.path().join("ext.sh");
+    exe_script(&script, &format!("touch '{}/fetch'; exit 1", s.display()));
+    let cfg = format!(
+        "[core]\n\trepositoryformatversion = 1\n\tsshCommand = {sh}\n\
+         [extensions]\n\tpartialClone = origin\n\
+         [remote \"origin\"]\n\turl = ext::{sh}\n\tpromisor = true\n\tpartialclonefilter = blob:none\n\
+         [protocol]\n\tallow = always\n[protocol \"ext\"]\n\tallow = always\n",
+        sh = script.display()
+    );
+    let config = w.repo.dir.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&cfg);
+    fs::write(&config, text).unwrap();
+    // a blob the build needs is missing locally: a lazy fetch would be the only way to get it
+    let oid = gitrepo::git(
+        &w.repo.dir,
+        &["rev-parse", &format!("{}:docs/a.md", w.repo.commits[1])],
+    );
+    let obj = w
+        .repo
+        .dir
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&obj).unwrap();
+    // control: careless git does try to fetch it
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&w.repo.dir)
+        .args(["cat-file", "-p", &oid])
+        .env_clear()
+        .env("PATH", gitrepo::system_path())
+        .output()
+        .unwrap();
+    assert!(
+        s.join("fetch").exists(),
+        "control: the promisor remote must be live"
+    );
+    fs::remove_file(s.join("fetch")).unwrap();
+
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes"]));
+    assert_ne!(c, 0, "{so}{se}");
+    assert!(se.contains("not a blob that git can read"), "{se}");
+    assert!(
+        !s.join("fetch").exists(),
+        "a command fetched from the promisor remote"
+    );
+    assert_eq!(w.tools.builds(), 0);
+}
+
+// ------------------------------------- provenance is not for hand-written manifests
+
+#[test]
+fn a_hand_written_manifest_cannot_claim_a_source_build() {
+    use fl_core::install::{BuildProvenance, ReleaseKind};
+    let art = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let m0 = fl_install::fixture::release(art.path(), "0.1.0", "a");
+    let prefix = base.path().join("prefix");
+    let write = |name: &str, m: &fl_core::install::ReleaseManifest| {
+        let p = base.path().join(name);
+        fs::write(&p, m.to_json()).unwrap();
+        p
+    };
+    let fl = |args: &[&str], manifest: &Path| {
+        let mut c = Command::cargo_bin("fl").unwrap();
+        c.env_clear()
+            .env("HOME", home.path())
+            .args(["install", "--profile", "headless", "--prefix"])
+            .arg(&prefix)
+            .arg("--manifest")
+            .arg(manifest)
+            .arg("--artifact-dir")
+            .arg(art.path())
+            .args(args);
+        run(&mut c)
+    };
+    // a forged build record: reviewed, on a source_build manifest with its one artifact
+    let mut forged = m0.clone();
+    forged.release.kind = ReleaseKind::SourceBuild;
+    forged.release.build = Some(BuildProvenance {
+        reviewed: true,
+        rustc: "rustc 1.98.0".into(),
+        cargo: "cargo 1.98.0".into(),
+        build_id: "forged".into(),
+        build_time_unix: 1,
+    });
+    forged
+        .validate()
+        .expect("a valid manifest, so only the rule can refuse it");
+    let f = write("forged.json", &forged);
+    for args in [vec!["--yes"], vec!["--dry-run"]] {
+        let (c, so, se) = fl(&args, &f);
+        assert_eq!(c, 3, "{args:?}: {so}{se}");
+        assert!(se.contains("only `fl install --from-git`"), "{se}");
+        assert!(!prefix.exists(), "a refusal writes nothing");
+    }
+    // a source_build manifest with artifacts and no record is refused by the validator
+    let mut bare = m0.clone();
+    bare.release.kind = ReleaseKind::SourceBuild;
+    let f = write("bare.json", &bare);
+    let (c, so, se) = fl(&["--yes"], &f);
+    assert_eq!(c, 3, "{so}{se}");
+    assert!(!prefix.exists());
+    // the same manifest as a plain release installs, so the refusal was about the claim
+    let f = write("release.json", &m0);
+    let (c, so, se) = fl(&["--yes"], &f);
+    assert_eq!(c, 0, "{so}{se}");
+    let r: Value =
+        serde_json::from_str(&fs::read_to_string(prefix.join("receipt.json")).unwrap()).unwrap();
+    assert_eq!(r["schema_version"], 1);
+    fl_install::make_tree_writable(base.path());
+}
+
+// ------------------------------------------------------------ stderr, npm, warning
+
+#[test]
+fn a_warning_on_stderr_does_not_break_the_version_check() {
+    let w = World::new(FakeCargo::NoisyStderr);
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert_eq!(w.check_status("G7.receipt-integrity"), "pass");
+}
+
+#[test]
+fn npm_ci_ignores_dependency_scripts_unless_asked() {
+    let w = World::new(FakeCargo::Ok);
+    let c4 = gitrepo::add_ui_commit(&w.repo);
+    let (c, so, se) = run(&mut w.install_git_with("full", &c4, &["--yes", "--with-ui"]));
+    assert_eq!(c, 0, "{so}{se}");
+    let log = w.tools.npm_args();
+    assert!(
+        log.contains("ci --no-audit --no-fund --no-update-notifier --ignore-scripts"),
+        "{log}"
+    );
+    assert!(log.contains("run build"), "{log}");
+
+    let w2 = World::new(FakeCargo::Ok);
+    let c4 = gitrepo::add_ui_commit(&w2.repo);
+    let (c, so, se) =
+        run(&mut w2.install_git_with("full", &c4, &["--yes", "--with-ui", "--npm-scripts"]));
+    assert_eq!(c, 0, "{so}{se}");
+    let log = w2.tools.npm_args();
+    assert!(
+        log.contains("ci --no-audit --no-fund --no-update-notifier\n"),
+        "{log}"
+    );
+    assert!(!log.contains("--ignore-scripts"), "{log}");
+
+    // --npm-scripts is for the UI build only
+    let (c, _, se) = run(&mut w.install_git(&w.repo.commits[1], &["--dry-run", "--npm-scripts"]));
+    assert_eq!(c, 2, "{se}");
+}
+
+#[test]
+fn the_unreviewed_warning_goes_to_stderr_before_the_build() {
+    let w = World::new(FakeCargo::Ok);
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[2], &["--yes", "--allow-unreviewed"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert!(se.contains("WARNING: --allow-unreviewed"), "{se}");
+    assert!(
+        so.contains("WARNING"),
+        "the final report keeps its warning too: {so}"
+    );
+    // a reviewed commit says nothing on stderr
+    let w = World::new(FakeCargo::Ok);
+    let (c, _, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes", "--allow-unreviewed"]));
+    assert_eq!(c, 0);
+    assert!(!se.contains("WARNING"), "{se}");
+}
+
+// ----------------------------------------------- the same commit installed again
+
+#[test]
+fn the_same_commit_with_another_review_status_is_refused_not_rewritten() {
+    let w = World::new(FakeCargo::Ok);
+    let c3 = w.repo.commits[2].clone();
+    let (c, so, se) = run(&mut w.install_git(&c3, &["--yes", "--allow-unreviewed"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert_eq!(w.receipt()["release"]["build"]["reviewed"], false);
+    // review catches up: origin/main now contains the commit
+    gitrepo::git(
+        &w.repo.dir,
+        &["update-ref", "refs/remotes/origin/main", &c3],
+    );
+    let (c, so, se) = run(&mut w.install_git(&c3, &["--yes"]));
+    assert_eq!(c, 3, "{so}{se}");
+    assert!(
+        se.contains("reviewed: false") && se.contains("not changed in place"),
+        "{se}"
+    );
+    assert_eq!(w.tools.builds(), 1, "refused before a second build");
+    assert_eq!(
+        w.receipt()["release"]["build"]["reviewed"],
+        false,
+        "nothing changed"
+    );
+}
+
+#[test]
+fn a_different_toolchain_alone_does_not_rebuild_the_same_install() {
+    let w = World::new(FakeCargo::Ok);
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes"]));
+    assert_eq!(c, 0, "{so}{se}");
+    // the toolchain on PATH changes (a new rustc)
+    let rustc = w.tools.bin_dir.join("rustc");
+    fs::write(&rustc, "#!/bin/sh\necho 'rustc 10.0.0 (newer)'\n").unwrap();
+    let (c, so, se) = run(&mut w.install_git(&w.repo.commits[1], &["--yes"]));
+    assert_eq!(c, 0, "{so}{se}");
+    assert!(
+        so.contains("already installed") && so.contains("not rebuilt"),
+        "{so}"
+    );
+    assert_eq!(w.tools.builds(), 1);
+    assert_eq!(
+        w.receipt()["release"]["build"]["rustc"],
+        "rustc 9.9.9 (fake 2026-01-01)"
+    );
+}
+
+// ------------------------------------------------- the real toolchain (ignored)
+
+/// Runs the REAL `cargo` and `rustc` (no network: the tree has no dependencies) against a
+/// synthetic two-package workspace whose `build.rs` is the real `crates/core/build/stamp.rs`.
+/// It checks what the fakes cannot: that the stamp the real build script reads from the
+/// installer's fresh `.git` (alternates, `read-tree`, `git status`, the workspace marker) is the
+/// commit, clean, at the commit's time.
+///
+/// Not part of CI. Run it by hand:
+///
+/// ```text
+/// cargo test -p fl-cli --test install_from_git -- --ignored real_cargo_stamps
+/// ```
+#[test]
+#[ignore = "runs the real cargo and rustc; run by hand with --ignored real_cargo_stamps"]
+fn real_cargo_stamps_the_synthetic_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let write = |rel: &str, text: &str| {
+        let p = repo.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    };
+    let stamp =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/build/stamp.rs"))
+            .unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    gitrepo::git(&repo, &["init", "-q", "-b", "main"]);
+    write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/cli\", \"crates/store\"]\nresolver = \"3\"\n\n\
+         [workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    write("crates/core/build/stamp.rs", &stamp);
+    for (pkg, bin) in [("cli", "fl"), ("store", "ferrostore")] {
+        write(
+            &format!("crates/{pkg}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"fl-{pkg}\"\nversion.workspace = true\nedition.workspace = true\n\
+                 build = \"build.rs\"\n\n[[bin]]\nname = \"{bin}\"\npath = \"src/main.rs\"\n"
+            ),
+        );
+        write(
+            &format!("crates/{pkg}/build.rs"),
+            "#[path = \"../core/build/stamp.rs\"]\nmod stamp;\nfn main() { stamp::emit(&[\".\"]); }\n",
+        );
+        write(
+            &format!("crates/{pkg}/src/main.rs"),
+            &format!(
+                "fn main() {{\n    println!(\"{{{{\\\"name\\\":\\\"{bin}\\\",\\\"version\\\":\\\"{{}}\\\",\\\"commit\\\":\\\"{{}}\\\",\\\"dirty\\\":{{}},\\\"build_time_unix\\\":{{}},\\\"source\\\":\\\"source-build\\\",\\\"protocol\\\":{{{{\\\"ferrowire\\\":{{{{\\\"current\\\":2}}}}}}}},\\\"store_formats\\\":{{{{\\\"redb_schema\\\":{{{{\\\"min\\\":2,\\\"max\\\":8}}}}}}}}}}}}\",\n        env!(\"CARGO_PKG_VERSION\"), env!(\"FL_BUILD_COMMIT\"), env!(\"FL_BUILD_DIRTY\"), env!(\"FL_BUILD_TIME\"));\n}}\n"
+            ),
+        );
+    }
+    let lock = std::process::Command::new("cargo")
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(&repo)
+        .env_remove("CARGO_MANIFEST_DIR")
+        .output()
+        .unwrap();
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    gitrepo::git(&repo, &["add", "-A"]);
+    gitrepo::git(&repo, &["commit", "-q", "-m", "synthetic"]);
+    let sha = gitrepo::git(&repo, &["rev-parse", "HEAD"]);
+    gitrepo::git(&repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+
+    let home = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let prefix = base.path().join("prefix");
+    let real_home = std::env::var("HOME").unwrap();
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or(format!("{real_home}/.cargo"));
+    let rustup_home = std::env::var("RUSTUP_HOME").unwrap_or(format!("{real_home}/.rustup"));
+    let mut c = Command::cargo_bin("fl").unwrap();
+    c.env_clear()
+        .env("HOME", home.path())
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("CARGO_HOME", cargo_home)
+        .env("RUSTUP_HOME", rustup_home)
+        .current_dir(base.path())
+        .args([
+            "install",
+            "--profile",
+            "minimal",
+            "--from-git",
+            "HEAD",
+            "--yes",
+            "--repo",
+        ])
+        .arg(&repo)
+        .arg("--prefix")
+        .arg(&prefix);
+    let (code, so, se) = run(&mut c);
+    let log = fs::read_to_string(prefix.join("build").join(&sha[..12]).join("build.log"))
+        .unwrap_or_default();
+    assert_eq!(code, 0, "{so}{se}\n--- build.log ---\n{log}");
+    let rel = prefix
+        .join("releases")
+        .join(format!("0.1.0+{}", &sha[..12]));
+    let out = std::process::Command::new(rel.join("bin/fl"))
+        .args(["--version", "--json"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["commit"], sha.as_str());
+    assert_eq!(v["dirty"], false);
+    assert_eq!(v["build_time_unix"], 1_700_000_500u64);
+    fl_install::make_tree_writable(base.path());
+}

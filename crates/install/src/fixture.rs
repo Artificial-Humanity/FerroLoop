@@ -251,6 +251,8 @@ pub mod gitrepo {
         WrongCommit,
         /// Builds stubs that report a dirty tree.
         Dirty,
+        /// Builds stubs that print a warning on STDERR before the version JSON on stdout.
+        NoisyStderr,
     }
 
     /// The fake toolchain on disk and the files it leaves evidence in.
@@ -274,6 +276,10 @@ pub mod gitrepo {
         }
         pub fn pid_file(&self) -> PathBuf {
             self.evidence.join("child.pid")
+        }
+        /// One line per `npm` call: its arguments.
+        pub fn npm_args(&self) -> String {
+            fs::read_to_string(self.evidence.join("npm.args")).unwrap_or_default()
         }
         pub fn src_dump(&self) -> PathBuf {
             self.evidence.join("src")
@@ -310,7 +316,7 @@ pub mod gitrepo {
         let build = match mode {
             FakeCargo::Fail => "echo 'boom: could not compile' >&2\nexit 101\n".to_string(),
             FakeCargo::Hang => format!("sleep 300 &\necho $! > '{}'\nwait\n", q(t.pid_file())),
-            FakeCargo::Ok | FakeCargo::WrongCommit | FakeCargo::Dirty => {
+            FakeCargo::Ok | FakeCargo::WrongCommit | FakeCargo::Dirty | FakeCargo::NoisyStderr => {
                 let sha = if mode == FakeCargo::WrongCommit {
                     "echo 0000000000000000000000000000000000000000".to_string()
                 } else {
@@ -320,6 +326,11 @@ pub mod gitrepo {
                     "true"
                 } else {
                     "false"
+                };
+                let noise = if mode == FakeCargo::NoisyStderr {
+                    "    echo \"  echo 'warning: noisy stderr' >&2\"\n"
+                } else {
+                    ""
                 };
                 format!(
                     r#"sha=$({sha})
@@ -331,7 +342,7 @@ for name in fl ferrostore; do
   {{
     echo '#!/bin/sh'
     echo 'if [ "$1" = "--version" ] && [ "$2" = "--json" ]; then'
-    echo "  echo '{{\"name\":\"'$name'\",\"version\":\"0.1.0\",\"commit\":\"'$sha'\",\"commit_short\":\"'$(echo $sha | cut -c1-12)'\",\"dirty\":'$dirty',\"build_time_unix\":'$ct',\"source\":\"source-build\",\"release_id\":null,\"protocol\":{{\"ferrowire\":{{\"current\":2}}}},\"schema\":{{}},\"store_formats\":{{\"redb_schema\":{{\"min\":2,\"max\":8}}}}}}'"
+{noise}    echo "  echo '{{\"name\":\"'$name'\",\"version\":\"0.1.0\",\"commit\":\"'$sha'\",\"commit_short\":\"'$(echo $sha | cut -c1-12)'\",\"dirty\":'$dirty',\"build_time_unix\":'$ct',\"source\":\"source-build\",\"release_id\":null,\"protocol\":{{\"ferrowire\":{{\"current\":2}}}},\"schema\":{{}},\"store_formats\":{{\"redb_schema\":{{\"min\":2,\"max\":8}}}}}}'"
     echo 'else'
     echo "  echo $name stub $sha"
     echo 'fi'
@@ -351,6 +362,7 @@ echo "$@" > '{args}'
 env | sort > '{env}'
 pwd > '{cwd}'
 cp stamp.txt '{src}/stamp.txt' 2>/dev/null
+cp README.md '{src}/README.md' 2>/dev/null
 cp .gitattributes '{src}/gitattributes' 2>/dev/null
 ls -la > '{src}/ls.txt'
 {build}"#,
@@ -367,13 +379,17 @@ ls -la > '{src}/ls.txt'
         );
         exe(
             &bin_dir.join("npm"),
-            r#"#!/bin/sh
+            &format!(
+                r#"#!/bin/sh
+echo "$@" >> '{npm_args}'
 case "$1" in
   ci) exit 0;;
   run) mkdir -p dist/assets && echo '<html>ui</html>' > dist/index.html && echo 'x' > dist/assets/app.js; exit 0;;
 esac
 exit 1
 "#,
+                npm_args = q(evidence.join("npm.args"))
+            ),
         );
         t
     }

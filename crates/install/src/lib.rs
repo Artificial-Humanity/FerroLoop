@@ -46,7 +46,7 @@ mod txn_tests;
 
 pub use builder::{
     BIN_PACKAGES, BuildCtx, BuildError, BuildJob, Builder, ENV_FIXED, ENV_PASSTHROUGH,
-    ProcessBuilder, Toolchain, cargo_args, env_name_allowed, sandbox_env,
+    ProcessBuilder, Toolchain, cargo_args, env_name_allowed, npm_ci_args, sandbox_env,
 };
 pub use engine::{
     ApplyArgs, ApplyReport, DEFAULT_LOCK_TIMEOUT_SECS, Decisions, Env, Outcome, RecoverAction,
