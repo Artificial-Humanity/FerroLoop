@@ -21,6 +21,7 @@ mod plan;
 mod plan_tests;
 mod receipt;
 mod txn;
+mod unit_template;
 
 pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
 pub use defaults::default_manifest;
@@ -46,6 +47,7 @@ pub use txn::{
     MAX_COMMITTED_ENTRIES, RELEASE_JSON, RETAINED_PREVIOUS_RELEASES, Retention, Step, TxnIntent,
     build_receipt, has_committed, hex, next_txn, release_json, retention, sha256_hex, tree_digest,
 };
+pub use unit_template::{UnitRenderError, render_unit};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
