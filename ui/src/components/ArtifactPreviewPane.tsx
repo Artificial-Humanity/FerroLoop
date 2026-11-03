@@ -2310,6 +2310,23 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             </label>
 
             <div
+              data-testid="artifact-cleanup-canonical-layout-summary"
+              className="fd-mono"
+              style={{
+                fontSize: "11px",
+                color: "var(--text-muted)",
+                padding: "6px 10px",
+                borderRadius: "var(--radius-sm)",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              Canonical layout:{" "}
+              <code>[home]/artifacts/[project-name]/[session-id]/</code> ·
+              Ratified specs pinned
+            </div>
+
+            <div
               data-testid="artifact-cleanup-preview-count"
               className="fd-mono"
               style={{
