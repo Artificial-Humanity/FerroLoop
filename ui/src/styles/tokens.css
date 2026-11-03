@@ -178,7 +178,7 @@ body,
 }
 
 .fd-header {
-  min-height: 54px;
+  min-height: 58px;
   background-color: var(--bg-surface);
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
