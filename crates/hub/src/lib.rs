@@ -3228,7 +3228,7 @@ mod tests {
 
         // Prepare without a route falls back to the session prompt queue.
         let queued = decommission(
-            Some("peer-tok-secret"),
+            Some("owner-tok-secret"),
             "claude:ada",
             json!({ "mode": "prepare" }),
         )
@@ -3636,10 +3636,22 @@ mod tests {
         assert_eq!(state.session_queue("claude:Foo Bar").len(), 1);
         jarvis_is_untouched();
 
-        // A Peer may tear down a hosted session; the Owner may adopt an unmanaged one.
+        // A Peer cannot tear down a hosted session either (even with an unparsable body); the
+        // Owner can, and may adopt an unmanaged one.
         assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
         assert_eq!(
             decommission_as(&state, "peer-tok-secret", "claude:ada", "teardown").status,
+            403
+        );
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/claude:ada/decommission")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
             200
         );
         assert_eq!(
@@ -3650,6 +3662,75 @@ mod tests {
         assert_eq!(
             store.agent_by_name("jarvis").unwrap().unwrap().status,
             AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn a_peer_cannot_decommission_a_hosted_session_and_nothing_changes() {
+        use fl_core::agent::AgentStatus;
+        use fl_core::store::AgentRegistry;
+        use fl_wire::identity::RouteTable;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let socket = tmp.path().join("ada.sock");
+        install_webhook_route(tmp.path(), "ada", &socket);
+        let routes_path = tmp.path().join(".cache/agent-bus/routes.json");
+        state.enqueue_session_prompt(
+            "claude:ada",
+            Some("ada".into()),
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let hosted = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .clone()
+        };
+        let before = hosted();
+        let mut frames = state.subscribe();
+
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Aada", mode);
+            assert_eq!(resp.status, 403, "{mode}: {}", error_text(&resp));
+            assert!(error_text(&resp).contains("Owner"), "{mode}");
+        }
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/claude%3Aada/decommission")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+
+        assert_eq!(hosted(), before);
+        assert_eq!(state.session_queue("claude:ada").len(), 1);
+        assert!(RouteTable::load(Some(&routes_path)).get("ada").is_some());
+        assert_eq!(
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("ada")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Active
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a refused call must broadcast nothing"
         );
     }
 

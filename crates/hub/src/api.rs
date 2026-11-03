@@ -5525,6 +5525,9 @@ fn handle_post_session_spin_up(
     }
 }
 
+/// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
+/// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
+/// a Peer, checked before the body is read and before any discovery, store access or side effect.
 fn handle_post_session_decommission(
     state: &HubState,
     authority: &HubAuthority,
@@ -5537,6 +5540,12 @@ fn handle_post_session_decommission(
         mode: String,
     }
 
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may decommission a session" }),
+        );
+    }
     let payload: DecommissionPayload = match req.json() {
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
@@ -5627,12 +5636,21 @@ fn handle_post_session_decommission(
 /// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
 /// (`restored` or `down`). When the old session was restored, the operator's model override
 /// (and thinking level) the teardown cleared is put back as it was (see [`run_remodel`]).
+///
+/// Owner only: 403 for a Peer, checked before the body is read and before any discovery, store
+/// access or side effect.
 fn handle_post_session_remodel(
     state: &HubState,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may remodel a session" }),
+        );
+    }
     let payload: RemodelRequest = match req.json() {
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
