@@ -32,6 +32,13 @@ import {
   type AcpConformanceOperation,
 } from "./FerroWatchPane";
 import {
+  DEFAULT_MCP_CATALOG_REPOS,
+  DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
+  type McpCatalogRepoRow,
+  type McpCatalogRepoStatus,
+  type VaultConsumerCutoverRow,
+} from "./VaultGatePane";
+import {
   evaluateAgentMcpPosture,
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
@@ -40,8 +47,13 @@ import {
 export {
   ACP_CONFORMANCE_OPERATIONS,
   DEFAULT_ACP_CONFORMANCE_MATRIX,
+  DEFAULT_MCP_CATALOG_REPOS,
+  DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
   type AcpAdapterConformanceRow,
   type AcpConformanceOperation,
+  type McpCatalogRepoRow,
+  type McpCatalogRepoStatus,
+  type VaultConsumerCutoverRow,
 };
 
 /**
