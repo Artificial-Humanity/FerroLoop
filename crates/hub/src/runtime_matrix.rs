@@ -29,7 +29,10 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use fl_core::telemetry::AdapterKind;
-use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport};
+use fl_core::{
+    AcpOperation, ConformanceState, OperationEvidence, SessionProtocolKind, VendorDescriptor,
+    VendorRegistry, VendorTransport,
+};
 use fl_exec::child_env::{child_env, helper_env};
 use fl_exec::stamp;
 use fl_gate::{MASTER_KEY_LEN, Vault, VaultSecretMetadata, resolve_vault_path};
@@ -161,6 +164,23 @@ pub struct LocalEngineStatus {
     pub error: Option<String>,
 }
 
+/// A hosted-session protocol and whether it is the current default.
+/// This is a profile selection, not proof that a vendor is installed or ready.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostedProtocolProfile {
+    pub kind: SessionProtocolKind,
+    pub active: bool,
+}
+
+/// Evidence for ACP production admission. No proof registry exists in this slice, so these
+/// rows are unproven and never authorize production ACP work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AcpAdmissionEvidence {
+    pub state: ConformanceState,
+    pub production_admitted: bool,
+    pub operations: Vec<OperationEvidence>,
+}
+
 /// One registered vendor, as `GET /api/v1/runtimes/matrix` lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VendorCatalogEntry {
@@ -180,6 +200,9 @@ pub struct VendorCatalogEntry {
     pub mcp_config_rel_path: Option<String>,
     /// Whether the vendor ships with fl, as opposed to being registered at run time.
     pub builtin: bool,
+    /// Native is the default; ACP is only a candidate until proven.
+    pub hosted_protocol_profiles: Vec<HostedProtocolProfile>,
+    pub acp_admission: AcpAdmissionEvidence,
 }
 
 impl VendorCatalogEntry {
@@ -212,6 +235,24 @@ impl VendorCatalogEntry {
             dialect,
             mcp_config_rel_path: d.mcp_config_rel_path.clone(),
             builtin: VendorRegistry::is_builtin(&d.id),
+            hosted_protocol_profiles: vec![
+                HostedProtocolProfile {
+                    kind: SessionProtocolKind::Native,
+                    active: true,
+                },
+                HostedProtocolProfile {
+                    kind: SessionProtocolKind::AcpV1Stdio,
+                    active: false,
+                },
+            ],
+            acp_admission: AcpAdmissionEvidence {
+                state: ConformanceState::Unproven,
+                production_admitted: false,
+                operations: AcpOperation::ALL
+                    .into_iter()
+                    .map(OperationEvidence::unproven)
+                    .collect(),
+            },
         }
     }
 }
@@ -1858,6 +1899,74 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_vendor_reports_native_and_unproven_acp_profiles() {
+        custom_vendor("rtm-acp-custom", None);
+        fl_core::ensure_vendor_registered(VendorDescriptor {
+            id: "rtm-acp-custom-cli".into(),
+            display_name: "Custom CLI".into(),
+            transport: VendorTransport::SubscriptionCli {
+                default_binary: "custom-cli".into(),
+            },
+            default_model: String::new(),
+            default_context_window: 0,
+            default_rate_card: fl_core::telemetry::RateCard::default(),
+            mcp_config_rel_path: None,
+        })
+        .unwrap();
+        let matrix = build_matrix(&inputs("", None), Some("vendors")).unwrap();
+        let output = serde_json::to_value(&matrix).unwrap();
+        let entries = output["vendors"].as_array().unwrap();
+        for id in [
+            "claude",
+            "codex",
+            "grok",
+            "antigravity",
+            "muse",
+            "rtm-acp-custom",
+            "rtm-acp-custom-cli",
+        ] {
+            assert!(entries.iter().any(|entry| entry["id"] == id), "{id}");
+        }
+        for entry in entries {
+            assert_eq!(
+                entry["hosted_protocol_profiles"],
+                json!([
+                    {"kind": "native", "active": true},
+                    {"kind": "acp_v1_stdio", "active": false},
+                ]),
+                "{}",
+                entry["id"]
+            );
+            assert_eq!(entry["acp_admission"]["state"], "unproven");
+            assert_eq!(entry["acp_admission"]["production_admitted"], false);
+            let operations = entry["acp_admission"]["operations"].as_array().unwrap();
+            assert_eq!(operations.len(), 6);
+            for (row, name) in operations.iter().zip([
+                "approvals",
+                "interrupt",
+                "reset",
+                "compact",
+                "thread_identity",
+                "usage",
+            ]) {
+                assert_eq!(
+                    row,
+                    &json!({
+                        "operation": name,
+                        "state": "unproven",
+                        "required_capabilities": [],
+                        "mechanism": "",
+                        "semantic_constraints": [],
+                        "test_evidence_refs": [],
+                    }),
+                    "{}",
+                    entry["id"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_target_filter_applies_to_the_vendor_catalog() {
         custom_vendor("rtm-custom-keyless", None);
         let by_target = |t: &str| {
@@ -1921,12 +2030,14 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "acp_admission",
                 "base_url",
                 "builtin",
                 "default_context_window",
                 "default_model",
                 "dialect",
                 "display_name",
+                "hosted_protocol_profiles",
                 "id",
                 "mcp_config_rel_path",
                 "needs_api_key",
