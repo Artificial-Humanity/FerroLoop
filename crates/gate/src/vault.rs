@@ -14,6 +14,7 @@ use fl_core::At;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::GateError;
 
@@ -301,6 +302,20 @@ impl Vault {
         &self,
         name: &str,
     ) -> Result<(VaultSecretMetadata, String), GateError> {
+        let (meta, bytes) = self.decrypt_bytes(name)?;
+        let value = String::from_utf8(bytes.to_vec()).map_err(|e| GateError::VaultCorrupt {
+            path: self.path.clone(),
+            cause: format!("decrypted secret `{}` is not valid UTF-8: {e}", meta.name),
+        })?;
+        Ok((meta, value))
+    }
+
+    /// [`Vault::decrypt_raw`] without the UTF-8 step: the plaintext stays in a [`Zeroizing`]
+    /// buffer, which is wiped when it drops (this path keeps no other copy of it).
+    pub(crate) fn decrypt_bytes(
+        &self,
+        name: &str,
+    ) -> Result<(VaultSecretMetadata, Zeroizing<Vec<u8>>), GateError> {
         let key_name = normalize_secret_name(name)?;
         let Some(record) = self.file.secrets.get(&key_name) else {
             return Err(GateError::NoSuchSecret { name: key_name });
@@ -311,15 +326,7 @@ impl Vault {
             return Err(GateError::VaultTampered { secret: key_name });
         }
 
-        if let Some(ref exp) = record.metadata.expires_at {
-            let now_str = At::from_unix_millis(now_unix_millis()).to_string();
-            if now_str.as_str() > exp.as_str() {
-                return Err(GateError::PolicyDenied {
-                    secret: key_name,
-                    reason: format!("secret lease expired at {exp}"),
-                });
-            }
-        }
+        check_lease(&record.metadata)?;
 
         let nonce_vec = BASE64
             .decode(&record.nonce_b64)
@@ -333,13 +340,12 @@ impl Vault {
                 cause: format!("nonce for `{key_name}` is not {NONCE_LEN} bytes"),
             })?;
 
-        let mut in_out =
-            BASE64
-                .decode(&record.ciphertext_b64)
-                .map_err(|e| GateError::VaultCorrupt {
-                    path: self.path.clone(),
-                    cause: format!("invalid ciphertext base64 for `{key_name}`: {e}"),
-                })?;
+        let mut in_out = Zeroizing::new(BASE64.decode(&record.ciphertext_b64).map_err(|e| {
+            GateError::VaultCorrupt {
+                path: self.path.clone(),
+                cause: format!("invalid ciphertext base64 for `{key_name}`: {e}"),
+            }
+        })?);
 
         let aad_str = canonical_aad(&record.metadata);
         let unbound =
@@ -347,7 +353,7 @@ impl Vault {
                 reason: "invalid AES-256-GCM master key".to_string(),
             })?;
         let key = LessSafeKey::new(unbound);
-        let plaintext_bytes = key
+        let plaintext_len = key
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce_bytes),
                 Aad::from(aad_str.as_bytes()),
@@ -355,14 +361,10 @@ impl Vault {
             )
             .map_err(|_| GateError::VaultTampered {
                 secret: key_name.clone(),
-            })?;
-
-        let value =
-            String::from_utf8(plaintext_bytes.to_vec()).map_err(|e| GateError::VaultCorrupt {
-                path: self.path.clone(),
-                cause: format!("decrypted secret `{key_name}` is not valid UTF-8: {e}"),
-            })?;
-        Ok((record.metadata.clone(), value))
+            })?
+            .len();
+        in_out.truncate(plaintext_len);
+        Ok((record.metadata.clone(), in_out))
     }
 
     /// Return all `(name, plaintext_value)` pairs for output scrubbing (`scrub_secrets`).
@@ -411,25 +413,22 @@ impl Vault {
     }
 
     /// Compare `candidate` against the decrypted value of `secret_name` in constant time.
+    ///
+    /// The work done does not depend on where the two differ, or on whether their lengths match:
+    /// see [`constant_time_eq`].
     pub fn verify_secret_constant_time(
         &self,
         secret_name: &str,
         candidate: &str,
     ) -> Result<bool, GateError> {
-        let (_meta, expected) = self.decrypt_raw(secret_name)?;
-        let a = expected.as_bytes();
-        let b = candidate.as_bytes();
-        if a.len() != b.len() {
-            return Ok(false);
-        }
-        let mut diff = 0u8;
-        for (&x, &y) in a.iter().zip(b.iter()) {
-            diff |= std::hint::black_box(x ^ y);
-        }
-        Ok(std::hint::black_box(diff) == 0)
+        let (_meta, expected) = self.decrypt_bytes(secret_name)?;
+        Ok(constant_time_eq(&expected, candidate.as_bytes()))
     }
 
     /// Append a structured JSONL audit log entry next to `vault.enc` (`gate-audit.jsonl`).
+    ///
+    /// Best effort: a failed write is ignored. A caller that must not proceed without the entry
+    /// uses [`Vault::try_append_audit_log`].
     pub fn append_audit_log(
         &self,
         caller: Option<&str>,
@@ -438,50 +437,62 @@ impl Vault {
         host: &str,
         outcome: &str,
     ) {
+        let _ = self.try_append_audit_log(caller, secrets, method, host, outcome);
+    }
+
+    /// [`Vault::append_audit_log`] that reports whether the entry reached the file.
+    ///
+    /// The caller is written normalised (see [`audit_caller`]), so no caller-supplied text can
+    /// add a line, a field or a look-alike name to the log. The file has no rotation and no size
+    /// cap: every refusal appends about a kilobyte at most, and any caller that can reach the
+    /// Vault can cause refusals (a known follow-up).
+    pub fn try_append_audit_log(
+        &self,
+        caller: Option<&str>,
+        secrets: &[String],
+        method: &str,
+        host: &str,
+        outcome: &str,
+    ) -> Result<(), GateError> {
+        let audit_failed = |cause: String| GateError::Io {
+            op: "append to the audit log",
+            path: self.path.with_file_name("gate-audit.jsonl"),
+            cause,
+        };
         let Some(parent) = self.path.parent() else {
-            return;
+            return Err(audit_failed(
+                "the vault path has no parent directory".into(),
+            ));
         };
         let audit_path = parent.join("gate-audit.jsonl");
-        if reject_if_symlink(&audit_path).is_err() {
-            return;
-        }
+        reject_if_symlink(&audit_path)?;
         let ts = At::from_unix_millis(now_unix_millis()).to_string();
         let entry = serde_json::json!({
             "timestamp": ts,
-            "caller": caller.unwrap_or("anonymous"),
+            "caller": audit_caller(caller),
             "secrets": secrets,
             "method": method,
             "host": host,
             "outcome": outcome,
         });
-        let Ok(mut line) = serde_json::to_string(&entry) else {
-            return;
-        };
+        let mut line = serde_json::to_string(&entry).map_err(|e| audit_failed(e.to_string()))?;
         // One `write_all` so an `O_APPEND` write from another thread or process cannot land
         // between the entry and its newline.
         line.push('\n');
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(mut f) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&audit_path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
+            // The explicit check above gives a clear error; `O_NOFOLLOW` closes the window between
+            // that check and this open, in which the path could become a symlink.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        #[cfg(not(unix))]
-        {
-            if let Ok(mut f) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&audit_path)
-            {
-                let _ = f.write_all(line.as_bytes());
-            }
-        }
+        let mut f = options
+            .open(&audit_path)
+            .map_err(|e| audit_failed(e.kind().to_string()))?;
+        f.write_all(line.as_bytes())
+            .map_err(|e| audit_failed(e.kind().to_string()))
     }
 }
 
@@ -655,6 +666,71 @@ impl Drop for VaultLock {
         #[cfg(unix)]
         flock::unlock(&self.file);
     }
+}
+
+/// The longest caller name the audit log keeps.
+const MAX_AUDIT_CALLER_LEN: usize = 255;
+
+/// A caller as the audit log writes it: trimmed and lower-cased (the form policy matching uses),
+/// every character outside `[A-Za-z0-9._@-]` replaced by `?`, at most 255 characters; a missing
+/// or blank caller is `anonymous`.
+pub(crate) fn audit_caller(caller: Option<&str>) -> String {
+    let trimmed = caller
+        .map(|c| c.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if trimmed.is_empty() {
+        return "anonymous".to_string();
+    }
+    trimmed
+        .chars()
+        .take(MAX_AUDIT_CALLER_LEN)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// What a lease-expired [`GateError::PolicyDenied`] says first; the proxy audit keys on it.
+pub(crate) const LEASE_EXPIRED_REASON: &str = "secret lease expired at ";
+
+/// `Err(PolicyDenied)` once the secret's lease has run out.
+pub(crate) fn check_lease(meta: &VaultSecretMetadata) -> Result<(), GateError> {
+    if let Some(ref exp) = meta.expires_at {
+        let now_str = At::from_unix_millis(now_unix_millis()).to_string();
+        if now_str.as_str() > exp.as_str() {
+            return Err(GateError::PolicyDenied {
+                secret: meta.name.clone(),
+                reason: format!("{LEASE_EXPIRED_REASON}{exp}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Constant-time equality of two byte strings of any lengths.
+///
+/// Both sides are zero-padded to the longer length and every byte is compared (the differences
+/// are OR-ed, never branched on), and the lengths are folded in last: there is no early return on a
+/// length mismatch, so the time taken does not tell a caller how long the expected value is
+/// (beyond the work for the longer of the two). The padded copies are wiped on drop.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let width = a.len().max(b.len());
+    let mut pa = Zeroizing::new(vec![0u8; width]);
+    let mut pb = Zeroizing::new(vec![0u8; width]);
+    pa[..a.len()].copy_from_slice(a);
+    pb[..b.len()].copy_from_slice(b);
+    let mut diff = 0u8;
+    for (&x, &y) in pa.iter().zip(pb.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    // The lengths are folded in without a branch. Zero padding alone would make `abc` equal
+    // `abc\0`.
+    let len_diff = std::hint::black_box(a.len() ^ b.len());
+    std::hint::black_box(diff) == 0 && len_diff == 0
 }
 
 /// Build the canonical AEAD Additional Authenticated Data (AAD) string for `meta`.
@@ -1542,5 +1618,55 @@ mod tests {
         assert_eq!(calls, TMP_NAME_ATTEMPTS);
         assert!(matches!(err, GateError::Io { op: "write", .. }), "{err}");
         assert_eq!(fs::read_to_string(&taken).unwrap(), "x");
+    }
+    #[test]
+    fn constant_time_eq_covers_equal_unequal_lengths_and_empty() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"s3cret-value", b"s3cret-value"));
+        assert!(!constant_time_eq(b"s3cret-value", b"s3cret-valuf"));
+        assert!(!constant_time_eq(b"s3cret-value", b"X3cret-value"));
+        // Different lengths, including a prefix and a longer candidate.
+        assert!(!constant_time_eq(b"s3cret-value", b"s3cret"));
+        assert!(!constant_time_eq(b"s3cret", b"s3cret-value"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"x", b""));
+        // Zero padding must not make a short value equal a longer one that ends in zeros.
+        assert!(!constant_time_eq(b"abc", b"abc\0"));
+        assert!(!constant_time_eq(b"abc\0\0", b"abc"));
+        assert!(!constant_time_eq(b"", b"\0"));
+    }
+
+    #[test]
+    fn verify_secret_constant_time_answers_for_every_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = open_at(dir.path());
+        vault
+            .set(args("WEBHOOK_SECRET", "whsec_abcdef123456"))
+            .unwrap();
+        assert!(
+            vault
+                .verify_secret_constant_time("WEBHOOK_SECRET", "whsec_abcdef123456")
+                .unwrap()
+        );
+        for wrong in [
+            "",
+            "w",
+            "whsec_abcdef12345",
+            "whsec_abcdef1234567",
+            "whsec_abcdef12345X",
+            "WHSEC_ABCDEF123456",
+            "whsec_abcdef123456\0",
+        ] {
+            assert!(
+                !vault
+                    .verify_secret_constant_time("WEBHOOK_SECRET", wrong)
+                    .unwrap(),
+                "{wrong:?}"
+            );
+        }
+        assert!(matches!(
+            vault.verify_secret_constant_time("ABSENT", "x"),
+            Err(GateError::NoSuchSecret { .. })
+        ));
     }
 }

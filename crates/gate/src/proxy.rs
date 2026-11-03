@@ -324,18 +324,103 @@ pub fn prepare_proxied_request_with_provider(
     Ok(prepare_proxied_request_inner(vault, req, provider)?.request)
 }
 
+/// What a refused request is audited with: filled in as the request is understood, so a denial
+/// at any step names what was known by then. Names, methods and hosts only, never a value, a
+/// path or a query.
+#[derive(Default)]
+struct DenialTrace {
+    /// The method, once it is a plausible HTTP method.
+    method: Option<String>,
+    /// The destination host, once the URL parsed.
+    host: Option<String>,
+    /// Valid secret names referenced by the request (a malformed name is never logged).
+    secrets: Vec<String>,
+    /// The rule that refused, when the refusing code knows it better than the error variant.
+    reason: Option<&'static str>,
+}
+
+impl DenialTrace {
+    fn refuse<T>(&mut self, reason: &'static str, err: GateError) -> Result<T, GateError> {
+        self.reason = Some(reason);
+        Err(err)
+    }
+}
+
+/// A method is audited only when it is 1 to 16 ASCII capitals.
+fn audit_method(method: &str) -> String {
+    if (1..=16).contains(&method.len()) && method.bytes().all(|b| b.is_ascii_uppercase()) {
+        method.to_string()
+    } else {
+        "INVALID".to_string()
+    }
+}
+
+/// The `denied:<reason>` outcome for `err`, preferring the rule the code named.
+fn denial_reason(trace: &DenialTrace, err: &GateError) -> String {
+    let reason = trace.reason.unwrap_or(match err {
+        GateError::NoSuchSecret { .. } => "no_such_secret",
+        GateError::InvalidSecret { .. } => "invalid_secret_name",
+        GateError::PolicyDenied { reason, .. }
+            if reason.starts_with(crate::vault::LEASE_EXPIRED_REASON) =>
+        {
+            "expired"
+        }
+        GateError::PolicyDenied { .. } => "policy",
+        GateError::SsrfBlocked { .. } => "ssrf",
+        GateError::InvalidPlaceholder { .. } => "placeholder",
+        GateError::InvalidUrl { .. } => "invalid_url",
+        GateError::Adapter { .. } => "provider_error",
+        _ => "vault_error",
+    });
+    format!("denied:{reason}")
+}
+
+/// Every exit of a proxied request is audited: the success path writes `allowed` (below), and a
+/// refusal writes `denied:<reason>` here before the error is returned. The audit write is best
+/// effort and never changes the outcome: a denial stays a denial when the log cannot be written.
 fn prepare_proxied_request_inner(
     vault: &Vault,
     req: &ProxyRequest,
     provider: Option<&dyn SecretProviderAdapter>,
 ) -> Result<PreparedSecrets, GateError> {
+    let mut trace = DenialTrace::default();
+    let result = prepare_checked(vault, req, provider, &mut trace);
+    if let Err(err) = &result {
+        let host: String = trace
+            .host
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(255)
+            .collect();
+        let _ = vault.try_append_audit_log(
+            req.caller_agent.as_deref(),
+            &trace.secrets,
+            trace.method.as_deref().unwrap_or("INVALID"),
+            &host,
+            &denial_reason(&trace, err),
+        );
+    }
+    result
+}
+
+fn prepare_checked(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    trace: &mut DenialTrace,
+) -> Result<PreparedSecrets, GateError> {
     let method = req.method.trim().to_ascii_uppercase();
     if method.is_empty() {
-        return Err(GateError::InvalidUrl {
-            url: req.url.clone(),
-            reason: "HTTP method must not be empty".to_string(),
-        });
+        return trace.refuse(
+            "method",
+            GateError::InvalidUrl {
+                url: req.url.clone(),
+                reason: "HTTP method must not be empty".to_string(),
+            },
+        );
     }
+    trace.method = Some(audit_method(&method));
 
     // Collect all referenced placeholders across URL, headers, and body BEFORE parsing URL
     // (in case a query parameter has a placeholder).
@@ -361,13 +446,18 @@ fn prepare_proxied_request_inner(
         .map(|(before, _)| before)
         .unwrap_or(&req.url);
     if authority_part.contains(PLACEHOLDER_PREFIX) {
-        return Err(GateError::InvalidPlaceholder {
-            reason: "secret placeholders are not permitted in the URL host or path before `?`"
-                .to_string(),
-        });
+        return trace.refuse(
+            "placeholder",
+            GateError::InvalidPlaceholder {
+                reason: "secret placeholders are not permitted in the URL host or path before `?`"
+                    .to_string(),
+            },
+        );
     }
+    trace.secrets = referenced.iter().cloned().collect();
 
     let (scheme, host, port) = parse_url_scheme_host_port(&req.url)?;
+    trace.host = Some(host.clone());
 
     let mut decrypted_map = BTreeMap::new();
     let mut external_plaintexts = Vec::new();
@@ -381,12 +471,15 @@ fn prepare_proxied_request_inner(
         }
 
         if !meta.allow_private_network && scheme != "https" {
-            return Err(GateError::PolicyDenied {
-                secret: secret_name.clone(),
-                reason: format!(
-                    "secret `{secret_name}` requires an `https://` destination unless `allow_private_network = true`"
-                ),
-            });
+            return trace.refuse(
+                "https_required",
+                GateError::PolicyDenied {
+                    secret: secret_name.clone(),
+                    reason: format!(
+                        "secret `{secret_name}` requires an `https://` destination unless `allow_private_network = true`"
+                    ),
+                },
+            );
         }
 
         if meta.allowed_hosts.is_empty()
@@ -395,13 +488,16 @@ fn prepare_proxied_request_inner(
                 .iter()
                 .any(|pat| host_matches_pattern(&host, pat))
         {
-            return Err(GateError::PolicyDenied {
-                secret: secret_name.clone(),
-                reason: format!(
-                    "destination host `{host}` is not in allowed_hosts {:?}",
-                    meta.allowed_hosts
-                ),
-            });
+            return trace.refuse(
+                "host",
+                GateError::PolicyDenied {
+                    secret: secret_name.clone(),
+                    reason: format!(
+                        "destination host `{host}` is not in allowed_hosts {:?}",
+                        meta.allowed_hosts
+                    ),
+                },
+            );
         }
 
         if !meta.allowed_methods.is_empty()
@@ -410,13 +506,16 @@ fn prepare_proxied_request_inner(
                 .iter()
                 .any(|m| m.eq_ignore_ascii_case(&method))
         {
-            return Err(GateError::PolicyDenied {
-                secret: secret_name.clone(),
-                reason: format!(
-                    "HTTP method `{method}` is not in allowed_methods {:?}",
-                    meta.allowed_methods
-                ),
-            });
+            return trace.refuse(
+                "method",
+                GateError::PolicyDenied {
+                    secret: secret_name.clone(),
+                    reason: format!(
+                        "HTTP method `{method}` is not in allowed_methods {:?}",
+                        meta.allowed_methods
+                    ),
+                },
+            );
         }
 
         if !meta.allowed_agents.is_empty() {
@@ -430,13 +529,16 @@ fn prepare_proxied_request_inner(
                 .iter()
                 .any(|a| a == "*" || a.eq_ignore_ascii_case(&caller));
             if !permitted {
-                return Err(GateError::PolicyDenied {
-                    secret: secret_name.clone(),
-                    reason: format!(
-                        "caller agent `{caller}` is not in allowed_agents {:?}",
-                        meta.allowed_agents
-                    ),
-                });
+                return trace.refuse(
+                    "agent",
+                    GateError::PolicyDenied {
+                        secret: secret_name.clone(),
+                        reason: format!(
+                            "caller agent `{caller}` is not in allowed_agents {:?}",
+                            meta.allowed_agents
+                        ),
+                    },
+                );
             }
         }
 
@@ -637,6 +739,19 @@ fn scrub_with_external(
     (scrubbed, names)
 }
 
+/// The outbound client's settings. No proxy: `ureq` reads `HTTP_PROXY`, `HTTPS_PROXY` and
+/// `ALL_PROXY` (and `NO_PROXY`) from the environment by default, which would send the request,
+/// injected secret and all, to whatever process the environment names. No redirects either: a
+/// credential must not follow one to another origin. An error status is an answer, not an error.
+fn agent_config(timeout: Duration) -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .proxy(None)
+        .build()
+}
+
 /// Execute `req` through the zero-knowledge credential proxy (`prepare_proxied_request`),
 /// disabling automatic redirect following so credentials are never forwarded cross-origin,
 /// and scrubbing any secret values from the response body and headers.
@@ -659,13 +774,20 @@ pub fn execute_proxied_request_with_provider(
     let prepared = prepared_secrets.request;
     let external = prepared_secrets.external_plaintexts;
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(1, 300));
+    // After the `allowed` entry: what became of the request. Best effort, like every audit write.
+    let audit_after_send = |outcome: &str| {
+        if !prepared.injected_secrets.is_empty() {
+            vault.append_audit_log(
+                req.caller_agent.as_deref(),
+                &prepared.injected_secrets,
+                &audit_method(&prepared.method),
+                &prepared.host,
+                outcome,
+            );
+        }
+    };
 
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .build();
-    let agent: ureq::Agent = config.into();
+    let agent: ureq::Agent = agent_config(timeout).into();
 
     let send_result = match prepared.method.as_str() {
         "GET" => {
@@ -711,6 +833,7 @@ pub fn execute_proxied_request_with_provider(
             b.send(prepared.body.as_deref().unwrap_or("").as_bytes())
         }
         other => {
+            audit_after_send("denied:unsupported_method");
             // `prepared.url` holds injected plaintext in its query: report the request's own URL.
             return Err(GateError::InvalidUrl {
                 url: req.url.clone(),
@@ -720,6 +843,7 @@ pub fn execute_proxied_request_with_provider(
     };
 
     let mut resp = send_result.map_err(|e| {
+        audit_after_send("error:upstream");
         let (scrubbed_err, _) = scrub_with_external(vault, &e.to_string(), &external);
         GateError::UpstreamHttp {
             cause: scrubbed_err,
@@ -727,6 +851,11 @@ pub fn execute_proxied_request_with_provider(
     })?;
 
     let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        // Redirects are never followed (the credential would go with them); the 3xx is returned
+        // to the caller as it is, and the refusal to follow it is on record.
+        audit_after_send("redirect_not_followed");
+    }
     let mut resp_headers = BTreeMap::new();
     let mut scrubbed_names = BTreeSet::new();
     for (hk, hv) in resp.headers() {
@@ -1004,5 +1133,15 @@ mod tests {
         let shown = format!("{prepared:?}");
         assert!(!shown.contains("s3cr3t-value-123"), "{shown}");
         assert!(shown.contains("API_KEY"), "{shown}");
+    }
+
+    #[test]
+    fn the_outbound_client_has_no_proxy_and_follows_no_redirect() {
+        let config = agent_config(Duration::from_secs(1));
+        assert!(
+            config.proxy().is_none(),
+            "an ambient HTTP(S)_PROXY / ALL_PROXY must not be read"
+        );
+        assert_eq!(config.max_redirects(), 0);
     }
 }
