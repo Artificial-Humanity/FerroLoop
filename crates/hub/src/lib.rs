@@ -745,6 +745,14 @@ mod remodel_api_tests;
 #[cfg(test)]
 mod conn_and_auth_cache_tests;
 
+#[cfg(test)]
+mod probe_env_tests;
+
+/// A test that sets a secret-named variable (`FL_VAULT_MASTER_KEY`, `FL_HUB_OWNER_TOKEN`, ...)
+/// in this process holds this lock while it is set, as the doctor tests do while they clear them.
+#[cfg(test)]
+pub(crate) static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `FL_WIRE_TMUX_BIN` is process-global. A test that points it at a fake tmux holds this lock
 /// while it is set.
 #[cfg(test)]

@@ -189,9 +189,33 @@ pub fn child_env_from(
     pass: &[String],
     extra: &[(OsString, OsString)],
 ) -> Vec<(OsString, OsString)> {
+    env_from(Some(kind), parent, pass, extra)
+}
+
+/// The environment for a helper that is not a vendor CLI (a hydrate script, `curl`): the
+/// baseline of [`child_env`] and no vendor's credentials at all.
+pub fn helper_env(pass: &[String], extra: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
+    helper_env_from(std::env::vars_os(), pass, extra)
+}
+
+/// [`helper_env`] with the parent environment given instead of read.
+pub fn helper_env_from(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    pass: &[String],
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    env_from(None, parent, pass, extra)
+}
+
+fn env_from(
+    kind: Option<AdapterKind>,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    pass: &[String],
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
     let prefixes: Vec<&str> = BASELINE_PREFIXES
         .iter()
-        .chain(dialect_prefixes(kind))
+        .chain(kind.map_or(&[][..], dialect_prefixes))
         .copied()
         .collect();
     let rules = Rules {
@@ -614,5 +638,32 @@ mod tests {
                 assert!(!DENIED_PREFIXES.iter().any(|d| p.starts_with(d)), "{p}");
             }
         }
+    }
+
+    fn helper_map(pass: &[String], extra: &[(OsString, OsString)]) -> BTreeMap<String, String> {
+        helper_env_from(pairs(&parent_all()), pass, extra)
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn a_helper_gets_the_baseline_and_no_vendor_key() {
+        let env = helper_map(&[], &[]);
+        for (k, v) in BASELINE {
+            assert_eq!(env.get(*k).map(String::as_str), Some(*v), "{k}");
+        }
+        for (k, _) in VENDOR_KEYS.iter().chain(DENIED) {
+            assert!(!env.contains_key(*k), "{k} reached a helper");
+        }
+    }
+
+    #[test]
+    fn a_helper_takes_pass_names_and_extras_but_never_an_fl_name() {
+        let pass = vec!["HTTPS_PROXY".to_string(), "FL_VAULT_MASTER_KEY".to_string()];
+        let env = helper_map(&pass, &pairs(&[("UV_CACHE_DIR", "/uv")]));
+        assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some("p2"));
+        assert_eq!(env.get("UV_CACHE_DIR").map(String::as_str), Some("/uv"));
+        assert!(!env.contains_key("FL_VAULT_MASTER_KEY"));
     }
 }
