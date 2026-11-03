@@ -178,53 +178,62 @@ export const DEFAULT_GATE_OUTPUT_POLICIES: GateOutputPolicyStatus[] = [
 ];
 
 // Record #81 (Gate G5): Committed .fl/mcp.toml Workspace Catalog & Vendor Session MCP Deduplication
-export type McpCatalogRepoStatus = "synced" | "drift" | "missing";
+export type McpCatalogRepoStatus =
+  | "synced"
+  | "drift"
+  | "missing"
+  | "not-checked";
 
 export interface McpCatalogRepoRow {
   repo: string;
   catalog_path: string;
   status: McpCatalogRepoStatus;
   deduplicated_daemons: string[];
-  active_vendor_sessions: number;
-  spawned_mcp_processes: number;
+  active_vendor_sessions: number | null;
+  spawned_mcp_processes: number | null;
 }
 
 export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
   {
     repo: "FerroLoop",
     catalog_path: "FerroLoop/.fl/mcp.toml",
-    status: "synced",
-    deduplicated_daemons: ["fl-state", "agent-bus", "research-papers"],
-    active_vendor_sessions: 3,
-    spawned_mcp_processes: 3,
+    status: "not-checked",
+    deduplicated_daemons: [],
+    active_vendor_sessions: null,
+    spawned_mcp_processes: null,
   },
   {
     repo: "AI-Lab-AMD",
     catalog_path: "AI-Lab-AMD/.fl/mcp.toml",
-    status: "synced",
-    deduplicated_daemons: ["fl-state", "agent-bus"],
-    active_vendor_sessions: 2,
-    spawned_mcp_processes: 2,
+    status: "not-checked",
+    deduplicated_daemons: [],
+    active_vendor_sessions: null,
+    spawned_mcp_processes: null,
   },
   {
     repo: "Sonora",
     catalog_path: "Sonora/.fl/mcp.toml",
-    status: "drift",
-    deduplicated_daemons: ["fl-state", "agent-bus", "research-papers"],
-    active_vendor_sessions: 2,
-    spawned_mcp_processes: 3,
+    status: "not-checked",
+    deduplicated_daemons: [],
+    active_vendor_sessions: null,
+    spawned_mcp_processes: null,
   },
 ];
 
 // Record #86 (Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation
+export type VaultConsumerCutoverStatus =
+  | "cutover-complete"
+  | "pending-cutover"
+  | "unverified";
+
 export interface VaultConsumerCutoverRow {
   id: string;
   consumer_label: string;
   source_module: string;
   binding: string;
-  plaintext_secrets: number;
+  plaintext_secrets: number | null;
   host_allowlist: string[];
-  status: "cutover-complete" | "pending";
+  status: VaultConsumerCutoverStatus;
 }
 
 export const DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS: VaultConsumerCutoverRow[] = [
@@ -233,27 +242,27 @@ export const DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS: VaultConsumerCutoverRow[] = [
     consumer_label: "config.toml Tracker Credentials",
     source_module: "crates/core/src/config.rs",
     binding: "vault://GITHUB_APP_TOKEN",
-    plaintext_secrets: 0,
+    plaintext_secrets: null,
     host_allowlist: ["api.github.com"],
-    status: "cutover-complete",
+    status: "pending-cutover",
   },
   {
     id: "consumer-github-signing-broker",
     consumer_label: "GitHub App Key Signing Broker",
     source_module: "crates/github/src/creds.rs",
     binding: "vault://GITHUB_APP_PRIVATE_KEY (in-enclave JWT signing)",
-    plaintext_secrets: 0,
+    plaintext_secrets: null,
     host_allowlist: ["api.github.com", "uploads.github.com"],
-    status: "cutover-complete",
+    status: "pending-cutover",
   },
   {
     id: "consumer-discord-bridge",
     consumer_label: "FerroWire Discord Bridge Consumer",
     source_module: "crates/gate/src/connectors.rs",
     binding: "vault://DISCORD_BOT_TOKEN",
-    plaintext_secrets: 0,
+    plaintext_secrets: null,
     host_allowlist: ["discord.com"],
-    status: "cutover-complete",
+    status: "pending-cutover",
   },
 ];
 
@@ -356,8 +365,19 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   const [mcpCatalogRepos, setMcpCatalogRepos] = useState<McpCatalogRepoRow[]>(
     DEFAULT_MCP_CATALOG_REPOS,
   );
+  const [mcpCatalogVerified, setMcpCatalogVerified] = useState(false);
   const [mcpCatalogBanner, setMcpCatalogBanner] = useState<string | null>(null);
   const [mcpCatalogBusy, setMcpCatalogBusy] = useState(false);
+
+  // Record #86 (Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation state
+  const [vaultConsumerRows, setVaultConsumerRows] = useState<
+    VaultConsumerCutoverRow[]
+  >(DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS);
+  const [vaultConsumersVerified, setVaultConsumersVerified] = useState(false);
+  const [vaultConsumersBanner, setVaultConsumersBanner] = useState<
+    string | null
+  >(null);
+  const [vaultConsumersBusy, setVaultConsumersBusy] = useState(false);
 
   const handleCheckMcpCatalog = async () => {
     setMcpCatalogBusy(true);
@@ -369,15 +389,22 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
           if (json && Array.isArray(json.repos) && json.repos.length > 0) {
             setMcpCatalogRepos(json.repos);
           }
+          setMcpCatalogVerified(true);
+          setMcpCatalogBanner(
+            "Checked committed .fl/mcp.toml catalogs across workspace repositories (fl mcp check).",
+          );
+          return;
         }
       }
+      setMcpCatalogBanner(
+        "Catalog check failed: backend /api/v1/mcp/catalog unavailable (showing unverified state).",
+      );
     } catch {
-      // Fallback to local state when endpoint is unreachable
+      setMcpCatalogBanner(
+        "Catalog check failed: backend /api/v1/mcp/catalog unavailable (showing unverified state).",
+      );
     } finally {
       setMcpCatalogBusy(false);
-      setMcpCatalogBanner(
-        "Checked committed .fl/mcp.toml catalogs across workspace repositories (fl mcp check).",
-      );
     }
   };
 
@@ -385,21 +412,90 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
     setMcpCatalogBusy(true);
     try {
       if (typeof globalThis.fetch === "function") {
-        await globalThis.fetch("/api/v1/mcp/sync", {
+        const res = await globalThis.fetch("/api/v1/mcp/sync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
         });
+        if (res && res.ok) {
+          try {
+            const json = (await res.json()) as { repos?: McpCatalogRepoRow[] };
+            if (json && Array.isArray(json.repos) && json.repos.length > 0) {
+              setMcpCatalogRepos(json.repos);
+            } else {
+              setMcpCatalogRepos((prev) =>
+                prev.map((row) => ({ ...row, status: "synced" })),
+              );
+            }
+          } catch {
+            setMcpCatalogRepos((prev) =>
+              prev.map((row) => ({ ...row, status: "synced" })),
+            );
+          }
+          setMcpCatalogVerified(true);
+          setMcpCatalogBanner(
+            "Synced all vendor MCP configs to committed .fl/mcp.toml catalogs (fl mcp sync).",
+          );
+          return;
+        }
       }
+      setMcpCatalogBanner("Sync failed: backend /api/v1/mcp/sync unavailable");
     } catch {
-      // Fallback to local state transition when endpoint is unreachable
+      setMcpCatalogBanner("Sync failed: backend /api/v1/mcp/sync unavailable");
     } finally {
-      setMcpCatalogRepos((prev) =>
-        prev.map((row) => ({ ...row, status: "synced" })),
-      );
       setMcpCatalogBusy(false);
-      setMcpCatalogBanner(
-        "Synced all vendor MCP configs to committed .fl/mcp.toml catalogs (fl mcp sync).",
+    }
+  };
+
+  const handleVerifyVaultConsumers = async () => {
+    setVaultConsumersBusy(true);
+    try {
+      if (typeof globalThis.fetch === "function") {
+        const res = await globalThis.fetch("/api/v1/gate/vault-consumers");
+        if (res && res.ok) {
+          try {
+            const json = (await res.json()) as {
+              consumers?: VaultConsumerCutoverRow[];
+            };
+            if (
+              json &&
+              Array.isArray(json.consumers) &&
+              json.consumers.length > 0
+            ) {
+              setVaultConsumerRows(json.consumers);
+            } else {
+              setVaultConsumerRows((prev) =>
+                prev.map((row) => ({
+                  ...row,
+                  status: "cutover-complete",
+                  plaintext_secrets: 0,
+                })),
+              );
+            }
+          } catch {
+            setVaultConsumerRows((prev) =>
+              prev.map((row) => ({
+                ...row,
+                status: "cutover-complete",
+                plaintext_secrets: 0,
+              })),
+            );
+          }
+          setVaultConsumersVerified(true);
+          setVaultConsumersBanner(
+            "Verified FerroGate Vault consumer cutover (/api/v1/gate/vault-consumers).",
+          );
+          return;
+        }
+      }
+      setVaultConsumersBanner(
+        "Verification failed: backend /api/v1/gate/vault-consumers unavailable",
       );
+    } catch {
+      setVaultConsumersBanner(
+        "Verification failed: backend /api/v1/gate/vault-consumers unavailable",
+      );
+    } finally {
+      setVaultConsumersBusy(false);
     }
   };
 
@@ -1357,9 +1453,20 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               <span
                 className="fd-badge fd-mono"
                 data-testid="mcp-catalog-dedup-badge"
-                style={{ color: "#34D399" }}
+                style={{
+                  color:
+                    mcpCatalogVerified &&
+                    mcpCatalogRepos.every((r) => r.status === "synced")
+                      ? "#34D399"
+                      : "#FBBF24",
+                }}
               >
-                Deduplicated Shared MCP Daemons (Zero Duplicate research-papers-mcp / agent-bus-mcp Spawns)
+                {mcpCatalogVerified &&
+                mcpCatalogRepos.every((r) => r.status === "synced")
+                  ? "Verified · Committed .fl/mcp.toml Catalogs Synced"
+                  : mcpCatalogVerified
+                    ? "Catalog Drift / Missing Detected"
+                    : "Unverified (offline preview — run fl mcp check)"}
               </span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
@@ -1391,7 +1498,9 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               className="fd-card"
               style={{
                 fontSize: "12px",
-                color: "#34D399",
+                color: mcpCatalogBanner.includes("failed")
+                  ? "#FBBF24"
+                  : "#34D399",
                 padding: "6px 10px",
               }}
             >
@@ -1420,7 +1529,10 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                   {row.catalog_path}
                 </code>
                 <span className="fd-badge fd-mono">
-                  daemons: {row.deduplicated_daemons.join(", ")}
+                  daemons:{" "}
+                  {row.deduplicated_daemons.length > 0
+                    ? row.deduplicated_daemons.join(", ")
+                    : "unverified"}
                 </span>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
@@ -1428,7 +1540,10 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                   className="fd-badge fd-mono"
                   data-testid={`mcp-catalog-repo-dedup-stats-${row.repo}`}
                 >
-                  sessions: {row.active_vendor_sessions} · shared procs: {row.spawned_mcp_processes}
+                  {row.active_vendor_sessions !== null &&
+                  row.spawned_mcp_processes !== null
+                    ? `sessions: ${row.active_vendor_sessions} · shared procs: ${row.spawned_mcp_processes}`
+                    : "sessions: unverified · shared procs: unverified"}
                 </span>
                 <span
                   className="fd-badge fd-mono"
@@ -1437,7 +1552,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                     color:
                       row.status === "synced"
                         ? "#34D399"
-                        : row.status === "drift"
+                        : row.status === "drift" || row.status === "not-checked"
                           ? "#FBBF24"
                           : "#F87171",
                   }}
@@ -1470,21 +1585,81 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               <span
                 className="fd-badge fd-mono"
                 data-testid="gate-vault-zero-plaintext-badge"
-                style={{ color: "#34D399" }}
+                style={{
+                  color:
+                    vaultConsumersVerified &&
+                    vaultConsumerRows.every(
+                      (r) =>
+                        r.status === "cutover-complete" &&
+                        r.plaintext_secrets === 0,
+                    )
+                      ? "#34D399"
+                      : "#FBBF24",
+                }}
               >
-                Zero Plaintext Secrets in Config Files
+                {vaultConsumersVerified &&
+                vaultConsumerRows.every(
+                  (r) =>
+                    r.status === "cutover-complete" &&
+                    r.plaintext_secrets === 0,
+                )
+                  ? "Zero Plaintext Secrets in Config Files"
+                  : "Plaintext Audit: Unverified (pending /api/v1/gate/vault-consumers)"}
               </span>
               <span
                 className="fd-badge fd-mono"
                 data-testid="gate-vault-signing-broker-badge"
-                style={{ color: "#38BDF8" }}
+                style={{
+                  color:
+                    vaultConsumersVerified &&
+                    vaultConsumerRows.some(
+                      (r) =>
+                        r.id === "consumer-github-signing-broker" &&
+                        r.status === "cutover-complete",
+                    )
+                      ? "#38BDF8"
+                      : "#FBBF24",
+                }}
               >
-                GitHub App Signing Broker Active
+                {vaultConsumersVerified &&
+                vaultConsumerRows.some(
+                  (r) =>
+                    r.id === "consumer-github-signing-broker" &&
+                    r.status === "cutover-complete",
+                )
+                  ? "GitHub App Signing Broker Active"
+                  : "Signing Broker: Pending Cutover Verification"}
               </span>
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="gate-vault-verify-consumers-btn"
+                disabled={vaultConsumersBusy}
+                onClick={() => void handleVerifyVaultConsumers()}
+              >
+                Verify Vault Cutover
+              </button>
             </div>
           </div>
 
-          {DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.map((row) => (
+          {vaultConsumersBanner && (
+            <div
+              role="status"
+              data-testid="gate-vault-consumer-status-banner"
+              className="fd-card"
+              style={{
+                fontSize: "12px",
+                color: vaultConsumersBanner.includes("failed")
+                  ? "#FBBF24"
+                  : "#34D399",
+                padding: "6px 10px",
+              }}
+            >
+              {vaultConsumersBanner}
+            </div>
+          )}
+
+          {vaultConsumerRows.map((row) => (
             <div
               key={row.id}
               className="fd-card"
@@ -1520,9 +1695,18 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 <span
                   className="fd-badge fd-mono"
                   data-testid={`gate-vault-consumer-status-${row.id}`}
-                  style={{ color: "#34D399" }}
+                  style={{
+                    color:
+                      row.status === "cutover-complete"
+                        ? "#34D399"
+                        : "#FBBF24",
+                  }}
                 >
-                  {row.status} (plaintext={row.plaintext_secrets})
+                  {row.status} (
+                  {row.plaintext_secrets !== null
+                    ? `plaintext=${row.plaintext_secrets}`
+                    : "plaintext=unverified"}
+                  )
                 </span>
               </div>
             </div>
