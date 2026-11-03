@@ -295,7 +295,7 @@ fn check_api_key(env: &LifecycleEnv<'_>, vendor: &str) -> Result<(), LifecycleEr
 pub trait SessionRuntime: std::fmt::Debug {
     /// Start a detached runtime; `false` when it did not start (tmux failed, or the name exists).
     /// With `launch` the window runs that command (the vendor's CLI) instead of a blank shell.
-    /// Only Muse is launched so far ([`launch_spec_for`]); every other vendor gets a blank window.
+    /// Built-in CLI vendors launch via [`launch_spec_for`]; custom vendors get a blank window.
     ///
     /// `session` is the tmux session to create, except [`MUSE_SESSION`]: that one is shared, so
     /// `window` is added to it when it exists (and the spawn is refused when a window of that
@@ -461,12 +461,18 @@ pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
     }
 }
 
-/// The vendor CLI to start in a new runtime window, with `prompt` as its first input; `None`
-/// where the window stays a blank shell. Only Muse is launched so far. For Muse the argument
-/// vector is `<bin> --model <id> <prompt>`: `--model` is the CLI's flag (`muse --help`:
-/// `--model <MODEL>  Model id for non-echo providers`). There is no `--` before the prompt:
-/// Muse's CLI rejects a bare `--` ("unknown option `--`"). So [`muse_prompt_argument`] makes
-/// sure the prompt can never start with `-` and be read as a flag.
+/// A plain model id cannot be interpreted as a command-line option.
+fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
+    let id = requested?.trim();
+    (id.len() <= 64
+        && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+    .then(|| id.to_string())
+}
+
+/// Build a launch command for built-in CLI vendors; custom vendors use prompt delivery.
 fn launch_spec_for(
     env: &LifecycleEnv<'_>,
     vendor: &str,
@@ -474,20 +480,42 @@ fn launch_spec_for(
     model: Option<&str>,
     prompt: &str,
 ) -> Option<LaunchSpec> {
-    (vendor == "muse").then(|| LaunchSpec {
-        env: vec![("AGENT_PERSONA".to_string(), persona.to_string())],
-        argv: vec![
-            resolve_muse_bin(
-                std::env::var_os("FL_WIRE_MUSE_BIN"),
-                env.home_override
-                    .map(Path::to_path_buf)
-                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-                    .as_deref(),
-            ),
-            "--model".to_string(),
+    let home = env
+        .home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let mut argv = if vendor == "muse" {
+        vec![
+            resolve_muse_bin(std::env::var_os("FL_WIRE_MUSE_BIN"), home.as_deref()),
+            "--model".into(),
             normalize_muse_model(model),
-            muse_prompt_argument(prompt),
-        ],
+        ]
+    } else {
+        let (variable, bin, flags): (&str, &str, &[&str]) = match vendor {
+            "codex" => ("FL_WIRE_CODEX_BIN", "codex", &["--yolo"]),
+            "claude" => ("FL_WIRE_CLAUDE_BIN", "claude", &["--enable-auto-mode"]),
+            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo"]),
+            "antigravity" => ("FL_WIRE_AGY_BIN", "agy", &["--mode", "auto"]),
+            _ => return None,
+        };
+        let mut args = vec![resolve_vendor_bin(
+            std::env::var_os(variable),
+            home.as_deref(),
+            bin,
+        )];
+        args.extend(flags.iter().map(|flag| (*flag).to_string()));
+        if let Some(model) = normalize_plain_model(model) {
+            args.extend(["--model".into(), model]);
+        }
+        if vendor == "antigravity" {
+            args.push("--prompt-interactive".into());
+        }
+        args
+    };
+    argv.push(muse_prompt_argument(prompt));
+    Some(LaunchSpec {
+        env: vec![("AGENT_PERSONA".into(), persona.into())],
+        argv,
     })
 }
 
@@ -505,12 +533,24 @@ fn muse_prompt_argument(prompt: &str) -> String {
 /// The Muse binary: `configured` (`FL_WIRE_MUSE_BIN`, the one the dispatcher honours) when set,
 /// else `<home>/.local/bin/muse` when that file exists, else `muse` from `PATH`.
 fn resolve_muse_bin(configured: Option<std::ffi::OsString>, home: Option<&Path>) -> String {
+    resolve_vendor_bin(configured, home, "muse")
+}
+
+/// Resolve a configured binary, then a user-local binary, then a PATH command.
+fn resolve_vendor_bin(
+    configured: Option<std::ffi::OsString>,
+    home: Option<&Path>,
+    bin_name: &str,
+) -> String {
     if let Some(bin) = configured.filter(|b| !b.is_empty()) {
         return bin.to_string_lossy().into_owned();
     }
-    home.map(|h| h.join(".local").join("bin").join("muse"))
+    home.map(|h| h.join(".local").join("bin").join(bin_name))
         .filter(|p| p.is_file())
-        .map_or_else(|| "muse".to_string(), |p| p.to_string_lossy().into_owned())
+        .map_or_else(
+            || bin_name.to_string(),
+            |p| p.to_string_lossy().into_owned(),
+        )
 }
 
 /// The real runtime: the host's `tmux`.
