@@ -5968,7 +5968,7 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
          1. Read `.agents/AGENTS.md` and `.agents/REGISTRY.md`.\n\
          2. Read your role file(s): `.agents/roles/{role}.md`.\n\
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
-         4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state get current --scope {scope}` for your latest handoff, and `fl state search \"<query>\"` to look up anything specific.\n\
+         4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state handoff get --scope {scope} --key {name_lower}` for your own latest handoff (if it reports none, `fl state handoff get --scope {scope}` reads the shared `current` handoff), and `fl state search \"<query>\"` to look up anything specific.\n\
          5. Optional legacy reference: if `Notes/{project}/STATE.md` exists, skim it; FerroState wins wherever the two disagree. Do not require it.\n\
          6. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
             ```bash\n\
@@ -5998,7 +5998,7 @@ pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &s
     let to = if role == "lead" { "jarvis" } else { "<lead>" };
     format!(
         "{name}, you are being prepared for decommission. This session will be shut down after you finish; do not start new work. Complete these steps now:\n\
-         1. Save unsaved progress, findings and your handoff in FerroState, the primary state source: `fl state handoff set --scope {scope} --summary \"<one line, at most 240 characters>\" --by {name_lower}` for the handoff (the summary must be ONE line of at most 240 characters; put the detail in repeatable `--shipped`, `--in-flight`, `--blocker`, `--next` flags or in `--notes`), then `fl state checkpoint --scope {scope} --by {name_lower}` for the git checkpoint. `Notes/{project}/STATE.md` is an optional legacy note; update it only if it exists.\n\
+         1. Save unsaved progress, findings and your handoff in FerroState, the primary state source: `fl state handoff set --scope {scope} --key {name_lower} --summary \"<one line, at most 240 characters>\" --by {name_lower}` for the handoff (`--key {name_lower}` keeps it apart from other agents' handoffs in the project; the summary must be ONE line of at most 240 characters; put the detail in repeatable `--shipped`, `--in-flight`, `--blocker`, `--next` flags or in `--notes`), then `fl state checkpoint --scope {scope} --by {name_lower}` for the git checkpoint. `Notes/{project}/STATE.md` is an optional legacy note; update it only if it exists.\n\
          2. Commit and push your work, or clean up your temp worktrees and branches (`git worktree remove`, `git branch -d`). Leave nothing only on this session's disk.\n\
          3. Send your final handoff to {recipient} once:\n\
             ```bash\n\

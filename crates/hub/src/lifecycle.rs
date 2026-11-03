@@ -3728,7 +3728,7 @@ mod tests {
         let p = synthesize_decommission_prompt("Felicity", "FerroLoop", "assistant");
         for needle in [
             "Felicity",
-            "fl state handoff set --scope project:ferroloop",
+            "fl state handoff set --scope project:ferroloop --key felicity --summary",
             "fl state checkpoint --scope project:ferroloop",
             "worktrees",
             "fl wire send <lead> \"Felicity decommission handoff\"",
@@ -3801,7 +3801,12 @@ mod tests {
             "{p}"
         );
         assert!(
-            p.contains("fl state get current --scope project:ferroloop"),
+            p.contains("fl state handoff get --scope project:ferroloop --key felicity"),
+            "{p}"
+        );
+        // A first reforge has no per-agent handoff yet: the shared `current` one is the fallback.
+        assert!(
+            p.contains("`fl state handoff get --scope project:ferroloop` reads the shared `current` handoff"),
             "{p}"
         );
         assert!(p.contains("primary state source"), "{p}");
@@ -3848,6 +3853,37 @@ mod tests {
         let p = synthesize_decommission_prompt("Ada", "!!!", "assistant");
         assert!(p.contains("--scope workspace"), "{p}");
         assert!(!p.contains("project:"), "{p}");
+    }
+
+    /// The `--key` token in the prompts is the lowercase persona, which must be a valid state
+    /// slug, so concurrent agents in one project never share (and overwrite) a handoff key.
+    #[test]
+    fn prompt_handoff_key_is_the_lowercase_persona_and_a_valid_slug() {
+        use fl_core::state::validate_slug;
+        for (name, role) in [
+            ("Felicity", "assistant"),
+            ("Ferris", "lead"),
+            ("Ada_2", "lab_manager"),
+        ] {
+            let lower = name.to_ascii_lowercase();
+            let prompts = [
+                canonical_reforge_prompt(name, "FerroLoop", role),
+                synthesize_decommission_prompt(name, "FerroLoop", role),
+            ];
+            for p in prompts {
+                let keys: Vec<&str> = p
+                    .split("--key ")
+                    .skip(1)
+                    .map(|rest| rest.split([' ', '`']).next().unwrap())
+                    .collect();
+                assert!(!keys.is_empty(), "{name}: {p}");
+                for k in keys {
+                    assert_eq!(k, lower, "{p}");
+                    assert_eq!(validate_slug(k).unwrap(), k, "{p}");
+                    assert_ne!(k, "current", "{p}");
+                }
+            }
+        }
     }
 
     #[test]
