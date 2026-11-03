@@ -3123,7 +3123,7 @@ mod tests {
         assert_eq!(rec["status"], "running");
         assert_eq!(rec["restart_policy"], "on-failure");
         assert_eq!(rec["restart_count"], 0);
-        assert_eq!(rec["tmux_target"], "Ada-2:muse");
+        assert_eq!(rec["tmux_target"], "muse:ada-2");
         assert_eq!(rec["hydration_dispatched"], false);
         assert!(rec["decommission_prepared_at_ms"].is_null());
         assert!(rec["created_at_ms"].as_u64().unwrap() > 0);

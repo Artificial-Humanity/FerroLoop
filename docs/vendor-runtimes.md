@@ -324,6 +324,15 @@ and windows are kept, a missing CLI window falls back to the file, and the trans
 FerroLoop pastes into the session tmux pane. The CLI fallback is
 `muse exec --session-id <id> --json`.
 
+### Hosting
+
+A hosted Muse agent runs as a window named `<persona>` (lowercase) in the one shared tmux
+session `muse`; its target is `muse:<persona>`. Spin-up uses `new-window` when the session
+exists and `new-session` when not. A window of that name that already exists (for example from
+`muse-sessions`) is not touched: the prompt is delivered to it. Teardown, restart and remodel
+stop only a window that spin-up created, with `kill-window`, and never the session. Discovery
+also accepts a `<Session>:muse` window and prefers `muse:<persona>` when both exist.
+
 ## Store guard
 
 HTTP authentication opens the store only long enough to resolve a session token, then drops
