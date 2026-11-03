@@ -26,10 +26,64 @@ import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
+  ACP_CONFORMANCE_OPERATIONS,
+  DEFAULT_ACP_CONFORMANCE_MATRIX,
+  type AcpAdapterConformanceRow,
+  type AcpConformanceOperation,
+} from "./FerroWatchPane";
+import {
   evaluateAgentMcpPosture,
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
 } from "./AgentSettingsModal";
+
+export {
+  ACP_CONFORMANCE_OPERATIONS,
+  DEFAULT_ACP_CONFORMANCE_MATRIX,
+  type AcpAdapterConformanceRow,
+  type AcpConformanceOperation,
+};
+
+/**
+ * Issue #205 Phase A1: `<ui_dir>/build-info.json` schema and `/api/v1/version` response.
+ */
+export interface UiBuildInfoPayload {
+  commit: string;
+  build_time_unix: number | null;
+  version: string | null;
+  dirty?: boolean;
+}
+
+export interface HubVersionProvenanceResponse {
+  name: string;
+  version: string;
+  commit: string;
+  commit_short: string;
+  dirty: boolean | null;
+  build_time_unix: number | null;
+  source: string;
+  release_id: string | null;
+  ui: UiBuildInfoPayload | null;
+  code_ui_agree: boolean | null;
+}
+
+export const DEFAULT_VERSION_PROVENANCE: HubVersionProvenanceResponse = {
+  name: "fl-hub",
+  version: "0.9.4",
+  commit: "b0888c6bc1ed0000000000000000000000000000",
+  commit_short: "b0888c6bc1ed",
+  dirty: false,
+  build_time_unix: 1775232000,
+  source: "source-build",
+  release_id: "0.9.4+b0888c6bc1ed",
+  ui: {
+    commit: "b0888c6bc1ed0000000000000000000000000000",
+    build_time_unix: 1775232000,
+    version: "0.1.0",
+    dirty: false,
+  },
+  code_ui_agree: true,
+};
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -92,6 +146,7 @@ export interface SettingsModalProps {
     agentKey: string,
     report: AgentMcpPostureReport,
   ) => void;
+  versionProvenance?: HubVersionProvenanceResponse;
 }
 
 export const CANONICAL_PROJECTS = [
@@ -581,6 +636,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   apiClient,
   postureInputsByAgent,
   onReconcileAgentPosture,
+  versionProvenance: propVersionProvenance,
 }) => {
   const [reconciledPostureAgents, setReconciledPostureAgents] = useState<
     Set<string>
@@ -593,6 +649,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [receiptAdoptionState, setReceiptAdoptionState] = useState<
     "managed" | "unmanaged_adopt_required"
   >("managed");
+  // Issue #205 Phase A1: Live `/api/v1/version` & `<ui_dir>/build-info.json` provenance state
+  const [versionProvenance, setVersionProvenance] =
+    useState<HubVersionProvenanceResponse>(
+      () => propVersionProvenance ?? DEFAULT_VERSION_PROVENANCE,
+    );
+  const [verifyingVersion, setVerifyingVersion] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
@@ -4780,8 +4842,64 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           ? "Managed Receipt (Schema v1)"
                           : "Unmanaged Artifact (--adopt required)"}
                       </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="version-code-ui-parity-badge"
+                        style={{
+                          background:
+                            versionProvenance.code_ui_agree === true
+                              ? "rgba(52, 211, 153, 0.14)"
+                              : versionProvenance.code_ui_agree === false
+                                ? "rgba(248, 113, 113, 0.18)"
+                                : "rgba(251, 191, 36, 0.16)",
+                          color:
+                            versionProvenance.code_ui_agree === true
+                              ? "#34d399"
+                              : versionProvenance.code_ui_agree === false
+                                ? "#f87171"
+                                : "#fbbf24",
+                        }}
+                      >
+                        {versionProvenance.code_ui_agree === true
+                          ? "Code ↔ UI Parity: Matched (code_ui_agree=true)"
+                          : versionProvenance.code_ui_agree === false
+                            ? "Code ↔ UI Parity: Drift Detected (code_ui_agree=false)"
+                            : "Code ↔ UI Parity: Unknown (code_ui_agree=null)"}
+                      </span>
                     </div>
                     <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        data-testid="receipt-verify-version-btn"
+                        className="fd-btn"
+                        style={{ fontSize: "11px", padding: "3px 8px" }}
+                        disabled={verifyingVersion}
+                        onClick={async () => {
+                          setVerifyingVersion(true);
+                          try {
+                            if (typeof globalThis.fetch === "function") {
+                              const res = await globalThis.fetch("/api/v1/version");
+                              if (res && res.ok) {
+                                const json = (await res.json()) as Partial<HubVersionProvenanceResponse>;
+                                if (json && typeof json.commit === "string") {
+                                  setVersionProvenance((prev) => ({
+                                    ...prev,
+                                    ...json,
+                                  }));
+                                }
+                              }
+                            }
+                          } catch {
+                            // Keep current versionProvenance when /api/v1/version is unreachable
+                          } finally {
+                            setVerifyingVersion(false);
+                          }
+                        }}
+                      >
+                        {verifyingVersion
+                          ? "Verifying /api/v1/version…"
+                          : "Verify /api/v1/version Parity"}
+                      </button>
                       <button
                         type="button"
                         data-testid="receipt-simulate-unmanaged-btn"
@@ -4838,7 +4956,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         Release ID &amp; Source Provenance
                       </div>
                       <code className="fd-mono" style={{ fontSize: "11px" }}>
-                        0.9.4+b0888c6bc1ed · signed_release · dirty=false
+                        {versionProvenance.release_id ?? `${versionProvenance.version}+${versionProvenance.commit_short}`} · signed_release · dirty={String(versionProvenance.dirty ?? false)}
+                      </code>
+                    </div>
+                    <div
+                      data-testid="receipt-ui-build-info"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
+                        UI Bundle Provenance (`build-info.json`)
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        {versionProvenance.ui
+                          ? `commit=${versionProvenance.ui.commit.slice(0, 12)} · v=${versionProvenance.ui.version ?? "unknown"} · dirty=${String(versionProvenance.ui.dirty ?? false)}`
+                          : "build-info.json absent"}
                       </code>
                     </div>
                     <div

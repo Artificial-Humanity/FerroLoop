@@ -71,7 +71,47 @@ export interface TriageQueuePaneProps extends TriageAggregateInput {
   onSelectTab?: (tab: CockpitTab) => void;
   onSelectLeftPanelTab?: (tab: LeftPanelTab) => void;
   onAckWireMessage?: (messageId: string) => Promise<unknown> | void;
+  routedCiPrEvents?: RoutedCiPrFeedbackEvent[];
 }
+
+// Record #88: Automated CI Check Failure & PR Review Feedback Routing
+export interface RoutedCiPrFeedbackEvent {
+  id: string;
+  kind: "ci-check-failure" | "pr-review-feedback";
+  repo: string;
+  pr_number: number;
+  branch: string;
+  author_agent: string;
+  check_or_reviewer: string;
+  failing_step_or_summary: string;
+  status: "routed" | "dispatched" | "acknowledged";
+}
+
+export const DEFAULT_ROUTED_CI_PR_EVENTS: RoutedCiPrFeedbackEvent[] = [
+  {
+    id: "ci-fail-pr-238",
+    kind: "ci-check-failure",
+    repo: "Artificial-Humanity/FerroLoop",
+    pr_number: 238,
+    branch: "felix/wave4-otlp-and-ref-repos",
+    author_agent: "felix",
+    check_or_reviewer: "verify / test, clippy, fmt",
+    failing_step_or_summary: "cargo clippy --all-targets -- -D warnings",
+    status: "routed",
+  },
+  {
+    id: "pr-rev-pr-35",
+    kind: "pr-review-feedback",
+    repo: "Artificial-Humanity/FerroDeck",
+    pr_number: 35,
+    branch: "felix/wave4-otlp-and-ref-repos",
+    author_agent: "felix",
+    check_or_reviewer: "ferris (changes_requested)",
+    failing_step_or_summary:
+      "Inline review comment on src/components/FerroWatchPane.tsx:42",
+    status: "routed",
+  },
+];
 
 const SEVERITY_RANK: Record<TriageIncidentSeverity, number> = {
   critical: 0,
@@ -486,7 +526,36 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
   onSelectTab,
   onSelectLeftPanelTab,
   onAckWireMessage,
+  routedCiPrEvents: propRoutedEvents,
 }) => {
+  const [routedEvents, setRoutedEvents] = useState<RoutedCiPrFeedbackEvent[]>(
+    propRoutedEvents ?? DEFAULT_ROUTED_CI_PR_EVENTS,
+  );
+  const [routedActionStatus, setRoutedActionStatus] = useState<string | null>(
+    null,
+  );
+
+  const handleDispatchRoutedEvent = (ev: RoutedCiPrFeedbackEvent) => {
+    setRoutedEvents((prev) =>
+      prev.map((item) =>
+        item.id === ev.id ? { ...item, status: "dispatched" } : item,
+      ),
+    );
+    setRoutedActionStatus(
+      `Dispatched ${ev.kind} fix task for PR #${ev.pr_number} (${ev.branch}) to @${ev.author_agent}.`,
+    );
+  };
+
+  const handleAckRoutedEvent = (ev: RoutedCiPrFeedbackEvent) => {
+    setRoutedEvents((prev) =>
+      prev.map((item) =>
+        item.id === ev.id ? { ...item, status: "acknowledged" } : item,
+      ),
+    );
+    setRoutedActionStatus(
+      `Acknowledged ${ev.kind} event for PR #${ev.pr_number}.`,
+    );
+  };
   const [categoryFilter, setCategoryFilter] =
     useState<TriageCategoryFilter>("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -915,6 +984,135 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
             </div>
           ))
         )}
+
+        {/* Record #88: Automated CI Check Failure & PR Review Feedback Routing */}
+        <div
+          data-testid="triage-routed-ci-pr-section"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "6px",
+            marginTop: "6px",
+            paddingTop: "8px",
+            borderTop: "1px solid var(--border-subtle)",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "6px",
+              flexWrap: "wrap",
+            }}
+          >
+            <strong
+              style={{
+                fontSize: "11px",
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+                color: "var(--text-muted)",
+              }}
+            >
+              Routed CI &amp; PR Review Feedback ({routedEvents.length})
+            </strong>
+            <span className="fd-badge fd-mono" style={{ fontSize: "10px" }}>
+              Auto-Routed to Author
+            </span>
+          </div>
+
+          {routedActionStatus && (
+            <div
+              role="status"
+              data-testid="triage-routed-action-status"
+              style={{
+                fontSize: "11px",
+                color: "#34D399",
+                padding: "4px 8px",
+                borderRadius: "4px",
+                backgroundColor: "rgba(16, 185, 129, 0.12)",
+              }}
+            >
+              {routedActionStatus}
+            </div>
+          )}
+
+          {routedEvents.map((ev) => (
+            <div
+              key={ev.id}
+              data-testid={`routed-ci-pr-card-${ev.id}`}
+              data-kind={ev.kind}
+              data-status={ev.status}
+              className="fd-card"
+              style={{
+                padding: "8px 10px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`routed-ci-pr-kind-${ev.id}`}
+                  >
+                    {ev.kind}
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`routed-ci-pr-branch-${ev.id}`}
+                  >
+                    PR #{ev.pr_number} · {ev.branch}
+                  </span>
+                  <span className="fd-badge fd-mono">@{ev.author_agent}</span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`routed-ci-pr-status-${ev.id}`}
+                  >
+                    {ev.status}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid={`routed-ci-pr-dispatch-btn-${ev.id}`}
+                    disabled={ev.status === "dispatched"}
+                    style={{ fontSize: "10.5px", padding: "2px 8px" }}
+                    onClick={() => handleDispatchRoutedEvent(ev)}
+                  >
+                    Dispatch Fix to Author
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid={`routed-ci-pr-ack-btn-${ev.id}`}
+                    disabled={ev.status === "acknowledged"}
+                    style={{ fontSize: "10.5px", padding: "2px 8px" }}
+                    onClick={() => handleAckRoutedEvent(ev)}
+                  >
+                    Acknowledge
+                  </button>
+                </div>
+              </div>
+              <div style={{ fontSize: "11.5px", fontWeight: 600 }}>
+                {ev.repo} — {ev.check_or_reviewer}
+              </div>
+              <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                {ev.failing_step_or_summary}
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </section>
   );
