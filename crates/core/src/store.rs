@@ -74,6 +74,9 @@ pub enum StoreError {
     Imported { id: Iri, action: &'static str },
     #[error("backend failure: {0}")]
     Backend(String),
+    /// Caller-supplied provider/session data failed validation (maps to HTTP 400 in hub).
+    #[error("{0}")]
+    ProviderValidation(String),
     /// ⚠ The write committed and is durable at `seq`, but the sync adapter
     /// (`WriteThrough`) has not received it: `cause` is the adapter's error,
     /// for this commit's batch or for an older one still queued ahead of it.

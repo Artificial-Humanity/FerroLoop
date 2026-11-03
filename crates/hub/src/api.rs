@@ -554,6 +554,9 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/roles") => handle_get_roles(state),
         ("POST", "/api/v1/roles") => handle_post_role(state, &authority, req),
+        ("GET", "/api/v1/cloud-sessions") => handle_get_cloud_sessions(state),
+        ("GET", "/api/v1/providers/local") => handle_get_local_providers(state),
+        ("POST", "/api/v1/providers/local") => handle_post_local_provider(state, &authority, req),
         ("GET", "/api/v1/notifications/subscribe") => handle_get_notifications_subscribe(state),
         ("POST", "/api/v1/notifications/subscribe") => {
             handle_post_notifications_subscribe(state, &authority, req)
@@ -4177,6 +4180,166 @@ fn handle_delete_role(state: &HubState, authority: &HubAuthority, raw_slug: &str
     }
 }
 
+/// `GET /api/v1/cloud-sessions` (Record #71): all vendor cloud sessions.
+/// Any authenticated caller.
+fn handle_get_cloud_sessions(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::list_cloud_sessions(&*store) {
+        Ok(sessions) => {
+            HttpResponse::json(200, serde_json::to_value(&sessions).unwrap_or(json!([])))
+        }
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+fn cloud_session_not_found() -> HttpResponse {
+    HttpResponse::json(404, json!({ "error": "cloud session not found" }))
+}
+
+/// `POST /api/v1/cloud-sessions/{id}/attach` (Record #71): mark mirrored. Owner only.
+fn handle_post_cloud_session_attach(
+    state: &HubState,
+    authority: &HubAuthority,
+    raw_id: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change cloud sessions" }),
+        );
+    }
+    let session_id = percent_decode(raw_id);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::attach_cloud_session(&*store, &session_id) {
+        Ok(Some(entry)) => {
+            HttpResponse::json(200, serde_json::to_value(&entry).unwrap_or(json!({})))
+        }
+        Ok(None) => cloud_session_not_found(),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `POST /api/v1/cloud-sessions/{id}/handoff` (Record #71): record a handoff. Owner only.
+fn handle_post_cloud_session_handoff(
+    state: &HubState,
+    authority: &HubAuthority,
+    raw_id: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change cloud sessions" }),
+        );
+    }
+    let session_id = percent_decode(raw_id);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let synced_at = stamp::now().as_str().to_string();
+    match fl_core::record_cloud_session_handoff(&*store, &session_id, synced_at.clone()) {
+        Ok(Some(entry)) => HttpResponse::json(
+            200,
+            json!({
+                "session_id": entry.session_id,
+                "repo_branch": entry.repo_branch,
+                "handoff_synced": true,
+                "synced_at": synced_at,
+            }),
+        ),
+        Ok(None) => cloud_session_not_found(),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudSessionStatusBody {
+    status: fl_core::VendorCloudSessionStatus,
+}
+
+/// `POST /api/v1/cloud-sessions/{id}/status` (Record #71): set status. Owner only.
+fn handle_post_cloud_session_status(
+    state: &HubState,
+    authority: &HubAuthority,
+    raw_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change cloud sessions" }),
+        );
+    }
+    let body: CloudSessionStatusBody = match serde_json::from_slice(&req.body) {
+        Ok(body) => body,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid cloud session status: {e}") }),
+            );
+        }
+    };
+    let session_id = percent_decode(raw_id);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::set_cloud_session_status(&*store, &session_id, body.status) {
+        Ok(Some(entry)) => {
+            HttpResponse::json(200, serde_json::to_value(&entry).unwrap_or(json!({})))
+        }
+        Ok(None) => cloud_session_not_found(),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `GET /api/v1/providers/local` (Record #72): all local model providers.
+/// Any authenticated caller.
+fn handle_get_local_providers(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::list_local_model_providers(&*store) {
+        Ok(presets) => HttpResponse::json(200, serde_json::to_value(&presets).unwrap_or(json!([]))),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `POST /api/v1/providers/local` (Record #72): update a provider by kind. Owner only.
+fn handle_post_local_provider(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change local providers" }),
+        );
+    }
+    let update: fl_core::LocalProviderUpdate = match serde_json::from_slice(&req.body) {
+        Ok(update) => update,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid local provider: {e}") }),
+            );
+        }
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::update_local_model_provider_by_kind(&*store, update) {
+        Ok(preset) => HttpResponse::json(200, serde_json::to_value(&preset).unwrap_or(json!({}))),
+        Err(e @ fl_core::StoreError::ProviderValidation(_)) => {
+            HttpResponse::json(400, json!({ "error": e.to_string() }))
+        }
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
 /// `GET /api/v1/notifications/subscribe` (Record #67): current operator push
 /// state (defaults when unset). Any authenticated caller.
 fn handle_get_notifications_subscribe(state: &HubState) -> HttpResponse {
@@ -4779,6 +4942,23 @@ fn handle_dynamic_api_routes(
         {
             let bridge_id = percent_decode(segments[4]);
             return handle_post_gate_bridge_webhook(state, authority, &bridge_id, req);
+        }
+    }
+
+    // /api/v1/cloud-sessions/:id/attach|handoff|status
+    if segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "cloud-sessions"
+        && method == "POST"
+    {
+        match segments[4] {
+            "attach" => return handle_post_cloud_session_attach(state, authority, segments[3]),
+            "handoff" => return handle_post_cloud_session_handoff(state, authority, segments[3]),
+            "status" => {
+                return handle_post_cloud_session_status(state, authority, segments[3], req);
+            }
+            _ => {}
         }
     }
 
@@ -7301,6 +7481,213 @@ mod tests {
         );
         assert_eq!(status, 403);
         let (status, _) = roles_call(&state, "DELETE", "/api/v1/roles/y", "peer-test-tok", None);
+        assert_eq!(status, 403);
+    }
+
+    #[test]
+    fn cloud_sessions_list_defaults() {
+        let (_tmp, state) = roles_test_state();
+        let (status, list) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/cloud-sessions",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200, "{list}");
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0]["session_id"], "cs-claude-web-901");
+    }
+
+    #[test]
+    fn cloud_session_attach_flips_mirrored_and_persists() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let (status, entry) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/cs-codex-cloud-412/attach",
+            owner,
+            None,
+        );
+        assert_eq!(status, 200, "{entry}");
+        assert_eq!(entry["session_id"], "cs-codex-cloud-412");
+        assert_eq!(entry["mirrored"], true);
+        let (status, list) = roles_call(&state, "GET", "/api/v1/cloud-sessions", owner, None);
+        assert_eq!(status, 200);
+        let found = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == "cs-codex-cloud-412")
+            .unwrap();
+        assert_eq!(found["mirrored"], true);
+    }
+
+    #[test]
+    fn cloud_session_attach_unknown_404_and_peer_403() {
+        let (_tmp, state) = roles_test_state();
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/nope/attach",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 404, "{err}");
+        assert!(err.get("error").is_some());
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/cs-codex-cloud-412/attach",
+            "peer-test-tok",
+            None,
+        );
+        assert_eq!(status, 403, "{err}");
+        assert!(err.get("error").is_some());
+    }
+
+    #[test]
+    fn cloud_session_handoff_returns_branch_and_synced() {
+        let (_tmp, state) = roles_test_state();
+        let (status, resp) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/cs-claude-web-901/handoff",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200, "{resp}");
+        assert_eq!(resp["session_id"], "cs-claude-web-901");
+        assert_eq!(
+            resp["repo_branch"],
+            "Artificial-Humanity/FerroLoop@feat/cloud-handoff"
+        );
+        assert_eq!(resp["handoff_synced"], true);
+        assert!(!resp["synced_at"].as_str().unwrap().is_empty());
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/nope/handoff",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 404, "{err}");
+        assert!(err.get("error").is_some());
+    }
+
+    #[test]
+    fn cloud_session_status_persists_and_bad_status_400() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let body = serde_json::to_vec(&json!({ "status": "paused" })).unwrap();
+        let (status, entry) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/cs-claude-web-901/status",
+            owner,
+            Some(body),
+        );
+        assert_eq!(status, 200, "{entry}");
+        assert_eq!(entry["status"], "paused");
+        let (_, list) = roles_call(&state, "GET", "/api/v1/cloud-sessions", owner, None);
+        let found = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_id"] == "cs-claude-web-901")
+            .unwrap();
+        assert_eq!(found["status"], "paused");
+        let bad = serde_json::to_vec(&json!({ "status": "bogus" })).unwrap();
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/cs-claude-web-901/status",
+            owner,
+            Some(bad),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(err.get("error").is_some());
+        let body = serde_json::to_vec(&json!({ "status": "paused" })).unwrap();
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/cloud-sessions/nope/status",
+            owner,
+            Some(body),
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn local_providers_list_defaults() {
+        let (_tmp, state) = roles_test_state();
+        let (status, list) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/providers/local",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200, "{list}");
+        assert_eq!(list.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn local_providers_update_ollama_keeps_id_and_persists() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let body = serde_json::to_vec(&json!({
+            "kind": "ollama",
+            "endpoint_url": "http://127.0.0.1:9999/v1",
+            "vault_credential_ref": "keyless (loopback)",
+            "context_window_tokens": 131072,
+            "max_output_tokens": 16384
+        }))
+        .unwrap();
+        let (status, preset) =
+            roles_call(&state, "POST", "/api/v1/providers/local", owner, Some(body));
+        assert_eq!(status, 200, "{preset}");
+        assert_eq!(preset["id"], "ollama-local");
+        assert_eq!(preset["endpoint_url"], "http://127.0.0.1:9999/v1");
+        let (_, list) = roles_call(&state, "GET", "/api/v1/providers/local", owner, None);
+        let found = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "ollama-local")
+            .unwrap();
+        assert_eq!(found["endpoint_url"], "http://127.0.0.1:9999/v1");
+    }
+
+    #[test]
+    fn local_providers_raw_key_400_and_peer_403() {
+        let (_tmp, state) = roles_test_state();
+        let body = serde_json::to_vec(&json!({
+            "kind": "ollama",
+            "endpoint_url": "http://127.0.0.1:9999/v1",
+            "vault_credential_ref": "sk-rawkey123",
+            "context_window_tokens": 131072,
+            "max_output_tokens": 16384
+        }))
+        .unwrap();
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/providers/local",
+            "owner-test-tok",
+            Some(body.clone()),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(err.get("error").is_some());
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/providers/local",
+            "peer-test-tok",
+            Some(body),
+        );
         assert_eq!(status, 403);
     }
 

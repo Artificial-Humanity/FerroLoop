@@ -7,6 +7,7 @@ pub mod arch;
 pub mod at;
 pub mod build_info;
 pub mod child_env;
+pub mod cloud_sessions;
 pub mod code_index;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
@@ -23,6 +24,7 @@ pub mod finding;
 pub mod ids;
 pub mod install;
 pub mod iri;
+pub mod local_providers;
 pub mod log;
 pub mod mem;
 #[cfg(any(test, feature = "conformance"))]
@@ -57,6 +59,12 @@ pub use arch::{
     check_architecture_conformance, export_likec4_dsl, validate_architecture_model,
 };
 pub use at::{At, AtError};
+pub use cloud_sessions::{
+    CloudSessionError, VENDOR_CLOUD_SESSIONS_SLUG, VendorCloudSessionEntry,
+    VendorCloudSessionStatus, VendorCloudSessionVendor, attach_cloud_session,
+    default_vendor_cloud_sessions, list_cloud_sessions, record_cloud_session_handoff,
+    set_cloud_session_status, upsert_cloud_session,
+};
 pub use code_index::{
     CodeFileRef, CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, CodeSymbolRef,
     MAX_CODE_FILE_BYTES, TOKEN_GAIN_SLUG, TokenGainSummary, load_token_gain, outcome_from_hits,
@@ -89,6 +97,12 @@ pub use ids::{
     WorkflowId, WorkflowRunId,
 };
 pub use iri::{Iri, IriError};
+pub use local_providers::{
+    KEYLESS_LOOPBACK_REF, LOCAL_MODEL_PROVIDERS_SLUG, LocalLifecycleOp, LocalModelProviderKind,
+    LocalModelProviderPreset, LocalProviderError, LocalProviderUpdate, VAULT_REF_PREFIX,
+    default_local_model_providers, list_local_model_providers, update_local_model_provider_by_kind,
+    upsert_local_model_provider,
+};
 pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 pub use mem::MemStore;
 pub use model::{
