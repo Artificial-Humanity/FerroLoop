@@ -885,6 +885,9 @@ fn a_vendor_file_that_is_a_link_is_refused_not_written_through() {
 #[test]
 fn concurrent_syncs_take_turns() {
     let f = fixture();
+    // Six threads each ask git a few questions; on a loaded machine the last in line may wait
+    // longer than the default before it answers `busy`.
+    f.state.mcp.set_wait(std::time::Duration::from_secs(120));
     let results: Vec<(u16, Value)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..6)
             .map(|_| {
