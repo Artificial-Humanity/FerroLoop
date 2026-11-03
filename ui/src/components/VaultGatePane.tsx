@@ -8,8 +8,23 @@ import type {
   GateSecretResponse,
   HubAuthority,
   SetVaultSecretInput,
+  VaultConsumerDeniedInfo,
+  VaultConsumerReportEntry,
+  VaultConsumerSourceClass,
+  VaultConsumersAuditSummary,
+  VaultConsumersReport,
+  VaultCustodySummary,
   VaultSecretMetadata,
 } from "../types/api";
+
+export type {
+  VaultConsumerDeniedInfo,
+  VaultConsumerReportEntry,
+  VaultConsumerSourceClass,
+  VaultConsumersAuditSummary,
+  VaultConsumersReport,
+  VaultCustodySummary,
+};
 
 export interface VaultGatePaneProps {
   secrets?: VaultSecretMetadata[];
@@ -249,51 +264,111 @@ export const DEFAULT_MCP_CATALOG_REPOS: McpCatalogRepoRow[] = [
   },
 ];
 
-// Record #86 (Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation
+// Record #86 (Gate G6): Observational FerroGate Vault Consumer Status (`GET /api/v1/gate/vault-consumers`)
 export type VaultConsumerCutoverStatus =
-  | "cutover-complete"
   | "pending-cutover"
-  | "unverified";
+  | "unverified"
+  | VaultConsumerSourceClass;
 
 export interface VaultConsumerCutoverRow {
   id: string;
+  consumer?: string;
   consumer_label: string;
   source_module: string;
   binding: string;
+  class: VaultConsumerSourceClass;
+  vault_entry: string | null;
+  vault_key_field: string | null;
+  evidence?: string;
+  plaintext_path_present?: boolean | null;
   plaintext_secrets: number | null;
   host_allowlist: string[];
   status: VaultConsumerCutoverStatus;
+  last_denied?: VaultConsumerDeniedInfo | null;
 }
+
+export const DEFAULT_VAULT_CONSUMERS_DISCLAIMER =
+  "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.";
 
 export const DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS: VaultConsumerCutoverRow[] = [
   {
-    id: "consumer-config-tracker",
-    consumer_label: "config.toml Tracker Credentials",
-    source_module: "crates/core/src/config.rs",
-    binding: "vault://GITHUB_APP_TOKEN",
-    plaintext_secrets: null,
-    host_allowlist: ["api.github.com"],
-    status: "pending-cutover",
-  },
-  {
-    id: "consumer-github-signing-broker",
-    consumer_label: "GitHub App Key Signing Broker",
+    id: "github.reviewer",
+    consumer: "github.reviewer",
+    consumer_label: "GitHub App Reviewer Private Key",
     source_module: "crates/github/src/creds.rs",
-    binding: "vault://GITHUB_APP_PRIVATE_KEY (in-enclave JWT signing)",
+    binding: "vault://GITHUB_APP_REVIEWER_PEM",
+    class: "unknown",
+    vault_entry: null,
+    vault_key_field: null,
+    evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
+    plaintext_path_present: null,
     plaintext_secrets: null,
     host_allowlist: ["api.github.com", "uploads.github.com"],
     status: "pending-cutover",
+    last_denied: null,
   },
   {
-    id: "consumer-discord-bridge",
+    id: "github-token",
+    consumer: "github-token",
+    consumer_label: "config.toml Tracker Credentials",
+    source_module: "crates/core/src/config.rs",
+    binding: "vault://GITHUB_APP_TOKEN",
+    class: "unknown",
+    vault_entry: null,
+    vault_key_field: null,
+    evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
+    plaintext_path_present: null,
+    plaintext_secrets: null,
+    host_allowlist: ["api.github.com"],
+    status: "pending-cutover",
+    last_denied: null,
+  },
+  {
+    id: "discord.bridge",
+    consumer: "discord.bridge",
     consumer_label: "FerroWire Discord Bridge Consumer",
     source_module: "crates/gate/src/connectors.rs",
     binding: "vault://DISCORD_BOT_TOKEN",
+    class: "unknown",
+    vault_entry: null,
+    vault_key_field: null,
+    evidence: "Not yet queried from GET /api/v1/gate/vault-consumers",
+    plaintext_path_present: null,
     plaintext_secrets: null,
     host_allowlist: ["discord.com"],
     status: "pending-cutover",
+    last_denied: null,
   },
 ];
+
+export const DEFAULT_VAULT_CONSUMERS_REPORT: VaultConsumersReport = {
+  schema_version: 1,
+  disclaimer: DEFAULT_VAULT_CONSUMERS_DISCLAIMER,
+  custody: {
+    mode: "same-unix-user",
+    master_key_source: "unverified",
+    key_file_mode: null,
+    vault_key_mode: null,
+    vault_key_readable_by_group_or_other: null,
+    note: "The Vault master key and the Vault file belong to one Unix user, and every FerroLoop process runs as that user. Custody is file permission, not a separate signer boundary.",
+  },
+  consumers: DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.map((row) => ({
+    id: row.id,
+    consumer: row.consumer ?? row.id,
+    label: row.consumer_label,
+    class: row.class,
+    evidence: row.evidence,
+    plaintext_path_present: row.plaintext_path_present,
+    vault_entry: row.vault_entry,
+    vault_key_field: row.vault_key_field,
+    last_denied: row.last_denied ?? null,
+  })),
+  audit: {
+    state: "unverified",
+    last_denied: null,
+  },
+  last_denied: null,
+};
 
 /** Mirrors `normalize_secret_name` in `crates/gate/src/vault.rs` (server uppercases). */
 const SECRET_NAME_PATTERN = /^[A-Z0-9_]{1,64}$/;
@@ -398,11 +473,10 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   const [mcpCatalogBanner, setMcpCatalogBanner] = useState<string | null>(null);
   const [mcpCatalogBusy, setMcpCatalogBusy] = useState(false);
 
-  // Record #86 (Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation state
-  const [vaultConsumerRows, setVaultConsumerRows] = useState<
-    VaultConsumerCutoverRow[]
-  >(DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS);
-  const [vaultConsumersVerified, setVaultConsumersVerified] = useState(false);
+  // Record #86 (Gate G6): Observational FerroGate Vault Consumer Status (`GET /api/v1/gate/vault-consumers`)
+  const [vaultConsumersReport, setVaultConsumersReport] =
+    useState<VaultConsumersReport>(DEFAULT_VAULT_CONSUMERS_REPORT);
+  const [vaultConsumersLoaded, setVaultConsumersLoaded] = useState(false);
   const [vaultConsumersBanner, setVaultConsumersBanner] = useState<
     string | null
   >(null);
@@ -610,58 +684,154 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
     }
   };
 
-  const handleVerifyVaultConsumers = async () => {
-    setVaultConsumersBusy(true);
-    try {
-      if (typeof globalThis.fetch === "function") {
-        const res = await globalThis.fetch("/api/v1/gate/vault-consumers");
-        if (res && res.ok) {
-          try {
-            const json = (await res.json()) as {
-              consumers?: VaultConsumerCutoverRow[];
+  const normalizeVaultConsumerClass = (
+    raw: unknown,
+  ): VaultConsumerSourceClass => {
+    if (
+      raw === "vault-ref" ||
+      raw === "plaintext-file" ||
+      raw === "env" ||
+      raw === "unconfigured" ||
+      raw === "unknown"
+    ) {
+      return raw;
+    }
+    return "unknown";
+  };
+
+  const fetchVaultConsumersReport = useCallback(
+    async (silentOnLoad = false) => {
+      if (!silentOnLoad) {
+        setVaultConsumersBusy(true);
+      }
+      try {
+        if (typeof globalThis.fetch === "function") {
+          const res = await globalThis.fetch("/api/v1/gate/vault-consumers");
+          if (res && res.ok) {
+            const raw = (await res.json()) as Partial<VaultConsumersReport>;
+            const rawConsumers = Array.isArray(raw?.consumers)
+              ? raw.consumers
+              : [];
+            const consumers: VaultConsumerReportEntry[] =
+              rawConsumers.length > 0
+                ? rawConsumers.map((item) => {
+                    const key =
+                      item.consumer ?? item.id ?? "unknown-consumer";
+                    return {
+                      id: item.id ?? key,
+                      consumer: item.consumer ?? key,
+                      label: item.label ?? key,
+                      class: normalizeVaultConsumerClass(item.class),
+                      evidence:
+                        typeof item.evidence === "string"
+                          ? item.evidence
+                          : undefined,
+                      plaintext_path_present:
+                        typeof item.plaintext_path_present === "boolean"
+                          ? item.plaintext_path_present
+                          : null,
+                      vault_entry:
+                        typeof item.vault_entry === "string"
+                          ? item.vault_entry
+                          : null,
+                      vault_key_field:
+                        typeof item.vault_key_field === "string"
+                          ? item.vault_key_field
+                          : null,
+                      last_denied: item.last_denied ?? null,
+                    };
+                  })
+                : DEFAULT_VAULT_CONSUMERS_REPORT.consumers;
+
+            const masterKeyConsumer = consumers.find(
+              (c) => (c.id ?? c.consumer) === "vault-master-key",
+            );
+            const inferredMasterKeySource =
+              masterKeyConsumer?.class === "env"
+                ? "env"
+                : masterKeyConsumer?.class === "plaintext-file"
+                  ? "key-file"
+                  : masterKeyConsumer?.class === "unconfigured"
+                    ? "missing"
+                    : "unverified";
+
+            const rawCustody = raw?.custody;
+            const custody: VaultCustodySummary = {
+              mode: rawCustody?.mode ?? "same-unix-user",
+              note:
+                rawCustody?.note ??
+                DEFAULT_VAULT_CONSUMERS_REPORT.custody.note,
+              master_key_source:
+                rawCustody?.master_key_source ??
+                rawCustody?.master_key_Source ??
+                inferredMasterKeySource,
+              key_file_mode:
+                rawCustody?.key_file_mode ??
+                rawCustody?.vault_key_mode ??
+                null,
+              vault_key_mode:
+                rawCustody?.vault_key_mode ??
+                rawCustody?.key_file_mode ??
+                null,
+              vault_key_readable_by_group_or_other:
+                typeof rawCustody?.vault_key_readable_by_group_or_other ===
+                "boolean"
+                  ? rawCustody.vault_key_readable_by_group_or_other
+                  : null,
             };
-            if (
-              json &&
-              Array.isArray(json.consumers) &&
-              json.consumers.length > 0
-            ) {
-              setVaultConsumerRows(json.consumers);
-            } else {
-              setVaultConsumerRows((prev) =>
-                prev.map((row) => ({
-                  ...row,
-                  status: "cutover-complete",
-                  plaintext_secrets: 0,
-                })),
+
+            const lastDenied: VaultConsumerDeniedInfo | null =
+              raw?.last_denied ?? raw?.audit?.last_denied ?? null;
+
+            const disclaimer =
+              typeof raw?.disclaimer === "string" &&
+              raw.disclaimer.trim().length > 0
+                ? raw.disclaimer
+                : DEFAULT_VAULT_CONSUMERS_DISCLAIMER;
+
+            setVaultConsumersReport({
+              schema_version: raw?.schema_version ?? 1,
+              disclaimer,
+              custody,
+              consumers,
+              audit: raw?.audit ?? {
+                state: "ok",
+                last_denied: lastDenied,
+              },
+              last_denied: lastDenied,
+            });
+            setVaultConsumersLoaded(true);
+            if (!silentOnLoad) {
+              setVaultConsumersBanner(
+                "Refreshed observational Vault consumer status (/api/v1/gate/vault-consumers).",
               );
             }
-          } catch {
-            setVaultConsumerRows((prev) =>
-              prev.map((row) => ({
-                ...row,
-                status: "cutover-complete",
-                plaintext_secrets: 0,
-              })),
-            );
+            return;
           }
-          setVaultConsumersVerified(true);
+        }
+        if (!silentOnLoad) {
           setVaultConsumersBanner(
-            "Verified FerroGate Vault consumer cutover (/api/v1/gate/vault-consumers).",
+            "Refresh failed: backend /api/v1/gate/vault-consumers unavailable",
           );
-          return;
+        }
+      } catch {
+        if (!silentOnLoad) {
+          setVaultConsumersBanner(
+            "Refresh failed: backend /api/v1/gate/vault-consumers unavailable",
+          );
+        }
+      } finally {
+        if (!silentOnLoad) {
+          setVaultConsumersBusy(false);
         }
       }
-      setVaultConsumersBanner(
-        "Verification failed: backend /api/v1/gate/vault-consumers unavailable",
-      );
-    } catch {
-      setVaultConsumersBanner(
-        "Verification failed: backend /api/v1/gate/vault-consumers unavailable",
-      );
-    } finally {
-      setVaultConsumersBusy(false);
-    }
-  };
+    },
+    [],
+  );
+
+  useEffect(() => {
+    void fetchVaultConsumersReport(true);
+  }, [fetchVaultConsumersReport]);
 
   const handleRevokeBundle = async (bundleId: string) => {
     try {
@@ -1827,7 +1997,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
           ))}
         </div>
 
-        {/* Record #86 (Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation */}
+        {/* Record #86 (Gate G6): Observational FerroGate Vault Consumer Status (`GET /api/v1/gate/vault-consumers`) */}
         <div
           data-testid="gate-vault-consumer-cutover-g6-section"
           style={{ display: "flex", flexDirection: "column", gap: "10px" }}
@@ -1842,67 +2012,52 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
             }}
           >
             <h3 style={{ margin: 0, fontSize: "14px" }}>
-              Vault Consumer Cutover &amp; Signing Broker (Gate G6)
+              Vault Consumer Configuration &amp; Custody Status (Gate G6 · Observational)
             </h3>
             <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
               <span
                 className="fd-badge fd-mono"
                 data-testid="gate-vault-zero-plaintext-badge"
                 style={{
-                  color:
-                    vaultConsumersVerified &&
-                    vaultConsumerRows.every(
-                      (r) =>
-                        r.status === "cutover-complete" &&
-                        r.plaintext_secrets === 0,
-                    )
-                      ? "#34D399"
-                      : "#FBBF24",
+                  color: vaultConsumersLoaded ? "#38BDF8" : "#FBBF24",
                 }}
               >
-                {vaultConsumersVerified &&
-                vaultConsumerRows.every(
-                  (r) =>
-                    r.status === "cutover-complete" &&
-                    r.plaintext_secrets === 0,
-                )
-                  ? "Zero Plaintext Secrets in Config Files"
-                  : "Plaintext Audit: Unverified (pending /api/v1/gate/vault-consumers)"}
+                {vaultConsumersLoaded
+                  ? "Observational Config & Audit Read Only"
+                  : "Observational Status: Unverified (pending /api/v1/gate/vault-consumers)"}
               </span>
               <span
                 className="fd-badge fd-mono"
                 data-testid="gate-vault-signing-broker-badge"
                 style={{
-                  color:
-                    vaultConsumersVerified &&
-                    vaultConsumerRows.some(
-                      (r) =>
-                        r.id === "consumer-github-signing-broker" &&
-                        r.status === "cutover-complete",
-                    )
-                      ? "#38BDF8"
-                      : "#FBBF24",
+                  color: "#FBBF24",
                 }}
               >
-                {vaultConsumersVerified &&
-                vaultConsumerRows.some(
-                  (r) =>
-                    r.id === "consumer-github-signing-broker" &&
-                    r.status === "cutover-complete",
-                )
-                  ? "GitHub App Signing Broker Active"
-                  : "Signing Broker: Pending Cutover Verification"}
+                Custody: {vaultConsumersReport.custody.mode}
               </span>
               <button
                 type="button"
                 className="fd-btn"
-                data-testid="gate-vault-verify-consumers-btn"
+                data-testid="gate-vault-consumer-verify-btn"
                 disabled={vaultConsumersBusy}
-                onClick={() => void handleVerifyVaultConsumers()}
+                onClick={() => void fetchVaultConsumersReport(false)}
               >
-                Verify Vault Cutover
+                Refresh Consumer Status
               </button>
             </div>
+          </div>
+
+          <div
+            data-testid="gate-vault-consumer-disclaimer"
+            className="fd-card"
+            style={{
+              fontSize: "12px",
+              color: "#FBBF24",
+              borderLeft: "3px solid #FBBF24",
+              padding: "8px 10px",
+            }}
+          >
+            {vaultConsumersReport.disclaimer}
           </div>
 
           {vaultConsumersBanner && (
@@ -1914,7 +2069,7 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
                 fontSize: "12px",
                 color: vaultConsumersBanner.includes("failed")
                   ? "#FBBF24"
-                  : "#34D399",
+                  : "#38BDF8",
                 padding: "6px 10px",
               }}
             >
@@ -1922,58 +2077,219 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
             </div>
           )}
 
-          {vaultConsumerRows.map((row) => (
+          {/* Custody & Last Denied Audit Summary */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+              gap: "8px",
+            }}
+          >
             <div
-              key={row.id}
               className="fd-card"
-              data-testid={`gate-vault-consumer-row-${row.id}`}
+              data-testid="gate-vault-custody-summary"
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "10px",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                gap: "6px",
                 fontSize: "12px",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                <strong>{row.consumer_label}</strong>
-                <code className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                  {row.source_module}
-                </code>
-                <span
-                  className="fd-badge fd-mono"
-                  data-testid={`gate-vault-consumer-binding-${row.id}`}
-                >
-                  {row.binding}
-                </span>
-              </div>
+              <strong>Custody Summary</strong>
               <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
                 <span
                   className="fd-badge fd-mono"
-                  data-testid={`gate-vault-consumer-allowlist-${row.id}`}
+                  data-testid="gate-vault-custody-mode"
                 >
-                  allowlist: {row.host_allowlist.join(", ")}
+                  mode: {vaultConsumersReport.custody.mode}
                 </span>
                 <span
                   className="fd-badge fd-mono"
-                  data-testid={`gate-vault-consumer-status-${row.id}`}
-                  style={{
-                    color:
-                      row.status === "cutover-complete"
-                        ? "#34D399"
-                        : "#FBBF24",
-                  }}
+                  data-testid="gate-vault-custody-key-source"
                 >
-                  {row.status} (
-                  {row.plaintext_secrets !== null
-                    ? `plaintext=${row.plaintext_secrets}`
-                    : "plaintext=unverified"}
-                  )
+                  master_key_source:{" "}
+                  {vaultConsumersReport.custody.master_key_source ??
+                    vaultConsumersReport.custody.master_key_Source ??
+                    "unverified"}
                 </span>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="gate-vault-custody-key-mode"
+                >
+                  key_file_mode:{" "}
+                  {vaultConsumersReport.custody.key_file_mode ??
+                    vaultConsumersReport.custody.vault_key_mode ??
+                    "none"}
+                </span>
+                {typeof vaultConsumersReport.custody
+                  .vault_key_readable_by_group_or_other === "boolean" && (
+                  <span
+                    className="fd-badge fd-mono"
+                    style={{
+                      color: vaultConsumersReport.custody
+                        .vault_key_readable_by_group_or_other
+                        ? "#F87171"
+                        : "#34D399",
+                    }}
+                  >
+                    group/other readable:{" "}
+                    {String(
+                      vaultConsumersReport.custody
+                        .vault_key_readable_by_group_or_other,
+                    )}
+                  </span>
+                )}
               </div>
+              {vaultConsumersReport.custody.note && (
+                <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                  {vaultConsumersReport.custody.note}
+                </span>
+              )}
             </div>
-          ))}
+
+            <div
+              className="fd-card"
+              data-testid="gate-vault-last-denied-summary"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                fontSize: "12px",
+              }}
+            >
+              <strong>Last Denied Audit Entry</strong>
+              {vaultConsumersReport.last_denied ? (
+                <div
+                  data-testid="gate-vault-last-denied-detail"
+                  style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}
+                >
+                  <span
+                    className="fd-badge fd-mono"
+                    style={{ color: "#F87171" }}
+                  >
+                    outcome: {vaultConsumersReport.last_denied.outcome}
+                  </span>
+                  {vaultConsumersReport.last_denied.consumer && (
+                    <span className="fd-badge fd-mono">
+                      consumer: {vaultConsumersReport.last_denied.consumer}
+                    </span>
+                  )}
+                  {vaultConsumersReport.last_denied.action && (
+                    <span className="fd-badge fd-mono">
+                      action: {vaultConsumersReport.last_denied.action}
+                    </span>
+                  )}
+                  {vaultConsumersReport.last_denied.secret && (
+                    <span className="fd-badge fd-mono">
+                      secret: {vaultConsumersReport.last_denied.secret}
+                    </span>
+                  )}
+                  {vaultConsumersReport.last_denied.target_host && (
+                    <span className="fd-badge fd-mono">
+                      target_host: {vaultConsumersReport.last_denied.target_host}
+                    </span>
+                  )}
+                  {vaultConsumersReport.last_denied.ts && (
+                    <span className="fd-badge fd-mono">
+                      ts: {vaultConsumersReport.last_denied.ts}
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <span
+                  data-testid="gate-vault-last-denied-empty"
+                  style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                >
+                  No refused Vault uses recorded in audit tail (last_denied: none)
+                </span>
+              )}
+            </div>
+          </div>
+
+          {vaultConsumersReport.consumers.map((row) => {
+            const rowKey = row.consumer ?? row.id ?? "unknown-consumer";
+            const classColor =
+              row.class === "vault-ref"
+                ? "#38BDF8"
+                : row.class === "plaintext-file"
+                  ? "#F87171"
+                  : row.class === "env"
+                    ? "#FBBF24"
+                    : "var(--text-muted)";
+            return (
+              <div
+                key={rowKey}
+                className="fd-card"
+                data-testid={`gate-vault-consumer-row-${rowKey}`}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                  fontSize: "12px",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <strong
+                    className="fd-mono"
+                    data-testid={`gate-vault-consumer-name-${rowKey}`}
+                  >
+                    {rowKey}
+                  </strong>
+                  {row.label && row.label !== rowKey && (
+                    <span style={{ color: "var(--text-secondary)" }}>
+                      {row.label}
+                    </span>
+                  )}
+                  {row.vault_entry && (
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`gate-vault-consumer-entry-${rowKey}`}
+                    >
+                      vault_entry: {row.vault_entry}
+                      {row.vault_key_field
+                        ? ` (field: ${row.vault_key_field})`
+                        : ""}
+                    </span>
+                  )}
+                  {row.evidence && (
+                    <span
+                      data-testid={`gate-vault-consumer-evidence-${rowKey}`}
+                      style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                    >
+                      {row.evidence}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                  {typeof row.plaintext_path_present === "boolean" && (
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`gate-vault-consumer-plaintext-path-${rowKey}`}
+                    >
+                      plaintext_path_present: {String(row.plaintext_path_present)}
+                    </span>
+                  )}
+                  {row.last_denied?.outcome && (
+                    <span
+                      className="fd-badge fd-mono"
+                      style={{ color: "#F87171" }}
+                    >
+                      last_denied: {row.last_denied.outcome}
+                    </span>
+                  )}
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid={`gate-vault-consumer-class-${rowKey}`}
+                    style={{ color: classColor }}
+                  >
+                    class: {row.class}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     </section>

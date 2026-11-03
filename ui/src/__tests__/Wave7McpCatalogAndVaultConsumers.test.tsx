@@ -242,8 +242,8 @@ describe("Wave 7, Wave 13 & Wave 14 Item 1 (Record #81 / Gate G5): .fl/mcp.toml 
   });
 });
 
-describe("Wave 7 & Wave 13 Item 2 (Record #86 / Gate G6): FerroGate Vault Consumer Cutover & Signing Broker Attestation UI", () => {
-  it("defaults Vault consumer cutover rows to pending-cutover (plaintext=unverified) and transitions to cutover-complete (plaintext=0) only on 2xx verification", async () => {
+describe("Wave 7, Wave 13 & Wave 15 Item 2 (Record #86 / Gate G6): Observational FerroGate Vault Consumer Status UI (PR #261)", () => {
+  it("fetches GET /api/v1/gate/vault-consumers on load and refresh, renders consumers[], custody, last_denied, and verbatim disclaimer, and never fabricates cutover-complete", async () => {
     expect(ReExportedGateConsumers).toEqual(
       DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS,
     );
@@ -252,7 +252,7 @@ describe("Wave 7 & Wave 13 Item 2 (Record #86 / Gate G6): FerroGate Vault Consum
     );
     expect(
       DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.every(
-        (r) => r.status === "pending-cutover" && r.plaintext_secrets === null,
+        (r) => r.class === "unknown" && r.plaintext_secrets === null,
       ),
     ).toBe(true);
 
@@ -261,74 +261,161 @@ describe("Wave 7 & Wave 13 Item 2 (Record #86 / Gate G6): FerroGate Vault Consum
       status: 503,
     } as Response);
 
-    render(<FerroGatePane />);
+    const { container } = render(<FerroGatePane />);
 
     expect(
       screen.getByTestId("gate-vault-consumer-cutover-g6-section"),
     ).toBeTruthy();
+
+    // Mount fetch is triggered automatically
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith("/api/v1/gate/vault-consumers");
+    });
+
     expect(
       screen.getByTestId("gate-vault-zero-plaintext-badge").textContent,
     ).toContain(
-      "Plaintext Audit: Unverified (pending /api/v1/gate/vault-consumers)",
+      "Observational Status: Unverified (pending /api/v1/gate/vault-consumers)",
     );
     expect(
       screen.getByTestId("gate-vault-signing-broker-badge").textContent,
-    ).toContain("Signing Broker: Pending Cutover Verification");
+    ).toContain("Custody: same-unix-user");
+    expect(
+      screen.getByTestId("gate-vault-consumer-disclaimer").textContent,
+    ).toContain(
+      "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.",
+    );
+    expect(screen.getByTestId("gate-vault-last-denied-empty")).toBeTruthy();
 
     for (const row of DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS) {
       expect(
         screen.getByTestId(`gate-vault-consumer-row-${row.id}`),
       ).toBeTruthy();
       expect(
-        screen.getByTestId(`gate-vault-consumer-binding-${row.id}`).textContent,
-      ).toContain("vault://");
-      expect(
-        screen.getByTestId(`gate-vault-consumer-status-${row.id}`).textContent,
-      ).toContain("pending-cutover (plaintext=unverified)");
+        screen.getByTestId(`gate-vault-consumer-class-${row.id}`).textContent,
+      ).toBe("class: unknown");
     }
 
-    // Non-2xx response keeps rows pending-cutover
-    fireEvent.click(screen.getByTestId("gate-vault-verify-consumers-btn"));
+    // Non-2xx response on explicit refresh shows failure banner and keeps observational unknown state
+    fireEvent.click(screen.getByTestId("gate-vault-consumer-verify-btn"));
     await waitFor(() => {
-      expect(fetchSpy).toHaveBeenCalledWith("/api/v1/gate/vault-consumers");
       expect(
         screen.getByTestId("gate-vault-consumer-status-banner").textContent,
       ).toBe(
-        "Verification failed: backend /api/v1/gate/vault-consumers unavailable",
+        "Refresh failed: backend /api/v1/gate/vault-consumers unavailable",
       );
       expect(
-        screen.getByTestId(
-          "gate-vault-consumer-status-consumer-github-signing-broker",
-        ).textContent,
-      ).toContain("pending-cutover (plaintext=unverified)");
+        screen.getByTestId("gate-vault-consumer-class-github.reviewer")
+          .textContent,
+      ).toBe("class: unknown");
     });
 
-    // 2xx response transitions rows to cutover-complete (plaintext=0)
-    fetchSpy.mockResolvedValue({
+    // 200 OK with PR #261 observational payload renders consumers[], custody, last_denied, and disclaimer without ever claiming cutover-complete
+    const customDisclaimer =
+      "Observational config and audit read only. Does not verify live credential rotation, custody separation, or absence of plaintext copies outside config.toml.";
+    fetchSpy.mockResolvedValueOnce({
       ok: true,
       status: 200,
       json: async () => ({
-        consumers: DEFAULT_VAULT_CONSUMER_CUTOVER_ROWS.map((r) => ({
-          ...r,
-          status: "cutover-complete",
-          plaintext_secrets: 0,
-        })),
+        consumers: [
+          {
+            consumer: "github.reviewer",
+            class: "vault-ref",
+            vault_entry: "GITHUB_APP_REVIEWER_PEM",
+            vault_key_field: "pem",
+            evidence:
+              "`[github] private_key_ref` is configured to a secret named GITHUB_APP_REVIEWER_PEM",
+            plaintext_path_present: false,
+          },
+          {
+            consumer: "hub-owner-token",
+            class: "plaintext-file",
+            vault_entry: null,
+            vault_key_field: null,
+            evidence: "`[hub] owner_token_file` names the token file",
+            plaintext_path_present: true,
+          },
+          {
+            consumer: "vendor:openai",
+            class: "unconfigured",
+            vault_entry: null,
+            vault_key_field: null,
+            evidence: "$OPENAI_API_KEY is not set; no Vault secret is named",
+            plaintext_path_present: false,
+          },
+        ],
+        custody: {
+          mode: "same-unix-user",
+          master_key_source: "key-file",
+          key_file_mode: "0600",
+        },
+        last_denied: {
+          ts: "2026-11-03T13:00:00Z",
+          consumer: "github.reviewer",
+          action: "sign_jwt",
+          secret: "GITHUB_APP_REVIEWER_PEM",
+          target_host: "evil.example.com",
+          outcome: "denied:host_not_allowed",
+        },
+        disclaimer: customDisclaimer,
       }),
     } as Response);
 
-    fireEvent.click(screen.getByTestId("gate-vault-verify-consumers-btn"));
+    fireEvent.click(screen.getByTestId("gate-vault-consumer-verify-btn"));
     await waitFor(() => {
       expect(
         screen.getByTestId("gate-vault-zero-plaintext-badge").textContent,
-      ).toContain("Zero Plaintext Secrets in Config Files");
+      ).toBe("Observational Config & Audit Read Only");
       expect(
-        screen.getByTestId("gate-vault-signing-broker-badge").textContent,
-      ).toContain("GitHub App Signing Broker Active");
+        screen.getByTestId("gate-vault-consumer-disclaimer").textContent,
+      ).toBe(customDisclaimer);
       expect(
-        screen.getByTestId(
-          "gate-vault-consumer-status-consumer-github-signing-broker",
-        ).textContent,
-      ).toContain("cutover-complete (plaintext=0)");
+        screen.getByTestId("gate-vault-custody-mode").textContent,
+      ).toBe("mode: same-unix-user");
+      expect(
+        screen.getByTestId("gate-vault-custody-key-source").textContent,
+      ).toBe("master_key_source: key-file");
+      expect(
+        screen.getByTestId("gate-vault-custody-key-mode").textContent,
+      ).toBe("key_file_mode: 0600");
+
+      // Last denied details
+      const deniedDetail = screen.getByTestId("gate-vault-last-denied-detail");
+      expect(deniedDetail.textContent).toContain(
+        "outcome: denied:host_not_allowed",
+      );
+      expect(deniedDetail.textContent).toContain("consumer: github.reviewer");
+      expect(deniedDetail.textContent).toContain(
+        "secret: GITHUB_APP_REVIEWER_PEM",
+      );
+      expect(deniedDetail.textContent).toContain(
+        "target_host: evil.example.com",
+      );
+
+      // Consumers classes & vault_entry / vault_key_field
+      expect(
+        screen.getByTestId("gate-vault-consumer-class-github.reviewer")
+          .textContent,
+      ).toBe("class: vault-ref");
+      expect(
+        screen.getByTestId("gate-vault-consumer-entry-github.reviewer")
+          .textContent,
+      ).toBe("vault_entry: GITHUB_APP_REVIEWER_PEM (field: pem)");
+      expect(
+        screen.getByTestId("gate-vault-consumer-class-hub-owner-token")
+          .textContent,
+      ).toBe("class: plaintext-file");
+      expect(
+        screen.getByTestId("gate-vault-consumer-plaintext-path-hub-owner-token")
+          .textContent,
+      ).toBe("plaintext_path_present: true");
+      expect(
+        screen.getByTestId("gate-vault-consumer-class-vendor:openai")
+          .textContent,
+      ).toBe("class: unconfigured");
     });
+
+    // Strict No-False-Passes invariant: never renders "cutover-complete"
+    expect(container.textContent).not.toContain("cutover-complete");
   });
 });
