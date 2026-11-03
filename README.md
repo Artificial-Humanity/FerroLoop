@@ -134,6 +134,7 @@ others can reach. Which store `fl` opens, and the permission details, are in
 * [docs/github-ledger.md](docs/github-ledger.md) — publish each decision's evidence to the tracker's repository.
 * [docs/routing.md](docs/routing.md) — keep developer-level items in the local store and human-level items in GitHub.
 * [docs/mcp.md](docs/mcp.md) — one committed catalog of a project's MCP servers, written into each agent CLI's own file.
+* [docs/hub-home-and-artifacts.md](docs/hub-home-and-artifacts.md) — where the Hub keeps its data and artifact registry, per-project artifact directories, and relocating them.
 * [docs/vendor-runtimes.md](docs/vendor-runtimes.md) — on-disk session, transcript and prompt-delivery shapes of the five vendor CLIs.
 * [docs/README.md](docs/README.md) — index of the public documentation directory.
 * [AGENTS.md](AGENTS.md) — working rules, core stack matrix, and file-naming conventions for agents and contributors.

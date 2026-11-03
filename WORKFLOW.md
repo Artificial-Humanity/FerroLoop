@@ -20,21 +20,31 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    Lead or the owner.
 4. Push the branch and open a ready-for-review pull request against `main` with
    `fl github pr create`. It reports the required reviewer tier and the target reviewer,
-   and that report decides. For the Lead or Lab Manager tier it queues a FerroWire notice
-   to the target reviewer; for the Owner tier it requests the owner's review on GitHub.
+   and that report decides, except that a pull request touching an instruction file
+   always needs the owner (below). For the Lead or Lab Manager tier it queues a FerroWire
+   notice to the target reviewer; for the Owner tier it requests the owner's review on
+   GitHub.
    If the target reviewer is an agent, ask it for a review over `agent-msg`; the owner is
    reached through the GitHub review request. In summary:
    * A pull request co-authored by an assisting agent is reviewed by the project Lead.
    * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
      The Lab Manager may also approve a Lead-tier pull request.
-   * The owner reviews a pull request that touches a protected path (the
+   * `fl` puts a pull request in the Owner tier when it touches a protected path (the
      `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
-     instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
-     without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has a
-     co-author who is not registered as an active agent.
+     `.github/**`, `.agents/**`, `.fl/manifest.json`; `fl` adds no other patterns), carries
+     a commit without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has
+     a co-author who is not registered as an active agent. It also puts a pull request in
+     the Owner tier when it has no commits, when no commit has an active agent co-author,
+     or when no active Lead or Lab Manager who is not a co-author is available.
      [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
-     also requests the owner's review for the protected-path, missing-trailer and Lab
-     Manager co-author cases; it cannot see the agent registry.
+     requests the owner's review, and assigns the pull request to the owner, for those
+     paths (matched case-sensitively) and also for the instruction files `AGENTS.md`,
+     `CLAUDE.md`, `WORKFLOW.md`, `PERSONA.md` and `CONTRIBUTING.md` at any depth, and for
+     the missing-trailer and Lab Manager co-author cases; it cannot see the agent registry.
+     So a pull request that touches an instruction file gets the owner's review request
+     even when `fl github pr create` reports a lower tier, and it needs the owner's
+     approval. The workflow only requests the review; it adds no label and is not a
+     required check.
 5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
    by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
    machine account cannot approve a pull request it opened. The command needs the App's
@@ -45,8 +55,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    stable identity and can be spoofed, so `[github]` `reviewer_logins` is opt-in; setting
    either key makes the two keys the whole set, and an absent key is empty, so
    `reviewer_ids = []` with a `reviewer_logins` list matches by login alone.
-6. Once the target reviewer that `fl github pr create` reported, or a higher tier (the Lab
-   Manager for a Lead-tier pull request, or the owner), has approved and the checks pass,
+6. Once the target reviewer that `fl github pr create` reported (the owner, for a pull
+   request that touches an instruction file), or a higher tier (the Lab Manager for a
+   Lead-tier pull request, or the owner), has approved and the checks pass,
    the agent who opened the pull request merges it through the pull request with
    `gh pr merge`, which does not check the tier. This applies to every tier: after the
    owner approves an Owner-tier pull request, the author merges it too.
