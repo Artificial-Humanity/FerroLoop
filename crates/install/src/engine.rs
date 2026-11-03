@@ -1994,6 +1994,9 @@ fn apply_locked(
         )));
     }
 
+    env.faults
+        .fail_io(Step::Begin)
+        .ctx(|| format!("cannot create the journal {}", paths.journal.display()))?;
     let mut journal = Journal::create(&paths.journal, txn)?;
     *began = true;
     journal.append(JournalOp::Begin {

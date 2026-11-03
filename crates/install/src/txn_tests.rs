@@ -2033,6 +2033,25 @@ fn every_crash_point_of_an_install_into_a_missing_deep_prefix_removes_what_it_ma
 }
 
 #[test]
+fn a_journal_that_cannot_be_created_leaves_no_ancestor_or_lock_behind() {
+    let w = World::new(Kind::Deep);
+    let pre = w.snap();
+    let e = w
+        .install_faulty(
+            &w.release("0.1.0", "a"),
+            &Decisions::default(),
+            Faults::fail(Step::Begin, libc::ENOSPC),
+        )
+        .unwrap_err();
+    assert_eq!(e.exit_code(), 1, "{e}");
+    assert_eq!(
+        w.snap(),
+        pre,
+        "a, b, c, the prefix and the lock are all gone"
+    );
+}
+
+#[test]
 fn a_deep_prefix_with_a_failing_step_leaves_no_ancestor_behind() {
     let w = World::new(Kind::Deep);
     let e = w
@@ -2080,6 +2099,16 @@ fn forged_created_dirs_are_refused_or_cannot_remove_anything_non_empty() {
             assert_eq!(w.snap(), before, "{name} / {what}");
         }
         assert!(w.base.path().join("outside").is_dir(), "{name}");
+    }
+    // With no home known, `/` and a system directory above the install are refused as such.
+    for entry in ["/", "/tmp"] {
+        let w = forged_world(Kind::UnderRoot, &|i, _| {
+            i["created_dirs"] = serde_json::json!([entry]);
+        });
+        let before = w.snap();
+        let e = recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{entry}: {e}");
+        assert_eq!(w.snap(), before, "{entry}");
     }
     // An ancestor of the install that is NOT empty passes the check and is never removed.
     let w = forged_world(Kind::UnderRoot, &|i, w| {
