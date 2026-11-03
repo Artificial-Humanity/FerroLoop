@@ -60,7 +60,7 @@ repository as a git dependency.
 | [FerroWire](https://github.com/Artificial-Humanity/FerroWire) | [ferroloop.ai/ferrowire](https://ferroloop.ai/ferrowire) | Agent-to-agent messaging transport: the local daemon, peer relay, route table and push to vendor CLIs. Its message model and mailbox traits come from `fl-core`. | `crates/wire` |
 | [FerroTrack](https://github.com/Artificial-Humanity/FerroTrack) | [ferroloop.ai/ferrotrack](https://ferroloop.ai/ferrotrack) | Two-tier tracking: GitHub Issues as a tier, the `fl/ledger` branch, and the pull-request client. | `crates/github` |
 | [FerroGate](https://github.com/Artificial-Humanity/FerroGate) | [ferroloop.ai/ferrogate](https://ferroloop.ai/ferrogate) | The zero-knowledge secrets vault, credential proxy and API-to-MCP gateway. | `crates/gate` |
-| FerroWatch | [ferroloop.ai/ferrowatch](https://ferroloop.ai/ferrowatch) | Reserved name for observability and monitoring: no repository and no code yet. See [Roadmap](#roadmap). | — |
+| FerroWatch | [ferroloop.ai/ferrowatch](https://ferroloop.ai/ferrowatch) | Observability and monitoring. It has no repository of its own. The `fl-watch` crate computes telemetry rollups, agent liveness and alerts, and balances subscription usage; the `fl watch` CLI (`status`, `rollups`, `liveness`, `alerts`, `balance`) and the hub's `/api/v1/watch/*` routes serve them. | `crates/watch`, `fl watch` in `crates/cli`, `crates/hub` (`watch_api.rs`, `balance_api.rs`) |
 
 The six repositories are mounted as optional git submodules under `submodules/`. The build does
 not use them. See [Submodules](docs/getting-started.md#submodules).
@@ -122,7 +122,7 @@ others can reach. Which store `fl` opens, and the permission details, are in
   `fl hub serve` serves.
 * Multi-hub federation across tailnets for `fl wire` and `fl hub`.
 * A cherry-pick installer: install `fl` and optional components without building from source.
-* FerroWatch: observability and monitoring.
+* FerroWatch: extraction into its own repository.
 
 ---
 

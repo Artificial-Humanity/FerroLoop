@@ -627,7 +627,8 @@ fn redb_engine(
 /// 4. otherwise `migrate_verified` runs; clean -> the `.fls` is opened, after
 ///    the lock is released, which is after the `.fls` is linked and the redb
 ///    made read-only; not clean -> redb engine, and this process does not copy
-///    that store again.
+///    that store again; an `Err` that left this migration's own `.fls` linked
+///    (its unpublish could not remove it) -> that `Err`, never the `.fls`.
 ///
 /// A held redb is not remembered (the holder may stop), only its warning.
 ///
@@ -719,7 +720,11 @@ fn open_ferro(
     }
     #[cfg(test)]
     tests::note_migration_attempt(&key);
-    match crate::migrate::migrate_verified(path, physical) {
+    #[cfg(test)]
+    let migrated = tests::migrate_for_open(path, physical);
+    #[cfg(not(test))]
+    let migrated = crate::ferrostore::migrate_verified_checked(path, physical);
+    match migrated {
         Ok(report) if report.is_clean() => {
             drop(lock);
             sink(&format!(
@@ -749,11 +754,14 @@ fn open_ferro(
             }
             stay(Some(lock))
         }
-        Err(err) if is_redb_busy(&err) => busy(lock),
+        // This migration linked the `.fls` and could not take it back: it is
+        // not another process's store, and the error says to remove it.
+        Err(failure) if failure.left_published => Err(failure.error),
+        Err(failure) if is_redb_busy(&failure.error) => busy(lock),
         // Another process migrated first (one that took no lock).
-        Err(err) => {
+        Err(failure) => {
             drop(lock);
-            fls_if_present(physical, err)
+            fls_if_present(physical, failure.error)
         }
     }
 }
@@ -1957,6 +1965,71 @@ mod tests {
 
     pub(super) fn note_migration_attempt(key: &Path) {
         *attempts().entry(key.to_path_buf()).or_default() += 1;
+    }
+
+    thread_local! {
+        /// Set by a test: the next migration an open on this thread runs fails
+        /// its `chmod`, and then the unlink that would unpublish its `.fls`.
+        static STUCK_UNPUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The migration `open_ferro` runs: the real one, or the faulty one
+    /// [`STUCK_UNPUBLISH`] asks for.
+    pub(super) fn migrate_for_open(
+        path: &Path,
+        physical: &Path,
+    ) -> Result<crate::migrate::ParityReport, crate::ferrostore::MigrateFailure> {
+        if STUCK_UNPUBLISH.with(|stuck| stuck.replace(false)) {
+            return crate::ferrostore::migrate_verified_with_faults(
+                path,
+                physical,
+                crate::ferrostore::sync_dir,
+                |_| Err(std::io::Error::from_raw_os_error(libc::EPERM)),
+                |_| Err(std::io::Error::from_raw_os_error(libc::EBUSY)),
+            );
+        }
+        crate::ferrostore::migrate_verified_checked(path, physical)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_whose_migration_cannot_unpublish_its_fls_fails_and_names_it() {
+        // The chmod fails after the link, and so does the unlink that takes
+        // the link back: the `.fls` stays beside a writable redb. The open
+        // must return that error, not open the `.fls` as one another process
+        // migrated.
+        let dir = TempDir::new().unwrap();
+        let redb = dir.path().join("s.redb");
+        let fls = dir.path().join("s.fls");
+        {
+            let src = RedbStore::open(&redb).unwrap();
+            populate(&src);
+        }
+        STUCK_UNPUBLISH.with(|stuck| stuck.set(true));
+        let err = open_store_with(&redb, &ferro_opts(Unmigrated::Migrate))
+            .err()
+            .expect("the open refuses the .fls it could not unpublish");
+        assert!(!STUCK_UNPUBLISH.with(|stuck| stuck.get()), "the fault ran");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("{} could not be unpublished", fls.display())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("remove it before running on {}", redb.display())),
+            "{text}"
+        );
+        assert!(text.contains("FL_STORE_BACKEND=redb"), "{text}");
+        assert!(
+            fls.is_file(),
+            "the unlink failed, so the .fls is still there"
+        );
+        assert_eq!(mode(&redb) & 0o200, 0o200, "the redb stays writable");
+
+        // Once the leftover `.fls` is removed, the next open migrates.
+        std::fs::remove_file(&fls).unwrap();
+        let store = open_store_with(&redb, &ferro_opts(Unmigrated::Migrate)).unwrap();
+        assert_eq!(store.kind(), BackendKind::Ferro);
     }
 
     #[test]
