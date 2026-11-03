@@ -32,17 +32,31 @@ import {
 } from "./AgentSettingsModal";
 import {
   BUILTIN_ROLE_REGISTRY,
+  DEFAULT_LOCAL_MODEL_PROVIDERS,
   DEFAULT_OPERATOR_PUSH_STATE,
+  DEFAULT_VENDOR_CLOUD_SESSIONS,
   type ConfigurableRoleRecord,
+  type LocalModelProviderKind,
+  type LocalModelProviderPreset,
   type OperatorPushSubscriptionState,
   type RoleReviewPolicy,
+  type VendorCloudSessionEntry,
+  type VendorCloudSessionStatus,
+  type VendorCloudSessionVendor,
 } from "./SettingsModal";
 export {
   BUILTIN_ROLE_REGISTRY,
+  DEFAULT_LOCAL_MODEL_PROVIDERS,
   DEFAULT_OPERATOR_PUSH_STATE,
+  DEFAULT_VENDOR_CLOUD_SESSIONS,
   type ConfigurableRoleRecord,
+  type LocalModelProviderKind,
+  type LocalModelProviderPreset,
   type OperatorPushSubscriptionState,
   type RoleReviewPolicy,
+  type VendorCloudSessionEntry,
+  type VendorCloudSessionStatus,
+  type VendorCloudSessionVendor,
 };
 
 export type HubSubTab = "workflows" | "routines" | "architecture" | "stats";
