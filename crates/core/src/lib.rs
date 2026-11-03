@@ -29,6 +29,7 @@ pub mod mem;
 #[doc(hidden)]
 pub mod mem_issues;
 pub mod model;
+pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
 pub mod routing;
@@ -93,6 +94,13 @@ pub use mem::MemStore;
 pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
+};
+pub use notifications::{
+    MAX_PUSH_RECEIPTS, MobilePushChannelStatus, NotificationError, OPERATOR_PUSH_RECEIPTS_SLUG,
+    OPERATOR_PUSH_STATE_SLUG, OperatorPushQuietHours, OperatorPushSubscriptionState,
+    OperatorPushTriggers, PushDispatchReceipt, PushTriggerKind, WebPushPermissionStatus,
+    active_channels, append_push_receipt, get_operator_push_state, list_push_receipts,
+    set_operator_push_state, should_deliver,
 };
 pub use pr_policy::{
     CommitTrailerAuthor, DEFAULT_OWNER_LOGIN, DEFAULT_PROTECTED_PATTERNS, DEFAULT_REVIEWER_APP_IDS,
