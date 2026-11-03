@@ -1,4 +1,9 @@
 import React, { useMemo, useState } from "react";
+import {
+  DEFAULT_ROUTED_CI_PR_EVENTS,
+  type RoutedCiPrFeedbackEvent,
+} from "./TriageQueuePane";
+export { DEFAULT_ROUTED_CI_PR_EVENTS, type RoutedCiPrFeedbackEvent };
 import type { HubApiClient } from "../api/client";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import {

@@ -52,6 +52,105 @@ export const DEFAULT_OTLP_EXPORTER_STATUS: OtlpExporterStatus = {
   last_flush_at: "2026-11-03T05:30:00Z",
 };
 
+// Record #93: ACP Vendor Transport Conformance Matrix
+export type AcpConformanceOperation =
+  | "approvals"
+  | "interrupt"
+  | "reset"
+  | "compact"
+  | "thread_identity"
+  | "usage";
+
+export const ACP_CONFORMANCE_OPERATIONS: readonly AcpConformanceOperation[] = [
+  "approvals",
+  "interrupt",
+  "reset",
+  "compact",
+  "thread_identity",
+  "usage",
+] as const;
+
+export interface AcpAdapterConformanceRow {
+  adapter: "claude" | "agy" | "codex" | "muse" | "grok" | "acp";
+  transport_label: string;
+  operations: Record<AcpConformanceOperation, "pass" | "gated">;
+}
+
+export const DEFAULT_ACP_CONFORMANCE_MATRIX: AcpAdapterConformanceRow[] = [
+  {
+    adapter: "claude",
+    transport_label: "Claude Code CLI (stream-json / PTY)",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "pass",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+  {
+    adapter: "agy",
+    transport_label: "Google Antigravity (AGY JSON-RPC / CLI)",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "pass",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+  {
+    adapter: "codex",
+    transport_label: "OpenAI Codex CLI (MCP / exec)",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "pass",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+  {
+    adapter: "muse",
+    transport_label: "Muse Code (ACP stdio)",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "gated",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+  {
+    adapter: "grok",
+    transport_label: "xAI Grok CLI (REST / stream)",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "gated",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+  {
+    adapter: "acp",
+    transport_label: "Generic ACP JSON-RPC 2.0",
+    operations: {
+      approvals: "pass",
+      interrupt: "pass",
+      reset: "pass",
+      compact: "pass",
+      thread_identity: "pass",
+      usage: "pass",
+    },
+  },
+];
+
 export interface FerroWatchPaneProps {
   authority?: HubAuthority | null;
   agents?: AgentRecord[];
@@ -60,6 +159,7 @@ export interface FerroWatchPaneProps {
   onAfterRemodel?: (res: RemodelSessionResponse) => void;
   otlpStatus?: OtlpExporterStatus;
   tokenizerLedger?: CountedTokenizerLedgerEntry[];
+  acpConformanceMatrix?: AcpAdapterConformanceRow[];
 }
 
 export const CANONICAL_WATCH_VENDORS = [
@@ -387,6 +487,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   onAfterRemodel,
   otlpStatus: propOtlpStatus,
   tokenizerLedger: propTokenizerLedger,
+  acpConformanceMatrix: propAcpMatrix,
 }) => {
   const isOwner = authority?.tier === "owner";
   const activeTimeZone = useActiveTimeZone();
@@ -398,6 +499,8 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
   const [otlpStatusMsg, setOtlpStatusMsg] = useState<string | null>(null);
   const effectiveTokenizerLedger =
     propTokenizerLedger ?? DEFAULT_TOKENIZER_LEDGER;
+  const effectiveAcpMatrix =
+    propAcpMatrix ?? DEFAULT_ACP_CONFORMANCE_MATRIX;
 
   const handleOtlpExportSnapshot = async () => {
     try {
@@ -2856,6 +2959,86 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     exact: {entry.exact_tokens_saved.toLocaleString()} tok · ceil(chars/4):{" "}
                     {entry.heuristic_ceil_chars4.toLocaleString()} ({entry.delta_pct}%)
                   </span>
+                </div>
+              ))}
+            </div>
+
+            {/* Record #93: ACP Vendor Transport Conformance Matrix */}
+            <div
+              data-testid="acp-conformance-matrix-card"
+              style={{
+                padding: "10px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "11.5px",
+                    fontWeight: 700,
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  ACP Vendor Transport Conformance Matrix (6 Operations)
+                </span>
+                <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                  approvals · interrupt · reset · compact · thread_identity · usage
+                </span>
+              </div>
+              {effectiveAcpMatrix.map((row) => (
+                <div
+                  key={row.adapter}
+                  data-testid={`acp-conformance-row-${row.adapter}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    fontSize: "11px",
+                    padding: "4px 6px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                    <strong className="fd-mono">{row.adapter}</strong>
+                    <span style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
+                      {row.transport_label}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
+                    {ACP_CONFORMANCE_OPERATIONS.map((op) => {
+                      const status = row.operations[op];
+                      return (
+                        <span
+                          key={op}
+                          className="fd-badge fd-mono"
+                          data-testid={`acp-conformance-cell-${row.adapter}-${op}`}
+                          data-status={status}
+                          style={{
+                            fontSize: "10px",
+                            color: status === "pass" ? "#34D399" : "#FBBF24",
+                          }}
+                        >
+                          {op}:{status.toUpperCase()}
+                        </span>
+                      );
+                    })}
+                  </div>
                 </div>
               ))}
             </div>
