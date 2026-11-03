@@ -548,7 +548,9 @@ pub enum MemoryCmd {
 
 #[derive(Subcommand)]
 pub enum HandoffCmd {
-    /// Create or update a `Handoff` snapshot (`--key` defaults to `"current"`).
+    /// Create or update a `Handoff` snapshot (`--key` defaults to `"current"`). Agents that share
+    /// a scope should each pass their own `--key` (their persona) so they never overwrite one
+    /// another's handoff.
     Set {
         #[arg(long)]
         scope: String,
@@ -572,6 +574,16 @@ pub enum HandoffCmd {
         not_sensitive: bool,
         #[arg(long)]
         by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read one `Handoff` snapshot by key (`--key` defaults to `"current"`). Looks only at the
+    /// handoff concern, so a memory or runtime entry with the same key never shadows it.
+    Get {
+        #[arg(long)]
+        scope: String,
+        #[arg(long, default_value = "current")]
+        key: String,
         #[arg(long)]
         json: bool,
     },
@@ -1136,6 +1148,19 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                         by,
                     })
                     .map_err(|e| e.to_string())?;
+                print_state_entry(&store, &entry, json);
+                Ok(())
+            }
+            HandoffCmd::Get { scope, key, json } => {
+                let parsed_scope = StateScope::from_wire(&scope).map_err(|e| e.to_string())?;
+                let store = env.open_for_scope(Some(&parsed_scope))?;
+                let slug = validate_slug(&key).map_err(|e| e.to_string())?;
+                let entry = store
+                    .get_state_by_key(&parsed_scope, StateConcern::Handoff, &slug)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("no handoff `{slug}` in scope `{}`", parsed_scope.as_wire())
+                    })?;
                 print_state_entry(&store, &entry, json);
                 Ok(())
             }

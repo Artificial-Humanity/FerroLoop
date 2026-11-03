@@ -607,6 +607,7 @@ fl agent roster [--project <area>] [--include-retired] [--render <path>] [--json
 fl state memory set --scope <scope> --key <slug> --category <warning|rule|decision|note> --basis <ruling|measured|inference> --summary <text> (--body <text> | --body-file <path>) [--pinned | --unpinned] [--sensitive | --not-sensitive] --by <author> [--json]
 fl state memory retire <id-or-key> [--scope <scope>] [--superseded-by <id-or-key>] --by <author> [--json]
 fl state handoff set --scope <scope> [--key <slug>] --summary <text> [--shipped <item>...] [--in-flight <item>...] [--blocker <item>...] [--next <item>...] [--notes <text>] [--sensitive | --not-sensitive] --by <author> [--json]
+fl state handoff get --scope <scope> [--key <slug>] [--json]
 fl state runtime set --scope <scope> --key <slug> --value <json> [--merge <conflict|append|last_writer>] [--sensitive | --not-sensitive] --by <author> [--json]
 fl state get <id-or-key> [--scope <scope>] [--concern <memory|handoff|runtime>] [--history] [--json]
 fl state list [--scope <scope>] [--concern <memory|handoff|runtime>] [--category <cat>] [--include-retired] [--json]
