@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import {
   AgentSettingsModal,
@@ -151,5 +151,96 @@ describe("formatExecutionMode", () => {
     expect(formatExecutionMode("dontask")).toBe("dontask");
     expect(formatExecutionMode("  ")).toBe("Unknown");
     expect(formatExecutionMode(undefined)).toBe("Unknown");
+  });
+});
+
+describe("AgentSettingsModal 3-tab layout, pinned header, scrollable body, and pinned lifecycle footer", () => {
+  it("renders a pinned header with 3 tabs, a scrollable body with 3 mounted panels, and a pinned footer with the 4 lifecycle actions", () => {
+    render(<AgentSettingsModal {...modalProps()} />);
+
+    const modal = screen.getByTestId("agent-settings-modal");
+    const header = screen.getByTestId("agent-settings-header");
+    const scrollBody = screen.getByTestId("agent-settings-scroll-body");
+    const footer = screen.getByTestId("agent-settings-footer");
+
+    expect(modal).toContainElement(header);
+    expect(modal).toContainElement(scrollBody);
+    expect(modal).toContainElement(footer);
+    expect(header.style.flexShrink).toBe("0");
+    expect(scrollBody.style.overflowY).toBe("auto");
+    expect(scrollBody.style.flex).toContain("1");
+    expect(footer.style.flexShrink).toBe("0");
+
+    // All 4 lifecycle buttons live in the static footer and outside the scrollable body
+    const recastBtn = within(footer).getByTestId("recast-agent-btn-ferris");
+    const compactBtn = within(footer).getByTestId("compact-context-btn");
+    const clearBtn = within(footer).getByTestId("open-clear-reforge-modal-btn");
+    const decommBtn = within(footer).getByTestId("open-decommission-modal-btn");
+    expect(recastBtn).toHaveTextContent("Re-Cast");
+    expect(compactBtn).toHaveTextContent("Compact");
+    expect(clearBtn).toHaveTextContent("Clear / Reforge");
+    expect(decommBtn).toHaveTextContent("Decommission");
+    expect(scrollBody).not.toContainElement(recastBtn);
+    expect(scrollBody).not.toContainElement(compactBtn);
+    expect(scrollBody).not.toContainElement(clearBtn);
+    expect(scrollBody).not.toContainElement(decommBtn);
+
+    // 3-tab bar inside pinned header
+    const tablist = within(header).getByTestId("agent-settings-tabs");
+    expect(tablist).toHaveAttribute("role", "tablist");
+    const tabOverview = within(tablist).getByTestId("agent-settings-tab-overview");
+    const tabPermissions = within(tablist).getByTestId("agent-settings-tab-permissions");
+    const tabRuntime = within(tablist).getByTestId("agent-settings-tab-runtime");
+    expect(tabOverview).toHaveTextContent("Overview & Model");
+    expect(tabPermissions).toHaveTextContent("Permissions & Sandbox");
+    expect(tabRuntime).toHaveTextContent("MCP & Runtime");
+
+    const panelOverview = within(scrollBody).getByTestId("agent-settings-panel-overview");
+    const panelPermissions = within(scrollBody).getByTestId("agent-settings-panel-permissions");
+    const panelRuntime = within(scrollBody).getByTestId("agent-settings-panel-runtime");
+
+    // Default tab is Overview & Model
+    expect(tabOverview).toHaveAttribute("aria-selected", "true");
+    expect(tabPermissions).toHaveAttribute("aria-selected", "false");
+    expect(tabRuntime).toHaveAttribute("aria-selected", "false");
+    expect(panelOverview.style.display).toBe("flex");
+    expect(panelPermissions.style.display).toBe("none");
+    expect(panelRuntime.style.display).toBe("none");
+    expect(panelOverview).toContainElement(screen.getByTestId("agent-settings-identity"));
+
+    // Switch to Permissions & Sandbox tab
+    fireEvent.click(tabPermissions);
+    expect(tabOverview).toHaveAttribute("aria-selected", "false");
+    expect(tabPermissions).toHaveAttribute("aria-selected", "true");
+    expect(tabRuntime).toHaveAttribute("aria-selected", "false");
+    expect(panelOverview.style.display).toBe("none");
+    expect(panelPermissions.style.display).toBe("flex");
+    expect(panelRuntime.style.display).toBe("none");
+    expect(panelPermissions).toContainElement(screen.getByTestId("agent-permissions-section"));
+    // Footer remains visible across tabs
+    expect(within(footer).getByTestId("recast-agent-btn-ferris")).toBeInTheDocument();
+
+    // Switch to MCP & Runtime tab
+    fireEvent.click(tabRuntime);
+    expect(tabOverview).toHaveAttribute("aria-selected", "false");
+    expect(tabPermissions).toHaveAttribute("aria-selected", "false");
+    expect(tabRuntime).toHaveAttribute("aria-selected", "true");
+    expect(panelOverview.style.display).toBe("none");
+    expect(panelPermissions.style.display).toBe("none");
+    expect(panelRuntime.style.display).toBe("flex");
+    expect(panelRuntime).toContainElement(screen.getByTestId("agent-posture-section"));
+    expect(panelRuntime).toContainElement(screen.getByTestId("agent-worktree-policy-section"));
+    expect(panelRuntime).toContainElement(screen.getByTestId("agent-host-supervisor-telemetry"));
+    expect(within(footer).getByTestId("open-decommission-modal-btn")).toBeInTheDocument();
+  });
+
+  it("supports initialTab prop to open directly on permissions or runtime", () => {
+    render(<AgentSettingsModal {...modalProps({ initialTab: "runtime" })} />);
+    expect(screen.getByTestId("agent-settings-tab-runtime")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByTestId("agent-settings-panel-runtime").style.display).toBe("flex");
+    expect(screen.getByTestId("agent-settings-panel-overview").style.display).toBe("none");
   });
 });
