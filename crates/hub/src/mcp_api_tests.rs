@@ -166,6 +166,24 @@ fn get(state: &HubState) -> Value {
     body
 }
 
+/// The digest of the first row, or 64 zeros when the row has none (it is not `synced` or `drift`).
+fn digest_of(state: &HubState) -> String {
+    let body = get(state);
+    only_row(&body)["catalog_digest"]
+        .as_str()
+        .map_or_else(|| "0".repeat(64), str::to_string)
+}
+
+/// What FerroDeck does: look at the row, then sync it with the digest it saw.
+fn sync(state: &HubState) -> (u16, Value) {
+    let digest = digest_of(state);
+    let repo = repo_name(&state.config.repo_root);
+    post(
+        state,
+        &json!({ "repo": repo, "expect_digest": digest }).to_string(),
+    )
+}
+
 fn post(state: &HubState, body: &str) -> (u16, Value) {
     send(state, "POST", "/api/v1/mcp/sync", Some(OWNER), body)
 }
@@ -220,9 +238,11 @@ fn both_endpoints_are_owner_only() {
         let (status, body) = send(&f.state, method, path, Some(PEER), "");
         assert_eq!(status, 403, "{path}");
         assert!(body["error"].as_str().unwrap().contains("owner"), "{body}");
+        // The Owner is let in: the GET answers, and the POST reads a body and wants a digest.
+        let want = if method == "GET" { 200 } else { 400 };
         assert_eq!(
             send(&f.state, method, path, Some(OWNER), "").0,
-            200,
+            want,
             "{path}"
         );
     }
@@ -294,7 +314,7 @@ fn a_repo_without_a_catalog_is_missing() {
     assert!(row["enabled_servers"].is_null());
     assert!(row["vendors"].is_null());
     assert!(row["deduplicated_daemons"].is_null());
-    let (status, body) = post(&f.state, "{}");
+    let (status, body) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(body["ok"], true);
     let result = &body["repos"][0];
@@ -335,7 +355,7 @@ fn a_malformed_catalog_is_an_error_row_that_quotes_nothing() {
     assert!(row["vendors"].is_null());
     assert!(row["enabled_servers"].is_null());
     // A sync of it is refused, with the same text, and writes nothing.
-    let (status, sync) = post(&f.state, "{}");
+    let (status, sync) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(sync["ok"], false);
     assert_eq!(sync["repos"][0]["status_before"], "error");
@@ -363,7 +383,7 @@ fn a_vendor_file_git_would_commit_is_an_error_row() {
             .contains("not ignored by git"),
         "{row}"
     );
-    let (_, sync) = post(&f.state, "{}");
+    let (_, sync) = sync(&f.state);
     assert_eq!(sync["ok"], false);
     assert!(!f.repo.join(".mcp.json").exists());
 }
@@ -397,7 +417,7 @@ fn the_catalog_may_sit_above_the_hubs_repo_root() {
         f.repo.join(".fl/mcp.toml").display().to_string()
     );
     // A sync writes in the project directory, not in the nested one.
-    let (status, sync) = post(&state, "{}");
+    let (status, sync) = sync(&state);
     assert_eq!(status, 200);
     assert_eq!(sync["ok"], true, "{sync}");
     assert!(f.repo.join(".mcp.json").is_file());
@@ -415,7 +435,7 @@ fn the_machine_switches_decide_what_is_enabled_and_written() {
     });
     let body = get(&f.state);
     assert_eq!(only_row(&body)["enabled_servers"], json!(["beta", "gamma"]));
-    let (_, sync) = post(&f.state, "{}");
+    let (_, sync) = sync(&f.state);
     assert_eq!(sync["ok"], true, "{sync}");
     let claude = fs::read_to_string(f.repo.join(".mcp.json")).unwrap();
     assert!(claude.contains("gamma") && claude.contains("beta") && !claude.contains("alpha"));
@@ -433,7 +453,7 @@ fn the_machine_switches_decide_what_is_enabled_and_written() {
 #[test]
 fn a_sync_writes_the_vendor_files_then_a_second_sync_changes_nothing() {
     let f = fixture();
-    let (status, body) = post(&f.state, "");
+    let (status, body) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(body["ok"], true, "{body}");
     let result = &body["repos"][0];
@@ -456,7 +476,7 @@ fn a_sync_writes_the_vendor_files_then_a_second_sync_changes_nothing() {
     assert_eq!(only_row(&get(&f.state))["status"], "synced");
 
     let after_first = snapshot(f.tmp.path());
-    let (status, body) = post(&f.state, "{}");
+    let (status, body) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(body["ok"], true);
     let result = &body["repos"][0];
@@ -471,7 +491,7 @@ fn a_sync_writes_only_the_project_files_and_leaves_the_home_directory_alone() {
     let f = fixture();
     let home_before = snapshot(&f.home);
     let tmp_before = snapshot(f.tmp.path());
-    let (status, body) = post(&f.state, "{}");
+    let (status, body) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(body["ok"], true, "{body}");
     assert_eq!(snapshot(&f.home), home_before, "the home directory changed");
@@ -529,7 +549,7 @@ fn a_vendor_file_is_never_a_user_level_file() {
 #[test]
 fn one_vendor_can_drift_while_the_others_are_synced() {
     let f = fixture();
-    post(&f.state, "{}");
+    sync(&f.state);
     fs::remove_file(f.repo.join(".mcp.json")).unwrap();
     let body = get(&f.state);
     let row = only_row(&body);
@@ -539,7 +559,7 @@ fn one_vendor_can_drift_while_the_others_are_synced() {
         assert_eq!(vendor_state(row, vendor), "synced", "{vendor}");
     }
     // The sync writes that one file.
-    let (_, sync) = post(&f.state, "{}");
+    let (_, sync) = sync(&f.state);
     assert_eq!(sync["repos"][0]["written"], json!([".mcp.json"]));
     assert_eq!(only_row(&get(&f.state))["status"], "synced");
 }
@@ -547,7 +567,7 @@ fn one_vendor_can_drift_while_the_others_are_synced() {
 #[test]
 fn a_hand_edited_entry_is_refused_and_nothing_is_written() {
     let f = fixture();
-    post(&f.state, "{}");
+    sync(&f.state);
     let path = f.repo.join(".mcp.json");
     let mut json: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     json["mcpServers"]["alpha"]["command"] = json!("hand-edited");
@@ -568,7 +588,7 @@ fn a_hand_edited_entry_is_refused_and_nothing_is_written() {
         "a value leaked: {body}"
     );
 
-    let (status, sync) = post(&f.state, "{}");
+    let (status, sync) = sync(&f.state);
     assert_eq!(status, 200);
     assert_eq!(sync["ok"], false);
     let result = &sync["repos"][0];
@@ -583,9 +603,9 @@ fn a_hand_edited_entry_is_refused_and_nothing_is_written() {
 fn no_secret_value_or_launch_detail_is_in_any_answer() {
     let f = fixture();
     let mut seen = vec![get(&f.state).to_string()];
-    seen.push(post(&f.state, "{}").1.to_string());
+    seen.push(sync(&f.state).1.to_string());
     seen.push(get(&f.state).to_string());
-    seen.push(post(&f.state, "{}").1.to_string());
+    seen.push(sync(&f.state).1.to_string());
     let (_, unknown) = post(&f.state, "{\"repo\":\"nope\"}");
     seen.push(unknown.to_string());
     // The literals really are in play: fl writes them into the claude file.
@@ -610,19 +630,15 @@ fn no_secret_value_or_launch_detail_is_in_any_answer() {
 #[test]
 fn a_known_repo_is_named_by_its_name_or_its_path() {
     let f = fixture();
-    let (status, body) = post(&f.state, "{\"repo\":\"work\"}");
-    assert_eq!((status, &body["ok"]), (200, &json!(true)));
+    let body = json!({ "repo": "work", "expect_digest": digest_of(&f.state) });
+    let (status, body) = post(&f.state, &body.to_string());
+    assert_eq!((status, &body["ok"]), (200, &json!(true)), "{body}");
     assert_eq!(body["repos"][0]["status_after"], "synced");
-    let by_path = json!({ "repo": f.repo.display().to_string() }).to_string();
-    let (status, body) = post(&f.state, &by_path);
-    assert_eq!((status, &body["ok"]), (200, &json!(true)));
+    let by_path =
+        json!({ "repo": f.repo.display().to_string(), "expect_digest": digest_of(&f.state) });
+    let (status, body) = post(&f.state, &by_path.to_string());
+    assert_eq!((status, &body["ok"]), (200, &json!(true)), "{body}");
     assert_eq!(body["repos"].as_array().unwrap().len(), 1);
-    // `null` and `{}` mean every known repo.
-    for all in ["{\"repo\":null}", "{}", "  "] {
-        let (status, body) = post(&f.state, all);
-        assert_eq!(status, 200, "{all}");
-        assert_eq!(body["repos"].as_array().unwrap().len(), 1, "{all}");
-    }
 }
 
 #[test]
@@ -645,7 +661,8 @@ fn an_unknown_repo_is_refused_and_nothing_is_written() {
         ("./work".into(), 400),
     ];
     for (given, want) in cases {
-        let (status, body) = post(&f.state, &json!({ "repo": given }).to_string());
+        let body = json!({ "repo": given, "expect_digest": "0".repeat(64) });
+        let (status, body) = post(&f.state, &body.to_string());
         assert_eq!(status, want, "{given}: {body}");
         assert!(body["error"].is_string());
         assert!(body.get("repos").is_none());
@@ -658,20 +675,167 @@ fn an_unknown_repo_is_refused_and_nothing_is_written() {
 #[test]
 fn a_bad_body_is_a_400() {
     let f = fixture();
+    let zero = "0".repeat(64);
     for body in [
-        "[]",
-        "not json",
-        "{\"repo\":3}",
-        "{\"repo\":\"\"}",
-        "{\"repo\":\"  \"}",
-        "{\"repo\":[\"work\"]}",
-        "{\"repo\":\"work\",\"force\":true}",
-        "{\"all\":true}",
+        "[]".to_string(),
+        "not json".into(),
+        format!("{{\"repo\":3,\"expect_digest\":\"{zero}\"}}"),
+        format!("{{\"repo\":\"\",\"expect_digest\":\"{zero}\"}}"),
+        format!("{{\"repo\":[\"work\"],\"expect_digest\":\"{zero}\"}}"),
+        format!("{{\"repo\":\"work\",\"expect_digest\":\"{zero}\",\"force\":true}}"),
+        format!("{{\"expect_digest\":\"{zero}\"}}"),
+        format!("{{\"repo\":null,\"expect_digest\":\"{zero}\"}}"),
+        "{\"repo\":\"work\",\"expect_digest\":\"short\"}".into(),
+        "{\"repo\":\"work\",\"expect_digest\":7}".into(),
     ] {
-        let (status, answer) = post(&f.state, body);
+        let (status, answer) = post(&f.state, &body);
         assert_eq!(status, 400, "{body}: {answer}");
     }
     assert!(!f.repo.join(".mcp.json").exists());
+}
+
+#[test]
+fn a_sync_without_a_digest_is_refused_and_writes_nothing() {
+    let f = fixture();
+    let before = snapshot(f.tmp.path());
+    // No digest, whether it names a repo, names none, or is empty: "sync everything" is gone.
+    for body in [
+        "",
+        "{}",
+        "{\"repo\":\"work\"}",
+        "{\"repo\":\"work\",\"expect_digest\":null}",
+    ] {
+        let (status, answer) = post(&f.state, body);
+        assert_eq!(status, 400, "{body}");
+        let error = answer["error"].as_str().unwrap();
+        assert!(error.contains("expect_digest"), "{error}");
+    }
+    assert_eq!(snapshot(f.tmp.path()), before);
+}
+
+#[test]
+fn the_digest_follows_the_catalog_the_switches_and_the_plan() {
+    let f = fixture();
+    let d1 = digest_of(&f.state);
+    assert_eq!(d1.len(), 64);
+    assert!(d1.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(digest_of(&f.state), d1, "the digest is stable");
+    // A different command in the catalog is a different digest, and putting it back restores it.
+    let catalog = f.repo.join(".fl/mcp.toml");
+    fs::write(&catalog, CATALOG.replace(CANARY_COMMAND, "another-bin")).unwrap();
+    let d2 = digest_of(&f.state);
+    assert_ne!(d2, d1);
+    fs::write(&catalog, CATALOG).unwrap();
+    assert_eq!(digest_of(&f.state), d1);
+    // So are the machine's switches...
+    f.state.set_mcp_switches(|_| {
+        Ok(fl_mcp::sync::Switches {
+            enable: vec![],
+            disable: vec!["beta".into()],
+        })
+    });
+    let d3 = digest_of(&f.state);
+    assert_ne!(d3, d1);
+    // ...and the state of the vendor files (a synced repo is another digest from a drifting one).
+    f.state
+        .set_mcp_switches(|_| Ok(fl_mcp::sync::Switches::default()));
+    assert_eq!(digest_of(&f.state), d1);
+    sync(&f.state);
+    let d4 = digest_of(&f.state);
+    assert_ne!(d4, d1);
+    // A digest is a hash: none of the catalog's text is in it.
+    for text in [d1, d2, d3, d4] {
+        for canary in [CANARY_ENV, CANARY_HEADER, CANARY_COMMAND, CANARY_ARG] {
+            assert!(!text.contains(canary));
+        }
+    }
+}
+
+#[test]
+fn a_digest_of_a_catalog_that_has_changed_since_is_refused_and_nothing_is_written() {
+    let f = fixture();
+    let looked_at = digest_of(&f.state);
+    // A `git pull` changes the command of a server between the look and the click.
+    fs::write(
+        f.repo.join(".fl/mcp.toml"),
+        CATALOG.replace(CANARY_COMMAND, "pulled-bin"),
+    )
+    .unwrap();
+    let before = snapshot(f.tmp.path());
+    let body = json!({ "repo": "work", "expect_digest": looked_at });
+    let (status, answer) = post(&f.state, &body.to_string());
+    assert_eq!(status, 200);
+    assert_eq!(answer["ok"], false);
+    let result = &answer["repos"][0];
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("catalog changed since you looked")
+    );
+    assert_eq!(result["written"], json!([]));
+    assert_eq!(snapshot(f.tmp.path()), before, "a stale sync wrote");
+    assert!(!f.repo.join(".mcp.json").exists());
+    // With the digest of what it now is, the sync goes through, and writes what it now says.
+    let (_, answer) = sync(&f.state);
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert!(
+        fs::read_to_string(f.repo.join(".mcp.json"))
+            .unwrap()
+            .contains("pulled-bin")
+    );
+}
+
+#[test]
+fn the_row_says_what_a_click_would_do_by_name_only() {
+    let f = fixture();
+    let body = get(&f.state);
+    let row = only_row(&body);
+    let changes = row["changes"].as_array().unwrap();
+    assert!(changes.contains(&json!({ "vendor": "claude", "server": "alpha", "action": "add" })));
+    assert!(changes.contains(&json!({ "vendor": "claude", "server": "beta", "action": "add" })));
+    assert!(
+        !changes.iter().any(|c| c["server"] == "gamma"),
+        "gamma is off"
+    );
+    for c in changes {
+        let keys: Vec<&String> = c.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 3, "{c}");
+    }
+    sync(&f.state);
+    assert_eq!(only_row(&get(&f.state))["changes"], json!([]));
+    // An edit to a server's launch is an update, and a server dropped is a remove.
+    fs::write(
+        f.repo.join(".fl/mcp.toml"),
+        CATALOG
+            .replace(CANARY_COMMAND, "other-bin")
+            .replace("[server.gamma]", "[server.gamma-gone]")
+            .replace("enabled = false", "enabled = false\nvendors = [\"claude\"]"),
+    )
+    .unwrap();
+    let body = get(&f.state);
+    let changes = only_row(&body)["changes"].as_array().unwrap().clone();
+    assert!(
+        changes.contains(&json!({ "vendor": "claude", "server": "alpha", "action": "update" }))
+    );
+    assert!(!body.to_string().contains("other-bin"));
+}
+
+#[test]
+fn a_busy_hub_answers_busy_instead_of_waiting() {
+    let f = fixture();
+    f.state.mcp.set_wait(std::time::Duration::from_millis(50));
+    let held = f.state.mcp.gate().expect("the gate is free");
+    let (status, body) = send(&f.state, "GET", "/api/v1/mcp/catalog", Some(OWNER), "");
+    assert_eq!(status, 503, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("busy"));
+    let post_body = json!({ "repo": "work", "expect_digest": "0".repeat(64) });
+    let (status, body) = post(&f.state, &post_body.to_string());
+    assert_eq!(status, 200);
+    assert_eq!(body["ok"], false);
+    assert!(body["error"].as_str().unwrap().contains("busy"));
+    drop(held);
+    assert_eq!(get(&f.state)["repos"].as_array().unwrap().len(), 1);
 }
 
 #[cfg(unix)]
@@ -694,7 +858,8 @@ fn a_repo_root_reached_through_a_link_is_synced_where_it_really_is() {
     );
     // It answers to the link's path and to the real one.
     for given in [link.display().to_string(), f.repo.display().to_string()] {
-        let (status, body) = post(&state, &json!({ "repo": given }).to_string());
+        let body = json!({ "repo": given, "expect_digest": digest_of(&state) });
+        let (status, body) = post(&state, &body.to_string());
         assert_eq!(status, 200, "{given}: {body}");
     }
     assert!(f.repo.join(".mcp.json").is_file());
@@ -710,7 +875,7 @@ fn a_vendor_file_that_is_a_link_is_refused_not_written_through() {
     std::os::unix::fs::symlink(&outside, f.repo.join(".mcp.json")).unwrap();
     let body = get(&f.state);
     assert_eq!(only_row(&body)["status"], "error", "{body}");
-    let (_, sync) = post(&f.state, "{}");
+    let (_, sync) = sync(&f.state);
     assert_eq!(sync["ok"], false);
     assert_eq!(fs::read_to_string(&outside).unwrap(), "{}");
 }
@@ -722,7 +887,17 @@ fn concurrent_syncs_take_turns() {
     let f = fixture();
     let results: Vec<(u16, Value)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..6)
-            .map(|_| scope.spawn(|| post(&f.state, "{}")))
+            .map(|_| {
+                scope.spawn(|| {
+                    // A digest another thread's sync made stale is looked at again.
+                    loop {
+                        let answer = sync(&f.state);
+                        if !answer.1.to_string().contains("catalog changed") {
+                            break answer;
+                        }
+                    }
+                })
+            })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
@@ -737,4 +912,129 @@ fn concurrent_syncs_take_turns() {
         .count();
     assert_eq!(writers, 1, "{results:?}");
     assert_eq!(only_row(&get(&f.state))["status"], "synced");
+}
+
+// --- gates that keep the hub inside the repository -------------------------------------------
+
+/// A repository whose config makes git run a script on every index read, the script leaving a
+/// sentinel file; returns the sentinel's path.
+fn fsmonitor_trap(repo: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let sentinel = repo.join("..").join("fsmonitor-ran");
+    let script = repo.join("..").join("fsmonitor.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    git(repo, &["add", ".gitignore"]);
+    let config = repo.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[core]\n\tfsmonitor = {}\n", script.display()));
+    fs::write(&config, text).unwrap();
+    sentinel
+}
+
+#[test]
+fn a_repositorys_fsmonitor_never_runs_when_the_hub_asks_git() {
+    let f = fixture();
+    let sentinel = fsmonitor_trap(&f.repo);
+    // The control: plain git, as the CLI runs it, does run the program.
+    let _ = fl_exec::git::Git::is_tracked(&f.repo, ".mcp.json");
+    let _ = fl_exec::git::Git::is_ignored(&f.repo, ".mcp.json");
+    assert!(
+        sentinel.exists(),
+        "the trap does not fire for plain git, so this test proves nothing"
+    );
+    fs::remove_file(&sentinel).unwrap();
+    // The hub asks git for both questions on a drifting repo, and gets answers.
+    let body = get(&f.state);
+    assert_eq!(only_row(&body)["status"], "drift", "{body}");
+    sync(&f.state);
+    assert!(
+        !sentinel.exists(),
+        "git ran the repository's fsmonitor for the hub"
+    );
+}
+
+#[test]
+fn a_catalog_in_the_home_directory_or_above_it_is_never_synced() {
+    let f = fixture_with(None);
+    let base = fs::canonicalize(f.tmp.path()).unwrap();
+    // A dotfiles repository: the hub's root is the home directory, with a catalog and a `.git`.
+    git(&f.home, &["init", "-q"]);
+    fs::write(f.home.join(".gitignore"), GITIGNORE).unwrap();
+    fs::create_dir_all(f.home.join(".fl")).unwrap();
+    fs::write(f.home.join(".fl/mcp.toml"), CATALOG).unwrap();
+    // ... a repository below it that has no catalog of its own, so the one above is found ...
+    let below = f.home.join("code/proj");
+    fs::create_dir_all(&below).unwrap();
+    let home_before = snapshot(&f.home);
+    for root in [f.home.clone(), below] {
+        let state = hub(&base, &root, &f.home);
+        let body = get(&state);
+        let row = only_row(&body);
+        assert_eq!(row["status"], "error", "{root:?}: {row}");
+        assert!(
+            row["error"].as_str().unwrap().contains("home directory"),
+            "{row}"
+        );
+        assert!(row["catalog_digest"].is_null());
+        let sync = post(
+            &state,
+            &json!({ "repo": repo_name(&root), "expect_digest": "0".repeat(64) }).to_string(),
+        );
+        assert_eq!(sync.1["ok"], false);
+        assert_eq!(
+            snapshot(&f.home),
+            home_before,
+            "{root:?}: the home directory changed"
+        );
+    }
+}
+
+#[test]
+fn a_catalog_above_the_repositorys_git_root_is_not_this_repositorys() {
+    let f = fixture_with(None);
+    let base = fs::canonicalize(f.tmp.path()).unwrap();
+    // `big` holds a catalog and no `.git`; the hub's repository is a git root below it.
+    let big = base.join("big");
+    fs::create_dir_all(big.join(".fl")).unwrap();
+    fs::write(big.join(".fl/mcp.toml"), CATALOG).unwrap();
+    let proj = repo(&big.join("proj"), None);
+    let before = snapshot(&big);
+    let state = hub(&base, &proj, &f.home);
+    let body = get(&state);
+    let row = only_row(&body);
+    assert_eq!(row["status"], "error", "{row}");
+    assert!(
+        row["error"]
+            .as_str()
+            .unwrap()
+            .contains("not in this repository"),
+        "{row}"
+    );
+    post(
+        &state,
+        &json!({ "repo": "proj", "expect_digest": "0".repeat(64) }).to_string(),
+    );
+    assert_eq!(snapshot(&big), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_dot_codex_into_the_home_directory_is_refused_and_the_home_is_untouched() {
+    let f = fixture();
+    std::os::unix::fs::symlink(f.home.join(".codex"), f.repo.join(".codex")).unwrap();
+    let home_before = snapshot(&f.home);
+    let body = get(&f.state);
+    let row = only_row(&body);
+    assert_eq!(row["status"], "error", "{row}");
+    let (status, answer) = sync(&f.state);
+    assert_eq!(status, 200);
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(snapshot(&f.home), home_before, "the home directory changed");
+    // Nothing else was written either: a refusal writes nothing.
+    assert!(!f.repo.join(".mcp.json").exists());
 }

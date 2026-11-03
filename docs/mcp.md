@@ -423,11 +423,19 @@ write, and `--replace` takes it back.
 
 ## Hub API
 
+A pulled catalog is executable config: `fl mcp sync` turns its commands into the files the agent
+CLIs run, so a sync of a catalog nobody looked at starts whatever a commit says. The hub makes a
+sync a compare-and-swap on what the caller looked at.
+
 The hub (`fl hub serve`) shows and syncs the catalog of the repository it serves, its
 `repo_root`; it does not list `[[project]]` roots. Both endpoints answer the Owner only (a Peer
 gets 403, an unauthenticated caller 401), and both plan with the same library calls as `fl mcp
-check` and `fl mcp sync`, with this machine's `[[mcp]]` switches. The project directory is found
-as above, from the root up.
+check` and `fl mcp sync`, with this machine's `[[mcp]]` switches, which the hub reads once, when
+it starts: restart it to pick up an edit. The project directory is found as above, from the root
+up, but must be the root or the root's git root, and never the home directory or a directory
+above it: such a catalog is an `error` row, and the hub writes nothing for it. A vendor file git
+would commit is an `error` too; the two git questions run with an empty environment but `PATH`,
+no `core.fsmonitor` or hooks, and a 10-second deadline.
 
 `GET /api/v1/mcp/catalog` answers `{ "repos": [ … ] }`, one row per known repo:
 
@@ -438,6 +446,8 @@ as above, from the root up.
 | `error`, `refusals` | For `error`: the library's refusal text, and one line per refused entry. The text never quotes a value. |
 | `enabled_servers` | The servers on, by name, or `null` when the plan failed first. |
 | `vendors` | Per agent CLI, `synced`, `drift` or `refused`, or `null` when no plan was made. |
+| `changes` | What a sync would do, `{ "vendor", "server", "action": "add" \| "update" \| "remove" }` each, names only; `null` when no plan was made. |
+| `catalog_digest` | The hex SHA-256 over the catalog's bytes, the switches and the bytes a sync would write; `null` unless the status is `synced` or `drift`. A hash: it shows nothing of its input. |
 | `deduplicated_daemons`, `active_vendor_sessions`, `spawned_mcp_processes` | Always `null`: nothing in the hub measures them. |
 
 `error` covers a catalog that does not parse or validate, a vendor file fl refuses (see above),
@@ -445,13 +455,18 @@ and a vendor file git would commit. FerroDeck's row type knows the first three s
 Only names and statuses leave the hub: no `env` or header value, command, argument or secret
 variable.
 
-`POST /api/v1/mcp/sync` takes `{}`, an empty body (every known repo) or `{ "repo": "<name>" }`;
-`repo` is a row's `repo`, or the absolute path of a known root. Any other name or path is a 404
-(a name two roots share is a 400), and any other key a 400. It answers `{ "ok": bool, "repos":
-[ { "repo", "status_before", "status_after", "written", "error"? } ] }`: `written` lists the
-vendor files written, relative to the project. A request the hub can read is a 200 whatever the
-repos did; `ok` is `false` when any repo has an `error`, and then that repo wrote nothing. A repo
-with no catalog is skipped with a `note`. Syncs and catalog reads take turns.
+`POST /api/v1/mcp/sync` takes `{ "repo": "<name>", "expect_digest": "<catalog_digest>" }`, both
+required: a body without them, `{}` included, is a 400 that names the field, so no request syncs
+a catalog its sender did not look at. `repo` is a row's `repo`, or the absolute path of a known
+root; any other name or path is a 404 (a name two roots share is a 400), and any other key a 400.
+If the catalog, the switches or the files a sync would write changed since the digest was read,
+the repo's `error` says so and nothing is written; read the row again. The answer is `{ "ok":
+bool, "repos": [ { "repo", "status_before", "status_after", "written", "error"? } ] }`: `written`
+lists the vendor files written, relative to the project. A request the hub can read is a 200
+whatever the repo did; `ok` is `false` when it has an `error`, and then it wrote nothing. A repo
+with no catalog is skipped with a `note`. Syncs and catalog reads take turns: a request that
+waits more than 5 seconds for another is answered `busy` (`ok: false` for the POST, a 503 for
+the GET). The library waits for a running `fl mcp sync` with no deadline.
 
 A sync writes the vendor files of the table above under the project directory and nothing else
 there; the hub refuses a plan with any target outside the project, and never reads or writes an
@@ -462,5 +477,7 @@ keeps them.
 
 `.fl/mcp.toml` in this repository names the workspace's two MCP servers: `ferrowire`
 (`fl wire mcp`) and `research-papers` (`/usr/local/bin/research-papers-mcp`). It holds no secret
-and no `env`. The repository's `.gitignore` holds the vendor-file lines above, so `fl mcp sync`
-writes the agent CLIs' files here and git ignores them.
+and no `env`. `research-papers-mcp` is an absolute path to this machine's install: another
+machine needs the program there, or its own `[[mcp]]` switch to turn the server off. The
+repository's `.gitignore` holds the vendor-file lines above, so `fl mcp sync` writes the agent
+CLIs' files here and git ignores them.
