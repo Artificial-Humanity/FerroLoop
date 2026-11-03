@@ -1352,6 +1352,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<
     string | null
   >(null);
+  const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
+    useState<DedicatedArtifactLayoutState>(
+      () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
+    );
+  const [artifactConsolidateBanner, setArtifactConsolidateBanner] = useState<
+    string | null
+  >(null);
+  const [settingsCleanupScope, setSettingsCleanupScope] = useState<
+    "archived" | "live" | "all"
+  >("archived");
+  const [settingsCleanupKind, setSettingsCleanupKind] = useState<
+    "all" | "images" | "docs" | "code"
+  >("all");
+  const [settingsCleanupAge, setSettingsCleanupAge] = useState<
+    "all" | "1d" | "7d" | "30d"
+  >("all");
+  const [settingsCleanupKeepVersions, setSettingsCleanupKeepVersions] =
+    useState<number>(0);
+  const [runningSettingsArtifactCleanup, setRunningSettingsArtifactCleanup] =
+    useState<boolean>(false);
+  const [settingsArtifactCleanupBanner, setSettingsArtifactCleanupBanner] =
+    useState<string | null>(null);
 
   // Agents Fleet & Re-Cast state
   const [loadedAgents, setLoadedAgents] = useState<AgentRecord[]>(
@@ -1499,6 +1521,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setArtifactsDirModalError(null);
     setSystemArtifactsDirStatus(null);
     setProjectArtifactsDirStatus(null);
+    setArtifactConsolidateBanner(null);
+    setSettingsArtifactCleanupBanner(null);
     setCloudAdaptersSaved(false);
     setRecastStatusBanner(null);
     setRecastReplaceLeadArmed({});
@@ -1607,7 +1631,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         }
         return;
       }
-      if (!submitting && !savingSettings && !savingCloudAdapters) {
+      if (
+        !submitting &&
+        !savingSettings &&
+        !savingCloudAdapters &&
+        !runningSettingsArtifactCleanup
+      ) {
         onClose();
       }
     };
@@ -1622,6 +1651,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     submitting,
     savingSettings,
     savingCloudAdapters,
+    runningSettingsArtifactCleanup,
     onClose,
   ]);
 
@@ -1739,13 +1769,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [localProviderBanner, setLocalProviderBanner] = useState<string | null>(
     null,
   );
-  const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
-    useState<DedicatedArtifactLayoutState>(
-      () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
-    );
-  const [artifactConsolidateBanner, setArtifactConsolidateBanner] = useState<
-    string | null
-  >(null);
   const [consoleLayoutMode, setConsoleLayoutMode] =
     useState<SystemConsoleLayoutMode>(() => getInitialConsoleLayoutMode());
   const [consoleLayoutBanner, setConsoleLayoutBanner] = useState<string | null>(
@@ -1902,6 +1925,65 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       );
     } finally {
       setPruningAttachments(false);
+    }
+  };
+
+  const handleSettingsArtifactCleanup = async (dryRun: boolean) => {
+    if (runningSettingsArtifactCleanup) return;
+    setRunningSettingsArtifactCleanup(true);
+    setError(null);
+    setSettingsArtifactCleanupBanner(null);
+    const maxAgeDays =
+      settingsCleanupAge === "1d"
+        ? 1
+        : settingsCleanupAge === "7d"
+          ? 7
+          : settingsCleanupAge === "30d"
+            ? 30
+            : undefined;
+    const kinds =
+      settingsCleanupKind === "images"
+        ? ["image", "svg", "mermaid"]
+        : settingsCleanupKind === "docs"
+          ? ["markdown", "pdf"]
+          : settingsCleanupKind === "code"
+            ? ["code", "binary"]
+            : undefined;
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.pruneArtifacts({
+        dry_run: dryRun,
+        status: settingsCleanupScope,
+        ...(maxAgeDays !== undefined ? { max_age_days: maxAgeDays } : {}),
+        ...(kinds ? { kinds } : {}),
+        ...(settingsCleanupKeepVersions > 0
+          ? { prune_versions_keep: settingsCleanupKeepVersions }
+          : {}),
+      });
+      const removedEntries =
+        res?.removed_entries ??
+        res?.pruned_count ??
+        res?.pruned ??
+        (Array.isArray(res?.pruned_paths) ? res.pruned_paths.length : 0);
+      const removedVersions = res?.removed_versions ?? 0;
+      const bytesFreed = res?.bytes_freed ?? 0;
+      if (dryRun) {
+        setSettingsArtifactCleanupBanner(
+          `Dry run preview: ${removedEntries} ${removedEntries === 1 ? "entry" : "entries"}, ${removedVersions} ${removedVersions === 1 ? "version" : "versions"} (${bytesFreed} bytes) eligible for cleanup under [home]/artifacts/[project-name].`,
+        );
+      } else {
+        setSettingsArtifactCleanupBanner(
+          `Cleaned up ${removedEntries} ${removedEntries === 1 ? "artifact" : "artifacts"} and ${removedVersions} ${removedVersions === 1 ? "version" : "versions"} (${bytesFreed} bytes freed).`,
+        );
+      }
+    } catch (err) {
+      setSettingsArtifactCleanupBanner(
+        err instanceof Error
+          ? err.message
+          : "Failed to run filtered artifact cleanup",
+      );
+    } finally {
+      setRunningSettingsArtifactCleanup(false);
     }
   };
 
@@ -2445,6 +2527,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {projArtifactsInfo.effectiveDir}
                   </code>
+                  <span
+                    data-testid="settings-project-artifacts-hierarchy-badge"
+                    className="fd-badge fd-mono"
+                    title="Default project hierarchy under [home]/artifacts/[project-name]"
+                    style={{
+                      fontSize: "10px",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    [home]/artifacts/[project-name]
+                  </span>
                   {projArtifactsInfo.artifactsDir && (
                     <span
                       data-testid="settings-project-artifacts-dir-override-badge"
@@ -5528,6 +5621,204 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     Consolidate Vendor Artifacts
                   </button>
+                </div>
+              </div>
+
+              {/* Filtered Artifact Cleanup Actions (Records #186 & #207) */}
+              <div
+                data-testid="settings-filtered-artifact-cleanup-card"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "8px",
+                  paddingTop: "8px",
+                  borderTop: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <strong>Filtered Artifact &amp; Revision Cleanup</strong>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="settings-artifact-cleanup-hierarchy-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    [home]/artifacts → [home]/artifacts/[project-name]
+                  </span>
+                </div>
+
+                {settingsArtifactCleanupBanner && (
+                  <div
+                    role="status"
+                    data-testid="settings-artifact-cleanup-banner"
+                    className="fd-card fd-mono"
+                    style={{
+                      padding: "6px 10px",
+                      fontSize: "11px",
+                      borderColor: "rgba(16, 185, 129, 0.45)",
+                      backgroundColor: "rgba(16, 185, 129, 0.12)",
+                    }}
+                  >
+                    {settingsArtifactCleanupBanner}
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <span>Scope:</span>
+                      <select
+                        aria-label="Storage Cleanup Target Scope"
+                        data-testid="settings-artifact-cleanup-scope"
+                        className="fd-select fd-mono"
+                        value={settingsCleanupScope}
+                        onChange={(e) =>
+                          setSettingsCleanupScope(
+                            e.target.value as "archived" | "live" | "all",
+                          )
+                        }
+                        style={{ fontSize: "11px", padding: "2px 6px" }}
+                      >
+                        <option value="archived">Archived &amp; Dead Paths</option>
+                        <option value="live">Live Tracked</option>
+                        <option value="all">All Tracked</option>
+                      </select>
+                    </label>
+
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <span>Kind:</span>
+                      <select
+                        aria-label="Storage Cleanup File Kind"
+                        data-testid="settings-artifact-cleanup-kind"
+                        className="fd-select fd-mono"
+                        value={settingsCleanupKind}
+                        onChange={(e) =>
+                          setSettingsCleanupKind(
+                            e.target.value as "all" | "images" | "docs" | "code",
+                          )
+                        }
+                        style={{ fontSize: "11px", padding: "2px 6px" }}
+                      >
+                        <option value="all">All Kinds</option>
+                        <option value="images">Images &amp; Diagrams</option>
+                        <option value="docs">Documents &amp; PDFs</option>
+                        <option value="code">Code &amp; Binary</option>
+                      </select>
+                    </label>
+
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <span>Age:</span>
+                      <select
+                        aria-label="Storage Cleanup Max Age"
+                        data-testid="settings-artifact-cleanup-age"
+                        className="fd-select fd-mono"
+                        value={settingsCleanupAge}
+                        onChange={(e) =>
+                          setSettingsCleanupAge(
+                            e.target.value as "all" | "1d" | "7d" | "30d",
+                          )
+                        }
+                        style={{ fontSize: "11px", padding: "2px 6px" }}
+                      >
+                        <option value="all">Any Age</option>
+                        <option value="1d">Older than 1 day</option>
+                        <option value="7d">Older than 7 days</option>
+                        <option value="30d">Older than 30 days</option>
+                      </select>
+                    </label>
+
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <span>Prune Versions:</span>
+                      <select
+                        aria-label="Storage Cleanup Version Retention"
+                        data-testid="settings-artifact-cleanup-versions-keep"
+                        className="fd-select fd-mono"
+                        value={String(settingsCleanupKeepVersions)}
+                        onChange={(e) =>
+                          setSettingsCleanupKeepVersions(
+                            Number(e.target.value) || 0,
+                          )
+                        }
+                        style={{ fontSize: "11px", padding: "2px 6px" }}
+                      >
+                        <option value="0">Keep all versions</option>
+                        <option value="1">Keep latest 1</option>
+                        <option value="3">Keep latest 3</option>
+                        <option value="5">Keep latest 5</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid="settings-artifact-cleanup-dryrun-btn"
+                      disabled={runningSettingsArtifactCleanup}
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => void handleSettingsArtifactCleanup(true)}
+                    >
+                      Preview Cleanup (Dry Run)
+                    </button>
+                    <button
+                      type="button"
+                      className="fd-btn fd-btn-primary"
+                      data-testid="settings-artifact-cleanup-apply-btn"
+                      disabled={runningSettingsArtifactCleanup}
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      onClick={() => void handleSettingsArtifactCleanup(false)}
+                    >
+                      {runningSettingsArtifactCleanup
+                        ? "Cleaning Up..."
+                        : "Clean Up Filtered Artifacts"}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

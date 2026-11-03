@@ -1519,6 +1519,25 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           >
             Artifacts &amp; Documents
           </strong>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+            <span
+              data-testid="artifact-hierarchy-path-badge"
+              className="fd-badge fd-mono"
+              title="Canonical artifact hierarchy: system root [home]/artifacts and project subdirectory [home]/artifacts/[project-name]/[session-id]/"
+              style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+            >
+              [home]/artifacts → [home]/artifacts/[project-name]
+            </span>
+            {storageStats && (
+              <span
+                data-testid="artifact-pane-storage-badge"
+                className="fd-badge fd-mono"
+                style={{ fontSize: "10.5px", color: "var(--text-secondary)" }}
+              >
+                Managed: {storageStats.managed_files ?? 0} ({formatByteSize(storageStats.managed_bytes ?? 0)}) · Versions: {storageStats.version_files ?? 0}
+              </span>
+            )}
+          </div>
         </div>
 
         <div
@@ -2321,7 +2340,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                 border: "1px solid var(--border-subtle)",
               }}
             >
-              Canonical layout:{" "}
+              Canonical layout: <code>[home]/artifacts</code> →{" "}
               <code>[home]/artifacts/[project-name]/[session-id]/</code> ·
               Ratified specs pinned
             </div>
