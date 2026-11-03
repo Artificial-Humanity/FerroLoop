@@ -56,6 +56,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
         });
     }
 
+    if posture == Posture::Plan && off {
+        return Err(CompileRefusal::SandboxConflict {
+            vendor,
+            reason: "plan is carried by the read-only profile and the sandbox, which sandbox off removes".into(),
+        });
+    }
+
     // Posture.
     let mut args: Vec<String> = Vec::new();
     let (note, class) = match posture {
@@ -171,6 +178,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         "the canonical ask default is carried by the strictest network mode",
                     );
                 }
+                Capability::FsWriteProtected if read_only_selected => cx.default_line(
+                    cap,
+                    surface,
+                    vec![],
+                    ReceiptClass::StricterDowngrade,
+                    "no protected-path concept: the read-only profile blocks every workspace write (stricter)",
+                ),
                 Capability::FsWriteProtected => cx.default_line(
                     cap,
                     surface,
@@ -244,16 +258,28 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                 }
                 (Capability::FsWriteProtected, Effect::Allow) => cx.dropped_allow(r, surface, "the vendor has no protected-path concept"),
                 (Capability::FsReadExternal | Capability::FsWriteExternal, Effect::Deny | Effect::Ask) => {
-                    if off {
-                        return Err(if r.effect == Effect::Deny {
-                            cx.refuse_deny(r, "sandbox off leaves no boundary outside the workspace")
+                    // Enforcement needs a selected verified profile that confines access to the
+                    // workspace (a fact), or a proven hard deny. Never an empty-handed Exact.
+                    let confined = profile.is_some() && cx.proves(&ProvenFact::ProfileConfinesExternal);
+                    if hard && r.effect == Effect::Deny {
+                        cx.push(sub, Origin::Rule, Some(Effect::Deny), r.describe(), vec![], ReceiptClass::Exact, surface,
+                            "enforcement asserted by the facts (HardDeny)");
+                    } else if off || !confined {
+                        let why = if off {
+                            "sandbox off leaves no boundary outside the workspace"
                         } else {
-                            CompileRefusal::UnenforceableAsk { vendor, rule: r.describe(), reason: "sandbox off".into() }
+                            "no selected verified profile is proven to confine access to the workspace"
+                        };
+                        return Err(if r.effect == Effect::Deny {
+                            cx.refuse_deny(r, why)
+                        } else {
+                            CompileRefusal::UnenforceableAsk { vendor, rule: r.describe(), reason: why.into() }
                         });
+                    } else {
+                        cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), profile.iter().map(|(id, _)| format!("--permission-profile {id}")).collect(),
+                            if r.effect == Effect::Deny && r.pattern.is_none() { ReceiptClass::Exact } else { ReceiptClass::StricterDowngrade }, surface,
+                            "the selected profile confines access to the workspace (asserted by the facts); every external path is blocked or prompts (stricter for a pattern)");
                     }
-                    cx.push(sub, Origin::Rule, Some(r.effect), r.describe(), vec![],
-                        if r.effect == Effect::Deny && r.pattern.is_none() { ReceiptClass::Exact } else { ReceiptClass::StricterDowngrade }, surface,
-                        "profiles confine access to the workspace; every external path is blocked or prompts (stricter for a pattern)");
                 }
                 (Capability::FsReadExternal | Capability::FsWriteExternal, Effect::Allow) => {
                     if restricted { cx.withdrawn_allow(r, surface) } else { cx.dropped_allow(r, surface, "profiles have no external-path grant") }
@@ -318,7 +344,7 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                 for r in &rules {
                     cx.push(sub, Origin::Rule, Some(Effect::Allow), r.describe(), vec!["--sandbox-network proxy-only".to_owned()],
                         ReceiptClass::StricterDowngrade, surface,
-                        "no domain grammar: the mode degrades to proxy-only, the honest middle; the proxy's own allowlist is outside this plan");
+                        "no domain grammar: the mode degrades to proxy-only, the honest middle. The proxy's own allowlist governs, and it may be broader than the requested domains; it is outside this plan");
                 }
             }
         }

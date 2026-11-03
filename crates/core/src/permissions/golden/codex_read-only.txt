@@ -11,7 +11,7 @@ web_search = "disabled"
 [Exact/SchemaDefined] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) ->  | the sandbox scope applies; leaving it needs an escalation prompt
 [Exact/SchemaDefined] Capability(FsWriteWorkspace) Rule: deny fs_write_workspace -> sandbox_mode=read-only | read-only sandbox
 [Exact/SchemaDefined] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) ->  | the sandbox scope applies; leaving it needs an escalation prompt
-[Unsupported/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) ->  | the vendor has no protected-path concept; the deny default is not enforced
+[StricterDowngrade/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) -> sandbox_mode=read-only | no protected-path concept: the read-only sandbox denies every write (stricter)
 [Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | the approval policy decides unmatched commands
 [Exact/SchemaDefined] Capability(NetworkWeb) Rule: deny network_web [sandbox network transport] -> network_access=false | sandbox network off (all hosts: stricter for a domain or an ask)
 [Exact/SchemaDefined] Capability(NetworkWeb) Rule: deny network_web [host approvals] ->  | no host approvals are pre-seeded; a host-scoped deny is not expressible
@@ -31,3 +31,4 @@ Rules(ShellExec) PendingNextStart
 Rules(NetworkWeb) Respawn
 Rules(McpToolCall) Respawn
 requires_respawn true
+unenforced []

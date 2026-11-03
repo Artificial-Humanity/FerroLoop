@@ -22,6 +22,15 @@ fn protected_globs(vendor: Vendor, class: PathClass) -> &'static [&'static str] 
     }
 }
 
+/// A workspace glob anchored with `./`, so a bare name (`Makefile`, `*.rs`) is not read with
+/// gitignore any-depth semantics, which would widen an allow.
+fn anchored(p: &Option<Pattern>) -> String {
+    match p {
+        Some(Pattern::PathGlob { glob }) => format!("./{glob}"),
+        _ => "./**".to_owned(),
+    }
+}
+
 fn native(entries: Vec<String>, class: ReceiptClass, note: &str) -> Translation {
     Translation::Native {
         entries,
@@ -45,17 +54,11 @@ pub(super) fn translate(vendor: Vendor, rule: &Rule) -> Translation {
     };
     match (rule.capability, &rule.pattern) {
         (Capability::FsReadWorkspace, p) => {
-            let g = match p {
-                Some(Pattern::PathGlob { glob }) => glob.clone(),
-                _ => "./**".to_owned(),
-            };
+            let g = anchored(p);
             native(vec![format!("Read({g})")], scoped, tool_note)
         }
         (Capability::FsWriteWorkspace, p) => {
-            let g = match p {
-                Some(Pattern::PathGlob { glob }) => glob.clone(),
-                _ => "./**".to_owned(),
-            };
+            let g = anchored(p);
             native(vec![format!("Edit({g})"), format!("Write({g})")], scoped, tool_note)
         }
         (Capability::FsReadExternal, Some(Pattern::AbsPathGlob { glob })) => {
@@ -112,6 +115,10 @@ pub(super) fn translate(vendor: Vendor, rule: &Rule) -> Translation {
                 )
             }
         }
+        (Capability::ShellExec, Some(Pattern::ShellGlob { glob })) if glob.ends_with(":*") => {
+            // The legacy prefix form: the vendor would read it as every command starting there.
+            Translation::Unsupported("a trailing `:*` reads as a legacy prefix and matches more".to_owned())
+        }
         (Capability::ShellExec, Some(Pattern::ShellGlob { glob })) => {
             native(vec![format!("Bash({glob})")], ReceiptClass::Exact, "string glob")
         }
@@ -158,6 +165,29 @@ pub(super) fn compile_rules(
     grok: bool,
 ) -> Result<(), CompileRefusal> {
     let vendor = cx.vendor;
+    if grok {
+        // No ask list: reads are never prompted, and an ask on a write capability cannot be
+        // stated, so no allow that could cover the asked path may stay (Edit and Write rules
+        // of the workspace and of the protected paths overlap).
+        if let Some(r) = cx
+            .rules(Capability::FsReadWorkspace)
+            .iter()
+            .find(|r| r.effect == Effect::Ask)
+        {
+            return Err(CompileRefusal::UnenforceableAsk {
+                vendor,
+                rule: r.describe(),
+                reason: "workspace reads are never prompted, so the ask would run".to_owned(),
+            });
+        }
+        let write_ask = [Capability::FsWriteWorkspace, Capability::FsWriteProtected]
+            .iter()
+            .any(|c| cx.rules(*c).iter().any(|r| r.effect == Effect::Ask));
+        if write_ask {
+            cx.forced_withdraw.insert(Capability::FsWriteWorkspace);
+            cx.forced_withdraw.insert(Capability::FsWriteProtected);
+        }
+    }
     for cap in Capability::ALL {
         if cx.rules(cap).is_empty() {
             continue;
@@ -174,9 +204,13 @@ pub(super) fn compile_rules(
         return Ok(());
     }
     // The protected default: deny every class no rule names.
+    // A class is covered by a rule that is at least as strict as the default, or that the
+    // vendor can honour: an ask that cannot be stated falls back to the default deny.
+    let forced = cx.forced_withdraw.contains(&Capability::FsWriteProtected);
     let covered: Vec<Option<PathClass>> = cx
         .rules(Capability::FsWriteProtected)
         .iter()
+        .filter(|r| !(grok && r.effect == Effect::Ask) && !(forced && r.effect != Effect::Deny))
         .map(|r| match &r.pattern {
             Some(Pattern::PathClass { class }) => Some(*class),
             _ => None,

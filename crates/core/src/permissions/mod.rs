@@ -25,10 +25,10 @@ pub use facts::{
 pub use plan::{
     ChangeClass, ChangeClassEntry, ChangeKey, CompileRefusal, CompiledPlan, ConfigBase,
     ConfigTarget, EvidenceClass, NativeFile, NativeFormat, Origin, ReceiptClass, ReceiptLine,
-    ReceiptSubject, evidence_for,
+    ReceiptSubject, UnenforcedItem, evidence_for,
 };
 pub use policy::{
     Capability, Effect, MAX_ARGV_TOKENS, MAX_PATH_SEGMENTS, MAX_PATTERN_BYTES, MAX_RULES,
-    MAX_TOKEN_BYTES, PathClass, Pattern, PermissionPolicy, PolicyError, Posture, Preset, Rule,
-    SCHEMA_VERSION, SandboxChoice, canonical_default,
+    MAX_SHELL_GLOB_STARS, MAX_TOKEN_BYTES, PathClass, Pattern, PermissionPolicy, PolicyError,
+    Posture, Preset, Rule, SCHEMA_VERSION, SandboxChoice, UnenforcedDefaults, canonical_default,
 };

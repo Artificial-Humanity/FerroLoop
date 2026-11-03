@@ -15,7 +15,7 @@ restricted
 [Exact/Documented] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) ->  | the approval mode and profile decide unmatched requests
 [Exact/Documented] Capability(FsWriteWorkspace) Default: ask fs_write_workspace (canonical default) ->  | the approval mode and profile decide unmatched requests
 [Exact/Documented] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) ->  | the approval mode and profile decide unmatched requests
-[Unsupported/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) ->  | the vendor has no protected-path concept; the deny default is not enforced
+[StricterDowngrade/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) ->  | no protected-path concept: the read-only profile blocks every workspace write (stricter)
 [Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | the approval mode and profile decide unmatched requests
 [StricterDowngrade/Documented] Capability(NetworkWeb) Default: ask network_web (canonical default) -> --sandbox-network restricted | the canonical ask default is carried by the strictest network mode
 [Exact/Documented] Capability(McpToolCall) Default: ask mcp_tool_call (canonical default) ->  | the approval mode and profile decide unmatched requests
@@ -31,3 +31,4 @@ Rules(ShellExec) Respawn
 Rules(NetworkWeb) Respawn
 Rules(McpToolCall) Respawn
 requires_respawn true
+unenforced []

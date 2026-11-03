@@ -4,7 +4,7 @@
 //! never satisfies a narrower policy, and `danger-full-access` is chosen only by
 //! `SandboxChoice::Off`. Shell rules are execpolicy `prefix_rule` entries over argv prefixes.
 
-use super::{Cx, exact_root, literal_prefix, prefixes_overlap, surface_of};
+use super::{Cx, exact_root, literal_prefix, prefixes_overlap, safe_token, surface_of};
 use crate::permissions::facts::{ProvenFact, Surface};
 use crate::permissions::plan::{
     CompileRefusal, ConfigTarget, NativeFile, NativeFormat, Origin, ReceiptClass, ReceiptSubject,
@@ -163,10 +163,16 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
             match cap {
                 Capability::FsReadWorkspace => cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
                     "workspace reads are not gated by the sandbox; the ask default is not enforced"),
+                Capability::FsWriteProtected if mode == Mode::ReadOnly => cx.default_line(cap, surface,
+                    vec!["sandbox_mode=read-only".to_owned()], ReceiptClass::StricterDowngrade,
+                    "no protected-path concept: the read-only sandbox denies every write (stricter)"),
                 Capability::FsWriteProtected => cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
                     "the vendor has no protected-path concept; the deny default is not enforced"),
                 Capability::McpToolCall => cx.default_line(cap, surface, vec![], ReceiptClass::Unsupported,
                     "MCP calls are not gated by compiled rules"),
+                Capability::NetworkWeb if mode == Mode::DangerFullAccess => cx.default_line(cap, surface,
+                    vec![], ReceiptClass::Unsupported,
+                    "sandbox off (danger-full-access) leaves the network open; the default is not enforced"),
                 Capability::NetworkWeb => cx.default_line(cap, surface,
                     vec!["network off".to_owned()], ReceiptClass::StricterDowngrade,
                     "the sandbox network is off (and enabled only by an allow): an ask becomes blocked, escalation prompts"),
@@ -344,25 +350,39 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                         Effect::Ask => "prompt",
                         Effect::Deny => "forbidden",
                     };
+                    // Only plain tokens become pattern elements; a glob is cut at the first
+                    // token that is not plain or holds a wildcard (the cut matches more: stricter).
                     let tokens: Option<(Vec<String>, bool)> = match &r.pattern {
                         Some(Pattern::ArgvPrefix { argv }) => Some((argv.clone(), false)),
                         Some(Pattern::ShellGlob { glob }) if r.effect != Effect::Allow => {
                             let t: Vec<String> = glob
                                 .split(' ')
-                                .take_while(|t| !t.is_empty() && !t.contains('*'))
+                                .take_while(|t| safe_token(t))
                                 .map(str::to_owned)
                                 .collect();
                             if t.is_empty() { None } else { Some((t, true)) }
                         }
                         _ => None,
                     };
+                    let keeps_sandbox = cx.proves(&ProvenFact::ExecpolicyAllowKeepsSandbox);
                     match (r.effect, tokens) {
                         (Effect::Allow, _) if ask_unsupported => cx.withdrawn_allow(r, surface),
-                        (Effect::Allow, Some((t, _))) => {
-                            let l = rule_line(&t, dec);
+                        (Effect::Allow, Some(_)) if mode == Mode::ReadOnly => cx.dropped_allow(
+                            r,
+                            surface,
+                            "under the read-only sandbox a shell allow is never emitted",
+                        ),
+                        (Effect::Allow, Some((t, _))) if keeps_sandbox => {
+                            let l = rule_line(&t, "allow");
                             prefix_lines.push(l.clone());
                             cx.push(sub, Origin::Rule, Some(Effect::Allow), r.describe(), vec![l], ReceiptClass::Exact, surface,
-                                "execpolicy prefix_rule over argv, compared token by token");
+                                "execpolicy prefix_rule over argv, compared token by token; the facts prove an allow keeps the sandbox");
+                        }
+                        (Effect::Allow, Some((t, _))) => {
+                            let l = rule_line(&t, "prompt");
+                            prefix_lines.push(l.clone());
+                            cx.push(sub, Origin::Rule, Some(Effect::Allow), r.describe(), vec![l], ReceiptClass::StricterDowngrade, surface,
+                                "execpolicy allow may bypass the sandbox; unverified, so the command prompts instead");
                         }
                         (Effect::Allow, None) => cx.dropped_allow(r, surface, "a string glob or an all-commands allow has no execpolicy form"),
                         (e, Some((t, truncated))) => {
@@ -370,7 +390,7 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                             prefix_lines.push(l.clone());
                             cx.push(sub, Origin::Rule, Some(e), r.describe(), vec![l],
                                 if truncated { ReceiptClass::StricterDowngrade } else { ReceiptClass::Exact }, surface,
-                                if truncated { "string glob reduced to its leading literal tokens: matches more (stricter)" } else { "execpolicy prefix_rule over argv, compared token by token" });
+                                if truncated { "string glob reduced to its leading plain tokens: matches more (stricter)" } else { "execpolicy prefix_rule over argv, compared token by token" });
                         }
                         (Effect::Deny, None) => return Err(cx.refuse_deny(r, "execpolicy has no form for a command that is a pure glob or for all commands")),
                         (Effect::Ask, None) => {

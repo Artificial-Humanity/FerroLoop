@@ -97,6 +97,12 @@ pub enum ProvenFact {
     HotEdit(ChangeField),
     /// Conformance tests have run this surface.
     RuntimeProven(Surface),
+    /// Codex: an execpolicy `allow` rule keeps the command inside the sandbox (it does not
+    /// bypass it). Without this, an allow is compiled as `prompt`.
+    ExecpolicyAllowKeepsSandbox,
+    /// Muse: the verified profiles confine access to the workspace, so a deny or ask on an
+    /// external path is enforced by the selected profile.
+    ProfileConfinesExternal,
 }
 
 /// The most authority a Muse permission profile grants. Asserted by the caller.
@@ -144,6 +150,7 @@ pub(crate) const MAX_EXACT_COMMAND_BYTES: usize = 512;
 fn id_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
+        && !s.starts_with('-')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }

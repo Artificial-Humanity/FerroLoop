@@ -1,0 +1,45 @@
+== launch_args ==
+--permission-mode
+default
+--deny
+Edit(.git/**)
+--deny
+Edit(.grok/**)
+--deny
+Edit(.grok/config.toml)
+--deny
+Edit(.mcp.json)
+--deny
+Write(.git/**)
+--deny
+Write(.grok/**)
+--deny
+Write(.grok/config.toml)
+--deny
+Write(.mcp.json)
+== receipts ==
+[Exact/Documented] Posture Axis: posture Ask -> --permission-mode ; default | launch flag; the TUI can switch mode inside the Claude-shaped set
+[Exact/Documented] Sandbox Axis: sandbox vendor-default ->  | no profile named in the facts; the vendor default stands
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:settings (canonical default) -> Edit(.grok/config.toml) ; Write(.grok/config.toml) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:git (canonical default) -> Edit(.git/**) ; Write(.git/**) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:tool-config (canonical default) -> Edit(.grok/**) ; Write(.grok/**) ; Edit(.mcp.json) ; Write(.mcp.json) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[Exact/Documented] Capability(FsReadWorkspace) Default: ask fs_read_workspace (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(FsWriteWorkspace) Default: ask fs_write_workspace (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(NetworkWeb) Default: ask network_web (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(McpToolCall) Default: ask mcp_tool_call (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+== change classes ==
+Posture Respawn
+Sandbox Respawn
+Rules(FsReadWorkspace) Respawn
+Rules(FsReadExternal) Respawn
+Rules(FsWriteWorkspace) Respawn
+Rules(FsWriteExternal) Respawn
+Rules(FsWriteProtected) Respawn
+Rules(ShellExec) Respawn
+Rules(NetworkWeb) Respawn
+Rules(McpToolCall) Respawn
+requires_respawn true
+unenforced []

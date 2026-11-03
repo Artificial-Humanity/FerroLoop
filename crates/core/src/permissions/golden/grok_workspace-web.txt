@@ -52,3 +52,4 @@ Rules(ShellExec) Respawn
 Rules(NetworkWeb) Respawn
 Rules(McpToolCall) Respawn
 requires_respawn true
+unenforced []

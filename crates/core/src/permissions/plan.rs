@@ -38,6 +38,14 @@ impl ConfigTarget {
     }
 }
 
+/// A capability the vendor cannot enforce that the plan was emitted without (an acknowledged
+/// unenforced default or deny). Whoever applies the plan must surface it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UnenforcedItem {
+    pub capability: Capability,
+    pub vendor: Vendor,
+}
+
 /// A native file's syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,7 +167,11 @@ pub struct CompiledPlan {
     pub env: Vec<(String, String)>,
     pub receipts: Vec<ReceiptLine>,
     pub change_classes: Vec<ChangeClassEntry>,
+    /// True when a field this plan actually sets has the `respawn` class.
     pub requires_respawn: bool,
+    /// Denies (defaults or requested) the vendor cannot enforce, present only under
+    /// `unenforced_defaults: acknowledge`.
+    pub unenforced: Vec<UnenforcedItem>,
 }
 
 /// Why a policy was not compiled. A refusal is the fail-closed answer: nothing is emitted.
@@ -200,6 +212,14 @@ pub enum CompileRefusal {
         vendor: Vendor,
         rule: String,
         class: ReceiptClass,
+    },
+    #[error(
+        "{vendor:?} cannot enforce `{request}` ({capability:?}) and the policy does not acknowledge unenforced defaults"
+    )]
+    UnenforcedRequest {
+        vendor: Vendor,
+        capability: Capability,
+        request: String,
     },
     #[error("internal safety audit failed: {0}")]
     InternalInvariant(String),

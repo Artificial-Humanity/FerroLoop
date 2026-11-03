@@ -16,6 +16,8 @@ pub const MAX_PATTERN_BYTES: usize = 512;
 pub const MAX_ARGV_TOKENS: usize = 32;
 /// Longest argv token, in bytes.
 pub const MAX_TOKEN_BYTES: usize = 256;
+/// Most `*` in one shell glob.
+pub const MAX_SHELL_GLOB_STARS: usize = 8;
 /// Most path segments in a glob.
 pub const MAX_PATH_SEGMENTS: usize = 64;
 
@@ -249,6 +251,21 @@ impl Rule {
     }
 }
 
+/// What a compile does with a canonical default or a requested deny the vendor cannot enforce.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnenforcedDefaults {
+    /// Refuse the plan, naming the capability and vendor.
+    #[default]
+    Refuse,
+    /// Emit the plan with its `unsupported` receipt and list the capability in
+    /// `CompiledPlan::unenforced`. Whoever applies the plan must surface that list; the Owner's
+    /// explicit acknowledgement is collected outside the compiler.
+    Acknowledge,
+}
+
 /// The canonical policy of one agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -260,6 +277,10 @@ pub struct PermissionPolicy {
     /// boundary (or the facts prove coverage), not by a tool-scoped rule.
     #[serde(default)]
     pub require_fs_enforcement: bool,
+    /// Defaults to `refuse`: a canonical default deny the vendor cannot enforce is not
+    /// silently left open.
+    #[serde(default)]
+    pub unenforced_defaults: UnenforcedDefaults,
     #[serde(default)]
     pub rules: Vec<Rule>,
 }
@@ -321,8 +342,11 @@ fn validate_segments(glob: &str, absolute: bool) -> Result<(), String> {
     if glob.trim() != glob {
         return Err("glob has leading or trailing whitespace".into());
     }
-    if glob.chars().any(|c| matches!(c, '[' | ']' | '{' | '}')) {
-        return Err("`[`, `]`, `{` and `}` are ambiguous across vendors".into());
+    if glob
+        .chars()
+        .any(|c| matches!(c, '[' | ']' | '{' | '}' | '(' | ')'))
+    {
+        return Err("`[ ] { } ( )` are ambiguous across vendors".into());
     }
     if glob.starts_with('!') || glob.starts_with('#') {
         return Err("a leading `!` or `#` is ambiguous across vendors".into());
@@ -463,6 +487,14 @@ fn canonical(
             if glob.contains("**") {
                 return Err(bad("`**` is ambiguous in a shell glob".into()));
             }
+            if glob.ends_with(":*") {
+                return Err(bad("a trailing `:*` is the legacy prefix form in Claude and matches more than the glob".into()));
+            }
+            if glob.matches('*').count() > MAX_SHELL_GLOB_STARS {
+                return Err(bad(format!(
+                    "more than {MAX_SHELL_GLOB_STARS} `*` in a shell glob"
+                )));
+            }
             Ok(if glob == "*" { None } else { Some(p.clone()) })
         }
         (Capability::NetworkWeb, Pattern::Domain { domain }) => {
@@ -503,6 +535,7 @@ impl PermissionPolicy {
             posture,
             sandbox,
             require_fs_enforcement: false,
+            unenforced_defaults: UnenforcedDefaults::Refuse,
             rules: Vec::new(),
         }
     }
@@ -606,6 +639,7 @@ impl PermissionPolicy {
             posture: self.posture,
             sandbox: self.sandbox,
             require_fs_enforcement: self.require_fs_enforcement,
+            unenforced_defaults: self.unenforced_defaults,
             rules,
         })
     }

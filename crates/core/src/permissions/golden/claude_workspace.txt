@@ -50,3 +50,4 @@ Rules(ShellExec) PendingNextStart
 Rules(NetworkWeb) PendingNextStart
 Rules(McpToolCall) PendingNextStart
 requires_respawn true
+unenforced []

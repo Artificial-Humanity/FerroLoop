@@ -22,10 +22,13 @@ mod muse;
 use super::facts::{ChangeField, ProvenFact, Surface, Vendor, VendorFacts};
 use super::plan::{
     ChangeClass, ChangeClassEntry, ChangeKey, CompileRefusal, CompiledPlan, EvidenceClass,
-    NativeFile, Origin, ReceiptClass, ReceiptLine, ReceiptSubject, evidence_for,
+    NativeFile, Origin, ReceiptClass, ReceiptLine, ReceiptSubject, UnenforcedItem, evidence_for,
 };
+use std::collections::BTreeSet;
+
 use super::policy::{
-    Capability, Effect, PermissionPolicy, Posture, Rule, SandboxChoice, canonical_default,
+    Capability, Effect, PermissionPolicy, Posture, Rule, SandboxChoice, UnenforcedDefaults,
+    canonical_default,
 };
 
 /// Compiles `policy` for `vendor`. Pure and deterministic: the same inputs give the same
@@ -50,6 +53,7 @@ pub fn compile(
         args: Vec::new(),
         files: Vec::new(),
         receipts: Vec::new(),
+        forced_withdraw: BTreeSet::new(),
     };
     match vendor {
         Vendor::Claude => claude::compile(&mut cx)?,
@@ -69,6 +73,8 @@ pub(crate) struct Cx<'a> {
     pub args: Vec<String>,
     pub files: Vec<NativeFile>,
     pub receipts: Vec<ReceiptLine>,
+    /// Capabilities whose allows are withdrawn because an ask elsewhere could not be stated.
+    pub forced_withdraw: BTreeSet<Capability>,
 }
 
 /// Native entries by effect.
@@ -146,7 +152,16 @@ impl Cx<'_> {
         surface: Surface,
         note: impl Into<String>,
     ) {
-        let evidence = self.ev(surface);
+        // A line the vendor cannot carry is never `RuntimeProven`, whatever the facts say.
+        let evidence = if class == ReceiptClass::Unsupported {
+            evidence_for(
+                self.vendor,
+                surface,
+                &VendorFacts::new(self.facts.transport),
+            )
+        } else {
+            self.ev(surface)
+        };
         self.receipts.push(ReceiptLine {
             subject,
             origin,
@@ -218,7 +233,7 @@ impl Cx<'_> {
             Vec::new(),
             ReceiptClass::StricterDowngrade,
             surface,
-            "withdrawn: an ask of this capability has no native form, and an allow would outrank it",
+            "withdrawn: an ask that covers this capability has no native form, and an allow would outrank it",
         );
     }
 
@@ -230,7 +245,7 @@ impl Cx<'_> {
         out: &mut Entries,
         translate: &dyn Fn(&Rule) -> Translation,
     ) -> Result<(), CompileRefusal> {
-        let mut ask_unsupported = false;
+        let mut ask_unsupported = self.forced_withdraw.contains(&cap);
         for rule in self.rules(cap) {
             let tr = translate(&rule);
             match (rule.effect, tr) {
@@ -307,10 +322,44 @@ impl Cx<'_> {
                 }
             }
         }
+        // A deny (a canonical default or a request) the vendor cannot enforce is refused unless
+        // the policy acknowledges it, in which case it is listed on the plan.
+        let mut unenforced: Vec<UnenforcedItem> = Vec::new();
+        for l in &self.receipts {
+            let ReceiptSubject::Capability(c) = l.subject else {
+                continue;
+            };
+            if l.effect == Some(Effect::Deny) && l.class == ReceiptClass::Unsupported {
+                if self.policy.unenforced_defaults == UnenforcedDefaults::Refuse {
+                    return Err(CompileRefusal::UnenforcedRequest {
+                        vendor: self.vendor,
+                        capability: c,
+                        request: l.requested.clone(),
+                    });
+                }
+                unenforced.push(UnenforcedItem {
+                    capability: c,
+                    vendor: self.vendor,
+                });
+            }
+        }
+        unenforced.sort();
+        unenforced.dedup();
         let change_classes = self.change_classes();
-        let requires_respawn = change_classes
-            .iter()
-            .any(|c| c.class == ChangeClass::Respawn);
+        // Respawn matters only for a field this plan actually sets.
+        let carried = |s: ReceiptSubject| {
+            self.receipts
+                .iter()
+                .any(|l| l.subject == s && !l.native.is_empty())
+        };
+        let requires_respawn = change_classes.iter().any(|c| {
+            c.class == ChangeClass::Respawn
+                && carried(match &c.field {
+                    ChangeField::Posture => ReceiptSubject::Posture,
+                    ChangeField::Sandbox => ReceiptSubject::Sandbox,
+                    ChangeField::Rules(cap) => ReceiptSubject::Capability(*cap),
+                })
+        });
         let plan = CompiledPlan {
             vendor: self.vendor,
             key: ChangeKey {
@@ -324,6 +373,7 @@ impl Cx<'_> {
             receipts: std::mem::take(&mut self.receipts),
             change_classes,
             requires_respawn,
+            unenforced,
         };
         audit(&plan, self.policy)?;
         Ok(plan)

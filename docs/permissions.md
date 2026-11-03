@@ -18,6 +18,7 @@ never runs or probes a vendor. The same arguments give the same bytes.
   "posture": "ask",
   "sandbox": "vendor-default",
   "require_fs_enforcement": false,
+  "unenforced_defaults": "refuse",
   "rules": [
     {"capability": "fs_read_workspace", "effect": "allow"},
     {"capability": "shell_exec", "effect": "deny",
@@ -36,6 +37,17 @@ Three separate axes:
 | `sandbox` | `off`, `vendor-default` | The OS sandbox under the rules. |
 | `rules` | up to 256 | Per-capability `allow`, `deny` or `ask`. |
 
+Two switches on the policy:
+
+* `require_fs_enforcement` (default `false`): see the fail-closed rules.
+* `unenforced_defaults` (`refuse`, the default, or `acknowledge`): what a compile does when a
+  canonical default deny, or a requested deny, has no native enforcement on the vendor. `refuse`
+  returns `UnenforcedRequest` naming the capability and vendor. `acknowledge` emits the plan with
+  its `unsupported` receipt line and lists the capability in `plan.unenforced`. The compiler
+  never decides to acknowledge: the Hub's spin-up UI must collect the Owner's explicit
+  acknowledgement before it sets `acknowledge`, and must show `plan.unenforced` wherever it shows
+  the plan.
+
 `bypass` is the only posture that produces a bypass flag (`--yolo`, `--disable-approval`,
 `--dangerously-skip-permissions`, `bypassPermissions`, approval `never`); `sandbox: off` is the
 only source of a sandbox-off flag (`--disable-sandbox`, `danger-full-access`). Rules never
@@ -48,11 +60,11 @@ capabilities, every path outside the workspace; for `network_web`, every domain)
 
 | Capability | Pattern `kind` | Grammar |
 |---|---|---|
-| `fs_read_workspace`, `fs_write_workspace` | `path_glob` | Relative to the workspace. No `..`, `.`, empty segment, trailing `/`, leading `/` or `~`, backslash, `[ ] { }`, leading `!` or `#`, partial `**`. |
+| `fs_read_workspace`, `fs_write_workspace` | `path_glob` | Relative to the workspace. No `..`, `.`, empty segment, trailing `/`, leading `/` or `~`, backslash, `[ ] { } ( )`, leading `!` or `#`, partial `**`. |
 | `fs_read_external`, `fs_write_external` | `abs_path_glob` | Absolute. The same rules. |
 | `fs_write_protected` | `path_class` | `settings`, `git` or `tool-config`. |
 | `shell_exec` | `argv_prefix` | 1 to 32 tokens compared exactly; the command name does not start with `-`. |
-| `shell_exec` | `shell_glob` | A string glob; `*` is the only wildcard; no `\ ( ) ? [ ] { }` or `**`. |
+| `shell_exec` | `shell_glob` | A string glob; `*` is the only wildcard (at most 8); no `\ ( ) ? [ ] { }` or `**`; it does not end in `:*`, which Claude reads as the legacy prefix form. |
 | `network_web` | `domain` | A lowercase ASCII host, or `*.host`. `*` means every domain. |
 | `mcp_tool_call` | `mcp` | `server`, or `server` and `tool`. A server name has no `__`. |
 
@@ -76,9 +88,15 @@ A capability no rule mentions takes the canonical default, never an unknown vend
 `deny` for `fs_write_protected`, `ask` for the other seven. `ask` means "defer to the posture's
 approval path". Defaults are not applied under `bypass`. A default is compiled where the vendor
 can state it (the protected-path denies on Claude and Grok) and is otherwise reported in a
-receipt line (`origin: default`) that says whether the vendor enforces it.
+receipt line (`origin: default`) that says whether the vendor enforces it. A default *deny* that
+a vendor cannot enforce follows `unenforced_defaults`. Codex's read-only sandbox and Muse's
+read-only profile block every write, so they count as enforcing the protected-path default.
 
 ### Presets
+
+Every preset ships with `unenforced_defaults: refuse`. With the default Antigravity facts, the
+writable presets are refused there (the protected-path default has no native form), as are Codex
+and Muse when the plan needs a writable sandbox or profile, until the policy acknowledges it.
 
 | Preset | Posture | Rules |
 |---|---|---|
@@ -100,18 +118,21 @@ compile(vendor: Vendor, facts: &VendorFacts, policy: &PermissionPolicy)
 `msp`), the `installed_version`, a set of `capabilities_proven`, and three vendor-specific
 lists (`exact_commands` for Antigravity, `muse_profiles` for Muse, `sandbox_profile` for Grok).
 A proven fact is one of: `interactive_ask`, `fs_enforcement_coverage`, `hard_deny(capability)`,
-`hot_edit(field)`, `runtime_proven(surface)`. Nothing is assumed.
+`hot_edit(field)`, `runtime_proven(surface)`, `execpolicy_allow_keeps_sandbox` (Codex) and
+`profile_confines_external` (Muse). Nothing is assumed. Profile and sandbox ids may not start
+with `-`.
 
 A `CompiledPlan` holds `launch_args`, `config_files` (each a symbolic `ConfigTarget`, a format
 and content; no `~` is resolved), `env` (always empty today; never a secret), `receipts`,
-`change_classes`, `requires_respawn`, and the `key` (vendor, transport, version) it was
-compiled for.
+`change_classes`, `requires_respawn` (true when a field this plan actually sets has the
+`respawn` class), `unenforced` (the acknowledged unenforceable denies) and the `key` (vendor,
+transport, version) it was compiled for.
 
 ### Native forms
 
 | Vendor | Posture and sandbox | Rules |
 |---|---|---|
-| Claude Code | `--permission-mode manual\|acceptEdits\|auto\|plan\|bypassPermissions`; bypass adds `--allow-dangerously-skip-permissions`; the skip flag is never emitted | `.claude/settings.local.json` `permissions.{allow,ask,deny}`: `Read(glob)`, `Edit(glob)` and `Write(glob)`, `Bash(prefix)` with `Bash(prefix *)`, `WebFetch(domain:d)`, `WebSearch`, `mcp__server[__tool]`; absolute globs as `//path`; protected paths as `Edit`/`Write` denies |
+| Claude Code | `--permission-mode manual\|acceptEdits\|auto\|plan\|bypassPermissions`; bypass adds `--allow-dangerously-skip-permissions`; the skip flag is never emitted | `.claude/settings.local.json` `permissions.{allow,ask,deny}`: `Read(./glob)`, `Edit(./glob)` and `Write(./glob)` (workspace globs are `./`-anchored), `Bash(prefix)` with `Bash(prefix *)`, `WebFetch(domain:d)`, `WebSearch`, `mcp__server[__tool]`; absolute globs as `//path`; protected paths as `Edit`/`Write` denies |
 | Codex | `-a` approval policy and `-s` sandbox mode, kept split; `danger-full-access` only for `sandbox: off` | execpolicy `prefix_rule(pattern=[...], decision=allow\|prompt\|forbidden)`; `config.toml` for `writable_roots`, `network_access`, `web_search`; `-c sandbox_permissions=["disk-full-read-access"]` and `--search` |
 | Muse | `--approval-mode`, `--approval-judge off`; bypass is `--disable-approval`, or `--yolo` when the sandbox is also off; `--disable-sandbox` for `sandbox: off` | `--permission-profile` (a caller-verified profile) and `--sandbox-network restricted\|proxy-only\|enabled` |
 | Grok | `--permission-mode default\|acceptEdits\|auto\|plan\|bypassPermissions`; `--sandbox <profile>` from the facts | the Claude rule strings as `--allow` and `--deny`; `--disable-web-search`; `--add-dir` |
@@ -124,17 +145,26 @@ Notes on what degrades:
   no tool-rule form, so a deny of it is refused. An argv token that needs quoting or holds a
   wildcard cannot be stated exactly: an allow with one is not granted; a deny or ask is cut at
   the first such token (matches more, so stricter), and refused if the command name itself is
-  affected. A wildcard-domain deny widens to every `WebFetch`. Grok has no ask list.
+  affected. A wildcard-domain deny widens to every `WebFetch`. Grok has no ask list: an ask on a
+  write capability withdraws every allow of both write capabilities (workspace and protected
+  paths overlap) and falls back to the default protected-path deny, and an ask on workspace
+  reads is refused.
 * **Codex.** Extra writable directories are explicit `writable_roots`, and only for a pattern
   that is exactly a directory subtree under the workspace-write sandbox. A narrower workspace
   write rule never widens the sandbox: a scoped write deny selects `read-only`. A coarse grant
   never satisfies a narrower policy. Shell rules are argv prefixes only; a string glob loses its
-  wildcard part (stricter) or is not granted. `network_web` has three receipt lines (sandbox
+  wildcard part (stricter) or is not granted; only plain tokens become pattern elements, and a
+  glob is cut at the first token that is not plain (refused if the command name is not plain).
+  An execpolicy `allow` may run the command outside the sandbox (unverified), so an allow of a
+  shell rule compiles to `prompt` unless the facts prove `execpolicy_allow_keeps_sandbox`, and is
+  never emitted under the read-only sandbox. `network_web` has three receipt lines (sandbox
   transport, host approvals, WebSearch tool). Arbitrary MCP servers have no proven per-tool
   control, so an MCP deny is refused unless the facts prove `hard_deny(mcp_tool_call)`.
 * **Muse.** A profile carries no glob grammar. The compiler picks the strongest verified profile
-  that does not exceed the policy and reports the rest as a downgrade. A domain allow degrades to
-  `proxy-only`. `--yolo` and `--disable-approval` come only from `bypass`.
+  that does not exceed the policy and reports the rest as a downgrade. A deny or ask on an
+  external path needs a selected verified profile plus `profile_confines_external`, or a proven
+  `hard_deny`, and is refused otherwise or under sandbox off. A domain allow degrades to
+  `proxy-only`; the proxy's own allowlist governs and may be broader than the domains. `--yolo` and `--disable-approval` come only from `bypass`.
 * **Antigravity.** A shell prefix or glob compiles by enumeration: only exact commands the caller
   lists in `exact_commands` and that no deny or ask rule matches become `command(...)` entries;
   everything else stays ask. One boolean stands for both external read and external write; it
@@ -185,8 +215,9 @@ sandbox change, is `respawn`. `requires_respawn` is true when any class is `resp
 ## Refusals
 
 `CompileRefusal` is one of: `InvalidPolicy`, `InvalidFacts`, `UnsupportedTransport`,
-`UnenforceableDeny`, `UnenforceableAsk`, `PostureNotEnforceable`, `SandboxConflict`,
-`FsEnforcementRequired`, `InternalInvariant`. A refusal emits nothing.
+`UnenforceableDeny`, `UnenforceableAsk`, `PostureNotEnforceable`, `SandboxConflict` (plan with
+sandbox off on Codex and Muse), `FsEnforcementRequired`, `UnenforcedRequest`,
+`InternalInvariant`. A refusal emits nothing.
 
 ## What this does not do
 

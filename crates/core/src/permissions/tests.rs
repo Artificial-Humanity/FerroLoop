@@ -29,10 +29,19 @@ fn facts(v: Vendor) -> VendorFacts {
     f
 }
 
+/// A policy that acknowledges unenforced defaults, so a fixture about something else compiles
+/// on every vendor. The refusal path has its own tests.
 fn pol(posture: Posture, rules: &[Rule]) -> PermissionPolicy {
     let mut p = PermissionPolicy::new(posture, SandboxChoice::VendorDefault);
+    p.unenforced_defaults = UnenforcedDefaults::Acknowledge;
     p.rules = rules.to_vec();
     p
+}
+
+fn ack(p: Preset) -> PermissionPolicy {
+    let mut q = p.policy();
+    q.unenforced_defaults = UnenforcedDefaults::Acknowledge;
+    q
 }
 
 fn r(cap: Capability, eff: Effect, pat: Option<Pattern>) -> Rule {
@@ -222,7 +231,7 @@ fn policy_wire_form_is_stable() {
     let json = serde_json::to_string(&Preset::Workspace.policy()).unwrap();
     assert_eq!(
         json,
-        r#"{"schema_version":1,"posture":"ask","sandbox":"vendor-default","require_fs_enforcement":false,"rules":[{"capability":"fs_read_workspace","effect":"allow"},{"capability":"fs_write_workspace","effect":"allow"},{"capability":"network_web","effect":"deny"}]}"#
+        r#"{"schema_version":1,"posture":"ask","sandbox":"vendor-default","require_fs_enforcement":false,"unenforced_defaults":"refuse","rules":[{"capability":"fs_read_workspace","effect":"allow"},{"capability":"fs_write_workspace","effect":"allow"},{"capability":"network_web","effect":"deny"}]}"#
     );
     let back: PermissionPolicy = serde_json::from_str(&json).unwrap();
     assert_eq!(back, Preset::Workspace.policy());
@@ -556,8 +565,8 @@ fn presets_are_valid_and_documented() {
             "{p:?} is already canonical"
         );
     }
-    assert_eq!(Preset::ReadOnly.policy().posture, Posture::Plan);
-    assert!(Preset::Custom.policy().rules.is_empty());
+    assert_eq!(ack(Preset::ReadOnly).posture, Posture::Plan);
+    assert!(ack(Preset::Custom).rules.is_empty());
     assert_eq!(
         canonical_default(Capability::FsWriteProtected),
         Effect::Deny
@@ -575,7 +584,7 @@ fn presets_are_valid_and_documented() {
 
 #[test]
 fn transport_facts_and_policy_are_checked_first() {
-    let p = Preset::Custom.policy();
+    let p = ack(Preset::Custom);
     let f = VendorFacts::new(Transport::Msp);
     assert!(matches!(
         compile(Vendor::Claude, &f, &p),
@@ -638,18 +647,29 @@ fn render(res: &Result<CompiledPlan, CompileRefusal>) -> String {
                 s.push_str(&format!("{:?} {:?}\n", c.field, c.class));
             }
             s.push_str(&format!("requires_respawn {}\n", p.requires_respawn));
+            let u: Vec<String> = p
+                .unenforced
+                .iter()
+                .map(|u| format!("{:?}/{:?}", u.vendor, u.capability))
+                .collect();
+            s.push_str(&format!("unenforced [{}]\n", u.join(", ")));
         }
     }
     s
 }
 
-fn golden_path(v: Vendor, p: Preset) -> String {
+fn golden_path(v: Vendor, p: Preset, acknowledged: bool) -> String {
     format!(
-        "{}/src/permissions/golden/{}_{}.txt",
+        "{}/src/permissions/golden/{}_{}{}.txt",
         env!("CARGO_MANIFEST_DIR"),
         v.as_str(),
-        p.as_str()
+        p.as_str(),
+        if acknowledged { ".ack" } else { "" }
     )
+}
+
+fn golden_policy(p: Preset, acknowledged: bool) -> PermissionPolicy {
+    if acknowledged { ack(p) } else { p.policy() }
 }
 
 #[test]
@@ -668,119 +688,52 @@ fn compile_is_deterministic() {
     }
 }
 
+macro_rules! golden {
+    ($v:literal, $p:literal) => {
+        (
+            include_str!(concat!("golden/", $v, "_", $p, ".txt")),
+            include_str!(concat!("golden/", $v, "_", $p, ".ack.txt")),
+        )
+    };
+}
+
+/// Each preset as shipped (`unenforced_defaults: refuse`) and acknowledged.
 #[test]
 fn presets_match_their_goldens() {
-    let goldens: [(Vendor, Preset, &str); 20] = [
-        (
-            Vendor::Claude,
-            Preset::ReadOnly,
-            include_str!("golden/claude_read-only.txt"),
-        ),
-        (
-            Vendor::Claude,
-            Preset::Workspace,
-            include_str!("golden/claude_workspace.txt"),
-        ),
-        (
-            Vendor::Claude,
-            Preset::WorkspaceWeb,
-            include_str!("golden/claude_workspace-web.txt"),
-        ),
-        (
-            Vendor::Claude,
-            Preset::Custom,
-            include_str!("golden/claude_custom.txt"),
-        ),
-        (
-            Vendor::Codex,
-            Preset::ReadOnly,
-            include_str!("golden/codex_read-only.txt"),
-        ),
-        (
-            Vendor::Codex,
-            Preset::Workspace,
-            include_str!("golden/codex_workspace.txt"),
-        ),
-        (
-            Vendor::Codex,
-            Preset::WorkspaceWeb,
-            include_str!("golden/codex_workspace-web.txt"),
-        ),
-        (
-            Vendor::Codex,
-            Preset::Custom,
-            include_str!("golden/codex_custom.txt"),
-        ),
-        (
-            Vendor::Muse,
-            Preset::ReadOnly,
-            include_str!("golden/muse_read-only.txt"),
-        ),
-        (
-            Vendor::Muse,
-            Preset::Workspace,
-            include_str!("golden/muse_workspace.txt"),
-        ),
-        (
-            Vendor::Muse,
-            Preset::WorkspaceWeb,
-            include_str!("golden/muse_workspace-web.txt"),
-        ),
-        (
-            Vendor::Muse,
-            Preset::Custom,
-            include_str!("golden/muse_custom.txt"),
-        ),
-        (
-            Vendor::Grok,
-            Preset::ReadOnly,
-            include_str!("golden/grok_read-only.txt"),
-        ),
-        (
-            Vendor::Grok,
-            Preset::Workspace,
-            include_str!("golden/grok_workspace.txt"),
-        ),
-        (
-            Vendor::Grok,
-            Preset::WorkspaceWeb,
-            include_str!("golden/grok_workspace-web.txt"),
-        ),
-        (
-            Vendor::Grok,
-            Preset::Custom,
-            include_str!("golden/grok_custom.txt"),
-        ),
-        (
-            Vendor::Antigravity,
-            Preset::ReadOnly,
-            include_str!("golden/antigravity_read-only.txt"),
-        ),
-        (
-            Vendor::Antigravity,
-            Preset::Workspace,
-            include_str!("golden/antigravity_workspace.txt"),
-        ),
-        (
-            Vendor::Antigravity,
-            Preset::WorkspaceWeb,
-            include_str!("golden/antigravity_workspace-web.txt"),
-        ),
-        (
-            Vendor::Antigravity,
-            Preset::Custom,
-            include_str!("golden/antigravity_custom.txt"),
-        ),
+    #[rustfmt::skip]
+    let goldens: [(Vendor, Preset, (&str, &str)); 20] = [
+        (Vendor::Claude, Preset::ReadOnly, golden!("claude", "read-only")),
+        (Vendor::Claude, Preset::Workspace, golden!("claude", "workspace")),
+        (Vendor::Claude, Preset::WorkspaceWeb, golden!("claude", "workspace-web")),
+        (Vendor::Claude, Preset::Custom, golden!("claude", "custom")),
+        (Vendor::Codex, Preset::ReadOnly, golden!("codex", "read-only")),
+        (Vendor::Codex, Preset::Workspace, golden!("codex", "workspace")),
+        (Vendor::Codex, Preset::WorkspaceWeb, golden!("codex", "workspace-web")),
+        (Vendor::Codex, Preset::Custom, golden!("codex", "custom")),
+        (Vendor::Muse, Preset::ReadOnly, golden!("muse", "read-only")),
+        (Vendor::Muse, Preset::Workspace, golden!("muse", "workspace")),
+        (Vendor::Muse, Preset::WorkspaceWeb, golden!("muse", "workspace-web")),
+        (Vendor::Muse, Preset::Custom, golden!("muse", "custom")),
+        (Vendor::Grok, Preset::ReadOnly, golden!("grok", "read-only")),
+        (Vendor::Grok, Preset::Workspace, golden!("grok", "workspace")),
+        (Vendor::Grok, Preset::WorkspaceWeb, golden!("grok", "workspace-web")),
+        (Vendor::Grok, Preset::Custom, golden!("grok", "custom")),
+        (Vendor::Antigravity, Preset::ReadOnly, golden!("antigravity", "read-only")),
+        (Vendor::Antigravity, Preset::Workspace, golden!("antigravity", "workspace")),
+        (Vendor::Antigravity, Preset::WorkspaceWeb, golden!("antigravity", "workspace-web")),
+        (Vendor::Antigravity, Preset::Custom, golden!("antigravity", "custom")),
     ];
-    for (v, p, want) in goldens {
-        let got = render(&compile(v, &facts(v), &p.policy()));
-        assert_eq!(
-            got,
-            want,
-            "golden {} {} differs; run the ignored `bless_goldens` test to review",
-            v.as_str(),
-            p.as_str()
-        );
+    for (v, p, (refuse, acknowledged)) in goldens {
+        for (ackd, want) in [(false, refuse), (true, acknowledged)] {
+            let got = render(&compile(v, &facts(v), &golden_policy(p, ackd)));
+            assert_eq!(
+                got,
+                want,
+                "golden {} {} (ack {ackd}) differs; run the ignored `bless_goldens` test to review",
+                v.as_str(),
+                p.as_str()
+            );
+        }
     }
 }
 
@@ -790,11 +743,13 @@ fn presets_match_their_goldens() {
 fn bless_goldens() {
     for v in Vendor::ALL {
         for p in Preset::ALL {
-            let got = render(&compile(v, &facts(v), &p.policy()));
-            std::fs::write(golden_path(v, p), got).unwrap();
+            for ackd in [false, true] {
+                let got = render(&compile(v, &facts(v), &golden_policy(p, ackd)));
+                std::fs::write(golden_path(v, p, ackd), got).unwrap();
+            }
         }
     }
-    let plan = ok(Vendor::Claude, &Preset::Workspace.policy());
+    let plan = ok(Vendor::Claude, &ack(Preset::Workspace));
     std::fs::write(
         format!(
             "{}/src/permissions/golden/claude_workspace.plan.json",
@@ -807,7 +762,7 @@ fn bless_goldens() {
 
 #[test]
 fn compiled_plan_wire_shape_matches_its_golden() {
-    let plan = ok(Vendor::Claude, &Preset::Workspace.policy());
+    let plan = ok(Vendor::Claude, &ack(Preset::Workspace));
     let want = include_str!("golden/claude_workspace.plan.json");
     assert_eq!(serde_json::to_string_pretty(&plan).unwrap() + "\n", want);
     let back: CompiledPlan = serde_json::from_str(want).unwrap();
@@ -826,7 +781,7 @@ fn symbolic_targets_never_hold_a_tilde() {
     }
     for v in Vendor::ALL {
         for p in Preset::ALL {
-            if let Ok(plan) = compile(v, &facts(v), &p.policy()) {
+            if let Ok(plan) = compile(v, &facts(v), &ack(p)) {
                 assert!(plan.env.is_empty(), "no env, so no secret can be there");
                 for a in &plan.launch_args {
                     assert!(!a.starts_with('~'));
@@ -935,7 +890,8 @@ fn allow_supported(v: Vendor, posture: Posture, cap: Capability, pat: &Option<Pa
                 matches!(pat, Some(Pattern::AbsPathGlob { glob }) if glob == "/opt/data/**")
                     && posture != Posture::Ask
             }
-            ShellExec => matches!(pat, Some(Pattern::ArgvPrefix { .. })),
+            // An execpolicy allow may bypass the sandbox: it compiles to `prompt` without proof.
+            ShellExec => false,
             NetworkWeb => pat.is_none() && posture != Posture::Ask,
             _ => false,
         },
@@ -1398,13 +1354,19 @@ fn an_ask_that_cannot_be_stated_withdraws_the_allows_it_would_lose_to() {
         ["Bash(git push *)", "Bash(git push)"]
     );
     assert_eq!(claude_list(&c, "allow"), ["Bash(git *)", "Bash(git)"]);
-    // Codex: `prompt` beats `allow` in execpolicy; both are kept.
-    let x = ok(Vendor::Codex, &p);
+    // Codex: without proof an allow prompts as well, so no `allow` line exists to outrank.
+    let pe = pol(Posture::AcceptEdits, &p.rules);
+    let x = ok(Vendor::Codex, &pe);
     let rules = file(&x, ConfigTarget::CodexRules).unwrap();
     assert!(
-        rules.contains("pattern=[\"git\"], decision=\"allow\"")
-            && rules.contains("decision=\"prompt\"")
+        rules.contains("pattern=[\"git\"], decision=\"prompt\""),
+        "{rules}"
     );
+    assert!(
+        rules.contains("pattern=[\"git\", \"push\"], decision=\"prompt\""),
+        "{rules}"
+    );
+    assert!(!rules.contains("decision=\"allow\""), "{rules}");
     // Antigravity: matching commands leave the enumeration.
     let mut f = facts(Vendor::Antigravity);
     f.exact_commands = vec!["git status".into(), "git push".into()];
@@ -1978,7 +1940,7 @@ fn fixture_antigravity_unmanaged_and_modes() {
 #[test]
 fn fixture_muse_profiles_and_network() {
     // Workspace preset: the workspace profile, restricted network.
-    let m = ok(Vendor::Muse, &Preset::Workspace.policy());
+    let m = ok(Vendor::Muse, &ack(Preset::Workspace));
     assert!(
         pair(&m, "--permission-profile", "ws")
             && pair(&m, "--sandbox-network", "restricted")
@@ -1986,7 +1948,7 @@ fn fixture_muse_profiles_and_network() {
     );
     assert!(pair(&m, "--approval-judge", "off"));
     // Read-only preset: the read-only profile.
-    let m = ok(Vendor::Muse, &Preset::ReadOnly.policy());
+    let m = ok(Vendor::Muse, &ack(Preset::ReadOnly));
     assert!(pair(&m, "--permission-profile", "ro"));
     // Domain allows degrade to proxy-only, receipted.
     let m = ok(
@@ -2049,7 +2011,7 @@ fn fixture_muse_profiles_and_network() {
     let bare = compile(
         Vendor::Muse,
         &VendorFacts::new(Transport::Pty),
-        &Preset::Workspace.policy(),
+        &ack(Preset::Workspace),
     )
     .unwrap();
     assert!(!has_arg(&bare, "--permission-profile"));
@@ -2344,7 +2306,7 @@ fn claude_path_and_domain_entries_are_exact() {
         claude_list(&c, "allow"),
         [
             "Edit(./**)",
-            "Read(src/**)",
+            "Read(./src/**)",
             "WebFetch(domain:example.com)",
             "Write(./**)",
             "mcp__git_hub__create_issue"
@@ -2396,7 +2358,7 @@ fn codex_prefix_rules_roundtrip_exactly() {
     for a in cases {
         let policy = pol(
             Posture::Ask,
-            &[r(Capability::ShellExec, Effect::Allow, argv(a))],
+            &[r(Capability::ShellExec, Effect::Deny, argv(a))],
         );
         let Ok(plan) = compile(Vendor::Codex, &facts(Vendor::Codex), &policy) else {
             continue;
@@ -2408,7 +2370,7 @@ fn codex_prefix_rules_roundtrip_exactly() {
             .unwrap();
         let want: Vec<String> = a.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(parse_starlark_tokens(line), want, "{line}");
-        assert!(line.ends_with("decision=\"allow\")"));
+        assert!(line.ends_with("decision=\"forbidden\")"));
     }
 }
 
@@ -2417,7 +2379,7 @@ fn codex_prefix_rules_roundtrip_exactly() {
 #[test]
 fn change_classes_default_to_the_slow_path() {
     for v in Vendor::ALL {
-        let plan = ok(v, &Preset::WorkspaceWeb.policy());
+        let plan = ok(v, &ack(Preset::WorkspaceWeb));
         assert!(plan.requires_respawn, "{v:?}");
         assert_eq!(plan.change_classes.len(), 2 + 8);
         for c in &plan.change_classes {
@@ -2437,7 +2399,7 @@ fn change_classes_default_to_the_slow_path() {
         assert_eq!(sandbox.class, ChangeClass::Respawn);
         assert_eq!(plan.key.vendor, v);
     }
-    let c = ok(Vendor::Claude, &Preset::Workspace.policy());
+    let c = ok(Vendor::Claude, &ack(Preset::Workspace));
     let shell = c
         .change_classes
         .iter()
@@ -2451,7 +2413,7 @@ fn change_classes_default_to_the_slow_path() {
         )))
         .with(ProvenFact::HotEdit(ChangeField::Posture))
         .with(ProvenFact::HotEdit(ChangeField::Sandbox));
-    let c = compile(Vendor::Claude, &f, &Preset::Workspace.policy()).unwrap();
+    let c = compile(Vendor::Claude, &f, &ack(Preset::Workspace)).unwrap();
     let get = |field: ChangeField| {
         c.change_classes
             .iter()
@@ -2475,7 +2437,7 @@ fn change_classes_default_to_the_slow_path() {
 fn evidence_is_runtime_proven_only_when_the_facts_say_so() {
     for v in Vendor::ALL {
         for p in Preset::ALL {
-            if let Ok(plan) = compile(v, &facts(v), &p.policy()) {
+            if let Ok(plan) = compile(v, &facts(v), &ack(p)) {
                 assert!(
                     plan.receipts
                         .iter()
@@ -2485,7 +2447,7 @@ fn evidence_is_runtime_proven_only_when_the_facts_say_so() {
         }
     }
     let f = facts(Vendor::Codex).with(ProvenFact::RuntimeProven(Surface::Posture));
-    let plan = compile(Vendor::Codex, &f, &Preset::Workspace.policy()).unwrap();
+    let plan = compile(Vendor::Codex, &f, &ack(Preset::Workspace)).unwrap();
     assert_eq!(
         line_for(&plan, "posture").evidence,
         EvidenceClass::RuntimeProven
@@ -2557,4 +2519,629 @@ fn every_rule_and_every_omitted_capability_has_a_receipt() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- review fixes
+
+fn compile_default(v: Vendor, p: &PermissionPolicy) -> Result<CompiledPlan, CompileRefusal> {
+    compile(v, &facts(v), p)
+}
+
+#[test]
+fn grok_ask_never_leaves_a_covering_allow_across_capabilities() {
+    // allow workspace writes + ask on .git: the broad Edit/Write allow would cover .git.
+    let p = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsWriteWorkspace, Effect::Allow, None),
+            r(
+                Capability::FsWriteProtected,
+                Effect::Ask,
+                class(PathClass::Git),
+            ),
+        ],
+    );
+    let g = ok(Vendor::Grok, &p);
+    assert!(
+        !has_arg(&g, "--allow"),
+        "no allow may stay: {:?}",
+        g.launch_args
+    );
+    assert!(
+        pair(&g, "--deny", "Edit(.git/**)") && pair(&g, "--deny", "Write(.git/**)"),
+        "the default deny covers the class: {:?}",
+        g.launch_args
+    );
+    assert_eq!(
+        line_for(&g, "allow fs_write_workspace").class,
+        ReceiptClass::StricterDowngrade
+    );
+    assert!(
+        line_for(&g, "allow fs_write_workspace")
+            .note
+            .contains("withdrawn")
+    );
+    // Claude states the ask natively and keeps the allow.
+    let c = ok(Vendor::Claude, &p);
+    assert_eq!(claude_list(&c, "allow"), ["Edit(./**)", "Write(./**)"]);
+    assert!(claude_raw(&c, "ask").contains(&"Edit(.git/**)".to_owned()));
+    assert!(
+        !claude_raw(&c, "deny").contains(&"Edit(.git/**)".to_owned()),
+        "an honoured ask is not overridden by the default"
+    );
+    // The reverse direction: a path ask in the workspace withdraws a protected allow.
+    let q = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsWriteWorkspace, Effect::Ask, pg("src/**")),
+            r(
+                Capability::FsWriteProtected,
+                Effect::Allow,
+                class(PathClass::Git),
+            ),
+        ],
+    );
+    let g = ok(Vendor::Grok, &q);
+    assert!(!has_arg(&g, "--allow"), "{:?}", g.launch_args);
+    assert!(
+        pair(&g, "--deny", "Edit(.git/**)"),
+        "the withdrawn protected allow falls back to the default deny"
+    );
+    // An explicit deny of the class still counts as covering it.
+    let d = pol(
+        Posture::Ask,
+        &[r(
+            Capability::FsWriteProtected,
+            Effect::Deny,
+            class(PathClass::Git),
+        )],
+    );
+    let g = ok(Vendor::Grok, &d);
+    assert_eq!(
+        g.launch_args
+            .iter()
+            .filter(|a| *a == "Edit(.git/**)")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn grok_refuses_an_ask_on_workspace_reads() {
+    let p = pol(
+        Posture::Ask,
+        &[r(Capability::FsReadWorkspace, Effect::Ask, pg("src/**"))],
+    );
+    assert!(matches!(
+        refusal(Vendor::Grok, &p),
+        CompileRefusal::UnenforceableAsk {
+            vendor: Vendor::Grok,
+            ..
+        }
+    ));
+    assert!(
+        compile_default(Vendor::Claude, &p).is_ok(),
+        "Claude states the ask natively"
+    );
+}
+
+#[test]
+fn codex_shell_allow_prompts_unless_the_sandbox_is_proven_kept() {
+    let rules = [r(
+        Capability::ShellExec,
+        Effect::Allow,
+        argv(&["cargo", "test"]),
+    )];
+    let p = pol(Posture::AcceptEdits, &rules);
+    let x = ok(Vendor::Codex, &p);
+    let text = file(&x, ConfigTarget::CodexRules).unwrap();
+    assert!(text.contains("pattern=[\"cargo\", \"test\"], decision=\"prompt\""));
+    assert!(!text.contains("decision=\"allow\""));
+    let l = line_for(&x, "allow shell_exec");
+    assert_eq!(l.class, ReceiptClass::StricterDowngrade);
+    assert!(l.note.contains("may bypass the sandbox") && l.note.contains("unverified"));
+    // With the fact (and a writable sandbox) it is a real allow.
+    let f = facts(Vendor::Codex).with(ProvenFact::ExecpolicyAllowKeepsSandbox);
+    let x = compile(Vendor::Codex, &f, &p).unwrap();
+    assert!(
+        file(&x, ConfigTarget::CodexRules)
+            .unwrap()
+            .contains("decision=\"allow\"")
+    );
+    assert_eq!(line_for(&x, "allow shell_exec").class, ReceiptClass::Exact);
+    // Under -s read-only (Plan, or Ask without a workspace-write allow) an allow is never emitted.
+    for posture in [Posture::Plan, Posture::Ask] {
+        let ro = pol(posture, &rules);
+        for facts in [facts_plain(), f.clone()] {
+            let x = compile(Vendor::Codex, &facts, &ro).unwrap();
+            assert!(pair(&x, "-s", "read-only"));
+            assert!(file(&x, ConfigTarget::CodexRules).is_none(), "{posture:?}");
+            assert_eq!(
+                line_for(&x, "allow shell_exec").native,
+                Vec::<String>::new()
+            );
+        }
+    }
+}
+
+fn facts_plain() -> VendorFacts {
+    VendorFacts::new(Transport::Pty)
+}
+
+#[test]
+fn codex_shell_glob_tokens_must_be_plain() {
+    let deny = |g: &str| {
+        pol(
+            Posture::AcceptEdits,
+            &[r(Capability::ShellExec, Effect::Deny, sg(g))],
+        )
+    };
+    // A quoted argument is cut away: the prefix is stricter and says so.
+    let x = ok(Vendor::Codex, &deny("rm \"a b\""));
+    let text = file(&x, ConfigTarget::CodexRules).unwrap();
+    assert!(
+        text.contains("prefix_rule(pattern=[\"rm\"], decision=\"forbidden\")"),
+        "{text}"
+    );
+    assert!(
+        !text.contains('\\'),
+        "no quote may leak into a pattern element: {text}"
+    );
+    assert_eq!(
+        line_for(&x, "deny shell_exec").class,
+        ReceiptClass::StricterDowngrade
+    );
+    // The metacharacter ends the plain run too.
+    let x = ok(Vendor::Codex, &deny("git push;x"));
+    assert!(
+        file(&x, ConfigTarget::CodexRules)
+            .unwrap()
+            .contains("pattern=[\"git\"]")
+    );
+    let x = ok(Vendor::Codex, &deny("git push"));
+    assert!(
+        file(&x, ConfigTarget::CodexRules)
+            .unwrap()
+            .contains("pattern=[\"git\", \"push\"]")
+    );
+    // An unsafe command name cannot be cut further: refuse.
+    for g in ["\"rm\" x", "r$m x", "'rm' x"] {
+        assert!(
+            matches!(
+                refusal(Vendor::Codex, &deny(g)),
+                CompileRefusal::UnenforceableDeny { .. }
+            ),
+            "{g}"
+        );
+    }
+    // An ask with an unsafe command name tightens the approval policy instead.
+    let a = pol(
+        Posture::AcceptEdits,
+        &[r(Capability::ShellExec, Effect::Ask, sg("\"rm\" x"))],
+    );
+    let x = ok(Vendor::Codex, &a);
+    assert!(pair(&x, "-a", "untrusted") && file(&x, ConfigTarget::CodexRules).is_none());
+    // A glob allow is never granted.
+    let al = pol(
+        Posture::AcceptEdits,
+        &[r(Capability::ShellExec, Effect::Allow, sg("rm \"a b\""))],
+    );
+    assert!(file(&ok(Vendor::Codex, &al), ConfigTarget::CodexRules).is_none());
+    // No element of any emitted rule line holds a character outside the plain set when it came from a glob.
+    for g in [
+        "git push*",
+        "git \"x\" y",
+        "ls -la",
+        "a/b c",
+        "echo h\u{e9}llo",
+    ] {
+        if let Ok(x) = compile(Vendor::Codex, &facts(Vendor::Codex), &deny(g)) {
+            let line = file(&x, ConfigTarget::CodexRules)
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("prefix_rule"))
+                .unwrap()
+                .to_owned();
+            for t in parse_starlark_tokens(&line) {
+                assert!(
+                    t.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "_./:=@%+,-".contains(c)),
+                    "{g}: {t}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn muse_external_restrictions_need_a_proven_confining_profile() {
+    let deny = pol(
+        Posture::Ask,
+        &[r(Capability::FsWriteExternal, Effect::Deny, ag("/etc/**"))],
+    );
+    let ask = pol(
+        Posture::Ask,
+        &[r(Capability::FsReadExternal, Effect::Ask, None)],
+    );
+    for (name, p) in [("deny", &deny), ("ask", &ask)] {
+        // No profiles at all.
+        let bare = VendorFacts::new(Transport::Pty);
+        assert!(
+            compile(Vendor::Muse, &bare, p).is_err(),
+            "{name}: empty facts must refuse"
+        );
+        // Verified profiles, but nothing proves they confine external paths.
+        assert!(
+            compile(Vendor::Muse, &facts(Vendor::Muse), p).is_err(),
+            "{name}"
+        );
+        // Proven confinement without a verified profile.
+        let only_fact = VendorFacts::new(Transport::Pty).with(ProvenFact::ProfileConfinesExternal);
+        assert!(compile(Vendor::Muse, &only_fact, p).is_err(), "{name}");
+        // Both.
+        let f = facts(Vendor::Muse).with(ProvenFact::ProfileConfinesExternal);
+        let plan = compile(Vendor::Muse, &f, p).unwrap();
+        assert!(
+            line_for(
+                &plan,
+                if name == "deny" {
+                    "deny fs_write_external"
+                } else {
+                    "ask fs_read_external"
+                }
+            )
+            .native
+            .iter()
+            .any(|n| n.starts_with("--permission-profile")),
+            "the receipt names the profile"
+        );
+        // Sandbox off removes the boundary whatever the profile says.
+        let mut off = p.clone();
+        off.sandbox = SandboxChoice::Off;
+        assert!(
+            compile(Vendor::Muse, &f, &off).is_err(),
+            "{name}: sandbox off"
+        );
+    }
+    assert!(matches!(
+        refusal(Vendor::Muse, &deny),
+        CompileRefusal::UnenforceableDeny { .. }
+    ));
+    assert!(matches!(
+        refusal(Vendor::Muse, &ask),
+        CompileRefusal::UnenforceableAsk { .. }
+    ));
+    // A proven hard deny stands in for the profile.
+    let hard = facts(Vendor::Muse).with(ProvenFact::HardDeny(Capability::FsWriteExternal));
+    assert!(compile(Vendor::Muse, &hard, &deny).is_ok());
+    // Plan with the sandbox off is a conflict, as on Codex.
+    let mut plan_off = pol(Posture::Plan, &[]);
+    plan_off.sandbox = SandboxChoice::Off;
+    assert!(matches!(
+        refusal(Vendor::Muse, &plan_off),
+        CompileRefusal::SandboxConflict { .. }
+    ));
+}
+
+#[test]
+fn pathological_shell_globs_finish_at_once() {
+    let started = std::time::Instant::now();
+    let glob = "*a*a*a*a*a*a*a*b";
+    let mut f = facts(Vendor::Antigravity);
+    f.exact_commands = vec![
+        "a".repeat(500),
+        format!("{}b", "a".repeat(499)),
+        "a".repeat(8),
+    ];
+    let p = pol(
+        Posture::Ask,
+        &[r(Capability::ShellExec, Effect::Allow, sg(glob))],
+    );
+    let plan = compile(Vendor::Antigravity, &f, &p).unwrap();
+    let s = plan
+        .launch_args
+        .iter()
+        .find(|a| a.starts_with('{'))
+        .unwrap();
+    assert!(
+        s.contains(&format!("command({}b)", "a".repeat(499)))
+            && !s.contains(&format!("command({})", "a".repeat(500)))
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+    // The star count is bounded by the grammar.
+    let nine = "*a".repeat(MAX_SHELL_GLOB_STARS + 1);
+    assert!(matches!(
+        invalid(Capability::ShellExec, sg(&nine)),
+        PolicyError::InvalidPattern { .. }
+    ));
+    assert!(
+        pol(
+            Posture::Ask,
+            &[r(
+                Capability::ShellExec,
+                Effect::Allow,
+                sg(&"*a".repeat(MAX_SHELL_GLOB_STARS))
+            )]
+        )
+        .normalized()
+        .is_ok()
+    );
+    // Work across all commands is bounded: too many (rule, command) pairs is refused, not run.
+    let mut many = facts(Vendor::Antigravity);
+    many.exact_commands = (0..1024).map(|i| format!("cmd{i}")).collect();
+    let rules: Vec<Rule> = (0..230)
+        .map(|i| {
+            r(
+                Capability::ShellExec,
+                Effect::Allow,
+                sg(&format!("cmd{i}*")),
+            )
+        })
+        .collect();
+    assert!(matches!(
+        compile(Vendor::Antigravity, &many, &pol(Posture::Ask, &rules)),
+        Err(CompileRefusal::InvalidFacts(_))
+    ));
+}
+
+#[test]
+fn a_legacy_prefix_glob_is_not_a_shell_glob() {
+    for g in ["npm:*", "git push:*", ":*"] {
+        assert!(
+            matches!(
+                invalid(Capability::ShellExec, sg(g)),
+                PolicyError::InvalidPattern { .. }
+            ),
+            "{g}"
+        );
+    }
+    // `:*` that is not trailing, and an ordinary star, stay valid and emit as written.
+    let p = pol(
+        Posture::Ask,
+        &[
+            r(Capability::ShellExec, Effect::Allow, sg("npm:* run")),
+            r(Capability::ShellExec, Effect::Allow, sg("npm *")),
+        ],
+    );
+    let c = ok(Vendor::Claude, &p);
+    assert_eq!(claude_list(&c, "allow"), ["Bash(npm *)", "Bash(npm:* run)"]);
+    // And the argv form of the same text is an exact token, not a prefix form.
+    let a = ok(
+        Vendor::Claude,
+        &pol(
+            Posture::Ask,
+            &[r(
+                Capability::ShellExec,
+                Effect::Allow,
+                argv(&["npm:", "x"]),
+            )],
+        ),
+    );
+    assert_eq!(claude_list(&a, "allow"), ["Bash(npm: x *)", "Bash(npm: x)"]);
+}
+
+#[test]
+fn unenforced_defaults_refuse_unless_acknowledged() {
+    // The default policy field is `refuse`, on the wire and in code.
+    let json = r#"{"schema_version":1,"posture":"ask","sandbox":"vendor-default","rules":[]}"#;
+    assert_eq!(
+        serde_json::from_str::<PermissionPolicy>(json)
+            .unwrap()
+            .unenforced_defaults,
+        UnenforcedDefaults::Refuse
+    );
+    assert!(
+        serde_json::from_str::<PermissionPolicy>(&json.replace(
+            "\"rules\":[]",
+            "\"unenforced_defaults\":\"yes\",\"rules\":[]"
+        ))
+        .is_err()
+    );
+    for p in Preset::ALL {
+        assert_eq!(p.policy().unenforced_defaults, UnenforcedDefaults::Refuse);
+    }
+    // Vendors that cannot enforce the protected-path default refuse every preset that leaves
+    // the sandbox writable, naming the capability.
+    // (Codex without a workspace-write allow runs read-only, and Muse selects the read-only
+    // profile; both block every write, so only the writable presets refuse there.)
+    for (v, presets) in [
+        (Vendor::Codex, vec![Preset::Workspace, Preset::WorkspaceWeb]),
+        (Vendor::Muse, vec![Preset::Workspace, Preset::WorkspaceWeb]),
+        (
+            Vendor::Antigravity,
+            vec![Preset::WorkspaceWeb, Preset::Custom],
+        ),
+    ] {
+        for p in presets {
+            match compile(v, &facts(v), &p.policy()) {
+                Err(CompileRefusal::UnenforcedRequest {
+                    vendor, capability, ..
+                }) => {
+                    assert_eq!(
+                        (vendor, capability),
+                        (v, Capability::FsWriteProtected),
+                        "{v:?} {p:?}"
+                    );
+                }
+                other => panic!("{v:?} {p:?}: expected UnenforcedRequest, got {other:?}"),
+            }
+            let plan = compile(v, &facts(v), &ack(p)).unwrap();
+            assert_eq!(
+                plan.unenforced,
+                vec![UnenforcedItem {
+                    capability: Capability::FsWriteProtected,
+                    vendor: v
+                }],
+                "{v:?} {p:?}"
+            );
+            assert_eq!(
+                line_for(&plan, "deny fs_write_protected").class,
+                ReceiptClass::Unsupported
+            );
+        }
+    }
+    // Claude and Grok emulate it (tool-scoped), so nothing is unenforced there.
+    for v in [Vendor::Claude, Vendor::Grok] {
+        for p in Preset::ALL {
+            let plan = compile(v, &facts(v), &p.policy()).unwrap();
+            assert!(plan.unenforced.is_empty(), "{v:?} {p:?}");
+        }
+    }
+    // Read-only sandbox / profile blocks every write, so the read-only preset needs no acknowledgement
+    // on Codex and Muse; Antigravity cannot prove it.
+    for v in [Vendor::Codex, Vendor::Muse] {
+        let plan = compile(v, &facts(v), &Preset::ReadOnly.policy()).unwrap();
+        assert!(plan.unenforced.is_empty());
+        assert_eq!(
+            line_for(&plan, "deny fs_write_protected").class,
+            ReceiptClass::StricterDowngrade
+        );
+    }
+    assert!(matches!(
+        compile(
+            Vendor::Antigravity,
+            &facts(Vendor::Antigravity),
+            &Preset::ReadOnly.policy()
+        ),
+        Err(CompileRefusal::UnenforcedRequest { .. })
+            | Err(CompileRefusal::UnenforceableDeny { .. })
+    ));
+    // Bypass applies no defaults, so nothing is unenforced or refused.
+    for v in Vendor::ALL {
+        let plan = compile(
+            v,
+            &facts(v),
+            &PermissionPolicy::new(Posture::Bypass, SandboxChoice::VendorDefault),
+        )
+        .unwrap();
+        assert!(plan.unenforced.is_empty());
+    }
+    // An unenforced list is stable and deduplicated.
+    let plan = compile(
+        Vendor::Codex,
+        &facts(Vendor::Codex),
+        &ack(Preset::Workspace),
+    )
+    .unwrap();
+    let again = compile(
+        Vendor::Codex,
+        &facts(Vendor::Codex),
+        &ack(Preset::Workspace),
+    )
+    .unwrap();
+    assert_eq!(plan.unenforced, again.unenforced);
+}
+
+#[test]
+fn minor_review_fixes() {
+    // A leading `-` is not an id.
+    let mut f = facts(Vendor::Grok);
+    f.sandbox_profile = Some("-strict".into());
+    assert!(matches!(
+        compile(Vendor::Grok, &f, &Preset::Custom.policy()),
+        Err(CompileRefusal::InvalidFacts(_))
+    ));
+    let mut f = facts(Vendor::Muse);
+    f.muse_profiles[0].id = "-ro".into();
+    assert!(matches!(
+        compile(Vendor::Muse, &f, &Preset::Custom.policy()),
+        Err(CompileRefusal::InvalidFacts(_))
+    ));
+    // Codex with the sandbox off does not claim the network default is off.
+    let mut off = pol(Posture::Ask, &[]);
+    off.sandbox = SandboxChoice::Off;
+    let x = ok(Vendor::Codex, &off);
+    let l = line_for(&x, "ask network_web");
+    assert_eq!(l.class, ReceiptClass::Unsupported);
+    assert!(l.native.is_empty() && l.note.contains("open"), "{l:?}");
+    // A runtime proof never stamps a line the vendor cannot carry.
+    let f = facts(Vendor::Codex)
+        .with(ProvenFact::RuntimeProven(Surface::ProtectedPath))
+        .with(ProvenFact::RuntimeProven(Surface::McpRule));
+    let x = compile(Vendor::Codex, &f, &ack(Preset::Workspace)).unwrap();
+    for l in x
+        .receipts
+        .iter()
+        .filter(|l| l.class == ReceiptClass::Unsupported)
+    {
+        assert_ne!(l.evidence, EvidenceClass::RuntimeProven, "{l:?}");
+    }
+    // requires_respawn follows the fields the plan sets.
+    let mut f = facts(Vendor::Claude).with(ProvenFact::HotEdit(ChangeField::Posture));
+    for c in [
+        Capability::FsReadWorkspace,
+        Capability::FsWriteWorkspace,
+        Capability::NetworkWeb,
+        Capability::FsWriteProtected,
+    ] {
+        f = f.with(ProvenFact::HotEdit(ChangeField::Rules(c)));
+    }
+    let calm = compile(Vendor::Claude, &f, &Preset::Workspace.policy()).unwrap();
+    assert!(!calm.requires_respawn, "{:?}", calm.change_classes);
+    assert!(
+        compile(
+            Vendor::Claude,
+            &facts(Vendor::Claude),
+            &Preset::Workspace.policy()
+        )
+        .unwrap()
+        .requires_respawn
+    );
+    // Antigravity `ask` sets no native posture: the posture alone does not force a respawn.
+    let a = ok(Vendor::Antigravity, &pol(Posture::Ask, &[]));
+    assert!(
+        !a.requires_respawn
+            || a.receipts.iter().any(|l| l.subject
+                == ReceiptSubject::Capability(Capability::FsReadExternal)
+                && !l.native.is_empty())
+    );
+    // Bare workspace globs are anchored, so gitignore any-depth reading cannot widen an allow.
+    let c = ok(
+        Vendor::Claude,
+        &pol(
+            Posture::Ask,
+            &[
+                r(Capability::FsReadWorkspace, Effect::Allow, pg("*.rs")),
+                r(Capability::FsWriteWorkspace, Effect::Allow, pg("Makefile")),
+            ],
+        ),
+    );
+    assert_eq!(
+        claude_list(&c, "allow"),
+        ["Edit(./Makefile)", "Read(./*.rs)", "Write(./Makefile)"]
+    );
+    // Parentheses cannot enter a path glob.
+    for g in ["a(b)", "a)", "(a"] {
+        assert!(
+            matches!(
+                invalid(Capability::FsReadWorkspace, pg(g)),
+                PolicyError::InvalidPattern { .. }
+            ),
+            "{g}"
+        );
+        assert!(
+            matches!(
+                invalid(Capability::FsReadExternal, ag(&format!("/{g}"))),
+                PolicyError::InvalidPattern { .. }
+            ),
+            "{g}"
+        );
+    }
+    // Muse proxy-only says the proxy's allowlist governs.
+    let m = ok(
+        Vendor::Muse,
+        &pol(
+            Posture::Ask,
+            &[r(
+                Capability::NetworkWeb,
+                Effect::Allow,
+                dom("a.example.com"),
+            )],
+        ),
+    );
+    assert!(line_for(&m, "allow network_web").note.contains("broader"));
 }

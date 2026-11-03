@@ -12,17 +12,45 @@ use crate::permissions::plan::{CompileRefusal, Origin, ReceiptClass, ReceiptSubj
 use crate::permissions::policy::{Capability, Effect, Pattern, Posture, Rule};
 use serde_json::{Map, Value, json};
 
-/// `*` is the only wildcard.
+/// `*` is the only wildcard. Iterative two-pointer matching: at most `pattern.len() *
+/// s.len()` steps, with no backtracking blow-up.
 pub(crate) fn wild_match(pat: &str, s: &str) -> bool {
-    fn go(p: &[u8], s: &[u8]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some((b'*', rest)) => (0..=s.len()).any(|i| go(rest, &s[i..])),
-            Some((c, rest)) => s.split_first().is_some_and(|(h, t)| h == c && go(rest, t)),
+    let (p, s) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut mark = 0usize;
+    while si < s.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == s[si] {
+            pi += 1;
+            si += 1;
+        } else if let Some(st) = star {
+            pi = st + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
         }
     }
-    go(pat.as_bytes(), s.as_bytes())
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
+
+/// Cheap rejections before the matcher: the literal bytes the glob needs must fit, and its
+/// literal head must be a prefix.
+fn glob_could_match(glob: &str, s: &str) -> bool {
+    let needed = glob.bytes().filter(|b| *b != b'*').count();
+    let head = glob.split('*').next().unwrap_or("");
+    needed <= s.len() && s.starts_with(head)
+}
+
+/// Most (rule, command) pairs one compile may test.
+const MATCH_BUDGET: usize = 200_000;
 
 fn plain_command(c: &str) -> bool {
     !c.is_empty()
@@ -40,7 +68,7 @@ fn covers(rule: &Rule, cmd: &str) -> bool {
             let t: Vec<&str> = cmd.split(' ').collect();
             t.len() >= argv.len() && t.iter().zip(argv).all(|(a, b)| a == b)
         }
-        Some(Pattern::ShellGlob { glob }) => wild_match(glob, cmd),
+        Some(Pattern::ShellGlob { glob }) => glob_could_match(glob, cmd) && wild_match(glob, cmd),
         Some(_) => false,
     }
 }
@@ -103,6 +131,8 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     );
 
     let mut commands: Vec<String> = Vec::new();
+    let shell_rules = cx.rules(Capability::ShellExec);
+    let mut work = 0usize;
     let mut non_ws: Option<bool> = None;
 
     for cap in Capability::ALL {
@@ -212,6 +242,12 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                     let mut skipped = 0usize;
                     let mut mine: Vec<String> = Vec::new();
                     for c in &cx.facts.exact_commands {
+                        work += 1 + shell_rules.len();
+                        if work > MATCH_BUDGET {
+                            return Err(CompileRefusal::InvalidFacts(
+                                "too many exact commands for the shell rules to match within the work budget".into(),
+                            ));
+                        }
                         if !covers(r, c) {
                             continue;
                         }
@@ -220,7 +256,7 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                             skipped += 1;
                             continue;
                         }
-                        let blocked = cx.rules(Capability::ShellExec).iter().any(|o| o.effect != Effect::Allow && covers(o, c));
+                        let blocked = shell_rules.iter().any(|o| o.effect != Effect::Allow && covers(o, c));
                         if !blocked {
                             mine.push(c.clone());
                         }
