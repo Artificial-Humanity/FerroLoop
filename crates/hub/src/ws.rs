@@ -106,13 +106,14 @@ impl ConnectionGates {
     }
 }
 
-/// The reply to a connection past the cap (`Retry-After` one second). Fixed bytes: no request is
-/// read or parsed.
+/// The reply to a connection past the cap (`Retry-After` one second). Fixed bytes: the request is
+/// never parsed.
 const OVERLOADED_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// Refuse `stream` without awaiting, so a slow or hostile client cannot hold up the accept
-/// loop: a non-blocking write of a few bytes into a fresh socket buffer, a non-blocking read to
-/// discard what has already arrived (closing a socket with unread data resets the connection
+/// loop: a non-blocking write of a few bytes into a fresh socket buffer, one non-blocking read of
+/// at most 1 KiB into a scratch buffer, to discard what has already arrived without keeping or
+/// parsing it (closing a socket with unread data resets the connection
 /// and can destroy the reply), then the stream drops.
 fn reject_overloaded(stream: TcpStream) {
     // `TcpStream::try_write` would do, but it waits on readiness tokio has not polled yet for a

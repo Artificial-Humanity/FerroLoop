@@ -106,6 +106,9 @@ pub(crate) const SESSION_MISS_CAPACITY: usize = 1024;
 /// A bounded cache of session tokens the store has already rejected, so a bearer or cookie that
 /// is not a live session costs one store open per [`SESSION_MISS_TTL`], not one per request.
 ///
+/// It only helps repeats of the same bad token: a flood of unique random tokens still opens the
+/// store once per request, so this is not full flood protection.
+///
 /// Invariants:
 /// - It holds only the SHA-256 of a presented token (the same digest the store keys sessions
 ///   by), never the token, and only rejections: a token that verified is never recorded.
@@ -520,6 +523,9 @@ pub struct AuthManager {
     cache: Arc<Mutex<AuthCache>>,
     /// Session tokens the store rejected (see [`SessionMissCache`]). Lock order: `cache`, then this.
     session_misses: Arc<Mutex<SessionMissCache>>,
+    /// Added to the rejected-session cache's clock, so a test moves time without sleeping.
+    #[cfg(test)]
+    miss_clock_skew: Arc<Mutex<Duration>>,
 }
 
 impl AuthManager {
@@ -556,6 +562,8 @@ impl AuthManager {
                 SESSION_MISS_TTL,
                 SESSION_MISS_CAPACITY,
             ))),
+            #[cfg(test)]
+            miss_clock_skew: Arc::default(),
         }
     }
 
@@ -565,6 +573,29 @@ impl AuthManager {
     pub(crate) fn with_session_miss_limits(mut self, ttl: Duration, capacity: usize) -> Self {
         self.session_misses = Arc::new(Mutex::new(SessionMissCache::new(ttl, capacity)));
         self
+    }
+
+    /// The clock the rejected-session cache reads.
+    fn miss_now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            return Instant::now()
+                + *self
+                    .miss_clock_skew
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    /// Move the rejected-session cache's clock forward by `by`.
+    #[cfg(test)]
+    pub(crate) fn advance_miss_clock(&self, by: Duration) {
+        *self
+            .miss_clock_skew
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += by;
     }
 
     /// Whether looking a request's session credentials up in the store could still change the
@@ -578,7 +609,7 @@ impl AuthManager {
         query: &BTreeMap<String, String>,
     ) -> bool {
         let (cookie, bearer) = session_candidates(headers, query);
-        let now = Instant::now();
+        let now = self.miss_now();
         let misses = self
             .session_misses
             .lock()
@@ -799,7 +830,7 @@ impl AuthManager {
                     .session_misses
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if misses.contains(&token_hash, Instant::now()) {
+                if misses.contains(&token_hash, self.miss_now()) {
                     return None;
                 }
                 match load_session_entry_checked(s, &token_hash) {
@@ -809,7 +840,7 @@ impl AuthManager {
                     }
                     // The store says there is no such session: remember it. This runs under
                     // the cache lock, so a mint cannot slip in between the read and the insert.
-                    Ok(None) => misses.insert(token_hash.clone(), Instant::now()),
+                    Ok(None) => misses.insert(token_hash.clone(), self.miss_now()),
                     // A read error says nothing about the token: record nothing.
                     Err(_) => {}
                 }
@@ -824,7 +855,7 @@ impl AuthManager {
                 self.session_misses
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(token_hash, Instant::now());
+                    .insert(token_hash, self.miss_now());
             }
             return None;
         }
@@ -1474,7 +1505,7 @@ mod tests {
     fn a_session_written_to_the_store_by_another_process_is_rejected_for_at_most_the_ttl() {
         let tmp = TempDir::new().unwrap();
         let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
-        let auth = test_auth().with_session_miss_limits(Duration::from_millis(80), 8);
+        let auth = test_auth().with_session_miss_limits(Duration::from_secs(60), 8);
         let token = "written-by-someone-else";
         assert!(auth.verify_session_token(Some(&store), token).is_none());
 
@@ -1493,7 +1524,7 @@ mod tests {
         .unwrap();
         // The bound the invariant documents: not at once, but within the TTL.
         assert!(auth.verify_session_token(Some(&store), token).is_none());
-        std::thread::sleep(Duration::from_millis(150));
+        auth.advance_miss_clock(Duration::from_secs(61));
         assert!(auth.verify_session_token(Some(&store), token).is_some());
     }
 

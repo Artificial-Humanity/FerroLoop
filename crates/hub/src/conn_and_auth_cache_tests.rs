@@ -104,10 +104,10 @@ fn a_rejection_is_checked_again_after_the_ttl() {
     state.auth = state
         .auth
         .clone()
-        .with_session_miss_limits(Duration::from_millis(80), 16);
+        .with_session_miss_limits(Duration::from_secs(60), 16);
     assert_eq!(opens(&state, "stale-token").1, 1);
     assert_eq!(opens(&state, "stale-token").1, 0);
-    std::thread::sleep(Duration::from_millis(150));
+    state.auth.advance_miss_clock(Duration::from_secs(61));
     let (resp, n) = opens(&state, "stale-token");
     assert_eq!(
         (resp.status, n),
