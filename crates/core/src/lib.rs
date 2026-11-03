@@ -36,6 +36,7 @@ pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
 pub mod routing;
+pub mod session_protocol;
 pub mod split;
 pub mod stale;
 pub mod state;
@@ -136,6 +137,10 @@ pub use ref_index::{
     RefLocatorClass, RefSource, classify_locator, index_local_source,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
+pub use session_protocol::{
+    AcpOperation, AcpProfileFingerprint, AcpProfileProofRecord, ConformanceState,
+    OperationEvidence, SessionProtocolKind,
+};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
     RemoteLedger, SplitLedger,
