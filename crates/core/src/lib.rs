@@ -6,6 +6,7 @@ pub mod agent;
 pub mod arch;
 pub mod at;
 pub mod build_info;
+pub mod child_env;
 pub mod code_index;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]

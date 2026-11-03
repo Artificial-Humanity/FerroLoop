@@ -1,5 +1,6 @@
 //! Native vendor push dispatcher for Claude Code, Antigravity, Codex, and Webhook routes (spec §3.2).
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
+use fl_core::telemetry::AdapterKind;
 
 use crate::identity::{
     RouteTable, VendorRoute, normalize_persona, resolve_agy_exe, resolve_claude_key_path,
@@ -496,8 +498,33 @@ fn cli_timeout(kind: CliKind) -> Duration {
     }
 }
 
-fn run_vendor_cli(cmd: &mut Command, kind: CliKind) -> std::io::Result<std::process::ExitStatus> {
+/// Runs a headless vendor CLI `cmd` for `vendor` with the ceiling for `kind`.
+///
+/// The hub process holds secrets in its environment (`FL_VAULT_MASTER_KEY`, `FL_HUB_*`,
+/// `GITHUB_TOKEN`), and a vendor CLI runs code fl does not control, so `cmd` never inherits it:
+/// its environment is cleared and rebuilt from the dialect allow-list of
+/// [`fl_core::child_env`] (the baseline plus `vendor`'s own `*_API_KEY` family; no `FL_*`,
+/// `FERROGATE_*`, `GITHUB_*`, `GH_*`, proxy, `AWS_*` or `SSH_AUTH_SOCK`), then `extra`. The wire
+/// crate has no adapter config, so there is no `env_pass` here: an operator who needs a proxy
+/// for these fallbacks has to wait for the hub to load `[adapters.*].env_pass` into the wire
+/// dispatcher. Every headless vendor launch goes through this function; set no variable on
+/// `cmd` before calling (it is cleared) and pass it as `extra` instead.
+fn run_vendor_cli(
+    cmd: &mut Command,
+    vendor: AdapterKind,
+    extra: &[(OsString, OsString)],
+    kind: CliKind,
+) -> std::io::Result<std::process::ExitStatus> {
+    cmd.env_clear().envs(vendor_child_env(vendor, extra));
     run_status_with_timeout(cmd, cli_timeout(kind))
+}
+
+/// The scrubbed environment of a `vendor` child, read from this process's environment.
+fn vendor_child_env(
+    vendor: AdapterKind,
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    fl_core::child_env::child_env_from(vendor, std::env::vars_os(), &[], extra)
 }
 
 /// Spawn `cmd` (retrying `ETXTBSY` for up to ~2s: a just-written script can raise it under load) and wait up to
@@ -603,7 +630,7 @@ fn run_codex_queue(
     {
         cmd.current_dir(dir);
     }
-    match run_vendor_cli(&mut cmd, CliKind::Enqueue) {
+    match run_vendor_cli(&mut cmd, AdapterKind::Codex, &[], CliKind::Enqueue) {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(CodexQueueError::Exit(format!(
             "codex queue exited with {status}"
@@ -665,7 +692,6 @@ fn run_muse_exec(
     text: &str,
 ) -> Result<(), String> {
     let mut cmd = Command::new(bin);
-    cmd.env("MUSE_NO_AUTO_UPDATE", "1");
     cmd.args(["exec", "--session-id", session_id, "--json", text])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -674,7 +700,8 @@ fn run_muse_exec(
     {
         cmd.current_dir(dir);
     }
-    let status = run_vendor_cli(&mut cmd, CliKind::Headless)
+    let extra = [(OsString::from("MUSE_NO_AUTO_UPDATE"), OsString::from("1"))];
+    let status = run_vendor_cli(&mut cmd, AdapterKind::Muse, &extra, CliKind::Headless)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("muse exec exited with {status}"));
@@ -738,7 +765,7 @@ fn run_grok_headless(
     {
         cmd.current_dir(dir);
     }
-    let status = run_vendor_cli(&mut cmd, CliKind::Headless)
+    let status = run_vendor_cli(&mut cmd, AdapterKind::Grok, &[], CliKind::Headless)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("grok exited with {status}"));
@@ -782,15 +809,29 @@ fn deliver_to_agy_route(
     cmd.args(["agentapi", "send-message", title, conversation_id, body])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
-    cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
+    let mut extra = vec![
+        (
+            OsString::from("ANTIGRAVITY_CONVERSATION_ID"),
+            OsString::from(conversation_id),
+        ),
+        (
+            OsString::from("ANTIGRAVITY_AGENTAPI_EXE"),
+            exe.clone().into_os_string(),
+        ),
+    ];
     if !addr.is_empty() {
-        cmd.env("ANTIGRAVITY_LS_ADDRESS", &addr);
+        extra.push((
+            OsString::from("ANTIGRAVITY_LS_ADDRESS"),
+            OsString::from(&addr),
+        ));
     }
     if !csrf.is_empty() {
-        cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
+        extra.push((
+            OsString::from("ANTIGRAVITY_CSRF_TOKEN"),
+            OsString::from(&csrf),
+        ));
     }
-    let status = run_vendor_cli(&mut cmd, CliKind::Enqueue)
+    let status = run_vendor_cli(&mut cmd, AdapterKind::Antigravity, &extra, CliKind::Enqueue)
         .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
     if !status.success() {
         return Err(format!("agy send-message exited with {status}"));
@@ -4692,5 +4733,204 @@ mod tests {
             assert_eq!(lines.len(), 1, "{case}: {lines:?}");
             assert!(lines[0].contains("discovery"), "{case}");
         }
+    }
+
+    // ---- audit P0-3c: the headless vendor fallbacks run with a scrubbed environment ----
+
+    /// Serialises the tests below, which plant secret-shaped sentinels in this process's
+    /// environment. They also hold the tmux, codex and agy locks (always in this order) because
+    /// they set the `FL_WIRE_*_BIN` seams those locks guard.
+    static SCRUB_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A name the hub holds (or could hold) that no vendor child may see, with a fake value.
+    const SECRET_SENTINELS: &[&str] = &[
+        "FL_VAULT_MASTER_KEY",
+        "FL_HUB_OWNER_TOKEN",
+        "FL_WIRE_TOKEN",
+        "FERROGATE_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "SSH_AUTH_SOCK",
+        "AWS_SECRET_ACCESS_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "XAI_API_KEY",
+        "MUSE_API_KEY",
+        "FL_WIRE_CODEX_BIN",
+        "FL_WIRE_TMUX_BIN",
+        "FL_WIRE_MUSE_BIN",
+        "FL_WIRE_GROK_BIN",
+        "FL_WIRE_AGY_BIN",
+    ];
+
+    /// What one dialect's child must keep of [`SECRET_SENTINELS`]: its own credential.
+    struct ScrubCase {
+        own_key: &'static str,
+        /// Explicit variables the launch sets itself, with their expected values.
+        extras: Vec<(&'static str, String)>,
+    }
+
+    /// Plants every sentinel (the dialect's own gets an "own" value), runs `launch` with a fake
+    /// vendor script that dumps its environment, and checks the dump. The launch goes through
+    /// the real spawn path (`run_vendor_cli`, with its `ETXTBSY` retry).
+    fn assert_scrubbed_launch(case: ScrubCase, launch: impl FnOnce(&Path)) {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _tmux = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _codex = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let dump = tmp.path().join("env.dump");
+        let script = write_script(
+            tmp.path(),
+            "fake-vendor.sh",
+            &format!("env > \"{}\"", dump.display()),
+        );
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let _no_exe = EnvGuard::remove("ANTIGRAVITY_AGENTAPI_EXE");
+        let _planted: Vec<EnvGuard> = SECRET_SENTINELS
+            .iter()
+            .map(|key| {
+                let value = if *key == case.own_key {
+                    "own-sentinel"
+                } else {
+                    "foreign-secret-sentinel"
+                };
+                EnvGuard::set(key, Path::new(value))
+            })
+            .collect();
+
+        launch(&script);
+
+        let text = fs::read_to_string(&dump).expect("the fake vendor CLI ran and dumped its env");
+        let env: std::collections::BTreeMap<&str, &str> =
+            text.lines().filter_map(|l| l.split_once('=')).collect();
+        for key in SECRET_SENTINELS.iter().filter(|k| **k != case.own_key) {
+            assert!(!env.contains_key(key), "{key} reached the child");
+        }
+        assert!(
+            !text.contains("foreign-secret-sentinel"),
+            "a foreign secret value reached the child"
+        );
+        assert_eq!(env.get(case.own_key), Some(&"own-sentinel"), "{text}");
+        assert!(env.contains_key("PATH"), "PATH missing");
+        assert!(env.contains_key("HOME"), "HOME missing");
+        for (key, value) in &case.extras {
+            assert_eq!(env.get(key), Some(&value.as_str()), "extra {key}");
+        }
+    }
+
+    #[test]
+    fn codex_queue_runs_with_the_codex_allow_list_only() {
+        assert_scrubbed_launch(
+            ScrubCase {
+                own_key: "OPENAI_API_KEY",
+                extras: vec![],
+            },
+            |bin| {
+                assert!(run_codex_queue(bin, "thread", None, "hello").is_ok());
+            },
+        );
+    }
+
+    #[test]
+    fn muse_exec_runs_with_the_muse_allow_list_and_its_update_switch() {
+        assert_scrubbed_launch(
+            ScrubCase {
+                own_key: "MUSE_API_KEY",
+                extras: vec![("MUSE_NO_AUTO_UPDATE", "1".into())],
+            },
+            |bin| {
+                run_muse_exec(bin, "sess", None, "hello").expect("muse exec ran");
+            },
+        );
+    }
+
+    #[test]
+    fn grok_headless_runs_with_the_grok_allow_list_only() {
+        // `--always-approve` lets grok run any tool, so its environment must hold no hub secret.
+        assert_scrubbed_launch(
+            ScrubCase {
+                own_key: "XAI_API_KEY",
+                extras: vec![],
+            },
+            |bin| {
+                run_grok_headless(bin, "sess", None, "hello").expect("grok -p ran");
+            },
+        );
+    }
+
+    #[test]
+    fn agy_send_message_runs_with_the_antigravity_allow_list_and_its_explicit_endpoint() {
+        assert_scrubbed_launch(
+            ScrubCase {
+                own_key: "GEMINI_API_KEY",
+                extras: vec![
+                    ("ANTIGRAVITY_CONVERSATION_ID", "conv-9".into()),
+                    ("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:1".into()),
+                    ("ANTIGRAVITY_CSRF_TOKEN", "route-csrf-token".into()),
+                ],
+            },
+            |bin| {
+                deliver_to_agy_route(
+                    "conv-9",
+                    &Some("127.0.0.1:1".to_string()),
+                    &Some("route-csrf-token".to_string()),
+                    &Some(bin.to_path_buf()),
+                    "title",
+                    "body",
+                )
+                .expect("agy send-message ran");
+            },
+        );
+    }
+
+    #[test]
+    fn the_agy_launch_passes_the_agentapi_exe_it_chose() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let dump = tmp.path().join("env.dump");
+        let script = write_script(
+            tmp.path(),
+            "fake-agy.sh",
+            &format!("env > \"{}\"", dump.display()),
+        );
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let _no_exe = EnvGuard::remove("ANTIGRAVITY_AGENTAPI_EXE");
+        deliver_to_agy_route("conv-1", &None, &None, &Some(script.clone()), "t", "b").unwrap();
+        let text = fs::read_to_string(&dump).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == format!("ANTIGRAVITY_AGENTAPI_EXE={}", script.display())),
+            "{text}"
+        );
+        // No endpoint was resolved, so none is invented.
+        assert!(!text.contains("ANTIGRAVITY_LS_ADDRESS="), "{text}");
+        assert!(!text.contains("ANTIGRAVITY_CSRF_TOKEN="), "{text}");
+    }
+
+    #[test]
+    fn the_scrubbed_launch_still_kills_a_hung_headless_cli() {
+        // The scrub sits before `run_status_with_timeout`, whose ETXTBSY retry re-spawns the
+        // same `Command` (so the cleared environment survives it) and whose deadline kill is
+        // unchanged.
+        CLI_TIMEOUT_OVERRIDE.with(|c| {
+            c.set(Some((
+                Duration::from_millis(300),
+                Duration::from_millis(300),
+            )));
+        });
+        let tmp = TempDir::new().unwrap();
+        let hung = write_script(tmp.path(), "hung-grok.sh", "exec sleep 30");
+        let started = Instant::now();
+        let result = run_grok_headless(&hung, "sess", None, "hello");
+        CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
+        assert!(result.unwrap_err().contains("did not finish"));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
