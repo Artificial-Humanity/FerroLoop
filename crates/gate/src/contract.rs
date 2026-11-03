@@ -87,12 +87,27 @@ fn validate_schema(value: &Value) -> Result<(), GateError> {
         }
         None => None,
     };
+    if ty.is_none() && !obj.contains_key("enum") && !obj.contains_key("const") {
+        return Err(unsupported("type"));
+    }
     if let Some(ap) = obj.get("additionalProperties")
         && ap.as_bool() != Some(false)
     {
         return Err(unsupported("additionalProperties"));
     }
-    let is_object_schema = ty == Some("object") || obj.contains_key("properties");
+    let has_object_keys = obj.contains_key("properties")
+        || obj.contains_key("required")
+        || obj.contains_key("additionalProperties");
+    if has_object_keys && ty != Some("object") {
+        return Err(unsupported("type"));
+    }
+    if ty == Some("array") {
+        match obj.get("items") {
+            Some(items) if items.is_object() => {}
+            _ => return Err(unsupported("items")),
+        }
+    }
+    let is_object_schema = ty == Some("object") || has_object_keys;
     if is_object_schema && obj.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
         return Err(unsupported("additionalProperties"));
     }
@@ -337,9 +352,14 @@ fn validate_node(
                 }
             }
             let props = get("properties").and_then(Value::as_object);
-            if get("additionalProperties").and_then(Value::as_bool) == Some(false) {
-                // Closed object even without `type`/`properties`: no declared
-                // properties means every key is additional.
+            let matched_solely_by_enum_or_const = get("type").is_none()
+                && get("properties").is_none()
+                && get("required").is_none()
+                && get("additionalProperties").is_none()
+                && (get("enum").is_some() || get("const").is_some());
+            if !matched_solely_by_enum_or_const {
+                // Closed object: no declared properties means every key
+                // is additional.
                 for key in map.keys() {
                     if !props.is_some_and(|p| p.contains_key(key)) {
                         return Err(ContractViolation::AdditionalProperty {
@@ -437,8 +457,46 @@ fn validate_bounds_only(
     path: &str,
     depth: u32,
 ) -> Result<(), ContractViolation> {
-    // Empty schema: only contract bounds, applied recursively.
-    validate_node(contract, &Value::Object(Map::new()), value, path, depth)
+    // No schema: only contract bounds, applied recursively. This is not
+    // a schema node, so closed-object checking does not apply here.
+    if depth > contract.max_depth {
+        return Err(ContractViolation::MaxDepth {
+            path: path.to_string(),
+            max: contract.max_depth,
+            actual: depth,
+        });
+    }
+    match value {
+        Value::Array(a) if a.len() as u64 > contract.max_array_len => {
+            return Err(ContractViolation::MaxArrayLen {
+                path: path.to_string(),
+                max: contract.max_array_len,
+                actual: a.len() as u64,
+            });
+        }
+        Value::String(s) if s.chars().count() as u64 > contract.max_string_len => {
+            return Err(ContractViolation::MaxStringLen {
+                path: path.to_string(),
+                max: contract.max_string_len,
+                actual: s.chars().count() as u64,
+            });
+        }
+        _ => {}
+    }
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map {
+                validate_bounds_only(contract, v, &join_path(path, key), depth + 1)?;
+            }
+        }
+        Value::Array(arr) => {
+            for (i, item) in arr.iter().enumerate() {
+                validate_bounds_only(contract, item, &format!("{path}[{i}]"), depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Iterative, string/escape-aware bracket-depth scan run before any JSON
@@ -571,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn closed_object_without_type_or_properties_refuses_all_keys() {
-        let c = contract(json!({"additionalProperties": false}));
+    fn closed_object_without_properties_refuses_all_keys() {
+        let c = contract(json!({"type": "object", "additionalProperties": false}));
         assert!(validate_value(&c, &json!({})).is_ok());
         let err = validate_value(&c, &json!({"SECRET_SENTINEL": 1})).unwrap_err();
         assert!(
@@ -614,7 +672,7 @@ mod tests {
         assert_eq!(bracket_depth(r#"{"a":"[[[["}"#), 1);
         assert_eq!(bracket_depth(r#"{"a":"\"{"}"#), 1);
         assert_eq!(bracket_depth("[[[1]]]"), 3);
-        let mut c = contract(json!({"type": "array"}));
+        let mut c = contract(json!({"type": "array", "items": {"type": "string"}}));
         c.max_depth = 2;
         assert!(check_pre_parse_depth(&c, "[[[1]]]").is_err());
         assert!(check_pre_parse_depth(&c, "[[1]]").is_ok());
@@ -652,6 +710,37 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn typeless_and_itemless_schemas_refused_at_load() {
+        for schema in [
+            json!({}),
+            json!({"required": ["id"]}),
+            json!({"type": "array"}),
+        ] {
+            let err = ResponseSchema::from_value(schema.clone()).unwrap_err();
+            assert!(
+                matches!(err, GateError::ContractUnsupportedConstruct { .. }),
+                "{schema}: {err}"
+            );
+        }
+        // A valid closed object schema still loads and validates.
+        let c = contract(json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["id"],
+            "properties": {"id": {"type": "string"}}
+        }));
+        assert!(validate_value(&c, &json!({"id": "x"})).is_ok());
+        assert!(validate_value(&c, &json!({"id": "x", "extra": 1})).is_err());
+        // Typeless enum/const schemas still work, including object values.
+        let enum_c = contract(json!({"enum": [{"id": "x"}, "a"]}));
+        assert!(validate_value(&enum_c, &json!({"id": "x"})).is_ok());
+        assert!(validate_value(&enum_c, &json!("a")).is_ok());
+        assert!(validate_value(&enum_c, &json!("c")).is_err());
+        let const_c = contract(json!({"const": {"id": "x"}}));
+        assert!(validate_value(&const_c, &json!({"id": "x"})).is_ok());
+        assert!(validate_value(&const_c, &json!({"id": "y"})).is_err());
     }
 
     #[test]

@@ -1399,7 +1399,7 @@ body_params = ["content"]
             }
             other => panic!("expected utf8 failure, got {other:?}"),
         }
-        let mut deep = test_contract(json!({"type":"array"}), 1_000_000);
+        let mut deep = test_contract(json!({"type":"array","items":{"type":"string"}}), 1_000_000);
         deep.max_depth = 3;
         let body = "[[[[\"SENTINEL\"]]]]";
         let out = evaluate_tool_response(Some(&deep), body, &[]);
