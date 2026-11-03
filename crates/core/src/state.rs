@@ -24,7 +24,7 @@ pub enum StateError {
     )]
     InvalidScope(String),
     #[error(
-        "invalid agent role `{0}`: expected `lead`, `assistant`, `lab_manager`, or `custom:<slug>`"
+        "invalid agent role `{0}`: expected a default role (`lead`, `assistant`, `lab_manager`, `ui-developer`, `web-developer`, `mobile-developer`, `system-developer`, `data-engineer`, `tester`, `strategist`, `journalist`) or `custom:<slug>`"
     )]
     InvalidRole(String),
     #[error("summary must be a single non-empty line of at most 240 characters")]

@@ -595,16 +595,34 @@ mod tests {
             ),
             (
                 "@role:scribe",
-                WireAddress::Role(AgentRole::Custom("scribe".into())),
-                "@role:custom:scribe",
+                WireAddress::Role(AgentRole::Journalist),
+                "@role:journalist",
+            ),
+            (
+                "@role:custom:ui_developer",
+                WireAddress::Role(AgentRole::UiDeveloper),
+                "@role:ui-developer",
+            ),
+            (
+                "@role:reviewer",
+                WireAddress::Role(AgentRole::Custom("reviewer".into())),
+                "@role:custom:reviewer",
             ),
             (
                 "@area:Kaggle-Gemma4/scribe",
                 WireAddress::AreaRole {
                     area: "kaggle-gemma4".into(),
-                    role: AgentRole::Custom("scribe".into()),
+                    role: AgentRole::Journalist,
                 },
-                "@area:kaggle-gemma4/custom:scribe",
+                "@area:kaggle-gemma4/journalist",
+            ),
+            (
+                "@area:Kaggle-Gemma4/auditor",
+                WireAddress::AreaRole {
+                    area: "kaggle-gemma4".into(),
+                    role: AgentRole::Custom("auditor".into()),
+                },
+                "@area:kaggle-gemma4/custom:auditor",
             ),
             (
                 "@area:FerroLoop/lead",

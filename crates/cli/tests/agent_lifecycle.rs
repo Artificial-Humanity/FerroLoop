@@ -162,7 +162,8 @@ fn spin_up_rejects_each_invalid_field_without_touching_the_store() {
         .assert()
         .code(1)
         .stderr(contains(
-            "role must be one of: lead, assistant, ui-developer, strategist, lab-manager",
+            "role must be one of: lead, assistant, ui-developer, web-developer, mobile-developer, \
+system-developer, data-engineer, tester, strategist, journalist, lab-manager",
         ));
     env.spin_up("felicity", "assistant", "gemini")
         .assert()

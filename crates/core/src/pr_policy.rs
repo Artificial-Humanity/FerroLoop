@@ -3,7 +3,7 @@
 //! Deterministic evaluation of commit `Co-authored-by:` trailers, changed file
 //! paths, `AgentRegistry` records, and `<!-- fl-review: ... -->` structured
 //! review markers to enforce the tiered agent rights hierarchy:
-//! `assistant` / `custom:<slug>` -> `lead(<project>)` -> `lab_manager` -> `owner`.
+//! `assistant` / other non-lead roles / `custom:<slug>` -> `lead(<project>)` -> `lab_manager` -> `owner`.
 
 use crate::agent::{AgentRecord, AgentRole, AgentStatus};
 use crate::at::At;
@@ -1091,13 +1091,7 @@ mod tests {
             make_agent(1, "Jarvis", "ai-lab-amd", AgentRole::LabManager, &[]),
             make_agent(2, "Ferris", "ferroloop", AgentRole::Lead, &[]),
             make_agent(3, "Felicia", "ferroloop", AgentRole::Assistant, &[]),
-            make_agent(
-                4,
-                "Kacey",
-                "ferroloop",
-                AgentRole::Custom("scribe".into()),
-                &[],
-            ),
+            make_agent(4, "Kacey", "ferroloop", AgentRole::Journalist, &[]),
             make_agent(5, "Sonya", "sonora", AgentRole::Lead, &[]),
         ]
     }

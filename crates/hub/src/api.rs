@@ -5879,7 +5879,20 @@ pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
         AgentRole::Lead => "lead".to_string(),
         AgentRole::Assistant => "assistant".to_string(),
         AgentRole::LabManager => "lab_manager".to_string(),
-        AgentRole::Custom(slug) => slug.clone(),
+        AgentRole::UiDeveloper => "ui-developer".to_string(),
+        AgentRole::WebDeveloper => "web-developer".to_string(),
+        AgentRole::MobileDeveloper => "mobile-developer".to_string(),
+        AgentRole::SystemDeveloper => "system-developer".to_string(),
+        AgentRole::DataEngineer => "data-engineer".to_string(),
+        AgentRole::Tester => "tester".to_string(),
+        AgentRole::Strategist => "strategist".to_string(),
+        AgentRole::Journalist => "journalist".to_string(),
+        // A custom slug that spells a reserved built-in keeps its `custom:` prefix, so
+        // `agent_role_from_label` does not read the label back as the built-in role.
+        AgentRole::Custom(slug) => match slug.as_str() {
+            "lead" | "assistant" | "lab_manager" | "lab-manager" => format!("custom:{slug}"),
+            _ => slug.clone(),
+        },
     }
 }
 
