@@ -26,6 +26,11 @@ import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
 import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
+  evaluateAgentMcpPosture,
+  type AgentMcpPostureInput,
+  type AgentMcpPostureReport,
+} from "./AgentSettingsModal";
+import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
   DEFAULT_WORKSPACE_AGENTS,
@@ -82,6 +87,11 @@ export interface SettingsModalProps {
   onChangeFontScalePct?: (pct: number) => void;
   onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
+  postureInputsByAgent?: Record<string, Partial<AgentMcpPostureInput>>;
+  onReconcileAgentPosture?: (
+    agentKey: string,
+    report: AgentMcpPostureReport,
+  ) => void;
 }
 
 export const CANONICAL_PROJECTS = [
@@ -323,7 +333,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onChangeFontScalePct,
   onSettingsUpdated,
   apiClient,
+  postureInputsByAgent,
+  onReconcileAgentPosture,
 }) => {
+  const [reconciledPostureAgents, setReconciledPostureAgents] = useState<
+    Set<string>
+  >(() => new Set());
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
@@ -1893,6 +1908,69 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         >
                           {canonicalizeDefaultRole(ag.role)}
                         </span>
+                        {(() => {
+                          const rawPosture = postureInputsByAgent?.[key] ?? {};
+                          const isReconciled = reconciledPostureAgents.has(key);
+                          const report = evaluateAgentMcpPosture({
+                            agentName: ag.name_key,
+                            project: ag.project,
+                            role: ag.role,
+                            ...rawPosture,
+                            ...(isReconciled
+                              ? {
+                                  appliedMcpServers:
+                                    rawPosture.desiredMcpServers,
+                                  liveMcpServers: rawPosture.desiredMcpServers,
+                                  sessionStartedBeforeSync: false,
+                                  sessionRole: ag.role,
+                                  sessionProject: ag.project,
+                                }
+                              : {}),
+                          });
+                          const isSynced = report.driftKind === "synced";
+                          return (
+                            <>
+                              <span
+                                className="fd-badge"
+                                data-testid={`settings-agent-posture-badge-${key}`}
+                                data-posture={report.driftKind}
+                                title={report.summary}
+                                style={{
+                                  fontSize: "10px",
+                                  fontWeight: 600,
+                                  backgroundColor: isSynced
+                                    ? "rgba(16, 185, 129, 0.14)"
+                                    : "rgba(245, 158, 11, 0.16)",
+                                  color: isSynced ? "#34D399" : "#FBBF24",
+                                  borderColor: isSynced
+                                    ? "rgba(16, 185, 129, 0.4)"
+                                    : "rgba(245, 158, 11, 0.45)",
+                                }}
+                              >
+                                {report.badgeLabel}
+                              </span>
+                              {!isSynced && (
+                                <button
+                                  type="button"
+                                  className="fd-btn"
+                                  data-testid={`settings-agent-reconcile-btn-${key}`}
+                                  style={{ fontSize: "10px", padding: "2px 6px" }}
+                                  title={report.summary}
+                                  onClick={() => {
+                                    setReconciledPostureAgents((prev) => {
+                                      const next = new Set(prev);
+                                      next.add(key);
+                                      return next;
+                                    });
+                                    onReconcileAgentPosture?.(key, report);
+                                  }}
+                                >
+                                  {report.remediationLabel}
+                                </button>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
 
                       <div
