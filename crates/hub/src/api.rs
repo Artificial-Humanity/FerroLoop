@@ -5955,6 +5955,10 @@ pub(crate) fn project_state_scope(project: &str) -> String {
 
 pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) -> String {
     let name_lower = name.to_ascii_lowercase();
+    // The handoff key is the lowercase persona. It relies on the upstream persona validators
+    // (`is_valid_persona` / `validate_agent_identity`), which always yield a valid state slug.
+    // Known limitation: a persona named `current` or `checkpoint-<x>` would collide with the shared
+    // handoff key or the checkpoint entries; those names are not reserved here.
     let scope = project_state_scope(project);
     let render_scopes = if scope == "workspace" {
         "--scope workspace".to_string()
@@ -5987,6 +5991,10 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
 /// its work. `role` is a [`reforge_role_label`] value; a Lead hands off to `jarvis`.
 pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &str) -> String {
     let name_lower = name.to_ascii_lowercase();
+    // The handoff key is the lowercase persona. It relies on the upstream persona validators
+    // (`is_valid_persona` / `validate_agent_identity`), which always yield a valid state slug.
+    // Known limitation: a persona named `current` or `checkpoint-<x>` would collide with the shared
+    // handoff key or the checkpoint entries; those names are not reserved here.
     let scope = project_state_scope(project);
     let recipient = match role {
         "lead" => "`jarvis`".to_string(),

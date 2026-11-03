@@ -100,10 +100,22 @@ fn handoff_get_reports_a_missing_key_and_an_invalid_key() {
     let db = cfg.path().join("t.redb");
     set(&cfg, &db, Some("alpha"), "alpha handoff", "alpha");
 
-    get(&cfg, &db, Some("gamma")).assert().failure();
-    get(&cfg, &db, Some("Not A Slug!")).assert().failure();
+    // Not found: a runtime failure (exit 1) with the store's message, not a clap parse error.
+    get(&cfg, &db, Some("gamma"))
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("no handoff `gamma`"));
     // No shared `current` handoff exists yet either.
-    get(&cfg, &db, None).assert().failure();
+    get(&cfg, &db, None)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("no handoff `current`"));
+    // Invalid slug: a distinct validation message, not "no handoff" and not a clap usage error.
+    let bad = get(&cfg, &db, Some("Not A Slug!")).assert().code(1);
+    let stderr = String::from_utf8_lossy(&bad.get_output().stderr).to_string();
+    assert!(stderr.contains("invalid slug `Not A Slug!`"), "{stderr}");
+    assert!(!stderr.contains("no handoff"), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
 }
 
 #[test]

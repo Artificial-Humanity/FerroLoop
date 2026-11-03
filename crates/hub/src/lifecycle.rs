@@ -3863,9 +3863,12 @@ mod tests {
         for (name, role) in [
             ("Felicity", "assistant"),
             ("Ferris", "lead"),
-            ("Ada_2", "lab_manager"),
+            ("Ada-2", "lab_manager"),
         ] {
             let lower = name.to_ascii_lowercase();
+            // The name is one a session can really have (`is_valid_persona` is lowercase letters,
+            // digits and `-`, always a valid slug).
+            assert!(is_valid_persona(&lower), "{lower}");
             let prompts = [
                 canonical_reforge_prompt(name, "FerroLoop", role),
                 synthesize_decommission_prompt(name, "FerroLoop", role),
