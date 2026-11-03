@@ -1,6 +1,7 @@
 //! Pure GitHub feedback evidence. No API access, authentication, delivery or model dispatch.
 //! Callers must authenticate GitHub data, binding receipts, session state and admission separately.
 
+use crate::ferrowire::{MessageKind, SendWireArgs, WireAddress, WireMessage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -20,6 +21,8 @@ pub enum FeedbackError {
 pub enum FeedbackKind {
     CiFailed,
     CiRecovered,
+    /// A completed Actions run that is not an actionable failure or recovery.
+    CiStatus,
     ReviewSubmitted,
     ReviewComment,
     PrComment,
@@ -324,6 +327,8 @@ pub struct GithubFeedbackV1 {
     pub binding_id: String,
     pub binding_revision: u64,
     pub kind: FeedbackKind,
+    /// Typed source retains review state or workflow conclusion.
+    pub source: EventSource,
     pub source_object_id: u64,
     pub source_version: String,
     pub run_attempt: Option<u32>,
@@ -368,7 +373,7 @@ pub struct FeedbackInput<'a> {
     /// Set only after the caller authenticates the broker actor and marker, never from text alone.
     pub authenticated_broker_output: bool,
 }
-/// `None` means status-only Actions evidence or authenticated broker output; neither is routed as a feedback event.
+/// `None` means authenticated broker output. Status-only Actions are retained as non-actionable evidence.
 pub fn normalize_feedback(
     input: &FeedbackInput<'_>,
 ) -> Result<Option<GithubFeedbackV1>, FeedbackError> {
@@ -408,7 +413,7 @@ pub fn normalize_feedback(
             ..
         } => match classify_run(*conclusion, input.previous_run_failed) {
             RunClassification::Feedback(kind) => (kind, Some(*attempt)),
-            RunClassification::StatusOnly => return Ok(None),
+            RunClassification::StatusOnly => (FeedbackKind::CiStatus, Some(*attempt)),
         },
         EventSource::Review { .. } => (FeedbackKind::ReviewSubmitted, None),
         EventSource::ReviewComment { .. } => (FeedbackKind::ReviewComment, None),
@@ -424,6 +429,7 @@ pub fn normalize_feedback(
         binding_id: input.binding_id.into(),
         binding_revision: input.binding_revision,
         kind,
+        source: input.source.clone(),
         source_object_id: input.source.object_id(),
         source_version: input.source.version(),
         run_attempt: attempt,
@@ -583,6 +589,44 @@ pub fn route_feedback_event(
     if current.dispatch_ambiguous {
         return FeedbackRouteDecision::AmbiguousDispatch;
     }
+    // Treat malformed or inconsistent typed evidence as operator-only. The input and
+    // binding still require authentication; this check grants no authority.
+    let source_matches = event.source.validate().is_ok()
+        && event.source.object_id() == event.source_object_id
+        && event.source.version() == event.source_version
+        && event_key(&event.api_origin, event.repository_id, &event.source)
+            .is_ok_and(|key| key == event.event_key)
+        && match &event.source {
+            EventSource::WorkflowRun {
+                attempt,
+                conclusion,
+                ..
+            } => {
+                event.run_attempt == Some(*attempt)
+                    && match conclusion {
+                        RunConclusion::Failure
+                        | RunConclusion::TimedOut
+                        | RunConclusion::ActionRequired => event.kind == FeedbackKind::CiFailed,
+                        RunConclusion::Success => matches!(
+                            event.kind,
+                            FeedbackKind::CiRecovered | FeedbackKind::CiStatus
+                        ),
+                        _ => event.kind == FeedbackKind::CiStatus,
+                    }
+            }
+            EventSource::Review { .. } => {
+                event.kind == FeedbackKind::ReviewSubmitted && event.run_attempt.is_none()
+            }
+            EventSource::ReviewComment { .. } => {
+                event.kind == FeedbackKind::ReviewComment && event.run_attempt.is_none()
+            }
+            EventSource::PrComment { .. } => {
+                event.kind == FeedbackKind::PrComment && event.run_attempt.is_none()
+            }
+        };
+    if !source_matches || event.kind == FeedbackKind::CiStatus {
+        return FeedbackRouteDecision::OperatorPending;
+    }
     if event.schema_version != 1
         || event.trust != FeedbackTrust::ExternalEvidence
         || event.api_origin != binding.api_origin
@@ -623,24 +667,50 @@ pub enum FeedbackDeliveryState {
     RefusedBudget,
     AmbiguousDispatch,
 }
-/// Immutable message arguments selected and persisted by the caller before any insertion.
+/// The complete resolved wire message and its separately bound immutable route, persisted
+/// before insertion. Comparing only send arguments is insufficient because the store can
+/// normalize sender and subject and derive thread or correlation fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedbackWireEnvelope {
-    pub message_id: String,
     pub event_key: String,
     pub routing_revision: u64,
     pub target_agent_id: String,
     pub target_incarnation: String,
-    pub body_json: String,
+    /// Exact arguments committed before `send_wire`.
+    pub send_args: SendWireArgs,
+    /// Expected resolved immutable message including derived correlation.
+    pub message: WireMessage,
 }
 impl FeedbackWireEnvelope {
-    /// Check the complete encoded envelope before persisting or publishing it.
     pub fn validate(&self) -> Result<(), FeedbackError> {
-        if !nonempty(&self.message_id, 256)
-            || !nonempty(&self.event_key, 256)
+        if !nonempty(&self.event_key, 256)
             || !nonempty(&self.target_agent_id, 256)
             || !nonempty(&self.target_incarnation, 256)
-            || serde_json::from_str::<serde_json::Value>(&self.body_json).is_err()
+            || self.message.validate().is_err()
+            || self.send_args.id.as_ref() != Some(&self.message.id)
+            || self.send_args.thread_id.as_ref() != Some(&self.message.thread_id)
+            || self.send_args.sender_id != self.message.sender_id
+            || self.send_args.sender_name != self.message.sender_name
+            || self.send_args.sender_host != self.message.sender_host
+            || self.send_args.to != self.message.to
+            || self.send_args.kind != self.message.kind
+            || self.send_args.urgency != self.message.urgency
+            || (self.send_args.durable
+                || matches!(
+                    self.send_args.kind,
+                    MessageKind::Ask
+                        | MessageKind::Handoff
+                        | MessageKind::TaskOffer
+                        | MessageKind::ApprovalRequest
+                ))
+                != self.message.durable
+            || self.send_args.subject != self.message.subject
+            || self.send_args.body != self.message.body
+            || self.send_args.reply_to != self.message.reply_to
+            || self.send_args.at != self.message.created_at
+            || self.send_args.deadline_at != self.message.deadline_at
+            || serde_json::from_str::<serde_json::Value>(&self.message.body).is_err()
+            || !matches!(&self.message.to, WireAddress::AgentId(id) if id.as_str() == self.target_agent_id)
         {
             return Err(FeedbackError::Invalid("wire envelope"));
         }
@@ -665,12 +735,18 @@ pub enum ExistingMessage {
     ExactMatch,
     Corruption,
 }
-/// A duplicate message ID is success only when every immutable argument is equal.
+/// Match the complete persisted message AND persisted outbox route. An outbox snapshot
+/// alone cannot establish what the message store actually retained.
 pub fn compare_existing_message(
     expected: &FeedbackWireEnvelope,
     existing: &FeedbackWireEnvelope,
+    stored: &WireMessage,
 ) -> ExistingMessage {
-    if expected.validate().is_ok() && existing.validate().is_ok() && expected == existing {
+    if expected.validate().is_ok()
+        && existing.validate().is_ok()
+        && expected == existing
+        && &expected.message == stored
+    {
         ExistingMessage::ExactMatch
     } else {
         ExistingMessage::Corruption
@@ -756,6 +832,79 @@ mod tests {
         assert_eq!(
             classify_run(RunConclusion::Neutral, false),
             RunClassification::StatusOnly
+        );
+    }
+
+    #[test]
+    fn normalized_status_and_review_keep_typed_source() {
+        let cancelled = EventSource::workflow_run(7, 2, RunConclusion::Cancelled).unwrap();
+        let event = normalize_feedback(&feedback_input(&cancelled, ""))
+            .unwrap()
+            .expect("cancelled runs remain visible as status evidence");
+        assert_eq!(event.kind, FeedbackKind::CiStatus);
+        let roundtrip: GithubFeedbackV1 =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(roundtrip, event);
+        let mut active = binding();
+        active.status = BindingStatus::Active;
+        active.authorization = Some(BindingAuthorization::Owner {
+            approval_receipt: "receipt".into(),
+        });
+        let context = RoutingContext {
+            api_origin: "https://api.github.com".into(),
+            repository_id: 42,
+            pr_number: 5,
+            head_repository_id: 42,
+            head_sha: "a".repeat(40),
+            binding_revision: 3,
+            session_incarnation: "incarnation".into(),
+            session_live: true,
+            dispatch_ambiguous: false,
+            binding_verified: true,
+        };
+        assert_eq!(
+            route_feedback_event(&active, &context, &event),
+            FeedbackRouteDecision::OperatorPending
+        );
+        let mut forged = event.clone();
+        forged.kind = FeedbackKind::CiFailed;
+        assert_eq!(
+            route_feedback_event(&active, &context, &forged),
+            FeedbackRouteDecision::OperatorPending
+        );
+        for conclusion in [
+            RunConclusion::Skipped,
+            RunConclusion::Other,
+            RunConclusion::Success,
+        ] {
+            let source = EventSource::workflow_run(8, 1, conclusion).unwrap();
+            let status = normalize_feedback(&feedback_input(&source, ""))
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.kind, FeedbackKind::CiStatus);
+            assert_eq!(
+                route_feedback_event(&active, &context, &status),
+                FeedbackRouteDecision::OperatorPending
+            );
+        }
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["source"]["conclusion"], "cancelled");
+        let neutral = EventSource::workflow_run(7, 2, RunConclusion::Neutral).unwrap();
+        let status = normalize_feedback(&feedback_input(&neutral, ""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.kind, FeedbackKind::CiStatus);
+        assert_eq!(
+            route_feedback_event(&active, &context, &status),
+            FeedbackRouteDecision::OperatorPending
+        );
+        let review = EventSource::review(9, ReviewState::ChangesRequested, "bad").unwrap();
+        let event = normalize_feedback(&feedback_input(&review, "bad"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["source"]["state"],
+            "changes_requested"
         );
     }
 
@@ -919,39 +1068,117 @@ mod tests {
             normalize_feedback(&input).unwrap().unwrap().freshness,
             FeedbackFreshness::Stale
         );
-        let envelope = FeedbackWireEnvelope {
-            message_id: "id".into(),
-            event_key: "key".into(),
-            routing_revision: 1,
-            target_agent_id: "agent".into(),
-            target_incarnation: "inc".into(),
-            body_json: format!("\"{}\"", "a".repeat(MAX_FEEDBACK_ENVELOPE_BYTES)),
-        };
+        let mut envelope = envelope();
+        envelope.message.body = format!("\"{}\"", "a".repeat(MAX_FEEDBACK_ENVELOPE_BYTES));
+        envelope.send_args.body = envelope.message.body.clone();
         assert_eq!(envelope.validate(), Err(FeedbackError::EnvelopeTooLarge));
         assert_eq!(
-            compare_existing_message(&envelope, &envelope),
+            compare_existing_message(&envelope, &envelope, &envelope.message),
             ExistingMessage::Corruption
         );
     }
 
-    #[test]
-    fn outbox_idempotency_requires_every_immutable_field() {
-        let a = FeedbackWireEnvelope {
-            message_id: "id".into(),
+    fn envelope() -> FeedbackWireEnvelope {
+        use crate::at::At;
+        use crate::ferrowire::{MessageKind, MessageUrgency, WireAddress};
+        use crate::ids::{AgentId, MessageId, seq_iri};
+        let recipient = AgentId(seq_iri(2));
+        FeedbackWireEnvelope {
             event_key: "event".into(),
             routing_revision: 1,
-            target_agent_id: "agent".into(),
+            target_agent_id: recipient.as_str().into(),
             target_incarnation: "inc".into(),
-            body_json: "{}".into(),
-        };
-        let mut b = a.clone();
+            send_args: SendWireArgs {
+                id: Some(MessageId(seq_iri(1))),
+                sender_id: Some(AgentId(seq_iri(3))),
+                sender_name: "sender".into(),
+                sender_host: Some("host".into()),
+                to: WireAddress::AgentId(recipient.clone()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "feedback".into(),
+                body: "{}".into(),
+                reply_to: None,
+                thread_id: Some(MessageId(seq_iri(1))),
+                deadline_at: None,
+                at: At::from_unix_millis(1),
+            },
+            message: WireMessage {
+                id: MessageId(seq_iri(1)),
+                thread_id: MessageId(seq_iri(1)),
+                reply_to: None,
+                correlation_id: None,
+                sender_id: Some(AgentId(seq_iri(3))),
+                sender_name: "sender".into(),
+                sender_host: Some("host".into()),
+                to: WireAddress::AgentId(recipient),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "feedback".into(),
+                body: "{}".into(),
+                created_at: At::from_unix_millis(1),
+                deadline_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn outbox_idempotency_requires_every_immutable_field() {
+        use crate::at::At;
+        use crate::ferrowire::{MessageKind, MessageUrgency, WireAddress};
+        use crate::ids::{AgentId, MessageId, seq_iri};
+        let e = envelope();
         assert_eq!(
-            compare_existing_message(&a, &b),
+            compare_existing_message(&e, &e, &e.message),
             ExistingMessage::ExactMatch
         );
-        b.target_incarnation = "other".into();
+        let mut changes: Vec<WireMessage> = Vec::new();
+        macro_rules! change {
+            ($field:ident, $value:expr) => {{
+                let mut m = e.message.clone();
+                m.$field = $value;
+                changes.push(m);
+            }};
+        }
+        change!(id, MessageId(seq_iri(4)));
+        change!(thread_id, MessageId(seq_iri(4)));
+        change!(reply_to, Some(MessageId(seq_iri(4))));
+        change!(correlation_id, Some(MessageId(seq_iri(4))));
+        change!(sender_id, Some(AgentId(seq_iri(4))));
+        change!(sender_name, "other".into());
+        change!(sender_host, Some("other".into()));
+        change!(to, WireAddress::AgentId(AgentId(seq_iri(4))));
+        change!(kind, MessageKind::System);
+        change!(urgency, MessageUrgency::Urgent);
+        change!(durable, false);
+        change!(subject, "other".into());
+        change!(body, "{\"x\":1}".into());
+        change!(created_at, At::from_unix_millis(2));
+        change!(deadline_at, Some(At::from_unix_millis(2)));
+        for message in changes {
+            assert_eq!(
+                compare_existing_message(&e, &e, &message),
+                ExistingMessage::Corruption
+            );
+        }
+        let mut other = e.clone();
+        other.target_incarnation = "other".into();
         assert_eq!(
-            compare_existing_message(&a, &b),
+            compare_existing_message(&e, &other, &e.message),
+            ExistingMessage::Corruption
+        );
+        let mut other = e.clone();
+        other.event_key = "other".into();
+        assert_eq!(
+            compare_existing_message(&e, &other, &e.message),
+            ExistingMessage::Corruption
+        );
+        let mut other = e.clone();
+        other.routing_revision += 1;
+        assert_eq!(
+            compare_existing_message(&e, &other, &e.message),
             ExistingMessage::Corruption
         );
     }
