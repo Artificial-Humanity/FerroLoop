@@ -14,7 +14,8 @@
 //! root up, that holds `.fl/mcp.toml`, else the nearest that holds `.git`. A repo with neither,
 //! or with no catalog, is `missing`. The project directory must be the root itself or the root's
 //! git root, and must not be the hub's home directory or one above it (a `~/.fl/mcp.toml` or a
-//! dotfiles repository would write `~/.mcp.json`): otherwise the row is an `error`.
+//! dotfiles repository would write `~/.mcp.json`), and the home must be known and exist:
+//! otherwise the row is an `error`.
 //!
 //! **`GET /api/v1/mcp/catalog`** answers `{ "repos": [ row, ... ] }`, one row per known repo:
 //!
@@ -214,9 +215,11 @@ fn project_dir(root: &Path) -> Option<(PathBuf, PathBuf)> {
 /// `home`: it is the home directory or above it, or it is neither the root nor the root's git
 /// root. A catalog there is not this repository's.
 fn project_problem(project: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
-    if let Some(home) = home.and_then(|h| fs::canonicalize(h).ok())
-        && home.starts_with(project)
-    {
+    // Fail closed: a home the hub cannot name is a home it cannot keep out of.
+    let Some(home) = home.and_then(|h| fs::canonicalize(h).ok()) else {
+        return Some("cannot determine the home directory; refusing to sync".into());
+    };
+    if home.starts_with(project) {
         return Some(
             "the catalog's project is the home directory or a directory above it, and the hub \
              would write the agent CLIs' files there; run `fl mcp sync` yourself if you mean it"
@@ -459,10 +462,19 @@ fn git_question(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     );
     let end = Instant::now() + GIT_DEADLINE;
+    // The leader is watched without being reaped, so its pid is ours until the group is killed.
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= end => {
+        match exited(pid) {
+            true => {
+                // Anything git started in its group goes with it. SAFETY: the leader is a
+                // zombie, not reaped, so the group number cannot belong to anyone else.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                match child.wait() {
+                    Ok(status) => break status,
+                    Err(e) => return Err(format!("could not wait for git: {e}")),
+                }
+            }
+            false if Instant::now() >= end => {
                 // SAFETY: the child is this process's own and is not yet reaped, so the
                 // process group number is still its own.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
@@ -472,13 +484,9 @@ fn git_question(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
                     GIT_DEADLINE.as_secs()
                 ));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(format!("could not wait for git: {e}")),
+            false => std::thread::sleep(Duration::from_millis(5)),
         }
     };
-    // Anything git started in its group goes with it.
-    // SAFETY: as above; a group with no process left is an error we ignore.
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
     match status.code() {
@@ -489,6 +497,21 @@ fn git_question(dir: &Path, args: &[&str]) -> Result<(i32, Vec<u8>), String> {
             dir.display(),
             String::from_utf8_lossy(&stderr).trim()
         )),
+    }
+}
+
+/// Whether the child `pid` has exited, without reaping it.
+fn exited(pid: i32) -> bool {
+    // SAFETY: `info` is zeroed and written by `waitid`; WNOWAIT leaves the child waitable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        r != 0 || info.si_pid() != 0
     }
 }
 

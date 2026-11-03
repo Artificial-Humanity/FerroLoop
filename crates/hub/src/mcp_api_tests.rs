@@ -1041,3 +1041,43 @@ fn a_linked_dot_codex_into_the_home_directory_is_refused_and_the_home_is_untouch
     // Nothing else was written either: a refusal writes nothing.
     assert!(!f.repo.join(".mcp.json").exists());
 }
+
+#[test]
+fn a_home_the_hub_cannot_determine_closes_the_gate() {
+    // Unit: no home at all, as with `$HOME` unset and no override, and a home that does not exist.
+    let tmp = TempDir::new().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    for home in [None, Some(root.join("no-such-home").as_path())] {
+        let problem = super::project_problem(&root, &root, home).expect("refused");
+        assert!(
+            problem.contains("cannot determine the home directory"),
+            "{problem}"
+        );
+    }
+    assert!(super::project_problem(&root, &root, Some(&root)).is_some());
+    let elsewhere = TempDir::new().unwrap();
+    let other = fs::canonicalize(elsewhere.path()).unwrap();
+    assert_eq!(super::project_problem(&root, &root, Some(&other)), None);
+}
+
+#[test]
+fn a_hub_whose_home_does_not_exist_syncs_nothing() {
+    let f = fixture();
+    let base = fs::canonicalize(f.tmp.path()).unwrap();
+    let state = hub(&base, &f.repo, &base.join("no-such-home"));
+    let body = get(&state);
+    let row = only_row(&body);
+    assert_eq!(row["status"], "error", "{row}");
+    assert!(
+        row["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot determine the home directory")
+    );
+    assert!(row["catalog_digest"].is_null());
+    let before = snapshot(&f.repo);
+    let (status, answer) = sync(&state);
+    assert_eq!(status, 200);
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(snapshot(&f.repo), before);
+}
