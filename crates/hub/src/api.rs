@@ -27,6 +27,7 @@ use fl_core::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId,
     WireAddress, WireFilter, validate_sender_name,
 };
+use fl_core::governor::Principal;
 use fl_core::ids::{GateId, Kind, MessageId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
 use fl_core::log::{AttemptStatus, GateRun};
@@ -51,9 +52,11 @@ use fl_exec::workflow::{
     reject_workflow_step, start_workflow_run,
 };
 use fl_gate::{
-    BridgeTarget, InboundBridgeEvent, ProxyRequest, SetSecretArgs, ToolOutcome, Vault,
-    discover_connectors, evaluate_inbound_bridge_event, execute_proxied_request,
-    handle_mcp_jsonrpc_request, handle_registry_v01_get, verify_inbound_bridge_webhook,
+    BridgeTarget, GateGovernor, GovernedOutcome, InboundBridgeEvent, ProxyRequest, SetSecretArgs,
+    ToolOutcome, Vault, admission_refusal_text, discover_connectors, evaluate_inbound_bridge_event,
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
+    handle_mcp_jsonrpc_request_with_governor_and_secret_provider, handle_registry_v01_get,
+    verify_inbound_bridge_webhook,
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
@@ -7245,12 +7248,135 @@ fn handle_post_gate_call(
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
 
-    // Raw proxy only: no connector tool is named, so no response contract
-    // applies — this surface is Uncontracted by definition (Record #96).
-    match execute_proxied_request(&vault, &proxy_req) {
-        Ok(resp) => HttpResponse::json(200, json!({ "response": resp, "outcome": "uncontracted" })),
-        Err(e) => HttpResponse::json(403, json!({ "error": e.to_string() })),
+    // Raw proxy: no connector tool is named, so no response contract
+    // applies — Uncontracted by definition (Record #96). It is still a
+    // governed dispatch: admit first with legacy-envelope reserved units
+    // (request body + URL bytes, at least 1), settle on execution.
+    // Project binding: `project` is not a ProxyRequest field, so the raw
+    // surface binds the endpoint host as its project scope label.
+    let governor = match hub_gate_governor(state) {
+        Ok(g) => g,
+        Err(()) => return hub_admission_unavailable(),
+    };
+    let (host, path) = match fl_gate::parse_url_scheme_host_port(&proxy_req.url) {
+        Ok((_, h, _)) => {
+            let after = proxy_req
+                .url
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            let p = after
+                .find('/')
+                .map(|i| {
+                    after[i..]
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or("/")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "/".to_string());
+            (h, p)
+        }
+        Err(_) => (String::new(), proxy_req.url.clone()),
+    };
+    let endpoint = fl_core::governor::canonical_endpoint(None, None, &host, &path);
+    let reserved =
+        (proxy_req.body.as_ref().map_or(0, |b| b.len()) + proxy_req.url.len()).max(1) as u64;
+    let mut adm_req = fl_core::governor::AdmissionRequest::new(
+        hub_principal(authority),
+        &host,
+        &endpoint,
+        reserved,
+    );
+    adm_req.caller_agent = proxy_req.caller_agent.clone().unwrap_or_default();
+    let vault_ref = &vault;
+    let proxy_ref = &proxy_req;
+    let dispatch_now = hub_now_ms();
+    match governor.governed_dispatch(&adm_req, dispatch_now, |permit| {
+        // Shared helper re-checks the deadline with a fresh now after prepare.
+        match execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+            vault_ref,
+            proxy_ref,
+            None,
+            None,
+            Some(permit.deadline_mono_ms),
+            &hub_now_ms,
+        ) {
+            Ok(resp) => {
+                let actual = resp.body.len() as u64;
+                fl_gate::DispatchResult::Executed(resp, actual)
+            }
+            Err(fl_gate::DispatchPhaseError::BeforeSend(e)) => {
+                fl_gate::DispatchResult::RefusedBeforeDispatch(e)
+            }
+            Err(fl_gate::DispatchPhaseError::AfterSend(e)) => {
+                fl_gate::DispatchResult::FailedAfterSend(e)
+            }
+        }
+    }) {
+        Ok((resp, _permit)) => {
+            HttpResponse::json(200, json!({ "response": resp, "outcome": "uncontracted" }))
+        }
+        Err(fl_gate::GovernedOrGateError::Refused(
+            fl_core::governor::AdmissionOutcome::AdmissionUnavailable,
+        )) => hub_admission_unavailable(),
+        Err(fl_gate::GovernedOrGateError::Refused(
+            fl_core::governor::AdmissionOutcome::Deferred {
+                reason,
+                retry_after_ms,
+            },
+        )) => HttpResponse::json(
+            429,
+            json!({ "error": "deferred", "reason": reason, "retry_after_ms": retry_after_ms }),
+        ),
+        Err(fl_gate::GovernedOrGateError::Refused(
+            fl_core::governor::AdmissionOutcome::Denied { reason },
+        )) => HttpResponse::json(403, json!({ "error": "denied", "reason": reason })),
+        Err(fl_gate::GovernedOrGateError::Refused(_)) => hub_admission_unavailable(),
+        Err(fl_gate::GovernedOrGateError::Gate(e)) => {
+            HttpResponse::json(403, json!({ "error": e.to_string() }))
+        }
     }
+}
+
+/// Build a GateGovernor over the hub's ONE shared persistent governor
+/// store (lazily built once on `HubState`, then reused by every governed
+/// hub path). Failure is an error, never a legacy ungoverned fallback:
+/// governed surfaces answer 503 `admission_unavailable`. Uses
+/// `GovernorPolicy::default()` (finite `DEFAULT_BUDGET_UNITS` budget)
+/// rather than a locally inflated cap.
+fn hub_gate_governor(state: &HubState) -> Result<std::sync::Arc<GateGovernor>, ()> {
+    let persistent = state.gate_governor_store.get_or_try_init(|| {
+        let store = fl_store::open_store(&state.config.store_path).map_err(|_| ())?;
+        Ok(std::sync::Arc::new(
+            fl_store::PersistentGovernorStore::with_policy(
+                store,
+                fl_core::governor::GovernorPolicy::default(),
+            ),
+        ))
+    })?;
+    Ok(std::sync::Arc::new(GateGovernor::new(persistent)))
+}
+
+fn hub_admission_unavailable() -> HttpResponse {
+    HttpResponse::json(503, json!({ "error": fl_gate::ADMISSION_UNAVAILABLE }))
+}
+
+/// Principal for a hub authority: Owner authority is `Principal::Owner`;
+/// a peer acts under a bundle named for its actor.
+fn hub_principal(authority: &HubAuthority) -> Principal {
+    if authority.is_owner() {
+        Principal::Owner
+    } else {
+        Principal::Bundle(authority.actor_name().to_string())
+    }
+}
+
+fn hub_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn handle_post_gate_mcp(
@@ -7275,15 +7401,71 @@ fn handle_post_gate_mcp(
     )
     .unwrap_or_default();
 
-    match handle_mcp_jsonrpc_request(
+    let governor = match hub_gate_governor(state) {
+        Ok(g) => g,
+        Err(()) => return hub_admission_unavailable(),
+    };
+    // Project binding: the request's `project` field when present, else ""
+    // (the MCP layer then binds the matched connector id).
+    let request_project = rpc_req
+        .get("project")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let principal = hub_principal(authority);
+    match handle_mcp_jsonrpc_request_with_governor_and_secret_provider(
         &rpc_req,
         &vault,
         &connectors,
         connector_filter,
         Some(authority.actor_name().to_string()),
+        Some(&governor),
+        &principal,
+        &request_project,
+        None,
     ) {
         Some(reply) => HttpResponse::json(200, reply),
         None => HttpResponse::json(202, json!({ "accepted": true })),
+    }
+}
+
+/// Bridge connector dispatch through the governor. Governor construction
+/// failure is a typed `admission_unavailable` refusal, never a legacy
+/// direct invoke. Project binding is the connector id.
+fn bridge_governed_execute(
+    state: &HubState,
+    authority: &HubAuthority,
+    conn: &fl_gate::ConnectorManifest,
+    vault: &Vault,
+    tool: &str,
+    args: &Value,
+) -> Result<(fl_gate::ProxyResponse, ToolOutcome), fl_gate::GateError> {
+    let gov = hub_gate_governor(state).map_err(|()| fl_gate::GateError::PolicyDenied {
+        secret: "gate-governor".into(),
+        reason: fl_gate::ADMISSION_UNAVAILABLE.to_string(),
+    })?;
+    let now = hub_now_ms();
+    let project = conn.id.clone();
+    match gov.governed_invoke(
+        conn,
+        vault,
+        tool,
+        args,
+        Some("bridge".to_string()),
+        hub_principal(authority),
+        &project,
+        now,
+        // No real quota observation exists on this path.
+        None,
+    ) {
+        Ok(GovernedOutcome::Completed {
+            response, outcome, ..
+        }) => Ok((response, outcome)),
+        Ok(GovernedOutcome::Refused(outcome)) => Err(fl_gate::GateError::PolicyDenied {
+            secret: "gate-governor".into(),
+            reason: admission_refusal_text(&outcome),
+        }),
+        Err(e) => Err(e),
     }
 }
 
@@ -7385,12 +7567,7 @@ fn handle_post_gate_bridge_webhook(
                 "content": plan.prompt_body,
                 "channel_id": plan.channel_id,
             });
-            match conn.execute_tool_outcome(
-                &vault,
-                &resolved_tool,
-                &args,
-                Some("bridge".to_string()),
-            ) {
+            match bridge_governed_execute(state, authority, conn, &vault, &resolved_tool, &args) {
                 Ok((
                     _resp,
                     ToolOutcome::ContractFailedAfterExecution {
@@ -7433,6 +7610,9 @@ fn handle_post_gate_bridge_webhook(
                         "result": projected,
                     }),
                 ),
+                Err(e) if e.to_string().contains(fl_gate::ADMISSION_UNAVAILABLE) => {
+                    hub_admission_unavailable()
+                }
                 Err(e) => HttpResponse::json(502, json!({ "error": e.to_string(), "plan": plan })),
             }
         }
@@ -7549,6 +7729,43 @@ mod tests {
             "review_policy": "lead-review", "prompt_template": "p"
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn gate_governor_unavailable_is_503_not_legacy_success() {
+        let (tmp, mut state) = roles_test_state();
+        // A directory where the store file should be: opening it fails.
+        let bad = tmp.path().join("store-as-dir");
+        fs::create_dir_all(&bad).unwrap();
+        state.config.store_path = bad;
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_thing", "arguments": {}}
+        }))
+        .unwrap();
+        let (status, value) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/gate/mcp",
+            "owner-test-tok",
+            Some(body),
+        );
+        assert_eq!(status, 503, "{value}");
+        assert_eq!(value["error"], "admission_unavailable");
+        // Raw gate call is governed too: same 503, not a legacy proxy attempt.
+        let body = serde_json::to_vec(&json!({
+            "method": "GET", "url": "https://example.com/x", "headers": {}, "body": null
+        }))
+        .unwrap();
+        let (status, value) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/gate/call",
+            "owner-test-tok",
+            Some(body),
+        );
+        assert_eq!(status, 503, "{value}");
+        assert_eq!(value["error"], "admission_unavailable");
     }
 
     #[test]

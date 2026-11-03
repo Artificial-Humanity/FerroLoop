@@ -9,10 +9,13 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use fl_core::governor::{AdmissionRequest, Principal};
 use fl_gate::{
-    ProxyRequest, SetSecretArgs, Vault, discover_connectors, execute_proxied_request,
-    handle_mcp_jsonrpc_request, import_openapi_to_connector, load_or_init_master_key,
-    resolve_master_key_path, resolve_vault_path,
+    DispatchPhaseError, DispatchResult, GateGovernor, GovernedOrGateError, ProxyRequest,
+    SetSecretArgs, Vault, admission_refusal_text, discover_connectors,
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
+    handle_mcp_jsonrpc_request_with_governor_and_secret_provider, import_openapi_to_connector,
+    load_or_init_master_key, resolve_master_key_path, resolve_vault_path,
 };
 use serde_json::{Value, json};
 
@@ -132,7 +135,22 @@ pub enum VaultCmd {
     },
 }
 
-pub fn run(cwd: &Path, cmd: VaultCmd) -> Result<i32, (i32, String)> {
+/// Run with the CLI's state environment (as wired in `main` the way other
+/// CLI state commands are): `fl vault mcp` opens the configured store
+/// through it so connector dispatch is governed.
+pub fn run_with_state_env(
+    cwd: &Path,
+    cmd: VaultCmd,
+    env: &crate::cmd::state::StateEnv<'_>,
+) -> Result<i32, (i32, String)> {
+    run_inner(cwd, cmd, Some(env))
+}
+
+fn run_inner(
+    cwd: &Path,
+    cmd: VaultCmd,
+    env: Option<&crate::cmd::state::StateEnv<'_>>,
+) -> Result<i32, (i32, String)> {
     match cmd {
         VaultCmd::Init { json } => cmd_init(json),
         VaultCmd::Set {
@@ -168,7 +186,7 @@ pub fn run(cwd: &Path, cmd: VaultCmd) -> Result<i32, (i32, String)> {
             agent,
             timeout_secs,
             json,
-        } => cmd_call(url, method, headers, body, agent, timeout_secs, json),
+        } => cmd_call(url, method, headers, body, agent, timeout_secs, json, env),
         VaultCmd::Connectors { json } => cmd_connectors(cwd, json),
         VaultCmd::ImportOpenapi {
             spec_path,
@@ -176,7 +194,7 @@ pub fn run(cwd: &Path, cmd: VaultCmd) -> Result<i32, (i32, String)> {
             secret,
             out,
         } => cmd_import_openapi(cwd, &spec_path, &id, secret.as_deref(), out.as_deref()),
-        VaultCmd::Mcp { connector } => cmd_mcp(cwd, connector.as_deref()),
+        VaultCmd::Mcp { connector } => cmd_mcp(cwd, connector.as_deref(), env),
         VaultCmd::Install { user, json } => cmd_install(cwd, user, json),
     }
 }
@@ -322,6 +340,7 @@ fn cmd_remove(name: &str, as_json: bool) -> Result<i32, (i32, String)> {
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_call(
     url: String,
     method: String,
@@ -330,6 +349,7 @@ fn cmd_call(
     agent: Option<String>,
     timeout_secs: u64,
     as_json: bool,
+    env: Option<&crate::cmd::state::StateEnv<'_>>,
 ) -> Result<i32, (i32, String)> {
     let mut headers = BTreeMap::new();
     for h in raw_headers {
@@ -354,9 +374,67 @@ fn cmd_call(
     };
     // Raw proxy only: no connector tool is named, so no response contract
     // applies — `fl vault call` is Uncontracted by definition (Record #96).
-    // Connector tools go through `fl vault mcp` / `handle_mcp_jsonrpc_request`,
-    // which enforces contracts via `ToolOutcome`.
-    let resp = execute_proxied_request(&vault, &req).map_err(|e| (1, e.to_string()))?;
+    // It is still a governed dispatch: admit first with legacy-envelope
+    // reserved units (request body + URL bytes, at least 1). When the CLI
+    // store cannot open, the governor has no store and dispatch is refused
+    // with `admission_unavailable`, never a legacy fallback.
+    let governor = cli_gate_governor(env);
+    let (host, path) = match fl_gate::parse_url_scheme_host_port(&req.url) {
+        Ok((_, h, _)) => {
+            let after = req.url.split_once("://").map(|(_, r)| r).unwrap_or("");
+            let p = after
+                .find('/')
+                .map(|i| {
+                    after[i..]
+                        .split(['?', '#'])
+                        .next()
+                        .unwrap_or("/")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "/".to_string());
+            (h, p)
+        }
+        Err(_) => (String::new(), req.url.clone()),
+    };
+    let endpoint = fl_core::governor::canonical_endpoint(None, None, &host, &path);
+    let reserved = (req.body.as_ref().map_or(0, |b| b.len()) + req.url.len()).max(1) as u64;
+    let mut adm_req = AdmissionRequest::new(Principal::Owner, &host, &endpoint, reserved);
+    adm_req.caller_agent = req.caller_agent.clone().unwrap_or_default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let vault_ref = &vault;
+    let req_ref = &req;
+    let resp = match governor.governed_dispatch(&adm_req, now_ms, |permit| {
+        // Shared helper re-checks the deadline with a fresh now after prepare.
+        match execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+            vault_ref,
+            req_ref,
+            None,
+            None,
+            Some(permit.deadline_mono_ms),
+            &|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            },
+        ) {
+            Ok(r) => {
+                let actual = r.body.len() as u64;
+                DispatchResult::Executed(r, actual)
+            }
+            Err(DispatchPhaseError::BeforeSend(e)) => DispatchResult::RefusedBeforeDispatch(e),
+            Err(DispatchPhaseError::AfterSend(e)) => DispatchResult::FailedAfterSend(e),
+        }
+    }) {
+        Ok((r, _permit)) => r,
+        Err(GovernedOrGateError::Refused(outcome)) => {
+            return Err((1, admission_refusal_text(&outcome)));
+        }
+        Err(GovernedOrGateError::Gate(e)) => return Err((1, e.to_string())),
+    };
     if as_json {
         // Structured raw-call output carries the same `outcome` flag as the
         // hub raw gate call: this surface is uncontracted (Record #96).
@@ -435,10 +513,31 @@ fn cmd_import_openapi(
     Ok(0)
 }
 
-fn cmd_mcp(cwd: &Path, connector_filter: Option<&str>) -> Result<i32, (i32, String)> {
+fn cli_gate_governor(env: Option<&crate::cmd::state::StateEnv<'_>>) -> GateGovernor {
+    // Open the CLI's configured store the way other CLI state commands do
+    // (`StateEnv::open_for_scope(None)` — the default `fl state` store).
+    // Failure yields a governor with no store, which refuses governed
+    // dispatch with `admission_unavailable`, never a legacy fallback.
+    let Some(env) = env else {
+        return GateGovernor::none();
+    };
+    match env.open_for_scope(None) {
+        Ok(store) => GateGovernor::new(std::sync::Arc::new(
+            fl_store::PersistentGovernorStore::new(store),
+        )),
+        Err(_) => GateGovernor::none(),
+    }
+}
+
+fn cmd_mcp(
+    cwd: &Path,
+    connector_filter: Option<&str>,
+    env: Option<&crate::cmd::state::StateEnv<'_>>,
+) -> Result<i32, (i32, String)> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let caller_agent = std::env::var("AGENT_PERSONA").ok();
+    let governor = cli_gate_governor(env);
 
     for line_res in stdin.lock().lines() {
         let line = match line_res {
@@ -474,12 +573,19 @@ fn cmd_mcp(cwd: &Path, connector_filter: Option<&str>) -> Result<i32, (i32, Stri
             }
         };
         let connectors = discover_connectors(Some(cwd), None).unwrap_or_default();
-        if let Some(reply) = handle_mcp_jsonrpc_request(
+        // Governed MCP: connector tools go through the governor (store
+        // opened via StateEnv above; project binds to the connector id
+        // inside the MCP layer when no explicit project is supplied).
+        if let Some(reply) = handle_mcp_jsonrpc_request_with_governor_and_secret_provider(
             &req_val,
             &vault,
             &connectors,
             connector_filter,
             caller_agent.clone(),
+            Some(&governor),
+            &Principal::Owner,
+            "",
+            None,
         ) {
             let _ = writeln!(stdout, "{reply}");
             let _ = stdout.flush();

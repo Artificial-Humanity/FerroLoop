@@ -22,6 +22,7 @@ pub mod fault;
 pub mod ferrostate;
 pub mod ferrowire;
 pub mod finding;
+pub mod governor;
 pub mod ids;
 pub mod install;
 pub mod iri;
@@ -100,6 +101,14 @@ pub use ferrowire::{
     validate_wire_body,
 };
 pub use finding::{Finding, FindingError, FindingState};
+pub use governor::{
+    AdmissionOutcome, AdmissionRequest, DEFAULT_BUDGET_UNITS, EndpointAlias, GOVERNANCE_CALLS,
+    GovernorError, GovernorPolicy, GovernorSnapshot, GovernorStore, LogicalOperationId,
+    MemGovernorStore, Permit, PermitRecord, Principal, RecordedOutcome, ReplayAttempt,
+    ReplayDecision, ReplayRecord, ReplayRecordAction, ReplayRequest, ScopeKey, ScopePolicy,
+    ScopeState, SettleRequest, SettledOutcome, SideEffectClass, WindowState, canonical_endpoint,
+    replay_decision, resolve_canonical_endpoint, scopes_for, window_admit,
+};
 pub use ids::{
     AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
     WorkflowId, WorkflowRunId,
