@@ -171,6 +171,45 @@ pub struct CatchUpEvaluation {
     pub clock_step: bool,
 }
 
+/// Durable calculation state; callers atomically persist each returned page and its next state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchUpScan {
+    spec: RoutineSpec,
+    from_utc: String,
+    to_utc: String,
+    catch_up_remaining: u8,
+    candidates: Vec<String>,
+    selecting: bool,
+    stream: RecoveryStream,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RecoveryStream {
+    lower: String,
+    upper: String,
+    cursor: String,
+    local_end: Option<String>,
+    pending: Option<ScheduledInstant>,
+    ready: Option<ScheduledInstant>,
+    exhausted: bool,
+}
+
+impl CatchUpScan {
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+/// A bounded calculation; a watermark may advance only after the emitted records are saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpPage {
+    pub records: Vec<FiringRecord>,
+    pub nominal_processed: usize,
+    pub recorded_through: Option<String>,
+    pub next: CatchUpScan,
+}
+
 fn parse_utc(s: &str) -> Result<DateTime<Utc>, RoutineError> {
     DateTime::parse_from_rfc3339(s)
         .map(|x| x.with_timezone(&Utc))
@@ -190,7 +229,7 @@ pub fn firing_key(routine_id: &str, scheduled_instant_utc: &str) -> Result<Strin
     Ok(format!("{:x}", hash.finalize()))
 }
 
-// POSIX five-field numeric cron; each field supports lists, ranges, and steps.
+// Five-field cron; each field supports lists, ranges, and steps.
 // Unsupported extensions fail closed. Sunday is 0 or 7.
 struct CronField {
     bits: Vec<bool>,
@@ -204,8 +243,17 @@ struct Cron {
     weekday: CronField,
 }
 impl CronField {
-    fn parse(s: &str, low: usize, high: usize) -> Result<Self, RoutineError> {
+    fn parse(s: &str, low: usize, high: usize, names: &[&str]) -> Result<Self, RoutineError> {
         let invalid = || RoutineError::Schedule(format!("invalid cron field {s}"));
+        let value = |input: &str| -> Result<usize, RoutineError> {
+            if let Some(index) = names
+                .iter()
+                .position(|name| input.eq_ignore_ascii_case(name))
+            {
+                return Ok(index + low);
+            }
+            input.parse().map_err(|_| invalid())
+        };
         let mut bits = vec![false; high + 1];
         for part in s.split(',') {
             let (range, step) = match part.split_once('/') {
@@ -218,13 +266,10 @@ impl CronField {
             let (start, end) = if range == "*" {
                 (low, high)
             } else if let Some((a, b)) = range.split_once('-') {
-                (
-                    a.parse().map_err(|_| invalid())?,
-                    b.parse().map_err(|_| invalid())?,
-                )
+                (value(a)?, value(b)?)
             } else {
-                let n = range.parse().map_err(|_| invalid())?;
-                (n, n)
+                let n = value(range)?;
+                (n, if part.contains('/') { high } else { n })
             };
             if start < low || end > high || start > end {
                 return Err(invalid());
@@ -251,11 +296,24 @@ impl Cron {
             ));
         }
         Ok(Self {
-            minute: CronField::parse(f[0], 0, 59)?,
-            hour: CronField::parse(f[1], 0, 23)?,
-            day: CronField::parse(f[2], 1, 31)?,
-            month: CronField::parse(f[3], 1, 12)?,
-            weekday: CronField::parse(f[4], 0, 7)?,
+            minute: CronField::parse(f[0], 0, 59, &[])?,
+            hour: CronField::parse(f[1], 0, 23, &[])?,
+            day: CronField::parse(f[2], 1, 31, &[])?,
+            month: CronField::parse(
+                f[3],
+                1,
+                12,
+                &[
+                    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV",
+                    "DEC",
+                ],
+            )?,
+            weekday: CronField::parse(
+                f[4],
+                0,
+                7,
+                &["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"],
+            )?,
         })
     }
     fn matches(&self, local: NaiveDateTime) -> bool {
@@ -263,9 +321,7 @@ impl Cron {
         let wd = local.weekday().num_days_from_sunday() as usize;
         let weekday = self.weekday.has(wd) || (wd == 0 && self.weekday.has(7));
         let day_match = match (self.day.wildcard, self.weekday.wildcard) {
-            (true, true) => true,
-            (true, false) => weekday,
-            (false, true) => day,
+            (true, true) | (true, false) | (false, true) => day && weekday,
             (false, false) => day || weekday,
         };
         self.minute.has(local.minute() as usize)
@@ -434,6 +490,173 @@ impl Schedule {
         }
     }
 }
+
+// A stream yields complete UTC groups, including every nominal local slot in a DST gap.
+// Search itself is resumable: each page examines at most 100 matching nominal instants and
+// at most 10,000 civil minutes, even when the expression is sparse or the range is very long.
+enum RecoveryStep {
+    Group(ScheduledInstant),
+    Yield,
+    Done,
+}
+impl RecoveryStream {
+    fn new(
+        schedule: &Schedule,
+        lower: DateTime<Utc>,
+        upper: DateTime<Utc>,
+    ) -> Result<Self, RoutineError> {
+        let (cursor, local_end) = match schedule {
+            Schedule::Interval {
+                every_secs,
+                anchor_utc,
+            } => {
+                if *every_secs < 300 || *every_secs > i64::MAX as u64 {
+                    return Err(RoutineError::Schedule("invalid interval".into()));
+                }
+                parse_utc(anchor_utc)?;
+                (utc_string(lower), None)
+            }
+            Schedule::Calendar { cron, .. } => {
+                Cron::parse(cron)?;
+                let tz = schedule.timezone()?;
+                let a = lower.with_timezone(&tz).naive_local();
+                let b = upper.with_timezone(&tz).naive_local();
+                let start = a
+                    .min(b)
+                    .checked_sub_signed(Duration::days(2))
+                    .ok_or(RoutineError::Timestamp)?;
+                let end = a
+                    .max(b)
+                    .checked_add_signed(Duration::days(2))
+                    .ok_or(RoutineError::Timestamp)?;
+                let start = start
+                    .date()
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or(RoutineError::Timestamp)?;
+                (
+                    start.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    Some(end.format("%Y-%m-%dT%H:%M:%S").to_string()),
+                )
+            }
+        };
+        Ok(Self {
+            lower: utc_string(lower),
+            upper: utc_string(upper),
+            cursor,
+            local_end,
+            pending: None,
+            ready: None,
+            exhausted: lower >= upper,
+        })
+    }
+
+    fn next_group(
+        &mut self,
+        schedule: &Schedule,
+        processed: &mut usize,
+        steps: &mut usize,
+    ) -> Result<RecoveryStep, RoutineError> {
+        if let Some(ready) = self.ready.take() {
+            return Ok(RecoveryStep::Group(ready));
+        }
+        loop {
+            if self.exhausted {
+                return Ok(self
+                    .pending
+                    .take()
+                    .map_or(RecoveryStep::Done, RecoveryStep::Group));
+            }
+            if *processed >= 100 || *steps >= 10_000 {
+                return Ok(RecoveryStep::Yield);
+            }
+            let nominal = match schedule {
+                Schedule::Interval {
+                    every_secs,
+                    anchor_utc,
+                } => {
+                    let cursor = parse_utc(&self.cursor)?;
+                    let anchor = parse_utc(anchor_utc)?;
+                    let period = *every_secs as i64;
+                    let mut n = cursor
+                        .timestamp()
+                        .checked_sub(anchor.timestamp())
+                        .ok_or(RoutineError::Timestamp)?
+                        .div_euclid(period)
+                        .max(0);
+                    let instant = loop {
+                        let offset = n
+                            .checked_mul(period)
+                            .and_then(Duration::try_seconds)
+                            .ok_or(RoutineError::Timestamp)?;
+                        let instant = anchor
+                            .checked_add_signed(offset)
+                            .ok_or(RoutineError::Timestamp)?;
+                        if instant > cursor {
+                            break instant;
+                        }
+                        n = n.checked_add(1).ok_or(RoutineError::Timestamp)?;
+                    };
+                    if instant > parse_utc(&self.upper)? {
+                        self.exhausted = true;
+                        continue;
+                    }
+                    self.cursor = utc_string(instant);
+                    *processed += 1;
+                    *steps += 1;
+                    Some(ScheduledInstant {
+                        scheduled_instant_utc: utc_string(instant),
+                        nominal_slots: vec![utc_string(instant)],
+                        coalesced: false,
+                    })
+                }
+                Schedule::Calendar { cron, .. } => {
+                    let local = NaiveDateTime::parse_from_str(&self.cursor, "%Y-%m-%dT%H:%M:%S")
+                        .map_err(|_| RoutineError::Timestamp)?;
+                    let end = NaiveDateTime::parse_from_str(
+                        self.local_end.as_deref().ok_or(RoutineError::Timestamp)?,
+                        "%Y-%m-%dT%H:%M:%S",
+                    )
+                    .map_err(|_| RoutineError::Timestamp)?;
+                    if local > end {
+                        self.exhausted = true;
+                        continue;
+                    }
+                    self.cursor = local
+                        .checked_add_signed(Duration::minutes(1))
+                        .ok_or(RoutineError::Timestamp)?
+                        .format("%Y-%m-%dT%H:%M:%S")
+                        .to_string();
+                    *steps += 1;
+                    if !Cron::parse(cron)?.matches(local) {
+                        continue;
+                    }
+                    *processed += 1;
+                    let instant = resolve_local(schedule.timezone()?, local)?;
+                    if instant <= parse_utc(&self.lower)? || instant > parse_utc(&self.upper)? {
+                        continue;
+                    }
+                    Some(ScheduledInstant {
+                        scheduled_instant_utc: utc_string(instant),
+                        nominal_slots: vec![local.format("%Y-%m-%dT%H:%M:%S").to_string()],
+                        coalesced: false,
+                    })
+                }
+            };
+            if let Some(slot) = nominal {
+                if let Some(pending) = self.pending.as_mut()
+                    && pending.scheduled_instant_utc == slot.scheduled_instant_utc
+                {
+                    pending.nominal_slots.extend(slot.nominal_slots);
+                    pending.coalesced = true;
+                    continue;
+                }
+                if let Some(previous) = self.pending.replace(slot) {
+                    return Ok(RecoveryStep::Group(previous));
+                }
+            }
+        }
+    }
+}
 impl RoutineSpec {
     /// Validate a proposed approval interval; authorization and durable state changes are external.
     pub fn validate_for_approval(&self, at: &str) -> Result<(), RoutineError> {
@@ -582,6 +805,130 @@ impl RoutineSpec {
         next.approval = None;
         Ok((old, next))
     }
+
+    /// Begin a fixed-range scan. The most recent candidates are selected incrementally before
+    /// evidence is emitted. The selected set and allowance then persist through all later pages.
+    pub fn start_catch_up_scan(
+        &self,
+        from: &str,
+        to: &str,
+        watermark: Option<&str>,
+    ) -> Result<CatchUpScan, RoutineError> {
+        let from = parse_utc(from)?;
+        let to = parse_utc(to)?;
+        let lower = watermark
+            .map(parse_utc)
+            .transpose()?
+            .map_or(from, |m| from.max(m));
+        if self.misfire_grace_secs > 3600 {
+            return Err(RoutineError::Validation("invalid misfire grace".into()));
+        }
+        let limit = match self.catch_up {
+            CatchUp::Skip => 0,
+            CatchUp::LatestOnce => 1,
+            CatchUp::Bounded { n: 0..=3 } => match self.catch_up {
+                CatchUp::Bounded { n } => n,
+                _ => unreachable!(),
+            },
+            _ => return Err(RoutineError::Validation("invalid catch-up bound".into())),
+        };
+        let selecting = to > lower && to < parse_utc(&self.expires_at)? && limit > 0;
+        let start = if selecting {
+            let grace = to
+                .checked_sub_signed(Duration::seconds(self.misfire_grace_secs as i64))
+                .and_then(|v| v.checked_sub_signed(Duration::nanoseconds(1)))
+                .ok_or(RoutineError::Timestamp)?;
+            lower.max(grace)
+        } else {
+            lower
+        };
+        Ok(CatchUpScan {
+            spec: self.clone(),
+            from_utc: utc_string(lower),
+            to_utc: utc_string(to),
+            catch_up_remaining: limit,
+            candidates: Vec::new(),
+            selecting,
+            stream: RecoveryStream::new(&self.schedule, start, to)?,
+            finished: lower >= to,
+        })
+    }
+
+    /// Compute one recovery page. At most 100 nominal instants are examined per page; even a
+    /// large coalesced gap is accumulated incrementally. The first phase selects candidates;
+    /// the second emits evidence in chronological order with at most one candidate per page.
+    pub fn catch_up_page(&self, scan: &CatchUpScan) -> Result<CatchUpPage, RoutineError> {
+        if *self != scan.spec {
+            return Err(RoutineError::Validation("scan revision changed".into()));
+        }
+        let mut next = scan.clone();
+        let mut records = Vec::new();
+        let mut processed = 0usize;
+        let mut steps = 0usize;
+        let mut recorded_through = None;
+        let mut planned = false;
+        while !next.finished {
+            let group = next
+                .stream
+                .next_group(&self.schedule, &mut processed, &mut steps)?;
+            match group {
+                RecoveryStep::Yield => break,
+                RecoveryStep::Done => {
+                    if next.selecting {
+                        next.selecting = false;
+                        next.stream = RecoveryStream::new(
+                            &self.schedule,
+                            parse_utc(&next.from_utc)?,
+                            parse_utc(&next.to_utc)?,
+                        )?;
+                        break;
+                    }
+                    next.finished = true;
+                    break;
+                }
+                RecoveryStep::Group(slot) if next.selecting => {
+                    next.candidates.push(slot.scheduled_instant_utc);
+                    if next.candidates.len() > next.catch_up_remaining as usize {
+                        next.candidates.remove(0);
+                    }
+                }
+                RecoveryStep::Group(slot) => {
+                    let candidate = next.candidates.contains(&slot.scheduled_instant_utc)
+                        && next.catch_up_remaining > 0;
+                    if candidate && planned {
+                        next.stream.ready = Some(slot);
+                        break;
+                    }
+                    if candidate {
+                        next.catch_up_remaining -= 1;
+                        planned = true;
+                    }
+                    let instant = slot.scheduled_instant_utc;
+                    records.push(FiringRecord {
+                        firing_key: firing_key(&self.routine_id, &instant)?,
+                        routine_id: self.routine_id.clone(),
+                        revision: self.revision,
+                        scheduled_instant_utc: instant.clone(),
+                        nominal_slots: slot.nominal_slots,
+                        coalesced: slot.coalesced,
+                        state: if candidate {
+                            FiringState::Planned
+                        } else {
+                            FiringState::SkippedMissed
+                        },
+                    });
+                    recorded_through = Some(instant);
+                }
+            }
+        }
+        Ok(CatchUpPage {
+            records,
+            nominal_processed: processed,
+            recorded_through,
+            next,
+        })
+    }
+
     /// Pure recovery calculation. Candidate means eligible for future admission, never a claim.
     pub fn evaluate_catch_up(
         &self,
@@ -592,12 +939,16 @@ impl RoutineSpec {
     ) -> Result<CatchUpEvaluation, RoutineError> {
         let now_time = parse_utc(now)?;
         let slots = self.schedule.instants(from, now, watermark)?;
+        let expiry = parse_utc(&self.expires_at)?;
         let eligible = slots
             .iter()
             .filter(|slot| {
-                parse_utc(&slot.scheduled_instant_utc).is_ok_and(|t| {
-                    now_time - t <= Duration::seconds(self.misfire_grace_secs.min(3600) as i64)
-                })
+                now_time < expiry
+                    && parse_utc(&slot.scheduled_instant_utc).is_ok_and(|t| {
+                        t < expiry
+                            && now_time - t
+                                <= Duration::seconds(self.misfire_grace_secs.min(3600) as i64)
+                    })
             })
             .count();
         let limit = match self.catch_up {
@@ -966,5 +1317,167 @@ mod tests {
         assert_eq!(decoded.misfire_grace_secs, 300);
         assert_eq!(decoded.max_firing_secs, 21_600);
         assert_eq!(decoded.max_firings_per_day, 24);
+    }
+    #[test]
+    fn stepped_day_fields_and_named_cron_match_correctly() {
+        let slots = calendar("0 9 */2 * *")
+            .instants("2026-03-01T00:00:00Z", "2026-03-06T00:00:00Z", None)
+            .unwrap();
+        assert_eq!(
+            slots
+                .iter()
+                .map(|s| s.nominal_slots[0].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-03-01T09:00:00",
+                "2026-03-03T09:00:00",
+                "2026-03-05T09:00:00"
+            ]
+        );
+        let c = calendar("0 9 * MAR MON-FRI");
+        let slots = c
+            .instants("2026-03-01T00:00:00Z", "2026-03-09T00:00:00Z", None)
+            .unwrap();
+        assert_eq!(slots.len(), 5);
+        assert!(
+            calendar("0 9 * Smarch MON")
+                .instants("2026-03-01T00:00:00Z", "2026-03-02T00:00:00Z", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_routine_never_proposes_catchup() {
+        let mut s = spec(interval());
+        s.catch_up = CatchUp::LatestOnce;
+        s.expires_at = "2026-03-08T00:12:00Z".into();
+        let e = s
+            .evaluate_catch_up("2026-03-08T00:00:00Z", "2026-03-08T00:20:00Z", None, 0)
+            .unwrap();
+        assert!(
+            e.records
+                .iter()
+                .all(|r| r.state == FiringState::SkippedMissed)
+        );
+    }
+
+    #[test]
+    fn recovery_pages_preserve_last_candidates_across_long_outage_and_restart() {
+        let mut s = spec(interval());
+        s.catch_up = CatchUp::Bounded { n: 2 };
+        s.expires_at = "2026-12-01T00:00:00Z".into();
+        let mut scan = s
+            .start_catch_up_scan("2026-03-08T00:00:00Z", "2026-06-09T00:00:00Z", None)
+            .unwrap();
+        let mut records = Vec::new();
+        for _ in 0..3000 {
+            let page = s.catch_up_page(&scan).unwrap();
+            assert!(page.nominal_processed <= 100);
+            assert!(
+                page.records
+                    .iter()
+                    .filter(|r| r.state == FiringState::Planned)
+                    .count()
+                    <= 1
+            );
+            records.extend(page.records);
+            scan = serde_json::from_str(&serde_json::to_string(&page.next).unwrap()).unwrap();
+            if scan.finished() {
+                break;
+            }
+        }
+        assert!(scan.finished());
+        assert_eq!(records.len(), 93 * 288);
+        let planned: Vec<_> = records
+            .iter()
+            .filter(|r| r.state == FiringState::Planned)
+            .collect();
+        assert_eq!(planned.len(), 2);
+        assert_eq!(planned[0].scheduled_instant_utc, "2026-06-08T23:55:00Z");
+        assert_eq!(planned[1].scheduled_instant_utc, "2026-06-09T00:00:00Z");
+    }
+    #[test]
+    fn recovery_pages_hold_coalesced_gap_evidence_until_complete() {
+        let mut s = spec(Schedule::Calendar {
+            cron: "*/5 * * * *".into(),
+            tz: "Pacific/Apia".into(),
+        });
+        s.catch_up = CatchUp::LatestOnce;
+        s.expires_at = "2012-01-02T00:00:00Z".into();
+        let mut scan = s
+            .start_catch_up_scan("2011-12-30T09:59:00Z", "2011-12-30T10:00:00Z", None)
+            .unwrap();
+        let mut output = Vec::new();
+        let mut saw_partial_gap = false;
+        for _ in 0..100 {
+            let page = s.catch_up_page(&scan).unwrap();
+            assert!(page.nominal_processed <= 100);
+            if !page.next.selecting
+                && page
+                    .next
+                    .stream
+                    .pending
+                    .as_ref()
+                    .is_some_and(|s| s.nominal_slots.len() >= 100)
+            {
+                saw_partial_gap = true;
+                assert!(page.records.is_empty());
+                assert!(page.recorded_through.is_none());
+            }
+            if !page.records.is_empty() {
+                assert_eq!(
+                    page.recorded_through.as_deref(),
+                    Some("2011-12-30T10:00:00Z")
+                );
+                output.extend(page.records);
+            }
+            scan = serde_json::from_str(&serde_json::to_string(&page.next).unwrap()).unwrap();
+            if scan.finished() {
+                break;
+            }
+        }
+        assert!(scan.finished());
+        assert!(saw_partial_gap);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].nominal_slots.len(), 289);
+        assert!(output[0].coalesced);
+        assert_eq!(output[0].state, FiringState::Planned);
+    }
+    #[test]
+    fn recovery_scan_fences_changes_and_expired_candidates() {
+        let mut s = spec(interval());
+        s.catch_up = CatchUp::LatestOnce;
+        s.expires_at = "2026-03-08T00:12:00Z".into();
+        let scan = s
+            .start_catch_up_scan("2026-03-08T00:00:00Z", "2026-03-08T00:20:00Z", None)
+            .unwrap();
+        let page = s.catch_up_page(&scan).unwrap();
+        assert_eq!(page.records.len(), 4);
+        assert!(
+            page.records
+                .iter()
+                .all(|r| r.state == FiringState::SkippedMissed)
+        );
+        s.revision += 1;
+        assert!(s.catch_up_page(&scan).is_err());
+    }
+
+    #[test]
+    fn weekday_wildcard_step_respects_its_mask() {
+        let slots = calendar("0 9 * MAR */2")
+            .instants("2026-03-01T00:00:00Z", "2026-03-08T00:00:00Z", None)
+            .unwrap();
+        assert_eq!(
+            slots
+                .iter()
+                .map(|s| s.nominal_slots[0].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-03-01T09:00:00",
+                "2026-03-03T09:00:00",
+                "2026-03-05T09:00:00",
+                "2026-03-07T09:00:00"
+            ]
+        );
     }
 }

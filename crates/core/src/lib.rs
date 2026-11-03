@@ -138,9 +138,9 @@ pub use ref_index::{
     RefLocatorClass, RefSource, classify_locator, index_local_source,
 };
 pub use routine::{
-    Allocation, Approval, CatchUp, CatchUpEvaluation, Concurrency, FiringRecord, FiringState,
-    RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork, Schedule,
-    ScheduledInstant, Window, firing_key,
+    Allocation, Approval, CatchUp, CatchUpEvaluation, CatchUpPage, CatchUpScan, Concurrency,
+    FiringRecord, FiringState, RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork,
+    Schedule, ScheduledInstant, Window, firing_key,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use session_protocol::{
