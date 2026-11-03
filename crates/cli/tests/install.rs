@@ -103,16 +103,12 @@ fn dry_run_prints_the_plan_and_creates_nothing() {
         "profile   lab",
         "unmanaged (no install receipt)",
         "ferrostore  dependency",
-        "included because ferrodeck needs ferrowire",
+        "included because ferrodeck needs ferrostore",
         "[requires_approval] ferrogate:init_credentials:vault",
         "[by_profile] ferrostore:register_service:ferrostore@.service",
         "planned actions (none runs as part of a plain install)",
         "0.1.0+unstamped",
     ] {
-        // ferrowire is a dependency only when ferrodeck is the sole reason
-        if want.contains("ferrodeck needs ferrowire") {
-            continue;
-        }
         assert!(out.contains(want), "missing `{want}` in:\n{out}");
     }
     let prefix = w.prefix();
@@ -629,4 +625,75 @@ fn install_manifest_matches_the_code() {
     // the shipped hub unit exists in the repo under the name the manifest gives it
     assert!(repo.join("contrib/ferroloop-hub.service").is_file());
     assert!(repo.join("ui").is_dir());
+}
+
+#[test]
+fn without_a_home_the_default_prefix_cannot_be_located() {
+    let w = World::new();
+    for home in [None, Some("")] {
+        let mut c = Command::cargo_bin("fl").unwrap();
+        c.env_clear().current_dir(w.cwd.path());
+        if let Some(h) = home {
+            c.env("HOME", h);
+        }
+        c.args(["install", "--dry-run"])
+            .assert()
+            .code(3)
+            .stdout("")
+            .stderr(contains(
+                "cannot locate the install prefix: HOME is not set; pass --prefix",
+            ));
+    }
+    // an explicit prefix or an isolated root needs no HOME
+    let mut c = Command::cargo_bin("fl").unwrap();
+    c.env_clear()
+        .env("FL_INSTALL_ROOT", w.root.path())
+        .args(["install", "--dry-run"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_fifo_and_a_huge_file_at_a_planned_path_neither_hang_nor_get_read() {
+    let w = World::new();
+    let bin = w.root.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(bin.join("fl"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let release = w.prefix().join("releases/0.1.0+unstamped/bin");
+    std::fs::create_dir_all(&release).unwrap();
+    let huge = std::fs::File::create(release.join("fl")).unwrap();
+    huge.set_len(300 * 1024 * 1024).unwrap(); // sparse
+    let before = w.trees();
+    let out = w
+        .fl()
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["install", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let c = |suffix: &str| {
+        v["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"].as_str().unwrap().ends_with(suffix))
+            .unwrap_or_else(|| panic!("no conflict at {suffix}: {}", v["conflicts"]))
+            .clone()
+    };
+    assert_eq!(c("/.local/bin/fl")["kind"], "foreign");
+    let big = c("releases/0.1.0+unstamped/bin/fl");
+    assert_eq!(big["kind"], "unreadable");
+    assert!(big["detail"].as_str().unwrap().contains("larger than"));
+    assert_eq!(w.trees(), before);
 }

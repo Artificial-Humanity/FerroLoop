@@ -6,7 +6,7 @@
 
 use clap::Args;
 use fl_core::install::{
-    FileFingerprint, HostInfo, HostProbe, InstallReceipt, InstallRequest, Layout,
+    HostInfo, HostProbe, InstallReceipt, InstallRequest, Layout, MAX_FINGERPRINT_BYTES,
     MAX_MANIFEST_BYTES, MAX_RECEIPT_BYTES, PathState, ReleaseManifest, default_manifest,
     fingerprint, plan,
 };
@@ -99,6 +99,12 @@ fn execute(cmd: &Cmd) -> Result<String, (i32, String)> {
             .filter(|h| !h.is_empty())
             .map(PathBuf::from),
     };
+    if layout.prefix.starts_with("~/") && probe.home.is_none() {
+        return Err((
+            EXIT_REFUSED,
+            "cannot locate the install prefix: HOME is not set; pass --prefix".into(),
+        ));
+    }
     let receipt_display = format!("{}/receipt.json", layout.prefix.trim_end_matches('/'));
     let receipt = read_receipt(&probe, &receipt_display)?;
     let request = InstallRequest {
@@ -179,11 +185,12 @@ fn read_manifest(path: &Path) -> Result<ReleaseManifest, (i32, String)> {
 /// The receipt at `display` (the unexpanded path), if there is one. A receipt
 /// that exists but cannot be read is a refusal, never "unmanaged".
 fn read_receipt(probe: &FsProbe, display: &str) -> Result<Option<InstallReceipt>, (i32, String)> {
-    let real = match probe.resolve(display) {
-        Ok(p) => p,
-        // No home to look in: nothing can be owned there either.
-        Err(_) => return Ok(None),
-    };
+    let real = probe.resolve(display).map_err(|e| {
+        (
+            EXIT_REFUSED,
+            format!("cannot locate the install receipt: {e}"),
+        )
+    })?;
     let raw = read_bounded(&real, MAX_RECEIPT_BYTES).map_err(|e| {
         (
             EXIT_REFUSED,
@@ -203,6 +210,39 @@ fn read_receipt(probe: &FsProbe, display: &str) -> Result<Option<InstallReceipt>
             )
         }),
     }
+}
+
+/// A failure while reading a file the probe opened, in words that do not depend
+/// on the platform's error text.
+fn read_failure(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::InvalidData => e.to_string(),
+        k => k.to_string(),
+    }
+}
+
+/// Open `path` to read it, without blocking and without following a symlink,
+/// then check THAT descriptor is a regular file of bounded size. The `lstat`
+/// that chose to open it may be stale; a FIFO swapped in since would otherwise
+/// block the open, and a symlink swapped in would be followed. `Ok(None)`: not
+/// a regular file any more.
+fn open_regular(path: &Path) -> Result<Option<fs::File>, String> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let f = opts.open(path).map_err(|e| e.kind().to_string())?;
+    let meta = f.metadata().map_err(|e| e.kind().to_string())?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_FINGERPRINT_BYTES {
+        return Err(format!("file is larger than {MAX_FINGERPRINT_BYTES} bytes"));
+    }
+    Ok(Some(f))
 }
 
 /// The real probe: `lstat`, `readlink`, and a read to hash a file. No write.
@@ -251,17 +291,16 @@ impl HostProbe for FsProbe {
         } else if ft.is_dir() {
             PathState::Dir
         } else if ft.is_file() {
-            match fs::File::open(&path).and_then(fingerprint) {
-                Ok(FileFingerprint {
-                    sha256,
-                    has_unit_marker,
-                }) => PathState::File(FileFingerprint {
-                    sha256,
-                    has_unit_marker,
-                }),
-                Err(e) => PathState::Unreadable {
-                    reason: e.kind().to_string(),
+            match open_regular(&path) {
+                Ok(Some(f)) => match fingerprint(f) {
+                    Ok(fp) => PathState::File(fp),
+                    Err(e) => PathState::Unreadable {
+                        reason: read_failure(&e),
+                    },
                 },
+                // Replaced by a non-file between the lstat and the open.
+                Ok(None) => PathState::Other,
+                Err(reason) => PathState::Unreadable { reason },
             }
         } else {
             PathState::Other
@@ -272,6 +311,52 @@ impl HostProbe for FsProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fifo_is_neither_opened_blocking_nor_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The open returns at once (O_NONBLOCK) and the descriptor is not a file.
+        assert!(matches!(open_regular(&fifo), Ok(None)));
+        let probe = FsProbe { home: None };
+        assert_eq!(probe.probe(fifo.to_str().unwrap()), PathState::Other);
+    }
+
+    #[test]
+    fn a_symlink_swapped_in_after_the_lstat_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        fs::write(&target, "x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_regular(&link).is_err(), "O_NOFOLLOW must refuse it");
+    }
+
+    #[test]
+    fn an_oversized_file_is_reported_unreadable_without_being_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(MAX_FINGERPRINT_BYTES + 1).unwrap(); // sparse: no data is written
+        let probe = FsProbe { home: None };
+        match probe.probe(big.to_str().unwrap()) {
+            PathState::Unreadable { reason } => assert!(reason.contains("larger than"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        let ok = dir.path().join("ok");
+        fs::write(&ok, "hello").unwrap();
+        assert!(matches!(
+            probe.probe(ok.to_str().unwrap()),
+            PathState::File(_)
+        ));
+    }
 
     #[test]
     fn prefix_beats_the_isolated_root_beats_the_default() {

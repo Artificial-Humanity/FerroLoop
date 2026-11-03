@@ -1,7 +1,8 @@
 //! `release-manifest.json`: the versioned description of a release.
 
 use super::{
-    MANIFEST_SCHEMA_VERSION, Os, Product, Profile, Target, is_sha256_hex, rel_path_problem,
+    MANIFEST_SCHEMA_VERSION, MAX_NAME_LEN, Os, Product, Profile, Target, file_name_ok,
+    is_sha256_hex, rel_path_problem,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,6 @@ const MAX_ACTIONS: usize = 32;
 const MAX_ALIASES: usize = 8;
 const MAX_PROFILES: usize = 8;
 const MAX_TARGETS: usize = 8;
-const MAX_NAME_LEN: usize = 80;
 const MAX_DETAIL_LEN: usize = 200;
 
 /// Where a release comes from.
@@ -297,13 +297,6 @@ pub enum ManifestError {
     NoTargets { product: String },
 }
 
-fn name_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_NAME_LEN
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@'))
-}
-
 fn bad_name(context: &str, value: &str) -> ManifestError {
     ManifestError::BadName {
         context: context.to_string(),
@@ -400,7 +393,7 @@ impl ReleaseManifest {
             errs.push(ManifestError::BadCommit(c.chars().take(64).collect()));
         }
         if let Some(t) = &self.release.toolchain
-            && !name_ok(t)
+            && !file_name_ok(t)
         {
             errs.push(bad_name("release.toolchain", t));
         }
@@ -502,14 +495,14 @@ impl ReleaseManifest {
             }
         }
         for a in e.aliases.iter().take(MAX_ALIASES) {
-            if !name_ok(a) || a == "fl" {
+            if !file_name_ok(a) || a == "fl" {
                 errs.push(bad_name(&format!("{id}.aliases"), a));
             }
         }
         let mut seen = BTreeSet::new();
         for a in e.actions.iter().take(MAX_ACTIONS) {
             let kind = a.kind.as_wire();
-            if !name_ok(&a.subject) {
+            if !file_name_ok(&a.subject) {
                 errs.push(bad_name(&format!("{id}.actions.subject"), &a.subject));
                 continue;
             }
@@ -613,7 +606,7 @@ impl ReleaseManifest {
         let mut provided: BTreeMap<(Target, Product), usize> = BTreeMap::new();
         for a in &self.artifacts {
             let mut duplicate = false;
-            if !name_ok(&a.id) {
+            if !file_name_ok(&a.id) {
                 errs.push(bad_name("artifacts.id", &a.id));
             } else if !ids.insert(a.id.clone()) {
                 duplicate = true;
@@ -908,6 +901,46 @@ pub(crate) mod tests {
             (
                 "alias with a slash",
                 |m| m.products[2].aliases.push("a/b".into()),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "alias dot",
+                |m| m.products[2].aliases.push(".".into()),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "alias dotdot",
+                |m| m.products[2].aliases.push("..".into()),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "alias leading dash",
+                |m| m.products[2].aliases.push("-x".into()),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "alias with a NUL",
+                |m| m.products[2].aliases.push("a\0b".into()),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "alias too long",
+                |m| m.products[2].aliases.push("a".repeat(81)),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "unit subject dotdot",
+                |m| m.products[2].actions[0].subject = "..".into(),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "unit subject with a slash",
+                |m| m.products[2].actions[0].subject = "../x.service".into(),
+                |e| matches!(e, ManifestError::BadName { .. }),
+            ),
+            (
+                "unit subject leading dash",
+                |m| m.products[2].actions[0].subject = "-x".into(),
                 |e| matches!(e, ManifestError::BadName { .. }),
             ),
             (

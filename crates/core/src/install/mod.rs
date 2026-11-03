@@ -30,9 +30,9 @@ pub use manifest::{
 };
 pub use plan::{
     Approval, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan, InstallRequest,
-    Layout, Management, MapProbe, ModuleRoute, NotInstalled, Origin, PathRole, PathState,
-    PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction, PlannedArtifact, PlannedPath,
-    PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint, plan,
+    Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled, Origin,
+    PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
+    PlannedArtifact, PlannedPath, PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint, plan,
 };
 pub use receipt::{
     InstallReceipt, JournalEntry, JournalPhase, MAX_RECEIPT_BYTES, OwnedAlias, OwnedArtifact,
@@ -267,6 +267,22 @@ pub(crate) fn rel_path_problem(path: &str) -> Option<&'static str> {
         return Some("is nested too deeply");
     }
     None
+}
+
+/// Longest accepted name (alias, unit, catalog entry, artifact id).
+pub(crate) const MAX_NAME_LEN: usize = 80;
+
+/// A single file name or identifier: `[A-Za-z0-9._+@-]`, at most 80 bytes, never
+/// `.` or `..`, never starting with `-`. No separator and no NUL can pass, so a
+/// name joined onto a directory stays inside it.
+pub(crate) fn file_name_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_NAME_LEN
+        && s != "."
+        && s != ".."
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@'))
 }
 
 /// A lowercase 64-digit hex SHA-256.

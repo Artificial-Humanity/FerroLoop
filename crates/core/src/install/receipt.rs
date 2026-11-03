@@ -7,7 +7,7 @@
 //! parse.
 
 use super::manifest::ReleaseKind;
-use super::{Product, Profile, RECEIPT_SCHEMA_VERSION, is_sha256_hex};
+use super::{Product, Profile, RECEIPT_SCHEMA_VERSION, file_name_ok, is_sha256_hex};
 use serde::{Deserialize, Serialize};
 
 /// A receipt larger than this is refused unread.
@@ -186,6 +186,18 @@ fn path_problem(p: &str) -> Option<&'static str> {
     }
 }
 
+/// A symlink target: bounded, no NUL or control character.
+fn link_target_check(field: &'static str, t: &str) -> Result<(), ReceiptError> {
+    if t.is_empty() || t.len() > MAX_PATH_LEN || t.chars().any(char::is_control) {
+        Err(ReceiptError::Bad {
+            field,
+            reason: "is empty, too long, or has a control character",
+        })
+    } else {
+        Ok(())
+    }
+}
+
 impl InstallReceipt {
     /// Parse and validate a receipt.
     pub fn parse(json: &str) -> Result<Self, ReceiptError> {
@@ -246,9 +258,6 @@ impl InstallReceipt {
                 return Err(bad("layout", r));
             }
         }
-        if self.release.name.is_empty() || self.release.name.contains('/') {
-            return Err(bad("release.name", "is empty or contains `/`"));
-        }
         for a in &self.artifacts {
             if !is_sha256_hex(&a.sha256) {
                 return Err(bad("artifacts.sha256", "is not 64 lowercase hex digits"));
@@ -301,6 +310,57 @@ impl InstallReceipt {
                     "is not 64 lowercase hex digits",
                 ));
             }
+        }
+        let name = |field: &'static str, v: &str| {
+            if file_name_ok(v) {
+                Ok(())
+            } else {
+                Err(bad(
+                    field,
+                    "is not an accepted name (letters, digits and . _ - + @, up to 80, no `.`/`..`)",
+                ))
+            }
+        };
+        name("release.version", &self.release.version)?;
+        name("release.name", &self.release.name)?;
+        if let Some(c) = &self.release.commit
+            && !(c.len() == 40 && c.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err(bad("release.commit", "is not 40 lowercase hex digits"));
+        }
+        for a in &self.artifacts {
+            name("artifacts.id", &a.id)?;
+        }
+        for a in &self.aliases {
+            name("aliases.name", &a.name)?;
+            link_target_check("aliases.target", &a.target)?;
+        }
+        for p in &self.paths {
+            if let Some(t) = &p.link_target {
+                link_target_check("paths.link_target", t)?;
+            }
+        }
+        for u in &self.units {
+            name("units.name", &u.name)?;
+            name("units.release", &u.release)?;
+        }
+        for c in &self.catalog_entries {
+            name("catalog_entries.name", &c.name)?;
+            if path_problem(&c.file).is_some() {
+                return Err(bad(
+                    "catalog_entries.file",
+                    "is not a bounded absolute path",
+                ));
+            }
+        }
+        for c in &self.config_blocks {
+            name("config_blocks.block_id", &c.block_id)?;
+            if path_problem(&c.file).is_some() {
+                return Err(bad("config_blocks.file", "is not a bounded absolute path"));
+            }
+        }
+        for j in &self.journal {
+            name("journal.release", &j.release)?;
         }
         Ok(())
     }
@@ -482,19 +542,51 @@ pub(crate) mod tests {
     #[test]
     fn receipt_validation_table() {
         type Mutate = fn(&mut InstallReceipt);
+        // (the field the refusal must name, the corruption)
         let cases: Vec<(&str, Mutate)> = vec![
-            ("hash", |r| r.artifacts[0].sha256 = "xyz".into()),
-            ("dotdot", |r| r.paths[0].path = "/a/../b".into()),
-            ("relative", |r| r.paths[0].path = "a/b".into()),
-            ("nul", |r| r.units[0].path = "/a\0b".into()),
-            ("file-no-hash", |r| r.paths[0].sha256 = None),
-            ("link-no-target", |r| r.paths[1].link_target = None),
-            ("name-slash", |r| r.release.name = "a/b".into()),
+            ("artifacts.sha256", |r| r.artifacts[0].sha256 = "xyz".into()),
+            ("paths.path", |r| r.paths[0].path = "/a/../b".into()),
+            ("paths.path", |r| r.paths[0].path = "a/b".into()),
+            ("units.path", |r| r.units[0].path = "/a\0b".into()),
+            ("paths.sha256", |r| r.paths[0].sha256 = None),
+            ("paths.link_target", |r| r.paths[1].link_target = None),
+            ("release.name", |r| r.release.name = "a/b".into()),
+            ("release.name", |r| r.release.name = "..".into()),
+            ("release.version", |r| r.release.version = "1 0".into()),
+            ("release.commit", |r| r.release.commit = Some("abc".into())),
+            ("artifacts.id", |r| r.artifacts[0].id = "a/b".into()),
+            ("artifacts.id", |r| r.artifacts[0].id = "-rf".into()),
+            ("aliases.name", |r| r.aliases[0].name = "..".into()),
+            ("aliases.name", |r| r.aliases[0].name = "x".repeat(81)),
+            ("aliases.target", |r| r.aliases[0].target = "a\0b".into()),
+            ("aliases.target", |r| r.aliases[0].target = "x".repeat(2000)),
+            ("paths.link_target", |r| {
+                r.paths[1].link_target = Some("a\nb".into())
+            }),
+            ("units.name", |r| r.units[0].name = "a b.service".into()),
+            ("units.release", |r| r.units[0].release = "a/b".into()),
+            ("catalog_entries.name", |r| {
+                r.catalog_entries[0].name = "a\0".into()
+            }),
+            ("catalog_entries.file", |r| {
+                r.catalog_entries[0].file = "rel/x".into()
+            }),
+            ("config_blocks.block_id", |r| {
+                r.config_blocks[0].block_id = "a/b".into()
+            }),
+            ("config_blocks.file", |r| {
+                r.config_blocks[0].file = "/a/../b".into()
+            }),
+            ("journal.release", |r| r.journal[0].release = "x".repeat(81)),
         ];
-        for (name, mutate) in cases {
+        for (field, mutate) in cases {
             let mut r = full_receipt();
             mutate(&mut r);
-            assert!(r.validate().is_err(), "case `{name}` must be refused");
+            let err = r.validate().expect_err(field);
+            assert!(
+                err.to_string().contains(&format!("`{field}`")),
+                "refused for the wrong reason (wanted `{field}`): {err}"
+            );
         }
         let mut r = full_receipt();
         r.schema_version = 2;
