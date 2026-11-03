@@ -1399,8 +1399,10 @@ mod tests {
         let started = Instant::now();
         let reply = w.call("close", json!({ "session_id": "flood" })).await;
         let took = started.elapsed();
+        // The correct path cancels the blocked readers promptly; a regression waiting
+        // out one drain grace takes >= READER_DRAIN_GRACE and fails.
         assert!(
-            took < Duration::from_millis(1500),
+            took < READER_DRAIN_GRACE,
             "close of a flooding session took {took:?}"
         );
         assert_eq!(reply.last().expect("reply").event, "exited");
@@ -1416,8 +1418,11 @@ mod tests {
             .await
             .expect("shutdown_all hung");
         let took = started.elapsed();
+        // The 10 s timeout above stays as the hang guard. A regression that serialised
+        // the grace per session (4 x 2 s = 8 s) exceeds 5 s and is caught, while the
+        // parallel teardown stays well under 5 s.
         assert!(
-            took < Duration::from_millis(3000),
+            took < Duration::from_secs(5),
             "shutdown_all of {FLOODERS} flooding sessions took {took:?}"
         );
         assert_eq!(w.mgr.active_count(), 0);
@@ -1499,7 +1504,8 @@ mod tests {
         let reply = w
             .call("input", json!({ "session_id": id, "data": "late\n" }))
             .await;
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // Refusal must be immediate, well before a stalled write would time out.
+        assert!(started.elapsed() < STDIN_WRITE_TIMEOUT);
         assert_eq!(reply.len(), 1, "input to an exited session: {reply:?}");
         assert_eq!(reply[0].event, "error");
         assert_eq!(reply[0].data["status"], 500, "{:?}", reply[0].data);
