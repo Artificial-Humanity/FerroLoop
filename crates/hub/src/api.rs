@@ -4868,42 +4868,33 @@ fn handle_post_session_prompt(
             );
         }
         let now_ms = stamp::now().unix_millis();
-        for (idx, (att, decoded)) in payload.attachments.iter().zip(&decoded_files).enumerate() {
-            let mut sanitized: String = att
-                .name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            sanitized = sanitized.trim_start_matches('.').to_string();
-            if sanitized.is_empty() {
-                sanitized = "attachment.bin".to_string();
-            }
-            let saved_name = format!("{now_ms}-{idx}-{sanitized}");
-            let saved_path = dir.join(&saved_name);
-            if let Err(e) = fs::write(&saved_path, decoded) {
-                // Do not leave the files of a failed prompt behind.
-                let _ = fs::remove_file(&saved_path);
-                for saved in &saved_attachments {
-                    let _ = fs::remove_file(&saved.path);
-                }
+        let names: Vec<String> = payload
+            .attachments
+            .iter()
+            .map(|att| policy::sanitize_upload_name(&att.name))
+            .collect();
+        let files: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(&decoded_files)
+            .map(|(name, decoded)| (name.as_str(), decoded.as_slice()))
+            .collect();
+        let stored = match policy::save_attachment_files(&dir, now_ms, &files) {
+            Ok(stored) => stored,
+            Err(e) => {
                 return HttpResponse::json(
                     500,
                     json!({ "error": format!("failed to write attachment: {e}") }),
                 );
             }
+        };
+        for ((name, decoded), file) in names.into_iter().zip(&decoded_files).zip(stored) {
             // The client's `media_type` is not stored: the hub derives it from the file.
-            let media_type = policy::stored_media_type(&sanitized, decoded);
+            let media_type = policy::stored_media_type(&name, decoded);
             saved_attachments.push(SavedPromptAttachment {
-                name: sanitized,
+                name,
                 media_type,
-                path: saved_path.display().to_string(),
-                url: format!("/api/v1/attachments/{saved_name}"),
+                path: file.path.display().to_string(),
+                url: format!("/api/v1/attachments/{}", file.saved_name),
             });
         }
         // Expire old attachments in the background; the files just saved are younger than any

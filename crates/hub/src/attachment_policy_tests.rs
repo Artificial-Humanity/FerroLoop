@@ -408,3 +408,182 @@ fn static_files_over_the_cap_or_behind_an_escaping_symlink_are_refused() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, b"<html>spa</html>");
 }
+
+#[test]
+fn a_name_ending_in_a_direction_mark_or_nul_is_stored_harmless_and_served_as_a_download() {
+    let env = env();
+    let html = b"<script>1</script>";
+    for raw in [
+        "a.html\u{200F}",
+        "a.html\u{200B}",
+        "a.html\0",
+        "a.html\u{202E}",
+    ] {
+        let resp = post_prompt(&env, vec![attachment(raw, "text/html", html)]);
+        assert_eq!(resp.status, 200, "{raw:?}");
+        let body = resp.json_value().unwrap();
+        let name = body["attachments"][0]["name"].as_str().unwrap();
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')),
+            "{name}"
+        );
+        assert_eq!(
+            body["attachments"][0]["media_type"],
+            "application/octet-stream"
+        );
+        let served = get(&env, body["attachments"][0]["url"].as_str().unwrap());
+        assert_eq!(served.status, 200);
+        assert_eq!(served.content_type, "application/octet-stream");
+        assert!(
+            header(&served, "Content-Disposition")
+                .unwrap()
+                .starts_with("attachment;")
+        );
+        assert_locked_down(&served);
+    }
+}
+
+#[test]
+fn head_carries_the_same_headers_as_get() {
+    let env = env();
+    env.plant("1-0-page.html", b"<script>1</script>");
+    env.plant("1-0-pic.png", PNG);
+    for name in ["1-0-page.html", "1-0-pic.png"] {
+        let url = format!("/api/v1/attachments/{name}");
+        let got = get(&env, &url);
+        let head = handle_http_request(
+            &env.state,
+            &HttpRequest::new("HEAD", &url).with_header("Authorization", format!("Bearer {OWNER}")),
+        );
+        assert_eq!(head.status, 200, "{name}");
+        assert_eq!(head.content_type, got.content_type, "{name}");
+        assert_locked_down(&head);
+        assert_eq!(
+            header(&head, "Content-Disposition"),
+            header(&got, "Content-Disposition"),
+            "{name}"
+        );
+        let wire = String::from_utf8_lossy(&head.to_http_bytes(true)).to_string();
+        assert!(wire.contains("X-Content-Type-Options: nosniff"), "{wire}");
+        assert!(wire.ends_with("\r\n\r\n"), "no body on the wire for HEAD");
+    }
+}
+
+#[test]
+fn a_long_name_is_cut_but_keeps_its_extension_for_every_decision() {
+    let env = env();
+    let long = "x".repeat(400);
+    // A long name still gets the blocked-extension check on its real extension.
+    let blocked = post_prompt(&env, vec![attachment(&format!("{long}.html"), "", b"<p>")]);
+    assert_eq!(blocked.status, 415);
+    assert_eq!(env.stored_count(), 0);
+
+    let resp = post_prompt(
+        &env,
+        vec![attachment(&format!("{long}.png"), "text/html", PNG)],
+    );
+    assert_eq!(resp.status, 200);
+    let body = resp.json_value().unwrap();
+    let name = body["attachments"][0]["name"].as_str().unwrap();
+    assert_eq!(name.len(), crate::attachment_policy::MAX_SAVED_NAME_CHARS);
+    assert!(name.ends_with(".png"), "{name}");
+    assert_eq!(body["attachments"][0]["media_type"], "image/png");
+    let served = get(&env, body["attachments"][0]["url"].as_str().unwrap());
+    assert_eq!(served.status, 200);
+    assert_eq!(served.content_type, "image/png");
+
+    // A long name with no usable extension, and the degenerate shapes.
+    use crate::attachment_policy::sanitize_upload_name as clean;
+    assert_eq!(clean(&"y".repeat(500)).len(), 120);
+    let weird = format!("{}.{}", "z".repeat(200), "e".repeat(40));
+    assert_eq!(clean(&weird).len(), 120);
+    assert_eq!(clean("..."), "attachment.bin");
+    assert_eq!(clean("..hidden.txt"), "hidden.txt");
+    assert_eq!(clean("a b\"c.txt"), "a_b_c.txt");
+}
+
+#[test]
+fn a_taken_name_gets_a_counter_instead_of_being_overwritten() {
+    let env = env();
+    fs::create_dir_all(env.attachments()).unwrap();
+    let dir = env.attachments();
+    fs::write(dir.join("7-0-a.txt"), "someone else's").unwrap();
+    let stored = crate::attachment_policy::save_attachment_files(
+        &dir,
+        7,
+        &[("a.txt", &b"mine"[..]), ("b.txt", &b"also mine"[..])],
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.join("7-0-a.txt")).unwrap(),
+        "someone else's"
+    );
+    assert_ne!(stored[0].saved_name, "7-0-a.txt");
+    assert!(
+        stored[0].saved_name.ends_with("_a.txt"),
+        "{}",
+        stored[0].saved_name
+    );
+    assert_eq!(fs::read(&stored[0].path).unwrap(), b"mine");
+    assert_eq!(stored[1].saved_name, "7-1-b.txt");
+    // The retry name is still upload-shaped, so the sweep can expire it.
+    let parts: Vec<&str> = stored[0].saved_name.splitn(3, '-').collect();
+    assert!(parts[0].parse::<u64>().is_ok() && parts[1].parse::<u64>().is_ok());
+}
+
+#[test]
+fn a_failed_save_removes_exactly_the_files_this_call_created() {
+    let env = env();
+    fs::create_dir_all(env.attachments()).unwrap();
+    let dir = env.attachments();
+    // Another prompt's file has the first-try name of our first file.
+    fs::write(dir.join("9-0-a.txt"), "concurrent").unwrap();
+    fs::write(dir.join("9-2-c.txt"), "also concurrent").unwrap();
+    let calls = std::cell::Cell::new(0);
+    let result = crate::attachment_policy::save_attachment_files_with(
+        &dir,
+        9,
+        &[
+            ("a.txt", &b"one"[..]),
+            ("b.txt", &b"two"[..]),
+            ("c.txt", &b"three"[..]),
+        ],
+        |file, bytes| {
+            use std::io::Write;
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                // The third file is half written and then fails.
+                file.write_all(&bytes[..1])?;
+                return Err(std::io::Error::other("disk full"));
+            }
+            file.write_all(bytes)
+        },
+    );
+    assert!(result.is_err());
+    let mut left: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["9-0-a.txt", "9-2-c.txt"]);
+    assert_eq!(
+        fs::read_to_string(dir.join("9-0-a.txt")).unwrap(),
+        "concurrent"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("9-2-c.txt")).unwrap(),
+        "also concurrent"
+    );
+}
+
+#[test]
+fn the_aggregate_limit_is_reachable_inside_the_http_request_cap() {
+    use crate::attachment_policy::HTTP_ENVELOPE_ALLOWANCE_BYTES;
+    assert_eq!(MAX_ATTACHMENTS_TOTAL_BYTES, 18_087_936);
+    let base64_of_all = MAX_ATTACHMENTS_TOTAL_BYTES.div_ceil(3) * 4;
+    assert!(
+        base64_of_all + HTTP_ENVELOPE_ALLOWANCE_BYTES <= crate::ws::MAX_HTTP_REQUEST_BYTES,
+        "a request at the aggregate limit must fit the HTTP reader cap"
+    );
+}

@@ -24,8 +24,9 @@
 //!   caps its file size.
 
 use std::fs;
-use std::io::Read;
-use std::path::Path;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::json;
 
@@ -35,10 +36,22 @@ use crate::api::HttpResponse;
 /// one maximal file still fits in the HTTP request cap ([`crate::ws::MAX_HTTP_REQUEST_BYTES`]).
 pub(crate) const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 
-/// The most decoded bytes one prompt may attach. This is what fits in the HTTP request cap
-/// after base64 (4 characters carry 3 bytes), so the limit holds for a caller that reaches the
-/// handler without the HTTP reader.
-pub(crate) const MAX_ATTACHMENTS_TOTAL_BYTES: usize = crate::ws::MAX_HTTP_REQUEST_BYTES / 4 * 3;
+/// What the JSON envelope of a prompt (the prompt text, field names, quotes) may take of the HTTP
+/// request cap, which the attachments' base64 shares.
+pub(crate) const HTTP_ENVELOPE_ALLOWANCE_BYTES: usize = 1024 * 1024;
+
+/// The most decoded bytes one prompt may attach: what fits in the HTTP request cap
+/// ([`crate::ws::MAX_HTTP_REQUEST_BYTES`]) after the envelope allowance and base64 (4 characters
+/// carry 3 bytes), 17.25 MiB. The HTTP reader refuses a larger request first; the limit also
+/// holds for a caller that reaches the handler without it.
+pub(crate) const MAX_ATTACHMENTS_TOTAL_BYTES: usize =
+    (crate::ws::MAX_HTTP_REQUEST_BYTES - HTTP_ENVELOPE_ALLOWANCE_BYTES) / 4 * 3;
+
+/// The longest file name the hub stores for an upload, before the `<epoch_ms>-<n>-` prefix.
+pub(crate) const MAX_SAVED_NAME_CHARS: usize = 120;
+
+/// The longest extension (with its dot) kept when a long name is cut to [`MAX_SAVED_NAME_CHARS`].
+const MAX_KEPT_EXTENSION_CHARS: usize = 17;
 
 /// The most files one prompt may attach.
 pub(crate) const MAX_ATTACHMENTS_PER_PROMPT: usize = 16;
@@ -129,6 +142,127 @@ pub(crate) fn stored_media_type(saved_name: &str, bytes: &[u8]) -> String {
     recognised_type(saved_name, bytes)
         .unwrap_or(OCTET_STREAM)
         .to_string()
+}
+
+/// The name an upload is stored under: ASCII letters, digits, `.`, `-` and `_` (anything else,
+/// NUL, direction marks and zero-width characters included, becomes `_`), no leading dot, never
+/// empty, and at most [`MAX_SAVED_NAME_CHARS`] long. A longer name loses the end of its stem and
+/// keeps its extension (up to 16 characters), so the type decisions still see the same extension.
+pub(crate) fn sanitize_upload_name(raw: &str) -> String {
+    let mapped: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = mapped.trim_start_matches('.');
+    if name.is_empty() {
+        return "attachment.bin".to_string();
+    }
+    if name.len() <= MAX_SAVED_NAME_CHARS {
+        return name.to_string();
+    }
+    // All ASCII from here, so byte offsets are character offsets.
+    let ext_start = name
+        .rfind('.')
+        .filter(|&i| i > 0 && name.len() - i <= MAX_KEPT_EXTENSION_CHARS)
+        .unwrap_or(name.len());
+    let ext = &name[ext_start..];
+    format!("{}{ext}", &name[..MAX_SAVED_NAME_CHARS - ext.len()])
+}
+
+/// Counter that makes the retry name of a colliding upload unique within this process.
+static COLLISION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How many names one file tries before the save fails.
+const MAX_NAME_ATTEMPTS: usize = 64;
+
+/// One file [`save_attachment_files`] stored.
+#[derive(Debug)]
+pub(crate) struct StoredFile {
+    /// The file name inside the attachments directory (`<epoch_ms>-<n>-<name>`, or with a
+    /// collision counter in front of the name).
+    pub(crate) saved_name: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Store `files` (sanitised name, bytes) in `dir` as `<now_ms>-<index>-<name>`.
+///
+/// A file is created with `create_new`, so an existing file is never overwritten or truncated:
+/// when the name is taken (another prompt in the same millisecond, or a file put there by hand)
+/// the file is stored as `<now_ms>-<index>-<counter>_<name>` with a process-wide counter instead.
+/// If any file fails to store, the files this call created are removed and no other file is
+/// touched.
+pub(crate) fn save_attachment_files(
+    dir: &Path,
+    now_ms: u64,
+    files: &[(&str, &[u8])],
+) -> io::Result<Vec<StoredFile>> {
+    save_attachment_files_with(dir, now_ms, files, |file, bytes| file.write_all(bytes))
+}
+
+pub(crate) fn save_attachment_files_with(
+    dir: &Path,
+    now_ms: u64,
+    files: &[(&str, &[u8])],
+    write: impl Fn(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<Vec<StoredFile>> {
+    let mut stored: Vec<StoredFile> = Vec::with_capacity(files.len());
+    for (idx, (name, bytes)) in files.iter().enumerate() {
+        match store_one(dir, now_ms, idx, name, bytes, &write) {
+            Ok(file) => stored.push(file),
+            Err(e) => {
+                for file in &stored {
+                    let _ = fs::remove_file(&file.path);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(stored)
+}
+
+fn store_one(
+    dir: &Path,
+    now_ms: u64,
+    idx: usize,
+    name: &str,
+    bytes: &[u8],
+    write: &impl Fn(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<StoredFile> {
+    for attempt in 0..MAX_NAME_ATTEMPTS {
+        let saved_name = if attempt == 0 {
+            format!("{now_ms}-{idx}-{name}")
+        } else {
+            let n = COLLISION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            format!("{now_ms}-{idx}-{n}_{name}")
+        };
+        let path = dir.join(&saved_name);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // This call created the file, so it may remove it.
+        if let Err(e) = write(&mut file, bytes) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(e);
+        }
+        return Ok(StoredFile { saved_name, path });
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free attachment name",
+    ))
 }
 
 /// Whether a recognised type is safe to show inside the page that fetched it. Images, plain text
