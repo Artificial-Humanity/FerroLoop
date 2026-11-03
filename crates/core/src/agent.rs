@@ -88,8 +88,10 @@ impl AgentRole {
     /// `scribe` / `custom:scribe` (now `journalist`).
     pub fn from_wire(s: &str) -> Result<Self, StateError> {
         let lower = s.trim().to_ascii_lowercase();
-        // Bare words are only the built-ins; `custom:<name>` also folds into
-        // a built-in when `<name>` is one of the non-structural defaults.
+        // Bare `lead` / `assistant` / `lab_manager` / `lab-manager` are the structural
+        // built-ins. Every other default (`tester`, `scribe`, `ui-developer`, ...) is
+        // accepted bare or as `custom:<name>`; `custom:lead`, `custom:assistant` and
+        // `custom:lab_manager` stay `Custom`, distinct from the structural roles.
         match lower.as_str() {
             "lead" => return Ok(Self::Lead),
             "assistant" => return Ok(Self::Assistant),
@@ -368,6 +370,19 @@ mod tests {
         ];
         for (raw, expected) in aliases {
             assert_eq!(AgentRole::from_wire(raw).unwrap(), expected, "{raw}");
+        }
+        for (raw, slug) in [
+            ("custom:lead", "lead"),
+            ("custom:assistant", "assistant"),
+            ("custom:lab_manager", "lab_manager"),
+            ("custom:lab-manager", "lab-manager"),
+        ] {
+            let role = AgentRole::from_wire(raw).unwrap();
+            assert_eq!(role, AgentRole::Custom(slug.into()), "{raw}");
+            assert_ne!(role, AgentRole::Lead);
+            assert_ne!(role, AgentRole::Assistant);
+            assert_ne!(role, AgentRole::LabManager);
+            assert_eq!(role.as_wire(), raw);
         }
         assert!(AgentRole::from_wire("leed").is_err());
         assert!(AgentRole::from_wire("reviewer").is_err());

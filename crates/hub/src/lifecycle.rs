@@ -3359,6 +3359,44 @@ mod tests {
     use fl_core::at::At;
     use tempfile::TempDir;
 
+    #[test]
+    fn reforge_role_label_round_trips_through_agent_role_from_label() {
+        let mut roles = vec![
+            AgentRole::Lead,
+            AgentRole::Assistant,
+            AgentRole::LabManager,
+            AgentRole::UiDeveloper,
+            AgentRole::WebDeveloper,
+            AgentRole::MobileDeveloper,
+            AgentRole::SystemDeveloper,
+            AgentRole::DataEngineer,
+            AgentRole::Tester,
+            AgentRole::Strategist,
+            AgentRole::Journalist,
+        ];
+        for slug in [
+            "lead",
+            "assistant",
+            "lab_manager",
+            "lab-manager",
+            "reviewer",
+        ] {
+            roles.push(AgentRole::Custom(slug.into()));
+        }
+        for role in roles {
+            let label = reforge_role_label(&role);
+            assert_eq!(agent_role_from_label(&label), role, "{label}");
+        }
+        assert_eq!(
+            reforge_role_label(&AgentRole::Custom("lead".into())),
+            "custom:lead"
+        );
+        assert_eq!(
+            reforge_role_label(&AgentRole::Custom("reviewer".into())),
+            "reviewer"
+        );
+    }
+
     fn req(persona: &str, role: &str, vendor: &str) -> SpinUpRequest {
         SpinUpRequest {
             persona: persona.into(),
