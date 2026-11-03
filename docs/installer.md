@@ -321,11 +321,22 @@ secret:
 | `ferroloop-hub.service` | `{{LAUNCHER}} hub serve --listen 127.0.0.1:8420 --ui-dir {{PREFIX}}/current/ui/dist` | `Wants=` and `After=` `ferrostore.service ferrowire.service` |
 
 The instance of `ferrostore@.service` is the store's absolute path as `systemd-escape --path`
-writes it; `%f` unescapes it, and a missing store is refused (no `--create`). The hub gets its
-bundle from `--ui-dir`, which wins over `[hub] ui_dir`; the unit sets no `WorkingDirectory`, so
-the hub and its terminal sessions start in the home directory. The store units set
-`NoNewPrivileges=yes`; the hub does not, because an owner terminal session runs `sudo`. The
-tests parse every template, check each `ExecStart` against the built `fl` and `ferrostore`
+writes it; `%f` unescapes it, and a missing store is refused (no `--create`). Its start limit
+is `StartLimitIntervalSec=60`, `StartLimitBurst=5`: with `RestartSec=3` an instance that fails
+at once would otherwise retry every 3 seconds for ever, and five starts in 60 seconds stop it.
+The other units set no start limit; with `Restart=on-failure` and `RestartSec=3` they stay
+inside systemd's default (5 starts in 10 seconds) and retry every 3 seconds. The hub gets its
+bundle from `--ui-dir`, which wins over `[hub] ui_dir`. The hub unit sets no
+`WorkingDirectory`, so the hub starts in the home directory and that is its repository root.
+It is the headless, UI-serving shape: the views that need a repository (worktrees, worktree
+diffs, architecture, commands and skills, repository paths) show nothing useful, code search
+answers empty and never scans the home directory (`$HOME` as the root is the only case the hub
+refuses), and an owner terminal session starts in the home directory. A hub bound to a
+repository needs `WorkingDirectory=<repo>` in a drop-in (`systemctl --user edit
+ferroloop-hub.service`). The store units set `NoNewPrivileges=yes`; the hub does not, because
+an owner terminal session runs `sudo`. `render_unit` refuses a launcher or prefix that has
+white space, `%`, `$`, a quote, a backslash or a brace, so such an install prefix cannot get a
+unit (choose another `--prefix`). The tests parse every template, check each `ExecStart` against the built `fl` and `ferrostore`
 `--help`, and check the staging of a `--from-git` build. `contrib/ferroloop-hub.service` is the
 reference of a hand-deployed unit and is not a template.
 

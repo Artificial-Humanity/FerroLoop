@@ -3,9 +3,12 @@
 # `systemd-escape --path` writes it, for example
 #   systemctl --user enable --now "ferrostore@$(systemd-escape --path /data/proj/state.fls).service"
 # The store must exist (`ferrostore serve` without --create refuses a missing one).
+# A missing store fails every start; five starts in 60 seconds stop the retries (start limit).
 # This unit holds no secret.
 [Unit]
 Description=FerroStore server (%f)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

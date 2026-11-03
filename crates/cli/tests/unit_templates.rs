@@ -21,6 +21,17 @@ fn exec_start(text: &str) -> String {
         .to_string()
 }
 
+/// Whether `help` names `flag` as a whole word: clap writes `--flag <VALUE>`, `--flag` or
+/// `-s, --flag`, so `--listen` is not found inside `--listen-all`.
+fn names_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(i, _)| {
+        let before = help[..i].chars().next_back();
+        let after = help[i + flag.len()..].chars().next();
+        matches!(before, Some(' ' | ',' | '\n') | None)
+            && matches!(after, Some(' ' | ',' | '=' | '\n') | None)
+    })
+}
+
 /// The `fl` units and the subcommand path each must run.
 const FL_UNITS: [(&str, &[&str]); 3] = [
     ("ferrostore.service", &["store", "serve"]),
@@ -52,7 +63,7 @@ fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
         assert!(out.status.success(), "{name}: fl {sub:?} --help\n{help}");
         for flag in words.iter().filter(|w| w.starts_with("--")) {
             assert!(
-                help.contains(*flag),
+                names_flag(&help, flag),
                 "{name}: `fl {}` has no {flag}\n{help}",
                 sub.join(" ")
             );
@@ -71,4 +82,14 @@ fn the_hub_unit_ui_dir_is_the_flag_the_hub_reads() {
         .unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();
     assert!(help.contains("--ui-dir <UI_DIR>"), "{help}");
+}
+
+#[test]
+fn a_flag_is_matched_as_a_whole_word() {
+    let help = "  -l, --listen-all <ADDR>  x\n      --ui-dir <UI_DIR>\n      --no-terminal\n";
+    assert!(!names_flag(help, "--listen"));
+    assert!(names_flag(help, "--ui-dir"));
+    assert!(names_flag(help, "--no-terminal"));
+    assert!(!names_flag(help, "--terminal"));
+    assert!(names_flag("-s, --store=<P>", "--store"));
 }

@@ -215,6 +215,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_instance_unit_has_a_start_limit() {
+        for (name, text) in TEMPLATES {
+            let limit = key(text, "Unit", "StartLimitIntervalSec");
+            let burst = key(text, "Unit", "StartLimitBurst");
+            if name == "ferrostore@.service" {
+                assert_eq!((limit, burst), (vec!["60"], vec!["5"]));
+            } else {
+                assert!(limit.is_empty() && burst.is_empty(), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn ordering_follows_the_spec() {
         let wire = template("ferrowire.service");
         assert_eq!(key(wire, "Unit", "PartOf"), ["ferrostore.service"]);
