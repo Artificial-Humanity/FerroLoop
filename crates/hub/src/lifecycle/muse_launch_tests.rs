@@ -1,7 +1,7 @@
-//! Muse launch tests: a spin-up or restart starts the Muse CLI in its tmux window with the
-//! hydration prompt as its first input, so the prompt is not delivered a second time; every other
-//! vendor still gets a blank window. Nothing here runs the real `tmux` or `muse`: the runtime is
-//! a `FakeRuntime`, and discovery reads a tempdir home and, in the end-to-end test, a fake tmux.
+//! Built-in CLI launch tests: spin-up and restart pass the hydration prompt as the first input;
+//! custom CLI vendors get a blank window and prompt delivery. Nothing here runs a real vendor
+//! CLI or `tmux`: the runtime is a `FakeRuntime`, and discovery reads a tempdir home and, in the
+//! end-to-end test, a fake tmux.
 
 use super::*;
 use fl_core::MemStore;
@@ -262,6 +262,61 @@ fn a_restart_launches_with_the_recorded_model_normalised() {
     assert_eq!(&argv[1..3], ["--model", "muse-wonder-1.0"]);
 }
 
+#[test]
+fn plain_models_reject_flags_and_invalid_ids() {
+    let long = "a".repeat(65);
+    for invalid in [
+        None,
+        Some(""),
+        Some("  "),
+        Some("--help"),
+        Some(".x"),
+        Some("a b"),
+        Some("é"),
+        Some(long.as_str()),
+    ] {
+        assert_eq!(normalize_plain_model(invalid), None, "{invalid:?}");
+    }
+    assert_eq!(
+        normalize_plain_model(Some(" Model.v2_3-x ")),
+        Some("Model.v2_3-x".into())
+    );
+    assert_eq!(
+        normalize_plain_model(Some(&"a".repeat(64))),
+        Some("a".repeat(64))
+    );
+}
+
+#[test]
+fn vendor_binary_resolution_prefers_config_then_home_then_path() {
+    let home = TempDir::new().unwrap();
+    assert_eq!(resolve_vendor_bin(None, Some(home.path()), "agy"), "agy");
+    let path = home.path().join(".local/bin/agy");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "").unwrap();
+    assert_eq!(
+        resolve_vendor_bin(Some("".into()), Some(home.path()), "agy"),
+        path.to_string_lossy()
+    );
+    assert_eq!(
+        resolve_vendor_bin(Some("/custom/agy".into()), Some(home.path()), "agy"),
+        "/custom/agy"
+    );
+}
+
+#[test]
+fn launched_built_in_vendors_do_not_receive_a_duplicate_prompt() {
+    for vendor in ["claude", "codex", "grok", "antigravity"] {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let listener = webhook_listener(home.path(), "ada");
+        let fake = FakeRuntime::default();
+        let out = spin(&store, &fake.env(home.path()), "ada", vendor);
+        assert!(out.runtime_spawned && out.hydration_dispatched, "{vendor}");
+        assert!(!delivered(&listener), "{vendor}");
+    }
+}
+
 // ------------------------------------------------------------------- what is launched
 
 #[test]
@@ -304,18 +359,40 @@ fn the_launched_muse_binary_follows_the_environment_setting_and_the_guard_clears
 }
 
 #[test]
-fn only_muse_is_launched_other_vendors_open_a_blank_window() {
-    for vendor in ["claude", "codex", "grok", "antigravity"] {
+fn built_in_vendors_launch_with_their_prompt() {
+    for (vendor, bin, variable, flags) in [
+        (
+            "claude",
+            "claude",
+            "FL_WIRE_CLAUDE_BIN",
+            vec!["--enable-auto-mode"],
+        ),
+        ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
+        ("grok", "grok", "FL_WIRE_GROK_BIN", vec!["--yolo"]),
+        (
+            "antigravity",
+            "agy",
+            "FL_WIRE_AGY_BIN",
+            vec!["--mode", "auto", "--prompt-interactive"],
+        ),
+    ] {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let fake = FakeRuntime::default();
         let out = spin(&store, &fake.env(home.path()), "ada", vendor);
-        assert!(out.runtime_spawned, "{vendor}");
-        assert_eq!(
-            *fake.launches.borrow(),
-            [(format!("Ada:{vendor}"), None)],
-            "{vendor}"
-        );
+        let launches = fake.launches.borrow();
+        let spec = launches[0].1.as_ref().expect(vendor);
+        let expected_bin = std::env::var_os(variable)
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || bin.to_string(),
+                |value| value.to_string_lossy().into_owned(),
+            );
+        let mut expected = vec![expected_bin];
+        expected.extend(flags.into_iter().map(String::from));
+        expected.push(out.prompt.unwrap());
+        assert_eq!(spec.env, [("AGENT_PERSONA".into(), "ada".into())]);
+        assert_eq!(spec.argv, expected, "{vendor}");
     }
 }
 
@@ -343,21 +420,50 @@ fn restart_launches_muse_in_the_window_it_reopens() {
 }
 
 #[test]
-fn restart_opens_other_vendors_blank() {
-    let store = MemStore::default();
-    let home = TempDir::new().unwrap();
-    let fake = FakeRuntime::default();
-    let env = fake.env(home.path());
-    spin(&store, &env, "ada", "codex");
-    fake.clear();
-    restart_hosted_session(&store, &env, "codex:ada", "owner").unwrap();
-    assert_eq!(
-        *fake.launches.borrow(),
-        [
-            ("Ada:codex".to_string(), None),
-            ("Ada:codex".to_string(), None)
-        ]
-    );
+fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
+    for (vendor, bin, variable, flags) in [
+        (
+            "claude",
+            "claude",
+            "FL_WIRE_CLAUDE_BIN",
+            vec!["--enable-auto-mode"],
+        ),
+        ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
+        ("grok", "grok", "FL_WIRE_GROK_BIN", vec!["--yolo"]),
+        (
+            "antigravity",
+            "agy",
+            "FL_WIRE_AGY_BIN",
+            vec!["--mode", "auto"],
+        ),
+    ] {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut request = req("ada", vendor);
+        request.model = Some(" Model.v2 ".into());
+        let initial = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        fake.clear();
+        let out = restart_hosted_session(&store, &env, &initial.session_id, "owner").unwrap();
+        let launches = fake.launches.borrow();
+        let spec = launches[1].1.as_ref().expect(vendor);
+        let expected_bin = std::env::var_os(variable)
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || bin.to_string(),
+                |value| value.to_string_lossy().into_owned(),
+            );
+        let mut expected = vec![expected_bin];
+        expected.extend(flags.into_iter().map(String::from));
+        expected.extend(["--model".into(), "Model.v2".into()]);
+        if vendor == "antigravity" {
+            expected.push("--prompt-interactive".into());
+        }
+        expected.push(out.prompt);
+        assert_eq!(spec.env, [("AGENT_PERSONA".into(), "ada".into())]);
+        assert_eq!(spec.argv, expected, "{vendor}");
+    }
 }
 
 // ------------------------------------------------------------------- hydration
@@ -423,13 +529,22 @@ fn a_muse_session_that_is_not_hosted_here_is_hydrated_by_delivery() {
 }
 
 #[test]
-fn a_launched_other_vendor_is_still_hydrated_by_delivery() {
+fn a_custom_cli_opens_blank_and_is_hydrated_by_delivery() {
+    let vendor = super::vendor_registry_tests::custom_cli("freya-custom-cli");
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
     let listener = webhook_listener(home.path(), "ada");
     let fake = FakeRuntime::default();
-    let out = spin(&store, &fake.env(home.path()), "ada", "claude");
+    let out = spin(&store, &fake.env(home.path()), "ada", &vendor);
     assert!(out.runtime_spawned && out.hydration_dispatched);
+    assert_eq!(fake.launches.borrow()[0].1, None);
+    assert!(delivered(&listener));
+
+    fake.clear();
+    let restarted =
+        restart_hosted_session(&store, &fake.env(home.path()), &out.session_id, "owner").unwrap();
+    assert!(restarted.record.runtime_spawned && restarted.record.hydration_dispatched);
+    assert_eq!(fake.launches.borrow()[1].1, None);
     assert!(delivered(&listener));
 }
 
