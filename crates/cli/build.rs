@@ -5,8 +5,20 @@
 mod stamp;
 
 fn main() {
-    // `fl` links every crate of the workspace, so a change to any of them moves the dirty
-    // flag: watch `crates/` and the lock file. (A leaf binary, so the rebuild costs nothing
-    // that the change itself would not.)
-    stamp::emit(&["..", "../../Cargo.lock"]);
+    // This package and every crate it builds from by path: their sources decide the dirty
+    // flag and are what cargo reruns the script for (with `HEAD`). Cargo rebuilds the package
+    // and its dependants whenever the script reruns, so the list is exactly the closure, no
+    // wider; `crates/core/tests/build_stamp.rs` checks it against the `Cargo.toml` files.
+    stamp::emit(&[
+        ".",
+        "../core",
+        "../exec",
+        "../gate",
+        "../github",
+        "../hub",
+        "../mcp",
+        "../store",
+        "../watch",
+        "../wire",
+    ]);
 }

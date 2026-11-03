@@ -25,13 +25,17 @@ pub struct BuildInfo {
     pub commit: String,
     /// The first [`SHORT_COMMIT_LEN`] digits of `commit`, or `unknown`.
     pub commit_short: String,
-    /// Whether the tree had changes the commit does not hold; `None` when git could not say.
+    /// Whether a file the binary is built from differs from `commit`; `None` when git could
+    /// not say.
     pub dirty: Option<bool>,
-    /// Build time, unix seconds (`SOURCE_DATE_EPOCH` when it was set).
+    /// Build time, unix seconds: `SOURCE_DATE_EPOCH` when it was set, else the commit time
+    /// (the clock only when the build had no git).
     pub build_time_unix: Option<u64>,
     /// Always [`SOURCE_BUILD`] for now.
     pub source: String,
-    /// The release id, set at build time through `$FL_RELEASE_ID`; `None` for a plain build.
+    /// The release id, set at build time through `$FL_RELEASE_ID`. `None` for a plain build,
+    /// and always `None` unless the tree is known to be clean (`dirty == Some(false)`): a dirty
+    /// or unreadable tree never reports a release id.
     pub release_id: Option<String>,
 }
 
@@ -54,20 +58,21 @@ impl BuildInfo {
         } else {
             (UNKNOWN.to_string(), UNKNOWN.to_string())
         };
+        let dirty = match dirty.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        };
         Self {
             version: version.to_string(),
             commit,
             commit_short,
-            dirty: match dirty.trim() {
-                "true" => Some(true),
-                "false" => Some(false),
-                _ => None,
-            },
+            dirty,
             build_time_unix: build_time.trim().parse().ok(),
             source: SOURCE_BUILD.to_string(),
             release_id: release_id
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && dirty == Some(false))
                 .map(str::to_string),
         }
     }
@@ -192,6 +197,21 @@ mod tests {
             BuildInfo::from_stamp("0.1.0", C, "false", "1", Some(" ")).release_id,
             None
         );
+    }
+
+    #[test]
+    fn a_dirty_or_unknown_tree_never_reports_a_release_id() {
+        for dirty in ["true", "unknown", "", "maybe"] {
+            let b = BuildInfo::from_stamp("0.1.0", C, dirty, "1", Some("2026.11.1"));
+            assert_eq!(b.release_id, None, "dirty={dirty:?}");
+            assert_eq!(b.source, SOURCE_BUILD);
+            assert!(!b.note().contains("release"), "{}", b.note());
+        }
+        assert_eq!(b_release("false"), Some("2026.11.1".to_string()));
+    }
+
+    fn b_release(dirty: &str) -> Option<String> {
+        BuildInfo::from_stamp("0.1.0", C, dirty, "1", Some("2026.11.1")).release_id
     }
 
     #[test]

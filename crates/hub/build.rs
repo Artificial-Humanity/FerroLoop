@@ -5,6 +5,18 @@
 mod stamp;
 
 fn main() {
-    // The crate's own sources move the dirty flag; the git state moves the commit.
-    stamp::emit(&["src", "Cargo.toml"]);
+    // This package and every crate it builds from by path: their sources decide the dirty
+    // flag and are what cargo reruns the script for (with `HEAD`). Cargo rebuilds the package
+    // and its dependants whenever the script reruns, so the list is exactly the closure, no
+    // wider; `crates/core/tests/build_stamp.rs` checks it against the `Cargo.toml` files.
+    stamp::emit(&[
+        ".",
+        "../core",
+        "../exec",
+        "../gate",
+        "../github",
+        "../store",
+        "../watch",
+        "../wire",
+    ]);
 }

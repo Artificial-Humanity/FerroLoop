@@ -13,23 +13,65 @@ shared, tested file, `crates/core/build/stamp.rs`, that each `build.rs` includes
 | Stamp | Value |
 |---|---|
 | `FL_BUILD_COMMIT` | The 40-digit `HEAD` commit, or `unknown`. |
-| `FL_BUILD_DIRTY` | `true` when `git status --porcelain` lists anything (untracked files that are not ignored count), `false`, or `unknown`. |
-| `FL_BUILD_TIME` | Unix seconds. `SOURCE_DATE_EPOCH` when it is set to a non-negative integer, else the clock. |
-| `FL_RELEASE_ID` | Only when `$FL_RELEASE_ID` is set (and not empty) at build time. |
+| `FL_BUILD_DIRTY` | `true` when a file the binary is built from differs from `HEAD` (staged or not, or new and not ignored), `false`, or `unknown`. "Built from" is the closure below. |
+| `FL_BUILD_TIME` | Unix seconds. `SOURCE_DATE_EPOCH` when it is set to a non-negative integer, else the `HEAD` commit time (`git log -1 --format=%ct`), else the clock when there is no git. |
+| `FL_RELEASE_ID` | Only when `$FL_RELEASE_ID` is set (and not empty) at build time AND the tree is clean. A dirty tree, or one whose dirty flag is `unknown`, reports no release id. |
 
-A tree with no git checkout (a tarball, `cargo publish`, a sandbox without `git`) builds with
-`unknown` for the commit and the dirty flag. It does not fail. The search for the checkout
-honours `GIT_CEILING_DIRECTORIES`. A linked worktree (`.git` is a file) is found too.
+The build time is the commit time, not the clock, on purpose: the same sources always stamp
+the same bytes, so a binary is reproducible. A build with no git has only the clock.
 
-Cargo reruns a build script only when told to. These stamps rerun it when `HEAD`, the branch
-ref it names, `packed-refs` or the index change, when `SOURCE_DATE_EPOCH` or `FL_RELEASE_ID`
-change, and when the crate's sources change (for `fl`, any crate under `crates/` or
-`Cargo.lock`). A build made after an edit to a file that is outside these paths, and that does
-not touch the index, can still say `dirty: false`; a build in CI or for release should start
-from a clean `cargo build`.
+A tree is a checkout only when the `.git` found above it (a directory, or the file of a linked
+worktree) sits in a directory that holds `crates/core/build/stamp.rs`. A copy of the sources
+under some other repository, such as a registry or tarball copy in a git-tracked home
+directory, is not stamped with that repository's commit. A tree that is not a checkout
+(a tarball, `cargo publish`, a sandbox without `git`) builds with `unknown` for the commit and
+the dirty flag. It does not fail. The search honours `GIT_CEILING_DIRECTORIES`. The git
+commands run with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES` and `GIT_NAMESPACE` removed, and
+`git status` runs with `--no-optional-locks` so reading the status never rewrites the index.
+
+### What the stamp is computed from, and when it reruns
+
+**Cargo rebuilds a package, and everything that depends on it, whenever its build script
+reruns, even when the script prints exactly what it printed before.** This was measured on this
+workspace (cargo verbose output, a script rerun with byte-identical output): `fl-store` was
+recompiled, then `fl-wire`, `fl-watch`, `fl-hub` and `fl`. So the stamp cannot lean on
+"identical output costs nothing". Instead each script names no more than the inputs of its own
+binary, and the dirty flag is computed from exactly those:
+
+* **Inputs.** For the package and every crate it depends on by path (its "closure"):
+  `src/`, `build/`, `build.rs` and `Cargo.toml` of the crate, plus the workspace `Cargo.toml`
+  and `Cargo.lock`. `fl-store` (and so `ferrostore`) builds from `fl-store` and `fl-core`;
+  `fl-hub` from `fl-core`, `fl-exec`, `fl-gate`, `fl-github`, `fl-store`, `fl-watch` and
+  `fl-wire`; `fl` from all of them and `fl-mcp`. Each `build.rs` lists its closure, and a test
+  (`crates/core/tests/build_stamp.rs`) checks every list against the `Cargo.toml` files.
+* **Dirty.** `git status --porcelain` over those inputs only. A change in another crate, in
+  `tests/`, in `docs/` or in `ui/` does not make the binary dirty, because it is not in the
+  binary. The same edit made to an input is dirty whether staged or not.
+* **Rerun.** The script reruns when an input changes, and when `HEAD`, the branch ref it names
+  (in the shared git directory for a linked worktree) or `packed-refs` change, and when
+  `SOURCE_DATE_EPOCH` or `FL_RELEASE_ID` change. It does NOT rerun for the git index, so a
+  `git add` rebuilds nothing, and an edit to a crate outside the closure rebuilds only what it
+  would have rebuilt anyway. A commit or a branch switch moves the commit and rebuilds the
+  binaries, which is right: their stamp changes.
+
+Measured with these scripts: touching the git index rebuilt nothing; touching a source file of
+`fl-cli` rebuilt `fl` only; of `fl-hub`, `fl-hub` and `fl`; of `fl-core`, everything that
+depends on it (as the edit itself requires).
+
+The dirty flag is read when the script reruns. A change to a file that is not an input is
+not seen, by design. A build with no git has no dirty flag (`unknown`) and its clock stamp
+changes on each rerun.
+
+### Packaging
+
+These crates are workspace-internal. Each `build.rs` includes `../core/build/stamp.rs` with
+`#[path]`, a file outside the crate's own directory, so `cargo package` (and `cargo publish`)
+of `fl-cli`, `fl-store` or `fl-hub` is not supported as it stands. Building from a source
+tarball of the whole workspace works; the stamps are then `unknown`.
 
 The `source` field is `source-build` for every build today: no release channel exists yet. A
-build that sets `FL_RELEASE_ID` reports it in `release_id` and still says `source-build`.
+build of a clean tree that sets `FL_RELEASE_ID` reports it in `release_id` and still says `source-build`.
 
 ## `fl --version`
 

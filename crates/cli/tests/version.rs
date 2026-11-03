@@ -40,7 +40,13 @@ fn version_json_has_the_documented_keys() {
     assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     // A source build never poses as a release.
     assert_eq!(v["source"], "source-build");
-    assert_eq!(v["release_id"], Value::Null);
+    // A release id exists only when `$FL_RELEASE_ID` was set at build time, and then only for
+    // a tree known to be clean. Either way the build still says `source-build`.
+    match &v["release_id"] {
+        Value::Null => {}
+        Value::String(_) => assert_eq!(v["dirty"], Value::Bool(false), "{v}"),
+        other => panic!("release_id is {other}"),
+    }
     assert!(v["build_time_unix"].is_u64() || v["build_time_unix"].is_null());
     assert!(v["dirty"].is_boolean() || v["dirty"].is_null());
     let commit = v["commit"].as_str().unwrap();
