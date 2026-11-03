@@ -43,7 +43,13 @@ import {
   type TotpEnrollmentResponse,
 } from "../types/api";
 
-export type SettingsTabId = "agents" | "system" | "runtimes" | "accessibility" | "auth";
+export type SettingsTabId =
+  | "agents"
+  | "system"
+  | "products"
+  | "runtimes"
+  | "accessibility"
+  | "auth";
 
 export interface SettingsModalProps {
   isOpen: boolean;
@@ -1264,6 +1270,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 onClick={() => setActiveTab("system")}
               >
                 System
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "products"}
+                data-testid="settings-tab-products"
+                className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("products")}
+              >
+                Products
               </button>
               {authority?.tier === "owner" && (
                 <button
@@ -2542,189 +2558,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               }}
             />
 
-            {/* Subsystem Toggles */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              <h3
-                style={{
-                  margin: 0,
-                  fontSize: "12.5px",
-                  fontWeight: 700,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.04em",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                }}
-              >
-                <img
-                  src="/brand/ferroloop-icon.jpg"
-                  alt=""
-                  width="16"
-                  height="16"
-                  aria-hidden="true"
-                  style={{ borderRadius: "3px", objectFit: "cover" }}
-                />
-                FerroLoop Installed Products &amp; Subsystem Toggles
-              </h3>
-              <div
-                style={{
-                  display: "flex",
-                  gap: "16px",
-                  flexWrap: "wrap",
-                  fontSize: "12.5px",
-                }}
-              >
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    data-testid="toggle-ferrogate"
-                    checked={settings.subsystems.ferrogate_enabled}
-                    onChange={(e) => {
-                      setSettingsSaved(false);
-                      setSettings((prev) => ({
-                        ...prev,
-                        subsystems: {
-                          ...prev.subsystems,
-                          ferrogate_enabled: e.target.checked,
-                        },
-                      }));
-                    }}
-                  />
-                  <img
-                    src="/brand/ferrogate-icon.jpg"
-                    alt=""
-                    width="15"
-                    height="15"
-                    aria-hidden="true"
-                    style={{ borderRadius: "3px", objectFit: "cover" }}
-                  />
-                  <span>FerroGate Vault &amp; Proxy</span>
-                </label>
-
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    data-testid="toggle-ferrostate"
-                    checked={settings.subsystems.ferrostate_enabled}
-                    onChange={(e) => {
-                      setSettingsSaved(false);
-                      setSettings((prev) => ({
-                        ...prev,
-                        subsystems: {
-                          ...prev.subsystems,
-                          ferrostate_enabled: e.target.checked,
-                        },
-                      }));
-                    }}
-                  />
-                  <img
-                    src="/brand/ferrostate-icon.jpg"
-                    alt=""
-                    width="15"
-                    height="15"
-                    aria-hidden="true"
-                    style={{ borderRadius: "3px", objectFit: "cover" }}
-                  />
-                  <span>FerroState Memory &amp; Index</span>
-                </label>
-
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    data-testid="toggle-ferrostep"
-                    checked={settings.subsystems.ferrostep_enabled}
-                    onChange={(e) => {
-                      setSettingsSaved(false);
-                      setSettings((prev) => ({
-                        ...prev,
-                        subsystems: {
-                          ...prev.subsystems,
-                          ferrostep_enabled: e.target.checked,
-                        },
-                      }));
-                    }}
-                  />
-                  <img
-                    src="/brand/ferroloop-icon.jpg"
-                    alt=""
-                    width="15"
-                    height="15"
-                    aria-hidden="true"
-                    style={{ borderRadius: "3px", objectFit: "cover" }}
-                  />
-                  <span>FerroStep Workflows</span>
-                </label>
-              </div>
-              <div
-                data-testid="ferrosuite-product-badges"
-                style={{
-                  display: "flex",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                  marginTop: "2px",
-                }}
-              >
-                {[
-                  { id: "ferrodeck", label: "FerroDeck", icon: "/brand/ferrodeck-icon.jpg" },
-                  { id: "ferrowire", label: "FerroWire", icon: "/brand/ferrowire-icon.jpg" },
-                  { id: "ferrotrack", label: "FerroTrack", icon: "/brand/ferrotrack-icon.jpg" },
-                  { id: "ferrostore", label: "FerroStore", icon: "/brand/ferrostore-icon.jpg" },
-                  { id: "ferrowatch", label: "FerroWatch", icon: "/brand/ferrowatch-icon.jpg" },
-                ].map((mod) => (
-                  <span
-                    key={mod.id}
-                    className="fd-badge"
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "5px",
-                      fontSize: "11px",
-                      padding: "2px 7px",
-                    }}
-                  >
-                    <img
-                      src={mod.icon}
-                      alt=""
-                      width="13"
-                      height="13"
-                      aria-hidden="true"
-                      style={{ borderRadius: "2px", objectFit: "cover" }}
-                    />
-                    {mod.label}
-                  </span>
-                ))}
-              </div>
-            </div>
-
-            <hr
-              style={{
-                border: "none",
-                borderTop: "1px solid var(--border-subtle)",
-                margin: 0,
-              }}
-            />
-
             {/* Notification Rules */}
             <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
               <h3
@@ -3219,6 +3052,971 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 {savingCloudAdapters ? "Saving..." : "Save Cloud Adapters"}
               </button>
+            </div>
+          </div>
+        </div>
+
+        {/* TAB: Products (FerroLoop Installed Products & Subsystem Toggles) */}
+        <div
+          role="tabpanel"
+          aria-label="Installed Products & Subsystem Toggles Panel"
+          data-testid="settings-panel-products"
+          style={{
+            display: activeTab === "products" ? "flex" : "none",
+            flexDirection: "column",
+            gap: "12px",
+          }}
+        >
+          <div
+            className="fd-card"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "12px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: "13px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                }}
+              >
+                <img
+                  src="/brand/ferroloop-icon.jpg"
+                  alt=""
+                  width="20"
+                  height="20"
+                  aria-hidden="true"
+                  style={{ borderRadius: "4px", objectFit: "cover" }}
+                />
+                FerroLoop Installed Products &amp; Subsystem Toggles
+              </h3>
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: "12px",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                Manage installed Ferro Suite products, core engine guarantees, and
+                per-product runtime configuration.
+              </p>
+            </div>
+            <button
+              type="button"
+              data-testid="save-products-settings-btn"
+              className="fd-btn fd-btn-primary"
+              disabled={savingSettings}
+              onClick={() => void handleSaveSettings()}
+            >
+              {savingSettings ? "Saving..." : "Save Product Settings"}
+            </button>
+          </div>
+
+          <div
+            data-testid="products-cards-grid"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+              gap: "12px",
+            }}
+          >
+            {/* 1. FerroLoop (Required Core Engine) */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferroloop"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferroloop-icon.jpg"
+                      alt="FerroLoop icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroLoop
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl · Core Engine &amp; DAG Workflows
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    title="FerroLoop is the required core engine and cannot be disabled"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      opacity: 0.7,
+                      cursor: "not-allowed",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span
+                      className="fd-badge"
+                      data-testid="product-status-ferroloop"
+                    >
+                      Required
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferroloop"
+                      aria-label="FerroLoop Core Engine (Required)"
+                      checked={true}
+                      disabled={true}
+                      readOnly
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Executable pre-flight gates, records, regret-classified
+                  transitions, and multi-step DAG workflows (`fl flow`).
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferroloop"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  fontSize: "11.5px",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="toggle-ferrostep"
+                    checked={settings.subsystems.ferrostep_enabled}
+                    onChange={(e) => {
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        subsystems: {
+                          ...prev.subsystems,
+                          ferrostep_enabled: e.target.checked,
+                        },
+                      }));
+                    }}
+                  />
+                  <span>Enable DAG Workflow Runner (`fl flow`)</span>
+                </label>
+                <div
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    color: "var(--text-muted)",
+                    fontSize: "11px",
+                  }}
+                >
+                  <img
+                    src="/brand/ferrostore-icon.jpg"
+                    alt=""
+                    width="14"
+                    height="14"
+                    aria-hidden="true"
+                    style={{ borderRadius: "3px", objectFit: "cover" }}
+                  />
+                  <span>
+                    Storage Engine: FerroStore (`.fls` / `redb` automatic dependency)
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* 2. FerroDeck */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrodeck"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrodeck-icon.jpg"
+                      alt="FerroDeck icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroDeck
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl hub · Command-Center Web App
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {(settings.subsystems.ferrodeck_enabled ?? true)
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrodeck"
+                      aria-label="Enable FerroDeck"
+                      checked={settings.subsystems.ferrodeck_enabled ?? true}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrodeck_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Multi-vendor agent cockpit PWA and HTTP/1.1 + WebSocket hub
+                  daemon (`fl hub serve`) for desktop, iPadOS, and iOS.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrodeck"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  fontSize: "11.5px",
+                }}
+              >
+                <span style={{ color: "var(--text-secondary)" }}>
+                  Auto-reconnect WS:{" "}
+                  <strong>
+                    {settings.hub_connection.auto_reconnect_ws ? "On" : "Off"}
+                  </strong>
+                </span>
+                <span className="fd-badge fd-mono">
+                  Poll: {settings.hub_connection.poll_interval_secs}s
+                </span>
+              </div>
+            </div>
+
+            {/* 3. FerroWire */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrowire"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrowire-icon.jpg"
+                      alt="FerroWire icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroWire
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl wire · Agent Messaging &amp; Relay
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {(settings.subsystems.ferrowire_enabled ?? true)
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrowire"
+                      aria-label="Enable FerroWire"
+                      checked={settings.subsystems.ferrowire_enabled ?? true}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrowire_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Agent-to-agent messaging transport, channels, threads, peer
+                  relay, and idle push delivery across vendor CLIs.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrowire"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  fontSize: "11.5px",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={settings.notifications.notify_on_wire_urgent}
+                    onChange={(e) => {
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        notifications: {
+                          ...prev.notifications,
+                          notify_on_wire_urgent: e.target.checked,
+                        },
+                      }));
+                    }}
+                  />
+                  <span>Urgent Mail Push Alerts</span>
+                </label>
+              </div>
+            </div>
+
+            {/* 4. FerroState */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrostate"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrostate-icon.jpg"
+                      alt="FerroState icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroState
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl state · Memory &amp; Code Index
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {settings.subsystems.ferrostate_enabled
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrostate"
+                      aria-label="Enable FerroState"
+                      checked={settings.subsystems.ferrostate_enabled}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrostate_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Durable agent memory, structured session handoffs, ranked
+                  recall, sensitivity redaction, and AST symbol indexing.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrostate"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  fontSize: "11.5px",
+                }}
+              >
+                <span style={{ color: "var(--text-secondary)" }}>
+                  Sensitivity Redaction &amp; AST Index
+                </span>
+                <span className="fd-badge">Active</span>
+              </div>
+            </div>
+
+            {/* 5. FerroGate */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrogate"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrogate-icon.jpg"
+                      alt="FerroGate icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroGate
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl vault / fl auth · Vault &amp; Proxy
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {settings.subsystems.ferrogate_enabled
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrogate"
+                      aria-label="Enable FerroGate"
+                      checked={settings.subsystems.ferrogate_enabled}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrogate_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Zero-knowledge secrets vault, header-injecting credential
+                  proxy, API-to-MCP gateway, and Ed25519 Owner warrants.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrogate"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                  fontSize: "11.5px",
+                }}
+              >
+                <span style={{ color: "var(--text-secondary)" }}>
+                  Secret Manager:{" "}
+                  <strong>
+                    {cloudAdapters.gate_cloud.secret_manager_enabled
+                      ? "Enabled"
+                      : "Off"}
+                  </strong>
+                </span>
+                <span className="fd-badge">
+                  Model Armor:{" "}
+                  {cloudAdapters.gate_cloud.model_armor_enabled ? "On" : "Off"}
+                </span>
+              </div>
+            </div>
+
+            {/* 6. FerroTrack */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrotrack"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrotrack-icon.jpg"
+                      alt="FerroTrack icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroTrack
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl github · Issue Tracker &amp; Ledger
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {(settings.subsystems.ferrotrack_enabled ?? true)
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrotrack"
+                      aria-label="Enable FerroTrack"
+                      checked={settings.subsystems.ferrotrack_enabled ?? true}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrotrack_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Two-tier issue tracking, Kanban board synchronization, PR
+                  review policy, and immutable `fl/ledger` decision evidence.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrotrack"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  fontSize: "11.5px",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={settings.notifications.notify_on_pr_review}
+                    onChange={(e) => {
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        notifications: {
+                          ...prev.notifications,
+                          notify_on_pr_review: e.target.checked,
+                        },
+                      }));
+                    }}
+                  />
+                  <span>PR Review Request Alerts</span>
+                </label>
+              </div>
+            </div>
+
+            {/* 7. FerroWatch */}
+            <div
+              className="fd-card"
+              data-testid="product-card-ferrowatch"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                justifyContent: "space-between",
+                gap: "10px",
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <img
+                      src="/brand/ferrowatch-icon.jpg"
+                      alt="FerroWatch icon"
+                      width="36"
+                      height="36"
+                      style={{
+                        borderRadius: "8px",
+                        objectFit: "cover",
+                        border: "1px solid var(--border-subtle)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: "13.5px" }}>
+                        FerroWatch
+                      </div>
+                      <code
+                        className="fd-mono"
+                        style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                      >
+                        fl stats · Observability &amp; Quotas
+                      </code>
+                    </div>
+                  </div>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "11.5px",
+                      cursor: "pointer",
+                      flexShrink: 0,
+                    }}
+                  >
+                    <span className="fd-badge">
+                      {(settings.subsystems.ferrowatch_enabled ?? true)
+                        ? "Enabled"
+                        : "Disabled"}
+                    </span>
+                    <input
+                      type="checkbox"
+                      data-testid="toggle-ferrowatch"
+                      aria-label="Enable FerroWatch"
+                      checked={settings.subsystems.ferrowatch_enabled ?? true}
+                      onChange={(e) => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: {
+                            ...prev.subsystems,
+                            ferrowatch_enabled: e.target.checked,
+                          },
+                        }));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    lineHeight: 1.45,
+                  }}
+                >
+                  Fleet liveness heartbeats, 5h/7d vendor runtime quota gauges,
+                  token accounting, and cost telemetry.
+                </p>
+              </div>
+              <div
+                data-testid="product-config-ferrowatch"
+                style={{
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  fontSize: "11.5px",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={settings.notifications.notify_on_session_error}
+                    onChange={(e) => {
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        notifications: {
+                          ...prev.notifications,
+                          notify_on_session_error: e.target.checked,
+                        },
+                      }));
+                    }}
+                  />
+                  <span>Session Error Telemetry Alerts</span>
+                </label>
+              </div>
             </div>
           </div>
         </div>

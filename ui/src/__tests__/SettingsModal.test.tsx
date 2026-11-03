@@ -740,4 +740,94 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       migrate: false,
     });
   });
+
+  it("renders dedicated Products tab with 7 product configuration cards, canonical icons, locked FerroLoop core engine toggle, and per-product config slots", async () => {
+    let savedBody: Record<string, unknown> | null = null;
+    const fetchImpl = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        if (url.endsWith("/api/v1/settings") && method === "PUT") {
+          savedBody = JSON.parse(String(init?.body));
+          return new Response(JSON.stringify(savedBody), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    );
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    const productsTabBtn = screen.getByTestId("settings-tab-products");
+    expect(productsTabBtn).toHaveTextContent("Products");
+    fireEvent.click(productsTabBtn);
+    expect(productsTabBtn).toHaveAttribute("aria-selected", "true");
+
+    const panel = screen.getByTestId("settings-panel-products");
+    expect(panel).toHaveStyle({ display: "flex" });
+
+    for (const slug of [
+      "ferroloop",
+      "ferrodeck",
+      "ferrowire",
+      "ferrostate",
+      "ferrogate",
+      "ferrotrack",
+      "ferrowatch",
+    ]) {
+      const card = within(panel).getByTestId(`product-card-${slug}`);
+      expect(card).toBeInTheDocument();
+      expect(
+        within(card).getByTestId(`product-config-${slug}`),
+      ).toBeInTheDocument();
+      const img = card.querySelector("img");
+      expect(img?.getAttribute("src")).toBe(`/brand/${slug}-icon.jpg`);
+    }
+
+    // FerroLoop core engine toggle is required / locked on
+    expect(screen.getByTestId("product-status-ferroloop")).toHaveTextContent(
+      "Required",
+    );
+    const ferroLoopToggle = screen.getByTestId(
+      "toggle-ferroloop",
+    ) as HTMLInputElement;
+    expect(ferroLoopToggle.checked).toBe(true);
+    expect(ferroLoopToggle.disabled).toBe(true);
+
+    // Retired FerroStep product name does not appear anywhere
+    expect(panel.textContent).not.toMatch(/FerroStep/);
+
+    // Toggle FerroGate and FerroWire and save from Products tab
+    fireEvent.click(screen.getByTestId("toggle-ferrogate"));
+    fireEvent.click(screen.getByTestId("toggle-ferrowire"));
+    fireEvent.click(screen.getByTestId("save-products-settings-btn"));
+
+    expect(
+      await screen.findByTestId("settings-saved-banner"),
+    ).toHaveTextContent(/Settings saved/i);
+    expect(savedBody).toMatchObject({
+      subsystems: {
+        ferrogate_enabled: false,
+        ferrostate_enabled: true,
+        ferrostep_enabled: true,
+        ferrowire_enabled: false,
+      },
+    });
+  });
 });
