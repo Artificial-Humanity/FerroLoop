@@ -835,4 +835,163 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       },
     });
   });
+
+  it("pins the modal header and tab bar while switching sub-tabs across Agents, System, and Products", async () => {
+    const apiClient = makeStubApiClient();
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+      />,
+    );
+
+    const modal = screen.getByTestId("settings-modal");
+    const tabBar = screen.getByTestId("settings-tab-bar");
+    const scrollBody = screen.getByTestId("settings-scroll-body");
+
+    expect(modal).toHaveStyle({ overflow: "hidden" });
+    expect(tabBar).toHaveStyle({ flexShrink: "0" });
+    expect(scrollBody).toHaveStyle({ overflowY: "auto" });
+
+    // 1. Agents sub-tabs
+    expect(screen.getByTestId("agents-subtab-bar")).toBeInTheDocument();
+    const rosterSubTab = screen.getByTestId("agents-subtab-roster");
+    const rolesSubTab = screen.getByTestId("agents-subtab-roles");
+    const runtimesSubTab = screen.getByTestId("agents-subtab-runtimes");
+
+    const rosterPanel = screen.getByTestId("agents-subpanel-roster");
+    const rolesPanel = screen.getByTestId("agents-subpanel-roles");
+    const runtimesPanel = screen.getByTestId("agents-subpanel-runtimes");
+
+    expect(rosterSubTab).toHaveAttribute("aria-selected", "true");
+    expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
+    expect(runtimesSubTab).toHaveAttribute("aria-selected", "false");
+    expect(rosterPanel).toHaveStyle({ display: "flex" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(runtimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(rolesSubTab);
+    expect(rosterSubTab).toHaveAttribute("aria-selected", "false");
+    expect(rolesSubTab).toHaveAttribute("aria-selected", "true");
+    expect(rosterPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "flex" });
+    expect(runtimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(runtimesSubTab);
+    expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
+    expect(runtimesSubTab).toHaveAttribute("aria-selected", "true");
+    expect(rosterPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(runtimesPanel).toHaveStyle({ display: "flex" });
+
+    // 2. System sub-tabs
+    fireEvent.click(screen.getByTestId("settings-tab-system"));
+    expect(screen.getByTestId("system-subtab-bar")).toBeInTheDocument();
+
+    const sysGeneralTab = screen.getByTestId("system-subtab-general");
+    const sysStorageTab = screen.getByTestId("system-subtab-storage");
+    const sysNotificationsTab = screen.getByTestId(
+      "system-subtab-notifications",
+    );
+
+    const sysGeneralPanel = screen.getByTestId("system-subpanel-general");
+    const sysStoragePanel = screen.getByTestId("system-subpanel-storage");
+    const sysNotificationsPanel = screen.getByTestId(
+      "system-subpanel-notifications",
+    );
+
+    expect(sysGeneralTab).toHaveAttribute("aria-selected", "true");
+    expect(sysGeneralPanel).toHaveStyle({ display: "flex" });
+    expect(sysStoragePanel).toHaveStyle({ display: "none" });
+    expect(sysNotificationsPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(sysStorageTab);
+    expect(sysStorageTab).toHaveAttribute("aria-selected", "true");
+    expect(sysGeneralPanel).toHaveStyle({ display: "none" });
+    expect(sysStoragePanel).toHaveStyle({ display: "flex" });
+    expect(sysNotificationsPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(sysNotificationsTab);
+    expect(sysNotificationsTab).toHaveAttribute("aria-selected", "true");
+    expect(sysGeneralPanel).toHaveStyle({ display: "none" });
+    expect(sysStoragePanel).toHaveStyle({ display: "none" });
+    expect(sysNotificationsPanel).toHaveStyle({ display: "flex" });
+
+    // 3. Products sub-tabs
+    fireEvent.click(screen.getByTestId("settings-tab-products"));
+    expect(screen.getByTestId("products-subtab-bar")).toBeInTheDocument();
+
+    const prodCatalogTab = screen.getByTestId("products-subtab-catalog");
+    const prodInstallerTab = screen.getByTestId("products-subtab-installer");
+
+    const prodCatalogPanel = screen.getByTestId("products-subpanel-catalog");
+    const prodInstallerPanel = screen.getByTestId("products-subpanel-installer");
+
+    expect(prodCatalogTab).toHaveAttribute("aria-selected", "true");
+    expect(prodCatalogPanel).toHaveStyle({ display: "flex" });
+    expect(prodInstallerPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(prodInstallerTab);
+    expect(prodCatalogTab).toHaveAttribute("aria-selected", "false");
+    expect(prodInstallerTab).toHaveAttribute("aria-selected", "true");
+    expect(prodCatalogPanel).toHaveStyle({ display: "none" });
+    expect(prodInstallerPanel).toHaveStyle({ display: "flex" });
+  });
+
+  it("renders 4 focused sub-tabs in the Project-Level Settings Modal when initialProject is set", async () => {
+    const apiClient = makeStubApiClient();
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+        initialProject="FerroLoop"
+      />,
+    );
+
+    expect(
+      screen.getByTestId("project-settings-subtab-bar"),
+    ).toBeInTheDocument();
+
+    const overviewTab = screen.getByTestId("project-tab-overview");
+    const agentsTab = screen.getByTestId("project-tab-agents");
+    const rolesTab = screen.getByTestId("project-tab-roles");
+    const runtimesTab = screen.getByTestId("project-tab-runtimes");
+
+    const overviewPanel = screen.getByTestId("project-subpanel-overview");
+    const agentsPanel = screen.getByTestId("project-subpanel-agents");
+    const rolesPanel = screen.getByTestId("project-subpanel-roles");
+    const runtimesPanel = screen.getByTestId("project-subpanel-runtimes");
+
+    expect(overviewTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewPanel).toHaveStyle({ display: "flex" });
+    expect(agentsPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(runtimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(agentsTab);
+    expect(overviewTab).toHaveAttribute("aria-selected", "false");
+    expect(agentsTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewPanel).toHaveStyle({ display: "none" });
+    expect(agentsPanel).toHaveStyle({ display: "flex" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(runtimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(rolesTab);
+    expect(agentsTab).toHaveAttribute("aria-selected", "false");
+    expect(rolesTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewPanel).toHaveStyle({ display: "none" });
+    expect(agentsPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "flex" });
+    expect(runtimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(runtimesTab);
+    expect(rolesTab).toHaveAttribute("aria-selected", "false");
+    expect(runtimesTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewPanel).toHaveStyle({ display: "none" });
+    expect(agentsPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(runtimesPanel).toHaveStyle({ display: "flex" });
+  });
 });
