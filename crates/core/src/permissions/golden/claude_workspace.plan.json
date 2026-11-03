@@ -1,0 +1,245 @@
+{
+  "vendor": "claude",
+  "key": {
+    "vendor": "claude",
+    "transport": "pty",
+    "installed_version": null
+  },
+  "launch_args": [
+    "--permission-mode",
+    "manual"
+  ],
+  "config_files": [
+    {
+      "target": "claude_settings",
+      "format": "json",
+      "content": "{\n  \"permissions\": {\n    \"allow\": [\n      \"Edit(./**)\",\n      \"Read(./**)\",\n      \"Write(./**)\"\n    ],\n    \"deny\": [\n      \"Edit(.claude/**)\",\n      \"Edit(.claude/settings.json)\",\n      \"Edit(.claude/settings.local.json)\",\n      \"Edit(.git/**)\",\n      \"Edit(.mcp.json)\",\n      \"WebFetch\",\n      \"WebSearch\",\n      \"Write(.claude/**)\",\n      \"Write(.claude/settings.json)\",\n      \"Write(.claude/settings.local.json)\",\n      \"Write(.git/**)\",\n      \"Write(.mcp.json)\"\n    ]\n  }\n}\n"
+    }
+  ],
+  "env": [],
+  "receipts": [
+    {
+      "subject": "posture",
+      "origin": "axis",
+      "effect": null,
+      "requested": "posture Ask",
+      "native": [
+        "--permission-mode",
+        "manual"
+      ],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "launch-fixed here; switchable in the TUI only inside the launch-offered set"
+    },
+    {
+      "subject": "sandbox",
+      "origin": "axis",
+      "effect": null,
+      "requested": "sandbox vendor-default",
+      "native": [],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "no launch sandbox control is compiled; the vendor default stands"
+    },
+    {
+      "subject": {
+        "capability": "fs_read_workspace"
+      },
+      "origin": "rule",
+      "effect": "allow",
+      "requested": "allow fs_read_workspace",
+      "native": [
+        "Read(./**)"
+      ],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "tool rule"
+    },
+    {
+      "subject": {
+        "capability": "fs_write_workspace"
+      },
+      "origin": "rule",
+      "effect": "allow",
+      "requested": "allow fs_write_workspace",
+      "native": [
+        "Edit(./**)",
+        "Write(./**)"
+      ],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "tool rule"
+    },
+    {
+      "subject": {
+        "capability": "network_web"
+      },
+      "origin": "rule",
+      "effect": "deny",
+      "requested": "deny network_web",
+      "native": [
+        "WebFetch",
+        "WebSearch"
+      ],
+      "class": "tool_scoped_emulation",
+      "evidence": "documented",
+      "note": "tool-scoped: binds this tool only, not shell, MCP or plugins"
+    },
+    {
+      "subject": {
+        "capability": "fs_write_protected"
+      },
+      "origin": "default",
+      "effect": "deny",
+      "requested": "deny fs_write_protected class:settings (canonical default)",
+      "native": [
+        "Edit(.claude/settings.json)",
+        "Write(.claude/settings.json)",
+        "Edit(.claude/settings.local.json)",
+        "Write(.claude/settings.local.json)"
+      ],
+      "class": "tool_scoped_emulation",
+      "evidence": "documented",
+      "note": "emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only"
+    },
+    {
+      "subject": {
+        "capability": "fs_write_protected"
+      },
+      "origin": "default",
+      "effect": "deny",
+      "requested": "deny fs_write_protected class:git (canonical default)",
+      "native": [
+        "Edit(.git/**)",
+        "Write(.git/**)"
+      ],
+      "class": "tool_scoped_emulation",
+      "evidence": "documented",
+      "note": "emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only"
+    },
+    {
+      "subject": {
+        "capability": "fs_write_protected"
+      },
+      "origin": "default",
+      "effect": "deny",
+      "requested": "deny fs_write_protected class:tool-config (canonical default)",
+      "native": [
+        "Edit(.claude/**)",
+        "Write(.claude/**)",
+        "Edit(.mcp.json)",
+        "Write(.mcp.json)"
+      ],
+      "class": "tool_scoped_emulation",
+      "evidence": "documented",
+      "note": "emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only"
+    },
+    {
+      "subject": {
+        "capability": "fs_read_external"
+      },
+      "origin": "default",
+      "effect": "ask",
+      "requested": "ask fs_read_external (canonical default)",
+      "native": [],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "no entry: the posture's native prompt path decides unmatched requests"
+    },
+    {
+      "subject": {
+        "capability": "fs_write_external"
+      },
+      "origin": "default",
+      "effect": "ask",
+      "requested": "ask fs_write_external (canonical default)",
+      "native": [],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "no entry: the posture's native prompt path decides unmatched requests"
+    },
+    {
+      "subject": {
+        "capability": "shell_exec"
+      },
+      "origin": "default",
+      "effect": "ask",
+      "requested": "ask shell_exec (canonical default)",
+      "native": [],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "no entry: the posture's native prompt path decides unmatched requests"
+    },
+    {
+      "subject": {
+        "capability": "mcp_tool_call"
+      },
+      "origin": "default",
+      "effect": "ask",
+      "requested": "ask mcp_tool_call (canonical default)",
+      "native": [],
+      "class": "exact",
+      "evidence": "documented",
+      "note": "no entry: the posture's native prompt path decides unmatched requests"
+    }
+  ],
+  "change_classes": [
+    {
+      "field": "posture",
+      "class": "respawn"
+    },
+    {
+      "field": "sandbox",
+      "class": "respawn"
+    },
+    {
+      "field": {
+        "rules": "fs_read_workspace"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "fs_read_external"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "fs_write_workspace"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "fs_write_external"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "fs_write_protected"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "shell_exec"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "network_web"
+      },
+      "class": "pending_next_start"
+    },
+    {
+      "field": {
+        "rules": "mcp_tool_call"
+      },
+      "class": "pending_next_start"
+    }
+  ],
+  "requires_respawn": true
+}

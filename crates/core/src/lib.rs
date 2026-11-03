@@ -37,6 +37,7 @@ pub mod mem;
 pub mod mem_issues;
 pub mod model;
 pub mod notifications;
+pub mod permissions;
 pub mod pr_policy;
 pub mod ref_index;
 pub mod routine;

@@ -1,0 +1,52 @@
+== launch_args ==
+--permission-mode
+manual
+== file ClaudeSettings Json (Workspace:.claude/settings.local.json) ==
+{
+  "permissions": {
+    "allow": [
+      "Edit(./**)",
+      "Read(./**)",
+      "WebFetch",
+      "WebSearch",
+      "Write(./**)"
+    ],
+    "deny": [
+      "Edit(.claude/**)",
+      "Edit(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)",
+      "Edit(.git/**)",
+      "Edit(.mcp.json)",
+      "Write(.claude/**)",
+      "Write(.claude/settings.json)",
+      "Write(.claude/settings.local.json)",
+      "Write(.git/**)",
+      "Write(.mcp.json)"
+    ]
+  }
+}
+== receipts ==
+[Exact/Documented] Posture Axis: posture Ask -> --permission-mode ; manual | launch-fixed here; switchable in the TUI only inside the launch-offered set
+[Exact/Documented] Sandbox Axis: sandbox vendor-default ->  | no launch sandbox control is compiled; the vendor default stands
+[Exact/Documented] Capability(FsReadWorkspace) Rule: allow fs_read_workspace -> Read(./**) | tool rule
+[Exact/Documented] Capability(FsWriteWorkspace) Rule: allow fs_write_workspace -> Edit(./**) ; Write(./**) | tool rule
+[Exact/Documented] Capability(NetworkWeb) Rule: allow network_web -> WebFetch ; WebSearch | tool rule
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:settings (canonical default) -> Edit(.claude/settings.json) ; Write(.claude/settings.json) ; Edit(.claude/settings.local.json) ; Write(.claude/settings.local.json) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:git (canonical default) -> Edit(.git/**) ; Write(.git/**) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[ToolScopedEmulation/Documented] Capability(FsWriteProtected) Default: deny fs_write_protected class:tool-config (canonical default) -> Edit(.claude/**) ; Write(.claude/**) ; Edit(.mcp.json) ; Write(.mcp.json) | emulation: the vendor has no protected-path rule; Edit/Write rules bind those tools only
+[Exact/Documented] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+[Exact/Documented] Capability(McpToolCall) Default: ask mcp_tool_call (canonical default) ->  | no entry: the posture's native prompt path decides unmatched requests
+== change classes ==
+Posture Respawn
+Sandbox Respawn
+Rules(FsReadWorkspace) PendingNextStart
+Rules(FsReadExternal) PendingNextStart
+Rules(FsWriteWorkspace) PendingNextStart
+Rules(FsWriteExternal) PendingNextStart
+Rules(FsWriteProtected) PendingNextStart
+Rules(ShellExec) PendingNextStart
+Rules(NetworkWeb) PendingNextStart
+Rules(McpToolCall) PendingNextStart
+requires_respawn true

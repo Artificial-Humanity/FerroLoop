@@ -1,0 +1,27 @@
+== launch_args ==
+--settings
+{"allowNonWorkspaceAccess":false}
+== receipts ==
+[Exact/Documented] Posture Axis: posture Ask ->  | no flag: the vendor prompts by default (no explicit ask mode exists)
+[Exact/Documented] Sandbox Axis: sandbox vendor-default ->  | no --sandbox flag is compiled; terminal restrictions stay as the vendor ships them
+[Unsupported/Documented] Posture Axis: artifactReviewPolicy ->  | a vendor-local review posture with no canonical counterpart: left unmanaged
+[Exact/Documented] Capability(FsReadWorkspace) Rule: allow fs_read_workspace ->  | the workspace is readable
+[Exact/Documented] Capability(FsReadExternal) Default: ask fs_read_external (canonical default) -> allowNonWorkspaceAccess=false | outside-workspace access prompts; one boolean stands for read and write
+[StricterDowngrade/Documented] Capability(FsWriteWorkspace) Rule: allow fs_write_workspace ->  | no flag allows workspace edits outside accept-edits or auto; not granted; no proven prompt channel, so it is treated as denied (not natively enforced)
+[Exact/Documented] Capability(FsWriteExternal) Default: ask fs_write_external (canonical default) -> allowNonWorkspaceAccess=false | outside-workspace access prompts; one boolean stands for read and write
+[Unsupported/Unsupported] Capability(FsWriteProtected) Default: deny fs_write_protected (canonical default) ->  | the vendor has no grammar for this capability; the default is not enforced
+[Exact/Documented] Capability(ShellExec) Default: ask shell_exec (canonical default) ->  | the mode and the prompt decide unmatched requests
+[StricterDowngrade/Unsupported] Capability(NetworkWeb) Rule: allow network_web ->  | the vendor has no grammar for this capability; not granted; no proven prompt channel, so it is treated as denied (not natively enforced)
+[Unsupported/Unsupported] Capability(McpToolCall) Default: ask mcp_tool_call (canonical default) ->  | the vendor has no grammar for this capability; the default is not enforced
+== change classes ==
+Posture Respawn
+Sandbox Respawn
+Rules(FsReadWorkspace) Respawn
+Rules(FsReadExternal) Respawn
+Rules(FsWriteWorkspace) Respawn
+Rules(FsWriteExternal) Respawn
+Rules(FsWriteProtected) Respawn
+Rules(ShellExec) Respawn
+Rules(NetworkWeb) Respawn
+Rules(McpToolCall) Respawn
+requires_respawn true

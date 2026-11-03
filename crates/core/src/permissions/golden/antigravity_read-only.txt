@@ -1,0 +1,1 @@
+REFUSED: Antigravity cannot enforce `deny fs_write_workspace`: the vendor has no native deny for this capability
