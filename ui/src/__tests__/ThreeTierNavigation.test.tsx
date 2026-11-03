@@ -283,10 +283,13 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
 
     // Left panel header defaults to Agent Roster (326px minimum width), stepped down inside cockpit-body below ContextHeader
     expect(screen.getByTestId("ferrodeck-brand")).toBeInTheDocument();
-    expect(screen.getByTestId("ferrodeck-brand-icon")).toBeInTheDocument();
-    expect(screen.getByTestId("ferrodeck-brand-title")).toHaveTextContent(
-      "FerroDeck",
-    );
+    const brandIcon = screen.getByTestId("ferrodeck-brand-icon");
+    expect(brandIcon).toBeInTheDocument();
+    expect(brandIcon).toHaveAttribute("width", "32");
+    expect(brandIcon).toHaveAttribute("height", "32");
+    const brandTitle = screen.getByTestId("ferrodeck-brand-title");
+    expect(brandTitle).toHaveTextContent("FerroDeck");
+    expect(brandTitle.style.fontSize).toBe("22px");
     const cockpitBody = screen.getByTestId("cockpit-body");
     const sidebar = within(cockpitBody).getByTestId("roster-sidebar");
     const leftHeader = within(sidebar).getByTestId("left-panel-header");

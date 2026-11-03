@@ -487,7 +487,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             style={{
               display: "inline-flex",
               alignItems: "center",
-              gap: "7px",
+              gap: "10px",
               flexShrink: 0,
             }}
           >
@@ -495,12 +495,14 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               data-testid="ferrodeck-brand-icon"
               src="/brand/ferrodeck-icon.jpg"
               alt=""
-              width="20"
-              height="20"
+              width="32"
+              height="32"
               aria-hidden="true"
               style={{
+                width: "32px",
+                height: "32px",
                 flexShrink: 0,
-                borderRadius: "4px",
+                borderRadius: "6px",
                 objectFit: "cover",
                 border: "1px solid var(--border-subtle)",
               }}
@@ -509,8 +511,9 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
               data-testid="ferrodeck-brand-title"
               style={{
                 fontWeight: 700,
-                fontSize: "14px",
-                letterSpacing: "-0.01em",
+                fontSize: "22px",
+                lineHeight: 1.1,
+                letterSpacing: "-0.015em",
                 color: "var(--text-primary)",
                 whiteSpace: "nowrap",
               }}
