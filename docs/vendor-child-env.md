@@ -106,7 +106,8 @@ GitHub credentials, another vendor's keys or a proxy.
 The probes do not read `[adapters.<name>] env_pass`, because the hub does not load adapter config.
 A probe runs with the baseline and its dialect's prefixes only. A CLI that needs a proxy to reach
 its quota endpoint gets none, and the probe reports no quota (follow-up: pass the adapter's
-`env_pass` list to the probes once the hub loads `[adapters.*]`). The binary overrides
+`env_pass` list to the probes once the hub loads `[adapters.*]`). This is a behaviour change: a
+quota probe for a Bedrock or Vertex setup, or for a host behind a proxy, now returns no quota. The binary overrides
 `FL_HUB_MUSE_BIN`, `FL_HUB_CLAUDE_BIN` and `FL_HUB_AGENT_HYDRATE_BIN` are read by the hub and are
 not passed to the child.
 
@@ -116,6 +117,12 @@ These still inherit the hub's whole environment:
 
 * The interactive vendor sessions the hub starts in tmux or a PTY (`terminal.rs`, `lifecycle.rs`,
   the wire dispatcher's tmux launches). They inherit by design: they are the Owner's own session.
+* The wire dispatcher's headless vendor spawns in `crates/wire/src/dispatcher.rs`
+  (`run_codex_queue`, `run_muse_exec`, `run_grok_headless`, and the agy `agentapi send-message`).
+  They run vendor CLIs from the hub with its whole environment, including `FL_VAULT_MASTER_KEY`.
+  `run_grok_headless` passes `--always-approve -p`. Follow-up: P0-3c.
+* The hub's non-vendor `git` and `openssl` spawns (`github_pr.rs`, `discovery.rs`, `lib.rs`)
+  inherit everything. The `git` call in `mcp_api.rs` is already hardened.
 * `crates/cli/src/cmd/wire.rs`: the hydrate spawn.
 * Command gates (`crates/exec/src/command.rs`), which run a project's own programs.
 * The hub's workflow-step endpoint (`crates/hub/src/api.rs`) does not read `[adapters.*]`, so
