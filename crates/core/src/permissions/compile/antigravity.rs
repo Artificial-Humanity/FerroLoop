@@ -49,8 +49,18 @@ fn glob_could_match(glob: &str, s: &str) -> bool {
     needed <= s.len() && s.starts_with(head)
 }
 
-/// Most (rule, command) pairs one compile may test.
-const MATCH_BUDGET: usize = 200_000;
+/// Most byte steps (a bound on matcher work) one compile may spend on matching.
+const MATCH_BUDGET: usize = 100_000_000;
+
+/// An upper bound on the matcher steps for one (rule, command) pair.
+fn pair_cost(rule: &Rule, cmd: &str) -> usize {
+    let p = match &rule.pattern {
+        Some(Pattern::ShellGlob { glob }) => glob.len(),
+        Some(Pattern::ArgvPrefix { argv }) => argv.len(),
+        _ => 0,
+    };
+    (p + 1) * (cmd.len() + 1)
+}
 
 fn plain_command(c: &str) -> bool {
     !c.is_empty()
@@ -242,7 +252,8 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                     let mut skipped = 0usize;
                     let mut mine: Vec<String> = Vec::new();
                     for c in &cx.facts.exact_commands {
-                        work += 1 + shell_rules.len();
+                        work += pair_cost(r, c)
+                            + shell_rules.iter().map(|o| pair_cost(o, c)).sum::<usize>();
                         if work > MATCH_BUDGET {
                             return Err(CompileRefusal::InvalidFacts(
                                 "too many exact commands for the shell rules to match within the work budget".into(),
@@ -278,6 +289,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                     if ask_seen || restricted { cx.withdrawn_allow(r, surface) } else { cx.dropped_allow(r, surface, "the vendor has no grammar for this capability") }
                 }
             }
+        }
+        if cap == Capability::FsWriteProtected {
+            cx.protected_class_defaults(
+                ReceiptClass::Unsupported,
+                vec![],
+                "the vendor has no grammar for this capability; the default is not enforced",
+            );
         }
     }
 

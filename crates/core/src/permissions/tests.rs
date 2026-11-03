@@ -650,7 +650,7 @@ fn render(res: &Result<CompiledPlan, CompileRefusal>) -> String {
             let u: Vec<String> = p
                 .unenforced
                 .iter()
-                .map(|u| format!("{:?}/{:?}", u.vendor, u.capability))
+                .map(|u| format!("{:?}/{:?}/{:?}", u.vendor, u.capability, u.kind))
                 .collect();
             s.push_str(&format!("unenforced [{}]\n", u.join(", ")));
         }
@@ -2523,6 +2523,14 @@ fn every_rule_and_every_omitted_capability_has_a_receipt() {
 
 // ---------------------------------------------------------------- review fixes
 
+fn denied(plan: &CompiledPlan) -> Vec<UnenforcedItem> {
+    plan.unenforced
+        .iter()
+        .filter(|u| u.kind == Effect::Deny)
+        .cloned()
+        .collect()
+}
+
 fn compile_default(v: Vendor, p: &PermissionPolicy) -> Result<CompiledPlan, CompileRefusal> {
     compile(v, &facts(v), p)
 }
@@ -2971,10 +2979,11 @@ fn unenforced_defaults_refuse_unless_acknowledged() {
             }
             let plan = compile(v, &facts(v), &ack(p)).unwrap();
             assert_eq!(
-                plan.unenforced,
+                denied(&plan),
                 vec![UnenforcedItem {
                     capability: Capability::FsWriteProtected,
-                    vendor: v
+                    vendor: v,
+                    kind: Effect::Deny
                 }],
                 "{v:?} {p:?}"
             );
@@ -2995,7 +3004,7 @@ fn unenforced_defaults_refuse_unless_acknowledged() {
     // on Codex and Muse; Antigravity cannot prove it.
     for v in [Vendor::Codex, Vendor::Muse] {
         let plan = compile(v, &facts(v), &Preset::ReadOnly.policy()).unwrap();
-        assert!(plan.unenforced.is_empty());
+        assert!(denied(&plan).is_empty());
         assert_eq!(
             line_for(&plan, "deny fs_write_protected").class,
             ReceiptClass::StricterDowngrade
@@ -3144,4 +3153,278 @@ fn minor_review_fixes() {
         ),
     );
     assert!(line_for(&m, "allow network_web").note.contains("broader"));
+}
+
+// ---------------------------------------------------------------- second review fixes
+
+fn default_class_lines(plan: &CompiledPlan) -> Vec<String> {
+    plan.receipts
+        .iter()
+        .filter(|l| {
+            l.origin == Origin::Default
+                && l.subject == ReceiptSubject::Capability(Capability::FsWriteProtected)
+        })
+        .map(|l| l.requested.clone())
+        .collect()
+}
+
+/// The exact reported input: an allow of one protected class, nothing else restricting writes.
+fn protected_allow_policy(v: Vendor, mode: UnenforcedDefaults) -> PermissionPolicy {
+    let mut rules = vec![r(
+        Capability::FsWriteProtected,
+        Effect::Allow,
+        class(PathClass::Git),
+    )];
+    if v == Vendor::Muse {
+        // Muse needs a workspace-write allow to select the writable profile.
+        rules.push(r(Capability::FsWriteWorkspace, Effect::Allow, None));
+    }
+    let posture = if v == Vendor::Codex {
+        Posture::AcceptEdits
+    } else {
+        Posture::Ask
+    };
+    let mut p = PermissionPolicy::new(posture, SandboxChoice::VendorDefault);
+    p.rules = rules;
+    p.unenforced_defaults = mode;
+    p
+}
+
+#[test]
+fn a_class_allow_never_silences_the_unenforced_check_of_the_other_classes() {
+    for v in [Vendor::Codex, Vendor::Muse, Vendor::Antigravity] {
+        // Without the allow the plan is refused; with the allow it still is.
+        let refused = compile(
+            v,
+            &facts(v),
+            &protected_allow_policy(v, UnenforcedDefaults::Refuse),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(CompileRefusal::UnenforcedRequest {
+                    capability: Capability::FsWriteProtected,
+                    ..
+                })
+            ),
+            "{v:?}: {refused:?}"
+        );
+        // Acknowledged: settings and tool-config are listed and receipted; git is not.
+        let plan = compile(
+            v,
+            &facts(v),
+            &protected_allow_policy(v, UnenforcedDefaults::Acknowledge),
+        )
+        .unwrap();
+        assert_eq!(
+            denied(&plan),
+            vec![UnenforcedItem {
+                capability: Capability::FsWriteProtected,
+                vendor: v,
+                kind: Effect::Deny
+            }],
+            "{v:?}"
+        );
+        let lines = default_class_lines(&plan);
+        assert_eq!(
+            lines,
+            [
+                "deny fs_write_protected class:settings (canonical default)",
+                "deny fs_write_protected class:tool-config (canonical default)"
+            ],
+            "{v:?}"
+        );
+        for l in plan
+            .receipts
+            .iter()
+            .filter(|l| l.origin == Origin::Default && l.effect == Some(Effect::Deny))
+        {
+            assert_eq!(l.class, ReceiptClass::Unsupported, "{v:?}");
+        }
+        // The allow itself is not granted on these vendors.
+        assert_eq!(
+            line_for(&plan, "allow fs_write_protected").native,
+            Vec::<String>::new(),
+            "{v:?}"
+        );
+    }
+    // Every class named by a rule: nothing is left to default, so nothing is flagged.
+    let mut all = pol(Posture::Ask, &[]);
+    for c in PathClass::ALL {
+        all.rules
+            .push(r(Capability::FsWriteProtected, Effect::Allow, class(c)));
+    }
+    all.unenforced_defaults = UnenforcedDefaults::Refuse;
+    let plan = compile(Vendor::Antigravity, &facts(Vendor::Antigravity), &all).unwrap();
+    assert!(denied(&plan).is_empty() && default_class_lines(&plan).is_empty());
+    // A restricting rule on Codex forces the read-only sandbox, which covers the other classes.
+    let mut deny = pol(
+        Posture::AcceptEdits,
+        &[r(
+            Capability::FsWriteProtected,
+            Effect::Deny,
+            class(PathClass::Git),
+        )],
+    );
+    deny.unenforced_defaults = UnenforcedDefaults::Refuse;
+    let plan = compile(Vendor::Codex, &facts(Vendor::Codex), &deny).unwrap();
+    assert!(denied(&plan).is_empty());
+    assert!(
+        default_class_lines(&plan)
+            .iter()
+            .all(|l| !l.contains("git"))
+    );
+    // Claude and Grok keep covering each class themselves.
+    for v in [Vendor::Claude, Vendor::Grok] {
+        let plan = compile(
+            v,
+            &facts(v),
+            &protected_allow_policy(v, UnenforcedDefaults::Refuse),
+        )
+        .unwrap();
+        assert_eq!(default_class_lines(&plan).len(), 2, "{v:?}");
+    }
+}
+
+#[test]
+fn grok_ask_withdraws_external_allows_that_could_cover_it() {
+    // The workspace may live under /home/u: the external allow could cover `src/**`.
+    let p = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsWriteWorkspace, Effect::Ask, pg("src/**")),
+            r(Capability::FsWriteExternal, Effect::Allow, ag("/home/u/**")),
+        ],
+    );
+    let g = ok(Vendor::Grok, &p);
+    assert!(!has_arg(&g, "--allow"), "{:?}", g.launch_args);
+    assert!(
+        line_for(&g, "allow fs_write_external")
+            .note
+            .contains("withdrawn")
+    );
+    // A launch root grants write too, so it is not emitted either.
+    let both = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsWriteWorkspace, Effect::Ask, pg("src/**")),
+            r(Capability::FsReadExternal, Effect::Allow, ag("/home/u/**")),
+            r(Capability::FsWriteExternal, Effect::Allow, ag("/home/u/**")),
+        ],
+    );
+    let g = ok(Vendor::Grok, &both);
+    assert!(!has_arg(&g, "--add-dir"), "{:?}", g.launch_args);
+    assert!(
+        !g.launch_args
+            .iter()
+            .any(|a| a.starts_with("Edit(//") || a.starts_with("Write(//")),
+        "no external write allow may stay: {:?}",
+        g.launch_args
+    );
+    // Without any ask the same allows stand.
+    let free = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsReadExternal, Effect::Allow, ag("/home/u/**")),
+            r(Capability::FsWriteExternal, Effect::Allow, ag("/home/u/**")),
+        ],
+    );
+    assert!(pair(&ok(Vendor::Grok, &free), "--add-dir", "/home/u"));
+    // The other direction: an ask on an external write withdraws the workspace allows.
+    let rev = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsWriteExternal, Effect::Ask, ag("/home/u/**")),
+            r(Capability::FsWriteWorkspace, Effect::Allow, None),
+        ],
+    );
+    assert!(!has_arg(&ok(Vendor::Grok, &rev), "--allow"));
+    // Reads: an external read ask withdraws the workspace read allow too.
+    let reads = pol(
+        Posture::Ask,
+        &[
+            r(Capability::FsReadExternal, Effect::Ask, ag("/home/u/**")),
+            r(Capability::FsReadWorkspace, Effect::Allow, None),
+            r(Capability::FsReadExternal, Effect::Allow, ag("/opt/x/**")),
+        ],
+    );
+    let g = ok(Vendor::Grok, &reads);
+    assert!(!has_arg(&g, "--allow"), "{:?}", g.launch_args);
+    // Shell and network asks do not reach the filesystem capabilities.
+    let shell = pol(
+        Posture::Ask,
+        &[
+            r(Capability::ShellExec, Effect::Ask, argv(&["git", "push"])),
+            r(Capability::FsWriteExternal, Effect::Allow, ag("/home/u/**")),
+        ],
+    );
+    assert!(pair(
+        &ok(Vendor::Grok, &shell),
+        "--allow",
+        "Edit(//home/u/**)"
+    ));
+    // Claude states the ask natively and keeps the allow.
+    let c = ok(Vendor::Claude, &p);
+    assert_eq!(
+        claude_list(&c, "allow"),
+        ["Edit(//home/u/**)", "Write(//home/u/**)"]
+    );
+}
+
+#[test]
+fn ungated_ask_defaults_are_listed_and_never_refuse() {
+    // Refuse policy: the plan still compiles, and the ask defaults are listed as `ask` entries.
+    let plan = compile(
+        Vendor::Codex,
+        &facts(Vendor::Codex),
+        &Preset::Custom.policy(),
+    )
+    .unwrap();
+    let asks: Vec<_> = plan
+        .unenforced
+        .iter()
+        .filter(|u| u.kind == Effect::Ask)
+        .map(|u| u.capability)
+        .collect();
+    assert!(
+        asks.contains(&Capability::FsReadWorkspace) && asks.contains(&Capability::McpToolCall),
+        "{asks:?}"
+    );
+    assert!(plan.unenforced.iter().all(|u| u.vendor == Vendor::Codex));
+    // Claude gates every ask default.
+    assert!(
+        ok(Vendor::Claude, &Preset::Custom.policy())
+            .unenforced
+            .is_empty()
+    );
+    // An older plan without the field still reads, and an entry without `kind` is a deny.
+    let mut v: serde_json::Value = serde_json::to_value(&plan).unwrap();
+    v.as_object_mut().unwrap().remove("unenforced");
+    let old: CompiledPlan = serde_json::from_value(v).unwrap();
+    assert!(old.unenforced.is_empty());
+    let item: UnenforcedItem =
+        serde_json::from_str(r#"{"capability":"fs_write_protected","vendor":"codex"}"#).unwrap();
+    assert_eq!(item.kind, Effect::Deny);
+}
+
+#[test]
+fn antigravity_match_work_is_bounded_in_byte_steps() {
+    // One long glob against many long commands is refused by the byte-step budget alone: the
+    // pair count (1024) is small.
+    let mut f = facts(Vendor::Antigravity);
+    f.exact_commands = (0..1024)
+        .map(|i| format!("{}{i}", "a".repeat(500)))
+        .collect();
+    let glob = format!("{}*", "a".repeat(400));
+    let p = pol(
+        Posture::Ask,
+        &[r(Capability::ShellExec, Effect::Allow, sg(&glob))],
+    );
+    assert!(matches!(
+        compile(Vendor::Antigravity, &f, &p),
+        Err(CompileRefusal::InvalidFacts(_))
+    ));
+    // A modest set is fine.
+    f.exact_commands.truncate(8);
+    assert!(compile(Vendor::Antigravity, &f, &p).is_ok());
 }

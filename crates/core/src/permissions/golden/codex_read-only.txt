@@ -31,4 +31,4 @@ Rules(ShellExec) PendingNextStart
 Rules(NetworkWeb) Respawn
 Rules(McpToolCall) Respawn
 requires_respawn true
-unenforced []
+unenforced [Codex/McpToolCall/Ask]

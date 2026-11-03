@@ -279,6 +279,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                             "no protected-path concept: the read-only sandbox denies every write (stricter)");
                     }
                 }
+                if mode == Mode::ReadOnly {
+                    cx.protected_class_defaults(ReceiptClass::StricterDowngrade, vec!["sandbox_mode=read-only".to_owned()],
+                        "no protected-path concept: the read-only sandbox denies every write (stricter)");
+                } else {
+                    cx.protected_class_defaults(ReceiptClass::Unsupported, vec![],
+                        "the vendor has no protected-path concept; the deny default is not enforced");
+                }
             }
             Capability::FsWriteExternal => {
                 let blocks: Vec<Option<Vec<String>>> = rules

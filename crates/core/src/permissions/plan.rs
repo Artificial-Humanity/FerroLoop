@@ -39,11 +39,20 @@ impl ConfigTarget {
 }
 
 /// A capability the vendor cannot enforce that the plan was emitted without (an acknowledged
-/// unenforced default or deny). Whoever applies the plan must surface it.
+/// unenforced default or deny, or an ungated ask default). Whoever applies the plan must surface it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnenforcedItem {
     pub capability: Capability,
     pub vendor: Vendor,
+    /// `deny`: a default or requested deny the vendor cannot enforce (refused unless
+    /// acknowledged). `ask`: a canonical ask default the vendor does not gate; never refuses,
+    /// listed so downstream can surface it.
+    #[serde(default = "deny_kind")]
+    pub kind: Effect,
+}
+
+fn deny_kind() -> Effect {
+    Effect::Deny
 }
 
 /// A native file's syntax.
@@ -170,7 +179,8 @@ pub struct CompiledPlan {
     /// True when a field this plan actually sets has the `respawn` class.
     pub requires_respawn: bool,
     /// Denies (defaults or requested) the vendor cannot enforce, present only under
-    /// `unenforced_defaults: acknowledge`.
+    /// `unenforced_defaults: acknowledge`, and ask defaults the vendor does not gate (always).
+    #[serde(default)]
     pub unenforced: Vec<UnenforcedItem>,
 }
 

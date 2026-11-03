@@ -297,6 +297,18 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
                 (Capability::NetworkWeb, _) => {}
             }
         }
+        if cap == Capability::FsWriteProtected {
+            if read_only_selected {
+                cx.protected_class_defaults(ReceiptClass::StricterDowngrade, vec![],
+                    "no protected-path concept: the read-only profile blocks every workspace write (stricter)");
+            } else {
+                cx.protected_class_defaults(
+                    ReceiptClass::Unsupported,
+                    vec![],
+                    "the vendor has no protected-path concept; the deny default is not enforced",
+                );
+            }
+        }
         if cap == Capability::NetworkWeb {
             if restricted {
                 if off {

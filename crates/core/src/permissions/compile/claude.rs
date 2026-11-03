@@ -180,12 +180,24 @@ pub(super) fn compile_rules(
                 reason: "workspace reads are never prompted, so the ask would run".to_owned(),
             });
         }
-        let write_ask = [Capability::FsWriteWorkspace, Capability::FsWriteProtected]
-            .iter()
-            .any(|c| cx.rules(*c).iter().any(|r| r.effect == Effect::Ask));
-        if write_ask {
-            cx.forced_withdraw.insert(Capability::FsWriteWorkspace);
-            cx.forced_withdraw.insert(Capability::FsWriteProtected);
+        // The workspace root is not known here, so an external glob may cover the workspace
+        // (and a workspace or protected path may sit under an external glob): the overlap
+        // cannot be ruled out, so every capability of the group is withdrawn.
+        let asked = |caps: &[Capability], cx: &Cx| {
+            caps.iter()
+                .any(|c| cx.rules(*c).iter().any(|r| r.effect == Effect::Ask))
+        };
+        let writes = [
+            Capability::FsWriteWorkspace,
+            Capability::FsWriteProtected,
+            Capability::FsWriteExternal,
+        ];
+        let reads = [Capability::FsReadWorkspace, Capability::FsReadExternal];
+        if asked(&writes, cx) {
+            cx.forced_withdraw.extend(writes);
+        }
+        if asked(&reads, cx) {
+            cx.forced_withdraw.extend(reads);
         }
     }
     for cap in Capability::ALL {

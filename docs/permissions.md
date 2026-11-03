@@ -43,7 +43,7 @@ Two switches on the policy:
 * `unenforced_defaults` (`refuse`, the default, or `acknowledge`): what a compile does when a
   canonical default deny, or a requested deny, has no native enforcement on the vendor. `refuse`
   returns `UnenforcedRequest` naming the capability and vendor. `acknowledge` emits the plan with
-  its `unsupported` receipt line and lists the capability in `plan.unenforced`. The compiler
+  its `unsupported` receipt line and lists the capability in `plan.unenforced` (kind `deny`). The compiler
   never decides to acknowledge: the Hub's spin-up UI must collect the Owner's explicit
   acknowledgement before it sets `acknowledge`, and must show `plan.unenforced` wherever it shows
   the plan.
@@ -91,6 +91,8 @@ can state it (the protected-path denies on Claude and Grok) and is otherwise rep
 receipt line (`origin: default`) that says whether the vendor enforces it. A default *deny* that
 a vendor cannot enforce follows `unenforced_defaults`. Codex's read-only sandbox and Muse's
 read-only profile block every write, so they count as enforcing the protected-path default.
+The protected-path default is judged per path class: a rule that names one class (an allow of
+`git`, say) leaves the other classes at the default, and they are refused or listed as above.
 
 ### Presets
 
@@ -125,14 +127,14 @@ with `-`.
 A `CompiledPlan` holds `launch_args`, `config_files` (each a symbolic `ConfigTarget`, a format
 and content; no `~` is resolved), `env` (always empty today; never a secret), `receipts`,
 `change_classes`, `requires_respawn` (true when a field this plan actually sets has the
-`respawn` class), `unenforced` (the acknowledged unenforceable denies) and the `key` (vendor,
+`respawn` class), `unenforced` (the acknowledged unenforceable denies, kind `deny`, and the ask defaults the vendor does not gate, kind `ask`, which are listed under either setting and never refuse; an older plan without the field reads as empty) and the `key` (vendor,
 transport, version) it was compiled for.
 
 ### Native forms
 
 | Vendor | Posture and sandbox | Rules |
 |---|---|---|
-| Claude Code | `--permission-mode manual\|acceptEdits\|auto\|plan\|bypassPermissions`; bypass adds `--allow-dangerously-skip-permissions`; the skip flag is never emitted | `.claude/settings.local.json` `permissions.{allow,ask,deny}`: `Read(./glob)`, `Edit(./glob)` and `Write(./glob)` (workspace globs are `./`-anchored), `Bash(prefix)` with `Bash(prefix *)`, `WebFetch(domain:d)`, `WebSearch`, `mcp__server[__tool]`; absolute globs as `//path`; protected paths as `Edit`/`Write` denies |
+| Claude Code | `--permission-mode manual\|acceptEdits\|auto\|plan\|bypassPermissions`; bypass adds `--allow-dangerously-skip-permissions`; the skip flag is never emitted | `.claude/settings.local.json` `permissions.{allow,ask,deny}`: `Read(./glob)`, `Edit(./glob)` and `Write(./glob)` (workspace globs are `./`-anchored: a bare `*.rs` or `Makefile` matches at the workspace root only, so to deny or allow at any depth write `**/*.rs`), `Bash(prefix)` with `Bash(prefix *)`, `WebFetch(domain:d)`, `WebSearch`, `mcp__server[__tool]`; absolute globs as `//path`; protected paths as `Edit`/`Write` denies |
 | Codex | `-a` approval policy and `-s` sandbox mode, kept split; `danger-full-access` only for `sandbox: off` | execpolicy `prefix_rule(pattern=[...], decision=allow\|prompt\|forbidden)`; `config.toml` for `writable_roots`, `network_access`, `web_search`; `-c sandbox_permissions=["disk-full-read-access"]` and `--search` |
 | Muse | `--approval-mode`, `--approval-judge off`; bypass is `--disable-approval`, or `--yolo` when the sandbox is also off; `--disable-sandbox` for `sandbox: off` | `--permission-profile` (a caller-verified profile) and `--sandbox-network restricted\|proxy-only\|enabled` |
 | Grok | `--permission-mode default\|acceptEdits\|auto\|plan\|bypassPermissions`; `--sandbox <profile>` from the facts | the Claude rule strings as `--allow` and `--deny`; `--disable-web-search`; `--add-dir` |
@@ -145,10 +147,11 @@ Notes on what degrades:
   no tool-rule form, so a deny of it is refused. An argv token that needs quoting or holds a
   wildcard cannot be stated exactly: an allow with one is not granted; a deny or ask is cut at
   the first such token (matches more, so stricter), and refused if the command name itself is
-  affected. A wildcard-domain deny widens to every `WebFetch`. Grok has no ask list: an ask on a
-  write capability withdraws every allow of both write capabilities (workspace and protected
-  paths overlap) and falls back to the default protected-path deny, and an ask on workspace
-  reads is refused.
+  affected. A wildcard-domain deny widens to every `WebFetch`. Grok has no ask list: the
+  workspace root is not known to the compiler, so an ask on any write capability withdraws every
+  allow of all three write capabilities (workspace, protected, external) and every `--add-dir`
+  root, and falls back to the default protected-path deny; an ask on an external read likewise
+  withdraws the read allows; an ask on workspace reads is refused.
 * **Codex.** Extra writable directories are explicit `writable_roots`, and only for a pattern
   that is exactly a directory subtree under the workspace-write sandbox. A narrower workspace
   write rule never widens the sandbox: a scoped write deny selects `read-only`. A coarse grant
@@ -166,7 +169,8 @@ Notes on what degrades:
   `hard_deny`, and is refused otherwise or under sandbox off. A domain allow degrades to
   `proxy-only`; the proxy's own allowlist governs and may be broader than the domains. `--yolo` and `--disable-approval` come only from `bypass`.
 * **Antigravity.** A shell prefix or glob compiles by enumeration: only exact commands the caller
-  lists in `exact_commands` and that no deny or ask rule matches become `command(...)` entries;
+  lists in `exact_commands` and that no deny or ask rule matches become `command(...)` entries
+  (matching work is capped in byte steps, and a request over the cap is refused as invalid facts);
   everything else stays ask. One boolean stands for both external read and external write; it
   is `true` only when both are allowed without a pattern. `artifactReviewPolicy` is left
   unmanaged. The vendor has no native deny, so a deny is refused unless the facts prove

@@ -27,8 +27,8 @@ use super::plan::{
 use std::collections::BTreeSet;
 
 use super::policy::{
-    Capability, Effect, PermissionPolicy, Posture, Rule, SandboxChoice, UnenforcedDefaults,
-    canonical_default,
+    Capability, Effect, PathClass, Pattern, PermissionPolicy, Posture, Rule, SandboxChoice,
+    UnenforcedDefaults, canonical_default,
 };
 
 /// Compiles `policy` for `vendor`. Pure and deterministic: the same inputs give the same
@@ -138,6 +138,47 @@ impl Cx<'_> {
             .into_iter()
             .filter(|c| self.policy.rules_for(*c).next().is_none())
             .collect()
+    }
+
+    /// The canonical protected-path default for the classes no rule names, when some rule of
+    /// `fs_write_protected` exists (with none, the vendor's whole-capability default line
+    /// applies). A rule with no pattern addresses every class. Each uncovered class gets its
+    /// own `default` receipt line, so the unenforced check never goes silent for a class
+    /// because another class carries an allow.
+    pub fn protected_class_defaults(
+        &mut self,
+        class: ReceiptClass,
+        native: Vec<String>,
+        note: &str,
+    ) {
+        if self.policy.posture == Posture::Bypass {
+            return;
+        }
+        let rules = self.rules(Capability::FsWriteProtected);
+        if rules.is_empty() || rules.iter().any(|r| r.pattern.is_none()) {
+            return;
+        }
+        for c in PathClass::ALL {
+            let named = rules
+                .iter()
+                .any(|r| matches!(&r.pattern, Some(Pattern::PathClass { class }) if *class == c));
+            if named {
+                continue;
+            }
+            self.push(
+                ReceiptSubject::Capability(Capability::FsWriteProtected),
+                Origin::Default,
+                Some(Effect::Deny),
+                format!(
+                    "deny fs_write_protected class:{} (canonical default)",
+                    c.as_str()
+                ),
+                native.clone(),
+                class,
+                Surface::ProtectedPath,
+                note,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,6 +381,14 @@ impl Cx<'_> {
                 unenforced.push(UnenforcedItem {
                     capability: c,
                     vendor: self.vendor,
+                    kind: Effect::Deny,
+                });
+            } else if l.effect == Some(Effect::Ask) && l.class == ReceiptClass::Unsupported {
+                // An ask the vendor does not gate never refuses; it is listed for the UI.
+                unenforced.push(UnenforcedItem {
+                    capability: c,
+                    vendor: self.vendor,
+                    kind: Effect::Ask,
                 });
             }
         }

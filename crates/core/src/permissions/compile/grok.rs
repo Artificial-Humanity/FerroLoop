@@ -90,9 +90,13 @@ pub(super) fn compile(cx: &mut Cx) -> Result<(), CompileRefusal> {
     }
     // --add-dir grants read and write, so it is emitted only for a root both allowed and
     // nothing restricts external access.
+    // A launch root grants read and write, so it also yields to any withdrawn ask group.
     let ext_free = [Capability::FsReadExternal, Capability::FsWriteExternal]
         .iter()
-        .all(|c| cx.rules(*c).iter().all(|r| r.effect == Effect::Allow));
+        .all(|c| {
+            !cx.forced_withdraw.contains(c)
+                && cx.rules(*c).iter().all(|r| r.effect == Effect::Allow)
+        });
     if ext_free {
         let roots = |cap| -> Vec<String> {
             cx.rules(cap)

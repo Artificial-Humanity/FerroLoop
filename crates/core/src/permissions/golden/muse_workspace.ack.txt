@@ -31,4 +31,4 @@ Rules(ShellExec) Respawn
 Rules(NetworkWeb) Respawn
 Rules(McpToolCall) Respawn
 requires_respawn true
-unenforced [Muse/FsWriteProtected]
+unenforced [Muse/FsWriteProtected/Deny]
