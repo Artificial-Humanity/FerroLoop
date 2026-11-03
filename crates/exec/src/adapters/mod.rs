@@ -46,6 +46,9 @@ pub struct AdapterBuild {
     /// A subscription CLI's binary, instead of the vendor's default.
     pub binary_override: Option<String>,
     pub rate_card: Option<RateCard>,
+    /// Names of parent variables a built-in CLI's child receives besides the allow-list
+    /// (`[adapters.<name>] env_pass`; see [`crate::child_env`]). Other vendors ignore it.
+    pub env_pass: Vec<String>,
     /// An API vendor's model, instead of the vendor's default.
     pub model: Option<String>,
     /// An API vendor's base URL (a proxy), instead of the vendor's default. It must be a place a
@@ -170,10 +173,24 @@ impl AnyAdapter {
             }
             Self::HttpApi(Box::new(api))
         };
+        adapter = adapter.with_env_pass(build.env_pass.clone());
         if let Some((attempt_id, project, agent, sink)) = build.liveness {
             adapter = adapter.with_liveness(attempt_id, project, agent, sink);
         }
         Ok(adapter)
+    }
+
+    /// Names parent variables to copy to a built-in CLI's child (see [`crate::child_env`]); any
+    /// other adapter is left as it is.
+    pub fn with_env_pass(self, names: Vec<String>) -> Self {
+        match self {
+            Self::Claude(a) => Self::Claude(a.with_env_pass(names)),
+            Self::Codex(a) => Self::Codex(a.with_env_pass(names)),
+            Self::Antigravity(a) => Self::Antigravity(a.with_env_pass(names)),
+            Self::Muse(a) => Self::Muse(a.with_env_pass(names)),
+            Self::Grok(a) => Self::Grok(a.with_env_pass(names)),
+            other @ (Self::HttpApi(_) | Self::Boxed(_)) => other,
+        }
     }
 
     pub fn with_liveness(
@@ -390,6 +407,51 @@ mod tests {
             AnyAdapter::from_vendor_id("claude", AdapterBuild::default()).unwrap(),
             AnyAdapter::Claude(_)
         ));
+    }
+
+    /// `env_pass` through the whole path a config takes: `AdapterBuild` to `AnyAdapter` to the
+    /// harness to a real spawn, against this process's real environment. `CARGO_PKG_NAME` and
+    /// `CARGO_PKG_VERSION` are set by cargo for the test run and are in no allow-list.
+    #[tokio::test]
+    async fn env_pass_in_the_build_reaches_the_spawned_cli_and_unnamed_variables_do_not() {
+        let d = tempfile::tempdir().unwrap();
+        let dump = d.path().join("env.txt");
+        let stub = d.path().join("env-claude.sh");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\n/usr/bin/env > '{}'\n", dump.display()),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+        let name = std::env::var("CARGO_PKG_NAME").expect("cargo sets CARGO_PKG_NAME");
+        assert!(std::env::var_os("CARGO_PKG_VERSION").is_some());
+
+        let adapter = AnyAdapter::from_vendor_id(
+            "claude",
+            AdapterBuild {
+                binary_override: Some(stub.to_string_lossy().into_owned()),
+                env_pass: vec!["CARGO_PKG_NAME".into(), "FL_VAULT_MASTER_KEY".into()],
+                ..AdapterBuild::default()
+            },
+        )
+        .unwrap();
+        let out = adapter
+            .attempt(AttemptSpec {
+                project_root: d.path().to_path_buf(),
+                record: RecordId(seq_iri(1)),
+                instruction: "x".into(),
+                timeout_secs: 10,
+                budget_usd_micros: 1_000_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.status, AttemptStatus::Completed);
+        let text = std::fs::read_to_string(&dump).unwrap();
+        assert!(text.contains(&format!("CARGO_PKG_NAME={name}\n")), "{text}");
+        assert!(!text.contains("CARGO_PKG_VERSION="), "{text}");
+        assert!(!text.contains("FL_VAULT_MASTER_KEY"), "{text}");
     }
 
     #[tokio::test]

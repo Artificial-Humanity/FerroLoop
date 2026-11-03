@@ -316,6 +316,11 @@ pub struct AdapterConfig {
     pub input_usd_micros_per_mtok: Option<u64>,
     #[serde(default)]
     pub output_usd_micros_per_mtok: Option<u64>,
+    /// Names of variables copied from fl's own environment to this CLI's child, besides the
+    /// allow-list (for example `HTTPS_PROXY` or `AWS_PROFILE`). Names only: the values are read
+    /// when the CLI starts. `FL_*` and `FERROGATE_*` are refused. See `docs/vendor-child-env.md`.
+    #[serde(default)]
+    pub env_pass: Vec<String>,
 }
 
 impl AdapterConfig {
@@ -795,6 +800,9 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
                 path.display()
             );
         }
+        fl_exec::child_env::check_pass_list(&adapter_cfg.env_pass).map_err(|why| {
+            anyhow::anyhow!("{}: `adapters.{raw_key}.env_pass` {why}", path.display())
+        })?;
         adapters.insert(kind, adapter_cfg);
     }
     let vendors = load_vendors(path, file.vendors)?;
@@ -1979,6 +1987,51 @@ mod tests {
             format!("{empty_bin:#}").contains("`adapters.muse.binary` must not be empty"),
             "{empty_bin:#}"
         );
+    }
+
+    #[test]
+    fn adapter_env_pass_is_parsed_and_validated_at_load() {
+        let cfg = load_text(
+            "[adapters.claude]\nenv_pass = [\"HTTPS_PROXY\", \"AWS_PROFILE\", \"HTTPS_PROXY\", \"GH_TOKEN\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.adapters.get(&AdapterKind::Claude).unwrap().env_pass,
+            ["HTTPS_PROXY", "AWS_PROFILE", "HTTPS_PROXY", "GH_TOKEN"]
+        );
+        assert!(
+            load_text("[adapters.codex]\nbinary = \"codex\"\n")
+                .unwrap()
+                .adapters[&AdapterKind::Codex]
+                .env_pass
+                .is_empty()
+        );
+
+        let many = (0..=fl_exec::child_env::MAX_ENV_PASS)
+            .map(|i| format!("\"V{i}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let long = "A".repeat(fl_exec::child_env::MAX_ENV_NAME_LEN + 1);
+        for (list, why) in [
+            ("\"FL_VAULT_MASTER_KEY\"", "can never reach"),
+            ("\"FERROGATE_TOKEN\"", "can never reach"),
+            ("\"FL_\"", "can never reach"),
+            ("\"1BAD\"", "not a variable name"),
+            ("\"A=B\"", "not a variable name"),
+            ("\"\"", "not a variable name"),
+            ("\"HTTPS PROXY\"", "not a variable name"),
+            (&format!("\"{long}\""), "longer than"),
+            (&many, "at most"),
+        ] {
+            let err = load_text(&format!("[adapters.muse]\nenv_pass = [{list}]\n")).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("`adapters.muse.env_pass`"), "{msg}");
+            assert!(msg.contains(why), "{list}: {msg}");
+        }
+        // Names, not values: a table or a string is not a list of names, and a key it does not
+        // know is still refused.
+        assert!(load_text("[adapters.muse]\nenv_pass = \"HTTPS_PROXY\"\n").is_err());
+        assert!(load_text("[adapters.muse]\nenv_passs = [\"X\"]\n").is_err());
     }
 
     #[test]

@@ -630,6 +630,8 @@ pub struct StepExecutionOptions {
     pub step_id: Option<String>,
     pub adapter_override: Option<String>,
     pub binary_override: Option<String>,
+    /// `[adapters.<name>] env_pass` of a built-in CLI (see [`crate::child_env`]).
+    pub env_pass: Vec<String>,
     pub rate_card: Option<RateCard>,
     pub timeout_secs: u64,
     pub budget_usd_micros: u64,
@@ -644,6 +646,7 @@ impl Default for StepExecutionOptions {
             step_id: None,
             adapter_override: None,
             binary_override: None,
+            env_pass: Vec::new(),
             rate_card: None,
             timeout_secs: 900,
             budget_usd_micros: 1_000_000,
@@ -1125,6 +1128,7 @@ pub fn execute_workflow_step_with(
     };
 
     let binary_override = options.binary_override.clone();
+    let env_pass = options.env_pass.clone();
     let rate_card = options.rate_card;
     let outcome = std::thread::scope(|s| {
         s.spawn(move || {
@@ -1133,7 +1137,9 @@ pub fn execute_workflow_step_with(
                 .build()
                 .expect("tokio current_thread runtime builds");
             let adapter = match &target {
-                StepTarget::Kind(kind) => AnyAdapter::new(*kind, binary_override, rate_card),
+                StepTarget::Kind(kind) => {
+                    AnyAdapter::new(*kind, binary_override, rate_card).with_env_pass(env_pass)
+                }
                 StepTarget::Vendor(id) => {
                     // ⚠ With a hook, the hook is the whole build: `options.binary_override` and
                     // `options.rate_card` are the five CLIs' settings and are not lent to a vendor.
@@ -1141,6 +1147,7 @@ pub fn execute_workflow_step_with(
                         Some(hook) => hook(id),
                         None => AdapterBuild {
                             binary_override,
+                            env_pass,
                             rate_card,
                             ..AdapterBuild::default()
                         },

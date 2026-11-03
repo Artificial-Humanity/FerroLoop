@@ -32,14 +32,16 @@
 //!    Codex, `GEMINI_*`, `GOOGLE_*`, `ANTIGRAVITY_*` and `AGY_*` for Antigravity, `XAI_*` and
 //!    `GROK_*` for Grok, `MUSE_*` for Muse. These include endpoint overrides such as
 //!    `ANTHROPIC_BASE_URL`. A Claude child never sees `OPENAI_API_KEY`.
-//! 3. **Explicit extras**: the `extra` argument, applied last, for the key the warrant layer
-//!    chooses for one attempt and for any setting an operator opts in to (a proxy, for
-//!    example). An extra replaces a same-named inherited variable.
+//! 3. **Opt-in names** (`pass`): variable NAMES an operator lists in `[adapters.<name>]
+//!    `env_pass`; each is copied from the parent when it is set there. This is the only way a
+//!    proxy, `AWS_*`, `GITHUB_TOKEN` or `GH_TOKEN` reaches a child.
+//! 4. **Explicit extras** (`extra`), applied last, for the key the warrant layer chooses for one
+//!    attempt. An extra replaces a same-named inherited variable.
 //!
 //! # What never passes
 //!
 //! Anything not listed, which covers `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (a
-//! proxy sees the vendor's traffic and its credentials; opt in through an extra), `SSH_AUTH_SOCK`
+//! proxy sees the vendor's traffic and its credentials; opt in with `env_pass`), `SSH_AUTH_SOCK`
 //! (the child gets no git-over-ssh; agents commit through fl), `DISPLAY` and `WAYLAND_DISPLAY`
 //! (no browser login flow from an unattended attempt), `AWS_*` (Claude on Bedrock needs them
 //! through an extra) and every other tool's token. A variable whose name starts with one of
@@ -101,10 +103,63 @@ pub const BASELINE_EXACT: &[&str] = &[
 /// Name prefixes every dialect's child receives.
 pub const BASELINE_PREFIXES: &[&str] = &["LC_"];
 
-/// Name prefixes that never reach a child, whatever an allow-list says. These are fl's own
+/// Name prefixes that never reach a child by inheritance, whatever an allow-list says: fl's own
 /// variables (the vault master key, hub and wire tokens), the ferrogate settings and the GitHub
-/// credentials.
+/// credentials. Matching is case-sensitive; default-deny (a name must be listed to pass) is the
+/// real protection, and this list is the second line.
 pub const DENIED_PREFIXES: &[&str] = &["FL_", "FERROGATE_", "GITHUB_", "GH_"];
+
+/// Name prefixes that reach a child by no route: not inheritance, not `env_pass`, not an extra.
+/// Config load refuses them; the filter drops them again.
+pub const NEVER_PREFIXES: &[&str] = &["FL_", "FERROGATE_"];
+
+/// The most names one `env_pass` list may hold.
+pub const MAX_ENV_PASS: usize = 64;
+/// The longest variable name `env_pass` accepts.
+pub const MAX_ENV_NAME_LEN: usize = 128;
+
+/// True when `name` can reach a child by no route (see [`NEVER_PREFIXES`]).
+pub fn never_passes(name: &str) -> bool {
+    NEVER_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Why `name` cannot be in an `env_pass` list, or `Ok`. A name is `[A-Za-z_][A-Za-z0-9_]*`, at
+/// most [`MAX_ENV_NAME_LEN`] bytes, and does not start with a [`NEVER_PREFIXES`] prefix.
+pub fn check_pass_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let shape_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if name.len() > MAX_ENV_NAME_LEN {
+        Err(format!(
+            "`{}...` is longer than {MAX_ENV_NAME_LEN} characters",
+            name.chars().take(16).collect::<String>()
+        ))
+    } else if !shape_ok {
+        Err(format!(
+            "`{name}` is not a variable name (letters, digits and `_`, not starting with a digit)"
+        ))
+    } else if never_passes(name) {
+        Err(format!(
+            "`{name}` can never reach a vendor CLI: names starting with {} are fl's own secrets",
+            NEVER_PREFIXES.join(" or ")
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Checks a whole `env_pass` list: length, then every name. Duplicates are fine.
+pub fn check_pass_list(names: &[String]) -> Result<(), String> {
+    if names.len() > MAX_ENV_PASS {
+        return Err(format!(
+            "lists {} names; at most {MAX_ENV_PASS} are allowed",
+            names.len()
+        ));
+    }
+    names.iter().try_for_each(|n| check_pass_name(n))
+}
 
 /// The credential and endpoint prefixes of one vendor CLI, and no other vendor's.
 pub const fn dialect_prefixes(kind: AdapterKind) -> &'static [&'static str] {
@@ -117,16 +172,21 @@ pub const fn dialect_prefixes(kind: AdapterKind) -> &'static [&'static str] {
     }
 }
 
-/// The environment for a `kind` child, from this process's environment. `extra` is applied
-/// last (see the module doc).
-pub fn child_env(kind: AdapterKind, extra: &[(OsString, OsString)]) -> Vec<(OsString, OsString)> {
-    child_env_from(kind, std::env::vars_os(), extra)
+/// The environment for a `kind` child, from this process's environment. `pass` names extra
+/// variables to copy from it and `extra` is applied last (see the module doc).
+pub fn child_env(
+    kind: AdapterKind,
+    pass: &[String],
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    child_env_from(kind, std::env::vars_os(), pass, extra)
 }
 
 /// [`child_env`] with the parent environment given instead of read.
 pub fn child_env_from(
     kind: AdapterKind,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
+    pass: &[String],
     extra: &[(OsString, OsString)],
 ) -> Vec<(OsString, OsString)> {
     let prefixes: Vec<&str> = BASELINE_PREFIXES
@@ -134,32 +194,58 @@ pub fn child_env_from(
         .chain(dialect_prefixes(kind))
         .copied()
         .collect();
-    scrub(parent, BASELINE_EXACT, &prefixes, DENIED_PREFIXES, extra)
+    let rules = Rules {
+        allow_exact: BASELINE_EXACT,
+        allow_prefixes: &prefixes,
+        denied_prefixes: DENIED_PREFIXES,
+        never_prefixes: NEVER_PREFIXES,
+    };
+    scrub(parent, &rules, pass, extra)
 }
 
-/// The filter itself, with every list given. A name passes when it is in `allow_exact` or starts
-/// with one of `allow_prefixes`, and starts with none of `denied_prefixes`. `extra` replaces
-/// same-named variables and is not filtered.
+/// The lists [`scrub`] applies.
+pub struct Rules<'a> {
+    /// Names that pass by inheritance.
+    pub allow_exact: &'a [&'a str],
+    /// Name prefixes that pass by inheritance.
+    pub allow_prefixes: &'a [&'a str],
+    /// Prefixes that do not pass by inheritance even if listed above.
+    pub denied_prefixes: &'a [&'a str],
+    /// Prefixes that pass by no route, `pass` and `extra` included.
+    pub never_prefixes: &'a [&'a str],
+}
+
+/// The filter itself, with every list given. A parent variable passes when its name starts with
+/// no `never_prefixes` prefix and either is named in `pass`, or is in `allow_exact` or starts
+/// with an `allow_prefixes` prefix and starts with no `denied_prefixes` prefix. `extra` replaces
+/// same-named variables; only its `never_prefixes` names are removed.
 pub fn scrub(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
-    allow_exact: &[&str],
-    allow_prefixes: &[&str],
-    denied_prefixes: &[&str],
+    rules: &Rules<'_>,
+    pass: &[String],
     extra: &[(OsString, OsString)],
 ) -> Vec<(OsString, OsString)> {
+    let never = |name: &str| rules.never_prefixes.iter().any(|p| name.starts_with(p));
     let mut out: Vec<(OsString, OsString)> = parent
         .into_iter()
         .filter(|(name, _)| {
             let Some(name) = name.to_str() else {
                 return false;
             };
-            !denied_prefixes.iter().any(|p| name.starts_with(p))
-                && (allow_exact.contains(&name)
-                    || allow_prefixes.iter().any(|p| name.starts_with(p)))
+            let inherited = !rules.denied_prefixes.iter().any(|p| name.starts_with(p))
+                && (rules.allow_exact.contains(&name)
+                    || rules.allow_prefixes.iter().any(|p| name.starts_with(p)));
+            !never(name)
+                && (inherited || pass.iter().any(|n| n == name))
                 && !extra.iter().any(|(e, _)| e == OsStr::new(name))
         })
         .collect();
-    out.extend(extra.iter().cloned());
+    out.extend(
+        extra
+            .iter()
+            .filter(|(name, _)| name.to_str().is_some_and(|n| !never(n)))
+            .cloned(),
+    );
     out
 }
 
@@ -189,7 +275,17 @@ mod tests {
         parent: &[(&str, &str)],
         extra: &[(&str, &str)],
     ) -> BTreeMap<String, String> {
-        child_env_from(kind, pairs(parent), &pairs(extra))
+        run_with_pass(kind, parent, &[], extra)
+    }
+
+    fn run_with_pass(
+        kind: AdapterKind,
+        parent: &[(&str, &str)],
+        pass: &[&str],
+        extra: &[(&str, &str)],
+    ) -> BTreeMap<String, String> {
+        let pass: Vec<String> = pass.iter().map(|s| s.to_string()).collect();
+        child_env_from(kind, pairs(parent), &pass, &pairs(extra))
             .into_iter()
             .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
             .collect()
@@ -332,13 +428,13 @@ mod tests {
             ("GH_TOKEN", "e"),
             ("KEEP", "k"),
         ]);
-        let out = scrub(
-            parent,
-            &["FL_VAULT_MASTER_KEY", "GITHUB_TOKEN", "KEEP"],
-            &["FL_", "FERROGATE_", "GH_"],
-            DENIED_PREFIXES,
-            &[],
-        );
+        let rules = Rules {
+            allow_exact: &["FL_VAULT_MASTER_KEY", "GITHUB_TOKEN", "KEEP"],
+            allow_prefixes: &["FL_", "FERROGATE_", "GH_"],
+            denied_prefixes: DENIED_PREFIXES,
+            never_prefixes: NEVER_PREFIXES,
+        };
+        let out = scrub(parent, &rules, &[], &[]);
         assert_eq!(out, pairs(&[("KEEP", "k")]));
     }
 
@@ -362,6 +458,7 @@ mod tests {
         let list = child_env_from(
             AdapterKind::Claude,
             pairs(&[("ANTHROPIC_API_KEY", "inherited")]),
+            &[],
             &pairs(&[("ANTHROPIC_API_KEY", "spliced")]),
         );
         assert_eq!(list, pairs(&[("ANTHROPIC_API_KEY", "spliced")]));
@@ -392,6 +489,7 @@ mod tests {
             AdapterKind::Muse,
             vec![(bad, os("x")), (os("PATH"), os("/bin"))],
             &[],
+            &[],
         );
         assert_eq!(out, pairs(&[("PATH", "/bin")]));
     }
@@ -401,9 +499,106 @@ mod tests {
         let out = child_env_from(
             AdapterKind::Grok,
             Vec::new(),
+            &[],
             &pairs(&[("XAI_API_KEY", "k")]),
         );
         assert_eq!(out, pairs(&[("XAI_API_KEY", "k")]));
+    }
+
+    #[test]
+    fn never_prefixes_are_refused_from_extra_and_pass_in_every_dialect() {
+        for kind in ALL {
+            let env = run_with_pass(
+                kind,
+                &[
+                    ("FL_VAULT_MASTER_KEY", "a"),
+                    ("FERROGATE_TOKEN", "b"),
+                    ("FL_HUB_TOKEN", "c"),
+                    ("PATH", "/bin"),
+                ],
+                &["FL_VAULT_MASTER_KEY", "FERROGATE_TOKEN"],
+                &[
+                    ("FL_HUB_TOKEN", "x"),
+                    ("FERROGATE_Y", "y"),
+                    ("OK_EXTRA", "z"),
+                ],
+            );
+            assert_eq!(
+                env.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["OK_EXTRA", "PATH"],
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_names_pass_only_when_named_or_given_never_by_inheritance() {
+        let parent = [("GITHUB_TOKEN", "g"), ("GH_TOKEN", "h"), ("GH_HOST", "x")];
+        for kind in ALL {
+            assert!(run(kind, &parent, &[]).is_empty(), "{kind:?}");
+            let env = run_with_pass(kind, &parent, &["GH_TOKEN"], &[("GITHUB_TOKEN", "e")]);
+            assert_eq!(env.get("GH_TOKEN").map(String::as_str), Some("h"));
+            assert_eq!(env.get("GITHUB_TOKEN").map(String::as_str), Some("e"));
+            assert!(!env.contains_key("GH_HOST"));
+        }
+    }
+
+    #[test]
+    fn pass_copies_only_the_named_variables_that_the_parent_has() {
+        let env = run_with_pass(
+            AdapterKind::Claude,
+            &[
+                ("HTTPS_PROXY", "http://p"),
+                ("NO_PROXY", "localhost"),
+                ("AWS_PROFILE", "dev"),
+                ("AWS_SECRET_ACCESS_KEY", "s"),
+            ],
+            &["HTTPS_PROXY", "AWS_PROFILE", "NOT_SET_ANYWHERE"],
+            &[],
+        );
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["AWS_PROFILE", "HTTPS_PROXY"]
+        );
+    }
+
+    #[test]
+    fn pass_name_validation_table() {
+        let long = "A".repeat(MAX_ENV_NAME_LEN + 1);
+        let ok = "A".repeat(MAX_ENV_NAME_LEN);
+        for good in [
+            "HTTPS_PROXY",
+            "_x",
+            "aws_profile",
+            "A1",
+            "GITHUB_TOKEN",
+            ok.as_str(),
+        ] {
+            assert!(check_pass_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "1A",
+            "A-B",
+            "A B",
+            "A=B",
+            "A\0B",
+            "é",
+            long.as_str(),
+            "FL_VAULT_MASTER_KEY",
+            "FL_",
+            "FERROGATE_TOKEN",
+        ] {
+            assert!(check_pass_name(bad).is_err(), "{bad:?}");
+        }
+        // Case matters: Unix names are case-sensitive, so `fl_x` is an ordinary variable.
+        assert!(check_pass_name("fl_x").is_ok());
+        let many: Vec<String> = (0..=MAX_ENV_PASS).map(|i| format!("V{i}")).collect();
+        assert!(check_pass_list(&many).is_err());
+        assert!(check_pass_list(&many[..MAX_ENV_PASS]).is_ok());
+        let dup = vec!["A".to_string(), "A".to_string()];
+        assert!(check_pass_list(&dup).is_ok());
+        assert!(check_pass_list(&["A".into(), "FL_B".into()]).is_err());
     }
 
     #[test]

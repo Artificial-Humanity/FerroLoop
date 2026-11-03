@@ -491,11 +491,16 @@ fn build_step_options(
     let rate_card = resolved_kind
         .and_then(|kind| adapters.get(&kind))
         .and_then(|cfg| cfg.rate_card());
+    let env_pass = resolved_kind
+        .and_then(|kind| adapters.get(&kind))
+        .map(|cfg| cfg.env_pass.clone())
+        .unwrap_or_default();
 
     StepExecutionOptions {
         step_id: step,
         adapter_override: adapter,
         binary_override,
+        env_pass,
         rate_card,
         timeout_secs,
         budget_usd_micros: 1_000_000,
@@ -1283,6 +1288,7 @@ mod tests {
             binary: Some("/opt/claude-bin".into()),
             input_usd_micros_per_mtok: Some(3),
             output_usd_micros_per_mtok: Some(15),
+            env_pass: vec!["HTTPS_PROXY".into()],
         };
         let adapters = BTreeMap::from([(AdapterKind::Claude, cfg)]);
         build_step_options(
@@ -1305,6 +1311,7 @@ mod tests {
                 Some("/opt/claude-bin"),
                 "{name:?}"
             );
+            assert_eq!(opts.env_pass, ["HTTPS_PROXY"], "{name:?}");
             let card = opts.rate_card.expect("the rate card");
             assert_eq!(
                 (
@@ -1321,6 +1328,7 @@ mod tests {
     fn a_vendor_that_is_not_one_of_the_five_clis_is_not_lent_their_settings() {
         let opts = options(Some("kimi-api"));
         assert_eq!(opts.binary_override, None);
+        assert!(opts.env_pass.is_empty());
         assert!(opts.rate_card.is_none());
     }
 }

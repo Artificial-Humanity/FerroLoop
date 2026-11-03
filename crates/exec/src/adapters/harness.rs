@@ -1,6 +1,6 @@
 //! Shared process harness, pre/post git snapshot delta, and wrapper liveness emitter.
 
-use crate::child_env::child_env_from;
+use crate::child_env::{child_env_from, never_passes};
 use crate::runner::{AttemptOutcome, AttemptSpec};
 use fl_core::at::At;
 use fl_core::ids::ProjectId;
@@ -67,6 +67,13 @@ pub struct ParsedOutput {
     pub vendor_cost_usd_micros: Option<u64>,
 }
 
+/// Names a variable fl refuses to pass to a child. Never the value.
+fn warn_if_never(name: &str) {
+    if never_passes(name) {
+        eprintln!("fl: warning: `{name}` is never passed to a vendor CLI; it was dropped");
+    }
+}
+
 pub trait CliDialect: Send + Sync {
     fn kind(&self) -> AdapterKind;
     fn default_binary(&self) -> &'static str;
@@ -90,7 +97,10 @@ pub struct ProcessHarness<D: CliDialect> {
     /// [`crate::child_env`]): the key the warrant layer chose for this attempt, or a setting an
     /// operator opted in to. They replace a same-named inherited variable.
     pub extra_env: Vec<(OsString, OsString)>,
-    /// The parent environment the allow-list is applied to. `None`: this process's own.
+    /// Names of parent variables copied to the child when the parent has them (`env_pass`).
+    pub env_pass: Vec<String>,
+    /// The parent environment the allow-list is applied to, in place of this process's.
+    #[cfg(test)]
     parent_env: Option<Vec<(OsString, OsString)>>,
 }
 
@@ -107,6 +117,8 @@ impl<D: CliDialect> ProcessHarness<D> {
             host: detect_host(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             extra_env: Vec::new(),
+            env_pass: Vec::new(),
+            #[cfg(test)]
             parent_env: None,
         }
     }
@@ -114,7 +126,21 @@ impl<D: CliDialect> ProcessHarness<D> {
     /// Adds variables to the child's environment, after the allow-list (see
     /// [`crate::child_env`]). Use it for the vendor key of one attempt.
     pub fn with_env(mut self, extra: Vec<(OsString, OsString)>) -> Self {
+        for (name, _) in &extra {
+            warn_if_never(&name.to_string_lossy());
+        }
         self.extra_env = extra;
+        self
+    }
+
+    /// Names parent variables to copy to the child (`[adapters.<name>] env_pass`). Values are
+    /// read from the parent when the child starts. A name fl never passes (`FL_*`,
+    /// `FERROGATE_*`) is dropped there with a warning.
+    pub fn with_env_pass(mut self, names: Vec<String>) -> Self {
+        for name in &names {
+            warn_if_never(name);
+        }
+        self.env_pass = names;
         self
     }
 
@@ -128,10 +154,21 @@ impl<D: CliDialect> ProcessHarness<D> {
     /// The whole environment of the child: the allow-list applied to the parent's, then the
     /// extras. The spawn clears everything else.
     fn child_env(&self) -> Vec<(OsString, OsString)> {
-        match &self.parent_env {
-            Some(parent) => child_env_from(self.dialect.kind(), parent.clone(), &self.extra_env),
-            None => child_env_from(self.dialect.kind(), std::env::vars_os(), &self.extra_env),
+        #[cfg(test)]
+        if let Some(parent) = &self.parent_env {
+            return child_env_from(
+                self.dialect.kind(),
+                parent.clone(),
+                &self.env_pass,
+                &self.extra_env,
+            );
         }
+        child_env_from(
+            self.dialect.kind(),
+            std::env::vars_os(),
+            &self.env_pass,
+            &self.extra_env,
+        )
     }
 
     pub fn with_rate_card(mut self, rate_card: Option<RateCard>) -> Self {
@@ -927,6 +964,7 @@ mod tests {
     async fn run_fake_vendor<D: CliDialect>(
         dialect: D,
         parent: &[(&str, &str)],
+        pass: &[&str],
         extra: &[(&str, &str)],
     ) -> (BTreeMap<String, String>, String, String, String) {
         let d = tempfile::tempdir().unwrap();
@@ -957,6 +995,7 @@ printf '%s\n' '{"result":"ok"}'
         extra.push(("FAKE_VENDOR_OUT".into(), out.clone().into_os_string()));
         let harness = ProcessHarness::new(stub.to_string_lossy().into_owned(), dialect)
             .with_parent_env(own(parent))
+            .with_env_pass(pass.iter().map(|s| s.to_string()).collect())
             .with_env(extra);
         let outcome = harness
             .run(AttemptSpec {
@@ -1006,6 +1045,7 @@ printf '%s\n' '{"result":"ok"}'
         let (env, pid, pgid, stdin) = run_fake_vendor(
             ClaudeDialect,
             &sentinel_parent(),
+            &[],
             &[("ANTHROPIC_API_KEY", "spliced-sentinel")],
         )
         .await;
@@ -1055,13 +1095,50 @@ printf '%s\n' '{"result":"ok"}'
     #[tokio::test]
     async fn a_codex_child_keeps_its_own_vendor_key_and_not_another_vendors() {
         use crate::adapters::codex::CodexDialect;
-        let (env, ..) = run_fake_vendor(CodexDialect, &sentinel_parent(), &[]).await;
+        let (env, ..) = run_fake_vendor(CodexDialect, &sentinel_parent(), &[], &[]).await;
         assert_eq!(
             env.get("OPENAI_API_KEY").map(String::as_str),
             Some("openai-sentinel")
         );
         assert!(!env.contains_key("ANTHROPIC_API_KEY"));
         assert!(!env.contains_key("FL_VAULT_MASTER_KEY"));
+    }
+
+    #[tokio::test]
+    async fn env_pass_names_reach_the_child_and_unnamed_or_never_names_do_not() {
+        use crate::adapters::claude::ClaudeDialect;
+        let mut parent = sentinel_parent();
+        parent.push(("AWS_PROFILE", "dev-sentinel"));
+        parent.push(("NO_PROXY", "localhost"));
+        let (env, ..) = run_fake_vendor(
+            ClaudeDialect,
+            &parent,
+            // A named FL_* is dropped at spawn even if it got past config load.
+            &[
+                "HTTPS_PROXY",
+                "AWS_PROFILE",
+                "GITHUB_TOKEN",
+                "FL_VAULT_MASTER_KEY",
+            ],
+            &[],
+        )
+        .await;
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://proxy-sentinel")
+        );
+        assert_eq!(
+            env.get("AWS_PROFILE").map(String::as_str),
+            Some("dev-sentinel")
+        );
+        assert_eq!(
+            env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("github-sentinel"),
+            "an operator may opt GITHUB_* in by name"
+        );
+        assert!(!env.contains_key("NO_PROXY"), "not named, so not passed");
+        assert!(!env.contains_key("FL_VAULT_MASTER_KEY"));
+        assert!(!env.contains_key("FL_HUB_TOKEN"));
     }
 
     #[tokio::test]
