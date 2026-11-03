@@ -32,7 +32,9 @@ File naming in this directory follows
   `GET /api/v1/version`, the UI bundle's `build-info.json`, and the build-time stamps behind
   them.
 * [installer.md](installer.md) — the release manifest and install receipt schemas, the profiles,
-  and `fl install --dry-run`: the deterministic plan, its exit codes, and what it never does.
+  `fl install --dry-run` (the deterministic plan) and `fl install --yes` (the journaled
+  transaction: lock, stage, verify, switch `current`, receipt last; resume and rollback),
+  the exit codes, and what the installer does not do.
 * [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the six observational
   `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,

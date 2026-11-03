@@ -20,6 +20,7 @@ mod plan;
 #[cfg(test)]
 mod plan_tests;
 mod receipt;
+mod txn;
 
 pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
 pub use defaults::default_manifest;
@@ -32,13 +33,18 @@ pub use plan::{
     Approval, BUDGET_EXCEEDED, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan,
     InstallRequest, Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled,
     Origin, PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
-    PlannedArtifact, PlannedPath, PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint, plan,
-    resolve_layout,
+    PlannedArtifact, PlannedPath, PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint,
+    is_forbidden_install_root, plan, release_dir_name, resolve_layout,
 };
 pub use receipt::{
     InstallReceipt, JournalEntry, JournalPhase, MAX_RECEIPT_BYTES, OwnedAlias, OwnedArtifact,
     OwnedCatalogEntry, OwnedConfigBlock, OwnedPath, OwnedPathKind, OwnedUnit, ReceiptError,
     ReceiptLayout, ReceiptRelease,
+};
+pub use txn::{
+    BackupSpec, IntentFile, JOURNAL_SCHEMA_VERSION, JournalLine, JournalOp, LinkSpec,
+    MAX_COMMITTED_ENTRIES, RELEASE_JSON, RETAINED_PREVIOUS_RELEASES, Retention, Step, TxnIntent,
+    build_receipt, has_committed, hex, next_txn, release_json, retention, sha256_hex, tree_digest,
 };
 
 use serde::{Deserialize, Serialize};
@@ -229,7 +235,7 @@ impl HostInfo {
 }
 
 /// Why an in-release or archive path was refused.
-pub(crate) fn rel_path_problem(path: &str) -> Option<&'static str> {
+pub fn rel_path_problem(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("is empty");
     }

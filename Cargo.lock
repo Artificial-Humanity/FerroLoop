@@ -475,9 +475,11 @@ version = "0.1.0"
 dependencies = [
  "fl-core",
  "libc",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

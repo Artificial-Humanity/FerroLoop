@@ -33,6 +33,7 @@ libc.workspace = true
 [dev-dependencies]
 redb.workspace = true
 sha2.workspace = true
+fl-install = { path = "../install", features = ["fault-injection", "fixtures"] }
 fl-github = { path = "../github", features = ["fake"] }
 fl-mcp = { path = "../mcp", features = ["fake"] }
 tempfile.workspace = true

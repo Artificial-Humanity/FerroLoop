@@ -8,8 +8,18 @@ version.workspace = true
 [dependencies]
 fl-core = { path = "../core" }
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-sha2.workspace = true
+
+[features]
+# Test seam: lets the `fl` binary read FL_INSTALL_FAULT and die between install steps. Enabled
+# only by fl-cli's dev-dependency, never in a shipped build.
+fault-injection = []
+# Fixtures (an extracted artifact tree and a manifest that pins it) for tests of the installer,
+# here and in fl-cli. Never part of a shipped build.
+fixtures = []
