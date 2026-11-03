@@ -601,6 +601,7 @@ export interface SpinUpSessionRequest {
   worktree_policy?: "create" | "reuse" | "shared";
   allocated_port?: number;
   allocated_vite_port?: number;
+  permission_policy?: unknown;
 }
 
 export interface SpinUpSessionResponse {
