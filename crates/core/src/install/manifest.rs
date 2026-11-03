@@ -48,6 +48,50 @@ pub struct ReleaseInfo {
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain: Option<String>,
+    /// How a reviewed-commit source build was made (`fl install --from-git`). Only a
+    /// `source_build` manifest carries it; it is built in memory and never part of a published
+    /// manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildProvenance>,
+}
+
+/// Longest `rustc -V` / `cargo -V` line a provenance record holds.
+pub const MAX_TOOL_LINE: usize = 200;
+
+/// How a source-build release was made. It is recorded in the install receipt and in the
+/// release's `release.json`, so a source build never poses as a signed release and an
+/// unreviewed commit is visible for as long as it is installed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildProvenance {
+    /// The commit was an ancestor of `origin/main` when it was built. `false` only with
+    /// `--allow-unreviewed`.
+    pub reviewed: bool,
+    /// `rustc -V` of the toolchain that built the binaries.
+    pub rustc: String,
+    /// `cargo -V` of the same toolchain.
+    pub cargo: String,
+    /// `<sha12>-<digest12>`: the commit and the first digits of the built tree's digest.
+    pub build_id: String,
+    /// Unix seconds: the commit time, also the build's `SOURCE_DATE_EPOCH`.
+    pub build_time_unix: u64,
+}
+
+impl BuildProvenance {
+    /// Why this record is not acceptable, if it is not.
+    pub fn problem(&self) -> Option<&'static str> {
+        let line_ok =
+            |s: &str| !s.is_empty() && s.len() <= MAX_TOOL_LINE && !s.chars().any(char::is_control);
+        if !line_ok(&self.rustc) {
+            Some("build.rustc is empty, too long, or has a control character")
+        } else if !line_ok(&self.cargo) {
+            Some("build.cargo is empty, too long, or has a control character")
+        } else if !file_name_ok(&self.build_id) {
+            Some("build.build_id is not an accepted name")
+        } else {
+            None
+        }
+    }
 }
 
 /// Compatibility metadata, as data. A later phase fills it from the build
@@ -273,6 +317,8 @@ pub enum ManifestError {
     BadCompat(String),
     #[error("release kind: {0}")]
     ReleaseKind(String),
+    #[error("release build provenance: {0}")]
+    BadBuild(String),
     #[error("`{product}` {kind} action `{subject}` cannot be approved by a profile")]
     ByProfileForbidden {
         product: String,
@@ -412,6 +458,11 @@ impl ReleaseManifest {
         }
         match self.release.kind {
             super::ReleaseKind::Release => {
+                if self.release.build.is_some() {
+                    errs.push(ManifestError::ReleaseKind(
+                        "a signed release carries no source-build provenance".into(),
+                    ));
+                }
                 if self.release.commit.is_none() {
                     errs.push(ManifestError::ReleaseKind(
                         "a signed release names its source commit".into(),
@@ -424,10 +475,33 @@ impl ReleaseManifest {
                 }
             }
             super::ReleaseKind::SourceBuild => {
-                if !self.artifacts.is_empty() {
-                    errs.push(ManifestError::ReleaseKind(
-                        "a source-build manifest has no artifacts".into(),
-                    ));
+                // A plan-only source-build manifest lists no artifacts. One built from a
+                // commit (`fl install --from-git`) names its provenance and exactly the one
+                // artifact tree that build produced.
+                match &self.release.build {
+                    None if !self.artifacts.is_empty() => {
+                        errs.push(ManifestError::ReleaseKind(
+                            "a source-build manifest has no artifacts unless it names how \
+                             they were built"
+                                .into(),
+                        ));
+                    }
+                    None => {}
+                    Some(b) => {
+                        if self.release.commit.is_none() {
+                            errs.push(ManifestError::ReleaseKind(
+                                "a source build names its source commit".into(),
+                            ));
+                        }
+                        if self.artifacts.len() > 1 {
+                            errs.push(ManifestError::ReleaseKind(
+                                "a source build lists at most the one artifact it built".into(),
+                            ));
+                        }
+                        if let Some(why) = b.problem() {
+                            errs.push(ManifestError::BadBuild(why.into()));
+                        }
+                    }
                 }
             }
         }
@@ -1251,5 +1325,100 @@ pub(crate) mod tests {
         assert!(full.is_subset(&lab));
         assert_eq!(full.len(), 8, "full is every product the user can pick");
         assert!(m.profile_products(Profile::Minimal).unwrap().len() == 1);
+    }
+
+    // ---- source builds with provenance (#205 A4b)
+
+    fn provenance() -> BuildProvenance {
+        BuildProvenance {
+            reviewed: true,
+            rustc: "rustc 1.98.0 (abc 2026-01-01)".into(),
+            cargo: "cargo 1.98.0 (def 2026-01-01)".into(),
+            build_id: "0123456789ab-fedcba987654".into(),
+            build_time_unix: 1_700_000_000,
+        }
+    }
+
+    fn source_build() -> ReleaseManifest {
+        let mut m = default_manifest();
+        m.release.commit = Some("0123456789abcdef0123456789abcdef01234567".into());
+        m.release.build = Some(provenance());
+        m
+    }
+
+    #[test]
+    fn a_source_build_names_its_provenance_and_at_most_one_artifact() {
+        // plan-only (the dry run): provenance, no artifact
+        assert_eq!(source_build().validate(), Ok(()));
+        // built: exactly the one artifact
+        let mut m = source_build();
+        m.artifacts = signed_manifest().artifacts;
+        assert_eq!(m.validate(), Ok(()));
+        // two artifacts
+        let mut two = m.clone();
+        let mut b = two.artifacts[0].clone();
+        b.id = "other".into();
+        b.file = "other".into();
+        two.artifacts.push(b);
+        assert!(
+            two.validate()
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ManifestError::ReleaseKind(_)))
+        );
+        // artifacts without provenance stay refused
+        let mut bare = m.clone();
+        bare.release.build = None;
+        assert!(
+            bare.validate()
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ManifestError::ReleaseKind(_)))
+        );
+        // a source build names its commit
+        let mut nocommit = source_build();
+        nocommit.release.commit = None;
+        assert!(
+            nocommit
+                .validate()
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ManifestError::ReleaseKind(_)))
+        );
+        // a signed release carries no source-build provenance
+        let mut rel = signed_manifest();
+        rel.release.build = Some(provenance());
+        assert!(
+            rel.validate()
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, ManifestError::ReleaseKind(_)))
+        );
+        // the record itself is bounded text
+        for mutate in [
+            (|b: &mut BuildProvenance| b.rustc = String::new()) as fn(&mut BuildProvenance),
+            |b| b.cargo = "x\ny".into(),
+            |b| b.rustc = "x".repeat(MAX_TOOL_LINE + 1),
+            |b| b.build_id = "a b".into(),
+        ] {
+            let mut bad = source_build();
+            mutate(bad.release.build.as_mut().unwrap());
+            assert!(
+                bad.validate()
+                    .unwrap_err()
+                    .iter()
+                    .any(|e| matches!(e, ManifestError::BadBuild(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn a_manifest_without_provenance_is_unchanged_on_the_wire() {
+        let json = default_manifest().to_json();
+        assert!(
+            !json.contains("\"build\""),
+            "an absent block is not written"
+        );
+        assert_eq!(ReleaseManifest::parse(&json).unwrap(), default_manifest());
     }
 }

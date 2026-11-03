@@ -233,6 +233,7 @@ pub fn default_manifest() -> ReleaseManifest {
             kind: ReleaseKind::SourceBuild,
             commit: None,
             toolchain: None,
+            build: None,
         },
         compat: Compat {
             protocol_major: PROTOCOL_MAJOR,

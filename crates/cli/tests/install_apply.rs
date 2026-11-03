@@ -280,7 +280,7 @@ fn the_exit_codes() {
     assert!(so.starts_with("fl install plan"));
 
     // 3: not implemented
-    for flag in [vec!["--from-git", "abc123"], vec!["--gc"], vec!["--adopt"]] {
+    for flag in [vec!["--gc"], vec!["--adopt"]] {
         let mut args = vec!["install", "--yes"];
         args.extend(&flag);
         let (c, so, se) = code(
@@ -308,7 +308,7 @@ fn the_exit_codes() {
             .arg(w.art.path()),
     );
     assert_eq!(c, 3);
-    assert!(se.contains("not implemented in this release"), "{se}");
+    assert!(se.contains("fl install --from-git"), "{se}");
     // 3: a system prefix
     let (c, _, _) = code(
         w.fl()

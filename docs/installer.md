@@ -40,11 +40,13 @@ checks those names, and the declared dependencies, against the model.
 
 ## The three schemas
 
-Each is JSON with an explicit `schema_version` (currently `1`). A newer version is refused
-before the rest of the document is read.
+Each is JSON with an explicit `schema_version` (the manifest and the plan are `1`; the receipt is
+`1`, or `2` when its release carries a `build` block, below). A version a reader does not know is
+refused before the rest of the document is read.
 
 **`release-manifest.json`** (`ReleaseManifest`): `release` (version, kind `release` or
-`source_build`, commit, toolchain), `compat` (protocol major, store format range), `artifacts`
+`source_build`, commit, toolchain, and for a source build of a commit `build`: the provenance
+record below), `compat` (protocol major, store format range), `artifacts`
 (id, target os/arch, archive path, sha256, size, provided products), `products` (dependencies,
 supported targets, files, aliases, actions), `profiles`. Unknown fields are rejected.
 `validate()` rejects: an unsupported schema version, a release version that is not a plain name
@@ -56,7 +58,10 @@ duplicate or ambiguous artifacts, a hash that is not 64 lowercase hex digits, a 
 `1..=2 GiB`, an archive or in-release path that is absolute, contains `..`, a NUL, a
 backslash, an empty segment, or is longer or deeper than the bound, too many products,
 artifacts, files, aliases, actions or profiles, a signed release with no commit or no artifacts,
-a source-build manifest with artifacts, a profile without `ferroloop`, a `lab` that is not a
+a source-build manifest with artifacts and no `build` record (a source build of a commit names
+its provenance and lists at most the ONE artifact it built; it also names its commit), a signed
+release with a `build` record, a `build` record whose toolchain lines are empty, longer than 200
+bytes or hold a control character, a profile without `ferroloop`, a `lab` that is not a
 superset of `full`, a `by_profile` approval on `init_credentials` or `migrate_state`, and a
 service unit the product does not ship. A manifest larger than 1 MiB is refused unread.
 
@@ -70,6 +75,17 @@ journal of committed transactions (one `committed` entry per transaction; `seq` 
 transaction counter and `at_ms` is always 0, because a receipt carries no clock). It records no
 credential: no field can hold one, and `deny_unknown_fields` refuses a document that carries
 any other field.
+
+**Receipt schema 1 and 2.** A receipt written for a signed release (or by any earlier installer)
+is `schema_version` 1 and has no `build` key. A receipt whose release is a source build of a
+commit is `schema_version` 2 and carries `release.build`: `reviewed` (was the commit an ancestor of
+`origin/main`), `rustc` and `cargo` (their `-V` first lines), `build_id` (`<sha12>-<digest12>`) and
+`build_time_unix` (the commit time). The two are tied together: version 1 with the block, version
+2 without it, a block on a `release`-kind receipt or on one without a commit, and a block with
+unbounded text are all refused. A reader that knows only version 1 answers
+`unsupported receipt schema_version 2` instead of a confusing unknown-field error, so the field
+is explicit; this release reads both. `fl doctor` reads both: `G7.receipt-integrity` passes a
+valid receipt and WARNS for a source build with `reviewed: false`.
 
 **The plan** (`InstallPlan`, printed by `--json`): `schema_version`, release, compat, host,
 profile, management, status, layout, products, not-installed, module routes, artifacts,
@@ -151,9 +167,9 @@ fl install --resume | --rollback [--prefix PATH]
 **Source.** A local directory of EXTRACTED artifacts. Each artifact's `file` in the manifest is a
 directory under `--artifact-dir`, and its `sha256` is the TREE DIGEST of that directory: the
 SHA-256 over one line `<file sha256> <size> <path>\n` per regular file, sorted by path.
-`size` is the total bytes of those files. An archive, a download and a source build are not
+`size` is the total bytes of those files. An archive and a download are not
 unpacked or fetched in this release. The built-in manifest is a source build with no artifacts,
-so `--yes` needs `--manifest`.
+so `--yes` needs `--manifest` or `--from-git` (which builds its own artifact).
 
 **Layout.** Under the prefix (mutable data, config, keys and logs are never inside it):
 
@@ -286,29 +302,161 @@ service manager (`systemctl --user`, `launchctl`) WOULD run. The service manager
 (`fl_install::ServiceManager`); the real ones only plan, and the tests use fakes that record
 every call. No unit file is written outside a release directory.
 
-**What this release does not do:** `--adopt`, `--gc`, `--from-git` (each exits 3 with
+**What this release does not do:** `--adopt` and `--gc` (each exits 3 with
 `not implemented in this release`), downloads, signatures, unpacking archives, upgrade
 preflight, a rollback between releases, service activation, shell `PATH` edits, MCP catalog
 writes, credential setup and state migration.
+
+## `fl install --from-git <rev>`
+
+```
+fl install --from-git REV [--repo PATH] [--allow-unreviewed] [--with-ui] [--build-timeout SECONDS]
+           [--yes | --dry-run] [--profile P] [--add X]... [--remove X]... [--prefix PATH]
+           [--replace PATH]... [--keep PATH]... [--lock-timeout SECONDS] [--json]
+```
+
+Builds one commit of a git checkout and installs the result through the same transaction as
+`--artifact-dir`; the two differ only in where the artifact tree comes from. It is the source
+route: the one that works before signed releases exist.
+
+**The reviewed-commit rule.** `REV` must resolve to one commit
+(`git rev-parse --verify REV^{commit}`) of `--repo` (default: the checkout holding the current
+directory; a bare repository or a non-checkout is refused). That commit must be an ancestor of
+the LOCAL `refs/remotes/origin/main` (`git merge-base --is-ancestor`). Nothing is ever fetched:
+a note says when `origin/main` is more than 7 days old, and an absent `origin/main` means
+nothing is reviewed. `--allow-unreviewed` builds a commit that fails the rule anyway: it prints a
+loud warning, the receipt records `reviewed: false`, and `fl doctor` warns for as long as it is
+installed. On a commit that passes the rule the flag changes nothing (`reviewed: true`).
+
+`REV` is one argument after `--end-of-options`, never through a shell. It must not be empty, start
+with `-`, `^` or `!`, contain whitespace or a control character, or be a range (exit 2). The
+checkout may not overlap the install prefix in either direction (the build directory is never
+inside the source repository).
+
+**What it proves and what it does not.** The built binaries are checked to report THIS commit, a
+clean tree, `source-build` and the commit's time (`--version --json`), and the tree digest pins
+the artifact in a manifest that was made in memory a moment earlier. That proves the installed
+bytes are the ones that were built and checked, and that the build was made from the named
+commit. It does NOT prove the commit is the maintainers' (the ancestor rule reads a local ref
+that anyone with the checkout can move), that the toolchain or the dependencies were not
+tampered with (`--locked` pins versions, not bytes), or that the build is reproducible. It is
+not a signed release and says so: kind `source_build`, no release id.
+
+**Order of events.**
+
+1. Read-only: open the checkout, resolve the revision, apply the review rule, read the commit's
+   file list, plan the install, and check every conflict decision. A refusal here costs nothing
+   and writes nothing. `--dry-run` (and a run without `--yes`) stops here: it prints the
+   resolved commit, its review status, the build directory, the exact `cargo` command, and
+   the install plan, and builds nothing.
+2. If the receipt already records this commit's source build (same release, same artifact, same
+   review status) and the engine's idempotence test passes, it reports `already installed` and
+   does not rebuild.
+3. Build in `<prefix>/build/<sha12>/`. 4. Assemble and verify. 5. Install (`fl install --yes`
+   semantics, one journaled transaction). 6. Remove the build directory.
+
+**The git commands.** Only object-reading plumbing runs against your checkout: `rev-parse`,
+`merge-base`, `ls-tree`, `cat-file`, `log`. Each runs with an EMPTY environment (no `GIT_DIR`,
+no credentials), `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `HOME` pointing nowhere,
+and `-c` overrides for the config keys that make git run a program:
+`core.hooksPath=/dev/null`, `core.fsmonitor=false`, `core.attributesFile=/dev/null`,
+`log.showSignature=false`, `protocol.ext.allow=never`, `protocol.allow=never` (and
+`--no-optional-locks`). Nothing checks out, merges, commits, fetches or writes in your repository.
+
+**Why not `git worktree add` or `git archive`.** A worktree writes metadata into your repository
+and runs your checkout's filters and hooks. `git archive` applies `.gitattributes`
+(`export-ignore`, `export-subst`) and so can produce bytes that are not what the commit holds.
+Instead the installer writes the commit's blobs itself from `git ls-tree` and `git cat-file
+--batch`: byte for byte, no attributes, no filters, no hooks. Every path is checked first (no
+absolute path, `..`, empty or `.git` segment, backslash or control character; bounded count and
+size) and one bad path refuses the whole commit. Symlinks are not written (a note counts them);
+a submodule becomes an empty directory. The build scripts need a `HEAD` to stamp, so the tree
+gets a FRESH `.git` (no template, empty config) whose `HEAD` is the commit, whose index is the
+commit's tree, and whose only tie to your repository is an `objects/info/alternates` line
+(read-only). `git status` there is clean exactly when the files match the commit, which is what
+the built binary's `dirty` flag reports; a binary that says `dirty: true` is refused.
+
+**The build directory** is `<prefix>/build/<sha12>/` (`src/`, `home/`, `tmp/`, `out/`,
+`build.log`, and `.fl-install-build`, a marker naming the commit and the installer's pid). It is
+mode 0700. A directory already there is cleaned only when its marker names the same commit and
+that installer is gone; a live installer's directory is "another install is running"; any other
+directory (no marker, another commit's marker, a symlink) is never touched and is a refusal. It
+is removed after a successful install. After a failure once the build has started it is KEPT
+and its path is in the error; a failure before that (a missing tool) removes it and every
+directory made for it.
+
+**The build.** `cargo build --release --locked -p fl-cli [-p fl-store] --bin fl [--bin ferrostore]`
+in `src/`: one `--bin` per binary the selected products need (every profile needs `fl` and
+`ferrostore`). It runs through an argument vector in its own process group, under
+`--build-timeout` (default 2700 seconds, for the whole build); on the timeout, and also after the
+child exits, the whole process group is killed, so nothing the build started outlives it. Its
+output goes to `build.log` (bounded at 32 MiB per step). The environment is an allow-list:
+
+| Variable | Value |
+|---|---|
+| `PATH` | the caller's, without relative entries |
+| `CARGO_HOME`, `RUSTUP_HOME` | the caller's if absolute; else `~/.cargo`, `~/.rustup` when they exist |
+| `RUSTUP_TOOLCHAIN`, `CARGO_NET_OFFLINE`, `SSL_CERT_FILE`, `SSL_CERT_DIR` | the caller's, if set |
+| `HOME`, `XDG_CONFIG_HOME`, `TMPDIR` | inside the build directory |
+| `SOURCE_DATE_EPOCH` | the commit time (the caller's value is ignored) |
+| `CARGO_TERM_COLOR=never`, `CARGO_INCREMENTAL=0`, `LC_ALL=C` | fixed |
+| `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, `GIT_CEILING_DIRECTORIES` | fixed |
+
+Nothing else is passed: no token, vault, cloud or registry credential, no `RUSTFLAGS`, no
+`FL_RELEASE_ID`, no `GIT_DIR`. This is hygiene for code that was reviewed, not isolation: the
+commit's build scripts and procedural macros run as you, with your file system and network, so
+`--allow-unreviewed` runs code nobody reviewed.
+
+**The UI.** The default is NO UI build: UI assets are optional in this release, FerroDeck shows
+"Not installed" for the UI, and the hub falls back as it does today. `--with-ui` additionally
+runs `npm ci --no-audit --no-fund --no-update-notifier` and `npm run build` in `ui/` (the commit
+needs `ui/package.json` and `ui/package-lock.json`; dependency lifecycle scripts run, under the
+same allow-listed environment and a build-local `HOME`, so a private-registry `~/.npmrc` is not
+read), and installs `ui/dist` with the FerroDeck product.
+
+**What is assembled.** `out/<id>/` holds `bin/<name>` copied from `target/release/` (each is run
+with `--version --json` and must report the commit), the commit's `contrib/units/*` (units the
+commit does not ship are not offered, and neither is any action that names them; the plan says
+which), `ui/dist` with `--with-ui`, and `release.json` (version, commit, `source-build`,
+`reviewed`, `rustc`, `cargo`, `build_id`, build time). The manifest takes its compat ranges from
+the built `fl`. The artifact's hash is the tree digest of this directory. The installed
+`release.json` is written by the transaction from the receipt's release record. The release
+directory is `<version>+<sha12>`; the receipt records the source build, the commit, the review
+flag, the toolchain and the build id, and no path into the source repository.
+
+**Limits.** The build needs the toolchain (`cargo`, `rustc`, and `npm` for `--with-ui`) on `PATH`
+and network access for crates the locked build has not cached; the build directory needs the
+disk of a release build under the install root's file system. Only the binaries `fl` and
+`ferrostore` have a build recipe. `--adopt`, `--gc`, signing, upgrade preflight and service
+activation are not part of this command.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | A plan was printed (including a plan with conflicts: read `status`); an install, `--resume` or `--rollback` completed; the install was already there. |
-| 1 | A step failed and the transaction was undone (or the undo failed too: run `--resume`); a file system error such as a read-only root. |
-| 2 | The request is not well formed: unknown product or profile, a product both added and removed, a relative or malformed prefix or `$FL_INSTALL_ROOT`, an unknown flag, `--db`, `--dry-run` with `--yes`, `--resume` with `--rollback`, `--yes` with `--resume`, a decision for a path that is not a conflict, `--yes` without `--artifact-dir` when a release must be staged. |
-| 3 | Refused: no `--dry-run` or `--yes` (the plan is printed first), `--adopt`, `--gc`, `--from-git`, an invalid or unreadable manifest or receipt, a source-build manifest, a forbidden prefix or one that resolves into a system tree, a symlinked prefix component, an artifact that fails its size or hash or holds a symlink, an unresolved conflict, another installer holding the lock, a corrupt journal, a removal of a required or needed product, an unsupported platform, a missing artifact. |
+| 1 | A step failed and the transaction was undone (or the undo failed too: run `--resume`); a file system error such as a read-only root; `--from-git`: the build failed, timed out, or produced no binary (the build directory and `build.log` are kept). |
+| 2 | The request is not well formed: unknown product or profile, a product both added and removed, a relative or malformed prefix or `$FL_INSTALL_ROOT`, an unknown flag, `--db`, `--dry-run` with `--yes`, `--resume` with `--rollback`, `--yes` with `--resume`, a decision for a path that is not a conflict, `--yes` without `--artifact-dir` when a release must be staged, a revision that is empty, starts with `-`, `^` or `!`, has whitespace or a control character, or is a range, `--from-git` with `--artifact-dir`, `--manifest`, `--resume` or `--rollback`, `--repo`/`--allow-unreviewed`/`--with-ui` without `--from-git`. |
+| 3 | Refused: no `--dry-run` or `--yes` (the plan is printed first), `--adopt`, `--gc`, a commit that is not an ancestor of `origin/main` (or no `origin/main`) without `--allow-unreviewed`, a revision that names no commit, not a git checkout, a checkout that overlaps the install root, a build directory this installer did not make, a missing `cargo`/`rustc`/`npm`, a built binary that does not report the commit, a clean tree and the commit time, an invalid or unreadable manifest or receipt, a source-build manifest, a forbidden prefix or one that resolves into a system tree, a symlinked prefix component, an artifact that fails its size or hash or holds a symlink, an unresolved conflict, another installer holding the lock, a corrupt journal, a removal of a required or needed product, an unsupported platform, a missing artifact. |
 | 70 | Test builds only: a simulated crash returned as an error. |
 
 ## What `--dry-run` does NOT do
 
 It creates, modifies and deletes nothing: no directory, link, unit, catalog, PATH entry,
-receipt, journal or lock file. It starts no process and no service, makes no network call,
+receipt, journal or lock file. It starts no process and no service (`--from-git --dry-run`
+starts `git`, and only the read-only plumbing listed below), makes no network call,
 opens no store, reads no project config and no credential, and never reads `$HOME` except to
 look at the paths the plan names.
 
 ## Tests
+
+The `--from-git` tests (`crates/cli/tests/install_from_git.rs`, `crates/install/src/fromgit_tests.rs`)
+build a throwaway git repository with three commits and a fake `origin/main`, and put a FAKE
+`cargo`, `rustc` and `npm` first on a PATH they construct (`fl_install::fixture::gitrepo`); the
+real toolchain and the network never run. The black-box tests drive the real process-spawn path
+(environment dump, process group, timeout); the in-process tests inject a `Builder`. A repository
+armed with hooks, filters, `core.fsmonitor`, a `gpg.program` and a signed commit, and a global
+config armed the same way, must leave no sentinel file.
 
 Every run is confined to a temporary root. The crash seam is `fl_install::Faults`: a `FaultPoint`
 (`before` or `after` any step) makes the transaction return a simulated crash with nothing

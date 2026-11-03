@@ -25,9 +25,9 @@ mod txn;
 pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
 pub use defaults::default_manifest;
 pub use manifest::{
-    ActionKind, ActionSpec, Artifact, Compat, FileKind, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES,
-    ManifestError, ProductEntry, ProductFile, ProfileEntry, ReleaseInfo, ReleaseKind,
-    ReleaseManifest,
+    ActionKind, ActionSpec, Artifact, BuildProvenance, Compat, FileKind, MAX_ARTIFACT_BYTES,
+    MAX_MANIFEST_BYTES, MAX_TOOL_LINE, ManifestError, ProductEntry, ProductFile, ProfileEntry,
+    ReleaseInfo, ReleaseKind, ReleaseManifest,
 };
 pub use plan::{
     Approval, BUDGET_EXCEEDED, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan,
@@ -52,8 +52,14 @@ use std::fmt;
 
 /// `schema_version` of the release manifest.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
-/// `schema_version` of the install receipt.
+/// `schema_version` of the install receipt of a signed release (and of every receipt written
+/// before source builds were installable).
 pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+/// `schema_version` of a receipt whose release carries `release.build` (a reviewed-commit
+/// source build, #205 A4b). Version 2 exists only to carry that block: an older reader answers
+/// "unsupported receipt schema_version 2" instead of a confusing unknown-field error, and a
+/// version 1 receipt with the block, or a version 2 receipt without it, is refused.
+pub const RECEIPT_SCHEMA_SOURCE_BUILD: u32 = 2;
 /// `schema_version` of the printed plan.
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 

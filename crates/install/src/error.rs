@@ -27,6 +27,19 @@ pub enum InstallError {
         #[source]
         source: io::Error,
     },
+    /// The source build ran and failed, or could not be completed (exit 1).
+    #[error("{what}{}", log_note(.log))]
+    BuildFailed {
+        what: String,
+        log: Option<std::path::PathBuf>,
+    },
+    /// A failure after a build directory was made: the directory is kept for diagnosis (the
+    /// exit status is the cause's).
+    #[error("{cause}; the build directory {} is kept for diagnosis", .dir.display())]
+    Kept {
+        cause: Box<InstallError>,
+        dir: std::path::PathBuf,
+    },
     /// Test seam: the process "died" here. Nothing is undone.
     #[error("simulated crash at {0}")]
     Crashed(FaultPoint),
@@ -42,6 +55,12 @@ pub enum InstallError {
         cause: Box<InstallError>,
         undo: Box<InstallError>,
     },
+}
+
+fn log_note(log: &Option<std::path::PathBuf>) -> String {
+    log.as_ref()
+        .map(|l| format!(" (log: {})", l.display()))
+        .unwrap_or_default()
 }
 
 fn pid_note(pid: &Option<u32>) -> String {
@@ -66,7 +85,10 @@ impl InstallError {
             InstallError::Usage(_) => 2,
             InstallError::Refused(_) | InstallError::Busy { .. } => 3,
             InstallError::Plan(e) => e.exit_code(),
-            InstallError::Io { .. } | InstallError::UndoFailed { .. } => 1,
+            InstallError::Io { .. }
+            | InstallError::UndoFailed { .. }
+            | InstallError::BuildFailed { .. } => 1,
+            InstallError::Kept { cause, .. } => cause.exit_code(),
             InstallError::Crashed(_) => 70,
             InstallError::RolledBack { cause } => cause.exit_code(),
         }

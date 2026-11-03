@@ -12,7 +12,7 @@ use super::receipt::{
     InstallReceipt, JournalEntry, JournalPhase, OwnedAlias, OwnedArtifact, OwnedPath,
     OwnedPathKind, ReceiptError, ReceiptLayout, ReceiptRelease,
 };
-use super::{Product, Profile, RECEIPT_SCHEMA_VERSION};
+use super::{Product, Profile};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -257,6 +257,17 @@ pub fn release_json(release: &ReceiptRelease, artifacts: &[OwnedArtifact]) -> St
         "commit": release.commit,
         "artifacts": artifacts,
     });
+    let mut value = value;
+    if let Some(b) = &release.build {
+        // A source build says how it was made; a signed release's bytes stay as they were.
+        value["build"] = serde_json::json!({
+            "reviewed": b.reviewed,
+            "rustc": b.rustc,
+            "cargo": b.cargo,
+            "build_id": b.build_id,
+            "build_time_unix": b.build_time_unix,
+        });
+    }
     let mut out = serde_json::to_string_pretty(&value).expect("release.json serializes");
     out.push('\n');
     out
@@ -407,7 +418,7 @@ pub fn build_receipt(
     artifacts.sort_by(|a, b| a.id.cmp(&b.id));
 
     let receipt = InstallReceipt {
-        schema_version: RECEIPT_SCHEMA_VERSION,
+        schema_version: intent.release.schema_version(),
         release: intent.release.clone(),
         profile: intent.profile,
         products,
@@ -505,6 +516,7 @@ mod tests {
                 name: name.into(),
                 kind: ReleaseKind::Release,
                 commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                build: None,
             },
             profile: Profile::Minimal,
             products: vec![Product::Ferroloop, Product::Ferrostore],
@@ -691,5 +703,33 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.contains("\"name\": \"0.1.0+aaaaaaaaaaaa\""));
         assert!(a.ends_with('\n'));
+    }
+
+    #[test]
+    fn release_json_says_how_a_source_build_was_made_and_a_release_is_unchanged() {
+        let mut i = intent("0.1.0+aaaaaaaaaaaa");
+        let plain = release_json(&i.release, &i.artifacts);
+        assert!(!plain.contains("\"build\""), "{plain}");
+        i.release.kind = ReleaseKind::SourceBuild;
+        i.release.build = Some(crate::install::BuildProvenance {
+            reviewed: false,
+            rustc: "rustc 1.98.0".into(),
+            cargo: "cargo 1.98.0".into(),
+            build_id: "aaaaaaaaaaaa-bbbbbbbbbbbb".into(),
+            build_time_unix: 7,
+        });
+        let text = release_json(&i.release, &i.artifacts);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["kind"], "source_build");
+        assert_eq!(v["build"]["reviewed"], false);
+        assert_eq!(v["build"]["rustc"], "rustc 1.98.0");
+        assert_eq!(v["build"]["build_time_unix"], 7);
+        assert_eq!(text, release_json(&i.release, &i.artifacts));
+        // and the receipt that results is schema 2
+        let r = build_receipt(None, &i, 1).unwrap();
+        assert_eq!(
+            r.schema_version,
+            crate::install::RECEIPT_SCHEMA_SOURCE_BUILD
+        );
     }
 }
