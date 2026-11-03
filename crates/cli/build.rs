@@ -16,6 +16,7 @@ fn main() {
         "../gate",
         "../github",
         "../hub",
+        "../install",
         "../mcp",
         "../store",
         "../watch",

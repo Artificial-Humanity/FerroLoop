@@ -1187,3 +1187,22 @@ fn actions_left_out_of_a_profile_are_said_so() {
             .any(|n| n.contains("ferroloop-hub.service is not planned"))
     );
 }
+
+#[test]
+fn prefix_beats_the_isolated_root_beats_the_default() {
+    use std::path::Path;
+    let l = resolve_layout(Some(Path::new("/work/p")), Some("/root1".into())).unwrap();
+    assert_eq!(l.prefix, "/work/p");
+    assert_eq!(l.bin_dir, "/work/p/bin");
+    let l = resolve_layout(None, Some("/work/r".into())).unwrap();
+    assert_eq!(l.prefix, "/work/r/.local/share/fl");
+    assert_eq!(l.bin_dir, "/work/r/.local/bin");
+    let l = resolve_layout(None, None).unwrap();
+    assert_eq!(l.prefix, "~/.local/share/fl");
+    assert_eq!(
+        resolve_layout(None, Some("".into())).unwrap().prefix,
+        "~/.local/share/fl"
+    );
+    assert!(resolve_layout(Some(Path::new("/usr")), None).is_err());
+    assert!(resolve_layout(None, Some("/".into())).is_err());
+}

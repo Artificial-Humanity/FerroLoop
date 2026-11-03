@@ -15,6 +15,7 @@ fn main() {
         "../exec",
         "../gate",
         "../github",
+        "../install",
         "../store",
         "../watch",
         "../wire",

@@ -80,6 +80,7 @@ Commands:
   watch       FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store
   version     Print how this build was made and the versions it speaks (same as `--version [--json]`)
   install     Plan an install of the FerroLoop products (`--dry-run` only; nothing is written)
+  doctor      Check this install's health and change nothing (exit 1 when a check fails)
   help        Print this message or the help of the given subcommand(s)
 
 Options:

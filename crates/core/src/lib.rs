@@ -11,6 +11,7 @@ pub mod code_index;
 #[doc(hidden)]
 pub mod conformance;
 pub mod decision;
+pub mod doctor;
 pub mod embed;
 pub mod escalate;
 pub mod escalation;
@@ -35,6 +36,7 @@ pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod tiered;
+pub mod ui_bundle;
 pub mod vendor;
 pub mod verdict;
 pub mod workflow;

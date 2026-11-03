@@ -1,0 +1,609 @@
+//! `fl doctor` (#205 phase A3), driven as a black box. It only observes: these tests check the
+//! report (the six ids, the statuses, the JSON contract), the exit codes (0 no failure, 1 a
+//! failure, 3 a refused repair) and, above all, that NOTHING was written, anywhere.
+
+use assert_cmd::Command;
+use fl_core::install::{
+    InstallReceipt, OwnedAlias, OwnedPath, OwnedPathKind, OwnedUnit, Product, Profile,
+    RECEIPT_SCHEMA_VERSION, ReceiptLayout, ReceiptRelease, ReleaseKind,
+};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+const IDS: [&str; 6] = [
+    "G7.release-identity",
+    "G7.receipt-integrity",
+    "G7.path-ownership",
+    "G7.store-health",
+    "G7.vault-perms",
+    "G7.code-ui-agree",
+];
+
+fn sha(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Every path under `dir`: kind, mode, size, mtime and content hash, so any create, write,
+/// chmod, touch or delete changes it.
+fn snapshot(dir: &Path) -> BTreeMap<String, String> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            let extra = if meta.file_type().is_symlink() {
+                std::fs::read_link(&p).unwrap().display().to_string()
+            } else if meta.is_file() {
+                sha(&std::fs::read(&p).unwrap())
+            } else {
+                String::new()
+            };
+            out.insert(
+                p.strip_prefix(base).unwrap().display().to_string(),
+                format!(
+                    "{:?} {:o} {} {:?} {extra}",
+                    meta.file_type(),
+                    meta.permissions().mode(),
+                    meta.len(),
+                    meta.modified().unwrap()
+                ),
+            );
+            if meta.is_dir() {
+                walk(base, &p, out);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A scratch world: a HOME (stores, vault, config), an isolated install root and a cwd.
+struct World {
+    home: tempfile::TempDir,
+    root: tempfile::TempDir,
+    cwd: tempfile::TempDir,
+}
+
+impl World {
+    fn new() -> Self {
+        Self {
+            home: tempfile::tempdir().unwrap(),
+            root: tempfile::tempdir().unwrap(),
+            cwd: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn fl(&self) -> Command {
+        let mut c = Command::cargo_bin("fl").unwrap();
+        c.env_clear()
+            .env("HOME", self.home.path())
+            .env("FL_INSTALL_ROOT", self.root.path())
+            .current_dir(self.cwd.path());
+        c
+    }
+
+    fn prefix(&self) -> PathBuf {
+        self.root.path().join(".local/share/fl")
+    }
+
+    fn release_dir(&self) -> PathBuf {
+        self.prefix().join("releases/0.1.0+0123456789ab")
+    }
+
+    fn trees(&self) -> [BTreeMap<String, String>; 3] {
+        [
+            snapshot(self.home.path()),
+            snapshot(self.root.path()),
+            snapshot(self.cwd.path()),
+        ]
+    }
+
+    /// Run `fl doctor --json` plus `args`: the exit code and the parsed report.
+    fn doctor(&self, args: &[&str]) -> (i32, Value) {
+        let before = self.trees();
+        let out = self
+            .fl()
+            .arg("doctor")
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(self.trees(), before, "`fl doctor` wrote something");
+        let code = out.status.code().unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
+        (code, v)
+    }
+
+    /// A real install under the isolated root, and the receipt that owns it.
+    fn install(&self) {
+        self.install_with_commit(None);
+    }
+
+    /// [`Self::install`], the receipt naming `commit`.
+    fn install_with_commit(&self, commit: Option<&str>) {
+        let root = self.root.path();
+        let rel = self.release_dir();
+        std::fs::create_dir_all(rel.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join(".local/bin")).unwrap();
+        std::fs::create_dir_all(root.join(".config/systemd/user")).unwrap();
+        let bin = b"fl binary bytes";
+        std::fs::write(rel.join("bin/fl"), bin).unwrap();
+        std::os::unix::fs::symlink("releases/0.1.0+0123456789ab", self.prefix().join("current"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            self.prefix().join("current/bin/fl"),
+            root.join(".local/bin/fl"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("fl", root.join(".local/bin/agent-msg")).unwrap();
+        let unit = b"# generated by fl install 0.1.0+0123456789ab\n[Service]\nExecStart=fl\n";
+        let unit_path = root.join(".config/systemd/user/ferrowire.service");
+        std::fs::write(&unit_path, unit).unwrap();
+        let s = |p: &Path| p.display().to_string();
+        let receipt = InstallReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            release: ReceiptRelease {
+                version: env!("CARGO_PKG_VERSION").into(),
+                name: format!("{}+0123456789ab", env!("CARGO_PKG_VERSION")),
+                kind: ReleaseKind::SourceBuild,
+                commit: commit.map(str::to_string),
+            },
+            profile: Profile::Full,
+            products: vec![Product::Ferroloop],
+            layout: ReceiptLayout {
+                prefix: s(&self.prefix()),
+                bin_dir: s(&root.join(".local/bin")),
+                unit_dir: s(&root.join(".config/systemd/user")),
+            },
+            artifacts: vec![],
+            paths: vec![
+                OwnedPath {
+                    path: s(&rel),
+                    kind: OwnedPathKind::Dir,
+                    sha256: None,
+                    link_target: None,
+                },
+                OwnedPath {
+                    path: s(&rel.join("bin/fl")),
+                    kind: OwnedPathKind::File,
+                    sha256: Some(sha(bin)),
+                    link_target: None,
+                },
+                OwnedPath {
+                    path: s(&self.prefix().join("current")),
+                    kind: OwnedPathKind::Symlink,
+                    sha256: None,
+                    link_target: Some("releases/0.1.0+0123456789ab".into()),
+                },
+                OwnedPath {
+                    path: s(&root.join(".local/bin/fl")),
+                    kind: OwnedPathKind::Symlink,
+                    sha256: None,
+                    link_target: Some(s(&self.prefix().join("current/bin/fl"))),
+                },
+            ],
+            aliases: vec![OwnedAlias {
+                name: "agent-msg".into(),
+                path: s(&root.join(".local/bin/agent-msg")),
+                target: "fl".into(),
+            }],
+            units: vec![OwnedUnit {
+                name: "ferrowire.service".into(),
+                path: s(&unit_path),
+                sha256: sha(unit),
+                release: "0.1.0+0123456789ab".into(),
+            }],
+            catalog_entries: vec![],
+            config_blocks: vec![],
+            journal: vec![],
+        };
+        std::fs::write(self.prefix().join("receipt.json"), receipt.to_json()).unwrap();
+    }
+
+    fn receipt_path(&self) -> PathBuf {
+        self.prefix().join("receipt.json")
+    }
+
+    /// A healthy FerroStore at the default store location.
+    fn store(&self) {
+        let dir = self.home.path().join(".local/share/fl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = fl_store::FerroStore::open(dir.join("fl.fls")).unwrap();
+        s.put_doc("c", "a", &json!(1)).unwrap();
+    }
+
+    /// Vault and key files at the default locations, with these modes.
+    fn vault(&self, vault_mode: u32, key_mode: u32) {
+        let v = self.home.path().join(".local/share/fl/vault.enc");
+        let k = self.home.path().join(".config/fl/vault.key");
+        for (p, mode) in [(&v, vault_mode), (&k, key_mode)] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "SENTINEL-SECRET-CONTENT").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        for d in [v.parent().unwrap(), k.parent().unwrap()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// A UI bundle in the installed release.
+    fn ui(&self, info: Value) {
+        let dist = self.release_dir().join("ui/dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("build-info.json"), info.to_string()).unwrap();
+    }
+}
+
+fn status<'a>(v: &'a Value, id: &str) -> &'a str {
+    v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap_or_else(|| panic!("no {id}"))["status"]
+        .as_str()
+        .unwrap()
+}
+
+fn detail<'a>(v: &'a Value, id: &str) -> &'a str {
+    v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap()["detail"]
+        .as_str()
+        .unwrap()
+}
+
+/// What this binary says about itself: (the full commit, whether it is clean).
+fn this_build() -> (String, bool) {
+    let out = Command::cargo_bin("fl")
+        .unwrap()
+        .args(["--version", "--json"])
+        .env_clear()
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    (
+        v["commit"].as_str().unwrap().to_string(),
+        v["dirty"] == json!(false),
+    )
+}
+
+#[test]
+fn an_empty_home_is_unmanaged_not_healthy_and_nothing_is_written() {
+    let w = World::new();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 0, "nothing installed is not a failure: {v}");
+    let ids: Vec<&str> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, IDS);
+    for id in &IDS[1..] {
+        assert_eq!(status(&v, id), "not-installed", "{id}: {}", detail(&v, id));
+    }
+    assert_eq!(
+        detail(&v, "G7.receipt-integrity"),
+        "unmanaged (no install receipt)"
+    );
+    assert_ne!(v["overall"], "pass");
+    assert_eq!(v["schema_version"], 1);
+    // The empty world is still empty.
+    for t in w.trees() {
+        assert!(t.is_empty(), "{t:?}");
+    }
+}
+
+#[test]
+fn the_json_has_the_contract_ferrodeck_reads_and_is_deterministic() {
+    let w = World::new();
+    w.install();
+    let a = w.fl().args(["doctor", "--json"]).output().unwrap();
+    let b = w.fl().args(["doctor", "--json"]).output().unwrap();
+    assert_eq!(a.stdout, b.stdout, "two runs differ");
+    let v: Value = serde_json::from_slice(&a.stdout).unwrap();
+    let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    top.sort_unstable();
+    assert_eq!(top, ["checks", "overall", "schema_version", "summary"]);
+    for c in v["checks"].as_array().unwrap() {
+        let mut keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["detail", "id", "status", "title"]);
+    }
+    let text = String::from_utf8(a.stdout).unwrap();
+    assert!(
+        !text.contains("generated_at") && !text.contains("timestamp"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_healthy_install_reports_pass_where_it_can_prove_it() {
+    let w = World::new();
+    let (commit, clean) = this_build();
+    w.install_with_commit((commit != "unknown").then_some(commit.as_str()));
+    w.store();
+    w.vault(0o600, 0o600);
+    w.ui(json!({"commit": commit, "dirty": false, "version": "0.1.0"}));
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(
+        status(&v, "G7.receipt-integrity"),
+        "pass",
+        "{}",
+        detail(&v, "G7.receipt-integrity")
+    );
+    assert_eq!(
+        status(&v, "G7.path-ownership"),
+        "pass",
+        "{}",
+        detail(&v, "G7.path-ownership")
+    );
+    assert_eq!(
+        status(&v, "G7.store-health"),
+        "pass",
+        "{}",
+        detail(&v, "G7.store-health")
+    );
+    assert_eq!(
+        status(&v, "G7.vault-perms"),
+        "pass",
+        "{}",
+        detail(&v, "G7.vault-perms")
+    );
+    // Identity and UI agreement pass only for a clean build of a known commit.
+    let known = commit != "unknown";
+    let want = if known && clean { "pass" } else { "warn" };
+    assert_eq!(
+        status(&v, "G7.release-identity"),
+        want,
+        "{}",
+        detail(&v, "G7.release-identity")
+    );
+    let want_ui = if !known {
+        "unsupported"
+    } else if clean {
+        "pass"
+    } else {
+        "warn"
+    };
+    assert_eq!(
+        status(&v, "G7.code-ui-agree"),
+        want_ui,
+        "{}",
+        detail(&v, "G7.code-ui-agree")
+    );
+    // The secret never appears in the output.
+    let out = w.fl().args(["doctor"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("SENTINEL"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("SENTINEL"));
+}
+
+#[test]
+fn an_edited_owned_file_warns_and_a_missing_one_fails_with_the_documented_exit() {
+    let w = World::new();
+    w.install();
+    let bin = w.release_dir().join("bin/fl");
+    std::fs::write(&bin, "edited by hand").unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 0, "an edit is a warning: {v}");
+    assert_eq!(status(&v, "G7.path-ownership"), "warn");
+    assert!(detail(&v, "G7.path-ownership").contains("bin/fl was edited"));
+
+    std::fs::remove_file(&bin).unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(status(&v, "G7.path-ownership"), "fail");
+    assert!(detail(&v, "G7.path-ownership").contains("is missing"));
+    assert_eq!(v["overall"], "fail");
+
+    // A foreign file where the alias belongs is a failure too.
+    let w = World::new();
+    w.install();
+    let alias = w.root.path().join(".local/bin/agent-msg");
+    std::fs::remove_file(&alias).unwrap();
+    std::fs::write(&alias, "#!/bin/sh\n").unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1);
+    assert!(detail(&v, "G7.path-ownership").contains("alias"));
+}
+
+#[test]
+fn a_corrupt_receipt_fails_and_is_not_called_unmanaged() {
+    let w = World::new();
+    w.install();
+    let good = std::fs::read_to_string(w.receipt_path()).unwrap();
+    std::fs::write(w.receipt_path(), "{ \"schema_version\": 1, ").unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(status(&v, "G7.receipt-integrity"), "fail");
+    assert!(detail(&v, "G7.receipt-integrity").contains("not treated as unmanaged"));
+    assert_eq!(status(&v, "G7.path-ownership"), "unsupported");
+
+    // An unsupported schema names its version; an unknown field is refused by name.
+    let mut r: Value = serde_json::from_str(&good).unwrap();
+    r["schema_version"] = 7.into();
+    std::fs::write(w.receipt_path(), r.to_string()).unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1);
+    assert!(detail(&v, "G7.receipt-integrity").contains("schema_version 7"));
+
+    // Oversized: refused unread.
+    let f = std::fs::File::create(w.receipt_path()).unwrap();
+    f.set_len(9 * 1024 * 1024).unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1);
+    assert!(detail(&v, "G7.receipt-integrity").contains("larger than"));
+}
+
+#[test]
+fn a_vault_readable_by_others_fails() {
+    let w = World::new();
+    w.vault(0o644, 0o600);
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(status(&v, "G7.vault-perms"), "fail");
+    assert!(detail(&v, "G7.vault-perms").contains("0644"));
+    assert!(!v.to_string().contains("SENTINEL"));
+
+    let w = World::new();
+    w.vault(0o600, 0o666);
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1);
+    assert!(detail(&v, "G7.vault-perms").contains("world-writable"));
+}
+
+#[test]
+fn a_store_newer_than_this_build_supports_fails_and_is_not_migrated() {
+    let w = World::new();
+    let dir = w.home.path().join(".local/share/fl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("fl.redb");
+    drop(fl_store::RedbStore::open(&path).unwrap());
+    {
+        let meta: redb::TableDefinition<&str, u64> = redb::TableDefinition::new("meta");
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            let mut t = tx.open_table(meta).unwrap();
+            t.insert("format_version", 99u64).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(status(&v, "G7.store-health"), "fail");
+    assert!(
+        detail(&v, "G7.store-health").contains("99"),
+        "{}",
+        detail(&v, "G7.store-health")
+    );
+    assert!(!dir.join("fl.fls").exists(), "doctor migrated the store");
+}
+
+#[test]
+fn a_lone_redb_would_migrate_and_doctor_does_not() {
+    let w = World::new();
+    let dir = w.home.path().join(".local/share/fl");
+    std::fs::create_dir_all(&dir).unwrap();
+    drop(fl_store::RedbStore::open(&dir.join("fl.redb")).unwrap());
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(status(&v, "G7.store-health"), "warn");
+    assert!(detail(&v, "G7.store-health").contains("doctor does not migrate"));
+    assert!(!dir.join("fl.fls").exists());
+}
+
+#[test]
+fn db_names_the_one_store_to_verify() {
+    let w = World::new();
+    w.store();
+    let other = w.cwd.path().join("other.fls");
+    drop(fl_store::FerroStore::open(&other).unwrap());
+    let (_, v) = w.doctor(&["--db", other.to_str().unwrap()]);
+    assert_eq!(status(&v, "G7.store-health"), "pass");
+    assert!(detail(&v, "G7.store-health").contains("other.fls"));
+    assert!(
+        !detail(&v, "G7.store-health").contains("fl.fls: "),
+        "{}",
+        detail(&v, "G7.store-health")
+    );
+    // A store that does not exist at the named path is absent, and is not created.
+    let nope = w.cwd.path().join("nope/x.redb");
+    let before = w.trees();
+    let (_, v) = w.doctor(&["--db", nope.to_str().unwrap()]);
+    assert_eq!(status(&v, "G7.store-health"), "not-installed");
+    assert_eq!(w.trees(), before);
+}
+
+#[test]
+fn the_prefix_flag_looks_for_the_install_there() {
+    let w = World::new();
+    w.install();
+    // Without the flag the isolated root is found; with --prefix elsewhere, nothing is.
+    let elsewhere = w.cwd.path().join("elsewhere");
+    let (_, v) = w.doctor(&["--prefix", elsewhere.to_str().unwrap()]);
+    assert_eq!(status(&v, "G7.receipt-integrity"), "not-installed");
+    let (_, v) = w.doctor(&["--prefix", w.prefix().to_str().unwrap()]);
+    assert_eq!(status(&v, "G7.receipt-integrity"), "pass");
+    // A prefix that cannot be an install is refused, exit 3.
+    w.fl().args(["doctor", "--prefix", "/usr"]).assert().code(3);
+    w.fl()
+        .args(["doctor", "--prefix", "relative/dir"])
+        .assert()
+        .code(3);
+}
+
+#[test]
+fn fix_is_parsed_and_refused_with_exit_3_changing_nothing() {
+    let w = World::new();
+    w.install();
+    let before = w.trees();
+    for id in IDS.iter().chain(&["no-such-check"]) {
+        let out = w.fl().args(["doctor", "--fix", id]).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{id}");
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("repairs are not implemented in this release"),
+            "{err}"
+        );
+    }
+    assert_eq!(w.trees(), before);
+}
+
+#[test]
+fn the_human_report_lists_every_check_and_the_overall() {
+    let w = World::new();
+    w.install();
+    let out = w.fl().arg("doctor").output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    for id in IDS {
+        assert!(text.contains(id), "{id} missing: {text}");
+    }
+    assert!(text.contains("overall:"), "{text}");
+    assert!(text.contains("nothing was changed"), "{text}");
+}
+
+#[test]
+fn a_broken_config_does_not_stop_the_doctor_but_keeps_the_store_check_honest() {
+    let w = World::new();
+    w.store();
+    let cfg = w.home.path().join(".config/fl");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "this is = = not toml [[[").unwrap();
+    let (code, v) = w.doctor(&[]);
+    assert_eq!(code, 0, "{v}");
+    // The default store was verified, but the project stores could not be listed: not a pass.
+    assert_eq!(status(&v, "G7.store-health"), "warn");
+    assert!(detail(&v, "G7.store-health").contains("config could not be read"));
+    // The broken config's text is never echoed.
+    assert!(!v.to_string().contains("this is = ="));
+}
+
+#[test]
+fn doctor_spawns_nothing_and_needs_no_network_or_path() {
+    // An empty environment: no PATH to find a helper on, no proxy, no HOME-wide tools. If the
+    // command ran a subprocess or reached the network it would fail or hang here.
+    let w = World::new();
+    w.install();
+    let out = w
+        .fl()
+        .args(["doctor", "--json"])
+        .env_clear()
+        .env("HOME", w.home.path())
+        .env("FL_INSTALL_ROOT", w.root.path())
+        .timeout(std::time::Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+}

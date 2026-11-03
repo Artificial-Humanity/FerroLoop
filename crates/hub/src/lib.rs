@@ -14,6 +14,7 @@ pub mod cloud_adapters;
 pub mod commands;
 mod direct_quota;
 pub mod discovery;
+mod doctor_api;
 pub mod github_pr;
 pub mod lifecycle;
 pub mod nodes;

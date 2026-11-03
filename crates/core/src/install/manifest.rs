@@ -261,7 +261,9 @@ pub enum ManifestError {
     },
     #[error("{context}: `{value}` is not an accepted name")]
     BadName { context: String, value: String },
-    #[error("release version `{0}` is not accepted (letters, digits, `.`, `-`; up to 64)")]
+    #[error(
+        "release version `{0}` is not accepted (letters, digits, `.`, `-`; up to 64; not `.`, `..` or a leading `-`)"
+    )]
     BadVersion(String),
     #[error("release commit `{0}` is not a 40-digit lowercase hex sha")]
     BadCommit(String),
@@ -379,11 +381,15 @@ impl ReleaseManifest {
             });
         }
         let v = &self.release.version;
+        // The version is a path segment of the release directory and a field of the receipt:
+        // it must pass the receipt's own name rule (`file_name_ok`: never `.`, `..` or a
+        // leading `-`), so a manifest never produces a receipt that is then refused.
         if v.is_empty()
             || v.len() > 64
             || !v
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+            || !file_name_ok(v)
         {
             errs.push(ManifestError::BadVersion(v.chars().take(64).collect()));
         }
@@ -998,6 +1004,21 @@ pub(crate) mod tests {
             (
                 "bad version",
                 |m| m.release.version = "1.0+x".into(),
+                |e| matches!(e, ManifestError::BadVersion(_)),
+            ),
+            (
+                "version is the current directory",
+                |m| m.release.version = ".".into(),
+                |e| matches!(e, ManifestError::BadVersion(_)),
+            ),
+            (
+                "version is the parent directory",
+                |m| m.release.version = "..".into(),
+                |e| matches!(e, ManifestError::BadVersion(_)),
+            ),
+            (
+                "version starts with a dash",
+                |m| m.release.version = "-rf".into(),
                 |e| matches!(e, ManifestError::BadVersion(_)),
             ),
             (

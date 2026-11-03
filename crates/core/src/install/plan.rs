@@ -22,6 +22,10 @@ const MAX_PREFIX_LEN: usize = 400;
 
 // ---------------------------------------------------------------- probe
 
+/// The reason a probe reports ([`PathState::Unreadable`]) when its caller's time budget ran
+/// out before it read the path.
+pub const BUDGET_EXCEEDED: &str = "time budget exceeded";
+
 /// What a read-only look at one path found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathState {
@@ -208,6 +212,26 @@ fn forbidden_tree(norm: &str) -> bool {
 
 pub(crate) fn join(base: &str, rel: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), rel)
+}
+
+/// The layout a command works on: `--prefix`, then `$FL_INSTALL_ROOT`, then the per-user
+/// default. Pure: the caller passes the environment's value.
+pub fn resolve_layout(
+    prefix: Option<&std::path::Path>,
+    root: Option<std::ffi::OsString>,
+) -> Result<Layout, PlanError> {
+    let utf8 = |p: &std::ffi::OsStr, what: &str| {
+        p.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| PlanError::PrefixInvalid(format!("{what} is not valid UTF-8")))
+    };
+    if let Some(p) = prefix {
+        return Layout::explicit(&utf8(p.as_os_str(), "--prefix")?);
+    }
+    match root.filter(|r| !r.is_empty()) {
+        Some(r) => Layout::under_root(&utf8(&r, "$FL_INSTALL_ROOT")?),
+        None => Ok(Layout::user_default()),
+    }
 }
 
 impl Layout {

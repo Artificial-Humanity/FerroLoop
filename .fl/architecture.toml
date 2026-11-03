@@ -75,6 +75,14 @@ package = "fl-watch"
 paths = ["crates/watch/**"]
 
 [[components]]
+id = "fl_install"
+title = "Installer I/O"
+kind = "crate"
+description = "The I/O side of the installer: the read-only host probe behind install planning, doctor observation (receipt, owned paths, vault modes, UI build info), and later the transactional install writes"
+package = "fl-install"
+paths = ["crates/install/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
@@ -213,3 +221,18 @@ label = "serves /api/v1/watch summary, alerts, and rollups with discovered vendo
 from = "fl_cli"
 to = "fl_watch"
 label = "runs fl watch status, rollups, liveness, and alerts"
+
+[[edges]]
+from = "fl_install"
+to = "fl_core"
+label = "feeds the pure install planner and doctor engine the facts they judge"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_install"
+label = "runs fl install --dry-run and fl doctor over the host probe"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_install"
+label = "serves GET /api/v1/doctor and the UI build-info reader"

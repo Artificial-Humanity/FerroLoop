@@ -29,10 +29,11 @@ pub use manifest::{
     ReleaseManifest,
 };
 pub use plan::{
-    Approval, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan, InstallRequest,
-    Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled, Origin,
-    PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
+    Approval, BUDGET_EXCEEDED, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan,
+    InstallRequest, Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled,
+    Origin, PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
     PlannedArtifact, PlannedPath, PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint, plan,
+    resolve_layout,
 };
 pub use receipt::{
     InstallReceipt, JournalEntry, JournalPhase, MAX_RECEIPT_BYTES, OwnedAlias, OwnedArtifact,

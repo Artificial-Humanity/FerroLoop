@@ -547,6 +547,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("GET", "/api/v1/version") => crate::version_api::handle_get(state),
+        ("GET", "/api/v1/doctor") => crate::doctor_api::handle_get(state, &authority),
         ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
         ("POST", "/api/v1/settings/artifacts-dir") => {
             crate::artifact_dirs::handle_post_system_dir(state, &authority, req)

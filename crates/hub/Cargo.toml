@@ -11,6 +11,7 @@ base64.workspace = true
 fl-core = { path = "../core" }
 fl-exec = { path = "../exec" }
 fl-gate = { path = "../gate" }
+fl-install = { path = "../install" }
 fl-github = { path = "../github" }
 fl-store = { path = "../store" }
 fl-watch = { path = "../watch" }

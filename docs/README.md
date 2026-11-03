@@ -33,6 +33,8 @@ File naming in this directory follows
   them.
 * [installer.md](installer.md) — the release manifest and install receipt schemas, the profiles,
   and `fl install --dry-run`: the deterministic plan, its exit codes, and what it never does.
+* [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the six observational
+  `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.

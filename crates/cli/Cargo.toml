@@ -17,6 +17,7 @@ fl-github = { path = "../github" }
 fl-mcp = { path = "../mcp" }
 fl-wire = { path = "../wire" }
 fl-hub = { path = "../hub" }
+fl-install = { path = "../install" }
 fl-gate = { path = "../gate" }
 fl-watch = { path = "../watch" }
 anyhow.workspace = true
@@ -30,6 +31,8 @@ ureq.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+redb.workspace = true
+sha2.workspace = true
 fl-github = { path = "../github", features = ["fake"] }
 fl-mcp = { path = "../mcp", features = ["fake"] }
 tempfile.workspace = true
