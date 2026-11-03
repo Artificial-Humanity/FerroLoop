@@ -14,7 +14,7 @@
 //! * Mutable data (stores, config, keys, logs) is never inside a release and never touched.
 
 use crate::error::{Ctx, InstallError, Result};
-use crate::fault::{FaultPoint, Faults};
+use crate::fault::{FaultPoint, Faults, When};
 use crate::fsprobe::{FsProbe, read_bounded};
 use crate::journal::{self, Found, Journal, Pending, PendingState, sync_dir};
 use crate::lock::{self, LockGuard};
@@ -26,8 +26,8 @@ use fl_core::install::{
     InstallRequest, IntentFile, JournalOp, Layout, LinkSpec, MAX_RECEIPT_BYTES, Origin,
     OwnedArtifact, OwnedPathKind, PathRole, PathState, PlannedPath, RELEASE_JSON, ReceiptLayout,
     ReceiptRelease, ReleaseKind, ReleaseManifest, Retention, Step, TxnIntent, build_receipt,
-    file_name_ok, has_committed, is_sha256_hex, next_txn, plan, rel_path_problem, release_json,
-    retention, sha256_hex,
+    file_name_ok, has_committed, is_forbidden_install_root, is_sha256_hex, next_txn, plan,
+    rel_path_problem, release_json, retention, sha256_hex,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -856,13 +856,48 @@ impl Run<'_> {
                     .ctx(|| format!("cannot publish {}", release.display()))?;
                 sync_dir(&self.paths.releases)
             }
-            (false, true) => Ok(()),
+            // The staging directory is gone and the release is there: only if it holds exactly
+            // what this transaction staged is it ours (the rename happened and was not
+            // recorded); anything else is somebody else's directory and is not adopted.
+            (false, true) => {
+                if self.release_is_ours()? {
+                    Ok(())
+                } else {
+                    Err(InstallError::refused(format!(
+                        "{} exists and is not what this install staged; it is not touched",
+                        release.display()
+                    )))
+                }
+            }
             (true, true) => Err(InstallError::refused(format!(
                 "{} already exists; the staged release is not published over it",
                 release.display()
             ))),
             (false, false) => Err(InstallError::refused("the staged release is gone")),
         }
+    }
+
+    /// Whether `releases/<name>` is a real directory whose files are exactly the ones this
+    /// transaction staged (path, hash and size of each).
+    fn release_is_ours(&self) -> Result<bool> {
+        let release = self.release_path();
+        match lstat(&release)? {
+            Some(m) if m.is_dir() => {}
+            _ => return Ok(false),
+        }
+        let Ok(found) = tree::read_staged(&release) else {
+            return Ok(false);
+        };
+        let want: BTreeMap<&str, (&str, u64)> = self
+            .intent
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), (f.sha256.as_str(), f.size)))
+            .collect();
+        Ok(found.len() == want.len()
+            && found
+                .iter()
+                .all(|(p, (sha, size))| want.get(p.as_str()) == Some(&(sha.as_str(), *size))))
     }
 
     fn do_link_current(&self) -> Result<()> {
@@ -985,20 +1020,18 @@ impl Run<'_> {
     fn undo_release(&self, p: &Pending) -> Result<()> {
         let announced = |s: Step| p.announced(|o| o.step() == Some(s));
         let stage = self.paths.stage(self.txn);
-        let stage_present = lstat(&stage)?.is_some();
         if announced(Step::Stage) || announced(Step::Publish) {
             tree::remove_tree(&stage)?;
         }
-        // `releases/<name>` is removed only when THIS transaction put it there: the journal
-        // says the rename happened, or the publish was announced, the staging directory is
-        // gone and no undo has begun (a crash between the rename and its journal line). A
-        // directory that appeared while the staging directory still exists is somebody
-        // else's (the publish was refused), and an earlier undo may already have removed the
-        // staging directory, so then it is left alone too.
+        // `releases/<name>` is removed only when it is provably this transaction's: the
+        // journal records the rename (`published`), or it holds exactly the files this
+        // transaction staged (the rename happened and its journal line did not). A directory
+        // that is anything else is somebody else's and is left alone.
         let published = p.announced(|o| *o == JournalOp::Published);
-        let undo_begun = p.announced(|o| *o == JournalOp::RollbackBegin);
-        let renamed_unrecorded = announced(Step::Publish) && !undo_begun && !stage_present;
-        if !self.intent.release_existed && (published || renamed_unrecorded) {
+        if !self.intent.release_existed
+            && announced(Step::Publish)
+            && (published || self.release_is_ours()?)
+        {
             tree::remove_tree(&self.release_path())?;
         }
         Ok(())
@@ -1093,13 +1126,7 @@ impl Run<'_> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(InstallError::io("cannot remove the journal", e)),
         }
-        let mut dirs: Vec<PathBuf> = self
-            .intent
-            .created_dirs
-            .iter()
-            .map(PathBuf::from)
-            .filter(|d| d.starts_with(self.safe.canonical_root()))
-            .collect();
+        let mut dirs: Vec<PathBuf> = self.intent.created_dirs.iter().map(PathBuf::from).collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
         for d in dirs {
             // Only an empty directory this transaction created goes; anything else stays.
@@ -1165,6 +1192,10 @@ impl Tx<'_> {
                 Step::Publish => {
                     self.announce(step, JournalOp::Publish)?;
                     self.run.do_publish()?;
+                    self.run.env.faults.hit(FaultPoint {
+                        step: Step::Publish,
+                        when: When::Renamed,
+                    })?;
                     // From here the directory at `releases/<name>` is this transaction's.
                     self.journal.append(JournalOp::Published)?;
                     self.announced.push(JournalOp::Published);
@@ -1265,13 +1296,40 @@ fn validate_intent(i: &TxnIntent, safe: &Safe, paths: &Paths, layout: &Layout) -
         }
     }
     let plain = |s: &str| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control);
+    // `created_dirs` is every directory the transaction made, the missing ancestors of the
+    // prefix and launcher directory included (they can lie above the declared root: a fresh
+    // `--prefix /new/dir/fl`). One rule everywhere: the journal records them all, and the undo
+    // removes each with `remove_dir` (empty directories only), deepest first. So an entry must
+    // be a plain absolute path (no `.`/`..`) on the way to, or inside, the prefix or the
+    // launcher directory, and never `/`, a system directory or the home directory (or one
+    // above it): the floor an undo can never go below.
+    let prefix_real = safe.resolve(&layout.prefix)?;
+    let bin_real = safe.resolve(&layout.bin_dir)?;
+    let homes: Vec<PathBuf> = safe
+        .home()
+        .into_iter()
+        .flat_map(|h| [Some(h.to_path_buf()), fs::canonicalize(h).ok()])
+        .flatten()
+        .collect();
     for d in &i.created_dirs {
         let p = Path::new(d);
         let normal = p.is_absolute()
             && p.components()
                 .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
-        if !normal || !p.starts_with(safe.canonical_root()) {
-            return Err(bad(format!("created directory `{d}` is outside the root")));
+        let on_the_way = prefix_real.starts_with(p)
+            || bin_real.starts_with(p)
+            || p.starts_with(&prefix_real)
+            || p.starts_with(&bin_real);
+        if !normal || !on_the_way || is_forbidden_install_root(d) {
+            return Err(bad(format!(
+                "created directory `{}` is not one this install makes",
+                d.chars().take(80).collect::<String>()
+            )));
+        }
+        if homes.iter().any(|h| h.starts_with(p)) {
+            return Err(bad(format!(
+                "created directory `{d}` is the home directory or above it"
+            )));
         }
     }
     for (l, want) in std::iter::once((i.launcher.as_ref(), "fl"))
@@ -1781,10 +1839,8 @@ fn abandon_fresh(guard: &LockGuard, created: &[PathBuf], safe: &Safe) {
     if guard.created {
         let _ = guard.unlink();
     }
-    let mut dirs: Vec<&PathBuf> = created
-        .iter()
-        .filter(|d| d.starts_with(safe.canonical_root()))
-        .collect();
+    let _ = safe;
+    let mut dirs: Vec<&PathBuf> = created.iter().collect();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
     for d in dirs {
         let _ = fs::remove_dir(d);
@@ -1996,4 +2052,84 @@ fn apply_locked(
         retention: after.as_ref().map(retention),
         notes,
     })
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use fl_core::install::{Product, Profile};
+
+    /// A `Run` over a temp root whose intent stages exactly one file, `bin/fl` = "ours".
+    fn with_run(f: impl FnOnce(&Run<'_>, &Path)) {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("p");
+        let layout = Layout::explicit(root.to_str().unwrap()).unwrap();
+        let env = Env::new(root.clone(), None);
+        let safe = Safe::new(&root, None).unwrap();
+        let paths = Paths::new(&safe, &layout).unwrap();
+        fs::create_dir_all(&paths.releases).unwrap();
+        let intent = TxnIntent {
+            release: ReceiptRelease {
+                version: "0.1.0".into(),
+                name: "0.1.0+aaaaaaaaaaaa".into(),
+                kind: ReleaseKind::Release,
+                commit: None,
+            },
+            profile: Profile::Minimal,
+            products: vec![Product::Ferroloop],
+            layout: ReceiptLayout {
+                prefix: layout.prefix.clone(),
+                bin_dir: layout.bin_dir.clone(),
+                unit_dir: layout.unit_dir.clone(),
+            },
+            artifacts: vec![],
+            files: vec![IntentFile {
+                path: "bin/fl".into(),
+                sha256: sha256_hex(b"ours"),
+                size: 4,
+                exec: true,
+            }],
+            steps: vec![Step::Begin, Step::Publish, Step::Commit],
+            release_existed: false,
+            prev_current: None,
+            launcher: None,
+            aliases: vec![],
+            backups: vec![],
+            created_dirs: vec![],
+            lock_created: false,
+            prev_receipt: None,
+        };
+        let run = Run {
+            env: &env,
+            safe: &safe,
+            paths: &paths,
+            intent: &intent,
+            txn: 1,
+        };
+        f(&run, &paths.release("0.1.0+aaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn publish_with_the_stage_gone_adopts_only_a_release_that_holds_what_was_staged() {
+        with_run(|run, rel| {
+            // somebody else's directory
+            fs::create_dir_all(rel.join("bin")).unwrap();
+            fs::write(rel.join("bin/fl"), "theirs").unwrap();
+            let e = run.do_publish().unwrap_err();
+            assert_eq!(e.exit_code(), 3, "{e}");
+            assert_eq!(fs::read_to_string(rel.join("bin/fl")).unwrap(), "theirs");
+            // an extra file is not what was staged either
+            fs::write(rel.join("bin/fl"), "ours").unwrap();
+            fs::write(rel.join("extra"), "x").unwrap();
+            assert!(run.do_publish().is_err());
+            fs::remove_file(rel.join("extra")).unwrap();
+            // exactly what was staged: the rename happened, only its journal line is missing
+            run.do_publish().unwrap();
+            // a symlink in its place is never adopted
+            fs::remove_dir_all(rel).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), rel).unwrap();
+            assert!(run.do_publish().is_err());
+        });
+    }
 }

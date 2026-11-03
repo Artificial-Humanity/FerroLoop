@@ -9,6 +9,8 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum When {
     Before,
+    /// Only for `publish`: after the rename, before the `published` journal line.
+    Renamed,
     After,
 }
 
@@ -42,6 +44,12 @@ impl FaultPoint {
             if s != Step::Begin {
                 v.push(Self::before(s));
             }
+            if s == Step::Publish {
+                v.push(Self {
+                    step: s,
+                    when: When::Renamed,
+                });
+            }
             v.push(Self::after(s));
         }
         v
@@ -52,6 +60,7 @@ impl FaultPoint {
         let (when, step) = s.split_once(':')?;
         let when = match when {
             "before" => When::Before,
+            "renamed" => When::Renamed,
             "after" => When::After,
             _ => return None,
         };
@@ -66,6 +75,7 @@ impl fmt::Display for FaultPoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let w = match self.when {
             When::Before => "before",
+            When::Renamed => "renamed",
             When::After => "after",
         };
         write!(f, "{w}:{}", self.step.as_wire())

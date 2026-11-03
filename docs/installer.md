@@ -244,13 +244,26 @@ created, written or removed.
 
 **Journal checks.** `journal.jsonl` is read back from disk, so nothing in it is trusted before it
 is checked: the release name is a plain file name that extends its version, every file path
-passes the in-release path rules, every created directory and link is absolute, normalised and
-under the declared root (links sit in the launcher directory), backups sit under
-`<prefix>/backups/`, and the layout in the journal equals the layout of this run. A journal
-that fails any check is refused with exit 3 and nothing is touched. A release directory is
-removed by an undo only when the journal records that this transaction renamed the staging
-directory onto it (`published`), or the staging directory is gone with no undo begun; a
-directory that appeared while the staging directory still exists is left alone.
+passes the in-release path rules, every link is absolute, normalised, under the declared root
+and in the launcher directory, backups sit under `<prefix>/backups/`, and the layout in the
+journal equals the layout of this run. A journal that fails any check is refused with exit 3
+and nothing is touched.
+
+**Directories the install made.** The journal records every directory the transaction created,
+the missing ancestors of the prefix included (a fresh `--prefix /new/dir/fl` makes `/new` and
+`/new/dir`, which lie above the declared root). One rule applies when it is written, checked
+and undone: an entry is a plain absolute path (no `.` or `..`) on the way to, or inside, the
+prefix or the launcher directory, and never `/`, a system directory, the home directory or
+one above it. An undo removes each with `rmdir` (empty directories only), deepest first, and
+only those the journal lists, so it never goes below that floor and never removes a directory
+that holds anything.
+
+**The release directory in an undo.** `releases/<name>` is removed by an undo only when it is
+provably this transaction's: the journal holds a `published` line (written after the rename of
+the staging directory), or the directory holds exactly the files this transaction staged (same
+paths, hashes and sizes), which covers a crash between the rename and its journal line. Any
+other directory there is somebody else's: it is neither adopted by a resume nor removed by an
+undo, and the install is refused over it.
 
 **Known limit.** Paths are walked with `lstat` and then used by path (no `openat` with a
 directory descriptor), so a process of the same user that races the installer can swap a

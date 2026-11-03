@@ -19,6 +19,8 @@ enum Kind {
     Explicit,
     /// `FL_INSTALL_ROOT=<base>/root`: launcher in `<root>/.local/bin`, units elsewhere.
     UnderRoot,
+    /// `--prefix <base>/a/b/c/fl` with `a`, `b` and `c` missing: the install makes its ancestors.
+    Deep,
 }
 
 struct World {
@@ -46,13 +48,14 @@ impl World {
         match self.kind {
             Kind::Explicit => self.base.path().join("prefix"),
             Kind::UnderRoot => self.base.path().join("root"),
+            Kind::Deep => self.base.path().join("a/b/c/fl"),
         }
     }
 
     fn layout(&self) -> Layout {
         let r = self.root();
         match self.kind {
-            Kind::Explicit => Layout::explicit(r.to_str().unwrap()).unwrap(),
+            Kind::Explicit | Kind::Deep => Layout::explicit(r.to_str().unwrap()).unwrap(),
             Kind::UnderRoot => Layout::under_root(r.to_str().unwrap()).unwrap(),
         }
     }
@@ -1691,8 +1694,8 @@ fn the_selected_release_cannot_be_replaced_while_it_is_selected() {
 
 /// Crash a fresh install right after `begin`, then rewrite the journal: `edit` changes the
 /// intent, and a `stage` and a `publish` line are appended so an undo would act on the release.
-fn forged_world(edit: &dyn Fn(&mut serde_json::Value, &World)) -> World {
-    let w = World::new(Kind::Explicit);
+fn forged_world(kind: Kind, edit: &dyn Fn(&mut serde_json::Value, &World)) -> World {
+    let w = World::new(kind);
     let m = w.release("0.1.0", "a");
     let e = w
         .install_faulty(
@@ -1795,7 +1798,7 @@ fn a_forged_but_parseable_journal_is_refused_and_touches_nothing() {
         }),
     ];
     for (name, edit) in cases {
-        let w = forged_world(&edit);
+        let w = forged_world(Kind::Explicit, &edit);
         let before = w.snap();
         for what in ["resume", "rollback", "apply"] {
             let e = match what {
@@ -1831,7 +1834,7 @@ fn a_forged_but_parseable_journal_is_refused_and_touches_nothing() {
 fn a_genuine_journal_still_recovers_after_validation() {
     // The same forging helper with no change: the journal is the real one plus two lines the
     // installer itself writes, so it is valid and the undo runs.
-    let w = forged_world(&|_, _| {});
+    let w = forged_world(Kind::Explicit, &|_, _| {});
     let rep = recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
     assert_eq!(rep.action, RecoverAction::RolledBack);
     assert_eq!(
@@ -2007,5 +2010,207 @@ fn a_hostile_staging_name_is_refused_not_written_through() {
         untouched(&out);
         // the lock file this attempt made is removed again; everything else is as it was
         assert_eq!(w.snap(), pre);
+    }
+}
+
+#[test]
+fn every_crash_point_of_an_install_into_a_missing_deep_prefix_removes_what_it_made() {
+    // `<base>/a/b/c/fl` with a, b and c missing: the transaction journals and removes them.
+    crash_matrix(Kind::Deep, &|_| {}, &Decisions::default(), "0.1.0");
+    let w = World::new(Kind::Deep);
+    let e = w
+        .install_faulty(
+            &w.release("0.1.0", "a"),
+            &Decisions::default(),
+            Faults::crash(FaultPoint::after(Step::Stage)),
+        )
+        .unwrap_err();
+    assert!(matches!(e, InstallError::Crashed(_)));
+    assert!(w.base.path().join("a/b/c/fl/releases").is_dir());
+    recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+    assert!(!w.base.path().join("a").exists(), "a, b and c are gone too");
+    assert!(w.base.path().is_dir());
+}
+
+#[test]
+fn a_deep_prefix_with_a_failing_step_leaves_no_ancestor_behind() {
+    let w = World::new(Kind::Deep);
+    let e = w
+        .install_faulty(
+            &w.release("0.1.0", "a"),
+            &Decisions::default(),
+            Faults::fail(Step::Publish, libc::EACCES),
+        )
+        .unwrap_err();
+    assert_eq!(e.exit_code(), 1);
+    assert!(!w.base.path().join("a").exists());
+}
+
+#[test]
+fn forged_created_dirs_are_refused_or_cannot_remove_anything_non_empty() {
+    let cases: Vec<(&str, fn(&World) -> String)> = vec![
+        ("the filesystem root", |_| "/".to_string()),
+        ("a system directory", |_| "/usr".to_string()),
+        ("the home directory", |w| {
+            w.root().to_string_lossy().into_owned()
+        }),
+        ("a dot-dot path", |w| {
+            format!("{}/../outside", w.root().display())
+        }),
+        ("a path off the install", |w| {
+            w.base.path().join("outside").to_string_lossy().into_owned()
+        }),
+    ];
+    for (name, entry) in cases {
+        let w = forged_world(Kind::UnderRoot, &|i, w| {
+            i["created_dirs"] = serde_json::json!([entry(w)]);
+        });
+        let mut env = w.env();
+        // `$HOME` is the declared root here, an ancestor of the install.
+        env.home = Some(w.root());
+        let before = w.snap();
+        for what in ["resume", "rollback"] {
+            let mode = if what == "resume" {
+                RecoverMode::Auto
+            } else {
+                RecoverMode::Rollback
+            };
+            let e = recover(&env, &w.layout(), mode).unwrap_err();
+            assert_eq!(e.exit_code(), 3, "{name} / {what}: {e}");
+            assert_eq!(w.snap(), before, "{name} / {what}");
+        }
+        assert!(w.base.path().join("outside").is_dir(), "{name}");
+    }
+    // An ancestor of the install that is NOT empty passes the check and is never removed.
+    let w = forged_world(Kind::UnderRoot, &|i, w| {
+        i["created_dirs"] = serde_json::json!([w.base.path()]);
+    });
+    let rep = recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+    assert_eq!(rep.action, RecoverAction::RolledBack);
+    assert!(
+        w.base.path().join("outside").is_dir(),
+        "a non-empty directory stays"
+    );
+    assert!(w.base.path().is_dir());
+}
+
+// ------------------------------- a crash between the rename and its journal line
+
+fn renamed_point() -> FaultPoint {
+    FaultPoint {
+        step: Step::Publish,
+        when: When::Renamed,
+    }
+}
+
+fn crashed_after_the_rename() -> (
+    World,
+    fl_core::install::ReleaseManifest,
+    BTreeMap<String, String>,
+) {
+    let w = World::new(Kind::Explicit);
+    w.install(&w.release("0.1.0", "first"));
+    let pre = w.snap();
+    let m2 = w.release("0.2.0", "second");
+    let e = w
+        .install_faulty(&m2, &Decisions::default(), Faults::crash(renamed_point()))
+        .unwrap_err();
+    assert!(matches!(e, InstallError::Crashed(p) if p == renamed_point()));
+    let rel = w.prefix().join("releases").join(fixture::release_name(&m2));
+    assert!(rel.join("bin/fl").is_file(), "the rename happened");
+    assert!(!w.prefix().join("releases/.stage-2").exists());
+    (w, m2, pre)
+}
+
+#[test]
+fn a_crash_after_the_rename_resumes_with_the_release_intact() {
+    let (w, m2, _) = crashed_after_the_rename();
+    let rep = recover(&w.env(), &w.layout(), RecoverMode::Auto).unwrap();
+    assert_eq!(rep.action, RecoverAction::Completed, "{rep:?}");
+    let rel = w.prefix().join("releases").join(fixture::release_name(&m2));
+    assert_eq!(
+        fs::read_to_string(rel.join("bin/fl")).unwrap(),
+        "#!/bin/sh\necho fl second\n"
+    );
+    assert_eq!(w.receipt().release.name, fixture::release_name(&m2));
+}
+
+#[test]
+fn a_crash_after_the_rename_rolls_back_to_the_pre_state() {
+    let (w, _, pre) = crashed_after_the_rename();
+    recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+    assert_eq!(
+        w.snap(),
+        pre,
+        "our own release went, the old one is selected"
+    );
+}
+
+#[test]
+fn an_interrupted_rollback_after_the_rename_is_finished_by_the_retry() {
+    for undo in 0..=5usize {
+        let (w, _, pre) = crashed_after_the_rename();
+        let mut env = w.env();
+        env.faults = Faults {
+            die_in_rollback: Some((undo, Death::Return)),
+            ..Faults::none()
+        };
+        let e = recover(&env, &w.layout(), RecoverMode::Rollback).unwrap_err();
+        assert!(matches!(e, InstallError::Crashed(_)), "undo {undo}: {e:?}");
+        recover(&w.env(), &w.layout(), RecoverMode::Rollback).unwrap();
+        assert_eq!(
+            w.snap(),
+            pre,
+            "rollback interrupted after undo action {undo}"
+        );
+    }
+}
+
+#[test]
+fn a_foreign_release_directory_is_never_adopted_or_removed_when_the_stage_is_gone() {
+    for mode in [RecoverMode::Auto, RecoverMode::Rollback] {
+        let w = World::new(Kind::Explicit);
+        w.install(&w.release("0.1.0", "first"));
+        let pre = w.snap();
+        let m2 = w.release("0.2.0", "second");
+        let e = w
+            .install_faulty(
+                &m2,
+                &Decisions::default(),
+                Faults::crash(FaultPoint::before(Step::Publish)),
+            )
+            .unwrap_err();
+        assert!(matches!(e, InstallError::Crashed(_)));
+        // Something else removes the staging directory and puts its own directory in the
+        // release's place.
+        let stage = w.prefix().join("releases/.stage-2");
+        make_tree_writable(&stage);
+        fs::remove_dir_all(&stage).unwrap();
+        let foreign = w.prefix().join("releases").join(fixture::release_name(&m2));
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("theirs"), "not yours").unwrap();
+        let rep = recover(&w.env(), &w.layout(), mode).unwrap();
+        assert_eq!(rep.action, RecoverAction::RolledBack, "{mode:?}: {rep:?}");
+        assert_eq!(
+            fs::read_to_string(foreign.join("theirs")).unwrap(),
+            "not yours",
+            "{mode:?}"
+        );
+        let mut after = w.snap();
+        after.remove(&format!("prefix/releases/{}", fixture::release_name(&m2)));
+        after.remove(&format!(
+            "prefix/releases/{}/theirs",
+            fixture::release_name(&m2)
+        ));
+        assert_eq!(after, pre, "{mode:?}");
+        // and the install itself is refused over it (a conflict, not an adoption)
+        let e = w
+            .apply_with(&m2, None, &Decisions::default(), &w.env())
+            .unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{e}");
+        assert_eq!(
+            fs::read_to_string(foreign.join("theirs")).unwrap(),
+            "not yours"
+        );
     }
 }
