@@ -283,11 +283,63 @@ fn check_api_key(env: &LifecycleEnv<'_>, vendor: &str) -> Result<(), LifecycleEr
 /// persona). Only [`LifecycleEnv::runtime`] makes them, and only when `spawn_runtime` is on.
 pub trait SessionRuntime: std::fmt::Debug {
     /// Start a detached session; `false` when it did not start (tmux failed, or the name exists).
-    fn spawn(&self, session: &str, window: &str, cwd: Option<&str>) -> bool;
+    /// With `launch` the window runs that command (the vendor's CLI) instead of a blank shell.
+    /// Only Muse is launched so far ([`launch_spec_for`]); every other vendor gets a blank window.
+    fn spawn(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+    ) -> bool;
     /// Stop a session; `true` when it is gone afterwards.
     fn kill(&self, session: &str) -> bool;
     /// `true` when a session of this name runs.
     fn exists(&self, session: &str) -> bool;
+}
+
+/// The command a runtime window starts in place of a blank shell: run as an argument vector,
+/// never through a shell, so no argument needs quoting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSpec {
+    /// Environment variables set for the command.
+    pub env: Vec<(String, String)>,
+    /// The program, then its arguments.
+    pub argv: Vec<String>,
+}
+
+/// The vendor CLI to start in a new runtime window, with `prompt` as its first input; `None`
+/// where the window stays a blank shell. Only Muse is launched so far.
+fn launch_spec_for(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    persona: &str,
+    prompt: &str,
+) -> Option<LaunchSpec> {
+    (vendor == "muse").then(|| LaunchSpec {
+        env: vec![("AGENT_PERSONA".to_string(), persona.to_string())],
+        argv: vec![
+            resolve_muse_bin(
+                std::env::var_os("FL_WIRE_MUSE_BIN"),
+                env.home_override
+                    .map(Path::to_path_buf)
+                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+                    .as_deref(),
+            ),
+            prompt.to_string(),
+        ],
+    })
+}
+
+/// The Muse binary: `configured` (`FL_WIRE_MUSE_BIN`, the one the dispatcher honours) when set,
+/// else `<home>/.local/bin/muse` when that file exists, else `muse` from `PATH`.
+fn resolve_muse_bin(configured: Option<std::ffi::OsString>, home: Option<&Path>) -> String {
+    if let Some(bin) = configured.filter(|b| !b.is_empty()) {
+        return bin.to_string_lossy().into_owned();
+    }
+    home.map(|h| h.join(".local").join("bin").join("muse"))
+        .filter(|p| p.is_file())
+        .map_or_else(|| "muse".to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 /// The real runtime: the host's `tmux`.
@@ -295,8 +347,14 @@ pub trait SessionRuntime: std::fmt::Debug {
 pub struct TmuxRuntime;
 
 impl SessionRuntime for TmuxRuntime {
-    fn spawn(&self, session: &str, window: &str, cwd: Option<&str>) -> bool {
-        spawn_tmux_runtime(session, window, cwd)
+    fn spawn(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+    ) -> bool {
+        spawn_tmux_runtime(session, window, cwd, launch)
     }
 
     fn kill(&self, session: &str) -> bool {
@@ -316,6 +374,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) live: std::cell::RefCell<std::collections::BTreeSet<String>>,
     pub(crate) fail_windows: std::cell::RefCell<Vec<String>>,
     pub(crate) calls: std::cell::RefCell<Vec<String>>,
+    /// The launch command of each `spawn` call that was not refused, by `session:window`.
+    pub(crate) launches: std::cell::RefCell<Vec<(String, Option<LaunchSpec>)>>,
 }
 
 #[cfg(test)]
@@ -382,14 +442,26 @@ impl ApiKeyProbe for FakeKeys {
 
 #[cfg(test)]
 impl SessionRuntime for FakeRuntime {
-    fn spawn(&self, session: &str, window: &str, _cwd: Option<&str>) -> bool {
+    fn spawn(
+        &self,
+        session: &str,
+        window: &str,
+        _cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+    ) -> bool {
         self.calls
             .borrow_mut()
             .push(format!("spawn {session}:{window}"));
         if self.fail_windows.borrow().iter().any(|w| w == window) {
             return false;
         }
-        self.live.borrow_mut().insert(session.to_string())
+        let started = self.live.borrow_mut().insert(session.to_string());
+        if started {
+            self.launches
+                .borrow_mut()
+                .push((format!("{session}:{window}"), launch.cloned()));
+        }
+        started
     }
 
     fn kill(&self, session: &str) -> bool {
@@ -967,12 +1039,38 @@ fn command_succeeds_within(cmd: &mut Command, timeout: Duration) -> bool {
 }
 
 /// Best-effort detached `tmux` session. `false` when tmux is absent or the session exists.
-fn spawn_tmux_runtime(session: &str, window: &str, cwd: Option<&str>) -> bool {
-    let mut args = vec!["new-session", "-d", "-s", session, "-n", window];
+fn spawn_tmux_runtime(
+    session: &str,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+) -> bool {
+    let args = tmux_new_session_args(session, window, cwd, launch);
+    tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The `tmux new-session` arguments: a detached session, and with `launch` the command as an
+/// argument vector after `--` (tmux 3.2 and later run it without a shell).
+fn tmux_new_session_args(
+    session: &str,
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["new-session", "-d", "-s", session, "-n", window]
+        .map(String::from)
+        .into();
     if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
-        args.extend(["-c", dir]);
+        args.extend(["-c".to_string(), dir.to_string()]);
     }
-    tmux_ok(&args)
+    if let Some(launch) = launch {
+        for (key, value) in &launch.env {
+            args.extend(["-e".to_string(), format!("{key}={value}")]);
+        }
+        args.push("--".to_string());
+        args.extend(launch.argv.iter().cloned());
+    }
+    args
 }
 
 /// Kill a `tmux` session this lifecycle created; `true` when it is gone afterwards.
@@ -1375,11 +1473,16 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     };
     persist_hosted_session(store, &record, by)?;
 
+    let launch = launch_spec_for(env, &v.vendor, &v.persona, &prompt);
     let spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
-        && env.runtime.spawn(&display, &v.vendor, v.cwd.as_deref());
-    let hydration_dispatched = deliver_prompt(env, &v.persona, &session_id, by, &prompt);
+        && env
+            .runtime
+            .spawn(&display, &v.vendor, v.cwd.as_deref(), launch.as_ref());
+    // A runtime launched with the prompt as its first input has the prompt already.
+    let hydration_dispatched =
+        (spawned && launch.is_some()) || deliver_prompt(env, &v.persona, &session_id, by, &prompt);
     record.runtime_spawned |= spawned;
     record.hydration_dispatched = hydration_dispatched;
     record.updated_at_ms = now_ms();
@@ -1860,18 +1963,25 @@ pub fn restart_hosted_session<S: StateStore>(
         return Err(decommissioned_conflict(&record.session_id));
     }
     let display = capitalize(&record.persona);
+    let prompt = prompt_for(&display, &record.project, &record.role);
+    let launch = launch_spec_for(env, &record.vendor, &record.persona, &prompt);
+    let mut launched_with_prompt = false;
     if record.hosted
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
-        && env
-            .runtime
-            .spawn(&display, &record.vendor, record.cwd.as_deref())
+        && env.runtime.spawn(
+            &display,
+            &record.vendor,
+            record.cwd.as_deref(),
+            launch.as_ref(),
+        )
     {
         record.runtime_spawned = true;
+        // A runtime launched with the prompt as its first input has the prompt already.
+        launched_with_prompt = launch.is_some();
     }
-    let prompt = prompt_for(&display, &record.project, &record.role);
-    record.hydration_dispatched =
-        deliver_prompt(env, &record.persona, &record.session_id, by, &prompt);
+    record.hydration_dispatched = launched_with_prompt
+        || deliver_prompt(env, &record.persona, &record.session_id, by, &prompt);
     // A runtime may have reopened: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
@@ -2576,6 +2686,9 @@ mod remodel_tests;
 
 #[cfg(test)]
 mod vendor_registry_tests;
+
+#[cfg(test)]
+mod muse_launch_tests;
 
 #[cfg(test)]
 mod tests {

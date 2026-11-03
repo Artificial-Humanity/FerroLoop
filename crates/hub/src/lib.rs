@@ -725,6 +725,11 @@ mod artifact_dirs_tests;
 #[cfg(test)]
 mod remodel_api_tests;
 
+/// `FL_WIRE_TMUX_BIN` is process-global. A test that points it at a fake tmux holds this lock
+/// while it is set.
+#[cfg(test)]
+pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5887,8 +5892,6 @@ mod tests {
     }
 
     // ---- Operator prompts reach a terminal as direct input for the owner only -----------
-
-    static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Points `FL_WIRE_TMUX_BIN` at a fake tmux that records its arguments in `<dir>/tmux.out`
     /// and reports every pane alive, then restores the variable on drop. Hold `TMUX_ENV_LOCK`.

@@ -744,12 +744,19 @@ fn discover_sessions_impl(
             VendorRoute::Muse {
                 session_id, cwd, ..
             } => {
+                // A route made from a live tmux window has no id until Muse writes a transcript.
+                let id = if session_id.is_empty() {
+                    format!("muse-{persona}")
+                } else {
+                    session_id.clone()
+                };
                 let tpath = home
                     .as_deref()
-                    .and_then(|h| find_transcript_file_in_home(h, session_id));
+                    .filter(|_| !session_id.is_empty())
+                    .and_then(|h| find_transcript_file_in_home(h, &id));
                 (
                     "muse",
-                    session_id.clone(),
+                    id,
                     cwd.as_ref().map(|p| p.display().to_string()),
                     tpath,
                 )
