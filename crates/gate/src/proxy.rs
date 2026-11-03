@@ -386,13 +386,6 @@ fn prepare_proxied_request_inner(
     let mut trace = DenialTrace::default();
     let result = prepare_checked(vault, req, provider, &mut trace);
     if let Err(err) = &result {
-        let caller: String = req
-            .caller_agent
-            .as_deref()
-            .unwrap_or("anonymous")
-            .chars()
-            .take(255)
-            .collect();
         let host: String = trace
             .host
             .as_deref()
@@ -401,7 +394,7 @@ fn prepare_proxied_request_inner(
             .take(255)
             .collect();
         let _ = vault.try_append_audit_log(
-            Some(&caller),
+            req.caller_agent.as_deref(),
             &trace.secrets,
             trace.method.as_deref().unwrap_or("INVALID"),
             &host,

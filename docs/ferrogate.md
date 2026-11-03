@@ -15,6 +15,13 @@ section says where the protection ends.
 An entry holds the caller, the secret NAMES, the method, the destination host and the outcome. It
 never holds a secret value, a header, a body, or a URL path or query.
 
+The caller is written trimmed and lower-cased (the form policy matching uses), with every
+character outside `A-Za-z0-9._@-` replaced by `?`, at most 255 characters; a missing or blank
+caller is `anonymous`. Caller text therefore cannot add a line, a field or a look-alike entry.
+The file is opened with `O_NOFOLLOW` and refused when it is a symlink. It has no rotation and no
+size cap: each refusal appends at most about a kilobyte, and any caller that can reach the Vault
+can cause refusals. Rotating or capping it is a known follow-up.
+
 Every refusal on the credential proxy path (`prepare_proxied_request`,
 `execute_proxied_request`) writes an entry before the error is returned. A refusal happens before
 any connection is made. `secrets` lists the valid secret names the request referenced; a malformed
@@ -87,20 +94,36 @@ The policy runs before the key is decrypted, from the secret's metadata:
 
 1. the secret exists;
 2. its lease has not expired;
-3. `host` matches `allowed_hosts` (an empty list denies);
+3. `host` is a hostname (non-empty dot-separated labels of `A-Za-z0-9-_`; no leading or trailing
+   dot, no `..`) and matches `allowed_hosts` (an empty list denies);
 4. the caller is in `allowed_agents`, when that list is not empty (`*` admits any caller).
 
 Every outcome is audited under the secret's name with method `SIGN_RS256_JWT`: `allowed`, or
 `denied:` plus `host`, `agent`, `expired`, `no_such_secret`, `issuer`, `clock`, `vault_error`, `bad_key` or
 `policy`. If the `allowed` entry cannot be written, the call returns an error and no JWT.
 
-The PEM is held in zeroizing buffers and wiped as soon as the signature is made. The key pair that
-`ring` builds from it is `ring`'s own and is dropped straight after signing. The ordinary decrypt
+The PEM is held in zeroizing buffers and wiped as soon as the signature is made. Every buffer on
+the PEM-to-DER path (the decrypted bytes, the base64 body, the DER) is allocated once at its final
+size and never grown, because a grown buffer frees its old block un-wiped; a test checks the
+capacities. The PEM is read in place and never cloned or formatted. The key pair that `ring`
+builds from it is `ring`'s own memory, dropped straight after signing, and is not wiped by this
+crate.
+
+`sign_app_jwt` reads the Vault handle's in-memory snapshot, taken by `Vault::open`. A long-lived
+handle does not see a policy change or a rotated key written to disk afterwards: a consumer opens
+the Vault again for each call. The ordinary decrypt
 paths (`decrypt_raw`, the proxy's substitution, scrubbing) still return plain `String`s; only the
 signer and `verify_secret_constant_time` use the zeroizing path.
 
 ## What this does not protect against
 
+* The `host` that `sign_app_jwt` takes is a label the caller supplies. No connection is made, so
+  the `allowed_hosts` check proves nothing about where the JWT goes: any caller that
+  `allowed_agents` admits can pass any host in `allowed_hosts` and send the JWT elsewhere. An
+  EMPTY `allowed_agents` admits every caller that can reach the Vault. The gates that hold are
+  `allowed_agents` and who can call at all (the hub authenticates its callers; the local CLI path
+  does not). `allowed_hosts` catches an honest caller's mistake and puts the claimed destination
+  in the audit entry.
 * `vault.key` and `vault.enc` live under one Unix user. Any process of that user can read both and
   decrypt every secret. On the local CLI path `allowed_agents` is therefore advisory: it stops a
   mistake and leaves a record, and does not stop a process that skips the library. It is

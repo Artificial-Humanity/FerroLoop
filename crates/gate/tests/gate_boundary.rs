@@ -438,6 +438,11 @@ fn throwaway_pem(traditional: bool) -> Option<String> {
     match Command::new("openssl").args(&args).output() {
         Ok(out) if out.status.success() => Some(String::from_utf8(out.stdout).unwrap()),
         _ => {
+            // CI must never lose this coverage silently.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "the `openssl` CLI is required in CI to make a throwaway RSA key"
+            );
             eprintln!("SKIPPED: the `openssl` CLI is needed to make a throwaway RSA key");
             None
         }
@@ -568,13 +573,13 @@ fn sign_app_jwt_policy_runs_before_the_key_is_used_and_every_denial_is_audited()
     }
 
     // Caller not in allowed_agents, and no caller at all.
-    for caller in ["mallory", ""] {
+    for (caller, logged) in [("mallory", "mallory"), ("", "anonymous")] {
         let err = f
             .vault
             .sign_app_jwt(&secret, "42", caller, HOST, now())
             .unwrap_err();
         assert!(matches!(err, GateError::PolicyDenied { .. }), "{err}");
-        assert_sign_denied(&f, "agent", caller, HOST, marker);
+        assert_sign_denied(&f, "agent", logged, HOST, marker);
     }
 
     // An unknown secret.
@@ -671,6 +676,129 @@ fn sign_app_jwt_refuses_values_that_are_not_rsa_keys_without_echoing_them() {
         let e = f.last_audit();
         assert_eq!(e["outcome"], "denied:bad_key", "{label}");
         assert!(!f.audit_text().contains("SENTINEL"), "{label}");
+    }
+}
+
+fn hostile_callers() -> Vec<String> {
+    vec![
+        "x\n{\"outcome\":\"allowed\"}".to_string(),
+        "x\r\n{\"timestamp\":\"t\",\"outcome\":\"allowed\"}\r\n".to_string(),
+        "ev\u{202e}il".to_string(),
+        "q\"uote\\back\\".to_string(),
+        "tab\there\0nul".to_string(),
+        "\u{1f600}emoji".to_string(),
+        "A".repeat(10_000),
+        "ferris".to_string(),
+    ]
+}
+
+/// Every line parses as one JSON object, there is one line per call, and the caller is clipped to
+/// the audit alphabet.
+fn assert_audit_is_clean(f: &Fixture, calls: usize) -> Vec<Value> {
+    let text = f.audit_text();
+    assert!(text.ends_with('\n'));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), calls, "one line per call, no more: {text}");
+    let entries: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    for e in &entries {
+        let caller = e["caller"].as_str().unwrap();
+        assert!(caller.chars().count() <= 255, "{}", caller.len());
+        assert!(
+            caller
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-' | '?')),
+            "{caller:?}"
+        );
+        assert_eq!(e.as_object().unwrap().len(), 6, "{e}");
+    }
+    entries
+}
+
+#[test]
+fn caller_text_cannot_forge_or_split_an_audit_line_on_the_proxy_path() {
+    let target = Counter::start();
+    let mut f = Fixture::new();
+    f.set(proxy_secret("UPSTREAM_KEY"));
+    let callers = hostile_callers();
+    let mut calls = 0;
+    for caller in callers.iter().filter(|c| c.as_str() != "ferris") {
+        let err =
+            execute_proxied_request(&f.vault, &request("GET", target_url(&target), Some(caller)))
+                .unwrap_err();
+        assert!(matches!(err, GateError::PolicyDenied { .. }), "{err}");
+        calls += 1;
+    }
+    assert_eq!(target.settled_accepts(), 0);
+    let entries = assert_audit_is_clean(&f, calls);
+    assert!(
+        entries.iter().all(|e| e["outcome"] == "denied:agent"),
+        "a forged `allowed` line appeared: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["caller"].as_str().unwrap().len() == 255)
+    );
+}
+
+#[test]
+fn caller_text_cannot_forge_or_split_an_audit_line_on_the_sign_path() {
+    let Some(pem) = throwaway_pem(false) else {
+        return;
+    };
+    let secret = parse_vault_ref("vault://GITHUB_APP_KEY").unwrap();
+    let callers = hostile_callers();
+
+    // Denied: the secret admits only `ferris`.
+    let mut f = Fixture::new();
+    f.set(sign_secret(&pem));
+    let mut calls = 0;
+    for caller in callers.iter().filter(|c| c.as_str() != "ferris") {
+        f.vault
+            .sign_app_jwt(&secret, "42", caller, HOST, now())
+            .unwrap_err();
+        calls += 1;
+    }
+    let entries = assert_audit_is_clean(&f, calls);
+    assert!(
+        entries.iter().all(|e| e["outcome"] == "denied:agent"),
+        "a forged `allowed` line appeared: {entries:?}"
+    );
+
+    // Allowed: any caller is admitted, so each call signs and writes exactly one `allowed` line.
+    let mut g = Fixture::new();
+    g.set(SetSecretArgs {
+        allowed_agents: vec!["*".into()],
+        ..sign_secret(&pem)
+    });
+    for caller in &callers {
+        g.vault
+            .sign_app_jwt(&secret, "42", caller, HOST, now())
+            .unwrap();
+    }
+    let entries = assert_audit_is_clean(&g, callers.len());
+    assert!(entries.iter().all(|e| e["outcome"] == "allowed"));
+}
+
+#[test]
+fn the_audited_caller_is_the_normalised_form_policy_matching_uses() {
+    let target = Counter::start();
+    let mut f = Fixture::new();
+    f.set(proxy_secret("UPSTREAM_KEY"));
+    for (given, logged) in [
+        (Some("  Ferris "), "ferris"),
+        (Some("Fe Rris"), "fe?rris"),
+        (Some("ops@example.com"), "ops@example.com"),
+        (Some("\u{e9}cole"), "?cole"),
+        (Some("   "), "anonymous"),
+        (None, "anonymous"),
+    ] {
+        // `Ferris` matches `allowed_agents`; the others are refused. Either way one line is logged.
+        let _ = execute_proxied_request(&f.vault, &request("GET", target_url(&target), given));
+        assert_eq!(f.last_audit()["caller"], logged, "{given:?}");
     }
 }
 

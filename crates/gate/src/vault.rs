@@ -441,6 +441,11 @@ impl Vault {
     }
 
     /// [`Vault::append_audit_log`] that reports whether the entry reached the file.
+    ///
+    /// The caller is written normalised (see [`audit_caller`]), so no caller-supplied text can
+    /// add a line, a field or a look-alike name to the log. The file has no rotation and no size
+    /// cap: every refusal appends about a kilobyte at most, and any caller that can reach the
+    /// Vault can cause refusals (a known follow-up).
     pub fn try_append_audit_log(
         &self,
         caller: Option<&str>,
@@ -464,7 +469,7 @@ impl Vault {
         let ts = At::from_unix_millis(now_unix_millis()).to_string();
         let entry = serde_json::json!({
             "timestamp": ts,
-            "caller": caller.unwrap_or("anonymous"),
+            "caller": audit_caller(caller),
             "secrets": secrets,
             "method": method,
             "host": host,
@@ -479,7 +484,9 @@ impl Vault {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            // The explicit check above gives a clear error; `O_NOFOLLOW` closes the window between
+            // that check and this open, in which the path could become a symlink.
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut f = options
             .open(&audit_path)
@@ -659,6 +666,32 @@ impl Drop for VaultLock {
         #[cfg(unix)]
         flock::unlock(&self.file);
     }
+}
+
+/// The longest caller name the audit log keeps.
+const MAX_AUDIT_CALLER_LEN: usize = 255;
+
+/// A caller as the audit log writes it: trimmed and lower-cased (the form policy matching uses),
+/// every character outside `[A-Za-z0-9._@-]` replaced by `?`, at most 255 characters; a missing
+/// or blank caller is `anonymous`.
+pub(crate) fn audit_caller(caller: Option<&str>) -> String {
+    let trimmed = caller
+        .map(|c| c.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if trimmed.is_empty() {
+        return "anonymous".to_string();
+    }
+    trimmed
+        .chars()
+        .take(MAX_AUDIT_CALLER_LEN)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 /// What a lease-expired [`GateError::PolicyDenied`] says first; the proxy audit keys on it.
