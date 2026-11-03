@@ -72,9 +72,45 @@ struct Step {
     expected_exit: Option<i32>,
 }
 
+/// `fl <version> (<12 hex>[, dirty][, release <id>])` or `fl <version> (unknown commit)`
+/// becomes `fl <version> (<BUILD>)`: the stamp differs per checkout and tree. Any other
+/// shape of a version line is left alone, so a malformed one still fails the comparison.
+fn normalize_version_line(line: &str) -> String {
+    let Some(rest) = line.strip_prefix("fl ") else {
+        return line.to_string();
+    };
+    let Some((version, note)) = rest.split_once(" (") else {
+        return line.to_string();
+    };
+    let Some(note) = note.strip_suffix(')') else {
+        return line.to_string();
+    };
+    let mut parts = note.split(", ");
+    let head = parts.next().unwrap_or("");
+    let head_ok = head == "unknown commit"
+        || (head.len() == 12 && head.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    let mut rest: Vec<&str> = parts.collect();
+    if rest.first() == Some(&"dirty") {
+        rest.remove(0);
+    }
+    let release_ok = match rest.as_slice() {
+        [] => true,
+        [r] => r
+            .strip_prefix("release ")
+            .is_some_and(|id| !id.is_empty() && !id.contains(' ')),
+        _ => false,
+    };
+    if !version.is_empty() && !version.contains(' ') && head_ok && release_ok {
+        format!("fl {version} (<BUILD>)")
+    } else {
+        line.to_string()
+    }
+}
+
 /// Replace anything that legitimately differs between two runs.
 fn normalize(line: &str, demo_root: &str) -> String {
     let line = line.replace(demo_root, "<ROOT>");
+    let line = normalize_version_line(&line);
     let bytes: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -342,4 +378,30 @@ fn every_command_in_the_getting_started_guide_produces_the_output_it_prints() {
          If that is deliberate, update VERIFIED_COMMANDS; if it fell, the parser \
          has stopped seeing part of the page."
     );
+}
+
+#[test]
+fn only_a_well_formed_version_note_is_normalized() {
+    for ok in [
+        "fl 0.1.0 (0123456789ab)",
+        "fl 0.1.0 (0123456789ab, dirty)",
+        "fl 0.1.0 (unknown commit)",
+        "fl 0.1.0 (0123456789ab, release 2026.11.1)",
+    ] {
+        assert_eq!(normalize_version_line(ok), "fl 0.1.0 (<BUILD>)", "{ok}");
+    }
+    for bad in [
+        "fl 0.1.0",
+        "fl 0.1.0 ()",
+        "fl 0.1.0 (0123456789a)",
+        "fl 0.1.0 (0123456789abc)",
+        "fl 0.1.0 (0123456789AB)",
+        "fl 0.1.0 (0123456789ab, dirty, dirty)",
+        "fl 0.1.0 (0123456789ab, dirt)",
+        "fl 0.1.0 (garbage)",
+        "fl 0.1.0 (0123456789ab) trailing",
+        "fl  (0123456789ab)",
+    ] {
+        assert_eq!(normalize_version_line(bad), bad, "{bad}");
+    }
 }

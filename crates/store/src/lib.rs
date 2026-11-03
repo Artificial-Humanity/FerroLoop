@@ -18,6 +18,7 @@ pub mod cli;
 pub mod code_knowledge;
 pub mod ferrostore;
 pub mod ferrowire;
+pub mod formats;
 pub mod knowledge;
 pub mod manifest;
 pub mod migrate;

@@ -24,6 +24,7 @@ pub mod runtime_update;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
+mod version_api;
 mod warrants;
 mod watch_api;
 pub mod ws;

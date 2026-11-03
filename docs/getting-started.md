@@ -39,7 +39,7 @@ The binary is at `target/release/fl`.
 
 ```
 $ target/release/fl --version
-fl 0.1.0
+fl 0.1.0 (abc123456789)
 ```
 
 Every command below passes `--db <path>` explicitly so the walkthrough doesn't touch
@@ -78,6 +78,7 @@ Commands:
   vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   auth        Owner warrants: signed, scoped, expiring grants of Owner authority (`grant`, `verify`, `list`, `revoke`)
   watch       FerroWatch: telemetry rollups, agent liveness and alerts over the workspace store
+  version     Print how this build was made and the versions it speaks (same as `--version [--json]`)
   help        Print this message or the help of the given subcommand(s)
 
 Options:

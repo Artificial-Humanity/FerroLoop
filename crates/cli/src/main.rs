@@ -8,6 +8,7 @@ mod refs;
 mod testing;
 mod tiers;
 mod vendor_keys;
+mod version;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -17,7 +18,11 @@ use fl_store::AnyStore;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "fl", version, about = "Gate an action before it costs you")]
+#[command(
+    name = "fl",
+    version = version::clap_version(),
+    about = "Gate an action before it costs you"
+)]
 struct Cli {
     /// Path to the store. CONFINES the command to it: an IRI it does not
     /// hold is refused, not searched for elsewhere. Falls back to $FL_DB
@@ -110,6 +115,12 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::watch::WatchCmd,
     },
+    /// Print how this build was made and the versions it speaks (same as `--version [--json]`).
+    Version {
+        /// One JSON object instead of the human line.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Command {
@@ -138,7 +149,8 @@ impl Command {
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
-            | Command::Watch { .. } => Vec::new(),
+            | Command::Watch { .. }
+            | Command::Version { .. } => Vec::new(),
         }
     }
 
@@ -179,7 +191,8 @@ impl Command {
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
-            | Command::Watch { .. } => false,
+            | Command::Watch { .. }
+            | Command::Version { .. } => false,
         }
     }
 
@@ -214,7 +227,8 @@ impl Command {
             | Command::Store { .. }
             | Command::Vault { .. }
             | Command::Auth { .. }
-            | Command::Watch { .. } => false,
+            | Command::Watch { .. }
+            | Command::Version { .. } => false,
         }
     }
 }
@@ -722,8 +736,18 @@ fn main() {
                         2
                     }
                 }
+            } else if version::json_flag_request(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+                // `fl --version --json`; a bare `--version` is clap's, and prints the same
+                // human line.
+                print!("{}", version::render(true));
+                0
             } else {
                 let cli = Cli::parse();
+                if let Command::Version { json } = cli.command {
+                    // No config, no store: a version report must work on a broken setup.
+                    print!("{}", version::render(json));
+                    std::process::exit(0);
+                }
                 match run(cli) {
                     Ok(code) => code,
                     Err(e) => {
@@ -1389,7 +1413,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Store { .. }
         | Command::Vault { .. }
         | Command::Auth { .. }
-        | Command::Watch { .. } => {
+        | Command::Watch { .. }
+        | Command::Version { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

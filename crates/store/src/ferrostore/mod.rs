@@ -64,6 +64,11 @@ mod tests_verify;
 #[cfg(test)]
 mod tests_wire;
 
+/// The oldest FerroStore container format this build reads.
+pub const CONTAINER_FORMAT_OLDEST: u32 = layout::FORMAT_V1;
+/// The newest container format this build reads, and the one it writes.
+pub const CONTAINER_FORMAT_NEWEST: u32 = layout::FORMAT_VERSION;
+
 use container_io::{ContainerFs, ContainerIo, RealFs};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
