@@ -42,7 +42,9 @@ pub enum AgentCmd {
         /// Primary project / area slug.
         #[arg(long)]
         project: String,
-        /// Role (`lead`, `assistant`, `lab_manager`, or `custom:<slug>`).
+        /// Role: a default role (`lead`, `assistant`, `lab_manager`, `ui-developer`,
+        /// `web-developer`, `mobile-developer`, `system-developer`, `data-engineer`, `tester`,
+        /// `strategist`, `journalist`) or `custom:<slug>`.
         #[arg(long)]
         role: String,
         /// Create `--project` and any `--extra-area` in `areas` if not yet present.

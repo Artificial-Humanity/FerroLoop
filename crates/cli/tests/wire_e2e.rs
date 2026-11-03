@@ -104,7 +104,7 @@ fn run_json(mut cmd: Command) -> Value {
 fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
     let env = TestEnv::new();
 
-    // Register three agents: ferris (ferroloop lead), kayla (kaggle-gemma4 lead), kacey (kaggle-gemma4 scribe)
+    // Register three agents: ferris (ferroloop lead), kayla (kaggle-gemma4 lead), kacey (kaggle-gemma4 journalist, registered via the legacy `scribe` spelling)
     let agent_msg_bin = env.symlink_bin("agent-msg");
     for (name, proj, role) in [
         ("Ferris", "ferroloop", "lead"),
@@ -125,7 +125,8 @@ fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
 
     // Verify .agents/REGISTRY.md was updated automatically by agent-msg register
     let reg_md = std::fs::read_to_string(env.work_dir.join(".agents/REGISTRY.md")).unwrap();
-    assert!(reg_md.contains("Ferris") && reg_md.contains("custom:scribe"));
+    assert!(reg_md.contains("Ferris") && reg_md.contains("journalist"));
+    assert!(!reg_md.contains("scribe"), "{reg_md}");
 
     // Verify collision returns exit code 2 without --replace
     let dup = env
@@ -159,12 +160,12 @@ fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
     assert_eq!(sent["receipts"].as_array().unwrap().len(), 1);
     assert_eq!(sent["receipts"][0]["recipient_name"], "kayla");
 
-    // Area+role selector send: @area:kaggle-gemma4/scribe -> only kacey
+    // Area+role selector send: @area:kaggle-gemma4/journalist -> only kacey
     let mut role_cmd = env.fl();
     role_cmd.args([
         "wire",
         "send",
-        "@area:kaggle-gemma4/scribe",
+        "@area:kaggle-gemma4/journalist",
         "Log update",
         "Update experiment table.",
         "--from",

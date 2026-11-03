@@ -63,28 +63,57 @@ impl AreaRecord {
     }
 }
 
+/// A registered agent's role. The eleven default roles are first-class
+/// variants; `Custom` is only for genuinely custom roles (`custom:<slug>`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AgentRole {
     Lead,
     Assistant,
     LabManager,
+    UiDeveloper,
+    WebDeveloper,
+    MobileDeveloper,
+    SystemDeveloper,
+    DataEngineer,
+    Tester,
+    Strategist,
+    Journalist,
     Custom(String),
 }
 
 impl AgentRole {
+    /// Parse a role from its wire form (case-insensitive, trimmed). Legacy
+    /// spellings normalize to the built-in variant: `lab-manager`,
+    /// underscore forms of the hyphenated roles, `custom:<built-in>`, and
+    /// `scribe` / `custom:scribe` (now `journalist`).
     pub fn from_wire(s: &str) -> Result<Self, StateError> {
         let lower = s.trim().to_ascii_lowercase();
+        // Bare words are only the built-ins; `custom:<name>` also folds into
+        // a built-in when `<name>` is one of the non-structural defaults.
         match lower.as_str() {
-            "lead" => Ok(Self::Lead),
-            "assistant" => Ok(Self::Assistant),
-            "lab_manager" => Ok(Self::LabManager),
-            other => {
-                if let Some(slug) = other.strip_prefix("custom:") {
-                    Ok(Self::Custom(validate_slug(slug)?))
-                } else {
-                    Err(StateError::InvalidRole(s.to_string()))
-                }
-            }
+            "lead" => return Ok(Self::Lead),
+            "assistant" => return Ok(Self::Assistant),
+            "lab_manager" | "lab-manager" => return Ok(Self::LabManager),
+            _ => {}
+        }
+        let name = lower.strip_prefix("custom:").unwrap_or(&lower);
+        let default = match name {
+            "ui-developer" | "ui_developer" => Some(Self::UiDeveloper),
+            "web-developer" | "web_developer" => Some(Self::WebDeveloper),
+            "mobile-developer" | "mobile_developer" => Some(Self::MobileDeveloper),
+            "system-developer" | "system_developer" => Some(Self::SystemDeveloper),
+            "data-engineer" | "data_engineer" => Some(Self::DataEngineer),
+            "tester" => Some(Self::Tester),
+            "strategist" => Some(Self::Strategist),
+            "journalist" | "scribe" => Some(Self::Journalist),
+            _ => None,
+        };
+        if let Some(role) = default {
+            return Ok(role);
+        }
+        match lower.strip_prefix("custom:") {
+            Some(slug) => Ok(Self::Custom(validate_slug(slug)?)),
+            None => Err(StateError::InvalidRole(s.to_string())),
         }
     }
 
@@ -93,6 +122,14 @@ impl AgentRole {
             Self::Lead => "lead".to_string(),
             Self::Assistant => "assistant".to_string(),
             Self::LabManager => "lab_manager".to_string(),
+            Self::UiDeveloper => "ui-developer".to_string(),
+            Self::WebDeveloper => "web-developer".to_string(),
+            Self::MobileDeveloper => "mobile-developer".to_string(),
+            Self::SystemDeveloper => "system-developer".to_string(),
+            Self::DataEngineer => "data-engineer".to_string(),
+            Self::Tester => "tester".to_string(),
+            Self::Strategist => "strategist".to_string(),
+            Self::Journalist => "journalist".to_string(),
             Self::Custom(s) => format!("custom:{s}"),
         }
     }
@@ -177,12 +214,13 @@ pub struct RegisterAgentArgs {
 
 /// Derive `reports_to` deterministically from registry state (spec §2.3):
 /// - `Lead` or `LabManager` -> `"Owner"`
-/// - `Assistant` or `Custom(_)` -> `display_name` of the active `Lead` for
-///   `agent.project` (or `"Owner"` if none).
+/// - every other role (the built-in `Assistant`, developer, tester, strategist
+///   and journalist roles, and `Custom(_)`) -> `display_name` of the active
+///   `Lead` for `agent.project` (or `"Owner"` if none).
 pub fn reports_to(agent: &AgentRecord, all_agents: &[AgentRecord]) -> String {
     match agent.role {
         AgentRole::Lead | AgentRole::LabManager => "Owner".to_string(),
-        AgentRole::Assistant | AgentRole::Custom(_) => all_agents
+        _ => all_agents
             .iter()
             .find(|a| {
                 a.status == AgentStatus::Active
@@ -278,53 +316,133 @@ mod tests {
 
     #[test]
     fn agent_role_flat_wire_round_trips() {
-        for (raw, expected) in [
-            ("lead", "lead"),
-            ("assistant", "assistant"),
-            ("lab_manager", "lab_manager"),
-            ("custom:Scribe", "custom:scribe"),
-        ] {
-            let role = AgentRole::from_wire(raw).unwrap();
-            assert_eq!(role.as_wire(), expected);
-            let json = serde_json::to_string(&role).unwrap();
-            assert_eq!(json, format!("\"{expected}\""));
+        let canonical = [
+            (AgentRole::Lead, "lead"),
+            (AgentRole::Assistant, "assistant"),
+            (AgentRole::LabManager, "lab_manager"),
+            (AgentRole::UiDeveloper, "ui-developer"),
+            (AgentRole::WebDeveloper, "web-developer"),
+            (AgentRole::MobileDeveloper, "mobile-developer"),
+            (AgentRole::SystemDeveloper, "system-developer"),
+            (AgentRole::DataEngineer, "data-engineer"),
+            (AgentRole::Tester, "tester"),
+            (AgentRole::Strategist, "strategist"),
+            (AgentRole::Journalist, "journalist"),
+            (AgentRole::Custom("reviewer".into()), "custom:reviewer"),
+            (AgentRole::Custom("auditor".into()), "custom:auditor"),
+        ];
+        for (role, wire) in &canonical {
+            assert_eq!(&role.as_wire(), wire);
+            assert_eq!(&AgentRole::from_wire(wire).unwrap(), role);
+            assert_eq!(&role.to_string(), wire);
+            let json = serde_json::to_string(role).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
             let back: AgentRole = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, role);
+            assert_eq!(&back, role);
         }
-        assert!(AgentRole::from_wire("scribe").is_err());
+        let aliases = [
+            ("lab-manager", AgentRole::LabManager),
+            ("  LEAD ", AgentRole::Lead),
+            ("ui_developer", AgentRole::UiDeveloper),
+            ("custom:ui-developer", AgentRole::UiDeveloper),
+            ("custom:ui_developer", AgentRole::UiDeveloper),
+            ("web_developer", AgentRole::WebDeveloper),
+            ("custom:web-developer", AgentRole::WebDeveloper),
+            ("custom:web_developer", AgentRole::WebDeveloper),
+            ("mobile_developer", AgentRole::MobileDeveloper),
+            ("custom:mobile-developer", AgentRole::MobileDeveloper),
+            ("custom:mobile_developer", AgentRole::MobileDeveloper),
+            ("system_developer", AgentRole::SystemDeveloper),
+            ("custom:system-developer", AgentRole::SystemDeveloper),
+            ("custom:system_developer", AgentRole::SystemDeveloper),
+            ("data_engineer", AgentRole::DataEngineer),
+            ("custom:data-engineer", AgentRole::DataEngineer),
+            ("custom:data_engineer", AgentRole::DataEngineer),
+            ("Custom:Tester", AgentRole::Tester),
+            ("custom:strategist", AgentRole::Strategist),
+            ("scribe", AgentRole::Journalist),
+            ("Scribe", AgentRole::Journalist),
+            ("custom:scribe", AgentRole::Journalist),
+            ("custom:journalist", AgentRole::Journalist),
+            ("custom:Reviewer", AgentRole::Custom("reviewer".into())),
+        ];
+        for (raw, expected) in aliases {
+            assert_eq!(AgentRole::from_wire(raw).unwrap(), expected, "{raw}");
+        }
         assert!(AgentRole::from_wire("leed").is_err());
+        assert!(AgentRole::from_wire("reviewer").is_err());
         assert!(AgentRole::from_wire("custom:123").is_err());
+        assert!(AgentRole::from_wire("custom:").is_err());
         assert!(AgentRole::from_wire("").is_err());
     }
 
     #[test]
-    fn reports_to_derives_owner_for_leads_and_active_lead_for_assistants() {
-        let lead = AgentRecord {
-            id: AgentId(seq_iri(1)),
-            name_key: "kayla".into(),
-            display_name: "Kayla".into(),
-            email: "kayla@artificialhumanity.io".into(),
-            project: "kaggle-gemma4".into(),
-            role: AgentRole::Lead,
+    fn stored_legacy_role_records_deserialize_to_the_new_canonical_form() {
+        for (old, new) in [
+            ("custom:scribe", "journalist"),
+            ("scribe", "journalist"),
+            ("custom:ui-developer", "ui-developer"),
+            ("custom:data_engineer", "data-engineer"),
+            ("custom:tester", "tester"),
+            ("custom:reviewer", "custom:reviewer"),
+        ] {
+            let role: AgentRole = serde_json::from_str(&format!("\"{old}\"")).unwrap();
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{new}\""));
+        }
+        // A whole stored record with the pre-change role spelling.
+        let current = agent(1, "Uma", AgentRole::UiDeveloper, "p");
+        let stored = serde_json::to_string(&current).unwrap().replace(
+            "\"role\":\"ui-developer\"",
+            "\"role\":\"custom:ui-developer\"",
+        );
+        assert!(
+            stored.contains("\"role\":\"custom:ui-developer\""),
+            "{stored}"
+        );
+        let rec: AgentRecord = serde_json::from_str(&stored).unwrap();
+        assert_eq!(rec.role, AgentRole::UiDeveloper);
+        let out = serde_json::to_string(&rec).unwrap();
+        assert!(out.contains("\"role\":\"ui-developer\""), "{out}");
+    }
+
+    fn agent(n: u64, name: &str, role: AgentRole, project: &str) -> AgentRecord {
+        AgentRecord {
+            id: AgentId(seq_iri(n)),
+            name_key: name.to_ascii_lowercase(),
+            display_name: name.into(),
+            email: format!("{}@artificialhumanity.io", name.to_ascii_lowercase()),
+            project: project.into(),
+            role,
             extra_areas: vec![],
             status: AgentStatus::Active,
-            updated_at: At::from_unix_millis(1),
+            updated_at: At::from_unix_millis(n),
             by: "owner".into(),
-        };
-        let scribe = AgentRecord {
-            id: AgentId(seq_iri(2)),
-            name_key: "kacey".into(),
-            display_name: "Kacey".into(),
-            email: "kacey@artificialhumanity.io".into(),
-            project: "kaggle-gemma4".into(),
-            role: AgentRole::Custom("scribe".into()),
-            extra_areas: vec![],
-            status: AgentStatus::Active,
-            updated_at: At::from_unix_millis(2),
-            by: "owner".into(),
-        };
-        let all = vec![lead.clone(), scribe.clone()];
+        }
+    }
+
+    #[test]
+    fn reports_to_derives_owner_for_leads_and_active_lead_for_everyone_else() {
+        let lead = agent(1, "Kayla", AgentRole::Lead, "kaggle-gemma4");
+        let manager = agent(2, "Mgr", AgentRole::LabManager, "kaggle-gemma4");
+        let others = [
+            agent(3, "Kacey", AgentRole::Journalist, "kaggle-gemma4"),
+            agent(4, "Uma", AgentRole::UiDeveloper, "kaggle-gemma4"),
+            agent(5, "Asa", AgentRole::Assistant, "kaggle-gemma4"),
+            agent(
+                6,
+                "Rex",
+                AgentRole::Custom("reviewer".into()),
+                "kaggle-gemma4",
+            ),
+        ];
+        let elsewhere = agent(7, "Tess", AgentRole::Tester, "other");
+        let mut all = vec![lead.clone(), manager.clone(), elsewhere.clone()];
+        all.extend(others.iter().cloned());
         assert_eq!(reports_to(&lead, &all), "Owner");
-        assert_eq!(reports_to(&scribe, &all), "Kayla");
+        assert_eq!(reports_to(&manager, &all), "Owner");
+        for a in &others {
+            assert_eq!(reports_to(a, &all), "Kayla", "{}", a.role);
+        }
+        assert_eq!(reports_to(&elsewhere, &all), "Owner");
     }
 }

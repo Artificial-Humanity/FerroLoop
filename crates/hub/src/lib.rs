@@ -3936,10 +3936,10 @@ mod tests {
                 .unwrap();
             store
                 .register_agent(RegisterAgentArgs {
-                    display_name: "Scribe".into(),
+                    display_name: "Journalist".into(),
                     email: None,
                     project: "ferroloop".into(),
-                    role: AgentRole::Custom("scribe".into()),
+                    role: AgentRole::Journalist,
                     extra_areas: vec![],
                     create_area: false,
                     replace: true,
@@ -3949,15 +3949,23 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            api::reforge_role_label(&AgentRole::Custom("scribe".into())),
-            "scribe"
+            api::reforge_role_label(&AgentRole::Journalist),
+            "journalist"
+        );
+        assert_eq!(
+            api::reforge_role_label(&AgentRole::UiDeveloper),
+            "ui-developer"
+        );
+        assert_eq!(
+            api::reforge_role_label(&AgentRole::Custom("reviewer".into())),
+            "reviewer"
         );
         let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
         assert!(expected.contains("AGENT_PERSONA=felicia agent-msg register Felicia --project ferroloop --role assistant --replace"));
         assert!(expected.contains("Co-authored-by: Felicia <felicia@artificialhumanity.io>"));
         assert!(
-            api::canonical_reforge_prompt("Scribe", "ferroloop", "scribe")
-                .contains(".agents/roles/scribe.md")
+            api::canonical_reforge_prompt("Journalist", "ferroloop", "journalist")
+                .contains(".agents/roles/journalist.md")
         );
 
         state.enqueue_session_prompt(

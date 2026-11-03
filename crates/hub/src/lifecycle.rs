@@ -1168,18 +1168,16 @@ fn capitalize(persona: &str) -> String {
     }
 }
 
-/// `AgentRole` for a spin-up role string; every role but `lead`, `assistant` and `lab-manager`
-/// is a custom role (a label only: it carries no authority).
+/// `AgentRole` for a spin-up role string. Every label in [`SPIN_UP_ROLES`] is a built-in variant;
+/// a label outside the list (a stored record from an older build) falls back to a custom slug, or
+/// to `assistant` when it is not a slug.
 fn agent_role_from_label(label: &str) -> AgentRole {
-    match label.trim().to_ascii_lowercase().as_str() {
-        "lead" => AgentRole::Lead,
-        "assistant" => AgentRole::Assistant,
-        "lab-manager" | "lab_manager" => AgentRole::LabManager,
-        other => match other.strip_prefix("custom:").unwrap_or(other) {
+    AgentRole::from_wire(label).unwrap_or_else(|_| {
+        match label.trim().to_ascii_lowercase().as_str() {
             slug if validate_slug(slug).is_ok() => AgentRole::Custom(slug.to_string()),
             _ => AgentRole::Assistant,
-        },
-    }
+        }
+    })
 }
 
 /// Inverse of [`agent_role_from_label`], in the spin-up spelling.
@@ -3484,36 +3482,46 @@ mod tests {
         }
         assert_eq!(
             agent_role_from_label("ui-developer"),
-            AgentRole::Custom("ui-developer".into())
+            AgentRole::UiDeveloper
         );
+        assert_eq!(agent_role_from_label("strategist"), AgentRole::Strategist);
+        assert_eq!(agent_role_from_label("scribe"), AgentRole::Journalist);
         assert_eq!(
-            agent_role_from_label("strategist"),
-            AgentRole::Custom("strategist".into())
+            agent_role_from_label("reviewer"),
+            AgentRole::Custom("reviewer".into())
         );
         assert!(prompt_for("Faye", "FerroLoop", "strategist").contains("as the strategist."));
         assert_eq!(agent_role_from_label("lab-manager"), AgentRole::LabManager);
     }
 
     #[test]
-    fn new_roles_are_custom_labels_that_round_trip_the_registry_wire_form() {
-        for label in [
-            "web-developer",
-            "mobile-developer",
-            "system-developer",
-            "data-engineer",
-            "tester",
-            "journalist",
-        ] {
+    fn every_spin_up_label_is_a_first_class_role_that_round_trips_the_registry_wire_form() {
+        let expected = [
+            ("lead", AgentRole::Lead),
+            ("assistant", AgentRole::Assistant),
+            ("ui-developer", AgentRole::UiDeveloper),
+            ("web-developer", AgentRole::WebDeveloper),
+            ("mobile-developer", AgentRole::MobileDeveloper),
+            ("system-developer", AgentRole::SystemDeveloper),
+            ("data-engineer", AgentRole::DataEngineer),
+            ("tester", AgentRole::Tester),
+            ("strategist", AgentRole::Strategist),
+            ("journalist", AgentRole::Journalist),
+            ("lab-manager", AgentRole::LabManager),
+        ];
+        assert_eq!(expected.len(), SPIN_UP_ROLES.len());
+        for (label, want) in expected {
             assert!(SPIN_UP_ROLES.contains(&label), "{label}");
             let role = agent_role_from_label(label);
-            assert_eq!(role, AgentRole::Custom(label.into()), "{label}");
+            assert_eq!(role, want, "{label}");
+            assert!(!matches!(role, AgentRole::Custom(_)), "{label}");
             assert_eq!(role_label_of(&role), label);
-            // The `custom:` spelling the registry stores maps back to the same role.
-            assert_eq!(agent_role_from_label(&role.as_wire()), role, "{label}");
             assert_eq!(AgentRole::from_wire(&role.as_wire()).unwrap(), role);
-            assert_ne!(role, AgentRole::Lead);
-            assert_ne!(role, AgentRole::LabManager);
-            assert!(prompt_for("Faye", "FerroLoop", label).contains(&format!("as the {label}.")));
+            assert!(!role.as_wire().starts_with("custom:"), "{label}");
+            assert!(
+                prompt_for("Faye", "FerroLoop", label)
+                    .contains(&format!("as the {}.", reforge_role_label(&role)))
+            );
         }
     }
 
@@ -3595,7 +3603,7 @@ mod tests {
 
         let agent = store.agent_by_name("felicity").unwrap().unwrap();
         assert_eq!(agent.status, AgentStatus::Active);
-        assert_eq!(agent.role, AgentRole::Custom("ui-developer".into()));
+        assert_eq!(agent.role, AgentRole::UiDeveloper);
         assert!(store.get_area("ferroloop").unwrap().is_some());
 
         let again = spin_up(
@@ -3630,13 +3638,8 @@ mod tests {
             let agent = store.agent_by_name(&persona).unwrap().unwrap();
             assert_eq!(agent.status, AgentStatus::Active);
             assert_eq!(agent.role, agent_role_from_label(role), "{role}");
-            let expected = match *role {
-                "lead" => AgentRole::Lead,
-                "assistant" => AgentRole::Assistant,
-                "lab-manager" => AgentRole::LabManager,
-                other => AgentRole::Custom(other.into()),
-            };
-            assert_eq!(agent.role, expected, "{role}");
+            assert_eq!(agent.role, AgentRole::from_wire(role).unwrap(), "{role}");
+            assert!(!matches!(agent.role, AgentRole::Custom(_)), "{role}");
         }
         // The new labels did not displace the one Lead.
         let leads = store

@@ -5879,6 +5879,14 @@ pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
         AgentRole::Lead => "lead".to_string(),
         AgentRole::Assistant => "assistant".to_string(),
         AgentRole::LabManager => "lab_manager".to_string(),
+        AgentRole::UiDeveloper => "ui-developer".to_string(),
+        AgentRole::WebDeveloper => "web-developer".to_string(),
+        AgentRole::MobileDeveloper => "mobile-developer".to_string(),
+        AgentRole::SystemDeveloper => "system-developer".to_string(),
+        AgentRole::DataEngineer => "data-engineer".to_string(),
+        AgentRole::Tester => "tester".to_string(),
+        AgentRole::Strategist => "strategist".to_string(),
+        AgentRole::Journalist => "journalist".to_string(),
         AgentRole::Custom(slug) => slug.clone(),
     }
 }
