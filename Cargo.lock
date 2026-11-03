@@ -444,6 +444,7 @@ version = "0.1.0"
 dependencies = [
  "fl-core",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
