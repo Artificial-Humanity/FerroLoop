@@ -61,7 +61,6 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
             home.join(".local/bin/muse").to_string_lossy().into_owned(),
             "--model".into(),
             MUSE_DEFAULT_MODEL.into(),
-            "--".into(),
             prompt.to_string(),
         ],
     }
@@ -167,7 +166,7 @@ fn a_muse_model_that_is_not_a_plain_id_falls_back_to_the_default() {
 }
 
 #[test]
-fn the_launch_argv_puts_the_model_before_the_separator_and_the_prompt_last() {
+fn the_launch_argv_puts_the_model_first_and_the_prompt_last() {
     let _bin = MuseBinEnv::cleared();
     let home = TempDir::new().unwrap();
     install_home_muse(home.path());
@@ -201,7 +200,6 @@ fn the_launch_argv_puts_the_model_before_the_separator_and_the_prompt_last() {
                 bin.clone(),
                 "--model".to_string(),
                 want.to_string(),
-                "--".to_string(),
                 out.prompt.unwrap(),
             ],
             "{requested:?}"
@@ -231,7 +229,7 @@ fn a_restart_launches_with_the_recorded_model_normalised() {
     restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
     let launches = second.launches.borrow();
     let argv = &launches[0].1.as_ref().expect("restart launches").argv;
-    assert_eq!(&argv[1..4], ["--model", "muse-wonder-1.0", "--"]);
+    assert_eq!(&argv[1..3], ["--model", "muse-wonder-1.0"]);
 }
 
 // ------------------------------------------------------------------- what is launched
@@ -535,6 +533,39 @@ fn tmux_new_session_runs_the_launch_as_an_argument_vector() {
             "Take the name of Ada; $(rm -rf /) 'x'",
         ]
     );
+}
+
+#[test]
+fn the_muse_argv_after_the_tmux_separator_has_no_further_separator() {
+    // Muse's CLI rejects a bare `--`; only tmux's own `--` (before the command) is right.
+    let _bin = MuseBinEnv::cleared();
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+    let fake = FakeRuntime::default();
+    spin(&store, &fake.env(home.path()), "ada", "muse");
+    let launches = fake.launches.borrow();
+    let launch = launches[0].1.as_ref().unwrap();
+    let args = tmux_new_session_args("Ada", "muse", None, Some(launch));
+    let tmux_sep = args.iter().position(|a| a == "--").expect("tmux separator");
+    assert_eq!(args.iter().filter(|a| *a == "--").count(), 1, "{args:?}");
+    assert_eq!(&args[tmux_sep + 1..], launch.argv.as_slice());
+    assert!(!launch.argv.iter().any(|a| a == "--"), "{:?}", launch.argv);
+}
+
+#[test]
+fn a_muse_prompt_that_starts_with_a_dash_is_guarded_against_flag_parsing() {
+    for prompt in ["-h", "--version", "- a list item", "---"] {
+        let arg = muse_prompt_argument(prompt);
+        assert!(!arg.starts_with('-'), "{prompt:?} -> {arg:?}");
+        assert!(arg.ends_with(prompt), "{prompt:?} -> {arg:?}");
+    }
+    // Any other prompt is passed unchanged.
+    assert_eq!(
+        muse_prompt_argument("Take up residence"),
+        "Take up residence"
+    );
+    assert_eq!(muse_prompt_argument(""), "");
 }
 
 #[test]

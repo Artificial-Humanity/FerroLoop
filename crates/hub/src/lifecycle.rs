@@ -379,9 +379,10 @@ pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
 
 /// The vendor CLI to start in a new runtime window, with `prompt` as its first input; `None`
 /// where the window stays a blank shell. Only Muse is launched so far. For Muse the argument
-/// vector is `<bin> --model <id> -- <prompt>`: `--model` is the CLI's flag (`muse --help`:
-/// `--model <MODEL>  Model id for non-echo providers`), and `--` keeps the prompt from ever
-/// being read as a flag.
+/// vector is `<bin> --model <id> <prompt>`: `--model` is the CLI's flag (`muse --help`:
+/// `--model <MODEL>  Model id for non-echo providers`). There is no `--` before the prompt:
+/// Muse's CLI rejects a bare `--` ("unknown option `--`"). So [`muse_prompt_argument`] makes
+/// sure the prompt can never start with `-` and be read as a flag.
 fn launch_spec_for(
     env: &LifecycleEnv<'_>,
     vendor: &str,
@@ -401,10 +402,20 @@ fn launch_spec_for(
             ),
             "--model".to_string(),
             normalize_muse_model(model),
-            "--".to_string(),
-            prompt.to_string(),
+            muse_prompt_argument(prompt),
         ],
     })
+}
+
+/// The prompt as Muse's positional argument. Muse's CLI rejects a bare `--`, so nothing can
+/// mark the end of the options: a prompt starting with `-` is given a neutral leading word so
+/// it cannot be read as a flag. Any other prompt is passed unchanged.
+fn muse_prompt_argument(prompt: &str) -> String {
+    if prompt.starts_with('-') {
+        format!("Prompt: {prompt}")
+    } else {
+        prompt.to_string()
+    }
 }
 
 /// The Muse binary: `configured` (`FL_WIRE_MUSE_BIN`, the one the dispatcher honours) when set,
