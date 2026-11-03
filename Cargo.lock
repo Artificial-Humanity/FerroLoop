@@ -357,6 +357,7 @@ dependencies = [
  "fl-gate",
  "fl-github",
  "fl-hub",
+ "fl-install",
  "fl-mcp",
  "fl-store",
  "fl-watch",
@@ -379,7 +380,6 @@ name = "fl-core"
 version = "0.1.0"
 dependencies = [
  "globset",
- "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -449,6 +449,7 @@ dependencies = [
  "fl-exec",
  "fl-gate",
  "fl-github",
+ "fl-install",
  "fl-store",
  "fl-watch",
  "fl-wire",
@@ -466,6 +467,17 @@ dependencies = [
  "ureq",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "fl-install"
+version = "0.1.0"
+dependencies = [
+ "fl-core",
+ "libc",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

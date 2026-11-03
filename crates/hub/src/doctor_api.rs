@@ -17,8 +17,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fl_core::doctor::{Observe, StoreFact, StoreFacts, UiDir, observe};
+use fl_core::doctor::{StoreFact, StoreFacts};
 use fl_core::install::resolve_layout;
+use fl_install::{Observe, UiDir, observe};
 use serde_json::{Value, json};
 
 use crate::auth::HubAuthority;

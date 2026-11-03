@@ -6,9 +6,10 @@
 
 use clap::Args;
 use fl_core::install::{
-    FsProbe, HostInfo, InstallReceipt, InstallRequest, MAX_MANIFEST_BYTES, MAX_RECEIPT_BYTES,
-    ReleaseManifest, default_manifest, plan, read_bounded, resolve_layout,
+    HostInfo, InstallReceipt, InstallRequest, MAX_MANIFEST_BYTES, MAX_RECEIPT_BYTES,
+    ReleaseManifest, default_manifest, plan, resolve_layout,
 };
+use fl_install::{FsProbe, read_bounded};
 use std::path::{Path, PathBuf};
 
 /// Exit status of a refused plan, and of `fl install` without `--dry-run`.

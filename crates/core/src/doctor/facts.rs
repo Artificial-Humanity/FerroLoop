@@ -35,6 +35,9 @@ pub enum StoreOutcome {
     WouldMigrate { format: Option<u64> },
     /// Held by a writer; the wait was bounded.
     Locked,
+    /// A `.redb` that was not closed cleanly (a crash, a copy taken under a live writer): a
+    /// normal open would recover it, a read-only open cannot. Valid, not corrupt.
+    NeedsRecovery,
     /// A format or container this build does not read (a newer fl wrote it, or it is off the
     /// supported ladder).
     Unsupported { reason: String },
@@ -108,6 +111,6 @@ pub struct UiFacts {
     /// Where the bundle is, as displayed; `None`: no bundle is configured.
     pub dir: Option<String>,
     pub dir_exists: bool,
-    /// The validated `build-info.json` (see `ui_bundle::read_ui_build_info`).
+    /// The validated `build-info.json` (see `fl_install::read_ui_build_info`).
     pub info: Option<Map<String, Value>>,
 }

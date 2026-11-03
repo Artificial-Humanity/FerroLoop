@@ -29,9 +29,17 @@ fn exists(path: &Path) -> Result<bool, String> {
     }
 }
 
-/// Whether `path` (a store file, a symlink to one counted) is a regular file.
+/// Whether `path` (a store file; a symlink to one counts) is a regular file, judged on a
+/// descriptor opened `O_NONBLOCK`, so a FIFO put there cannot block the open and the answer is
+/// about the file the later read opens, not a stale `lstat`.
 fn regular(path: &Path) -> Result<(), String> {
-    match std::fs::metadata(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| e.kind().to_string())?;
+    match f.metadata() {
         Ok(m) if m.is_file() => Ok(()),
         Ok(_) => Err("is not a regular file".into()),
         Err(e) => Err(e.kind().to_string()),
@@ -164,6 +172,11 @@ fn redb_outcome(path: &Path) -> StoreOutcome {
             },
         },
         Err(e) if is_redb_busy(&e) => StoreOutcome::Locked,
+        // redb refuses a read-only open of a database that was not closed cleanly: it is valid,
+        // and only a writable open can recover it. Not corruption.
+        Err(StoreError::Unreachable { cause, .. }) if cause.contains("repair aborted") => {
+            StoreOutcome::NeedsRecovery
+        }
         Err(e @ StoreError::FormatVersion { .. }) | Err(e @ StoreError::ContainerFormat { .. }) => {
             StoreOutcome::Unsupported {
                 reason: e.to_string(),

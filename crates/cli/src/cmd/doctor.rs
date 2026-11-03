@@ -11,8 +11,9 @@
 //! implemented in this release).
 
 use clap::Args;
-use fl_core::doctor::{Observe, StoreFact, StoreFacts, UiDir, observe};
+use fl_core::doctor::{StoreFact, StoreFacts};
 use fl_core::install::resolve_layout;
+use fl_install::{Observe, UiDir, observe};
 use fl_store::store_identity;
 use std::path::PathBuf;
 use std::time::Duration;

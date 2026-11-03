@@ -3,13 +3,14 @@
 //! hash of the files the receipt owns. Nothing is created, written, locked or executed, and
 //! the vault files are only `lstat`ed.
 
-use super::{
+use crate::fsprobe::{FsProbe, read_bounded};
+use crate::ui::read_ui_build_info;
+use fl_core::build_info::BuildInfo;
+use fl_core::doctor::{
     DoctorInputs, DoctorReport, NodeMeta, ReceiptSource, StoreFacts, UiFacts, VaultFacts,
     VaultNode, run,
 };
-use crate::build_info::BuildInfo;
-use crate::install::{FsProbe, Layout, MAX_RECEIPT_BYTES, read_bounded};
-use crate::ui_bundle::read_ui_build_info;
+use fl_core::install::{Layout, MAX_RECEIPT_BYTES};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

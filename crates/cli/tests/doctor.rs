@@ -120,6 +120,11 @@ impl World {
 
     /// A real install under the isolated root, and the receipt that owns it.
     fn install(&self) {
+        self.install_with_commit(None);
+    }
+
+    /// [`Self::install`], the receipt naming `commit`.
+    fn install_with_commit(&self, commit: Option<&str>) {
         let root = self.root.path();
         let rel = self.release_dir();
         std::fs::create_dir_all(rel.join("bin")).unwrap();
@@ -145,7 +150,7 @@ impl World {
                 version: env!("CARGO_PKG_VERSION").into(),
                 name: format!("{}+0123456789ab", env!("CARGO_PKG_VERSION")),
                 kind: ReleaseKind::SourceBuild,
-                commit: None,
+                commit: commit.map(str::to_string),
             },
             profile: Profile::Full,
             products: vec![Product::Ferroloop],
@@ -323,10 +328,10 @@ fn the_json_has_the_contract_ferrodeck_reads_and_is_deterministic() {
 #[test]
 fn a_healthy_install_reports_pass_where_it_can_prove_it() {
     let w = World::new();
-    w.install();
+    let (commit, clean) = this_build();
+    w.install_with_commit((commit != "unknown").then_some(commit.as_str()));
     w.store();
     w.vault(0o600, 0o600);
-    let (commit, clean) = this_build();
     w.ui(json!({"commit": commit, "dirty": false, "version": "0.1.0"}));
     let (code, v) = w.doctor(&[]);
     assert_eq!(code, 0, "{v}");

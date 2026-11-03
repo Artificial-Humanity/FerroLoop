@@ -46,6 +46,12 @@ pub(super) fn check(inputs: &DoctorInputs<'_>) -> DoctorCheck {
                     "{p}: held by a writer; doctor waited briefly and took no lock"
                 ));
             }
+            StoreOutcome::NeedsRecovery => {
+                warns += 1;
+                lines.push(format!(
+                    "{p}: a .redb that was not closed cleanly; it needs recovery by a normal open (doctor does not repair)"
+                ));
+            }
             StoreOutcome::Unsupported { reason } => {
                 fails += 1;
                 lines.push(format!("{p}: {reason}"));

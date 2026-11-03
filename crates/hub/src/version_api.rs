@@ -21,13 +21,14 @@ use serde_json::Value;
 
 use crate::{HttpResponse, HubState};
 
-// The reader and the agreement rule live in `fl_core::ui_bundle`, so the CLI's doctor reads
-// the bundle the same way.
+// The validation and the agreement rule live in `fl_core::ui_bundle`, the file reader in
+// `fl_install`, so the doctor reads the bundle the same way.
+pub(crate) use fl_core::ui_bundle::code_ui_agree;
 #[cfg(test)]
 pub(crate) use fl_core::ui_bundle::parse_ui_build_info;
 #[cfg(test)]
 pub(crate) use fl_core::ui_bundle::{MAX_UI_BUILD_INFO_BYTES, UI_BUILD_INFO_FILE};
-pub(crate) use fl_core::ui_bundle::{code_ui_agree, read_ui_build_info};
+pub(crate) use fl_install::read_ui_build_info;
 
 /// This hub's build stamp.
 pub fn build_info() -> BuildInfo {

@@ -1,53 +1,55 @@
 //! The real, read-only [`HostProbe`]: `lstat`, `readlink`, and a bounded read to hash a file.
 //! Shared by `fl install --dry-run` and `fl doctor`. Nothing here writes.
 
-use super::plan::{HostProbe, MAX_FINGERPRINT_BYTES, PathState, fingerprint};
-use super::{Layout, PlanError};
+use fl_core::install::{BUDGET_EXCEEDED, HostProbe, MAX_FINGERPRINT_BYTES, PathState, fingerprint};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Why a probe stopped reading: the caller's time budget ran out.
-pub const BUDGET_EXCEEDED: &str = "time budget exceeded";
-
-/// `--prefix`, then `$FL_INSTALL_ROOT`, then the per-user default.
-pub fn resolve_layout(
-    prefix: Option<&Path>,
-    root: Option<std::ffi::OsString>,
-) -> Result<Layout, PlanError> {
-    let utf8 = |p: &std::ffi::OsStr, what: &str| {
-        p.to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| PlanError::PrefixInvalid(format!("{what} is not valid UTF-8")))
-    };
-    if let Some(p) = prefix {
-        return Layout::explicit(&utf8(p.as_os_str(), "--prefix")?);
+/// Open `path` to read it, without blocking and without following a symlink. A FIFO swapped in
+/// since an earlier `lstat` would otherwise block the open, and a symlink would be followed.
+fn open_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     }
-    match root.filter(|r| !r.is_empty()) {
-        Some(r) => Layout::under_root(&utf8(&r, "$FL_INSTALL_ROOT")?),
-        None => Ok(Layout::user_default()),
-    }
+    opts.open(path)
 }
 
-/// Read at most `max` bytes of a regular file. Refuses a symlink, a directory
-/// and anything larger. `Ok(None)`: the file does not exist.
+/// Read at most `max` bytes of a regular file, from a descriptor opened `O_NONBLOCK|O_NOFOLLOW`
+/// and checked with `fstat`, so nothing between an `lstat` and the open can swap in a FIFO or a
+/// symlink. Refuses a symlink, a directory and anything larger. `Ok(None)`: the file does not
+/// exist.
 pub fn read_bounded(path: &Path, max: usize) -> Result<Option<String>, String> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
+    let f = match open_nofollow(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.kind().to_string()),
+        Err(e) => {
+            // O_NOFOLLOW on a symlink fails (ELOOP / EMLINK); say what it is.
+            return Err(match fs::symlink_metadata(path) {
+                Ok(m) if !m.file_type().is_file() => "is not a regular file".to_string(),
+                _ => e.kind().to_string(),
+            });
+        }
     };
-    if !meta.file_type().is_file() {
+    let meta = f.metadata().map_err(|e| e.kind().to_string())?;
+    if !meta.is_file() {
         return Err("is not a regular file".into());
     }
     if meta.len() > max as u64 {
         return Err(format!("is larger than {max} bytes"));
     }
     let mut buf = String::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(max as u64 + 1).read_to_string(&mut buf))
+    f.take(max as u64 + 1)
+        .read_to_string(&mut buf)
         .map_err(|e| e.kind().to_string())?;
+    if buf.len() > max {
+        return Err(format!("is larger than {max} bytes"));
+    }
     Ok(Some(buf))
 }
 
@@ -60,20 +62,10 @@ fn read_failure(e: &std::io::Error) -> String {
     }
 }
 
-/// Open `path` to read it, without blocking and without following a symlink,
-/// then check THAT descriptor is a regular file of bounded size. The `lstat`
-/// that chose to open it may be stale; a FIFO swapped in since would otherwise
-/// block the open, and a symlink swapped in would be followed. `Ok(None)`: not
-/// a regular file any more.
+/// [`open_nofollow`], then check THAT descriptor is a regular file of bounded size. The `lstat`
+/// that chose to open it may be stale. `Ok(None)`: not a regular file any more.
 pub fn open_regular(path: &Path) -> Result<Option<fs::File>, String> {
-    let mut opts = fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let f = opts.open(path).map_err(|e| e.kind().to_string())?;
+    let f = open_nofollow(path).map_err(|e| e.kind().to_string())?;
     let meta = f.metadata().map_err(|e| e.kind().to_string())?;
     if !meta.is_file() {
         return Ok(None);
@@ -240,23 +232,5 @@ mod tests {
                 reason: BUDGET_EXCEEDED.into()
             }
         );
-    }
-
-    #[test]
-    fn prefix_beats_the_isolated_root_beats_the_default() {
-        let l = resolve_layout(Some(Path::new("/work/p")), Some("/root1".into())).unwrap();
-        assert_eq!(l.prefix, "/work/p");
-        assert_eq!(l.bin_dir, "/work/p/bin");
-        let l = resolve_layout(None, Some("/work/r".into())).unwrap();
-        assert_eq!(l.prefix, "/work/r/.local/share/fl");
-        assert_eq!(l.bin_dir, "/work/r/.local/bin");
-        let l = resolve_layout(None, None).unwrap();
-        assert_eq!(l.prefix, "~/.local/share/fl");
-        assert_eq!(
-            resolve_layout(None, Some("".into())).unwrap().prefix,
-            "~/.local/share/fl"
-        );
-        assert!(resolve_layout(Some(Path::new("/usr")), None).is_err());
-        assert!(resolve_layout(None, Some("/".into())).is_err());
     }
 }

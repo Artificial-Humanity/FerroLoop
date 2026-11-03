@@ -31,11 +31,8 @@ pub(super) fn check(inputs: &DoctorInputs<'_>, receipt: &ReceiptView) -> DoctorC
 
     if let ReceiptView::Valid(r) = receipt {
         let installed = &r.release;
-        if let Some(rc) = &installed.commit
-            && b.commit_known()
-            && rc != &b.commit
-        {
-            warn(
+        match &installed.commit {
+            Some(rc) if b.commit_known() && rc != &b.commit => warn(
                 &mut status,
                 format!(
                     "the installed release {} was built from {}, but this binary is {}",
@@ -43,7 +40,12 @@ pub(super) fn check(inputs: &DoctorInputs<'_>, receipt: &ReceiptView) -> DoctorC
                     short(rc),
                     short(&b.commit)
                 ),
-            );
+            ),
+            None if b.commit_known() => warn(
+                &mut status,
+                "the receipt records no commit to compare".into(),
+            ),
+            _ => {}
         }
         if installed.version != b.version {
             warn(

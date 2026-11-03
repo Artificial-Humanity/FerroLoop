@@ -1,12 +1,8 @@
-//! The UI bundle's `build-info.json`: how to read it, and whether the UI was built from a
-//! binary's commit. One reader for the hub's `GET /api/v1/version`, the hub's and the CLI's
-//! doctor.
+//! The UI bundle's `build-info.json`: how to validate its text, and whether the UI was built
+//! from a binary's commit. Pure: reading the file is `fl_install::read_ui_build_info`. One rule
+//! for the hub's `GET /api/v1/version` and for the doctor.
 //!
-//! Nothing here reads outside `<ui_dir>/build-info.json`, follows a symlink for it, or echoes
-//! more of the file than the four validated fields.
-
-use std::io::Read;
-use std::path::Path;
+//! Nothing here echoes more of the file than the four validated fields.
 
 use serde_json::{Map, Value};
 
@@ -53,28 +49,6 @@ pub fn parse_ui_build_info(text: &str) -> Option<Map<String, Value>> {
         out.insert("dirty".into(), d.into());
     }
     Some(out)
-}
-
-/// Read `<ui_dir>/build-info.json`: `None` for anything but a small, regular, valid file.
-pub fn read_ui_build_info(ui_dir: &Path) -> Option<Map<String, Value>> {
-    let path = ui_dir.join(UI_BUILD_INFO_FILE);
-    // `symlink_metadata`: a symlink is not followed, so the bundle cannot point the reader at
-    // another file.
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_UI_BUILD_INFO_BYTES {
-        return None;
-    }
-    let mut text = String::new();
-    // The length can change between the check and the read: bound the read itself.
-    std::fs::File::open(&path)
-        .ok()?
-        .take(MAX_UI_BUILD_INFO_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    if text.len() as u64 > MAX_UI_BUILD_INFO_BYTES {
-        return None;
-    }
-    parse_ui_build_info(&text)
 }
 
 /// Whether the UI was built from `binary`'s commit; `None` when either is unknown. A UI

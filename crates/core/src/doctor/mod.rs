@@ -19,12 +19,12 @@
 //! is `not-installed`; a proof the inputs cannot make is `unsupported`; neither is ever
 //! `pass`. The report carries no timestamp, so equal inputs give equal bytes.
 //!
-//! [`observe`] gathers the inputs from the file system (reads only) and runs the engine; it is
-//! what the CLI and the hub call.
+//! This module does no I/O, reads no clock and uses no `unsafe`. The caller gathers the facts:
+//! `fl_install::observe` reads the file system (reads only) and calls [`run`]; it is what the
+//! CLI and the hub use.
 
 mod facts;
 mod identity;
-mod observe;
 mod paths;
 mod receipt;
 mod render;
@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
 pub use facts::{
     NodeMeta, ReceiptSource, StoreFact, StoreFacts, StoreOutcome, UiFacts, VaultFacts, VaultNode,
 };
-pub use observe::{Observe, UiDir, node_meta, observe};
 
 /// `schema_version` of the printed report.
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;

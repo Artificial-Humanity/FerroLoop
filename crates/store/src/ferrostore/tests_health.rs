@@ -280,3 +280,80 @@ fn a_symlink_that_is_not_to_a_regular_file_is_invalid() {
     std::os::unix::fs::symlink(tmp.path(), &link).unwrap();
     assert!(matches!(verify(&link, None), StoreOutcome::Invalid { .. }));
 }
+
+#[test]
+fn a_redb_not_closed_cleanly_needs_recovery_and_is_neither_repaired_nor_called_corrupt() {
+    let live = tempfile::tempdir().unwrap();
+    let live_path = live.path().join("fl.redb");
+    let writer = RedbStore::open(&live_path).unwrap();
+    // A file copied under a live writer is what a crash leaves: the clean-shutdown flag unset.
+    let dir = tempfile::tempdir().unwrap();
+    let dirty = dir.path().join("fl.redb");
+    std::fs::copy(&live_path, &dirty).unwrap();
+    drop(writer);
+
+    let bytes = std::fs::read(&dirty).unwrap();
+    let first = verify(&dirty, Some(BackendKind::Redb));
+    assert_eq!(first, StoreOutcome::NeedsRecovery);
+    // Deterministic, and nothing was repaired or left beside it.
+    for _ in 0..3 {
+        assert_eq!(verify(&dirty, Some(BackendKind::Redb)), first);
+    }
+    assert_eq!(
+        std::fs::read(&dirty).unwrap(),
+        bytes,
+        "doctor changed the file"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "a sidecar appeared"
+    );
+    // The logical path under the ferro selection (a lone .redb) reports the same.
+    assert_eq!(verify(&dirty, None), StoreOutcome::NeedsRecovery);
+    // It is valid, not corrupt: a normal open recovers it (and only then does it change).
+    assert!(RedbStore::open(&dirty).is_ok());
+    // Garbage stays a failure.
+    let garbage = dir.path().join("garbage.redb");
+    std::fs::write(&garbage, vec![0x5A; 9000]).unwrap();
+    assert!(matches!(
+        verify(&garbage, Some(BackendKind::Redb)),
+        StoreOutcome::Invalid { .. }
+    ));
+}
+
+#[test]
+fn a_fls_held_open_by_a_live_writer_is_verified_at_once_without_a_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("fl.fls");
+    let writer = FerroStore::open(&path).unwrap();
+    writer.put_doc("c", "a", &json!(1)).unwrap();
+    let t = Instant::now();
+    let outcome = verify(&path, None);
+    let took = t.elapsed();
+    assert!(
+        matches!(outcome, StoreOutcome::Verified { ref engine, .. } if engine == "fls"),
+        "{outcome:?}"
+    );
+    assert!(took < Duration::from_millis(500), "waited {took:?}");
+    // The writer is unharmed and still writes after the check.
+    writer.put_doc("c", "b", &json!(2)).unwrap();
+    assert_eq!(writer.get_doc("c", "b").unwrap(), Some(json!(2)));
+    assert!(matches!(verify(&path, None), StoreOutcome::Verified { .. }));
+}
+
+#[test]
+fn a_fifo_in_place_of_a_store_is_refused_without_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fifo = tmp.path().join("fl.fls");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let t = Instant::now();
+    assert!(matches!(verify(&fifo, None), StoreOutcome::Invalid { .. }));
+    assert!(t.elapsed() < Duration::from_secs(2));
+}

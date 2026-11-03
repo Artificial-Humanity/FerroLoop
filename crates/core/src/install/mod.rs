@@ -15,7 +15,6 @@
 
 mod arch_check;
 mod defaults;
-mod fsprobe;
 mod manifest;
 mod plan;
 #[cfg(test)]
@@ -24,17 +23,17 @@ mod receipt;
 
 pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
 pub use defaults::default_manifest;
-pub use fsprobe::{BUDGET_EXCEEDED, FsProbe, open_regular, read_bounded, resolve_layout};
 pub use manifest::{
     ActionKind, ActionSpec, Artifact, Compat, FileKind, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES,
     ManifestError, ProductEntry, ProductFile, ProfileEntry, ReleaseInfo, ReleaseKind,
     ReleaseManifest,
 };
 pub use plan::{
-    Approval, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan, InstallRequest,
-    Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled, Origin,
-    PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
+    Approval, BUDGET_EXCEEDED, ConflictKind, Disposition, FileFingerprint, HostProbe, InstallPlan,
+    InstallRequest, Layout, MAX_FINGERPRINT_BYTES, Management, MapProbe, ModuleRoute, NotInstalled,
+    Origin, PathRole, PathState, PlanConflict, PlanError, PlanRelease, PlanStatus, PlannedAction,
     PlannedArtifact, PlannedPath, PlannedPathKind, SelectedProduct, UNIT_MARKER, fingerprint, plan,
+    resolve_layout,
 };
 pub use receipt::{
     InstallReceipt, JournalEntry, JournalPhase, MAX_RECEIPT_BYTES, OwnedAlias, OwnedArtifact,
