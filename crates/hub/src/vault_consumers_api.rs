@@ -472,7 +472,7 @@ fn denied_for(tail: &AuditTail, secret: &str) -> Option<String> {
     tail.denied
         .iter()
         .rev()
-        .find(|d| d.secrets.iter().any(|s| *s == secret))
+        .find(|d| d.secrets.contains(&secret))
         .map(|d| d.outcome.clone())
 }
 
