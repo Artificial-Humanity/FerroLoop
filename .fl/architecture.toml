@@ -6,7 +6,7 @@ strict_coverage = true
 id = "fl_core"
 title = "Core Domain"
 kind = "crate"
-description = "Pure domain model, state, workflow, PR policy, FerroWire, and architecture conformance"
+description = "Pure domain model, state, workflow, PR policy, FerroWire, vendor child-environment allow-lists, and architecture conformance"
 package = "fl-core"
 paths = ["crates/core/**"]
 
