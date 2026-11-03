@@ -30,7 +30,8 @@ at `notes/` (a gitignored symlink to `Notes/FerroLoop`) and deliberately not pub
   duration, tokens and cost), and its records and findings unless the project keeps those in
   GitHub Issues. FerroState searches state entries (memories, handoffs and runtime state) with
   exact BM25, and the code index by name tiers and line matches; on the ferro engine both fuse in
-  an HNSW vector leg.
+  an HNSW vector leg of local hashing embeddings (no network). `fl state search --mode
+  auto|lexical|vector|hybrid` (and the `mode` argument of `fl_memory_search`) picks the legs.
 * **Capability truth lives in code, not prose:** Enums, adapter registries, and protocol
   schemas generate capability lists wherever possible. Avoid duplicating hard-coded provider or
   feature lists in documentation that easily rots.

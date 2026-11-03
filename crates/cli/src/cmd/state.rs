@@ -21,7 +21,7 @@ use fl_core::state::{
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
 use fl_store::{
-    AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankedCode, RankedHits,
+    AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankMode, RankedCode, RankedHits,
     SearchMode,
 };
 
@@ -87,6 +87,57 @@ pub fn ranked_result_json(query: &str, ranked: &RankedHits) -> serde_json::Value
         }
     }
     out
+}
+
+/// [`ranked_result_json`] for a search that named its [`RankMode`]. `Auto`
+/// keeps the shape above; any other mode adds `"mode": "<mode>"`, the legs
+/// that ran (an explicit `vector` or `hybrid` request never falls back to
+/// BM25, so the name is exact).
+pub fn ranked_result_json_for(
+    query: &str,
+    ranked: &RankedHits,
+    mode: RankMode,
+) -> serde_json::Value {
+    let mut out = ranked_result_json(query, ranked);
+    if mode != RankMode::Auto
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert("mode".into(), mode.as_str().into());
+    }
+    out
+}
+
+/// Parse a `--mode` / `mode` value for a state search.
+pub fn parse_rank_mode(raw: &str) -> Result<RankMode, String> {
+    RankMode::parse(raw)
+}
+
+/// Rank `entries` for `mode` with the deterministic local embedder, indexing
+/// up to the default sync budget first. `Vector` and `Hybrid` fail on a store
+/// without a vector index (redb) instead of answering with BM25.
+pub fn rank_for_mode(
+    store: &AnyStore,
+    mode: RankMode,
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> Result<RankedHits, String> {
+    fl_store::rank_state_entries_mode(
+        store,
+        fl_store::default_embedder(),
+        IndexPolicy::Sync {
+            budget: fl_store::DEFAULT_SYNC_BUDGET,
+        },
+        mode,
+        entries,
+        query,
+        scope,
+        concern,
+        limit,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// The stderr line that tells an operator why a search fell back to BM25, or
@@ -272,7 +323,11 @@ pub enum StateCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Search state entries with BM25 ranking.
+    /// Search state entries. `--mode` picks the legs: `auto` (default) is
+    /// BM25 fused with the vector index when the store has one, `lexical` is
+    /// BM25 only, `vector` is the local hashing-embedding index only, `hybrid`
+    /// is BM25 + vector fused by reciprocal rank (k=60). `vector` and `hybrid`
+    /// need the FerroStore engine and make no network call.
     Search {
         /// Search query text.
         query: String,
@@ -282,6 +337,9 @@ pub enum StateCmd {
         concern: Option<String>,
         #[arg(long)]
         limit: Option<usize>,
+        /// Ranking legs: auto, lexical, vector, or hybrid.
+        #[arg(long, default_value = "auto", value_parser = parse_rank_mode)]
+        mode: RankMode,
         #[arg(long)]
         json: bool,
     },
@@ -1156,6 +1214,7 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             scope,
             concern,
             limit,
+            mode,
             json,
         } => {
             let parsed_scope = scope
@@ -1170,20 +1229,21 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             let entries: Vec<StateEntry> = store
                 .list_state(parsed_scope.as_ref(), parsed_concern)
                 .map_err(|e| e.to_string())?;
-            let ranked = fl_store::rank_state_entries(
+            let ranked = rank_for_mode(
                 &store,
+                mode,
                 &entries,
                 &query,
                 parsed_scope.as_ref(),
                 parsed_concern,
                 effective_limit,
-            );
+            )?;
             let hits = &ranked.hits;
             if let Some(line) = index_unavailable_line(&ranked) {
                 eprintln!("{line}");
             }
             if json {
-                let out = ranked_result_json(&query, &ranked);
+                let out = ranked_result_json_for(&query, &ranked, mode);
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else if hits.is_empty() {
                 println!("no hits for `{query}`");
@@ -1996,6 +2056,30 @@ mod tests {
         let value = ranked_result_json("q", &fell_back);
         assert_eq!(value["note"], "why");
         assert!(value.get("mode").is_none());
+    }
+
+    #[test]
+    fn explicit_modes_name_the_mode_that_ran_and_auto_keeps_the_old_shape() {
+        let plain = RankedHits {
+            hits: Vec::new(),
+            total_hits: 0,
+            mode: SearchMode::Bm25,
+            note: None,
+            cause: None,
+        };
+        assert_eq!(
+            ranked_result_json_for("q", &plain, RankMode::Auto),
+            ranked_result_json("q", &plain)
+        );
+        for (mode, name) in [
+            (RankMode::Lexical, "lexical"),
+            (RankMode::Vector, "vector"),
+            (RankMode::Hybrid, "hybrid"),
+        ] {
+            assert_eq!(ranked_result_json_for("q", &plain, mode)["mode"], name);
+            assert_eq!(parse_rank_mode(name), Ok(mode));
+        }
+        assert!(parse_rank_mode("bm25").is_err());
     }
 
     #[test]

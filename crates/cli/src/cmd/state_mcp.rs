@@ -24,7 +24,7 @@ use fl_core::workflow::{
 use fl_exec::workflow::{
     list_workflow_facts, list_workflow_handoffs, record_step_handoff, write_workflow_fact,
 };
-use fl_store::{AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy};
+use fl_store::{AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankMode};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -32,8 +32,9 @@ use crate::cmd::agent::now_at;
 use crate::cmd::state::{
     DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, effective_code_limit,
     effective_search_limit, index_unavailable_line, parse_concern, parse_memory_basis,
-    parse_memory_category, parse_merge_mode, ranked_result_json, render_state_markdown,
-    resolve_state_in_store, search_and_record, search_and_record_in,
+    parse_memory_category, parse_merge_mode, parse_rank_mode, rank_for_mode,
+    ranked_result_json_for, render_state_markdown, resolve_state_in_store, search_and_record,
+    search_and_record_in,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -222,6 +223,14 @@ fn parse_search_limit(args: &Value) -> Result<usize, String> {
                 Err("argument `limit` must be a number".to_string())
             }
         }
+    }
+}
+
+/// The optional `mode` argument of `fl_memory_search`; absent means `auto`.
+fn parse_search_mode(args: &Value) -> Result<RankMode, String> {
+    match opt_str(args, "mode")? {
+        Some(raw) => parse_rank_mode(&raw),
+        None => Ok(RankMode::Auto),
     }
 }
 
@@ -436,7 +445,7 @@ fn memory_search_json(
     limit: usize,
 ) -> String {
     let ranked = fl_store::rank_bm25(entries, query, scope, concern, limit);
-    serde_json::to_string_pretty(&ranked_result_json(query, &ranked)).unwrap()
+    serde_json::to_string_pretty(&crate::cmd::state::ranked_result_json(query, &ranked)).unwrap()
 }
 
 fn open_workflow_store(
@@ -752,22 +761,27 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
         }
         "fl_memory_search" => {
             let (query, parsed_scope, parsed_concern, limit) = parse_search_args(args)?;
+            let mode = parse_search_mode(args)?;
             let store = env.open_for_scope(parsed_scope.as_ref())?;
             let entries: Vec<StateEntry> = store
                 .list_state(parsed_scope.as_ref(), parsed_concern)
                 .map_err(|e| e.to_string())?;
-            let ranked = fl_store::rank_state_entries(
+            let ranked = rank_for_mode(
                 &store,
+                mode,
                 &entries,
                 &query,
                 parsed_scope.as_ref(),
                 parsed_concern,
                 limit,
-            );
+            )?;
             if let Some(line) = index_unavailable_line(&ranked) {
                 eprintln!("{line}");
             }
-            Ok(serde_json::to_string_pretty(&ranked_result_json(&query, &ranked)).unwrap())
+            Ok(
+                serde_json::to_string_pretty(&ranked_result_json_for(&query, &ranked, mode))
+                    .unwrap(),
+            )
         }
         "state_set_memory" => {
             let scope =
@@ -1448,7 +1462,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_memory_search",
-            "description": "Search state entries with BM25 ranking. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation.",
+            "description": "Search state entries. `mode` picks the ranking legs: auto (default; BM25 fused with the local vector index when the store has one), lexical (BM25 only), vector (local hashing-embedding index only), hybrid (BM25 + vector, reciprocal-rank fusion k=60). vector and hybrid need the FerroStore engine. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation; a non-auto mode adds `mode`.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -1456,7 +1470,8 @@ fn tool_definitions() -> Value {
                     "query": { "type": "string" },
                     "scope": { "type": "string" },
                     "concern": { "type": "string" },
-                    "limit": { "type": "number" }
+                    "limit": { "type": "number" },
+                    "mode": { "type": "string", "enum": ["auto", "lexical", "vector", "hybrid"] }
                 }
             }
         },

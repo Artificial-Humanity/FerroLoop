@@ -54,6 +54,14 @@
 //! FerroStore path never fails the search; it falls back to BM25 and sets a
 //! fixed [`RankedHits::note`].
 //!
+//! A caller picks the legs with [`RankMode`] ([`rank_state_entries_mode`]):
+//! `Auto` is the behaviour described above (hybrid on FerroStore, BM25 on
+//! redb, failing over to BM25 on error); `Lexical` is BM25 on either engine;
+//! `Vector` keeps the vector leg only; `Hybrid` is the fused ranking. `Vector`
+//! and `Hybrid` are explicit requests, so a redb store or a failing index is
+//! an error rather than a silent BM25 answer. No mode needs a network call:
+//! the embedder is the deterministic local [`HashingEmbedder`].
+//!
 //! Limits of the vector leg: it asks the index for the `max(200, entries)`
 //! nearest vectors of the whole collection, so a vector-only match can be
 //! missed in a store holding many more indexed entries than were passed, and
@@ -122,6 +130,47 @@ impl SearchMode {
     }
 }
 
+/// Which legs of the ranking a caller asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RankMode {
+    /// The engine's own best answer: hybrid on FerroStore, BM25 on redb, BM25
+    /// with a note when the index fails. This is what every surface did
+    /// before modes existed.
+    #[default]
+    Auto,
+    /// Field-weighted BM25 only, on either engine.
+    Lexical,
+    /// The vector leg only (FerroStore). Entries need a cosine of at least
+    /// [`MIN_VECTOR_COSINE`] to the query to count.
+    Vector,
+    /// BM25 fused with the vector leg (FerroStore).
+    Hybrid,
+}
+
+impl RankMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Lexical => "lexical",
+            Self::Vector => "vector",
+            Self::Hybrid => "hybrid",
+        }
+    }
+
+    /// Parse a wire value (`auto`, `lexical`, `vector`, `hybrid`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "lexical" => Ok(Self::Lexical),
+            "vector" => Ok(Self::Vector),
+            "hybrid" => Ok(Self::Hybrid),
+            other => Err(format!(
+                "unknown search mode `{other}`; expected one of: auto, lexical, vector, hybrid"
+            )),
+        }
+    }
+}
+
 /// Whether a search may write to the vector index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexPolicy {
@@ -186,7 +235,8 @@ fn bm25_ranked(all: Vec<StateSearchHit>, limit: usize) -> RankedHits {
     }
 }
 
-pub(crate) fn default_embedder() -> &'static HashingEmbedder {
+/// The deterministic local embedder every state search uses by default.
+pub fn default_embedder() -> &'static HashingEmbedder {
     static EMBEDDER: OnceLock<HashingEmbedder> = OnceLock::new();
     EMBEDDER.get_or_init(HashingEmbedder::default)
 }
@@ -254,6 +304,56 @@ pub fn rank_state_entries_with(
     .0
 }
 
+/// Rank `entries` for an explicit [`RankMode`]. `Auto` answers as
+/// [`rank_state_entries_with`] does and never fails. `Vector` and `Hybrid`
+/// need FerroStore and a working index: on redb, or on an index error, the
+/// error is returned instead of a BM25 answer. The scope and concern filters
+/// apply in every mode.
+#[allow(clippy::too_many_arguments)]
+pub fn rank_state_entries_mode(
+    store: &AnyStore,
+    embedder: &dyn Embedder,
+    policy: IndexPolicy,
+    mode: RankMode,
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> Result<RankedHits, StoreError> {
+    match mode {
+        RankMode::Auto => Ok(rank_state_entries_with(
+            store, embedder, policy, entries, query, scope, concern, limit,
+        )),
+        RankMode::Lexical => Ok(rank_bm25(entries, query, scope, concern, limit)),
+        RankMode::Vector | RankMode::Hybrid => {
+            let ferro = store.as_ferro().ok_or_else(|| {
+                crate::backend(format!(
+                    "{} search needs the FerroStore engine; this store is redb",
+                    mode.as_str()
+                ))
+            })?;
+            let vector_only = mode == RankMode::Vector;
+            let lexical = if vector_only {
+                Vec::new()
+            } else {
+                search_state_entries(entries, query, scope, concern, usize::MAX)
+            };
+            let mut stats = IndexStats::default();
+            let ranked = rank_knowledge(
+                ferro, embedder, policy, entries, query, scope, concern, limit, &lexical,
+                &mut stats,
+            )?;
+            Ok(ranked.unwrap_or_else(|| {
+                // Nothing to embed: the vector leg is empty.
+                let mut out = bm25_ranked(lexical, limit);
+                out.mode = SearchMode::Knowledge;
+                out
+            }))
+        }
+    }
+}
+
 /// The vector collection for an embedding space: another space or dimension
 /// never shares one.
 pub fn vector_collection_name(embedder: &dyn Embedder) -> String {
@@ -293,7 +393,8 @@ pub(crate) fn rank_with_stats(
 }
 
 /// `Ok(None)` when the query has nothing to embed and the BM25 answer is the
-/// right one.
+/// right one. An empty `lexical` slice makes this the vector leg alone: every
+/// near entry is then a vector-only hit and must clear [`MIN_VECTOR_COSINE`].
 #[allow(clippy::too_many_arguments)]
 fn rank_knowledge(
     ferro: &FerroStore,
@@ -1847,5 +1948,415 @@ mod tests {
             }
             assert!(b.total_hits >= a.total_hits, "`{q}`");
         }
+    }
+
+    // ---- explicit rank modes -------------------------------------------
+
+    /// A same-dimension embedder in another embedding space.
+    struct OtherSpace(HashingEmbedder);
+
+    impl Embedder for OtherSpace {
+        fn dim(&self) -> usize {
+            self.0.dim()
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            self.0.embed(text)
+        }
+        fn space_id(&self) -> String {
+            format!("other-{}", self.0.space_id())
+        }
+    }
+
+    /// The shared fixture plus an entry holding the exact term
+    /// `checkpointing`; `build-cache` holds only the near word `checkpoint`.
+    fn mode_fixture(store: &AnyStore) -> Vec<StateEntry> {
+        seed(store);
+        put(
+            store,
+            "exact-term",
+            "quarterly planning",
+            "checkpointing quarterly planning agenda",
+            2_000,
+        );
+        store.list_state(None, None).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ranked(
+        store: &AnyStore,
+        mode: RankMode,
+        policy: IndexPolicy,
+        entries: &[StateEntry],
+        query: &str,
+        scope: Option<&StateScope>,
+        concern: Option<StateConcern>,
+    ) -> Result<RankedHits, StoreError> {
+        rank_state_entries_mode(
+            store,
+            default_embedder(),
+            policy,
+            mode,
+            entries,
+            query,
+            scope,
+            concern,
+            10,
+        )
+    }
+
+    fn mode_run(
+        store: &AnyStore,
+        mode: RankMode,
+        entries: &[StateEntry],
+        query: &str,
+    ) -> Result<RankedHits, StoreError> {
+        ranked(store, mode, SYNC, entries, query, None, None)
+    }
+
+    #[test]
+    fn rank_mode_parses_every_wire_value_and_rejects_others() {
+        for (raw, mode) in [
+            ("auto", RankMode::Auto),
+            ("lexical", RankMode::Lexical),
+            ("vector", RankMode::Vector),
+            ("Hybrid", RankMode::Hybrid),
+        ] {
+            assert_eq!(RankMode::parse(raw).unwrap(), mode);
+            assert_eq!(RankMode::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert_eq!(RankMode::default(), RankMode::Auto);
+        let err = RankMode::parse("bm25").unwrap_err();
+        assert!(err.contains("auto, lexical, vector, hybrid"), "{err}");
+    }
+
+    #[test]
+    fn lexical_finds_the_exact_term_vector_finds_the_near_word_hybrid_finds_both() {
+        let d = TempDir::new().unwrap();
+        let ferro = open_ferro(&d);
+        let entries = mode_fixture(&ferro);
+        let q = "checkpointing";
+
+        let lex = mode_run(&ferro, RankMode::Lexical, &entries, q).unwrap();
+        assert_eq!(slugs(&lex), vec!["exact-term"], "lexical needs the term");
+        assert_eq!(lex.mode, SearchMode::Bm25);
+        assert!(!lex.hits[0].matched_terms.is_empty());
+
+        let vec = mode_run(&ferro, RankMode::Vector, &entries, q).unwrap();
+        assert!(
+            slugs(&vec).contains(&"build-cache"),
+            "vector finds the near word: {:?}",
+            slugs(&vec)
+        );
+        assert!(
+            vec.hits.iter().all(|h| h.matched_terms.is_empty()),
+            "a vector hit has no BM25 terms"
+        );
+
+        let hyb = mode_run(&ferro, RankMode::Hybrid, &entries, q).unwrap();
+        let hs = slugs(&hyb);
+        assert!(
+            hs.contains(&"exact-term") && hs.contains(&"build-cache"),
+            "{hs:?}"
+        );
+        assert_eq!(hs[0], "exact-term", "both legs rank the exact entry first");
+        assert_eq!(hyb.mode, SearchMode::Knowledge);
+        // Fused: the exact entry scores above the vector-only hit.
+        assert!(hyb.hits[0].score_millis > hyb.hits[1].score_millis);
+    }
+
+    #[test]
+    fn hybrid_fuses_with_reciprocal_rank_k_60() {
+        let d = TempDir::new().unwrap();
+        let ferro = open_ferro(&d);
+        let entries = mode_fixture(&ferro);
+        let q = "checkpointing";
+        let hyb = mode_run(&ferro, RankMode::Hybrid, &entries, q).unwrap();
+        let lex = mode_run(&ferro, RankMode::Lexical, &entries, q).unwrap();
+        let vec = mode_run(&ferro, RankMode::Vector, &entries, q).unwrap();
+        let rank_in = |r: &RankedHits, slug: &str| {
+            r.hits.iter().position(|h| h.entry.slug == slug).unwrap() + 1
+        };
+        let top = &hyb.hits[0];
+        let expect = 1.0 / (60.0 + rank_in(&lex, &top.entry.slug) as f64)
+            + 1.0 / (60.0 + rank_in(&vec, &top.entry.slug) as f64);
+        assert_eq!(
+            top.score_millis,
+            score_millis(expect * rank_weight(&top.entry))
+        );
+    }
+
+    #[test]
+    fn auto_is_exactly_the_pre_mode_behaviour_on_both_engines() {
+        let (_rd, redb, _fd, ferro) = pair();
+        let redb_entries = mode_fixture(&redb);
+        let ferro_entries = mode_fixture(&ferro);
+        for q in ["checkpointing", "build cache", "sandwiches", "chekpoint"] {
+            let old = rank_state_entries(&ferro, &ferro_entries, q, None, None, 10);
+            let new = mode_run(&ferro, RankMode::Auto, &ferro_entries, q).unwrap();
+            assert_eq!(old, new, "ferro `{q}`");
+            let old = rank_state_entries(&redb, &redb_entries, q, None, None, 10);
+            let new = mode_run(&redb, RankMode::Auto, &redb_entries, q).unwrap();
+            assert_eq!(old, new, "redb `{q}`");
+            assert_eq!(new.mode, SearchMode::Bm25);
+        }
+        // Auto is hybrid on ferro, so it equals the explicit hybrid ranking.
+        let auto = mode_run(&ferro, RankMode::Auto, &ferro_entries, "checkpointing").unwrap();
+        let hyb = mode_run(&ferro, RankMode::Hybrid, &ferro_entries, "checkpointing").unwrap();
+        assert_eq!(auto, hyb);
+    }
+
+    #[test]
+    fn vector_and_hybrid_are_refused_on_redb_but_lexical_works() {
+        let d = TempDir::new().unwrap();
+        let redb = open_redb(&d.path().join("k.redb")).unwrap();
+        let entries = mode_fixture(&redb);
+        for mode in [RankMode::Vector, RankMode::Hybrid] {
+            let err = mode_run(&redb, mode, &entries, "checkpointing").unwrap_err();
+            assert!(
+                err.to_string().contains("needs the FerroStore engine"),
+                "{mode:?}: {err}"
+            );
+        }
+        let lex = mode_run(&redb, RankMode::Lexical, &entries, "checkpointing").unwrap();
+        assert_eq!(slugs(&lex), vec!["exact-term"]);
+    }
+
+    #[test]
+    fn explicit_vector_and_hybrid_surface_an_index_error_instead_of_falling_back() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        let with_broken = |mode| {
+            rank_state_entries_mode(
+                &store,
+                &BrokenEmbedder,
+                SYNC,
+                mode,
+                &entries,
+                "checkpointing",
+                None,
+                None,
+                10,
+            )
+        };
+        for mode in [RankMode::Vector, RankMode::Hybrid] {
+            assert!(with_broken(mode).is_err(), "{mode:?} must not answer BM25");
+        }
+        // Auto still fails over, as it did before modes existed.
+        let auto = with_broken(RankMode::Auto).unwrap();
+        assert!(auto.note.is_some());
+    }
+
+    #[test]
+    fn scope_and_concern_filters_apply_in_every_mode() {
+        let d = TempDir::new().unwrap();
+        let ferro = open_ferro(&d);
+        put(&ferro, "ws-cache", "checkpoint workspace cache", "x", 1_000);
+        ferro
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Project("alpha".into()),
+                slug: "proj-cache".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "checkpoint project cache".into(),
+                    body: "x".into(),
+                }),
+                at: At::from_unix_millis(1_001),
+                by: "tester".into(),
+            })
+            .unwrap();
+        let entries = ferro.list_state(None, None).unwrap();
+        let scope = StateScope::Project("alpha".into());
+        let q = "checkpoint cache";
+        for mode in [
+            RankMode::Auto,
+            RankMode::Lexical,
+            RankMode::Vector,
+            RankMode::Hybrid,
+        ] {
+            let all = ranked(&ferro, mode, SYNC, &entries, q, None, None).unwrap();
+            assert_eq!(all.total_hits, 2, "{mode:?}: {:?}", slugs(&all));
+            let one = ranked(&ferro, mode, SYNC, &entries, q, Some(&scope), None).unwrap();
+            assert_eq!(slugs(&one), vec!["proj-cache"], "{mode:?} scope");
+            assert_eq!(one.total_hits, 1, "{mode:?} scope total");
+            let none = ranked(
+                &ferro,
+                mode,
+                SYNC,
+                &entries,
+                q,
+                Some(&scope),
+                Some(StateConcern::Runtime),
+            )
+            .unwrap();
+            assert!(none.hits.is_empty(), "{mode:?} concern: {:?}", slugs(&none));
+        }
+    }
+
+    #[test]
+    fn every_mode_is_deterministic_across_runs_and_stores() {
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        let (sa, sb) = (open_ferro(&a), open_ferro(&b));
+        let (ea, eb) = (mode_fixture(&sa), mode_fixture(&sb));
+        let scores = |r: &RankedHits| r.hits.iter().map(|h| h.score_millis).collect::<Vec<_>>();
+        for mode in [
+            RankMode::Auto,
+            RankMode::Lexical,
+            RankMode::Vector,
+            RankMode::Hybrid,
+        ] {
+            let one = mode_run(&sa, mode, &ea, "checkpointing").unwrap();
+            let again = mode_run(&sa, mode, &ea, "checkpointing").unwrap();
+            let other = mode_run(&sb, mode, &eb, "checkpointing").unwrap();
+            assert!(!one.hits.is_empty(), "{mode:?}");
+            assert_eq!(one, again, "{mode:?} repeat");
+            assert_eq!(slugs(&one), slugs(&other), "{mode:?} across stores");
+            assert_eq!(scores(&one), scores(&other), "{mode:?} scores");
+        }
+    }
+
+    #[test]
+    fn backfill_indexes_entries_written_before_any_vector_search() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        let ferro = store.as_ferro().unwrap();
+        let col = vector_collection_name(default_embedder());
+        let read_only = |entries: &[StateEntry]| {
+            ranked(
+                &store,
+                RankMode::Vector,
+                IndexPolicy::ReadOnly,
+                entries,
+                "checkpointing",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(!has_collection(ferro, &col), "no index before a search");
+
+        // A read-only vector search never writes: nothing to find.
+        assert!(read_only(&entries).hits.is_empty());
+        assert!(!has_collection(ferro, &col), "read-only must not index");
+
+        // The first syncing vector search backfills every entry.
+        let warm = mode_run(&store, RankMode::Vector, &entries, "checkpointing").unwrap();
+        assert!(slugs(&warm).contains(&"build-cache"), "{:?}", slugs(&warm));
+        assert!(has_collection(ferro, &col));
+        assert_eq!(slugs(&warm), slugs(&read_only(&entries)), "it persisted");
+    }
+
+    #[test]
+    fn create_update_and_supersede_are_reflected_in_the_vector_leg() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = mode_fixture(&store);
+        let q = "checkpointing";
+        let order = |entries: &[StateEntry]| -> Vec<String> {
+            let r = mode_run(&store, RankMode::Vector, entries, q).unwrap();
+            slugs(&r).iter().map(|s| s.to_string()).collect()
+        };
+        assert!(order(&entries).contains(&"build-cache".to_string()));
+
+        // Create: a new near entry joins the vector leg on the next search.
+        put(&store, "fresh", "checkpoint replay", "replaying one", 5_000);
+        let entries = store.list_state(None, None).unwrap();
+        assert!(order(&entries).contains(&"fresh".to_string()));
+
+        // Update: rewriting build-cache to unrelated text drops it.
+        put(
+            &store,
+            "build-cache",
+            "lunch sandwiches",
+            "offsite menu",
+            6_000,
+        );
+        let entries = store.list_state(None, None).unwrap();
+        assert!(!order(&entries).contains(&"build-cache".to_string()));
+
+        // Supersede: the old entry keeps its vector but is weighted below
+        // the active entry that replaces it.
+        let new = put(
+            &store,
+            "new-replay",
+            "checkpoint replay",
+            "replaying one",
+            7_001,
+        );
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "old-replay".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Superseded,
+                    superseded_by: Some(new.id.clone()),
+                    pinned: false,
+                    summary: "checkpoint replay".into(),
+                    body: "replaying one".into(),
+                }),
+                at: At::from_unix_millis(7_000),
+                by: "tester".into(),
+            })
+            .unwrap();
+        let entries = store.list_state(None, None).unwrap();
+        let got = order(&entries);
+        let pos = |s: &str| got.iter().position(|x| x == s).unwrap();
+        assert!(pos("new-replay") < pos("old-replay"), "{got:?}");
+    }
+
+    #[test]
+    fn a_different_embedding_space_gets_its_own_collection_and_is_reindexed() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let ferro = store.as_ferro().unwrap();
+        let entries = mode_fixture(&store);
+        let other = OtherSpace(HashingEmbedder::default());
+        let default_col = vector_collection_name(default_embedder());
+        let other_col = vector_collection_name(&other);
+        assert_ne!(default_col, other_col, "a space never shares a collection");
+
+        mode_run(&store, RankMode::Vector, &entries, "checkpointing").unwrap();
+        assert!(has_collection(ferro, &default_col));
+        assert!(!has_collection(ferro, &other_col));
+
+        let r = rank_state_entries_mode(
+            &store,
+            &other,
+            SYNC,
+            RankMode::Vector,
+            &entries,
+            "checkpointing",
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        assert!(slugs(&r).contains(&"build-cache"));
+        assert!(has_collection(ferro, &other_col), "indexed under its name");
+
+        // An index document of another space under the same collection name
+        // is not trusted: every entry is embedded again.
+        let refs: Vec<&StateEntry> = entries.iter().collect();
+        let space = stamp(&default_embedder().space_id());
+        IndexDoc {
+            revs: refs
+                .iter()
+                .map(|e| (e.id.as_str().to_string(), stamp(e.head_revision.as_str())))
+                .collect(),
+        }
+        .store(ferro, &default_col, space + 1)
+        .unwrap();
+        let stats = sync_index(ferro, default_embedder(), &default_col, &refs, 100).unwrap();
+        assert_eq!(stats.written, refs.len(), "a mismatch reindexes all");
     }
 }
