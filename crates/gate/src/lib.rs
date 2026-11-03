@@ -44,8 +44,8 @@ pub use registry::{connector_to_registry_entry, handle_registry_v01_get};
 pub use sign::SIGN_AUDIT_METHOD;
 pub use vault::{
     EncryptedSecretRecord, MASTER_KEY_LEN, NONCE_LEN, SetSecretArgs, VAULT_SCHEMA_VERSION, Vault,
-    VaultSecretMetadata, canonical_aad, load_or_init_master_key, normalize_secret_name,
-    resolve_master_key_path, resolve_vault_path,
+    VaultSecretMetadata, canonical_aad, load_existing_master_key, load_or_init_master_key,
+    normalize_secret_name, resolve_master_key_path, resolve_vault_path,
 };
 
 pub use vaultref::{VaultField, VaultRef, VaultRefError, parse_vault_ref};
@@ -117,6 +117,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn load_existing_master_key_reads_a_key_and_never_creates_one() {
+        if std::env::var_os("FL_VAULT_MASTER_KEY").is_some_and(|v| !v.is_empty()) {
+            eprintln!("SKIPPED: FL_VAULT_MASTER_KEY is set in this environment");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("vault.key");
+        let err = load_existing_master_key(&key_path).unwrap_err().to_string();
+        assert!(err.contains("no Vault master key"), "{err}");
+        assert!(!key_path.exists(), "a read must not create a key");
+        let made = load_or_init_master_key(&key_path).unwrap();
+        assert_eq!(load_existing_master_key(&key_path).unwrap(), made);
+    }
 
     #[test]
     fn vault_encrypts_with_aad_and_detects_policy_tampering() {

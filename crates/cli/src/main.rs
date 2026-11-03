@@ -2,6 +2,7 @@ mod cmd;
 mod comment;
 mod config;
 mod ctx;
+mod gate_signer;
 mod preflight;
 mod refs;
 #[cfg(test)]
@@ -285,6 +286,11 @@ fn api_override_host(url: &str) -> Result<String> {
     Ok(host.to_string())
 }
 
+/// Whether `$FL_GITHUB_PRIVATE_KEY_PATH` is set and not blank.
+pub(crate) fn env_key_path_set() -> bool {
+    std::env::var("FL_GITHUB_PRIVATE_KEY_PATH").is_ok_and(|v| !v.trim().is_empty())
+}
+
 fn open_github(
     b: &config::TrackerBinding,
     app: Option<&config::GithubApp>,
@@ -306,15 +312,22 @@ fn open_github(
             let Some(app) = app else {
                 bail!(
                     "`credential = \"app\"` needs a `[github]` section with `app_id` and \
-                     `private_key` in the config"
+                     `private_key` (or `private_key_ref`) in the config"
                 );
             };
-            Box::new(fl_github::AppCredentials::from_file(
+            // `$FL_GITHUB_PRIVATE_KEY_PATH` is not read here, but a `private_key_ref` beside it
+            // is ambiguous for the operator: refuse rather than pick.
+            config::refuse_env_key_path_with_ref(Some(app), env_key_path_set())?;
+            Box::new(fl_github::AppCredentials::with_signer(
                 &api,
                 app.app_id,
-                &app.private_key,
+                gate_signer::signer_for(
+                    app,
+                    &gate_signer::cli_caller(),
+                    &gate_signer::api_host(&api)?,
+                )?,
                 &b.github,
-            )?)
+            ))
         }
     };
     let (tracker, notice) =

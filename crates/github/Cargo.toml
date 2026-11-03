@@ -27,3 +27,4 @@ fake = ["dep:tiny_http", "dep:flate2"]
 fl-core = { path = "../core", features = ["conformance"] }
 tiny_http.workspace = true
 flate2 = "1.1"
+tempfile.workspace = true

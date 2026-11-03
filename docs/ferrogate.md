@@ -1,7 +1,8 @@
 # FerroGate: the audit log, vault references and the RS256 signer
 
 This page covers what `crates/gate` records when it refuses or allows a use of a Vault secret, the
-`vault://` reference syntax, and `Vault::sign_app_jwt`. It states the rules as they are; the last
+`vault://` reference syntax, `Vault::sign_app_jwt`, and `[github] private_key_ref`, the config key
+that makes fl sign its GitHub App JWT through the Vault. It states the rules as they are; the last
 section says where the protection ends.
 
 ## The audit log
@@ -115,6 +116,75 @@ the Vault again for each call. The ordinary decrypt
 paths (`decrypt_raw`, the proxy's substitution, scrubbing) still return plain `String`s; only the
 signer and `verify_secret_constant_time` use the zeroizing path.
 
+## `[github] private_key_ref`
+
+`[github]` names the App's private key in one of two ways:
+
+```toml
+[github]
+app_id = 123456
+private_key_ref = "vault://GITHUB_APP_KEY"   # or: private_key = "/abs/path/app.pem"
+```
+
+* Exactly one of `private_key` and `private_key_ref` is set. Both set is a config error that names
+  both keys; neither is a config error. `app_id` is required with either.
+* The reference is `vault://NAME` or `vault://NAME#pem` (the grammar above); anything else, and an
+  empty value, is a config error that names the key and the kind of mistake and echoes nothing of
+  the value.
+* The config load checks the shape only. It opens no Vault, reads no master key and creates
+  nothing. The Vault is used when a command first needs a JWT.
+* `$FL_GITHUB_PRIVATE_KEY_PATH` is unchanged: with `$FL_GITHUB_APP_ID` it replaces a `[github]`
+  that sets `private_key`. With a `private_key_ref` in `[github]` the variable is not a second
+  source but an ambiguity, and the command that builds the App credential (`fl github` on a
+  `credential = "app"` binding, `fl github pr` review and merge, `fl hub serve`) refuses with an
+  error that names both. Unset the variable or remove the ref.
+
+At use time each JWT is made by `BrokeredSigner` (`crates/cli/src/gate_signer.rs`), which opens the Vault again
+for every signing, read-only, and calls `Vault::sign_app_jwt(ref, app_id, caller, "api.github.com",
+now)`. fl holds no PEM: the JWT comes back, the key does not. The installation token that GitHub
+returns is a different credential and is cached for fifty minutes as before. A JWT is never kept.
+
+* The caller is `$AGENT_PERSONA` when it is set and not blank, else `fl`. The Hub signs as
+  `fl-hub`. A secret with a non-empty `allowed_agents` must list the caller (or `*`). The Hub
+  signs as `fl-hub` for every Hub-authorized request that reaches the merge and review endpoints,
+  so listing `fl-hub` in `allowed_agents` grants signing to all of them; and it is advisory
+  locally, because a local process can set `AGENT_PERSONA=fl-hub`.
+* The host is the host of the API URL the command sends the JWT to: `api.github.com` by default,
+  else the host of `$FL_GITHUB_API_URL` (or the Hub's API URL), lower-case, with no port. So a
+  GitHub Enterprise host must be in the secret's `allowed_hosts`, and `allowed_hosts` constrains
+  where fl sends the JWT: pointing `$FL_GITHUB_API_URL` at a host the secret does not list is
+  denied (`denied:host`) before the key is decrypted, and nothing is sent. A host the Vault cannot
+  read as a host name (a bracketed IPv6 address) is denied too. The check is made by fl's own
+  code, from the URL it then uses; a process that skips that code is not constrained.
+* There is no fallback. If the Vault file or its master key is missing, the secret does not
+  exist, or the policy denies the call, the command fails with a message that names the secret
+  and the reason (for example "the App private key `vault://GITHUB_APP_KEY` could not be used to
+  sign: FerroGate policy denied secret `GITHUB_APP_KEY`: the destination host is not in
+  allowed_hosts"). It does not read `private_key`, `$FL_GITHUB_PRIVATE_KEY_PATH` or any file. A
+  policy denial is audited as above; nothing is sent to GitHub.
+* A read never creates a Vault or a master key: the master key is loaded with
+  `load_existing_master_key`, which fails when there is none and cannot generate one.
+
+`fl-github` does not depend on `fl-gate`. It defines the `JwtSigner` trait; `FileKeySigner` (the
+PEM file, read again at every signing) is the `private_key` implementation, and `fl-cli` supplies
+the Vault one.
+
+### Moving to a Vault-held key
+
+1. Store the PEM as a secret open to GitHub and to the agents that run fl, for example
+   `fl vault set GITHUB_APP_KEY --stdin --host api.github.com --agent ferris --agent fl
+   < app.pem` (`--host` is the API host fl will send the JWT to; for GitHub Enterprise, that
+   host). List every caller that needs it: `fl` is the caller when `$AGENT_PERSONA` is
+   unset, `fl-hub` is the Hub.
+2. In `[github]` replace `private_key = "…"` with `private_key_ref = "vault://GITHUB_APP_KEY"`.
+3. Check it: `fl github whoami` prints `<slug>[bot]`, and `gate-audit.jsonl` has an `allowed`
+   `SIGN_RS256_JWT` entry for `GITHUB_APP_KEY`.
+4. Only then retire the PEM file, and rotate the App's key in GitHub if the old file may have
+   been copied. Rotating before the consumer has passed leaves nothing that signs.
+
+The drill that proves the plaintext path is denied (no process outside the Vault can read the
+key) is an Owner-window action. This change does not perform it, and nothing here claims it.
+
 ## What this does not protect against
 
 * The `host` that `sign_app_jwt` takes is a label the caller supplies. No connection is made, so
@@ -133,3 +203,8 @@ signer and `verify_secret_constant_time` use the zeroizing path.
 * The SSRF guard resolves a host name once to judge it and the HTTP client resolves it again to
   connect. A name that answers differently the second time (DNS rebinding) is not caught.
 * The audit log is a plain file the same user can edit.
+* `private_key_ref` moves the App's key out of a readable PEM file and into `vault.enc`. It does
+  not move it out of reach of the user that runs fl: `vault.key` lives under the same Unix user,
+  `allowed_agents` is advisory on the local CLI path, and fl-gate decrypts the key in the fl
+  process. What it adds is a policy check and an audit line at each use, and a key that is
+  encrypted at rest.

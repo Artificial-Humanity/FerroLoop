@@ -831,24 +831,53 @@ pub fn resolve_master_key_path(home_override: Option<&Path>) -> PathBuf {
     home.join(".config").join("fl").join("vault.key")
 }
 
-/// Load a 32-byte master key from `FL_VAULT_MASTER_KEY` or `key_path`, generating and persisting
-/// a fresh 256-bit key (`0600`) if `key_path` does not exist yet.
-pub fn load_or_init_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+/// The master key that already exists: `FL_VAULT_MASTER_KEY` when it is set and not blank, else
+/// the file at `key_path`. `None` when neither is there. Creates nothing.
+fn existing_master_key(key_path: &Path) -> Option<Result<[u8; MASTER_KEY_LEN], GateError>> {
     if let Ok(env_hex) = std::env::var("FL_VAULT_MASTER_KEY") {
         let trimmed = env_hex.trim();
         if !trimmed.is_empty() {
-            return parse_hex_master_key(trimmed, Path::new("FL_VAULT_MASTER_KEY"));
+            return Some(parse_hex_master_key(
+                trimmed,
+                Path::new("FL_VAULT_MASTER_KEY"),
+            ));
         }
     }
 
     if key_path.exists() {
-        reject_if_symlink(key_path)?;
-        let raw = fs::read_to_string(key_path).map_err(|e| GateError::Io {
+        return Some(
+            reject_if_symlink(key_path)
+                .and_then(|()| {
+                    fs::read_to_string(key_path).map_err(|e| GateError::Io {
+                        op: "read",
+                        path: key_path.to_path_buf(),
+                        cause: e.to_string(),
+                    })
+                })
+                .and_then(|raw| parse_hex_master_key(raw.trim(), key_path)),
+        );
+    }
+    None
+}
+
+/// Load the master key that exists, from `FL_VAULT_MASTER_KEY` or `key_path`, and never create
+/// one: a missing key is an error. A reader uses this so that a read cannot initialise a Vault.
+pub fn load_existing_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    existing_master_key(key_path).unwrap_or_else(|| {
+        Err(GateError::Io {
             op: "read",
             path: key_path.to_path_buf(),
-            cause: e.to_string(),
-        })?;
-        return parse_hex_master_key(raw.trim(), key_path);
+            cause: "no Vault master key (FL_VAULT_MASTER_KEY is unset and the file does not exist)"
+                .to_string(),
+        })
+    })
+}
+
+/// Load a 32-byte master key from `FL_VAULT_MASTER_KEY` or `key_path`, generating and persisting
+/// a fresh 256-bit key (`0600`) if `key_path` does not exist yet.
+pub fn load_or_init_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    if let Some(existing) = existing_master_key(key_path) {
+        return existing;
     }
 
     let rng = SystemRandom::new();

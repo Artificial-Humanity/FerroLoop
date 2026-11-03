@@ -14,7 +14,7 @@ pub mod pr;
 pub mod tracker;
 
 pub use client::{Client, DEFAULT_API, GraphqlAnswer, Method, Reply};
-pub use creds::{AppCredentials, Credentials, EnvToken};
+pub use creds::{AppCredentials, Credentials, EnvToken, FileKeySigner, JwtSigner};
 pub use ledger::GithubLedger;
 pub use pr::{
     MergeMethod, PrCommitSummary, PrReviewSummary, PullRequestView, create_pr, get_pr,

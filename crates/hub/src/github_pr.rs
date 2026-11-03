@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use fl_core::agent::{AgentRecord, AgentStatus};
 use fl_core::pr_policy::{
@@ -24,8 +25,8 @@ use fl_core::pr_policy::{
 use fl_core::store::{AgentRegistry, StoreError};
 use fl_exec::stamp;
 use fl_github::{
-    AppCredentials, Client, EnvToken, MergeMethod, PullRequestView, get_pr, list_pr_commits,
-    list_pr_files, list_pr_reviews, merge_pr, submit_pr_review,
+    AppCredentials, Client, EnvToken, JwtSigner, MergeMethod, PullRequestView, get_pr,
+    list_pr_commits, list_pr_files, list_pr_reviews, merge_pr, submit_pr_review,
 };
 use fl_store::AnyStore;
 use serde::Deserialize;
@@ -50,6 +51,10 @@ pub struct HubGithub {
     /// The Reviewer App: reviews and merges are made as `<slug>[bot]`.
     pub app_id: Option<u64>,
     pub private_key: Option<PathBuf>,
+    /// Signs the Reviewer App's JWT in place of the key file (`[github] private_key_ref`, a
+    /// FerroGate Vault secret). When it is set the key file is not used, and a signing that
+    /// fails is a failure: there is no fallback to `private_key`.
+    pub signer: Option<Arc<dyn JwtSigner>>,
 }
 
 impl fmt::Debug for HubGithub {
@@ -61,6 +66,7 @@ impl fmt::Debug for HubGithub {
             .field("token", &self.token.as_ref().map(|_| "<set>"))
             .field("app_id", &self.app_id)
             .field("private_key", &self.private_key)
+            .field("signer", &self.signer.as_ref().map(|_| "<set>"))
             .finish()
     }
 }
@@ -94,7 +100,14 @@ impl HubGithub {
     }
 
     fn app_client(&self, repo: &str) -> Result<Option<Client>, ClientError> {
-        let (Some(app_id), Some(key)) = (self.app_id, self.private_key.as_deref()) else {
+        let Some(app_id) = self.app_id else {
+            return Ok(None);
+        };
+        if let Some(signer) = &self.signer {
+            let creds = AppCredentials::with_signer(self.api(), app_id, signer.clone(), repo);
+            return Ok(Some(Client::new(self.api(), Box::new(creds))));
+        }
+        let Some(key) = self.private_key.as_deref() else {
             return Ok(None);
         };
         match AppCredentials::from_file(self.api(), app_id, key, repo) {

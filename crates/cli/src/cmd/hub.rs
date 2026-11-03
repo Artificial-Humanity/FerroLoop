@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Subcommand;
@@ -315,7 +316,11 @@ fn hub_github(
     let token = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
         .into_iter()
         .find_map(get);
-    let (app_id, private_key) = match (get("FL_GITHUB_APP_ID"), get("FL_GITHUB_PRIVATE_KEY_PATH")) {
+    let env_key_path = get("FL_GITHUB_PRIVATE_KEY_PATH");
+    crate::config::refuse_env_key_path_with_ref(cfg.github.as_ref(), env_key_path.is_some())
+        .map_err(|e| (2, e.to_string()))?;
+    let mut signer = None;
+    let (app_id, private_key) = match (get("FL_GITHUB_APP_ID"), env_key_path) {
         (Some(id), Some(path)) => {
             let id = id
                 .parse::<u64>()
@@ -323,7 +328,23 @@ fn hub_github(
             (Some(id), Some(PathBuf::from(path)))
         }
         _ => match cfg.github.as_ref() {
-            Some(app) => (Some(app.app_id), Some(app.private_key.clone())),
+            Some(app) => match app.key().map_err(|e| (2, e.to_string()))? {
+                crate::config::AppKey::File(path) => (Some(app.app_id), Some(path)),
+                // The Vault is opened when a JWT is signed, never here.
+                crate::config::AppKey::Vault(r) => {
+                    // The host the Hub sends the JWT to: its API URL's, else GitHub's.
+                    let host = crate::gate_signer::api_host(
+                        api_url.as_deref().unwrap_or(fl_github::DEFAULT_API),
+                    )
+                    .map_err(|e| (2, e.to_string()))?;
+                    signer = Some(Arc::new(crate::gate_signer::BrokeredSigner::new(
+                        r,
+                        crate::gate_signer::HUB_CALLER,
+                        host,
+                    )) as Arc<dyn fl_github::JwtSigner>);
+                    (Some(app.app_id), None)
+                }
+            },
             None => (None, None),
         },
     };
@@ -333,6 +354,7 @@ fn hub_github(
         token,
         app_id,
         private_key,
+        signer,
     })
 }
 
@@ -1470,7 +1492,8 @@ mod tests {
             ],
             github: Some(GithubApp {
                 app_id: 7,
-                private_key: PathBuf::from("/keys/app.pem"),
+                private_key: Some(PathBuf::from("/keys/app.pem")),
+                private_key_ref: None,
                 reviewer_ids: None,
                 reviewer_logins: None,
             }),
@@ -1502,6 +1525,45 @@ mod tests {
         assert_eq!(g.app_id, Some(9));
         assert_eq!(g.private_key, Some(PathBuf::from("/env/key.pem")));
         assert_eq!(g.token.as_deref(), Some("tok"));
+    }
+
+    fn ref_cfg() -> crate::config::Config {
+        let mut cfg = github_cfg();
+        let app = cfg.github.as_mut().unwrap();
+        app.private_key = None;
+        app.private_key_ref = Some("vault://APP_KEY".to_string());
+        cfg
+    }
+
+    #[test]
+    fn hub_github_with_a_private_key_ref_signs_through_the_vault_and_keeps_no_key_path() {
+        // Building the signer opens no Vault: the paths here do not exist.
+        let g = hub_github(&ref_cfg(), |_: &str| None).unwrap();
+        assert_eq!(g.app_id, Some(7));
+        assert!(g.signer.is_some());
+        assert_eq!(g.private_key, None, "no fallback key file");
+        assert!(format!("{g:?}").contains("<set>"));
+        // `$FL_GITHUB_APP_ID` alone does not replace `[github]`: the key still comes from the ref.
+        let env = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("9".to_string()),
+            _ => None,
+        };
+        assert_eq!(hub_github(&ref_cfg(), env).unwrap().app_id, Some(7));
+    }
+
+    #[test]
+    fn hub_github_refuses_the_key_variable_beside_a_private_key_ref() {
+        let env = |k: &str| match k {
+            "FL_GITHUB_APP_ID" => Some("9".to_string()),
+            "FL_GITHUB_PRIVATE_KEY_PATH" => Some("/env/key.pem".to_string()),
+            _ => None,
+        };
+        let (code, msg) = hub_github(&ref_cfg(), env).unwrap_err();
+        assert_eq!(code, 2);
+        assert!(msg.contains("private_key_ref"), "{msg}");
+        // A blank variable is unset.
+        let blank = |k: &str| (k == "FL_GITHUB_PRIVATE_KEY_PATH").then(|| "  ".to_string());
+        assert!(hub_github(&ref_cfg(), blank).is_ok());
     }
 
     fn cfg_with(bindings: &[(&str, &str)]) -> crate::config::Config {

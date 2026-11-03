@@ -163,7 +163,15 @@ pub enum Credential {
 #[serde(deny_unknown_fields)]
 pub struct GithubApp {
     pub app_id: u64,
-    pub private_key: PathBuf,
+    /// The App's private key as a PEM file (absolute path). Exactly one of `private_key` and
+    /// `private_key_ref` is set; read the choice through [`GithubApp::key`].
+    #[serde(default)]
+    pub private_key: Option<PathBuf>,
+    /// The App's private key as a FerroGate Vault secret, `vault://NAME` (optionally
+    /// `vault://NAME#pem`). The config load checks the shape only: it opens no Vault and reads
+    /// no master key. Read the choice through [`GithubApp::key`].
+    #[serde(default)]
+    pub private_key_ref: Option<String>,
     /// GitHub user ids whose reviews may carry an `fl-review` agent marker, normally the
     /// Reviewer App's bot user. A marker from any other account counts for nothing, so an
     /// outsider cannot claim to be an agent. Read it through [`reviewer_apps`].
@@ -174,6 +182,53 @@ pub struct GithubApp {
     /// renamed, so prefer `reviewer_ids`. Read it through [`reviewer_apps`].
     #[serde(default)]
     pub reviewer_logins: Option<Vec<String>>,
+}
+
+/// Where the App's private key comes from, as `[github]` names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppKey {
+    /// A PEM file, read when a JWT is signed (`private_key`).
+    File(PathBuf),
+    /// A FerroGate Vault secret that signs for us (`private_key_ref`).
+    Vault(fl_gate::VaultRef),
+}
+
+impl GithubApp {
+    /// The one key source `[github]` names. `load` has already checked the shape, so on a loaded
+    /// config this fails only for a `GithubApp` built by hand. The error names the keys, never a
+    /// value.
+    pub fn key(&self) -> Result<AppKey> {
+        match (&self.private_key, &self.private_key_ref) {
+            (Some(_), Some(_)) => {
+                bail!("`[github]` sets both `private_key` and `private_key_ref`; set exactly one")
+            }
+            (Some(path), None) => Ok(AppKey::File(path.clone())),
+            (None, Some(raw)) => match fl_gate::parse_vault_ref(raw) {
+                Ok(r) => Ok(AppKey::Vault(r)),
+                Err(e) => bail!("`[github] private_key_ref` is not a vault reference: {e}"),
+            },
+            (None, None) => {
+                bail!(
+                    "`[github]` needs `private_key` (a PEM file) or `private_key_ref` (`vault://NAME`)"
+                )
+            }
+        }
+    }
+}
+
+/// `$FL_GITHUB_PRIVATE_KEY_PATH` names a key file; a `[github] private_key_ref` names a Vault
+/// secret. With both present, which one signs is a guess, so none does: refuse. Called wherever
+/// a command builds the App's credential, with whether the variable is set and not blank.
+/// (`private_key` plus the variable is not ambiguous: the variable, with `$FL_GITHUB_APP_ID`,
+/// replaces `[github]` as it always did.)
+pub fn refuse_env_key_path_with_ref(app: Option<&GithubApp>, env_path_set: bool) -> Result<()> {
+    if env_path_set && app.is_some_and(|a| a.private_key_ref.is_some()) {
+        bail!(
+            "`$FL_GITHUB_PRIVATE_KEY_PATH` is set and `[github] private_key_ref` is set: which key \
+             signs is ambiguous. Unset the variable, or remove `private_key_ref`"
+        );
+    }
+    Ok(())
 }
 
 /// The accounts whose reviews may carry an agent marker (`[github] reviewer_ids` and
@@ -682,12 +737,32 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         }
     }
     if let Some(app) = &mut file.github {
-        if !app.private_key.is_absolute() {
-            bail!(
+        match (&app.private_key, &app.private_key_ref) {
+            (Some(_), Some(_)) => bail!(
+                "{}: `[github]` sets both `private_key` and `private_key_ref`; set exactly one",
+                path.display()
+            ),
+            (None, None) => bail!(
+                "{}: `[github]` needs `private_key` (a PEM file) or `private_key_ref` \
+                 (`vault://NAME`)",
+                path.display()
+            ),
+            (Some(key), None) if !key.is_absolute() => bail!(
                 "{}: `private_key` must be an absolute path (got `{}`)",
                 path.display(),
-                app.private_key.display()
-            );
+                key.display()
+            ),
+            // Shape only: the Vault is not opened and no master key is read here.
+            (None, Some(raw)) => {
+                if let Err(e) = fl_gate::parse_vault_ref(raw) {
+                    bail!(
+                        "{}: `private_key_ref` is not a vault reference ({e}); write \
+                         `vault://NAME`",
+                        path.display()
+                    );
+                }
+            }
+            (Some(_), None) => {}
         }
         for login in app.reviewer_logins.iter_mut().flatten() {
             *login = login.trim().to_string();
@@ -1235,6 +1310,120 @@ mod tests {
     }
 
     const GITHUB_TABLE: &str = "[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n";
+
+    fn github_key(text: &str) -> Result<AppKey> {
+        load_text(text).map(|c| c.github.unwrap().key().unwrap())
+    }
+
+    #[test]
+    fn private_key_ref_is_accepted_in_its_two_spellings_and_is_shape_only() {
+        for (raw, name) in [
+            ("vault://GITHUB_APP_KEY", "GITHUB_APP_KEY"),
+            ("vault://GITHUB_APP_KEY#pem", "GITHUB_APP_KEY"),
+        ] {
+            let key = github_key(&format!(
+                "[github]\napp_id = 1\nprivate_key_ref = \"{raw}\"\n"
+            ))
+            .unwrap();
+            let AppKey::Vault(r) = key else {
+                panic!("a ref is a vault key")
+            };
+            assert_eq!(r.name(), name);
+            assert_eq!(r.to_string(), raw);
+        }
+        let cfg = load_text(GITHUB_TABLE).unwrap();
+        assert_eq!(
+            cfg.github.unwrap().key().unwrap(),
+            AppKey::File("/k/key.pem".into())
+        );
+    }
+
+    #[test]
+    fn a_github_table_with_both_keys_or_neither_is_refused_naming_the_keys() {
+        let both = load_text(
+            "[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n\
+             private_key_ref = \"vault://APP_KEY\"\n",
+        )
+        .unwrap_err();
+        let both = format!("{both:#}");
+        assert!(
+            both.contains("both `private_key` and `private_key_ref`"),
+            "{both}"
+        );
+        let neither = format!("{:#}", load_text("[github]\napp_id = 1\n").unwrap_err());
+        assert!(
+            neither.contains("`private_key`") && neither.contains("`private_key_ref`"),
+            "{neither}"
+        );
+        // `app_id` is required with either.
+        assert!(load_text("[github]\nprivate_key_ref = \"vault://APP_KEY\"\n").is_err());
+        assert!(load_text("[github]\nprivate_key = \"/k/key.pem\"\n").is_err());
+    }
+
+    #[test]
+    fn a_bad_private_key_ref_is_refused_and_echoes_nothing_but_the_key_name() {
+        // Each of these could hold a pasted secret: none may come back in the error.
+        for bad in [
+            "",
+            "vault://",
+            "vault://app_key",
+            "vault://APP KEY",
+            "vault://APP_KEY#key",
+            "vault://APP_KEY#pem#pem",
+            "vault://APP/KEY",
+            "file:///k/key.pem",
+            "/k/key.pem",
+            "MIIEowIBAAKCAQEA-pasted-secret",
+        ] {
+            let err = load_text(&format!(
+                "[github]\napp_id = 1\nprivate_key_ref = \"{bad}\"\n"
+            ))
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("`private_key_ref` is not a vault reference"),
+                "{msg}"
+            );
+            // The message's own advice, `vault://NAME`, is not an echo.
+            let msg = msg.replace("`vault://NAME`", "");
+            if !bad.is_empty() {
+                assert!(!msg.contains(bad), "the ref must not be echoed: {msg}");
+            }
+        }
+        // Not a string at all.
+        assert!(load_text("[github]\napp_id = 1\nprivate_key_ref = 5\n").is_err());
+    }
+
+    #[test]
+    fn private_key_ref_does_not_loosen_the_github_tables_other_rules() {
+        let table = "[github]\napp_id = 1\nprivate_key_ref = \"vault://APP_KEY\"\n";
+        assert!(load_text(&format!("{table}private_keyref = \"x\"\n")).is_err());
+        let text = format!("{table}reviewer_ids = [5]\n");
+        assert_eq!(apps_of(&text).ids, vec![5]);
+        // A relative file path is still refused; the ref is not a path.
+        assert!(load_text("[github]\napp_id = 1\nprivate_key = \"key.pem\"\n").is_err());
+    }
+
+    #[test]
+    fn the_key_variable_and_a_private_key_ref_together_are_refused_as_ambiguous() {
+        let file = load_text(GITHUB_TABLE).unwrap().github;
+        let vault = load_text("[github]\napp_id = 1\nprivate_key_ref = \"vault://APP_KEY\"\n")
+            .unwrap()
+            .github;
+        // Ref + variable: refused, and the message names both and nothing secret.
+        let err = refuse_env_key_path_with_ref(vault.as_ref(), true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FL_GITHUB_PRIVATE_KEY_PATH") && msg.contains("private_key_ref"),
+            "{msg}"
+        );
+        // Ref alone, a file key with the variable (the variable wins, as always), a file key
+        // alone, and no `[github]` with the variable: all fine.
+        assert!(refuse_env_key_path_with_ref(vault.as_ref(), false).is_ok());
+        assert!(refuse_env_key_path_with_ref(file.as_ref(), true).is_ok());
+        assert!(refuse_env_key_path_with_ref(file.as_ref(), false).is_ok());
+        assert!(refuse_env_key_path_with_ref(None, true).is_ok());
+    }
 
     fn apps_of(text: &str) -> ReviewerApps {
         reviewer_apps(load_text(text).unwrap().github.as_ref())
