@@ -14,6 +14,18 @@ import type {
 } from "../types/api";
 import { getAdapterBadgeClass } from "./RosterSidebar";
 import {
+  DEFAULT_REFERENCE_REPOS,
+  DEFAULT_TOKENIZER_LEDGER,
+  type CountedTokenizerLedgerEntry,
+  type ReferenceRepoIndexEntry,
+} from "./FerroStatePane";
+export {
+  DEFAULT_REFERENCE_REPOS,
+  DEFAULT_TOKENIZER_LEDGER,
+  type CountedTokenizerLedgerEntry,
+  type ReferenceRepoIndexEntry,
+};
+import {
   evaluateAgentMcpPosture,
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
@@ -1418,6 +1430,47 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                   </div>
                 ))
               )}
+            </div>
+
+            {/* Record #92: Counted Tokenizer Savings Ledger */}
+            <div
+              data-testid="hub-tokenizer-ledger-card"
+              className="fd-card"
+              style={{ display: "flex", flexDirection: "column", gap: "8px" }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+                <div style={{ fontSize: "12px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.05em", color: "var(--text-muted)" }}>
+                  Counted Tokenizer Savings Ledger ({DEFAULT_TOKENIZER_LEDGER.length})
+                </div>
+                <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                  Exact Tokenizer vs ceil(chars/4)
+                </span>
+              </div>
+              {DEFAULT_TOKENIZER_LEDGER.map((item) => (
+                <div
+                  key={item.tokenizer}
+                  data-testid={`hub-tokenizer-row-${item.tokenizer}`}
+                  className="fd-mono"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    padding: "6px 8px",
+                    borderRadius: "var(--radius-sm)",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "11.5px",
+                  }}
+                >
+                  <strong>{item.tokenizer}</strong>
+                  <span>
+                    exact: {item.exact_tokens_saved.toLocaleString()} tok · ceil(chars/4):{" "}
+                    {item.heuristic_ceil_chars4.toLocaleString()} ({item.delta_pct}%)
+                  </span>
+                </div>
+              ))}
             </div>
           </>
         )}
