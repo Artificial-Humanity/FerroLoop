@@ -1444,6 +1444,36 @@ fn a_remodel_away_from_a_muse_window_it_did_not_open_is_refused_and_kills_nothin
 }
 
 #[test]
+fn a_remodel_away_from_a_foreign_window_under_a_dead_ones_name_is_refused() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
+    assert!(record(&store, "muse:ada").runtime_spawned);
+    // Our window died and a foreign one took the name; the flag still says ours.
+    fake.close_window("muse:ada");
+    fake.open_foreign_window("muse:ada");
+    fake.calls.borrow_mut().clear();
+
+    let err = remodel(
+        &store,
+        &env,
+        "muse:ada",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(
+        err.to_string().contains("did not start the window"),
+        "{err}"
+    );
+    assert!(kills(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"));
+}
+
+#[test]
 fn a_remodel_onto_a_muse_window_that_exists_adopts_it() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();

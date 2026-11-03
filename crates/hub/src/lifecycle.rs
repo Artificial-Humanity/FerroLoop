@@ -293,25 +293,40 @@ pub trait SessionRuntime: std::fmt::Debug {
     ///
     /// `session` is the tmux session to create, except [`MUSE_SESSION`]: that one is shared, so
     /// `window` is added to it when it exists (and the spawn is refused when a window of that
-    /// name is there already: it is not ours to touch).
+    /// name is there already: it is not ours to touch). A window it adds is marked with
+    /// `hosted_id` (the hosted record's session id, [`HOSTED_MARK`]); a spawn that cannot read
+    /// back and mark its window removes the window and fails.
     fn spawn(
         &self,
         session: &str,
         window: &str,
         cwd: Option<&str>,
         launch: Option<&LaunchSpec>,
+        hosted_id: &str,
     ) -> bool;
-    /// Stop a runtime unit; `true` when it is gone afterwards. A window unit (`muse:<persona>`)
-    /// is stopped with `kill-window` and never takes its session with it.
-    fn kill(&self, unit: &str) -> bool;
-    /// `true` when a runtime unit of this name runs.
+    /// Stop a runtime unit; `true` when nothing of ours is left of it. A window unit
+    /// (`muse:<persona>`) is stopped with `kill-window` on that one window and never takes its
+    /// session with it, and only when the window carries the mark `hosted_id`: a window of the
+    /// name without it (or with another) is not ours, is left alone, and counts as "nothing of
+    /// ours to kill" (`true`). A session unit is killed whole, `hosted_id` unused.
+    fn kill(&self, unit: &str, hosted_id: &str) -> bool;
+    /// `true` when a runtime unit of this name runs, whoever started it.
     fn exists(&self, unit: &str) -> bool;
+    /// `true` when `unit` runs and is the one `hosted_id` started: for a window unit, a window of
+    /// that name carrying the mark `hosted_id`; for a session unit, as [`Self::exists`].
+    fn owns(&self, unit: &str, hosted_id: &str) -> bool;
     /// The pause between the checks that a launched command's session is still there (see
     /// [`launch_survived`]). Zero for a runtime that answers at once.
     fn settle_delay(&self) -> std::time::Duration {
         std::time::Duration::ZERO
     }
 }
+
+/// The tmux window option that marks a window this lifecycle created. Its value is the hosted
+/// record's session id (`muse:<persona>`). A window of the shared Muse session is addressed by
+/// name, and a name cannot tell our window from one `muse-sessions` or a person opened under
+/// the same name later: only a window with this mark is ours to claim or kill.
+pub(crate) const HOSTED_MARK: &str = "@fl_hosted";
 
 /// The one tmux session every Muse agent's window lives in (`muse-sessions` hosts them there as
 /// windows named by persona). Never created or killed per persona: only a window is.
@@ -356,13 +371,13 @@ fn runtime_unit(tmux_target: &str) -> &str {
     }
 }
 
-/// `true` when `vendor` is Muse, the runtime may be touched, and the window `unit` this
-/// lifecycle once opened is gone. Its `runtime_spawned` flag is then stale: whoever opens a
-/// window of that name next (`muse-sessions`, a person) made a window we did not, and only a
+/// `true` when `vendor` is Muse, the runtime may be touched, and no window `unit` carries the
+/// mark of `hosted_id`. A `runtime_spawned` flag is then stale: our window is gone, and whatever
+/// window of that name runs now (`muse-sessions`, a person) is one we did not make. Only a
 /// successful spawn of ours may set the flag again. (A Muse window is addressed by name alone,
-/// so the name alone cannot tell the two apart.)
-fn muse_window_gone(env: &LifecycleEnv<'_>, vendor: &str, unit: &str) -> bool {
-    vendor == "muse" && env.spawn_runtime && !env.runtime.exists(unit)
+/// so the name cannot tell the two apart; the mark can.)
+fn muse_window_not_ours(env: &LifecycleEnv<'_>, vendor: &str, unit: &str, hosted_id: &str) -> bool {
+    vendor == "muse" && env.spawn_runtime && !env.runtime.owns(unit, hosted_id)
 }
 
 /// How many times [`launch_survived`] asks whether the session is there.
@@ -370,12 +385,13 @@ const LAUNCH_SURVIVAL_CHECKS: u32 = 5;
 
 /// `true` when the runtime unit of a command just launched in it (`spawn` with a [`LaunchSpec`])
 /// is still there: a command that exits at once (a missing binary) takes its window with it. Asks
-/// `exists` up to [`LAUNCH_SURVIVAL_CHECKS`] times, [`SessionRuntime::settle_delay`] apart, and
-/// answers at the first yes.
-fn launch_survived(env: &LifecycleEnv<'_>, unit: &str) -> bool {
+/// `owns` (our marked window, not any window of the name: one a person opened in the meantime
+/// is not the launched command) up to [`LAUNCH_SURVIVAL_CHECKS`] times,
+/// [`SessionRuntime::settle_delay`] apart, and answers at the first yes.
+fn launch_survived(env: &LifecycleEnv<'_>, unit: &str, hosted_id: &str) -> bool {
     let delay = env.runtime.settle_delay();
     for check in 0..LAUNCH_SURVIVAL_CHECKS {
-        if env.runtime.exists(unit) {
+        if env.runtime.owns(unit, hosted_id) {
             return true;
         }
         if check + 1 < LAUNCH_SURVIVAL_CHECKS && !delay.is_zero() {
@@ -502,16 +518,21 @@ impl SessionRuntime for TmuxRuntime {
         window: &str,
         cwd: Option<&str>,
         launch: Option<&LaunchSpec>,
+        hosted_id: &str,
     ) -> bool {
-        spawn_tmux_runtime(session, window, cwd, launch)
+        spawn_tmux_runtime(session, window, cwd, launch, hosted_id)
     }
 
-    fn kill(&self, unit: &str) -> bool {
-        kill_tmux_runtime(unit)
+    fn kill(&self, unit: &str, hosted_id: &str) -> bool {
+        kill_tmux_runtime(unit, hosted_id)
     }
 
     fn exists(&self, unit: &str) -> bool {
         tmux_unit_exists(unit)
+    }
+
+    fn owns(&self, unit: &str, hosted_id: &str) -> bool {
+        tmux_unit_owned(unit, hosted_id)
     }
 
     fn settle_delay(&self) -> std::time::Duration {
@@ -529,6 +550,10 @@ pub(crate) struct FakeRuntime {
     pub(crate) live: std::cell::RefCell<std::collections::BTreeSet<String>>,
     /// The windows of the shared Muse session, as `muse:<window>`.
     pub(crate) windows: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// The [`HOSTED_MARK`] of each window of the shared session that has one, by `muse:<window>`.
+    /// A window opened by anyone but a spawn has none. Whatever removes a window removes its
+    /// mark ([`Self::close_window`]).
+    pub(crate) marks: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     pub(crate) fail_windows: std::cell::RefCell<Vec<String>>,
     pub(crate) calls: std::cell::RefCell<Vec<String>>,
     /// The launch command of each `spawn` call that was not refused, by `session:window`.
@@ -537,6 +562,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) vanish_windows: std::cell::RefCell<Vec<String>>,
     /// How many times `exists` was asked.
     pub(crate) exists_calls: std::cell::Cell<u32>,
+    /// How many times `owns` was asked (the survival check of a launched command).
+    pub(crate) owns_calls: std::cell::Cell<u32>,
 }
 
 #[cfg(test)]
@@ -582,6 +609,21 @@ impl FakeRuntime {
     pub(crate) fn clear(&self) {
         self.live.borrow_mut().clear();
         self.windows.borrow_mut().clear();
+        self.marks.borrow_mut().clear();
+    }
+
+    /// A window of the shared session ends (its command exits, a person closes it), with its mark.
+    pub(crate) fn close_window(&self, unit: &str) {
+        self.windows.borrow_mut().remove(unit);
+        self.marks.borrow_mut().remove(unit);
+        self.sync_muse_session();
+    }
+
+    /// Someone else (`muse-sessions`, a person) opens a window of the shared session: no mark.
+    pub(crate) fn open_foreign_window(&self, unit: &str) {
+        self.windows.borrow_mut().insert(unit.to_string());
+        self.marks.borrow_mut().remove(unit);
+        self.sync_muse_session();
     }
 
     /// The shared session runs exactly while it holds a window (tmux ends a session with its
@@ -643,6 +685,7 @@ impl SessionRuntime for FakeRuntime {
         window: &str,
         _cwd: Option<&str>,
         launch: Option<&LaunchSpec>,
+        hosted_id: &str,
     ) -> bool {
         self.calls
             .borrow_mut()
@@ -654,6 +697,11 @@ impl SessionRuntime for FakeRuntime {
         let started = if session == MUSE_SESSION {
             // The shared session: a window of that name there is not ours to touch.
             let started = self.windows.borrow_mut().insert(unit.clone());
+            if started {
+                self.marks
+                    .borrow_mut()
+                    .insert(unit.clone(), hosted_id.to_string());
+            }
             self.sync_muse_session();
             started
         } else {
@@ -665,8 +713,7 @@ impl SessionRuntime for FakeRuntime {
                 .push((unit.clone(), launch.cloned()));
             if self.vanish_windows.borrow().iter().any(|w| w == window) {
                 if session == MUSE_SESSION {
-                    self.windows.borrow_mut().remove(&unit);
-                    self.sync_muse_session();
+                    self.close_window(&unit);
                 } else {
                     self.live.borrow_mut().remove(session);
                 }
@@ -675,14 +722,16 @@ impl SessionRuntime for FakeRuntime {
         started
     }
 
-    fn kill(&self, unit: &str) -> bool {
+    fn kill(&self, unit: &str, hosted_id: &str) -> bool {
         self.calls.borrow_mut().push(format!("kill {unit}"));
         if !is_killable_unit(unit) {
             return false;
         }
         if unit.contains(':') {
-            self.windows.borrow_mut().remove(unit);
-            self.sync_muse_session();
+            // As tmux: only a window with our mark goes; any other is "nothing of ours".
+            if self.owns(unit, hosted_id) {
+                self.close_window(unit);
+            }
         } else {
             self.live.borrow_mut().remove(unit);
         }
@@ -692,6 +741,16 @@ impl SessionRuntime for FakeRuntime {
     fn exists(&self, unit: &str) -> bool {
         self.exists_calls.set(self.exists_calls.get() + 1);
         self.is_live(unit)
+    }
+
+    fn owns(&self, unit: &str, hosted_id: &str) -> bool {
+        self.owns_calls.set(self.owns_calls.get() + 1);
+        if !unit.contains(':') {
+            return self.is_live(unit);
+        }
+        !hosted_id.is_empty()
+            && self.is_live(unit)
+            && self.marks.borrow().get(unit).map(String::as_str) == Some(hosted_id)
     }
 }
 
@@ -1316,9 +1375,10 @@ fn spawn_tmux_runtime(
     window: &str,
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
+    hosted_id: &str,
 ) -> bool {
     if session == MUSE_SESSION {
-        return spawn_muse_window(window, cwd, launch);
+        return spawn_muse_window(window, cwd, launch, hosted_id);
     }
     let args = tmux_new_session_args(session, window, cwd, launch);
     tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
@@ -1328,13 +1388,45 @@ fn spawn_tmux_runtime(
 /// runs, else the session itself. `false` when a window of that name is there already (it
 /// belongs to whoever started it, such as `muse-sessions`; it is left alone) or when tmux does
 /// not answer about the windows.
-fn spawn_muse_window(window: &str, cwd: Option<&str>, launch: Option<&LaunchSpec>) -> bool {
+///
+/// The new window's id is read back (`-P -F '#{window_id}'`) and the window is marked
+/// ([`HOSTED_MARK`]) with `hosted_id` at once, by that id: the mark is what later tells our
+/// window from one of the same name that someone else opens. When the id cannot be read or the
+/// mark cannot be set, the window is removed by its id (it is ours: this call just made it) and
+/// the spawn fails.
+fn spawn_muse_window(
+    window: &str,
+    cwd: Option<&str>,
+    launch: Option<&LaunchSpec>,
+    hosted_id: &str,
+) -> bool {
+    if hosted_id.is_empty() {
+        return false;
+    }
     let session_runs = tmux_session_exists(MUSE_SESSION);
     if session_runs && listed_window_count(MUSE_SESSION, window) != Some(0) {
         return false;
     }
     let args = tmux_muse_spawn_args(session_runs, window, cwd, launch);
-    tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    let Some(out) = tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
+        return false;
+    };
+    let id = out.trim();
+    if !is_window_id(id) {
+        // The window may exist, but without its id it cannot be marked or removed safely.
+        return false;
+    }
+    if tmux_ok(&["set-option", "-w", "-t", id, HOSTED_MARK, hosted_id]) {
+        return true;
+    }
+    let _ = tmux_ok(&["kill-window", "-t", id]);
+    false
+}
+
+/// `true` for a tmux window id (`@12`): unique within one tmux server's life, never reused.
+fn is_window_id(id: &str) -> bool {
+    id.strip_prefix('@')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The tail every spawn shares: the working directory (when it is a directory), then with
@@ -1376,15 +1468,36 @@ fn tmux_muse_spawn_args(
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
 ) -> Vec<String> {
+    // `-P -F '#{window_id}'` prints the new window's id, to mark the window by.
     let mut args: Vec<String> = if session_runs {
         let target = format!("={MUSE_SESSION}:");
-        ["new-window", "-d", "-t", &target, "-n", window]
-            .map(String::from)
-            .into()
+        [
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            &target,
+            "-n",
+            window,
+        ]
+        .map(String::from)
+        .into()
     } else {
-        ["new-session", "-d", "-s", MUSE_SESSION, "-n", window]
-            .map(String::from)
-            .into()
+        [
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-s",
+            MUSE_SESSION,
+            "-n",
+            window,
+        ]
+        .map(String::from)
+        .into()
     };
     push_cwd_and_launch(&mut args, cwd, launch);
     args
@@ -1403,11 +1516,13 @@ fn is_killable_unit(unit: &str) -> bool {
     }
 }
 
-/// Stop a runtime unit this lifecycle created; `true` when it is gone afterwards. A window unit
-/// (`muse:<persona>`) is stopped with `kill-window` on exactly that window, and only when
-/// exactly one window has that name: never the session, whose other windows belong to other
-/// agents.
-fn kill_tmux_runtime(unit: &str) -> bool {
+/// Stop a runtime unit this lifecycle created; `true` when nothing of ours is left of it. A
+/// window unit (`muse:<persona>`) is stopped with `kill-window` on that window's id, and only
+/// when exactly one window has that name and it carries the mark `hosted_id` ([`HOSTED_MARK`]):
+/// never the session, whose other windows belong to other agents, and never a window of the
+/// name that someone else opened (no mark, or another one), which is "nothing of ours to kill"
+/// and answers `true`. Two windows of the name, or no answer from tmux: `false`.
+fn kill_tmux_runtime(unit: &str, hosted_id: &str) -> bool {
     if !is_killable_unit(unit) {
         return false;
     }
@@ -1415,16 +1530,75 @@ fn kill_tmux_runtime(unit: &str) -> bool {
         let target = format!("={unit}");
         return tmux_ok(&["kill-session", "-t", &target]) || !tmux_session_exists(unit);
     };
-    match tmux_window_count(session, window) {
-        Some(0) => true,
-        Some(1) => {
-            let target = format!("={session}:{window}");
-            tmux_ok(&["kill-window", "-t", &target])
-                || tmux_window_count(session, window) == Some(0)
+    if hosted_id.is_empty() {
+        return false;
+    }
+    let Some(windows) = marked_windows(session) else {
+        return false;
+    };
+    let named: Vec<&TmuxWindow> = windows.iter().filter(|w| w.name == window).collect();
+    match named.as_slice() {
+        [] => true,
+        [ours] if ours.mark == hosted_id && is_window_id(&ours.id) => {
+            tmux_ok(&["kill-window", "-t", &ours.id])
+                || marked_windows(session)
+                    .is_some_and(|after| after.iter().all(|w| w.id != ours.id))
         }
-        // Two windows of the name (a kill would be ambiguous), or tmux did not answer.
+        // Someone else's window of the name: not ours to kill.
+        [foreign] if foreign.mark != hosted_id => true,
+        // Two windows of the name, or an id tmux did not give as one.
         _ => false,
     }
+}
+
+/// One window of a tmux session as [`marked_windows`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxWindow {
+    /// `#{window_id}` (`@12`).
+    id: String,
+    /// `#{window_name}`.
+    name: String,
+    /// `#{@fl_hosted}` ([`HOSTED_MARK`]); empty for a window nobody marked.
+    mark: String,
+}
+
+/// The windows of `session` with their ids and marks: empty when the session does not run,
+/// `None` when tmux did not answer about a session that runs.
+fn marked_windows(session: &str) -> Option<Vec<TmuxWindow>> {
+    if !tmux_session_exists(session) {
+        return Some(Vec::new());
+    }
+    let out = tmux_stdout(&[
+        "list-windows",
+        "-t",
+        &format!("={session}"),
+        "-F",
+        &format!("#{{window_id}}\t#{{window_name}}\t#{{{HOSTED_MARK}}}"),
+    ])?;
+    Some(out.lines().filter_map(parse_window_line).collect())
+}
+
+/// `<id>\t<name>\t<mark>`: the id has no tab and neither has the mark (a session id), so a tab
+/// in the name stays in the name.
+fn parse_window_line(line: &str) -> Option<TmuxWindow> {
+    let (id, rest) = line.split_once('\t')?;
+    let (name, mark) = rest.rsplit_once('\t')?;
+    Some(TmuxWindow {
+        id: id.to_string(),
+        name: name.to_string(),
+        mark: mark.to_string(),
+    })
+}
+
+/// `true` when the runtime unit is the one `hosted_id` started: for a window, one window of that
+/// exact name that carries the mark `hosted_id`; for a session, as [`tmux_unit_exists`].
+fn tmux_unit_owned(unit: &str, hosted_id: &str) -> bool {
+    let Some((session, window)) = unit.split_once(':') else {
+        return tmux_session_exists(unit);
+    };
+    !hosted_id.is_empty()
+        && marked_windows(session)
+            .is_some_and(|ws| ws.iter().any(|w| w.name == window && w.mark == hosted_id))
 }
 
 /// `true` when a `tmux` session of exactly this name runs.
@@ -1847,7 +2021,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
                 r.runtime_spawned
                     && is_live_hosted(r)
                     && r.tmux_target == tmux_target
-                    && !muse_window_gone(env, &v.vendor, &unit)
+                    && !muse_window_not_ours(env, &v.vendor, &unit, &session_id)
             }),
         created_at_ms: previous.as_ref().map_or(now, |r| r.created_at_ms),
         updated_at_ms: now,
@@ -1860,14 +2034,18 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     let spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
-        && env
-            .runtime
-            .spawn(&rt_session, &rt_window, v.cwd.as_deref(), launch.as_ref());
+        && env.runtime.spawn(
+            &rt_session,
+            &rt_window,
+            v.cwd.as_deref(),
+            launch.as_ref(),
+            &session_id,
+        );
     // A runtime launched with the prompt as its first input has the prompt already, provided the
     // command stayed up: one that exited at once took its session with it, and there is nothing
     // to deliver to.
     let launched = spawned && launch.is_some();
-    let survived = !launched || launch_survived(env, &unit);
+    let survived = !launched || launch_survived(env, &unit, &session_id);
     let spawned = spawned && survived;
     let hydration_dispatched = if launched {
         survived
@@ -1883,7 +2061,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         if spawned {
             // The record cannot learn about this runtime, so teardown could never stop it. Only
             // the unit this call created: for Muse its window, never the shared session.
-            env.runtime.kill(&unit);
+            env.runtime.kill(&unit, &session_id);
         }
         return Err(e);
     }
@@ -2297,10 +2475,13 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
         (Some(tmux_target), true) if env.spawn_runtime => {
             // The unit, not the session: a Muse window is killed alone, never the shared session.
-            let gone = env.runtime.kill(runtime_unit(tmux_target));
+            let unit = runtime_unit(tmux_target);
+            let gone = env.runtime.kill(unit, &record.session_id);
             // The runtime is gone, so the decommissioned record must not claim it any more.
             record.runtime_spawned &= !gone;
-            gone
+            // A window of the name that is not ours is left running: "nothing of ours to kill"
+            // clears the claim, but is not a stopped runtime.
+            gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
         }
         _ => false,
     };
@@ -2389,9 +2570,10 @@ pub fn restart_hosted_session<S: StateStore>(
     if record.hosted
         && !adopted_old_session
         && record.runtime_spawned
-        && muse_window_gone(env, &record.vendor, &unit)
+        && muse_window_not_ours(env, &record.vendor, &unit, &record.session_id)
     {
-        // Our window died. A window of the name that exists after this point is someone else's.
+        // Our window (the one carrying our mark) is gone. A window of the name that exists after
+        // this point is someone else's.
         record.runtime_spawned = false;
     }
     let mut launched_with_prompt = false;
@@ -2405,9 +2587,10 @@ pub fn restart_hosted_session<S: StateStore>(
             &rt_window,
             record.cwd.as_deref(),
             launch.as_ref(),
+            &record.session_id,
         )
     {
-        if launch.is_some() && !launch_survived(env, &unit) {
+        if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
             // The command exited at once and took its session with it: nothing to deliver to.
             launch_died = true;
             record.runtime_spawned = false;
@@ -2595,6 +2778,14 @@ fn check_old_runtime_stoppable<S: StateStore>(
             Some(r) if !r.runtime_spawned => format!("`{}` did not start it", r.session_id),
             Some(r) if r.tmux_target.as_deref().map(runtime_unit) != Some(unit) => {
                 format!("`{}` started another tmux session", r.session_id)
+            }
+            // The flag says it started a Muse window, but the window under the name carries no
+            // mark of its own: it is someone else's, and the teardown would leave it running.
+            Some(r) if is_muse_window_target(unit) && !env.runtime.owns(unit, &r.session_id) => {
+                format!(
+                    "`{}` did not start the window now under that name",
+                    r.session_id
+                )
             }
             Some(r) => {
                 let sharers = runtime_sharers(store, r)?;

@@ -443,7 +443,7 @@ fn a_launched_muse_that_exits_at_once_is_neither_spawned_nor_hydrated() {
 
     assert!(!out.runtime_spawned);
     assert!(!out.hydration_dispatched);
-    assert_eq!(fake.exists_calls.get(), 5, "bounded retry");
+    assert_eq!(fake.owns_calls.get(), 5, "bounded retry");
     assert!(!delivered(&listener), "nothing to deliver to");
     let record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
     assert!(!record.runtime_spawned && !record.hydration_dispatched);
@@ -474,7 +474,7 @@ fn a_launched_muse_that_stays_up_is_checked_once() {
     let fake = FakeRuntime::default();
     let out = spin(&store, &fake.env(home.path()), "ada", "muse");
     assert!(out.runtime_spawned && out.hydration_dispatched);
-    assert_eq!(fake.exists_calls.get(), 1);
+    assert_eq!(fake.owns_calls.get(), 1);
 }
 
 // ------------------------------------------------------------------- the launch itself
@@ -772,9 +772,9 @@ fn killed(fake: &FakeRuntime) -> Vec<String> {
 }
 
 /// A fake `tmux` that logs every call (one line of arguments) in `<dir>/tmux-calls`, answers
-/// `has-session` by `session_runs` and `list-windows` with `windows`, and succeeds at the rest.
-/// Holds [`crate::TMUX_ENV_LOCK`] and restores `FL_WIRE_TMUX_BIN` on drop, so the real `tmux` is
-/// never reached.
+/// `has-session` by `session_runs`, and lists `windows` (see [`TmuxLog::install`]). A new window
+/// is reported as `@99`. Holds [`crate::TMUX_ENV_LOCK`] and restores `FL_WIRE_TMUX_BIN` on drop,
+/// so the real `tmux` is never reached.
 struct TmuxLog {
     _lock: std::sync::MutexGuard<'static, ()>,
     prev_bin: Option<std::ffi::OsString>,
@@ -782,20 +782,48 @@ struct TmuxLog {
 }
 
 impl TmuxLog {
+    /// `windows` are the names in the session, window `i` having the id `@{i+1}`; `name=mark`
+    /// gives the window the [`HOSTED_MARK`] `mark`. `list-windows` answers the id, name and mark
+    /// (tab separated) when asked for `window_id`, else the names alone.
     fn install(dir: &Path, session_runs: bool, windows: &[&str]) -> Self {
+        Self::install_failing(dir, session_runs, windows, "@99", &[])
+    }
+
+    /// As [`Self::install`], with `new_window_out` printed by `new-window` and `new-session` and
+    /// `failing` the tmux commands (`set-option`, `kill-window`, ...) that exit 1.
+    fn install_failing(
+        dir: &Path,
+        session_runs: bool,
+        windows: &[&str],
+        new_window_out: &str,
+        failing: &[&str],
+    ) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
         let lock = crate::TMUX_ENV_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let log = dir.join("tmux-calls");
-        let names: String = windows.iter().map(|w| format!("  echo '{w}'\n")).collect();
+        let mut names = String::new();
+        let mut full = String::new();
+        for (i, w) in windows.iter().enumerate() {
+            let (name, mark) = w.split_once('=').unwrap_or((w, ""));
+            names.push_str(&format!("      echo '{name}'\n"));
+            full.push_str(&format!(
+                "      printf '@%s\\t%s\\t%s\\n' '{}' '{name}' '{mark}'\n",
+                i + 1
+            ));
+        }
+        let fail_cases: String = failing
+            .iter()
+            .map(|cmd| format!("  {cmd}) exit 1;;\n"))
+            .collect();
         let has_session = i32::from(!session_runs);
         let bin = dir.join("fake-tmux-log.sh");
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n  has-session) exit {has_session};;\n  list-windows)\n{names}  exit 0;;\n  *) exit 0;;\nesac\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n{fail_cases}  has-session) exit {has_session};;\n  new-window|new-session) echo '{new_window_out}'; exit 0;;\n  list-windows)\n    case \"$*\" in\n    *'#{{window_id}}'*)\n{full}      exit 0;;\n    *)\n{names}      exit 0;;\n    esac;;\n  *) exit 0;;\nesac\n",
                 log.display()
             ),
         )
@@ -816,6 +844,18 @@ impl TmuxLog {
             .unwrap_or_default()
             .lines()
             .map(str::to_string)
+            .collect()
+    }
+
+    /// The calls that change something (`new-*`, `set-option`, `kill-*`).
+    fn mutations(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| {
+                ["new-", "set-option", "kill-"]
+                    .iter()
+                    .any(|p| c.starts_with(p))
+            })
             .collect()
     }
 }
@@ -915,11 +955,31 @@ fn tmux_opens_a_muse_window_with_new_window_when_the_session_runs_and_new_sessio
     };
     assert_eq!(
         tmux_muse_spawn_args(true, "ada", Some(&cwd), Some(&spec)),
-        expected(&["new-window", "-d", "-t", "=muse:", "-n", "ada"])
+        expected(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            "=muse:",
+            "-n",
+            "ada"
+        ])
     );
     assert_eq!(
         tmux_muse_spawn_args(false, "ada", Some(&cwd), Some(&spec)),
-        expected(&["new-session", "-d", "-s", "muse", "-n", "ada"])
+        expected(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-s",
+            "muse",
+            "-n",
+            "ada"
+        ])
     );
 }
 
@@ -928,14 +988,15 @@ fn the_tmux_runtime_adds_a_window_to_a_running_muse_session() {
     let dir = TempDir::new().unwrap();
     let tmux = TmuxLog::install(dir.path(), true, &["mira"]);
     let spec = muse_spec("hi");
-    assert!(TmuxRuntime.spawn("muse", "ada", None, Some(&spec)));
+    assert!(TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"));
     assert_eq!(
         tmux.calls(),
         [
             "has-session -t =muse",
             "list-windows -t =muse -F #{window_name}",
-            "new-window -d -t =muse: -n ada -e AGENT_PERSONA=ada -- /bin/muse --model \
-             muse-wonder-full-1.0 hi",
+            "new-window -d -P -F #{window_id} -t =muse: -n ada -e AGENT_PERSONA=ada -- \
+             /bin/muse --model muse-wonder-full-1.0 hi",
+            "set-option -w -t @99 @fl_hosted muse:ada",
         ]
     );
 }
@@ -945,13 +1006,14 @@ fn the_tmux_runtime_creates_the_muse_session_when_it_does_not_run() {
     let dir = TempDir::new().unwrap();
     let tmux = TmuxLog::install(dir.path(), false, &[]);
     let spec = muse_spec("hi");
-    assert!(TmuxRuntime.spawn("muse", "ada", None, Some(&spec)));
+    assert!(TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"));
     assert_eq!(
         tmux.calls(),
         [
             "has-session -t =muse",
-            "new-session -d -s muse -n ada -e AGENT_PERSONA=ada -- /bin/muse --model \
-             muse-wonder-full-1.0 hi",
+            "new-session -d -P -F #{window_id} -s muse -n ada -e AGENT_PERSONA=ada -- \
+             /bin/muse --model muse-wonder-full-1.0 hi",
+            "set-option -w -t @99 @fl_hosted muse:ada",
         ]
     );
 }
@@ -961,7 +1023,7 @@ fn the_tmux_runtime_leaves_an_existing_muse_window_alone() {
     let dir = TempDir::new().unwrap();
     let tmux = TmuxLog::install(dir.path(), true, &["mira", "ada"]);
     let spec = muse_spec("hi");
-    assert!(!TmuxRuntime.spawn("muse", "ada", None, Some(&spec)));
+    assert!(!TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"));
     let calls = tmux.calls();
     assert!(
         calls
@@ -971,20 +1033,37 @@ fn the_tmux_runtime_leaves_an_existing_muse_window_alone() {
     );
 }
 
+const LIST_MARKED: &str = "list-windows -t =muse -F #{window_id}\t#{window_name}\t#{@fl_hosted}";
+
 #[test]
-fn the_tmux_runtime_kills_a_muse_window_and_never_the_session() {
+fn the_tmux_runtime_kills_a_marked_muse_window_by_its_id_and_never_the_session() {
     let dir = TempDir::new().unwrap();
-    let tmux = TmuxLog::install(dir.path(), true, &["mira", "ada"]);
-    assert!(TmuxRuntime.kill("muse:ada"));
-    let calls = tmux.calls();
-    assert!(
-        calls.contains(&"kill-window -t =muse:ada".to_string()),
-        "{calls:?}"
+    let tmux = TmuxLog::install(dir.path(), true, &["mira=muse:mira", "ada=muse:ada"]);
+    assert!(TmuxRuntime.kill("muse:ada", "muse:ada"));
+    assert_eq!(
+        tmux.calls(),
+        ["has-session -t =muse", LIST_MARKED, "kill-window -t @2"]
     );
-    assert!(
-        calls.iter().all(|c| !c.starts_with("kill-session")),
-        "{calls:?}"
-    );
+}
+
+#[test]
+fn the_tmux_runtime_never_kills_a_muse_window_without_its_mark() {
+    // Not marked at all, or marked for another session: someone else's window of the name.
+    for window in ["ada", "ada=muse:bob", "ada=muse:ada-2"] {
+        let dir = TempDir::new().unwrap();
+        let tmux = TmuxLog::install(dir.path(), true, &["mira=muse:mira", window]);
+        assert!(
+            TmuxRuntime.kill("muse:ada", "muse:ada"),
+            "{window}: nothing of ours to kill"
+        );
+        assert_eq!(tmux.mutations(), Vec::<String>::new(), "{window}");
+    }
+    // An empty id is nobody's mark: it never matches an unmarked window.
+    let dir = TempDir::new().unwrap();
+    let tmux = TmuxLog::install(dir.path(), true, &["ada"]);
+    assert!(!TmuxRuntime.kill("muse:ada", ""));
+    assert!(!TmuxRuntime.owns("muse:ada", ""));
+    assert!(tmux.mutations().is_empty());
 }
 
 #[test]
@@ -992,29 +1071,109 @@ fn the_tmux_runtime_kills_nothing_when_the_muse_window_is_gone_or_ambiguous() {
     // Gone (or the session is): nothing to kill, and it counts as stopped.
     let dir = TempDir::new().unwrap();
     {
-        let tmux = TmuxLog::install(dir.path(), true, &["mira"]);
-        assert!(TmuxRuntime.kill("muse:ada"));
-        assert!(tmux.calls().iter().all(|c| !c.starts_with("kill")));
+        let tmux = TmuxLog::install(dir.path(), true, &["mira=muse:mira"]);
+        assert!(TmuxRuntime.kill("muse:ada", "muse:ada"));
+        assert!(tmux.mutations().is_empty());
     }
     let dir = TempDir::new().unwrap();
     {
         let tmux = TmuxLog::install(dir.path(), false, &[]);
-        assert!(TmuxRuntime.kill("muse:ada"));
-        assert!(tmux.calls().iter().all(|c| !c.starts_with("kill")));
+        assert!(TmuxRuntime.kill("muse:ada", "muse:ada"));
+        assert!(tmux.mutations().is_empty());
     }
-    // Two windows of the name: a kill by name would be ambiguous, so none is made.
+    // Two windows of the name, ours among them: a kill is not made on a guess.
     let dir = TempDir::new().unwrap();
-    let tmux = TmuxLog::install(dir.path(), true, &["ada", "ada"]);
-    assert!(!TmuxRuntime.kill("muse:ada"));
-    assert!(tmux.calls().iter().all(|c| !c.starts_with("kill")));
+    let tmux = TmuxLog::install(dir.path(), true, &["ada=muse:ada", "ada"]);
+    assert!(!TmuxRuntime.kill("muse:ada", "muse:ada"));
+    assert!(tmux.mutations().is_empty());
+}
+
+#[test]
+fn the_tmux_runtime_reports_a_failed_window_kill() {
+    let dir = TempDir::new().unwrap();
+    let tmux =
+        TmuxLog::install_failing(dir.path(), true, &["ada=muse:ada"], "@99", &["kill-window"]);
+    // The window is still listed after the failed kill, so it is not gone.
+    assert!(!TmuxRuntime.kill("muse:ada", "muse:ada"));
+    assert_eq!(tmux.mutations(), ["kill-window -t @1"]);
+}
+
+#[test]
+fn the_tmux_runtime_owns_only_a_window_carrying_the_mark() {
+    let dir = TempDir::new().unwrap();
+    let tmux = TmuxLog::install(
+        dir.path(),
+        true,
+        &["ada", "bob=muse:bob", "cy=muse:cy", "dee=muse:dee"],
+    );
+    assert!(!TmuxRuntime.owns("muse:ada", "muse:ada"), "unmarked");
+    assert!(!TmuxRuntime.owns("muse:bob", "muse:ada"), "another mark");
+    assert!(TmuxRuntime.owns("muse:cy", "muse:cy"));
+    assert!(!TmuxRuntime.owns("muse:eve", "muse:eve"), "no such window");
+    // A name is exact: `cy` is not `cyd`.
+    assert!(!TmuxRuntime.owns("muse:cyd", "muse:cy"));
+    assert!(tmux.mutations().is_empty());
+    // Existence alone ignores marks (any window of the name counts as live).
+    assert!(TmuxRuntime.exists("muse:ada"));
+}
+
+#[test]
+fn a_failed_mark_removes_the_window_the_spawn_just_made_by_its_id_and_fails() {
+    let dir = TempDir::new().unwrap();
+    let spec = muse_spec("hi");
+    {
+        let tmux =
+            TmuxLog::install_failing(dir.path(), true, &["mira=muse:mira"], "@7", &["set-option"]);
+        assert!(!TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"));
+        let mutations = tmux.mutations();
+        assert_eq!(mutations.len(), 3, "{mutations:?}");
+        assert!(mutations[0].starts_with("new-window "), "{mutations:?}");
+        assert_eq!(
+            mutations[1..],
+            [
+                "set-option -w -t @7 @fl_hosted muse:ada",
+                "kill-window -t @7"
+            ]
+        );
+    }
+
+    // The same through the new-session branch.
+    let dir = TempDir::new().unwrap();
+    let tmux = TmuxLog::install_failing(dir.path(), false, &[], "@3", &["set-option"]);
+    assert!(!TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"));
+    assert_eq!(tmux.mutations().last().unwrap(), "kill-window -t @3");
+}
+
+#[test]
+fn a_spawn_that_cannot_read_the_window_id_marks_and_kills_nothing() {
+    let spec = muse_spec("hi");
+    for out in ["", "ada", "@", "@x1", "%5"] {
+        let dir = TempDir::new().unwrap();
+        let tmux = TmuxLog::install_failing(dir.path(), true, &[], out, &[]);
+        assert!(
+            !TmuxRuntime.spawn("muse", "ada", None, Some(&spec), "muse:ada"),
+            "{out:?}"
+        );
+        let mutations = tmux.mutations();
+        assert_eq!(mutations.len(), 1, "{out:?}: {mutations:?}");
+        assert!(mutations[0].starts_with("new-window "));
+    }
 }
 
 #[test]
 fn the_tmux_runtime_still_kills_a_persona_session_whole() {
     let dir = TempDir::new().unwrap();
     let tmux = TmuxLog::install(dir.path(), true, &[]);
-    assert!(TmuxRuntime.kill("Ada"));
+    assert!(TmuxRuntime.kill("Ada", "claude:ada"));
     assert_eq!(tmux.calls()[0], "kill-session -t =Ada");
+}
+
+#[test]
+fn a_blank_persona_session_is_spawned_as_before_without_a_window_id_or_mark() {
+    let dir = TempDir::new().unwrap();
+    let tmux = TmuxLog::install(dir.path(), false, &[]);
+    assert!(TmuxRuntime.spawn("Ada", "claude", None, None, "claude:ada"));
+    assert_eq!(tmux.calls(), ["new-session -d -s Ada -n claude"]);
 }
 
 #[test]
@@ -1187,13 +1346,11 @@ fn the_shared_session_name_is_not_a_muse_persona() {
 
 /// Our `muse:ada` window died; the next window of that name is someone else's.
 fn our_window_dies_then_a_foreign_one_opens(fake: &FakeRuntime) {
-    fake.windows.borrow_mut().remove("muse:ada");
-    fake.sync_muse_session();
+    fake.close_window("muse:ada");
 }
 
 fn a_foreign_window_opens(fake: &FakeRuntime) {
-    fake.windows.borrow_mut().insert("muse:ada".to_string());
-    fake.sync_muse_session();
+    fake.open_foreign_window("muse:ada");
 }
 
 #[test]
@@ -1278,8 +1435,7 @@ fn a_restart_of_a_stale_display_record_with_a_live_old_session_opens_no_second_m
     record.runtime_spawned = true;
     persist_hosted_session(&store, &record, "owner").unwrap();
     fake.live.borrow_mut().insert("Ada".to_string());
-    fake.windows.borrow_mut().clear();
-    fake.sync_muse_session();
+    fake.close_window("muse:ada");
     fake.calls.borrow_mut().clear();
     fake.launches.borrow_mut().clear();
     let listener = webhook_listener(home.path(), "ada");
@@ -1301,15 +1457,196 @@ fn a_restart_of_a_stale_display_record_with_a_live_old_session_opens_no_second_m
 #[test]
 fn the_shared_session_and_an_empty_window_are_never_killed() {
     let dir = TempDir::new().unwrap();
-    let tmux = TmuxLog::install(dir.path(), true, &["ada"]);
+    let tmux = TmuxLog::install(dir.path(), true, &["ada=muse:ada"]);
     for unit in ["muse", "muse:", ":ada", ":", ""] {
-        assert!(!TmuxRuntime.kill(unit), "{unit:?}");
+        assert!(!TmuxRuntime.kill(unit, "muse:ada"), "{unit:?}");
     }
     assert!(tmux.calls().is_empty(), "{:?}", tmux.calls());
 
     let fake = FakeRuntime::with_muse_windows(&["ada", "bob"]);
     for unit in ["muse", "muse:", ":ada", ""] {
-        assert!(!fake.kill(unit), "{unit:?}");
+        assert!(!fake.kill(unit, "muse:ada"), "{unit:?}");
     }
     assert!(fake.is_live("muse:ada") && fake.is_live("muse:bob") && fake.is_live("muse"));
+}
+
+// -------------------------------------------- a window is ours only when it carries our mark
+
+/// `muse:ada` is hosted and its window was opened by the lifecycle; then it dies and a foreign
+/// window takes the name.
+fn ours_dies_then_a_foreign_window_takes_the_name(
+    store: &MemStore,
+    env: &LifecycleEnv<'_>,
+    fake: &FakeRuntime,
+) {
+    spin(store, env, "ada", "muse");
+    assert!(record_of(store).runtime_spawned);
+    fake.close_window("muse:ada");
+    fake.open_foreign_window("muse:ada");
+}
+
+fn record_of(store: &MemStore) -> HostedSessionRecord {
+    find_hosted_session(store, &["muse:ada"]).unwrap().unwrap()
+}
+
+#[test]
+fn a_spawn_marks_its_muse_window_with_the_hosted_session_id_and_a_blank_session_gets_no_mark() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    spin(&store, &env, "ada", "claude");
+    assert_eq!(
+        *fake.marks.borrow(),
+        [("muse:ada".to_string(), "muse:ada".to_string())].into(),
+        "only the Muse window is marked, with the hosted session id"
+    );
+    assert!(fake.owns("muse:ada", "muse:ada"));
+    assert!(!fake.owns("muse:ada", "muse:bob"));
+    assert!(fake.owns("Ada", "claude:ada"), "a session needs no mark");
+}
+
+#[test]
+fn a_restart_does_not_claim_or_kill_a_foreign_window_that_took_the_name_of_a_dead_one() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    ours_dies_then_a_foreign_window_takes_the_name(&store, &env, &fake);
+    let listener = webhook_listener(home.path(), "ada");
+
+    // The name exists, so a name check keeps the flag; the mark does not.
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+    assert!(!out.record.runtime_spawned, "the window is not ours");
+    assert_eq!(fake.launches.borrow().len(), 1, "nothing new was opened");
+    assert!(out.record.hydration_dispatched);
+    assert!(delivered(&listener), "the prompt goes through delivery");
+
+    let stopped = teardown(&store, &env, "muse:ada");
+    assert!(!stopped.runtime_stopped);
+    assert!(killed(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada") && fake.is_live("muse"));
+    assert!(!record_of(&store).runtime_spawned);
+}
+
+#[test]
+fn a_spin_up_does_not_claim_or_kill_a_foreign_window_that_took_the_name_of_a_dead_one() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    ours_dies_then_a_foreign_window_takes_the_name(&store, &env, &fake);
+    let listener = webhook_listener(home.path(), "ada");
+
+    let out = spin(&store, &env, "ada", "muse");
+    assert!(!out.runtime_spawned);
+    assert!(!record_of(&store).runtime_spawned);
+    assert_eq!(fake.launches.borrow().len(), 1, "nothing new was opened");
+    assert!(out.hydration_dispatched);
+    assert!(delivered(&listener));
+
+    assert!(!teardown(&store, &env, "muse:ada").runtime_stopped);
+    assert!(killed(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_teardown_with_a_stale_flag_never_kills_a_foreign_window_nor_reports_it_stopped() {
+    // No restart or spin-up repaired the flag: the foreign window is under the name, the flag
+    // still says ours. The runtime is asked, and it refuses a window without our mark.
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    ours_dies_then_a_foreign_window_takes_the_name(&store, &env, &fake);
+    assert!(record_of(&store).runtime_spawned, "the flag is stale");
+
+    let out = teardown(&store, &env, "muse:ada");
+    assert!(
+        !out.runtime_stopped,
+        "a foreign window is not a stopped runtime"
+    );
+    assert!(fake.is_live("muse:ada"), "the foreign window was killed");
+    assert!(!record_of(&store).runtime_spawned, "the claim is cleared");
+
+    // A window marked for another session is no different.
+    let store = MemStore::default();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    ours_dies_then_a_foreign_window_takes_the_name(&store, &env, &fake);
+    fake.marks
+        .borrow_mut()
+        .insert("muse:ada".to_string(), "muse:bob".to_string());
+    assert!(!teardown(&store, &env, "muse:ada").runtime_stopped);
+    assert!(
+        fake.is_live("muse:ada"),
+        "a window with another mark was killed"
+    );
+}
+
+#[test]
+fn a_teardown_kills_the_marked_window_it_opened() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    let out = teardown(&store, &env, "muse:ada");
+    assert!(out.runtime_stopped);
+    assert_eq!(killed(&fake), ["kill muse:ada"]);
+    assert!(!fake.is_live("muse:ada") && fake.marks.borrow().is_empty());
+}
+
+#[test]
+fn a_launched_command_survives_only_as_the_marked_window_not_as_any_window_of_the_name() {
+    let home = TempDir::new().unwrap();
+    // Any window of the name, but not the one this lifecycle opened.
+    let fake = FakeRuntime::with_muse_windows(&["ada"]);
+    let env = fake.env(home.path());
+    assert!(!launch_survived(&env, "muse:ada", "muse:ada"));
+    assert_eq!(
+        fake.exists_calls.get(),
+        0,
+        "survival does not go by the name"
+    );
+
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    assert!(fake.spawn("muse", "ada", None, Some(&muse_spec("hi")), "muse:ada"));
+    assert!(launch_survived(&env, "muse:ada", "muse:ada"));
+    assert!(!launch_survived(&env, "muse:ada", "muse:bob"));
+}
+
+#[test]
+fn a_hand_edited_flag_does_not_make_a_window_without_the_mark_ours_on_restart() {
+    // The record says it spawned the window; the window under the name has no mark.
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::with_muse_windows(&["ada"]);
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    let mut record = record_of(&store);
+    record.runtime_spawned = true;
+    persist_hosted_session(&store, &record, "owner").unwrap();
+
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+    assert!(!out.record.runtime_spawned);
+    assert!(!teardown(&store, &env, "muse:ada").runtime_stopped);
+    assert!(killed(&fake).is_empty());
+}
+
+#[test]
+fn non_muse_vendors_keep_a_blank_session_that_teardown_kills_by_name() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    for vendor in ["claude", "codex", "grok"] {
+        spin(&store, &env, "ada", vendor);
+        let out = teardown(&store, &env, &format!("{vendor}:ada"));
+        assert!(out.runtime_stopped, "{vendor}");
+    }
+    assert_eq!(killed(&fake), ["kill Ada", "kill Ada", "kill Ada"]);
+    assert!(fake.marks.borrow().is_empty());
 }
