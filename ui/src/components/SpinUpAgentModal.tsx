@@ -540,6 +540,8 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [worktreePolicy, setWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
   const [worktreePolicyTouched, setWorktreePolicyTouched] = useState(false);
+  const [localProviderPreset, setLocalProviderPreset] =
+    useState<string>("vendor-native");
   const [posture, setPosture] = useState<UniversalPermissionPosture>("ask");
   const [sandbox, setSandbox] =
     useState<UniversalSandboxMode>("vendor-default");
@@ -932,6 +934,70 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 <option key={n} value={n} />
               ))}
             </datalist>
+          </div>
+
+          {/* Record #72: Local Model & API-Key Endpoint Preset */}
+          <div
+            data-testid="spin-up-local-provider-section"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              padding: "6px 10px",
+              borderRadius: "6px",
+              backgroundColor: "var(--bg-elevated)",
+              border: "1px solid var(--border-subtle)",
+              fontSize: "11px",
+              flexWrap: "wrap",
+            }}
+          >
+            <label
+              htmlFor="fd-spin-up-local-provider"
+              style={{
+                fontWeight: 600,
+                color: "var(--text-muted)",
+                textTransform: "uppercase",
+              }}
+            >
+              Model Provider (#72)
+            </label>
+            <select
+              id="fd-spin-up-local-provider"
+              aria-label="Model Provider Endpoint"
+              data-testid="spin-up-local-provider-select"
+              className="fd-select fd-mono"
+              value={localProviderPreset}
+              disabled={submitting}
+              onChange={(e) => setLocalProviderPreset(e.target.value)}
+              style={{ fontSize: "10.5px" }}
+            >
+              <option value="vendor-native">
+                vendor-native (Subscription CLI)
+              </option>
+              <option value="ollama-local">
+                ollama-local (http://127.0.0.1:11434/v1)
+              </option>
+              <option value="lemonade-rocm">
+                lemonade-rocm (http://127.0.0.1:8000/v1 · AMD ROCm)
+              </option>
+              <option value="openai-compat-vllm">
+                openai-compat-vllm (vault://ferrogate/providers/local-vllm-key)
+              </option>
+            </select>
+            <code
+              className="fd-mono"
+              data-testid="spin-up-local-provider-endpoint-preview"
+              style={{ fontSize: "10px", color: "var(--accent-primary)" }}
+            >
+              {localProviderPreset === "ollama-local"
+                ? "http://127.0.0.1:11434/v1 (keyless)"
+                : localProviderPreset === "lemonade-rocm"
+                  ? "http://127.0.0.1:8000/v1 (ROCm)"
+                  : localProviderPreset === "openai-compat-vllm"
+                    ? "http://127.0.0.1:8080/v1 (vault://ferrogate/providers/local-vllm-key)"
+                    : "Subscription CLI default"}
+            </code>
           </div>
 
           {/* Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Port Allocation */}

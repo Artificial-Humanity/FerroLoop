@@ -420,6 +420,136 @@ export const BUILTIN_ROLE_REGISTRY: ConfigurableRoleRecord[] = [
       "Record empirical milestones, experiment notes, and technical dispatches.",
   },
 ];
+
+/**
+ * Record #71: Manage Vendor Cloud Sessions in FerroDeck.
+ */
+export type VendorCloudSessionVendor =
+  | "claude-cloud"
+  | "codex-cloud"
+  | "gemini-jules-cloud"
+  | "grok-cloud";
+
+export type VendorCloudSessionStatus =
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed";
+
+export interface VendorCloudSessionEntry {
+  session_id: string;
+  vendor: VendorCloudSessionVendor;
+  vendor_label: string;
+  repo_branch: string;
+  status: VendorCloudSessionStatus;
+  turns: number;
+  tokens_used: number;
+  mirrored: boolean;
+  last_active: string;
+}
+
+export const DEFAULT_VENDOR_CLOUD_SESSIONS: VendorCloudSessionEntry[] = [
+  {
+    session_id: "cs-claude-web-901",
+    vendor: "claude-cloud",
+    vendor_label: "Claude Cloud / Web",
+    repo_branch: "Artificial-Humanity/FerroLoop@feat/cloud-handoff",
+    status: "running",
+    turns: 18,
+    tokens_used: 64200,
+    mirrored: true,
+    last_active: "2m ago",
+  },
+  {
+    session_id: "cs-codex-cloud-412",
+    vendor: "codex-cloud",
+    vendor_label: "OpenAI Codex Cloud",
+    repo_branch: "Artificial-Humanity/FerroDeck@fix/remote-sync",
+    status: "paused",
+    turns: 11,
+    tokens_used: 38900,
+    mirrored: false,
+    last_active: "14m ago",
+  },
+  {
+    session_id: "cs-jules-cloud-207",
+    vendor: "gemini-jules-cloud",
+    vendor_label: "Google Jules / Gemini Cloud",
+    repo_branch: "Artificial-Humanity/FerroLoop@audit/acp-matrix",
+    status: "completed",
+    turns: 24,
+    tokens_used: 91500,
+    mirrored: true,
+    last_active: "1h ago",
+  },
+  {
+    session_id: "cs-grok-cloud-088",
+    vendor: "grok-cloud",
+    vendor_label: "xAI Grok Cloud",
+    repo_branch: "Artificial-Humanity/FerroLoop@exp/fast-triage",
+    status: "running",
+    turns: 7,
+    tokens_used: 21400,
+    mirrored: false,
+    last_active: "5m ago",
+  },
+];
+
+/**
+ * Record #72: Local Model & API-Key Agent Lifecycle (OpenAI-compatible, Ollama, Lemonade).
+ */
+export type LocalModelProviderKind =
+  | "ollama"
+  | "lemonade"
+  | "openai-compatible";
+
+export interface LocalModelProviderPreset {
+  id: string;
+  kind: LocalModelProviderKind;
+  label: string;
+  endpoint_url: string;
+  default_model: string;
+  vault_credential_ref: string;
+  context_window_tokens: number;
+  max_output_tokens: number;
+  lifecycle_ops: readonly ("spin-up" | "compact" | "reforge" | "recast")[];
+}
+
+export const DEFAULT_LOCAL_MODEL_PROVIDERS: LocalModelProviderPreset[] = [
+  {
+    id: "ollama-local",
+    kind: "ollama",
+    label: "Ollama Local Runtime",
+    endpoint_url: "http://127.0.0.1:11434/v1",
+    default_model: "qwen3-coder:30b",
+    vault_credential_ref: "keyless (loopback)",
+    context_window_tokens: 131072,
+    max_output_tokens: 16384,
+    lifecycle_ops: ["spin-up", "compact", "reforge", "recast"],
+  },
+  {
+    id: "lemonade-rocm",
+    kind: "lemonade",
+    label: "Lemonade (AMD Ryzen AI / ROCm)",
+    endpoint_url: "http://127.0.0.1:8000/v1",
+    default_model: "Llama-3.3-70B-Instruct-ROCm",
+    vault_credential_ref: "keyless (loopback)",
+    context_window_tokens: 131072,
+    max_output_tokens: 16384,
+    lifecycle_ops: ["spin-up", "compact", "reforge", "recast"],
+  },
+  {
+    id: "openai-compat-vllm",
+    kind: "openai-compatible",
+    label: "OpenAI-Compatible (vLLM / llama.cpp / SGLang)",
+    endpoint_url: "http://127.0.0.1:8080/v1",
+    default_model: "deepseek-r1-distill-qwen-32b",
+    vault_credential_ref: "vault://ferrogate/providers/local-vllm-key",
+    context_window_tokens: 65536,
+    max_output_tokens: 8192,
+    lifecycle_ops: ["spin-up", "compact", "reforge", "recast"],
+  },
+];
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -1409,6 +1539,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     useState<RoleReviewPolicy>("lead-review");
   const [roleDraftPromptTemplate, setRoleDraftPromptTemplate] = useState("");
   const [roleRegistryBanner, setRoleRegistryBanner] = useState<string | null>(
+    null,
+  );
+  const [cloudSessions, setCloudSessions] = useState<VendorCloudSessionEntry[]>(
+    () => DEFAULT_VENDOR_CLOUD_SESSIONS,
+  );
+  const [cloudSessionBanner, setCloudSessionBanner] = useState<string | null>(
+    null,
+  );
+  const [localProviders, setLocalProviders] = useState<
+    LocalModelProviderPreset[]
+  >(() => DEFAULT_LOCAL_MODEL_PROVIDERS);
+  const [localProviderDraftKind, setLocalProviderDraftKind] =
+    useState<LocalModelProviderKind>("ollama");
+  const [localProviderDraftEndpoint, setLocalProviderDraftEndpoint] = useState(
+    "http://127.0.0.1:11434/v1",
+  );
+  const [localProviderDraftVaultRef, setLocalProviderDraftVaultRef] = useState(
+    "keyless (loopback)",
+  );
+  const [localProviderDraftContextWindow, setLocalProviderDraftContextWindow] =
+    useState("131072");
+  const [localProviderDraftMaxOutput, setLocalProviderDraftMaxOutput] =
+    useState("16384");
+  const [localProviderBanner, setLocalProviderBanner] = useState<string | null>(
     null,
   );
 
@@ -3172,6 +3326,499 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   Save Role Record
                 </button>
               </div>
+            </div>
+          </div>
+
+          {/* Record #71: Manage Vendor Cloud Sessions in FerroDeck */}
+          <div
+            className="fd-card"
+            data-testid="vendor-cloud-sessions-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: "0 0 2px 0",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Vendor Cloud Sessions (#71)
+                </h3>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "11.5px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  Inspect and attach remote cloud sessions across Claude Cloud,
+                  OpenAI Codex Cloud, Google Jules / Gemini Cloud, and xAI Grok
+                  Cloud via <code className="fd-mono">/api/v1/cloud-sessions</code>.
+                </p>
+              </div>
+              <span
+                className="fd-badge fd-mono"
+                data-testid="vendor-cloud-sessions-count-badge"
+                style={{ fontSize: "10.5px" }}
+              >
+                {cloudSessions.length} Cloud Sessions (
+                {cloudSessions.filter((s) => s.mirrored).length} Mirrored)
+              </span>
+            </div>
+
+            {cloudSessionBanner && (
+              <div
+                role="status"
+                data-testid="vendor-cloud-sessions-banner"
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  color: "#34D399",
+                  padding: "4px 8px",
+                  borderRadius: "4px",
+                  backgroundColor: "rgba(16, 185, 129, 0.12)",
+                }}
+              >
+                {cloudSessionBanner}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              {cloudSessions.map((sess) => (
+                <div
+                  key={sess.session_id}
+                  data-testid={`cloud-session-row-${sess.session_id}`}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                    backgroundColor: "var(--bg-elevated)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    fontSize: "11.5px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <code className="fd-mono" style={{ fontWeight: 700 }}>
+                        {sess.session_id}
+                      </code>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`cloud-session-vendor-${sess.session_id}`}
+                      >
+                        {sess.vendor_label}
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`cloud-session-status-${sess.session_id}`}
+                      >
+                        {sess.status}
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`cloud-session-mirrored-${sess.session_id}`}
+                      >
+                        {sess.mirrored ? "mirrored" : "unattached"}
+                      </span>
+                    </div>
+
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-primary"
+                        data-testid={`cloud-session-attach-btn-${sess.session_id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() => {
+                          setCloudSessions((prev) =>
+                            prev.map((item) =>
+                              item.session_id === sess.session_id
+                                ? { ...item, mirrored: true }
+                                : item,
+                            ),
+                          );
+                          setCloudSessionBanner(
+                            `Attached and mirrored remote cloud session ${sess.session_id} (${sess.vendor_label}).`,
+                          );
+                          if (typeof globalThis.fetch === "function") {
+                            void globalThis
+                              .fetch(
+                                `/api/v1/cloud-sessions/${encodeURIComponent(sess.session_id)}/attach`,
+                                { method: "POST" },
+                              )
+                              .catch(() => {});
+                          }
+                        }}
+                      >
+                        Attach / Mirror
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`cloud-session-sync-handoff-btn-${sess.session_id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() => {
+                          setCloudSessionBanner(
+                            `Synced FerroState handoff checkpoint for ${sess.session_id} (${sess.repo_branch}).`,
+                          );
+                          if (typeof globalThis.fetch === "function") {
+                            void globalThis
+                              .fetch(
+                                `/api/v1/cloud-sessions/${encodeURIComponent(sess.session_id)}/handoff`,
+                                { method: "POST" },
+                              )
+                              .catch(() => {});
+                          }
+                        }}
+                      >
+                        Sync Handoff
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`cloud-session-toggle-pause-btn-${sess.session_id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() => {
+                          const nextStatus: VendorCloudSessionStatus =
+                            sess.status === "paused" ? "running" : "paused";
+                          setCloudSessions((prev) =>
+                            prev.map((item) =>
+                              item.session_id === sess.session_id
+                                ? { ...item, status: nextStatus }
+                                : item,
+                            ),
+                          );
+                          setCloudSessionBanner(
+                            `Updated ${sess.session_id} cloud session status to ${nextStatus}.`,
+                          );
+                        }}
+                      >
+                        {sess.status === "paused" ? "Resume" : "Pause"}
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`cloud-session-pull-branch-btn-${sess.session_id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() => {
+                          setCloudSessionBanner(
+                            `Pulled remote branch ${sess.repo_branch} from ${sess.vendor_label}.`,
+                          );
+                        }}
+                      >
+                        Pull Branch / PR
+                      </button>
+                    </div>
+                  </div>
+                  <div
+                    className="fd-mono"
+                    style={{ fontSize: "10.5px", color: "var(--text-secondary)" }}
+                  >
+                    {sess.repo_branch} · {sess.turns} turns ·{" "}
+                    {(sess.tokens_used / 1000).toFixed(1)}k tokens · active{" "}
+                    {sess.last_active}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Record #72: Local Model & API-Key Agent Lifecycle (Ollama, Lemonade, OpenAI-Compatible) */}
+          <div
+            className="fd-card"
+            data-testid="local-model-providers-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: "0 0 2px 0",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Local &amp; API-Key Model Providers (#72)
+                </h3>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "11.5px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  Configure Ollama, Lemonade (AMD Ryzen AI / ROCm), and custom
+                  OpenAI-compatible endpoints (<code className="fd-mono">vLLM</code>{" "}
+                  / <code className="fd-mono">llama.cpp</code> /{" "}
+                  <code className="fd-mono">SGLang</code>) with FerroGate Vault
+                  references across the full agent lifecycle.
+                </p>
+              </div>
+              <span
+                className="fd-badge fd-mono"
+                data-testid="local-providers-lifecycle-badge"
+                style={{ fontSize: "10.5px" }}
+              >
+                Lifecycle: spin-up · compact · reforge · recast
+              </span>
+            </div>
+
+            {localProviderBanner && (
+              <div
+                role="status"
+                data-testid="local-provider-status-banner"
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  color: "#34D399",
+                  padding: "4px 8px",
+                  borderRadius: "4px",
+                  backgroundColor: "rgba(16, 185, 129, 0.12)",
+                }}
+              >
+                {localProviderBanner}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              {localProviders.map((prov) => (
+                <div
+                  key={prov.id}
+                  data-testid={`local-provider-row-${prov.id}`}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                    backgroundColor: "var(--bg-elevated)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    fontSize: "11px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <strong>{prov.label}</strong>
+                    <code
+                      className="fd-mono"
+                      data-testid={`local-provider-endpoint-${prov.id}`}
+                    >
+                      {prov.endpoint_url}
+                    </code>
+                    <span className="fd-badge fd-mono">{prov.default_model}</span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`local-provider-vault-ref-${prov.id}`}
+                    >
+                      {prov.vault_credential_ref}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid={`local-provider-load-btn-${prov.id}`}
+                    style={{ fontSize: "10.5px", padding: "2px 8px" }}
+                    onClick={() => {
+                      setLocalProviderDraftKind(prov.kind);
+                      setLocalProviderDraftEndpoint(prov.endpoint_url);
+                      setLocalProviderDraftVaultRef(prov.vault_credential_ref);
+                      setLocalProviderDraftContextWindow(
+                        String(prov.context_window_tokens),
+                      );
+                      setLocalProviderDraftMaxOutput(
+                        String(prov.max_output_tokens),
+                      );
+                    }}
+                  >
+                    Load Preset
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div
+              data-testid="local-provider-editor-form"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+                gap: "6px",
+                alignItems: "center",
+              }}
+            >
+              <select
+                aria-label="Local Provider Kind"
+                data-testid="local-provider-kind-select"
+                className="fd-select fd-mono"
+                value={localProviderDraftKind}
+                onChange={(e) =>
+                  setLocalProviderDraftKind(
+                    e.target.value as LocalModelProviderKind,
+                  )
+                }
+                style={{ fontSize: "11px" }}
+              >
+                <option value="ollama">ollama</option>
+                <option value="lemonade">lemonade (AMD ROCm)</option>
+                <option value="openai-compatible">openai-compatible</option>
+              </select>
+
+              <input
+                type="text"
+                aria-label="Local Provider Endpoint URL"
+                data-testid="local-provider-endpoint-input"
+                className="fd-input fd-mono"
+                value={localProviderDraftEndpoint}
+                onChange={(e) => setLocalProviderDraftEndpoint(e.target.value)}
+                style={{ fontSize: "11px" }}
+              />
+
+              <select
+                aria-label="Local Provider Vault Credential Reference"
+                data-testid="local-provider-vault-ref-select"
+                className="fd-select fd-mono"
+                value={localProviderDraftVaultRef}
+                onChange={(e) => setLocalProviderDraftVaultRef(e.target.value)}
+                style={{ fontSize: "11px" }}
+              >
+                <option value="keyless (loopback)">keyless (loopback)</option>
+                <option value="vault://ferrogate/providers/local-vllm-key">
+                  vault://ferrogate/providers/local-vllm-key
+                </option>
+                <option value="vault://ferrogate/providers/openrouter-key">
+                  vault://ferrogate/providers/openrouter-key
+                </option>
+              </select>
+
+              <input
+                type="number"
+                aria-label="Context Window Tokens"
+                data-testid="local-provider-context-window-input"
+                className="fd-input fd-mono"
+                value={localProviderDraftContextWindow}
+                onChange={(e) =>
+                  setLocalProviderDraftContextWindow(e.target.value)
+                }
+                style={{ fontSize: "11px" }}
+              />
+
+              <button
+                type="button"
+                className="fd-btn fd-btn-primary"
+                data-testid="local-provider-save-btn"
+                style={{ fontSize: "11px", padding: "4px 8px" }}
+                onClick={() => {
+                  const nextCtx =
+                    Number(localProviderDraftContextWindow) || 131072;
+                  const nextMaxOut =
+                    Number(localProviderDraftMaxOutput) || 16384;
+                  setLocalProviders((prev) =>
+                    prev.map((p) =>
+                      p.kind === localProviderDraftKind
+                        ? {
+                            ...p,
+                            endpoint_url: localProviderDraftEndpoint.trim(),
+                            vault_credential_ref: localProviderDraftVaultRef,
+                            context_window_tokens: nextCtx,
+                            max_output_tokens: nextMaxOut,
+                          }
+                        : p,
+                    ),
+                  );
+                  setLocalProviderBanner(
+                    `Saved ${localProviderDraftKind} provider (${localProviderDraftEndpoint.trim()}, ${localProviderDraftVaultRef}, ctx=${nextCtx}).`,
+                  );
+                  if (typeof globalThis.fetch === "function") {
+                    void globalThis
+                      .fetch("/api/v1/providers/local", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          kind: localProviderDraftKind,
+                          endpoint_url: localProviderDraftEndpoint.trim(),
+                          vault_credential_ref: localProviderDraftVaultRef,
+                          context_window_tokens: nextCtx,
+                          max_output_tokens: nextMaxOut,
+                        }),
+                      })
+                      .catch(() => {});
+                  }
+                }}
+              >
+                Save &amp; Probe Endpoint
+              </button>
             </div>
           </div>
         </div>
