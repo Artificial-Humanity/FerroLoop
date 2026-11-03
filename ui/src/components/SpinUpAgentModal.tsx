@@ -146,6 +146,75 @@ export type UniversalPermissionMode =
 
 export type PermissionRuleAction = "allow" | "ask" | "deny";
 
+export type ProtectedPathClass = "settings" | "git" | "tool-config";
+
+export type UnenforcedDefaultsMode = "refuse" | "acknowledge";
+
+export type ReceiptClass =
+  | "exact"
+  | "stricter_downgrade"
+  | "tool_scoped_emulation"
+  | "unsupported"
+  | "native"
+  | "downgraded"
+  | "emulated"
+  | "refused";
+
+export type EvidenceClass =
+  | "documented"
+  | "schema_defined"
+  | "runtime_proven"
+  | "unsupported"
+  | "live-verified"
+  | "docs-verified"
+  | "source-verified";
+
+export type CanonicalRulePattern =
+  | { kind: "path_glob"; glob: string }
+  | { kind: "abs_path_glob"; glob: string }
+  | { kind: "path_class"; class: ProtectedPathClass }
+  | { kind: "argv_prefix"; argv: string[] }
+  | { kind: "shell_glob"; glob: string }
+  | { kind: "domain"; domain: string }
+  | { kind: "mcp"; server: string; tool?: string };
+
+export interface CanonicalPermissionRule {
+  capability: UniversalPermissionCapability;
+  effect: PermissionRuleAction;
+  pattern?: CanonicalRulePattern;
+}
+
+/**
+ * Canonical `PermissionPolicy` v1 (`crates/core/src/permissions/policy.rs`, PR #271).
+ * Uses `deny_unknown_fields`: contains no extra UI-only keys.
+ */
+export interface CanonicalPermissionPolicy {
+  schema_version: 1;
+  posture: UniversalPermissionPosture;
+  sandbox: UniversalSandboxMode;
+  require_fs_enforcement?: boolean;
+  unenforced_defaults?: UnenforcedDefaultsMode;
+  rules: CanonicalPermissionRule[];
+}
+
+export interface CanonicalUnenforcedItem {
+  capability: UniversalPermissionCapability;
+  vendor?: string;
+  kind?: PermissionRuleAction;
+  effect?: PermissionRuleAction;
+  reason?: string;
+}
+
+export interface CanonicalReceiptLine {
+  subject?: string;
+  requested?: string;
+  native?: string[];
+  class: ReceiptClass;
+  evidence: EvidenceClass;
+  note?: string;
+  summary?: string;
+}
+
 export type UniversalPermissionCapability =
   | "fs_read_workspace"
   | "fs_read_external"
@@ -167,6 +236,122 @@ export const UNIVERSAL_PERMISSION_CAPABILITIES: readonly UniversalPermissionCapa
     "network_web",
     "mcp_tool_call",
   ] as const;
+
+export function canonicalDefaultEffect(
+  capability: UniversalPermissionCapability,
+): PermissionRuleAction {
+  return capability === "fs_write_protected" ? "deny" : "ask";
+}
+
+const EFFECT_RANK: Record<PermissionRuleAction, number> = {
+  deny: 0,
+  ask: 1,
+  allow: 2,
+};
+
+export interface BuildCanonicalPolicyInput {
+  posture: UniversalPermissionPosture;
+  sandbox: UniversalSandboxMode;
+  matrix?: UniversalPermissionMatrix;
+  requireFsEnforcement?: boolean;
+  unenforcedDefaults?: UnenforcedDefaultsMode;
+  patternRules?: CanonicalPermissionRule[];
+}
+
+export function buildCanonicalPermissionPolicy(
+  postureOrInput: UniversalPermissionPosture | BuildCanonicalPolicyInput,
+  sandboxArg: UniversalSandboxMode = "vendor-default",
+  matrixArg: UniversalPermissionMatrix = DEFAULT_RULE_PRESET_MATRICES.workspace,
+  options?: {
+    requireFsEnforcement?: boolean;
+    unenforcedDefaults?: UnenforcedDefaultsMode;
+    patternRules?: CanonicalPermissionRule[];
+  },
+): CanonicalPermissionPolicy {
+  const resolved: BuildCanonicalPolicyInput =
+    typeof postureOrInput === "object" && postureOrInput !== null
+      ? postureOrInput
+      : {
+          posture: postureOrInput,
+          sandbox: sandboxArg,
+          matrix: matrixArg,
+          requireFsEnforcement: options?.requireFsEnforcement,
+          unenforcedDefaults: options?.unenforcedDefaults,
+          patternRules: options?.patternRules,
+        };
+  const {
+    posture,
+    sandbox,
+    matrix = DEFAULT_RULE_PRESET_MATRICES.workspace,
+    requireFsEnforcement = false,
+    unenforcedDefaults = "refuse",
+    patternRules = [],
+  } = resolved;
+
+  const isWriteCap = (cap: UniversalPermissionCapability): boolean =>
+    cap === "fs_write_workspace" ||
+    cap === "fs_write_external" ||
+    cap === "fs_write_protected";
+
+  const candidateRules: CanonicalPermissionRule[] = [];
+  for (const cap of UNIVERSAL_PERMISSION_CAPABILITIES) {
+    const effect = matrix[cap];
+    if (effect === canonicalDefaultEffect(cap)) {
+      continue;
+    }
+    if (posture === "bypass" && effect !== "allow") {
+      continue;
+    }
+    if (posture === "auto" && effect === "ask") {
+      continue;
+    }
+    if (posture === "accept-edits" && effect === "ask" && isWriteCap(cap)) {
+      continue;
+    }
+    candidateRules.push({ capability: cap, effect });
+  }
+
+  for (const r of patternRules) {
+    if (posture === "bypass" && r.effect !== "allow") {
+      continue;
+    }
+    if (posture === "auto" && r.effect === "ask") {
+      continue;
+    }
+    if (
+      posture === "accept-edits" &&
+      r.effect === "ask" &&
+      isWriteCap(r.capability)
+    ) {
+      continue;
+    }
+    candidateRules.push(
+      r.pattern
+        ? { capability: r.capability, effect: r.effect, pattern: r.pattern }
+        : { capability: r.capability, effect: r.effect },
+    );
+  }
+
+  candidateRules.sort((a, b) => {
+    const capDiff =
+      UNIVERSAL_PERMISSION_CAPABILITIES.indexOf(a.capability) -
+      UNIVERSAL_PERMISSION_CAPABILITIES.indexOf(b.capability);
+    if (capDiff !== 0) return capDiff;
+    return EFFECT_RANK[a.effect] - EFFECT_RANK[b.effect];
+  });
+
+  const effectiveRequireFs =
+    posture === "bypass" || sandbox === "off" ? false : requireFsEnforcement;
+
+  return {
+    schema_version: 1,
+    posture,
+    sandbox,
+    require_fs_enforcement: effectiveRequireFs,
+    unenforced_defaults: unenforcedDefaults,
+    rules: candidateRules,
+  };
+}
 
 export type UniversalPermissionMatrix = Record<
   UniversalPermissionCapability,
@@ -241,6 +426,10 @@ export interface PermissionCompileReceipt {
   vendor: string;
   posture: UniversalPermissionPosture;
   sandbox: UniversalSandboxMode;
+  policy: CanonicalPermissionPolicy;
+  requiresRespawn: boolean;
+  unenforced: CanonicalUnenforcedItem[];
+  receiptLines: CanonicalReceiptLine[];
   nativeFlagsOrConfig: string;
   downgrades: string[];
   emulationNotices: string[];
@@ -253,11 +442,19 @@ export function compileUniversalPermissions(
   posture: UniversalPermissionPosture = "ask",
   sandbox: UniversalSandboxMode = "vendor-default",
   matrix: UniversalPermissionMatrix = DEFAULT_RULE_PRESET_MATRICES.workspace,
+  options?: {
+    requireFsEnforcement?: boolean;
+    unenforcedDefaults?: UnenforcedDefaultsMode;
+    patternRules?: CanonicalPermissionRule[];
+  },
 ): PermissionCompileReceipt {
   const v = (vendor ?? "claude").trim().toLowerCase();
+  const policy = buildCanonicalPermissionPolicy(posture, sandbox, matrix, options);
   const downgrades: string[] = [];
   const emulationNotices: string[] = [];
   const refused: string[] = [];
+  const unenforced: CanonicalUnenforcedItem[] = [];
+  const receiptLines: CanonicalReceiptLine[] = [];
 
   const hasExplicitDeny = UNIVERSAL_PERMISSION_CAPABILITIES.some(
     (cap) => matrix[cap] === "deny",
@@ -265,6 +462,11 @@ export function compileUniversalPermissions(
   if (posture === "bypass" && hasExplicitDeny) {
     refused.push(
       "posture=bypass skips rule evaluation and cannot enforce explicit deny rules.",
+    );
+  }
+  if (options?.requireFsEnforcement && sandbox === "off") {
+    refused.push(
+      "require_fs_enforcement=true requires sandbox=vendor-default (cannot enforce without OS sandbox boundary).",
     );
   }
 
@@ -281,15 +483,36 @@ export function compileUniversalPermissions(
               : "--permission-mode bypassPermissions --allow-dangerously-skip-permissions";
     const sandboxFlag =
       sandbox === "off" ? "sandbox.enabled=false" : "sandbox.enabled=true";
+    receiptLines.push(
+      {
+        class: "native",
+        summary: `Claude CLI posture flag: ${postureFlag}`,
+        evidence: "live-verified",
+      },
+      {
+        class: "native",
+        summary: `.claude/settings.local.json (${sandboxFlag})`,
+        evidence: "docs-verified",
+      },
+    );
     if (matrix.fs_write_protected === "deny") {
-      emulationNotices.push(
-        "fs_write_protected compiled as tool-scoped deny rules: Edit(.claude/**), Edit(.git/**), Write(.claude/**), Write(.git/**); Bash writes remain governed by shell_exec.",
-      );
+      const msg =
+        "fs_write_protected compiled as tool-scoped deny rules: Edit(.claude/**), Edit(.git/**), Write(.claude/**), Write(.git/**); Bash writes remain governed by shell_exec.";
+      emulationNotices.push(msg);
+      receiptLines.push({
+        class: "emulated",
+        summary: msg,
+        evidence: "docs-verified",
+      });
     }
     return {
       vendor: "claude",
       posture,
       sandbox,
+      policy,
+      requiresRespawn: false,
+      unenforced,
+      receiptLines,
       nativeFlagsOrConfig: `${postureFlag} · .claude/settings.local.json (${sandboxFlag})`,
       downgrades,
       emulationNotices,
@@ -318,18 +541,32 @@ export function compileUniversalPermissions(
       posture === "bypass" && sandbox === "off"
         ? "--dangerously-bypass-approvals-and-sandbox"
         : `${postureFlag} ${sandboxFlag}`;
+    receiptLines.push({
+      class: "native",
+      summary: `Codex launch flags: ${combinedFlags}`,
+      evidence: "live-verified",
+    });
     if (
       matrix.fs_read_external === "deny" ||
       matrix.fs_write_external === "deny"
     ) {
-      downgrades.push(
-        "codex has no path-glob deny file; external path isolation relies on OS Seatbelt/Landlock sandbox.",
-      );
+      const msg =
+        "codex has no path-glob deny file; external path isolation relies on OS Seatbelt/Landlock sandbox.";
+      downgrades.push(msg);
+      receiptLines.push({
+        class: "downgraded",
+        summary: msg,
+        evidence: "source-verified",
+      });
     }
     return {
       vendor: "codex",
       posture,
       sandbox,
+      policy,
+      requiresRespawn: false,
+      unenforced,
+      receiptLines,
       nativeFlagsOrConfig: `${combinedFlags} · ~/.codex/rules/default.rules`,
       downgrades,
       emulationNotices,
@@ -340,17 +577,27 @@ export function compileUniversalPermissions(
 
   if (v.includes("antigravity") || v.includes("agy")) {
     if (matrix.network_web === "deny" || matrix.mcp_tool_call === "deny") {
-      refused.push(
-        "antigravity has no network_web or mcp_tool_call deny primitive; unsupported deny rule refused.",
-      );
+      const msg =
+        "antigravity has no network_web or mcp_tool_call deny primitive; unsupported deny rule refused.";
+      refused.push(msg);
     }
-    downgrades.push(
-      "shell_exec patterns downgrade to exact-string command(...) entries in ~/.gemini/antigravity/settings.json (no glob/regex).",
-    );
+    const downgradeShell =
+      "shell_exec patterns downgrade to exact-string command(...) entries in ~/.gemini/antigravity/settings.json (no glob/regex).";
+    downgrades.push(downgradeShell);
+    receiptLines.push({
+      class: "downgraded",
+      summary: downgradeShell,
+      evidence: "docs-verified",
+    });
     if (matrix.fs_read_external !== matrix.fs_write_external) {
-      downgrades.push(
-        "fs_read_external and fs_write_external share a single allowNonWorkspaceAccess boolean in Antigravity.",
-      );
+      const downgradeFs =
+        "fs_read_external and fs_write_external share a single allowNonWorkspaceAccess boolean in Antigravity.";
+      downgrades.push(downgradeFs);
+      receiptLines.push({
+        class: "downgraded",
+        summary: downgradeFs,
+        evidence: "docs-verified",
+      });
     }
     const postureFlag =
       posture === "bypass"
@@ -364,6 +611,10 @@ export function compileUniversalPermissions(
       vendor: "antigravity",
       posture,
       sandbox,
+      policy,
+      requiresRespawn: false,
+      unenforced,
+      receiptLines,
       nativeFlagsOrConfig: `${postureFlag} · ~/.gemini/antigravity/settings.json`,
       downgrades,
       emulationNotices,
@@ -385,9 +636,19 @@ export function compileUniversalPermissions(
         "grok has no path-scoped or network deny primitive; unsupported deny rule refused.",
       );
     }
-    downgrades.push(
-      "grok supports shell prefix strings in ~/.grok/user-settings.json only; no OS sandbox.",
-    );
+    const msg =
+      "grok supports shell prefix strings in ~/.grok/user-settings.json only; no OS sandbox.";
+    downgrades.push(msg);
+    receiptLines.push({
+      class: "downgraded",
+      summary: msg,
+      evidence: "source-verified",
+    });
+    unenforced.push({
+      capability: "fs_write_protected",
+      effect: matrix.fs_write_protected,
+      reason: "Grok CLI has no OS sandbox or path-scoped write deny primitive.",
+    });
     const postureFlag =
       posture === "bypass"
         ? "full-auto"
@@ -400,6 +661,10 @@ export function compileUniversalPermissions(
       vendor: "grok",
       posture,
       sandbox,
+      policy,
+      requiresRespawn: false,
+      unenforced,
+      receiptLines,
       nativeFlagsOrConfig: `mode=${postureFlag} · ~/.grok/user-settings.json`,
       downgrades,
       emulationNotices,
@@ -413,9 +678,14 @@ export function compileUniversalPermissions(
 
   // Muse
   if (matrix.network_web === "deny") {
-    downgrades.push(
-      "network_web=deny downgrades to Muse proxy-only sandbox network mode (HTTPS_PROXY=http://localhost:8877).",
-    );
+    const msg =
+      "network_web=deny downgrades to Muse proxy-only sandbox network mode (HTTPS_PROXY=http://localhost:8877).";
+    downgrades.push(msg);
+    receiptLines.push({
+      class: "downgraded",
+      summary: msg,
+      evidence: "source-verified",
+    });
   }
   const musePosture =
     posture === "bypass"
@@ -426,10 +696,19 @@ export function compileUniversalPermissions(
           ? "plan"
           : "default";
   const museSandbox = sandbox === "off" ? "--no-sandbox" : "--sandbox";
+  receiptLines.push({
+    class: "native",
+    summary: `Muse profile=${musePosture} ${museSandbox}`,
+    evidence: "source-verified",
+  });
   return {
     vendor: "muse",
     posture,
     sandbox,
+    policy,
+    requiresRespawn: false,
+    unenforced,
+    receiptLines,
     nativeFlagsOrConfig: `profile=${musePosture} ${museSandbox} · ~/.muse/settings.json`,
     downgrades,
     emulationNotices,
@@ -553,6 +832,10 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
     useState<UniversalPermissionMatrix>(
       () => DEFAULT_RULE_PRESET_MATRICES.workspace,
     );
+  const [requireFsEnforcement, setRequireFsEnforcement] = useState(false);
+  const [unenforcedDefaults, setUnenforcedDefaults] =
+    useState<UnenforcedDefaultsMode>("refuse");
+  const [permissionsTouched, setPermissionsTouched] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -560,6 +843,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
     if (isOpen) {
       setProject(resolveSpinUpProject(initialProject));
       setWorktreePolicyTouched(false);
+      setPermissionsTouched(false);
     }
   }, [initialProject, isOpen]);
 
@@ -613,6 +897,19 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
             worktree_policy: worktreePolicy,
             allocated_port: worktreePreview.allocatedPort,
             allocated_vite_port: worktreePreview.allocatedVitePort,
+          }
+        : {}),
+      ...(permissionsTouched
+        ? {
+            permission_policy: buildCanonicalPermissionPolicy(
+              posture,
+              sandbox,
+              permissionMatrix,
+              {
+                requireFsEnforcement,
+                unenforcedDefaults,
+              },
+            ),
           }
         : {}),
     };
@@ -1102,6 +1399,10 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               posture,
               sandbox,
               permissionMatrix,
+              {
+                requireFsEnforcement,
+                unenforcedDefaults,
+              },
             );
             return (
               <div
@@ -1178,9 +1479,11 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                       onChange={(e) => {
                         const nextPosture = e.target
                           .value as UniversalPermissionPosture;
+                        setPermissionsTouched(true);
                         setPosture(nextPosture);
                         if (nextPosture === "bypass") {
                           setPermissionMode("auto-accept");
+                          setRequireFsEnforcement(false);
                         } else if (nextPosture === "accept-edits") {
                           setPermissionMode("workspace-write");
                         }
@@ -1216,9 +1519,15 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                       className="fd-select fd-mono"
                       value={sandbox}
                       disabled={submitting}
-                      onChange={(e) =>
-                        setSandbox(e.target.value as UniversalSandboxMode)
-                      }
+                      onChange={(e) => {
+                        const nextSandbox = e.target
+                          .value as UniversalSandboxMode;
+                        setPermissionsTouched(true);
+                        setSandbox(nextSandbox);
+                        if (nextSandbox === "off") {
+                          setRequireFsEnforcement(false);
+                        }
+                      }}
                       style={{ width: "100%", fontSize: "10.5px" }}
                     >
                       <option value="vendor-default">vendor-default</option>
@@ -1250,6 +1559,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                       onChange={(e) => {
                         const nextPreset = e.target
                           .value as UniversalRulePreset;
+                        setPermissionsTouched(true);
                         setRulePreset(nextPreset);
                         setPermissionMatrix({
                           ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
@@ -1265,6 +1575,80 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                   </div>
                 </div>
 
+                {/* Canonical PermissionPolicy v1 enforcement & unenforced_defaults controls */}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      fontSize: "10.5px",
+                      color: "var(--text-secondary)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      data-testid="spin-up-require-fs-enforcement-checkbox"
+                      checked={requireFsEnforcement}
+                      disabled={
+                        submitting || sandbox === "off" || posture === "bypass"
+                      }
+                      onChange={(e) => {
+                        setPermissionsTouched(true);
+                        setRequireFsEnforcement(e.target.checked);
+                      }}
+                    />
+                    <span>
+                      require_fs_enforcement (OS boundary for fs_write_protected)
+                    </span>
+                  </label>
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "4px",
+                    }}
+                  >
+                    <label
+                      htmlFor="fd-spin-up-unenforced-defaults"
+                      style={{
+                        fontSize: "10px",
+                        color: "var(--text-muted)",
+                        fontWeight: 600,
+                      }}
+                    >
+                      unenforced_defaults:
+                    </label>
+                    <select
+                      id="fd-spin-up-unenforced-defaults"
+                      aria-label="Unenforced Defaults Policy"
+                      data-testid="spin-up-unenforced-defaults-select"
+                      className="fd-select fd-mono"
+                      value={unenforcedDefaults}
+                      disabled={submitting}
+                      onChange={(e) => {
+                        setPermissionsTouched(true);
+                        setUnenforcedDefaults(
+                          e.target.value as UnenforcedDefaultsMode,
+                        );
+                      }}
+                      style={{ fontSize: "10px", padding: "1px 4px" }}
+                    >
+                      <option value="refuse">refuse (default)</option>
+                      <option value="acknowledge">acknowledge</option>
+                    </select>
+                  </div>
+                </div>
+
                 <select
                   id="fd-spin-up-permission-mode"
                   aria-label="Permission & Approval Mode"
@@ -1274,12 +1658,14 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                   disabled={submitting}
                   onChange={(e) => {
                     const nextMode = e.target.value as UniversalPermissionMode;
+                    setPermissionsTouched(true);
                     setPermissionMode(nextMode);
                     setPermissionMatrix({
                       ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
                     });
                     if (nextMode === "auto-accept") {
                       setPosture("bypass");
+                      setRequireFsEnforcement(false);
                     } else if (nextMode === "workspace-write") {
                       setPosture("accept-edits");
                       setRulePreset("workspace");
@@ -1334,6 +1720,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                         onChange={(e) => {
                           const nextAction = e.target
                             .value as PermissionRuleAction;
+                          setPermissionsTouched(true);
                           setPermissionMode("granular");
                           setRulePreset("custom");
                           setPermissionMatrix((prev) => ({
@@ -1371,6 +1758,17 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                   >
                     Compiled ({compileReceipt.vendor}):{" "}
                     {compileReceipt.nativeFlagsOrConfig}
+                  </div>
+                  <div
+                    className="fd-mono"
+                    data-testid="spin-up-canonical-policy-preview"
+                    style={{ color: "var(--text-secondary)", fontSize: "10px" }}
+                  >
+                    Policy v{compileReceipt.policy.schema_version}: posture=
+                    {compileReceipt.policy.posture} · sandbox=
+                    {compileReceipt.policy.sandbox} · rules=
+                    {compileReceipt.policy.rules.length} · unenforced_defaults=
+                    {compileReceipt.policy.unenforced_defaults ?? "refuse"}
                   </div>
                   {compileReceipt.downgrades.length > 0 && (
                     <div
