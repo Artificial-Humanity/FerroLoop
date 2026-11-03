@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentSettingsModal,
   UNIVERSAL_PERMISSION_CAPABILITIES as ReExportedCapabilities,
+  compileUniversalPermissions as ReExportedCompile,
+  resolvePermissionChangeClass as ReExportedChangeClass,
   resolveVendorPermissionPreview as ReExportedVendorPreview,
 } from "../components/AgentSettingsModal";
 import {
@@ -12,8 +14,11 @@ import {
   computeDryRunInstallPlan,
 } from "../components/SettingsModal";
 import {
+  DEFAULT_RULE_PRESET_MATRICES,
   SpinUpAgentModal,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  compileUniversalPermissions,
+  resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
 } from "../components/SpinUpAgentModal";
 import {
@@ -120,10 +125,12 @@ describe("Wave 8 Item 2 (Issue #205 Phase C): Versioned releases/<ver>+<sha12>/ 
   });
 });
 
-describe("Wave 8 Item 3 (Record #103): Universal Agent Permission & Auto-Accept Management", () => {
-  it("renders Permission & Approval Mode and 8-capability granular matrix in SpinUpAgentModal and AgentSettingsModal", () => {
+describe("Wave 8 & Wave 9 (Record #103): Universal Agent Permission 3-Layer Model, Compile Receipt & Channel-Honest Remote Resolution", () => {
+  it("renders separated Posture, Sandbox, and Rule Preset controls, Compile Receipt, and keyed Change Classes in SpinUpAgentModal and AgentSettingsModal", () => {
     expect(ReExportedCapabilities).toEqual(UNIVERSAL_PERMISSION_CAPABILITIES);
     expect(ReExportedVendorPreview).toBe(resolveVendorPermissionPreview);
+    expect(ReExportedCompile).toBe(compileUniversalPermissions);
+    expect(ReExportedChangeClass).toBe(resolvePermissionChangeClass);
     expect(UNIVERSAL_PERMISSION_CAPABILITIES).toEqual([
       "fs_read_workspace",
       "fs_read_external",
@@ -135,19 +142,94 @@ describe("Wave 8 Item 3 (Record #103): Universal Agent Permission & Auto-Accept 
       "mcp_tool_call",
     ]);
 
-    expect(resolveVendorPermissionPreview("claude", "auto-accept")).toBe(
-      "--dangerously-skip-permissions",
+    // 1. Verify 5-vendor compile receipts & separation of posture vs sandbox
+    const codexBypassKeepSandbox = compileUniversalPermissions(
+      "codex",
+      "bypass",
+      "vendor-default",
+      DEFAULT_RULE_PRESET_MATRICES.workspace,
     );
-    expect(resolveVendorPermissionPreview("codex", "auto-accept")).toBe(
-      "--dangerously-bypass-approvals-and-sandbox",
+    expect(codexBypassKeepSandbox.nativeFlagsOrConfig).toContain(
+      "--ask-for-approval never --sandbox workspace-write",
     );
+    expect(codexBypassKeepSandbox.refused[0]).toContain(
+      "posture=bypass skips rule evaluation",
+    );
+
+    const agyReceipt = compileUniversalPermissions(
+      "antigravity",
+      "ask",
+      "vendor-default",
+      DEFAULT_RULE_PRESET_MATRICES["workspace-web"],
+    );
+    expect(agyReceipt.downgrades.join(" ")).toContain(
+      "exact-string command(...)",
+    );
+    expect(agyReceipt.downgrades.join(" ")).toContain(
+      "allowNonWorkspaceAccess",
+    );
+
+    const museReceipt = compileUniversalPermissions(
+      "muse",
+      "ask",
+      "vendor-default",
+      DEFAULT_RULE_PRESET_MATRICES["read-only"],
+    );
+    expect(museReceipt.downgrades.join(" ")).toContain(
+      "Muse proxy-only sandbox network mode",
+    );
+
+    // 2. Verify keyed change classes: hot | session | pending-next-start | respawn
+    expect(resolvePermissionChangeClass("claude", "pipe-rpc", "sandbox")).toBe(
+      "respawn",
+    );
+    expect(
+      resolvePermissionChangeClass(
+        "claude",
+        "pipe-rpc",
+        "posture",
+        "accept-edits",
+      ),
+    ).toBe("session");
+    expect(
+      resolvePermissionChangeClass(
+        "claude",
+        "pipe-rpc",
+        "posture",
+        "bypass",
+        false,
+      ),
+    ).toBe("respawn");
+    expect(
+      resolvePermissionChangeClass("claude", "pipe-rpc", "shell_exec"),
+    ).toBe("hot");
+    expect(
+      resolvePermissionChangeClass("codex", "pipe-rpc", "shell_exec"),
+    ).toBe("hot");
+    expect(
+      resolvePermissionChangeClass("codex", "pipe-rpc", "fs_write_external"),
+    ).toBe("pending-next-start");
+    expect(
+      resolvePermissionChangeClass("antigravity", "pipe-rpc", "posture"),
+    ).toBe("respawn");
 
     render(<SpinUpAgentModal isOpen={true} onClose={() => {}} />);
 
     expect(screen.getByTestId("spin-up-permissions-section")).toBeTruthy();
     expect(
-      screen.getByTestId("spin-up-permission-vendor-preview").textContent,
-    ).toBe("--dangerously-skip-permissions");
+      (screen.getByTestId("spin-up-posture-select") as HTMLSelectElement).value,
+    ).toBe("ask");
+    expect(
+      (screen.getByTestId("spin-up-sandbox-select") as HTMLSelectElement).value,
+    ).toBe("vendor-default");
+    expect(
+      (screen.getByTestId("spin-up-rule-preset-select") as HTMLSelectElement)
+        .value,
+    ).toBe("workspace");
+    expect(screen.getByTestId("spin-up-compile-receipt")).toBeTruthy();
+    expect(
+      screen.getByTestId("spin-up-compile-emulation").textContent,
+    ).toContain("Edit(.claude/**)");
 
     for (const cap of UNIVERSAL_PERMISSION_CAPABILITIES) {
       expect(screen.getByTestId(`spin-up-perm-cap-${cap}`)).toBeTruthy();
@@ -196,38 +278,73 @@ describe("Wave 8 Item 3 (Record #103): Universal Agent Permission & Auto-Accept 
 
     expect(screen.getByTestId("agent-permissions-section")).toBeTruthy();
     expect(
-      screen.getByTestId("agent-permission-vendor-preview").textContent,
-    ).toBe("--dangerously-bypass-approvals-and-sandbox");
-    for (const cap of UNIVERSAL_PERMISSION_CAPABILITIES) {
-      expect(screen.getByTestId(`agent-perm-cap-${cap}`)).toBeTruthy();
-      expect(screen.getByTestId(`agent-perm-select-${cap}`)).toBeTruthy();
-    }
+      screen.getByTestId("agent-change-class-posture").textContent,
+    ).toBe("session");
+    expect(
+      screen.getByTestId("agent-change-class-sandbox").textContent,
+    ).toBe("respawn");
+    expect(
+      screen.getByTestId("agent-perm-change-class-shell_exec").textContent,
+    ).toBe("hot");
+    expect(
+      screen.getByTestId("agent-perm-change-class-fs_write_external")
+        .textContent,
+    ).toBe("pending-next-start");
+    expect(screen.getByTestId("agent-compile-receipt")).toBeTruthy();
   });
 
-  it("renders live permission prompt cards in TriageQueuePane with 1-click Approve Once, Approve for Session, Always Allow Rule, and Deny controls", () => {
+  it("renders channel-honest remote resolution in TriageQueuePane (RPC verified buttons vs PTY snapshot Notification Only + Send keys — unverified)", () => {
     expect(ReExportedTurnPrompts).toEqual(DEFAULT_PENDING_PERMISSION_PROMPTS);
+    expect(DEFAULT_PENDING_PERMISSION_PROMPTS).toHaveLength(3);
 
     render(<TriageQueuePane />);
 
     expect(screen.getByTestId("triage-permission-prompts-section")).toBeTruthy();
+
+    // 1. Real RPC channel with Always Allow supported (Claude SDK MCP)
     expect(screen.getByTestId("perm-prompt-card-perm-req-01")).toBeTruthy();
     expect(
-      screen.getByTestId("perm-prompt-capability-perm-req-01").textContent,
-    ).toBe("fs_read_external");
-
+      (
+        screen.getByTestId(
+          "perm-prompt-always-allow-btn-perm-req-01",
+        ) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
     fireEvent.click(
       screen.getByTestId("perm-prompt-approve-session-btn-perm-req-01"),
     );
     expect(
       screen.getByTestId("perm-prompt-status-perm-req-01").textContent,
     ).toBe("approve_session");
-    expect(
-      screen.getByTestId("triage-permission-prompt-banner").textContent,
-    ).toContain("Sent approve_session for @felix");
 
+    // 2. Real RPC channel where Always Allow is NOT supported (Codex item/fileChange/requestApproval)
+    expect(
+      (
+        screen.getByTestId(
+          "perm-prompt-always-allow-btn-perm-req-02",
+        ) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     fireEvent.click(screen.getByTestId("perm-prompt-deny-btn-perm-req-02"));
     expect(
       screen.getByTestId("perm-prompt-status-perm-req-02").textContent,
     ).toBe("deny");
+
+    // 3. PTY snapshot channel (pty-vt100): Notification Only + Send keys — unverified (no verified RPC buttons)
+    expect(
+      screen.getByTestId("perm-prompt-notification-only-badge-perm-req-03"),
+    ).toBeTruthy();
+    expect(
+      screen.queryByTestId("perm-prompt-approve-once-btn-perm-req-03"),
+    ).toBeNull();
+    fireEvent.click(
+      screen.getByTestId("perm-prompt-send-keys-unverified-btn-perm-req-03"),
+    );
+    expect(
+      screen.getByTestId("perm-prompt-status-perm-req-03").textContent,
+    ).toBe("send_keys_unverified");
+    expect(
+      screen.getByTestId("triage-permission-prompt-banner").textContent,
+    ).toContain("no verified permission grant recorded");
   });
 });

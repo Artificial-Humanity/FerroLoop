@@ -117,6 +117,28 @@ export function computeWorktreeBootstrapPreview(
 }
 
 // Record #103: Universal Agent Permission & Auto-Accept Management
+// Converged 5-Vendor 3-Layer Model: Posture + Sandbox + Rules
+export type UniversalPermissionPosture =
+  | "ask"
+  | "accept-edits"
+  | "auto"
+  | "plan"
+  | "bypass";
+
+export type UniversalSandboxMode = "vendor-default" | "off";
+
+export type UniversalRulePreset =
+  | "read-only"
+  | "workspace"
+  | "workspace-web"
+  | "custom";
+
+export type PermissionChangeClass =
+  | "hot"
+  | "session"
+  | "pending-next-start"
+  | "respawn";
+
 export type UniversalPermissionMode =
   | "auto-accept"
   | "workspace-write"
@@ -151,6 +173,52 @@ export type UniversalPermissionMatrix = Record<
   PermissionRuleAction
 >;
 
+export const DEFAULT_RULE_PRESET_MATRICES: Record<
+  UniversalRulePreset,
+  UniversalPermissionMatrix
+> = {
+  "read-only": {
+    fs_read_workspace: "allow",
+    fs_read_external: "ask",
+    fs_write_workspace: "deny",
+    fs_write_external: "deny",
+    fs_write_protected: "deny",
+    shell_exec: "deny",
+    network_web: "deny",
+    mcp_tool_call: "ask",
+  },
+  workspace: {
+    fs_read_workspace: "allow",
+    fs_read_external: "ask",
+    fs_write_workspace: "allow",
+    fs_write_external: "ask",
+    fs_write_protected: "deny",
+    shell_exec: "ask",
+    network_web: "ask",
+    mcp_tool_call: "allow",
+  },
+  "workspace-web": {
+    fs_read_workspace: "allow",
+    fs_read_external: "allow",
+    fs_write_workspace: "allow",
+    fs_write_external: "ask",
+    fs_write_protected: "deny",
+    shell_exec: "ask",
+    network_web: "allow",
+    mcp_tool_call: "allow",
+  },
+  custom: {
+    fs_read_workspace: "allow",
+    fs_read_external: "ask",
+    fs_write_workspace: "allow",
+    fs_write_external: "ask",
+    fs_write_protected: "deny",
+    shell_exec: "ask",
+    network_web: "ask",
+    mcp_tool_call: "allow",
+  },
+};
+
 export const DEFAULT_UNIVERSAL_PERMISSION_MATRICES: Record<
   UniversalPermissionMode,
   UniversalPermissionMatrix
@@ -165,27 +233,258 @@ export const DEFAULT_UNIVERSAL_PERMISSION_MATRICES: Record<
     network_web: "allow",
     mcp_tool_call: "allow",
   },
-  "workspace-write": {
-    fs_read_workspace: "allow",
-    fs_read_external: "ask",
-    fs_write_workspace: "allow",
-    fs_write_external: "ask",
-    fs_write_protected: "deny",
-    shell_exec: "ask",
-    network_web: "ask",
-    mcp_tool_call: "allow",
-  },
-  granular: {
-    fs_read_workspace: "allow",
-    fs_read_external: "allow",
-    fs_write_workspace: "allow",
-    fs_write_external: "ask",
-    fs_write_protected: "deny",
-    shell_exec: "ask",
-    network_web: "allow",
-    mcp_tool_call: "allow",
-  },
+  "workspace-write": DEFAULT_RULE_PRESET_MATRICES.workspace,
+  granular: DEFAULT_RULE_PRESET_MATRICES["workspace-web"],
 };
+
+export interface PermissionCompileReceipt {
+  vendor: string;
+  posture: UniversalPermissionPosture;
+  sandbox: UniversalSandboxMode;
+  nativeFlagsOrConfig: string;
+  downgrades: string[];
+  emulationNotices: string[];
+  refused: string[];
+  respawnOnLaterChange: string[];
+}
+
+export function compileUniversalPermissions(
+  vendor?: string | null,
+  posture: UniversalPermissionPosture = "ask",
+  sandbox: UniversalSandboxMode = "vendor-default",
+  matrix: UniversalPermissionMatrix = DEFAULT_RULE_PRESET_MATRICES.workspace,
+): PermissionCompileReceipt {
+  const v = (vendor ?? "claude").trim().toLowerCase();
+  const downgrades: string[] = [];
+  const emulationNotices: string[] = [];
+  const refused: string[] = [];
+
+  const hasExplicitDeny = UNIVERSAL_PERMISSION_CAPABILITIES.some(
+    (cap) => matrix[cap] === "deny",
+  );
+  if (posture === "bypass" && hasExplicitDeny) {
+    refused.push(
+      "posture=bypass skips rule evaluation and cannot enforce explicit deny rules.",
+    );
+  }
+
+  if (v.includes("claude")) {
+    const postureFlag =
+      posture === "ask"
+        ? "--permission-mode default"
+        : posture === "accept-edits"
+          ? "--permission-mode acceptEdits"
+          : posture === "auto"
+            ? "--permission-mode auto"
+            : posture === "plan"
+              ? "--permission-mode plan"
+              : "--permission-mode bypassPermissions --allow-dangerously-skip-permissions";
+    const sandboxFlag =
+      sandbox === "off" ? "sandbox.enabled=false" : "sandbox.enabled=true";
+    if (matrix.fs_write_protected === "deny") {
+      emulationNotices.push(
+        "fs_write_protected compiled as tool-scoped deny rules: Edit(.claude/**), Edit(.git/**), Write(.claude/**), Write(.git/**); Bash writes remain governed by shell_exec.",
+      );
+    }
+    return {
+      vendor: "claude",
+      posture,
+      sandbox,
+      nativeFlagsOrConfig: `${postureFlag} · .claude/settings.local.json (${sandboxFlag})`,
+      downgrades,
+      emulationNotices,
+      refused,
+      respawnOnLaterChange: [
+        "sandbox",
+        ...(posture !== "bypass"
+          ? ["posture -> bypass (when not offered at launch)"]
+          : []),
+      ],
+    };
+  }
+
+  if (v.includes("codex")) {
+    const postureFlag =
+      posture === "bypass"
+        ? "--ask-for-approval never"
+        : posture === "accept-edits" || posture === "auto"
+          ? "--ask-for-approval on-request"
+          : "--ask-for-approval untrusted";
+    const sandboxFlag =
+      sandbox === "off"
+        ? "--sandbox danger-full-access"
+        : "--sandbox workspace-write";
+    const combinedFlags =
+      posture === "bypass" && sandbox === "off"
+        ? "--dangerously-bypass-approvals-and-sandbox"
+        : `${postureFlag} ${sandboxFlag}`;
+    if (
+      matrix.fs_read_external === "deny" ||
+      matrix.fs_write_external === "deny"
+    ) {
+      downgrades.push(
+        "codex has no path-glob deny file; external path isolation relies on OS Seatbelt/Landlock sandbox.",
+      );
+    }
+    return {
+      vendor: "codex",
+      posture,
+      sandbox,
+      nativeFlagsOrConfig: `${combinedFlags} · ~/.codex/rules/default.rules`,
+      downgrades,
+      emulationNotices,
+      refused,
+      respawnOnLaterChange: ["sandbox", "config.toml non-shell rules"],
+    };
+  }
+
+  if (v.includes("antigravity") || v.includes("agy")) {
+    if (matrix.network_web === "deny" || matrix.mcp_tool_call === "deny") {
+      refused.push(
+        "antigravity has no network_web or mcp_tool_call deny primitive; unsupported deny rule refused.",
+      );
+    }
+    downgrades.push(
+      "shell_exec patterns downgrade to exact-string command(...) entries in ~/.gemini/antigravity/settings.json (no glob/regex).",
+    );
+    if (matrix.fs_read_external !== matrix.fs_write_external) {
+      downgrades.push(
+        "fs_read_external and fs_write_external share a single allowNonWorkspaceAccess boolean in Antigravity.",
+      );
+    }
+    const postureFlag =
+      posture === "bypass"
+        ? "--yolo"
+        : posture === "auto"
+          ? "terminalAutoExecutionPolicy=auto"
+          : posture === "plan"
+            ? "planningMode=plan"
+            : "terminalAutoExecutionPolicy=off";
+    return {
+      vendor: "antigravity",
+      posture,
+      sandbox,
+      nativeFlagsOrConfig: `${postureFlag} · ~/.gemini/antigravity/settings.json`,
+      downgrades,
+      emulationNotices,
+      refused,
+      respawnOnLaterChange: [
+        "posture",
+        "sandbox",
+        "settings.json rules (pending-next-start)",
+      ],
+    };
+  }
+
+  if (v.includes("grok")) {
+    if (
+      matrix.fs_write_external === "deny" ||
+      matrix.network_web === "deny"
+    ) {
+      refused.push(
+        "grok has no path-scoped or network deny primitive; unsupported deny rule refused.",
+      );
+    }
+    downgrades.push(
+      "grok supports shell prefix strings in ~/.grok/user-settings.json only; no OS sandbox.",
+    );
+    const postureFlag =
+      posture === "bypass"
+        ? "full-auto"
+        : posture === "accept-edits" || posture === "auto"
+          ? "auto-edit"
+          : posture === "plan"
+            ? "plan"
+            : "default";
+    return {
+      vendor: "grok",
+      posture,
+      sandbox,
+      nativeFlagsOrConfig: `mode=${postureFlag} · ~/.grok/user-settings.json`,
+      downgrades,
+      emulationNotices,
+      refused,
+      respawnOnLaterChange: [
+        "sandbox",
+        "user-settings.json rules (pending-next-start)",
+      ],
+    };
+  }
+
+  // Muse
+  if (matrix.network_web === "deny") {
+    downgrades.push(
+      "network_web=deny downgrades to Muse proxy-only sandbox network mode (HTTPS_PROXY=http://localhost:8877).",
+    );
+  }
+  const musePosture =
+    posture === "bypass"
+      ? "yolo"
+      : posture === "accept-edits" || posture === "auto"
+        ? "auto_edit"
+        : posture === "plan"
+          ? "plan"
+          : "default";
+  const museSandbox = sandbox === "off" ? "--no-sandbox" : "--sandbox";
+  return {
+    vendor: "muse",
+    posture,
+    sandbox,
+    nativeFlagsOrConfig: `profile=${musePosture} ${museSandbox} · ~/.muse/settings.json`,
+    downgrades,
+    emulationNotices,
+    refused,
+    respawnOnLaterChange: [
+      "posture",
+      "sandbox",
+      "settings.json rules (pending-next-start)",
+    ],
+  };
+}
+
+export function resolvePermissionChangeClass(
+  vendor?: string | null,
+  transport?: string | null,
+  target: "posture" | "sandbox" | UniversalPermissionCapability = "posture",
+  nextPosture?: UniversalPermissionPosture,
+  bypassOfferedAtLaunch = false,
+): PermissionChangeClass {
+  if (target === "sandbox") {
+    return "respawn";
+  }
+  const v = (vendor ?? "claude").trim().toLowerCase();
+  const t = (transport ?? "").trim().toLowerCase();
+
+  if (target === "posture") {
+    if (v.includes("claude")) {
+      if (nextPosture === "bypass" && !bypassOfferedAtLaunch) {
+        return "respawn";
+      }
+      return "session";
+    }
+    if (v.includes("grok")) {
+      return "session";
+    }
+    if (v.includes("codex")) {
+      return t.includes("app-server") || t.includes("rpc") || t.includes("pipe")
+        ? "session"
+        : "respawn";
+    }
+    return "respawn";
+  }
+
+  // Capability rule change class
+  if (v.includes("claude")) {
+    return "hot";
+  }
+  if (v.includes("codex")) {
+    return target === "shell_exec" ? "hot" : "pending-next-start";
+  }
+  if (v.includes("muse") && t.includes("msp")) {
+    return "session";
+  }
+  return "pending-next-start";
+}
 
 export function resolveVendorPermissionPreview(
   vendor?: string | null,
@@ -241,11 +540,16 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [worktreePolicy, setWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
   const [worktreePolicyTouched, setWorktreePolicyTouched] = useState(false);
+  const [posture, setPosture] = useState<UniversalPermissionPosture>("ask");
+  const [sandbox, setSandbox] =
+    useState<UniversalSandboxMode>("vendor-default");
+  const [rulePreset, setRulePreset] =
+    useState<UniversalRulePreset>("workspace");
   const [permissionMode, setPermissionMode] =
     useState<UniversalPermissionMode>("auto-accept");
   const [permissionMatrix, setPermissionMatrix] =
     useState<UniversalPermissionMatrix>(
-      () => DEFAULT_UNIVERSAL_PERMISSION_MATRICES["auto-accept"],
+      () => DEFAULT_RULE_PRESET_MATRICES.workspace,
     );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -725,122 +1029,319 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
             );
           })()}
 
-          {/* Record #103: Universal Agent Permission & Auto-Accept Management */}
-          <div
-            data-testid="spin-up-permissions-section"
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "6px",
-              padding: "8px 10px",
-              borderRadius: "6px",
-              backgroundColor: "var(--bg-elevated)",
-              border: "1px solid var(--border-subtle)",
-              fontSize: "11.5px",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "8px",
-                flexWrap: "wrap",
-              }}
-            >
-              <label
-                htmlFor="fd-spin-up-permission-mode"
+          {/* Record #103: Universal Agent Permission & Auto-Accept Management (3-Layer Model) */}
+          {(() => {
+            const compileReceipt = compileUniversalPermissions(
+              vendor,
+              posture,
+              sandbox,
+              permissionMatrix,
+            );
+            return (
+              <div
+                data-testid="spin-up-permissions-section"
                 style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  color: "var(--text-muted)",
-                  textTransform: "uppercase",
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  padding: "8px 10px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  fontSize: "11.5px",
                 }}
               >
-                Permission &amp; Approval Mode
-              </label>
-              <code
-                className="fd-mono"
-                data-testid="spin-up-permission-vendor-preview"
-                style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
-              >
-                {resolveVendorPermissionPreview(vendor, permissionMode)}
-              </code>
-            </div>
-            <select
-              id="fd-spin-up-permission-mode"
-              aria-label="Permission & Approval Mode"
-              data-testid="spin-up-permission-mode-select"
-              className="fd-select fd-mono"
-              value={permissionMode}
-              disabled={submitting}
-              onChange={(e) => {
-                const nextMode = e.target.value as UniversalPermissionMode;
-                setPermissionMode(nextMode);
-                setPermissionMatrix({
-                  ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
-                });
-              }}
-              style={{ width: "100%" }}
-            >
-              <option value="auto-accept">
-                auto-accept (Full autonomous bypass)
-              </option>
-              <option value="workspace-write">
-                workspace-write (Auto-allow workspace, prompt external/shell)
-              </option>
-              <option value="granular">
-                granular (Per-capability allow / ask / deny matrix)
-              </option>
-            </select>
-            <div
-              data-testid="spin-up-permission-matrix"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: "4px",
-                marginTop: "2px",
-              }}
-            >
-              {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => (
                 <div
-                  key={cap}
-                  data-testid={`spin-up-perm-cap-${cap}`}
                   style={{
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    htmlFor="fd-spin-up-permission-mode"
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      color: "var(--text-muted)",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Permission Posture, Sandbox &amp; Rules
+                  </label>
+                  <code
+                    className="fd-mono"
+                    data-testid="spin-up-permission-vendor-preview"
+                    style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+                  >
+                    {resolveVendorPermissionPreview(vendor, permissionMode)}
+                  </code>
+                </div>
+
+                {/* 3-Layer Controls: Posture + Sandbox + Rule Preset */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                    gap: "6px",
+                  }}
+                >
+                  <div>
+                    <label
+                      htmlFor="fd-spin-up-posture"
+                      style={{
+                        display: "block",
+                        fontSize: "10px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "2px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      1. Posture
+                    </label>
+                    <select
+                      id="fd-spin-up-posture"
+                      aria-label="Approval Posture"
+                      data-testid="spin-up-posture-select"
+                      className="fd-select fd-mono"
+                      value={posture}
+                      disabled={submitting}
+                      onChange={(e) => {
+                        const nextPosture = e.target
+                          .value as UniversalPermissionPosture;
+                        setPosture(nextPosture);
+                        if (nextPosture === "bypass") {
+                          setPermissionMode("auto-accept");
+                        } else if (nextPosture === "accept-edits") {
+                          setPermissionMode("workspace-write");
+                        }
+                      }}
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="ask">ask (default)</option>
+                      <option value="accept-edits">accept-edits</option>
+                      <option value="auto">auto</option>
+                      <option value="plan">plan</option>
+                      <option value="bypass">bypass (skip prompts)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="fd-spin-up-sandbox"
+                      style={{
+                        display: "block",
+                        fontSize: "10px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "2px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      2. Sandbox
+                    </label>
+                    <select
+                      id="fd-spin-up-sandbox"
+                      aria-label="OS Sandbox Mode"
+                      data-testid="spin-up-sandbox-select"
+                      className="fd-select fd-mono"
+                      value={sandbox}
+                      disabled={submitting}
+                      onChange={(e) =>
+                        setSandbox(e.target.value as UniversalSandboxMode)
+                      }
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="vendor-default">vendor-default</option>
+                      <option value="off">off (no OS sandbox)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="fd-spin-up-rule-preset"
+                      style={{
+                        display: "block",
+                        fontSize: "10px",
+                        fontWeight: 600,
+                        color: "var(--text-muted)",
+                        marginBottom: "2px",
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      3. Rule Preset
+                    </label>
+                    <select
+                      id="fd-spin-up-rule-preset"
+                      aria-label="Capability Rule Preset"
+                      data-testid="spin-up-rule-preset-select"
+                      className="fd-select fd-mono"
+                      value={rulePreset}
+                      disabled={submitting}
+                      onChange={(e) => {
+                        const nextPreset = e.target
+                          .value as UniversalRulePreset;
+                        setRulePreset(nextPreset);
+                        setPermissionMatrix({
+                          ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
+                        });
+                      }}
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="read-only">read-only</option>
+                      <option value="workspace">workspace</option>
+                      <option value="workspace-web">workspace-web</option>
+                      <option value="custom">custom</option>
+                    </select>
+                  </div>
+                </div>
+
+                <select
+                  id="fd-spin-up-permission-mode"
+                  aria-label="Permission & Approval Mode"
+                  data-testid="spin-up-permission-mode-select"
+                  className="fd-select fd-mono"
+                  value={permissionMode}
+                  disabled={submitting}
+                  onChange={(e) => {
+                    const nextMode = e.target.value as UniversalPermissionMode;
+                    setPermissionMode(nextMode);
+                    setPermissionMatrix({
+                      ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
+                    });
+                    if (nextMode === "auto-accept") {
+                      setPosture("bypass");
+                    } else if (nextMode === "workspace-write") {
+                      setPosture("accept-edits");
+                      setRulePreset("workspace");
+                    } else {
+                      setRulePreset("custom");
+                    }
+                  }}
+                  style={{ width: "100%", fontSize: "10.5px" }}
+                >
+                  <option value="auto-accept">
+                    auto-accept (Full autonomous bypass)
+                  </option>
+                  <option value="workspace-write">
+                    workspace-write (Auto-allow workspace, prompt external/shell)
+                  </option>
+                  <option value="granular">
+                    granular (Per-capability allow / ask / deny matrix)
+                  </option>
+                </select>
+
+                <div
+                  data-testid="spin-up-permission-matrix"
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
                     gap: "4px",
-                    padding: "3px 6px",
+                    marginTop: "2px",
+                  }}
+                >
+                  {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => (
+                    <div
+                      key={cap}
+                      data-testid={`spin-up-perm-cap-${cap}`}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "4px",
+                        padding: "3px 6px",
+                        borderRadius: "4px",
+                        border: "1px solid var(--border-subtle)",
+                        fontSize: "10.5px",
+                      }}
+                    >
+                      <code className="fd-mono">{cap}</code>
+                      <select
+                        aria-label={`Permission for ${cap}`}
+                        data-testid={`spin-up-perm-select-${cap}`}
+                        className="fd-select fd-mono"
+                        style={{ fontSize: "10px", padding: "1px 4px" }}
+                        value={permissionMatrix[cap]}
+                        onChange={(e) => {
+                          const nextAction = e.target
+                            .value as PermissionRuleAction;
+                          setPermissionMode("granular");
+                          setRulePreset("custom");
+                          setPermissionMatrix((prev) => ({
+                            ...prev,
+                            [cap]: nextAction,
+                          }));
+                        }}
+                      >
+                        <option value="allow">allow</option>
+                        <option value="ask">ask</option>
+                        <option value="deny">deny</option>
+                      </select>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Compile Receipt & Downgrade Preview */}
+                <div
+                  data-testid="spin-up-compile-receipt"
+                  style={{
+                    padding: "6px 8px",
                     borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
                     border: "1px solid var(--border-subtle)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "4px",
                     fontSize: "10.5px",
                   }}
                 >
-                  <code className="fd-mono">{cap}</code>
-                  <select
-                    aria-label={`Permission for ${cap}`}
-                    data-testid={`spin-up-perm-select-${cap}`}
-                    className="fd-select fd-mono"
-                    style={{ fontSize: "10px", padding: "1px 4px" }}
-                    value={permissionMatrix[cap]}
-                    onChange={(e) => {
-                      const nextAction = e.target.value as PermissionRuleAction;
-                      setPermissionMode("granular");
-                      setPermissionMatrix((prev) => ({
-                        ...prev,
-                        [cap]: nextAction,
-                      }));
-                    }}
+                  <div
+                    className="fd-mono"
+                    data-testid="spin-up-compile-native-flags"
+                    style={{ color: "var(--accent-primary)" }}
                   >
-                    <option value="allow">allow</option>
-                    <option value="ask">ask</option>
-                    <option value="deny">deny</option>
-                  </select>
+                    Compiled ({compileReceipt.vendor}):{" "}
+                    {compileReceipt.nativeFlagsOrConfig}
+                  </div>
+                  {compileReceipt.downgrades.length > 0 && (
+                    <div
+                      data-testid="spin-up-compile-downgrades"
+                      style={{ color: "#FBBF24" }}
+                    >
+                      Downgrade: {compileReceipt.downgrades.join(" ")}
+                    </div>
+                  )}
+                  {compileReceipt.emulationNotices.length > 0 && (
+                    <div
+                      data-testid="spin-up-compile-emulation"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      Emulated: {compileReceipt.emulationNotices.join(" ")}
+                    </div>
+                  )}
+                  {compileReceipt.refused.length > 0 && (
+                    <div
+                      data-testid="spin-up-compile-refused"
+                      style={{ color: "#F87171", fontWeight: 600 }}
+                    >
+                      Refused: {compileReceipt.refused.join(" ")}
+                    </div>
+                  )}
+                  <div
+                    className="fd-mono"
+                    data-testid="spin-up-compile-respawn-notice"
+                    style={{ color: "var(--text-muted)", fontSize: "10px" }}
+                  >
+                    Requires Respawn if Changed Later:{" "}
+                    {compileReceipt.respawnOnLaterChange.join(", ")}
+                  </div>
                 </div>
-              ))}
-            </div>
-          </div>
+              </div>
+            );
+          })()}
 
           <label
             style={{
