@@ -877,27 +877,59 @@ impl Run<'_> {
         }
     }
 
-    /// Whether `releases/<name>` is a real directory whose files are exactly the ones this
-    /// transaction staged (path, hash and size of each).
+    /// Whether `releases/<name>` is a real directory that is exactly what this transaction
+    /// staged and sealed: the same files (path, hash, size, mode bits), the same
+    /// subdirectories (mode `0555`) and nothing more.
     fn release_is_ours(&self) -> Result<bool> {
         let release = self.release_path();
         match lstat(&release)? {
             Some(m) if m.is_dir() => {}
             _ => return Ok(false),
         }
-        let Ok(found) = tree::read_staged(&release) else {
+        let Ok((files, dirs)) = tree::read_shape(&release) else {
             return Ok(false);
         };
-        let want: BTreeMap<&str, (&str, u64)> = self
-            .intent
-            .files
-            .iter()
-            .map(|f| (f.path.as_str(), (f.sha256.as_str(), f.size)))
-            .collect();
-        Ok(found.len() == want.len()
-            && found
+        let mut want_dirs: BTreeSet<String> = BTreeSet::new();
+        for f in &self.intent.files {
+            let mut acc = String::new();
+            let mut segs: Vec<&str> = f.path.split('/').collect();
+            segs.pop();
+            for s in segs {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(s);
+                want_dirs.insert(acc.clone());
+            }
+        }
+        let files_ok = files.len() == self.intent.files.len()
+            && self.intent.files.iter().all(|f| {
+                let mode = if f.exec { 0o555 } else { 0o444 };
+                files.get(&f.path) == Some(&(f.sha256.clone(), f.size, mode))
+            });
+        let dirs_ok = dirs.len() == want_dirs.len()
+            && dirs
                 .iter()
-                .all(|(p, (sha, size))| want.get(p.as_str()) == Some(&(sha.as_str(), *size))))
+                .all(|(d, mode)| want_dirs.contains(d) && *mode == 0o555);
+        Ok(files_ok && dirs_ok)
+    }
+
+    /// Whether the live install owns `releases/<name>`: the committed receipt lists it, or
+    /// `current` resolves to it.
+    fn release_is_live(&self) -> Result<bool> {
+        let name = &self.intent.release.name;
+        if read_link_string(&self.paths.current)?.as_deref()
+            == Some(format!("releases/{name}").as_str())
+        {
+            return Ok(true);
+        }
+        let Some(text) = read_receipt_text(&self.paths.receipt)? else {
+            return Ok(false);
+        };
+        let shown = shown_join(&self.intent.layout.prefix, &format!("releases/{name}"));
+        Ok(InstallReceipt::parse(&text)
+            .map(|r| r.release.name == *name || r.owned_path(&shown).is_some())
+            .unwrap_or(false))
     }
 
     fn do_link_current(&self) -> Result<()> {
@@ -1028,9 +1060,12 @@ impl Run<'_> {
         // transaction staged (the rename happened and its journal line did not). A directory
         // that is anything else is somebody else's and is left alone.
         let published = p.announced(|o| *o == JournalOp::Published);
+        // Even then, a release the live install lists (committed receipt) or selects
+        // (`current`) is never removed: a journal cannot take a committed release away.
         if !self.intent.release_existed
             && announced(Step::Publish)
             && (published || self.release_is_ours()?)
+            && !self.release_is_live()?
         {
             tree::remove_tree(&self.release_path())?;
         }
@@ -1324,6 +1359,13 @@ fn validate_intent(i: &TxnIntent, safe: &Safe, paths: &Paths, layout: &Layout) -
             return Err(bad(format!(
                 "created directory `{}` is not one this install makes",
                 d.chars().take(80).collect::<String>()
+            )));
+        }
+        // Inside the install root no component may be a symlink, so an `rmdir` never follows
+        // a planted one out of it.
+        if p.starts_with(safe.canonical_root()) && safe.check_chain(&p.join("x")).is_err() {
+            return Err(bad(format!(
+                "created directory `{d}` has a symlinked component"
             )));
         }
         if homes.iter().any(|h| h.starts_with(p)) {
@@ -2061,6 +2103,7 @@ fn apply_locked(
 mod publish_tests {
     use super::*;
     use fl_core::install::{Product, Profile};
+    use std::os::unix::fs::PermissionsExt;
 
     /// A `Run` over a temp root whose intent stages exactly one file, `bin/fl` = "ours".
     fn with_run(f: impl FnOnce(&Run<'_>, &Path)) {
@@ -2115,20 +2158,43 @@ mod publish_tests {
     #[test]
     fn publish_with_the_stage_gone_adopts_only_a_release_that_holds_what_was_staged() {
         with_run(|run, rel| {
+            let seal = || {
+                tree::seal_and_read(rel, &|r| r == "bin/fl").unwrap();
+            };
+            let open = || tree::make_tree_writable(rel);
             // somebody else's directory
             fs::create_dir_all(rel.join("bin")).unwrap();
             fs::write(rel.join("bin/fl"), "theirs").unwrap();
             let e = run.do_publish().unwrap_err();
             assert_eq!(e.exit_code(), 3, "{e}");
             assert_eq!(fs::read_to_string(rel.join("bin/fl")).unwrap(), "theirs");
-            // an extra file is not what was staged either
+            // the right bytes but not sealed (modes differ) is not what was staged
             fs::write(rel.join("bin/fl"), "ours").unwrap();
+            assert!(run.do_publish().is_err(), "unsealed");
+            // an extra file
             fs::write(rel.join("extra"), "x").unwrap();
-            assert!(run.do_publish().is_err());
+            seal();
+            assert!(run.do_publish().is_err(), "extra file");
+            open();
             fs::remove_file(rel.join("extra")).unwrap();
-            // exactly what was staged: the rename happened, only its journal line is missing
+            // an extra empty subdirectory
+            fs::create_dir(rel.join("emptydir")).unwrap();
+            seal();
+            assert!(run.do_publish().is_err(), "extra empty directory");
+            open();
+            fs::remove_dir(rel.join("emptydir")).unwrap();
+            // a changed mode bit (exec on a file that was staged read-only... here the
+            // binary loses its exec bit)
+            seal();
+            fs::set_permissions(rel.join("bin/fl"), fs::Permissions::from_mode(0o444)).unwrap();
+            assert!(run.do_publish().is_err(), "mode changed");
+            open();
+            // exactly what was staged and sealed: the rename happened, only its journal
+            // line is missing
+            seal();
             run.do_publish().unwrap();
             // a symlink in its place is never adopted
+            open();
             fs::remove_dir_all(rel).unwrap();
             let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), rel).unwrap();

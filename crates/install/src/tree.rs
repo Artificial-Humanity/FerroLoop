@@ -270,6 +270,42 @@ pub fn read_staged(root: &Path) -> Result<BTreeMap<String, (String, u64)>> {
     Ok(out)
 }
 
+/// What a sealed release holds: each file's (hash, size, mode bits) and every subdirectory
+/// with its mode bits. Refuses a symlink or special file.
+pub type Shape = (BTreeMap<String, (String, u64, u32)>, BTreeMap<String, u32>);
+
+pub fn read_shape(root: &Path) -> Result<Shape> {
+    let mut files = BTreeMap::new();
+    let mut dirs = BTreeMap::new();
+    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        for e in fs::read_dir(&dir).ctx(|| format!("cannot read {}", dir.display()))? {
+            let e = e.ctx(|| format!("cannot read {}", dir.display()))?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let path = e.path();
+            let m =
+                fs::symlink_metadata(&path).ctx(|| format!("cannot inspect {}", path.display()))?;
+            if m.is_dir() {
+                dirs.insert(child.clone(), m.mode() & 0o7777);
+                stack.push((path, child));
+            } else if m.is_file() {
+                let (sha, size) = hash_file(&path, u64::MAX / 2)?;
+                files.insert(child, (sha, size, m.mode() & 0o7777));
+            } else {
+                return Err(InstallError::refused(format!(
+                    "path `{child}` is a symlink or special file"
+                )));
+            }
+        }
+    }
+    Ok((files, dirs))
+}
+
 /// Make the staged tree read-only (files `0555` for binaries, else `0444`; directories
 /// `0555`; children before parents) and return what the SEALED files hold: relative path to
 /// (hash, size). Every file and directory is opened without following a symlink and changed

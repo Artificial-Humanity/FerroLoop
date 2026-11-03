@@ -2244,3 +2244,87 @@ fn a_foreign_release_directory_is_never_adopted_or_removed_when_the_stage_is_gon
         );
     }
 }
+
+// ------------------------------------- hardening: live releases, shapes, planted links
+
+#[test]
+fn a_forged_journal_cannot_take_a_committed_release_away() {
+    let w = World::new(Kind::Explicit);
+    let m1 = w.release("0.1.0", "first");
+    w.install(&m1);
+    let name1 = fixture::release_name(&m1);
+    let pre = w.snap();
+    // A real journal of a second install, rewritten to name the committed release, with the
+    // lines an undo keys on.
+    let m2 = w.release("0.2.0", "second");
+    let e = w
+        .install_faulty(
+            &m2,
+            &Decisions::default(),
+            Faults::crash(FaultPoint::after(Step::Begin)),
+        )
+        .unwrap_err();
+    assert!(matches!(e, InstallError::Crashed(_)));
+    let jp = w.prefix().join("journal.jsonl");
+    let text = fs::read_to_string(&jp).unwrap();
+    let mut first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    first["intent"]["release"]["name"] = name1.clone().into();
+    first["intent"]["release"]["version"] = "0.1.0".into();
+    first["intent"]["release_existed"] = false.into();
+    let mut out = format!("{first}\n");
+    for (seq, op) in [(1, "stage"), (2, "publish"), (3, "published")] {
+        out.push_str(&format!(
+            "{{\"v\":1,\"txn\":2,\"seq\":{seq},\"op\":\"{op}\"}}\n"
+        ));
+    }
+    fs::write(&jp, out).unwrap();
+    for mode in [RecoverMode::Auto, RecoverMode::Rollback] {
+        let _ = recover(&w.env(), &w.layout(), mode);
+        assert!(
+            w.prefix()
+                .join("releases")
+                .join(&name1)
+                .join("bin/fl")
+                .is_file(),
+            "{mode:?}: the committed release is intact"
+        );
+        assert_eq!(
+            fs::read_link(w.prefix().join("current")).unwrap(),
+            PathBuf::from(format!("releases/{name1}"))
+        );
+        // restore the journal for the second mode if the first consumed it
+        if !jp.exists() {
+            let mut o = format!("{first}\n");
+            for (seq, op) in [(1, "stage"), (2, "publish"), (3, "published")] {
+                o.push_str(&format!(
+                    "{{\"v\":1,\"txn\":2,\"seq\":{seq},\"op\":\"{op}\"}}\n"
+                ));
+            }
+            fs::write(&jp, o).unwrap();
+        }
+    }
+    let _ = pre;
+    assert!(
+        w.receipt()
+            .owned_path(w.prefix().join("releases").join(&name1).to_str().unwrap())
+            .is_some()
+    );
+}
+
+#[test]
+fn a_created_dir_through_a_planted_symlink_inside_the_prefix_is_refused() {
+    let w = forged_world(Kind::Explicit, &|i, w| {
+        let outside = w.base.path().join("outside");
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        symlink(&outside, w.prefix().join("planted")).unwrap();
+        i["created_dirs"] = serde_json::json!([w.prefix().join("planted/sub")]);
+    });
+    let before = w.snap();
+    for mode in [RecoverMode::Auto, RecoverMode::Rollback] {
+        let e = recover(&w.env(), &w.layout(), mode).unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{mode:?}: {e}");
+        assert!(e.to_string().contains("symlinked"), "{e}");
+    }
+    assert_eq!(w.snap(), before);
+    assert!(w.base.path().join("outside/sub").is_dir(), "never followed");
+}

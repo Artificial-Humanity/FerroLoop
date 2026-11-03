@@ -263,7 +263,14 @@ provably this transaction's: the journal holds a `published` line (written after
 the staging directory), or the directory holds exactly the files this transaction staged (same
 paths, hashes and sizes), which covers a crash between the rename and its journal line. Any
 other directory there is somebody else's: it is neither adopted by a resume nor removed by an
-undo, and the install is refused over it.
+undo, and the install is refused over it. "Exactly what was staged" means the same files (hash,
+size and mode bits), the same subdirectories (`0555`) and nothing more. An undo also never
+removes a release that the committed receipt lists or that `current` resolves to, so a journal
+cannot take a committed release away; created directories inside the install root must have no
+symlinked component. The residual limit: a journal is a file of the same user, so anyone who can
+write it can still make an undo `rmdir` an EMPTY directory on the way to the install, or restore
+a backup the journal names; the checks bound that to the install root and its ancestors, never to
+a directory that holds anything.
 
 **Known limit.** Paths are walked with `lstat` and then used by path (no `openat` with a
 directory descriptor), so a process of the same user that races the installer can swap a
