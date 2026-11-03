@@ -74,7 +74,7 @@ pub use nodes::{
     touch_node,
 };
 pub use terminal::{TerminalManager, TerminalSession};
-pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
+pub use ws::{ConnectionLimits, HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
 
 /// Default listen address for `fl hub serve` (`127.0.0.1:8420`, spec §2.1).
 pub const DEFAULT_HUB_LISTEN: &str = "127.0.0.1:8420";
@@ -725,6 +725,9 @@ mod artifact_dirs_tests;
 
 #[cfg(test)]
 mod remodel_api_tests;
+
+#[cfg(test)]
+mod conn_and_auth_cache_tests;
 
 /// `FL_WIRE_TMUX_BIN` is process-global. A test that points it at a fake tmux holds this lock
 /// while it is set.

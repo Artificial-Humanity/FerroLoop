@@ -2,10 +2,11 @@
 //! `HttpOnly; SameSite=Strict` session cookies, Tailscale header trust, and constant-time
 //! token comparison (spec §2.2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
 use fl_core::state::{
@@ -95,6 +96,107 @@ struct StoredSessionEntry {
 struct AuthCache {
     pairings: BTreeMap<String, StoredPairingEntry>,
     sessions: BTreeMap<String, StoredSessionEntry>,
+}
+
+/// How long a rejected session token stays in the [`SessionMissCache`].
+pub(crate) const SESSION_MISS_TTL: Duration = Duration::from_secs(30);
+/// The most rejected session tokens the [`SessionMissCache`] holds; the oldest go first.
+pub(crate) const SESSION_MISS_CAPACITY: usize = 1024;
+
+/// A bounded cache of session tokens the store has already rejected, so a bearer or cookie that
+/// is not a live session costs one store open per [`SESSION_MISS_TTL`], not one per request.
+///
+/// Invariants:
+/// - It holds only the SHA-256 of a presented token (the same digest the store keys sessions
+///   by), never the token, and only rejections: a token that verified is never recorded.
+/// - A hash enters only when the store answered "no such session", "revoked" or "expired".
+///   A store read error records nothing. A revoked or expired session never becomes live again.
+/// - A session this hub mints is live at once: [`AuthManager::mint_session`], the one place a
+///   session token is created, removes the new token's hash in the same critical section that
+///   puts the session in the in-memory cache. The lookup order also protects it: the in-memory
+///   cache is read before this cache, so a minted session never reaches it.
+/// - A session entry written to the store by something other than this `AuthManager` (another
+///   process) is rejected for at most [`SESSION_MISS_TTL`] if its token was presented first.
+/// - Entries are in insertion order, which is also expiry order, so expiry and eviction both
+///   pop from the front. A hit does not refresh an entry: a stale rejection ends on schedule.
+#[derive(Debug)]
+struct SessionMissCache {
+    ttl: Duration,
+    capacity: usize,
+    seen: HashMap<String, Instant>,
+    order: VecDeque<(String, Instant)>,
+}
+
+impl SessionMissCache {
+    fn new(ttl: Duration, capacity: usize) -> Self {
+        Self {
+            ttl,
+            capacity,
+            seen: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, token_hash: &str, now: Instant) -> bool {
+        self.seen
+            .get(token_hash)
+            .is_some_and(|at| now.saturating_duration_since(*at) < self.ttl)
+    }
+
+    fn pop_oldest(&mut self) {
+        if let Some((hash, at)) = self.order.pop_front()
+            && self.seen.get(&hash) == Some(&at)
+        {
+            self.seen.remove(&hash);
+        }
+    }
+
+    fn insert(&mut self, token_hash: String, now: Instant) {
+        if self.capacity == 0 {
+            return;
+        }
+        while let Some((_, at)) = self.order.front() {
+            if now.saturating_duration_since(*at) < self.ttl {
+                break;
+            }
+            self.pop_oldest();
+        }
+        if self.contains(&token_hash, now) {
+            return;
+        }
+        while self.seen.len() >= self.capacity {
+            self.pop_oldest();
+        }
+        self.seen.insert(token_hash.clone(), now);
+        self.order.push_back((token_hash, now));
+    }
+
+    /// Drop `token_hash`. Its place in `order` goes stale and is popped with its time.
+    fn forget(&mut self, token_hash: &str) {
+        self.seen.remove(token_hash);
+    }
+}
+
+/// The session-token candidates of a request: the `fl_hub_session` cookie and the bearer token
+/// (header, else the `?token=` query value), in the order [`AuthManager::authenticate_request`]
+/// tries them.
+fn session_candidates(
+    headers: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+) -> (Option<String>, Option<String>) {
+    let cookie_token = headers
+        .get("cookie")
+        .and_then(|c| extract_session_cookie(c));
+    let bearer_token = headers
+        .get("authorization")
+        .and_then(|a| extract_bearer_token(a))
+        .or_else(|| {
+            query
+                .get("token")
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        });
+    (cookie_token, bearer_token)
 }
 
 /// Generate a cryptographically random lowercase hex token with `byte_len` bytes (`2 * byte_len` hex chars).
@@ -323,20 +425,31 @@ fn persist_session_entry(store: &AnyStore, entry: &StoredSessionEntry) -> Result
 }
 
 fn load_session_entry(store: &AnyStore, token_hash: &str) -> Option<StoredSessionEntry> {
-    let state_entry = store
+    load_session_entry_checked(store, token_hash).ok().flatten()
+}
+
+/// As [`load_session_entry`], but a store read error is `Err`, not "no such session".
+fn load_session_entry_checked(
+    store: &AnyStore,
+    token_hash: &str,
+) -> Result<Option<StoredSessionEntry>, String> {
+    let Some(state_entry) = store
         .get_state_by_key(
             &StateScope::Workspace,
             StateConcern::Runtime,
             &session_state_slug(token_hash),
         )
-        .ok()??;
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
     if !state_entry.sensitive {
-        return None;
+        return Ok(None);
     }
     let StatePayload::Runtime(rt) = state_entry.payload else {
-        return None;
+        return Ok(None);
     };
-    serde_json::from_value(rt.value).ok()
+    Ok(serde_json::from_value(rt.value).ok())
 }
 
 /// Every persisted session entry: a prefix scan of the sensitive runtime state under the
@@ -405,6 +518,8 @@ pub struct AuthManager {
     trust_tailscale_headers: bool,
     session_ttl_secs: u64,
     cache: Arc<Mutex<AuthCache>>,
+    /// Session tokens the store rejected (see [`SessionMissCache`]). Lock order: `cache`, then this.
+    session_misses: Arc<Mutex<SessionMissCache>>,
 }
 
 impl AuthManager {
@@ -437,7 +552,53 @@ impl AuthManager {
             trust_tailscale_headers,
             session_ttl_secs: ttl,
             cache: Arc::new(Mutex::new(AuthCache::default())),
+            session_misses: Arc::new(Mutex::new(SessionMissCache::new(
+                SESSION_MISS_TTL,
+                SESSION_MISS_CAPACITY,
+            ))),
         }
+    }
+
+    /// This manager with its own rejected-session cache of the given size and lifetime. A test
+    /// seam: a test needs a tiny cache or a short TTL.
+    #[cfg(test)]
+    pub(crate) fn with_session_miss_limits(mut self, ttl: Duration, capacity: usize) -> Self {
+        self.session_misses = Arc::new(Mutex::new(SessionMissCache::new(ttl, capacity)));
+        self
+    }
+
+    /// Whether looking a request's session credentials up in the store could still change the
+    /// answer: it has a cookie or bearer token and at least one of them is not a known
+    /// rejection. When this is `false` the caller may answer 401 without opening the store.
+    /// Owner, peer and Tailscale credentials are not session lookups; they are decided before
+    /// the store is needed.
+    pub(crate) fn session_store_lookup_needed(
+        &self,
+        headers: &BTreeMap<String, String>,
+        query: &BTreeMap<String, String>,
+    ) -> bool {
+        let (cookie, bearer) = session_candidates(headers, query);
+        let now = Instant::now();
+        let misses = self
+            .session_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        [cookie, bearer]
+            .into_iter()
+            .flatten()
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty())
+            .any(|token| !misses.contains(&sha256_hex(&token), now))
+    }
+
+    /// How many rejected session tokens are cached (test observation).
+    #[cfg(test)]
+    pub(crate) fn session_miss_len(&self) -> usize {
+        self.session_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seen
+            .len()
     }
 
     pub fn owner_login(&self) -> &str {
@@ -491,7 +652,19 @@ impl AuthManager {
     /// Mint a 256-bit owner session token and persist its SHA-256 hash in `store` and memory.
     pub fn mint_session(&self, store: Option<&AnyStore>, login: &str) -> Result<String, String> {
         let session_token = try_generate_hex_token(32)?;
-        let token_hash = sha256_hex(&session_token);
+        self.install_session(store, login, &session_token)?;
+        Ok(session_token)
+    }
+
+    /// Persist and cache a session for `session_token`. Every session this hub creates goes
+    /// through here; a test passes a token it chose.
+    fn install_session(
+        &self,
+        store: Option<&AnyStore>,
+        login: &str,
+        session_token: &str,
+    ) -> Result<(), String> {
+        let token_hash = sha256_hex(session_token);
         let expires_at_ms = now_millis().saturating_add(self.session_ttl_secs.saturating_mul(1000));
         let entry = StoredSessionEntry {
             kind: "hub/session".to_string(),
@@ -504,10 +677,29 @@ impl AuthManager {
         if let Some(s) = store {
             persist_session_entry(s, &entry)?;
         }
-        if let Ok(mut guard) = self.cache.lock() {
-            guard.sessions.insert(token_hash, entry);
-        }
-        Ok(session_token)
+        // Live at once: the session is in the cache and not in the rejected-session cache, in
+        // one critical section (see `SessionMissCache`).
+        let mut guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.sessions.insert(token_hash.clone(), entry);
+        self.session_misses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget(&token_hash);
+        Ok(())
+    }
+
+    /// [`AuthManager::mint_session`] for a token the test picked.
+    #[cfg(test)]
+    pub(crate) fn mint_session_for_token(
+        &self,
+        store: Option<&AnyStore>,
+        login: &str,
+        session_token: &str,
+    ) -> Result<(), String> {
+        self.install_session(store, login, session_token)
     }
 
     /// Exchange a one-time pairing `code` or owner `token` for a new session token (spec §2.2).
@@ -603,9 +795,23 @@ impl AuthManager {
             if found.is_none()
                 && let Some(s) = store
             {
-                found = load_session_entry(s, &token_hash);
-                if let Some(ref entry) = found {
-                    guard.sessions.insert(token_hash.clone(), entry.clone());
+                let mut misses = self
+                    .session_misses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if misses.contains(&token_hash, Instant::now()) {
+                    return None;
+                }
+                match load_session_entry_checked(s, &token_hash) {
+                    Ok(Some(entry)) => {
+                        guard.sessions.insert(token_hash.clone(), entry.clone());
+                        found = Some(entry);
+                    }
+                    // The store says there is no such session: remember it. This runs under
+                    // the cache lock, so a mint cannot slip in between the read and the insert.
+                    Ok(None) => misses.insert(token_hash.clone(), Instant::now()),
+                    // A read error says nothing about the token: record nothing.
+                    Err(_) => {}
                 }
             }
             found
@@ -613,6 +819,13 @@ impl AuthManager {
 
         let entry = found?;
         if entry.revoked || now_ms > entry.expires_at_ms {
+            if store.is_some() {
+                // Revoked and expired are final; a stale cookie is the common repeat.
+                self.session_misses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(token_hash, Instant::now());
+            }
             return None;
         }
         Some(HubAuthority::Owner { login: entry.login })
@@ -707,18 +920,7 @@ impl AuthManager {
         headers: &BTreeMap<String, String>,
         query: &BTreeMap<String, String>,
     ) -> Option<HubAuthority> {
-        let cookie_token = headers
-            .get("cookie")
-            .and_then(|c| extract_session_cookie(c));
-        let bearer_token = headers
-            .get("authorization")
-            .and_then(|a| extract_bearer_token(a))
-            .or_else(|| {
-                query
-                    .get("token")
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            });
+        let (cookie_token, bearer_token) = session_candidates(headers, query);
 
         // 1. Active session cookie or session bearer token -> Owner.
         if let Some(ref c_tok) = cookie_token
@@ -1235,5 +1437,97 @@ mod tests {
         let cookie = format_session_set_cookie("tok", auth.session_ttl_secs());
         assert!(cookie.contains("HttpOnly"), "{cookie}");
         assert!(cookie.ends_with("Max-Age=2592000"), "{cookie}");
+    }
+
+    // --- Rejected-session cache --------------------------------------------------------------
+
+    #[test]
+    fn the_miss_cache_expires_evicts_oldest_first_and_forgets() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut cache = SessionMissCache::new(Duration::from_millis(100), 3);
+        for (i, h) in ["a", "b", "c", "d"].iter().enumerate() {
+            cache.insert((*h).to_string(), at(i as u64));
+        }
+        assert_eq!(cache.seen.len(), 3, "capacity is a hard bound");
+        assert!(!cache.contains("a", at(4)), "the oldest went first");
+        assert!(["b", "c", "d"].iter().all(|h| cache.contains(h, at(4))));
+        // `b` was inserted at 1 ms: gone at 101 ms, while `c` (2 ms) is still there.
+        assert!(!cache.contains("b", at(101)));
+        assert!(cache.contains("c", at(101)));
+        // A hit does not refresh the entry.
+        cache.insert("c".to_string(), at(50));
+        assert!(!cache.contains("c", at(102)));
+        // Inserting purges expired entries from the front.
+        cache.insert("e".to_string(), at(500));
+        assert_eq!(cache.seen.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+        cache.forget("e");
+        assert!(!cache.contains("e", at(501)));
+        // Zero capacity stores nothing.
+        let mut none = SessionMissCache::new(Duration::from_secs(1), 0);
+        none.insert("x".to_string(), t0);
+        assert!(!none.contains("x", t0));
+    }
+
+    #[test]
+    fn a_session_written_to_the_store_by_another_process_is_rejected_for_at_most_the_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
+        let auth = test_auth().with_session_miss_limits(Duration::from_millis(80), 8);
+        let token = "written-by-someone-else";
+        assert!(auth.verify_session_token(Some(&store), token).is_none());
+
+        let token_hash = sha256_hex(token);
+        persist_session_entry(
+            &store,
+            &StoredSessionEntry {
+                kind: "hub/session".to_string(),
+                key: format!("hub/session/{token_hash}"),
+                token_hash,
+                login: "alice".to_string(),
+                expires_at_ms: now_millis() + 60_000,
+                revoked: false,
+            },
+        )
+        .unwrap();
+        // The bound the invariant documents: not at once, but within the TTL.
+        assert!(auth.verify_session_token(Some(&store), token).is_none());
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(auth.verify_session_token(Some(&store), token).is_some());
+    }
+
+    #[test]
+    fn a_session_found_in_the_store_is_never_recorded_as_a_rejection() {
+        let tmp = TempDir::new().unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
+        let minter = test_auth();
+        let token = minter.mint_session(Some(&store), "alice").unwrap();
+        // A cold manager, as after a restart, finds it in the store.
+        let cold = test_auth();
+        assert!(cold.verify_session_token(Some(&store), &token).is_some());
+        assert_eq!(cold.session_miss_len(), 0);
+        // And a lookup with no store (the in-memory leg) records nothing either.
+        assert!(cold.verify_session_token(None, "nope").is_none());
+        assert_eq!(cold.session_miss_len(), 0);
+    }
+
+    #[test]
+    fn a_pairing_exchange_after_a_rejection_of_an_unrelated_token_is_unaffected() {
+        let tmp = TempDir::new().unwrap();
+        let store = fl_store::open_redb(&tmp.path().join("store.redb")).unwrap();
+        let auth = test_auth();
+        assert!(auth.verify_session_token(Some(&store), "junk").is_none());
+        let (session, _, _) = auth
+            .exchange_pairing_or_token(Some(&store), None, Some("owner-secret"))
+            .unwrap();
+        assert!(auth.verify_session_token(Some(&store), &session).is_some());
+        assert!(
+            auth.session_store_lookup_needed(
+                &BTreeMap::from([("authorization".to_string(), format!("Bearer {session}"))]),
+                &BTreeMap::new(),
+            ),
+            "a session token is never short-circuited"
+        );
     }
 }
