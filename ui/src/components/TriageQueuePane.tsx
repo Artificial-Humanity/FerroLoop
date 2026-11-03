@@ -113,20 +113,28 @@ export const DEFAULT_ROUTED_CI_PR_EVENTS: RoutedCiPrFeedbackEvent[] = [
   },
 ];
 
-// Record #103: Live Permission Prompt Interception & Remote Approval
+// Record #103: Live Permission Prompt Interception & Channel-Honest Remote Resolution
+export type PermissionChannelKind = "rpc" | "pty-snapshot";
+
 export type PermissionResponseDecision =
   | "approve_once"
   | "approve_session"
   | "always_allow_rule"
-  | "deny";
+  | "deny"
+  | "send_keys_unverified";
 
 export interface PendingPermissionPromptItem {
   id: string;
   session_id: string;
   agent: string;
   vendor: string;
+  transport: string;
+  channel_kind: PermissionChannelKind;
+  request_kind?: string;
   capability: string;
   command_or_target: string;
+  always_allow_supported?: boolean;
+  unverified_keys_supported?: boolean;
   status: "pending" | PermissionResponseDecision;
 }
 
@@ -137,9 +145,13 @@ export const DEFAULT_PENDING_PERMISSION_PROMPTS: PendingPermissionPromptItem[] =
       session_id: "sess-felix-ui",
       agent: "felix",
       vendor: "claude",
+      transport: "claude-sdk-mcp",
+      channel_kind: "rpc",
+      request_kind: "canUseTool",
       capability: "fs_read_external",
       command_or_target:
         "Read /tmp/ferrodeck-repo/ui/src/components/SettingsModal.tsx",
+      always_allow_supported: true,
       status: "pending",
     },
     {
@@ -147,8 +159,26 @@ export const DEFAULT_PENDING_PERMISSION_PROMPTS: PendingPermissionPromptItem[] =
       session_id: "sess-feira-sys",
       agent: "feira",
       vendor: "codex",
+      transport: "codex-app-server",
+      channel_kind: "rpc",
+      request_kind: "item/fileChange/requestApproval",
+      capability: "fs_write_workspace",
+      command_or_target: "Patch crates/fl-core/src/install_plan.rs",
+      always_allow_supported: false,
+      status: "pending",
+    },
+    {
+      id: "perm-req-03",
+      session_id: "sess-kacey-tui",
+      agent: "kacey",
+      vendor: "grok",
+      transport: "pty-vt100",
+      channel_kind: "pty-snapshot",
+      request_kind: "tui-screen-classifier",
       capability: "shell_exec",
-      command_or_target: "cargo test -p fl-core --test install_plan",
+      command_or_target: "pytest tests/test_permissions.py",
+      always_allow_supported: false,
+      unverified_keys_supported: true,
       status: "pending",
     },
   ];
@@ -612,9 +642,15 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
     setPermissionPrompts((prev) =>
       prev.map((p) => (p.id === item.id ? { ...p, status: decision } : p)),
     );
-    setPermissionPromptBanner(
-      `Sent ${decision} for @${item.agent} (${item.capability}: ${item.command_or_target}).`,
-    );
+    if (decision === "send_keys_unverified") {
+      setPermissionPromptBanner(
+        `Sent unverified PTY keystroke for @${item.agent} (${item.transport}; no verified permission grant recorded).`,
+      );
+    } else {
+      setPermissionPromptBanner(
+        `Sent ${decision} for @${item.agent} (${item.capability}: ${item.command_or_target}).`,
+      );
+    }
     try {
       if (typeof globalThis.fetch === "function") {
         await globalThis.fetch(
@@ -625,6 +661,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
             body: JSON.stringify({
               prompt_id: item.id,
               capability: item.capability,
+              channel_kind: item.channel_kind,
               decision,
             }),
           },
@@ -1245,6 +1282,7 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
               key={item.id}
               data-testid={`perm-prompt-card-${item.id}`}
               data-status={item.status}
+              data-channel-kind={item.channel_kind}
               className="fd-card"
               style={{
                 padding: "8px 10px",
@@ -1267,6 +1305,12 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
                   <span className="fd-badge fd-mono">{item.vendor}</span>
                   <span
                     className="fd-badge fd-mono"
+                    data-testid={`perm-prompt-transport-${item.id}`}
+                  >
+                    {item.transport} ({item.channel_kind})
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
                     data-testid={`perm-prompt-capability-${item.id}`}
                   >
                     {item.capability}
@@ -1279,56 +1323,100 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
                   </span>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid={`perm-prompt-approve-once-btn-${item.id}`}
-                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
-                    onClick={() =>
-                      void handleRespondPermissionPrompt(item, "approve_once")
-                    }
-                  >
-                    Approve Once
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    data-testid={`perm-prompt-approve-session-btn-${item.id}`}
-                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
-                    onClick={() =>
-                      void handleRespondPermissionPrompt(
-                        item,
-                        "approve_session",
-                      )
-                    }
-                  >
-                    Approve for Session
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    data-testid={`perm-prompt-always-allow-btn-${item.id}`}
-                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
-                    onClick={() =>
-                      void handleRespondPermissionPrompt(
-                        item,
-                        "always_allow_rule",
-                      )
-                    }
-                  >
-                    Always Allow Rule
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-danger"
-                    data-testid={`perm-prompt-deny-btn-${item.id}`}
-                    style={{ fontSize: "10.5px", padding: "2px 6px" }}
-                    onClick={() =>
-                      void handleRespondPermissionPrompt(item, "deny")
-                    }
-                  >
-                    Deny
-                  </button>
+                  {item.channel_kind === "rpc" ? (
+                    <>
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-primary"
+                        data-testid={`perm-prompt-approve-once-btn-${item.id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() =>
+                          void handleRespondPermissionPrompt(
+                            item,
+                            "approve_once",
+                          )
+                        }
+                      >
+                        Approve Once
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`perm-prompt-approve-session-btn-${item.id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() =>
+                          void handleRespondPermissionPrompt(
+                            item,
+                            "approve_session",
+                          )
+                        }
+                      >
+                        Approve for Session
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`perm-prompt-always-allow-btn-${item.id}`}
+                        disabled={item.always_allow_supported === false}
+                        title={
+                          item.always_allow_supported === false
+                            ? `Always Allow not supported for ${item.request_kind || item.transport}`
+                            : "Persist allow rule"
+                        }
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() =>
+                          void handleRespondPermissionPrompt(
+                            item,
+                            "always_allow_rule",
+                          )
+                        }
+                      >
+                        Always Allow Rule
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-danger"
+                        data-testid={`perm-prompt-deny-btn-${item.id}`}
+                        style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                        onClick={() =>
+                          void handleRespondPermissionPrompt(item, "deny")
+                        }
+                      >
+                        Deny
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`perm-prompt-notification-only-badge-${item.id}`}
+                        style={{
+                          fontSize: "10px",
+                          backgroundColor: "rgba(245, 158, 11, 0.16)",
+                          color: "#FBBF24",
+                          borderColor: "rgba(245, 158, 11, 0.4)",
+                        }}
+                      >
+                        Notification Only (No Verified Approval RPC)
+                      </span>
+                      {item.unverified_keys_supported !== false && (
+                        <button
+                          type="button"
+                          className="fd-btn"
+                          data-testid={`perm-prompt-send-keys-unverified-btn-${item.id}`}
+                          style={{ fontSize: "10.5px", padding: "2px 6px" }}
+                          onClick={() =>
+                            void handleRespondPermissionPrompt(
+                              item,
+                              "send_keys_unverified",
+                            )
+                          }
+                        >
+                          Send keys — unverified
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
               <div className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>

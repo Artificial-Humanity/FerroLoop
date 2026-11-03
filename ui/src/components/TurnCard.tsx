@@ -9,12 +9,14 @@ import { parseWireIntentMetadata } from "./WireMailPane";
 import {
   DEFAULT_PENDING_PERMISSION_PROMPTS,
   type PendingPermissionPromptItem,
+  type PermissionChannelKind,
   type PermissionResponseDecision,
 } from "./TriageQueuePane";
 
 export {
   DEFAULT_PENDING_PERMISSION_PROMPTS,
   type PendingPermissionPromptItem,
+  type PermissionChannelKind,
   type PermissionResponseDecision,
 };
 

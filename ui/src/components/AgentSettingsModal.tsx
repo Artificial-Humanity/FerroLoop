@@ -20,25 +20,41 @@ import {
   type EstimatedContextUsage,
 } from "./ChatPane";
 import {
+  DEFAULT_RULE_PRESET_MATRICES,
   DEFAULT_UNIVERSAL_PERMISSION_MATRICES,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  compileUniversalPermissions,
   computeWorktreeBootstrapPreview,
+  resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
+  type PermissionChangeClass,
+  type PermissionCompileReceipt,
   type PermissionRuleAction,
   type UniversalPermissionCapability,
   type UniversalPermissionMatrix,
   type UniversalPermissionMode,
+  type UniversalPermissionPosture,
+  type UniversalRulePreset,
+  type UniversalSandboxMode,
   type WorktreePolicyMode,
 } from "./SpinUpAgentModal";
 
 export {
+  DEFAULT_RULE_PRESET_MATRICES,
   DEFAULT_UNIVERSAL_PERMISSION_MATRICES,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  compileUniversalPermissions,
+  resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
+  type PermissionChangeClass,
+  type PermissionCompileReceipt,
   type PermissionRuleAction,
   type UniversalPermissionCapability,
   type UniversalPermissionMatrix,
   type UniversalPermissionMode,
+  type UniversalPermissionPosture,
+  type UniversalRulePreset,
+  type UniversalSandboxMode,
 };
 
 /**
@@ -375,11 +391,17 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const { pinnedAgents } = usePinnedState();
   const [agentWorktreePolicy, setAgentWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
+  const [agentPosture, setAgentPosture] =
+    useState<UniversalPermissionPosture>("ask");
+  const [agentSandbox, setAgentSandbox] =
+    useState<UniversalSandboxMode>("vendor-default");
+  const [agentRulePreset, setAgentRulePreset] =
+    useState<UniversalRulePreset>("workspace");
   const [agentPermissionMode, setAgentPermissionMode] =
     useState<UniversalPermissionMode>("auto-accept");
   const [agentPermissionMatrix, setAgentPermissionMatrix] =
     useState<UniversalPermissionMatrix>(
-      () => DEFAULT_UNIVERSAL_PERMISSION_MATRICES["auto-accept"],
+      () => DEFAULT_RULE_PRESET_MATRICES.workspace,
     );
   const [recastModalOpen, setRecastModalOpen] = useState(false);
   const [recastProject, setRecastProject] = useState(agentProject || "Workspace");
@@ -1359,112 +1381,371 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             );
           })()}
 
-          {/* Record #103: Universal Agent Permission & Auto-Accept Management */}
-          <div
-            data-testid="agent-permissions-section"
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "6px",
-              padding: "8px 10px",
-              marginBottom: "8px",
-              borderRadius: "6px",
-              backgroundColor: "var(--bg-elevated)",
-              border: "1px solid var(--border-subtle)",
-              fontSize: "11.5px",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "8px",
-                flexWrap: "wrap",
-              }}
-            >
-              <span style={{ fontWeight: 700, fontSize: "11px" }}>
-                Permission &amp; Approval Mode
-              </span>
-              <code
-                className="fd-mono"
-                data-testid="agent-permission-vendor-preview"
-                style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+          {/* Record #103: Universal Agent Permission & Auto-Accept Management (3-Layer + Keyed Change Classes) */}
+          {(() => {
+            const hostTelemetryForPerms = resolveAgentHostSupervisorTelemetry(
+              effectiveAdapter,
+              agentName || sessionId,
+            );
+            const postureChangeClass = resolvePermissionChangeClass(
+              effectiveAdapter,
+              hostTelemetryForPerms.transportMode,
+              "posture",
+              agentPosture,
+            );
+            const sandboxChangeClass = resolvePermissionChangeClass(
+              effectiveAdapter,
+              hostTelemetryForPerms.transportMode,
+              "sandbox",
+            );
+            const compileReceipt = compileUniversalPermissions(
+              effectiveAdapter,
+              agentPosture,
+              agentSandbox,
+              agentPermissionMatrix,
+            );
+            return (
+              <div
+                data-testid="agent-permissions-section"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  padding: "8px 10px",
+                  marginBottom: "8px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  fontSize: "11.5px",
+                }}
               >
-                {resolveVendorPermissionPreview(adapter, agentPermissionMode)}
-              </code>
-            </div>
-            <select
-              aria-label="Agent Permission & Approval Mode"
-              data-testid="agent-permission-mode-select"
-              className="fd-select fd-mono"
-              value={agentPermissionMode}
-              onChange={(e) => {
-                const nextMode = e.target.value as UniversalPermissionMode;
-                setAgentPermissionMode(nextMode);
-                setAgentPermissionMatrix({
-                  ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
-                });
-              }}
-              style={{ width: "100%", fontSize: "11.5px" }}
-            >
-              <option value="auto-accept">
-                auto-accept (Full autonomous bypass)
-              </option>
-              <option value="workspace-write">
-                workspace-write (Auto-allow workspace, prompt external/shell)
-              </option>
-              <option value="granular">
-                granular (Per-capability allow / ask / deny matrix)
-              </option>
-            </select>
-            <div
-              data-testid="agent-permission-matrix"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: "4px",
-              }}
-            >
-              {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => (
                 <div
-                  key={cap}
-                  data-testid={`agent-perm-cap-${cap}`}
                   style={{
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                    Permission Posture, Sandbox &amp; Rules
+                  </span>
+                  <code
+                    className="fd-mono"
+                    data-testid="agent-permission-vendor-preview"
+                    style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+                  >
+                    {resolveVendorPermissionPreview(
+                      effectiveAdapter,
+                      agentPermissionMode,
+                    )}
+                  </code>
+                </div>
+
+                {/* 3-Layer Controls with Keyed Change-Class Badges */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                    gap: "6px",
+                  }}
+                >
+                  <div>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "4px",
+                        marginBottom: "2px",
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: "10px",
+                          fontWeight: 600,
+                          color: "var(--text-muted)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        1. Posture
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="agent-change-class-posture"
+                        style={{ fontSize: "9.5px" }}
+                      >
+                        {postureChangeClass}
+                      </span>
+                    </div>
+                    <select
+                      aria-label="Agent Approval Posture"
+                      data-testid="agent-posture-select"
+                      className="fd-select fd-mono"
+                      value={agentPosture}
+                      onChange={(e) => {
+                        const nextPosture = e.target
+                          .value as UniversalPermissionPosture;
+                        setAgentPosture(nextPosture);
+                        if (nextPosture === "bypass") {
+                          setAgentPermissionMode("auto-accept");
+                        } else if (nextPosture === "accept-edits") {
+                          setAgentPermissionMode("workspace-write");
+                        }
+                      }}
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="ask">ask (default)</option>
+                      <option value="accept-edits">accept-edits</option>
+                      <option value="auto">auto</option>
+                      <option value="plan">plan</option>
+                      <option value="bypass">bypass (skip prompts)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "4px",
+                        marginBottom: "2px",
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: "10px",
+                          fontWeight: 600,
+                          color: "var(--text-muted)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        2. Sandbox
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="agent-change-class-sandbox"
+                        style={{ fontSize: "9.5px" }}
+                      >
+                        {sandboxChangeClass}
+                      </span>
+                    </div>
+                    <select
+                      aria-label="Agent OS Sandbox Mode"
+                      data-testid="agent-sandbox-select"
+                      className="fd-select fd-mono"
+                      value={agentSandbox}
+                      onChange={(e) =>
+                        setAgentSandbox(e.target.value as UniversalSandboxMode)
+                      }
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="vendor-default">vendor-default</option>
+                      <option value="off">off (no OS sandbox)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "4px",
+                        marginBottom: "2px",
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontSize: "10px",
+                          fontWeight: 600,
+                          color: "var(--text-muted)",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        3. Rule Preset
+                      </span>
+                    </div>
+                    <select
+                      aria-label="Agent Capability Rule Preset"
+                      data-testid="agent-rule-preset-select"
+                      className="fd-select fd-mono"
+                      value={agentRulePreset}
+                      onChange={(e) => {
+                        const nextPreset = e.target
+                          .value as UniversalRulePreset;
+                        setAgentRulePreset(nextPreset);
+                        setAgentPermissionMatrix({
+                          ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
+                        });
+                      }}
+                      style={{ width: "100%", fontSize: "10.5px" }}
+                    >
+                      <option value="read-only">read-only</option>
+                      <option value="workspace">workspace</option>
+                      <option value="workspace-web">workspace-web</option>
+                      <option value="custom">custom</option>
+                    </select>
+                  </div>
+                </div>
+
+                <select
+                  aria-label="Agent Permission & Approval Mode"
+                  data-testid="agent-permission-mode-select"
+                  className="fd-select fd-mono"
+                  value={agentPermissionMode}
+                  onChange={(e) => {
+                    const nextMode = e.target.value as UniversalPermissionMode;
+                    setAgentPermissionMode(nextMode);
+                    setAgentPermissionMatrix({
+                      ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
+                    });
+                    if (nextMode === "auto-accept") {
+                      setAgentPosture("bypass");
+                    } else if (nextMode === "workspace-write") {
+                      setAgentPosture("accept-edits");
+                      setAgentRulePreset("workspace");
+                    } else {
+                      setAgentRulePreset("custom");
+                    }
+                  }}
+                  style={{ width: "100%", fontSize: "11px" }}
+                >
+                  <option value="auto-accept">
+                    auto-accept (Full autonomous bypass)
+                  </option>
+                  <option value="workspace-write">
+                    workspace-write (Auto-allow workspace, prompt external/shell)
+                  </option>
+                  <option value="granular">
+                    granular (Per-capability allow / ask / deny matrix)
+                  </option>
+                </select>
+
+                <div
+                  data-testid="agent-permission-matrix"
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
                     gap: "4px",
-                    padding: "3px 6px",
+                  }}
+                >
+                  {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => {
+                    const capChangeClass = resolvePermissionChangeClass(
+                      effectiveAdapter,
+                      hostTelemetryForPerms.transportMode,
+                      cap,
+                    );
+                    return (
+                      <div
+                        key={cap}
+                        data-testid={`agent-perm-cap-${cap}`}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "4px",
+                          padding: "3px 6px",
+                          borderRadius: "4px",
+                          border: "1px solid var(--border-subtle)",
+                          fontSize: "10.5px",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            minWidth: 0,
+                          }}
+                        >
+                          <code className="fd-mono">{cap}</code>
+                          <span
+                            className="fd-badge fd-mono"
+                            data-testid={`agent-perm-change-class-${cap}`}
+                            style={{ fontSize: "9px", padding: "0 4px" }}
+                          >
+                            {capChangeClass}
+                          </span>
+                        </div>
+                        <select
+                          aria-label={`Agent permission for ${cap}`}
+                          data-testid={`agent-perm-select-${cap}`}
+                          className="fd-select fd-mono"
+                          style={{ fontSize: "10px", padding: "1px 4px" }}
+                          value={agentPermissionMatrix[cap]}
+                          onChange={(e) => {
+                            const nextAction = e.target
+                              .value as PermissionRuleAction;
+                            setAgentPermissionMode("granular");
+                            setAgentRulePreset("custom");
+                            setAgentPermissionMatrix((prev) => ({
+                              ...prev,
+                              [cap]: nextAction,
+                            }));
+                          }}
+                        >
+                          <option value="allow">allow</option>
+                          <option value="ask">ask</option>
+                          <option value="deny">deny</option>
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Compile Receipt & Downgrade Preview */}
+                <div
+                  data-testid="agent-compile-receipt"
+                  style={{
+                    padding: "6px 8px",
                     borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
                     border: "1px solid var(--border-subtle)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "4px",
                     fontSize: "10.5px",
                   }}
                 >
-                  <code className="fd-mono">{cap}</code>
-                  <select
-                    aria-label={`Agent permission for ${cap}`}
-                    data-testid={`agent-perm-select-${cap}`}
-                    className="fd-select fd-mono"
-                    style={{ fontSize: "10px", padding: "1px 4px" }}
-                    value={agentPermissionMatrix[cap]}
-                    onChange={(e) => {
-                      const nextAction = e.target.value as PermissionRuleAction;
-                      setAgentPermissionMode("granular");
-                      setAgentPermissionMatrix((prev) => ({
-                        ...prev,
-                        [cap]: nextAction,
-                      }));
-                    }}
+                  <div
+                    className="fd-mono"
+                    data-testid="agent-compile-native-flags"
+                    style={{ color: "var(--accent-primary)" }}
                   >
-                    <option value="allow">allow</option>
-                    <option value="ask">ask</option>
-                    <option value="deny">deny</option>
-                  </select>
+                    Compiled ({compileReceipt.vendor}):{" "}
+                    {compileReceipt.nativeFlagsOrConfig}
+                  </div>
+                  {compileReceipt.downgrades.length > 0 && (
+                    <div
+                      data-testid="agent-compile-downgrades"
+                      style={{ color: "#FBBF24" }}
+                    >
+                      Downgrade: {compileReceipt.downgrades.join(" ")}
+                    </div>
+                  )}
+                  {compileReceipt.emulationNotices.length > 0 && (
+                    <div
+                      data-testid="agent-compile-emulation"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      Emulated: {compileReceipt.emulationNotices.join(" ")}
+                    </div>
+                  )}
+                  {compileReceipt.refused.length > 0 && (
+                    <div
+                      data-testid="agent-compile-refused"
+                      style={{ color: "#F87171", fontWeight: 600 }}
+                    >
+                      Refused: {compileReceipt.refused.join(" ")}
+                    </div>
+                  )}
                 </div>
-              ))}
-            </div>
-          </div>
+              </div>
+            );
+          })()}
           <div
             style={{
               display: "flex",
