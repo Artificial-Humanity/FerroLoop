@@ -210,7 +210,16 @@ perform it and no field of it reports it.
 
 * `class` is one of `vault-ref`, `plaintext-file`, `env`, `unconfigured` and `unknown`. `unknown`
   means the facts conflict (for example `[github] private_key_ref` together with
-  `$FL_GITHUB_PRIVATE_KEY_PATH`) or the hub was not told its configuration; `evidence` says which.
+  `$FL_GITHUB_PRIVATE_KEY_PATH`), the hub was not told its configuration, or a configured Vault
+  secret name could not be checked because the Vault file could not be listed (corrupt, too
+  large or not a regular file); `evidence` says which. A Vault file that does not exist lists no
+  secrets, so a name is then not found: the GitHub key stays `vault-ref` (the reference is
+  explicit) and a vendor is `unconfigured`.
+* `env` means the credential is read from the hub's environment. For `github-app-private-key` the
+  variable holds a PATH to a plaintext PEM file (`plaintext_path_present` can be `true`). For the
+  tokens, the vendor keys and the master key the secret VALUE itself is in the process
+  environment, readable through `/proc/<pid>/environ` by the same Unix user and inherited by
+  every child process unless it is scrubbed.
 * `plaintext_path_present` is `true` when a plaintext file is configured and exists, `false` when
   none is configured (a value held directly in an environment variable has no file), and `null`
   when the hub cannot tell.
@@ -232,8 +241,11 @@ The consumers, in order, and how each class is decided:
 | `github-token` | n/a | n/a | `$FL_GITHUB_TOKEN`, `$GITHUB_TOKEN` or `$GH_TOKEN` set, or a tracker with `credential = "env"` |
 | `hub-owner-token` | n/a | `--owner-token-file` or `[hub] owner_token_file` | `$FL_HUB_OWNER_TOKEN` (wins over the file) |
 | `wire-peer-token` | n/a | `[wire] token_file` | `$FL_WIRE_TOKEN` (wins over the file) |
-| `vendor:<id>`, one per API vendor that needs a key | `vault_secret` names a secret the Vault lists | n/a | the vendor's `env_key` variable is set (resolves first) |
+| `vendor:<id>`, one per API vendor that needs a key | `vault_secret` names a secret the Vault lists (`unknown` when the Vault cannot be listed) | n/a | the vendor's `env_key` variable is set (resolves first) |
 | `vault-master-key` | n/a | the key file exists | `$FL_VAULT_MASTER_KEY` is set |
+
+`github-token` looks at the hub's environment variables and the tracker bindings only. A credential
+held by `gh` (for example its hosts file) is not inspected, and its evidence says so.
 
 The owner and wire tokens are inbound: callers present them to the Hub, so the Vault cannot
 broker them. A vendor whose named Vault secret is not in the Vault, and that has no variable set,

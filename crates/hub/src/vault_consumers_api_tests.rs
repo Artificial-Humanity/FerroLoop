@@ -159,6 +159,7 @@ fn a_private_key_ref_is_a_vault_ref_that_is_configured_and_nothing_more() {
         no_tail(),
         (false, false),
     );
+    assert_eq!(class(&unlisted, KEY), "unknown");
     assert!(
         consumer(&unlisted, KEY)["evidence"]
             .as_str()
@@ -256,6 +257,13 @@ fn the_github_token_is_env_when_a_variable_or_a_binding_says_so() {
     let v = report_of(Some(&cfg), &[("GITHUB_TOKEN", CANARY_ENV)]);
     assert_eq!(class(&v, "github-token"), "env");
     let text = consumer(&v, "github-token")["evidence"].as_str().unwrap();
+    assert!(text.contains("held by `gh`"));
+    assert!(
+        consumer(&report_of(Some(&cfg), &[]), "github-token")["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("held by `gh`")
+    );
     assert!(text.contains("$GITHUB_TOKEN"));
     assert!(!v.to_string().contains(CANARY_ENV));
     assert_eq!(
@@ -402,6 +410,28 @@ fn each_vendor_reports_which_source_resolves() {
         ]
     );
     assert!(!v.to_string().contains(CANARY_ENV));
+}
+
+#[test]
+fn a_vendor_secret_in_a_vault_that_could_not_be_listed_is_unknown() {
+    let listed = |env: &[(&str, &str)]| {
+        run(
+            Some(&Default::default()),
+            &fake(env),
+            vec![vendor("a", Some("A_KEY"), Some("A_KEY"))],
+            Path::new("/nonexistent-g6c/vault.key"),
+            None,
+            no_tail(),
+            (false, false),
+        )
+    };
+    let v = listed(&[]);
+    assert_eq!(class(&v, "vendor:a"), "unknown");
+    let text = consumer(&v, "vendor:a")["evidence"].as_str().unwrap();
+    assert!(text.contains("configured to a secret named A_KEY"));
+    assert!(text.contains("could not be listed"));
+    // A variable that is set still resolves first.
+    assert_eq!(class(&listed(&[("A_KEY", CANARY_ENV)]), "vendor:a"), "env");
 }
 
 // --- Custody and the master key ----------------------------------------------------------------
@@ -680,7 +710,7 @@ fn the_report_never_says_complete_and_says_it_does_not_verify() {
 
 /// Every variable the endpoint reads, and the Vault's location ones: a developer's real values
 /// must never reach a test.
-const READ_ENV: [&str; 16] = [
+const READ_ENV: [&str; 15] = [
     "FL_VAULT_PATH",
     "FL_VAULT_KEY_PATH",
     "FL_VAULT_MASTER_KEY",
@@ -693,7 +723,6 @@ const READ_ENV: [&str; 16] = [
     "GH_TOKEN",
     "FL_HUB_OWNER_TOKEN",
     "FL_WIRE_TOKEN",
-    "G6C_TEST_VENDOR_KEY",
     "ANTHROPIC_API_KEY",
     "MOONSHOT_API_KEY",
     "FL_STORE_BACKEND",
@@ -705,11 +734,14 @@ struct CleanEnv {
 }
 
 fn clean_env() -> CleanEnv {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The crate-wide lock the doctor and probe tests take for the same variables. These tests
+    // never take the probe lock, so there is no order to keep with it.
+    let lock = crate::SECRET_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let saved = READ_ENV.iter().map(|k| (*k, std::env::var_os(k))).collect();
     for k in READ_ENV {
-        // SAFETY: every test that reads these variables holds LOCK.
+        // SAFETY: every test that reads these variables holds SECRET_ENV_LOCK.
         unsafe { std::env::remove_var(k) };
     }
     CleanEnv { saved, _lock: lock }
@@ -723,7 +755,7 @@ fn set_env(k: &str, v: &str) {
 impl Drop for CleanEnv {
     fn drop(&mut self) {
         for (k, v) in self.saved.drain(..) {
-            // SAFETY: still holding LOCK.
+            // SAFETY: still holding SECRET_ENV_LOCK.
             unsafe {
                 match v {
                     Some(v) => std::env::set_var(k, v),
@@ -836,7 +868,7 @@ fn the_endpoint_reports_the_real_files_and_leaves_them_untouched() {
             .unwrap();
         vault
             .set(fl_gate::vault::SetSecretArgs {
-                name: "G6C_TEST_VENDOR_KEY".into(),
+                name: "MOONSHOT_API_KEY".into(),
                 value: CANARY_VAULT.into(),
                 ..Default::default()
             })
@@ -857,23 +889,6 @@ fn the_endpoint_reports_the_real_files_and_leaves_them_untouched() {
     write(&owner_file, CANARY_FILE, 0o600);
     let pem = home.join("app.pem");
     write(&pem, CANARY_FILE, 0o600);
-
-    fl_core::vendor::VendorRegistry::global()
-        .ensure_registered(fl_core::vendor::VendorDescriptor {
-            id: "g6c-test".into(),
-            display_name: "g6c test".into(),
-            transport: fl_core::vendor::VendorTransport::HttpApi {
-                default_base_url: "https://api.example.test".into(),
-                api_dialect: fl_core::vendor::ApiDialect::OpenAiChatCompletions,
-                vault_secret_name: Some("G6C_TEST_VENDOR_KEY".into()),
-                env_key_name: Some("G6C_TEST_VENDOR_KEY".into()),
-            },
-            default_model: "m".into(),
-            default_context_window: 0,
-            default_rate_card: Default::default(),
-            mcp_config_rel_path: None,
-        })
-        .unwrap();
 
     let state = hub(&tmp);
     state.set_vault_consumer_config(VaultConsumerConfig {
@@ -901,7 +916,7 @@ fn the_endpoint_reports_the_real_files_and_leaves_them_untouched() {
     assert_eq!(class(&v, "github-token"), "env");
     assert_eq!(class(&v, "hub-owner-token"), "plaintext-file");
     assert_eq!(class(&v, "wire-peer-token"), "env");
-    assert_eq!(class(&v, "vendor:g6c-test"), "vault-ref");
+    assert_eq!(class(&v, "vendor:kimi-api"), "vault-ref");
     assert_eq!(class(&v, "vault-master-key"), "plaintext-file");
     assert_eq!(v["custody"]["vault_key_mode"], "0644");
     assert_eq!(v["custody"]["vault_key_readable_by_group_or_other"], true);
@@ -911,9 +926,9 @@ fn the_endpoint_reports_the_real_files_and_leaves_them_untouched() {
     );
 
     // With the vendor variable set, that vendor resolves from the environment.
-    set_env("G6C_TEST_VENDOR_KEY", CANARY_ENV);
+    set_env("MOONSHOT_API_KEY", CANARY_ENV);
     let (_, v2) = request(&state, "GET", Some(OWNER));
-    assert_eq!(class(&v2, "vendor:g6c-test"), "env");
+    assert_eq!(class(&v2, "vendor:kimi-api"), "env");
 
     for body in [v.to_string(), v2.to_string()] {
         for secret in [CANARY_ENV, CANARY_FILE, CANARY_VAULT, &"ab".repeat(32)] {
@@ -948,6 +963,7 @@ fn the_endpoint_survives_a_corrupt_vault_and_a_symlinked_log() {
     assert_eq!(status, 200, "{v}");
     assert_eq!(v["audit"]["state"], "symlink");
     assert_eq!(v["audit"]["last_denied"], Value::Null);
+    assert_eq!(class(&v, KEY), "unknown");
     assert!(
         consumer(&v, KEY)["evidence"]
             .as_str()

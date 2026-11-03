@@ -259,11 +259,17 @@ fn github_private_key(i: &Inputs<'_>) -> Consumer {
             c.evidence = format!("`[github] private_key` names a PEM file{unused}");
         }
         (None, Some(name)) => {
-            c.class = Class::VaultRef;
+            let has = i.vault_has(&name);
+            // A Vault that could not be listed leaves the reference unchecked: unknown.
+            c.class = if has.is_none() {
+                Class::Unknown
+            } else {
+                Class::VaultRef
+            };
             c.plaintext_path_present = Some(false);
             c.evidence = format!(
-                "`[github] private_key_ref` is set to secret {name}; {}{unused}",
-                vault_presence_text(i.vault_has(&name))
+                "`[github] private_key_ref` is configured to a secret named {name}; {}{unused}",
+                vault_presence_text(has)
             );
             c.secret_name = Some(name);
         }
@@ -277,6 +283,13 @@ fn github_private_key(i: &Inputs<'_>) -> Consumer {
 }
 
 fn github_token(i: &Inputs<'_>) -> Consumer {
+    let mut c = github_token_source(i);
+    c.evidence
+        .push_str("; credentials held by `gh` (for example its hosts file) are not inspected");
+    c
+}
+
+fn github_token_source(i: &Inputs<'_>) -> Consumer {
     const VARS: [&str; 3] = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
     let set: Vec<&str> = VARS.into_iter().filter(|v| i.env_set(v)).collect();
     let bindings = i.config.map(|c| c.github_env_credential_bindings);
@@ -417,9 +430,14 @@ fn vendor_key(i: &Inputs<'_>, v: &VendorKey) -> Consumer {
             c.secret_name = Some(secret.clone());
         }
         (Some(secret), has) => {
-            c.class = Class::VaultRef;
+            // A Vault that could not be listed leaves the name unchecked: unknown.
+            c.class = if has.is_none() {
+                Class::Unknown
+            } else {
+                Class::VaultRef
+            };
             c.evidence = format!(
-                "{env_note}; Vault secret {secret} is named ({})",
+                "{env_note}; configured to a secret named {secret}; {}",
                 vault_presence_text(has)
             );
             c.secret_name = Some(secret.clone());
