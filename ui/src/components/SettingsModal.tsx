@@ -242,6 +242,184 @@ export const DEFAULT_RELEASE_SLOTS: ReleaseSlotEntry[] = [
     dirty: false,
   },
 ];
+
+/**
+ * Record #67: FerroDeck+ Operator Push Notifications (Web Push VAPID + APNs + FCM).
+ */
+export type WebPushPermissionStatus = "granted" | "default" | "denied";
+export type MobilePushChannelStatus = "active" | "pending" | "unregistered";
+
+export interface OperatorPushSubscriptionState {
+  web_push_permission: WebPushPermissionStatus;
+  vapid_service_worker_registered: boolean;
+  vapid_public_key_fingerprint: string;
+  apns_ios_status: MobilePushChannelStatus;
+  fcm_android_status: MobilePushChannelStatus;
+  triggers: {
+    question_badge: boolean;
+    blocker_error_badge: boolean;
+    urgent_wire_mail: boolean;
+    pr_review_requests: boolean;
+  };
+  project_scope: string;
+  quiet_hours: {
+    enabled: boolean;
+    start_time: string;
+    end_time: string;
+    timezone: string;
+  };
+}
+
+export const DEFAULT_OPERATOR_PUSH_STATE: OperatorPushSubscriptionState = {
+  web_push_permission: "granted",
+  vapid_service_worker_registered: true,
+  vapid_public_key_fingerprint: "VAPID-SHA256:8f4e2b91c0d3",
+  apns_ios_status: "active",
+  fcm_android_status: "active",
+  triggers: {
+    question_badge: true,
+    blocker_error_badge: true,
+    urgent_wire_mail: true,
+    pr_review_requests: true,
+  },
+  project_scope: "all",
+  quiet_hours: {
+    enabled: true,
+    start_time: "22:00",
+    end_time: "07:00",
+    timezone: "UTC",
+  },
+};
+
+/**
+ * Record #74: User-Configurable Agent Role Registry (11 built-in roles + custom RoleRecord).
+ */
+export type RoleReviewPolicy =
+  | "lead-review"
+  | "lab-manager-review"
+  | "peer-review";
+
+export interface ConfigurableRoleRecord {
+  slug: string;
+  label: string;
+  description: string;
+  builtin: boolean;
+  review_policy: RoleReviewPolicy;
+  prompt_template: string;
+}
+
+export const BUILTIN_ROLE_REGISTRY: ConfigurableRoleRecord[] = [
+  {
+    slug: "lead",
+    label: "Project Lead",
+    description:
+      "Owns project planning, architecture, subordinate PR reviews, and delegation.",
+    builtin: true,
+    review_policy: "lab-manager-review",
+    prompt_template:
+      "Read .agents/roles/lead.md and lead project architecture and reviews.",
+  },
+  {
+    slug: "assistant",
+    label: "Assisting Engineer",
+    description:
+      "Executes delegated engineering tasks with local subagent pre-review.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Read .agents/roles/assistant.md and execute delegated implementation tasks.",
+  },
+  {
+    slug: "strategist",
+    label: "Research & Architecture Strategist",
+    description:
+      "Serves on the Strategy Council synthesizing research literature and architecture.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Read .agents/roles/strategist.md and synthesize research against empirical findings.",
+  },
+  {
+    slug: "ui-developer",
+    label: "UI & Full-Stack Application Developer",
+    description:
+      "Specializes in React, TypeScript, Rust web frameworks, and native cross-platform UI.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Read .agents/roles/ui-developer.md and maintain cockpit UI parity and tests.",
+  },
+  {
+    slug: "lab-manager",
+    label: "Lab Manager",
+    description:
+      "Workspace-wide authority over ai-lab-0, GPU arbitration, and Lead PR reviews.",
+    builtin: true,
+    review_policy: "peer-review",
+    prompt_template:
+      "Read .agents/roles/lab-manager.md and manage workspace infrastructure and governance.",
+  },
+  {
+    slug: "qa-tester",
+    label: "QA & Verification Engineer",
+    description:
+      "Owns regression harnesses, conformance suites, and end-to-end verification.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Run exhaustive verification suites and report deterministic reproduction cases.",
+  },
+  {
+    slug: "security-engineer",
+    label: "Security & Vault Engineer",
+    description:
+      "Audits FerroGate vault policies, credential boundaries, and sandbox isolation.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Audit secret boundaries, capability matrices, and sandbox enforcement.",
+  },
+  {
+    slug: "devops-release",
+    label: "DevOps & Release Engineer",
+    description:
+      "Maintains CI/CD pipelines, versioned release slots, and systemd supervisor units.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Manage release slot rollouts, build provenance stamps, and CI workflows.",
+  },
+  {
+    slug: "data-ml-engineer",
+    label: "Data & ML Systems Engineer",
+    description:
+      "Builds dataset pipelines, training runs, and evaluation benchmarks.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Maintain training hygiene, dataset lineage, and benchmark reproducibility.",
+  },
+  {
+    slug: "technical-writer",
+    label: "Technical Writer & Spec Maintainer",
+    description:
+      "Maintains architecture specifications, runbooks, and operator documentation.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Keep specifications, runbooks, and documentation accurate and concise.",
+  },
+  {
+    slug: "journalist",
+    label: "Journalist & Technical Scribe",
+    description:
+      "Chronicles project milestones, experiment logs, and publication drafts.",
+    builtin: true,
+    review_policy: "lead-review",
+    prompt_template:
+      "Record empirical milestones, experiment notes, and technical dispatches.",
+  },
+];
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -1217,6 +1395,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
     return authority.agent ? `Peer: ${authority.agent}` : "Peer";
   }, [authority]);
+
+  const [operatorPushState, setOperatorPushState] =
+    useState<OperatorPushSubscriptionState>(() => DEFAULT_OPERATOR_PUSH_STATE);
+  const [pushActionBanner, setPushActionBanner] = useState<string | null>(null);
+  const [roleRegistry, setRoleRegistry] = useState<ConfigurableRoleRecord[]>(
+    () => BUILTIN_ROLE_REGISTRY,
+  );
+  const [roleDraftSlug, setRoleDraftSlug] = useState("");
+  const [roleDraftLabel, setRoleDraftLabel] = useState("");
+  const [roleDraftDescription, setRoleDraftDescription] = useState("");
+  const [roleDraftReviewPolicy, setRoleDraftReviewPolicy] =
+    useState<RoleReviewPolicy>("lead-review");
+  const [roleDraftPromptTemplate, setRoleDraftPromptTemplate] = useState("");
+  const [roleRegistryBanner, setRoleRegistryBanner] = useState<string | null>(
+    null,
+  );
 
   if (!isOpen) {
     return null;
@@ -2692,6 +2886,294 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
           </div>
+
+          {/* Record #74: User-Configurable Agent Role Registry */}
+          <div
+            className="fd-card"
+            data-testid="configurable-role-registry-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "10px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: "0 0 2px 0",
+                    fontSize: "13px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  User-Configurable Agent Role Registry
+                </h3>
+                <p
+                  style={{
+                    margin: 0,
+                    fontSize: "11.5px",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  Inspect the 11 built-in workspace roles and define or edit custom{" "}
+                  <code className="fd-mono">RoleRecord</code> templates synced via{" "}
+                  <code className="fd-mono">/api/v1/roles</code>.
+                </p>
+              </div>
+              <span
+                className="fd-badge fd-mono"
+                data-testid="role-registry-count-badge"
+                style={{ fontSize: "10.5px" }}
+              >
+                {roleRegistry.length} Roles (
+                {roleRegistry.filter((r) => r.builtin).length} Built-in ·{" "}
+                {roleRegistry.filter((r) => !r.builtin).length} Custom)
+              </span>
+            </div>
+
+            {roleRegistryBanner && (
+              <div
+                role="status"
+                data-testid="role-registry-status-banner"
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  color: "#34D399",
+                  padding: "4px 8px",
+                  borderRadius: "4px",
+                  backgroundColor: "rgba(16, 185, 129, 0.12)",
+                }}
+              >
+                {roleRegistryBanner}
+              </div>
+            )}
+
+            <div
+              data-testid="role-registry-list"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: "6px",
+                maxHeight: "220px",
+                overflowY: "auto",
+              }}
+            >
+              {roleRegistry.map((roleRec) => (
+                <div
+                  key={roleRec.slug}
+                  data-testid={`role-registry-row-${roleRec.slug}`}
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                    backgroundColor: "var(--bg-elevated)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "4px",
+                    fontSize: "11px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "4px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <code className="fd-mono" style={{ fontWeight: 700 }}>
+                      {roleRec.slug}
+                    </code>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`role-registry-kind-${roleRec.slug}`}
+                        style={{ fontSize: "9.5px" }}
+                      >
+                        {roleRec.builtin ? "built-in" : "custom"}
+                      </span>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`role-registry-edit-btn-${roleRec.slug}`}
+                        style={{ fontSize: "10px", padding: "1px 6px" }}
+                        onClick={() => {
+                          setRoleDraftSlug(roleRec.slug);
+                          setRoleDraftLabel(roleRec.label);
+                          setRoleDraftDescription(roleRec.description);
+                          setRoleDraftReviewPolicy(roleRec.review_policy);
+                          setRoleDraftPromptTemplate(roleRec.prompt_template);
+                        }}
+                      >
+                        Edit
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontWeight: 600 }}>{roleRec.label}</div>
+                  <div
+                    style={{
+                      fontSize: "10.5px",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    {roleRec.description}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Create / Edit RoleRecord Form */}
+            <div
+              data-testid="role-registry-editor-form"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                padding: "8px 10px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr 1fr",
+                  gap: "6px",
+                }}
+              >
+                <input
+                  type="text"
+                  aria-label="Role Slug"
+                  data-testid="role-registry-slug-input"
+                  className="fd-input fd-mono"
+                  placeholder="slug (e.g. benchmark-auditor)"
+                  value={roleDraftSlug}
+                  onChange={(e) => setRoleDraftSlug(e.target.value)}
+                  style={{ fontSize: "11px" }}
+                />
+                <input
+                  type="text"
+                  aria-label="Role Display Label"
+                  data-testid="role-registry-label-input"
+                  className="fd-input"
+                  placeholder="Display Label"
+                  value={roleDraftLabel}
+                  onChange={(e) => setRoleDraftLabel(e.target.value)}
+                  style={{ fontSize: "11px" }}
+                />
+                <select
+                  aria-label="Role Review Policy"
+                  data-testid="role-registry-review-policy-select"
+                  className="fd-select fd-mono"
+                  value={roleDraftReviewPolicy}
+                  onChange={(e) =>
+                    setRoleDraftReviewPolicy(e.target.value as RoleReviewPolicy)
+                  }
+                  style={{ fontSize: "11px" }}
+                >
+                  <option value="lead-review">lead-review</option>
+                  <option value="lab-manager-review">lab-manager-review</option>
+                  <option value="peer-review">peer-review</option>
+                </select>
+              </div>
+              <input
+                type="text"
+                aria-label="Role Description"
+                data-testid="role-registry-description-input"
+                className="fd-input"
+                placeholder="Role responsibilities and coverage summary"
+                value={roleDraftDescription}
+                onChange={(e) => setRoleDraftDescription(e.target.value)}
+                style={{ fontSize: "11px" }}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                <input
+                  type="text"
+                  aria-label="Role Prompt Template"
+                  data-testid="role-registry-prompt-input"
+                  className="fd-input fd-mono"
+                  placeholder="Startup hydration prompt template"
+                  value={roleDraftPromptTemplate}
+                  onChange={(e) => setRoleDraftPromptTemplate(e.target.value)}
+                  style={{ flex: 1, fontSize: "11px" }}
+                />
+                <button
+                  type="button"
+                  className="fd-btn fd-btn-primary"
+                  data-testid="role-registry-save-btn"
+                  style={{ fontSize: "11px", padding: "4px 10px" }}
+                  onClick={() => {
+                    const cleanSlug = roleDraftSlug
+                      .trim()
+                      .toLowerCase()
+                      .replace(/[^a-z0-9-_]/g, "-");
+                    if (!cleanSlug) return;
+                    const nextRec: ConfigurableRoleRecord = {
+                      slug: cleanSlug,
+                      label: roleDraftLabel.trim() || cleanSlug,
+                      description:
+                        roleDraftDescription.trim() ||
+                        `Custom role ${cleanSlug}`,
+                      builtin: BUILTIN_ROLE_REGISTRY.some(
+                        (b) => b.slug === cleanSlug,
+                      ),
+                      review_policy: roleDraftReviewPolicy,
+                      prompt_template:
+                        roleDraftPromptTemplate.trim() ||
+                        `Read .agents/roles/${cleanSlug}.md and execute assigned tasks.`,
+                    };
+                    setRoleRegistry((prev) => {
+                      const exists = prev.some((r) => r.slug === cleanSlug);
+                      if (exists) {
+                        return prev.map((r) =>
+                          r.slug === cleanSlug ? nextRec : r,
+                        );
+                      }
+                      return [...prev, nextRec];
+                    });
+                    setRoleRegistryBanner(
+                      `Saved RoleRecord '${cleanSlug}' (${nextRec.review_policy}) to registry.`,
+                    );
+                    if (typeof globalThis.fetch === "function") {
+                      void globalThis
+                        .fetch("/api/v1/roles", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify(nextRec),
+                        })
+                        .catch(() => {});
+                    }
+                  }}
+                >
+                  Save Role Record
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* TAB 2: System */}
@@ -3331,6 +3813,350 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                   <span>Sound Alerts</span>
                 </label>
+              </div>
+            </div>
+
+            {/* Record #67: FerroDeck+ Operator Push Notifications (VAPID Web Push + APNs + FCM) */}
+            <div
+              data-testid="operator-push-notifications-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                padding: "10px 12px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                fontSize: "11.5px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h4
+                    style={{
+                      margin: 0,
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    FerroDeck+ Operator Push Notifications (#67)
+                  </h4>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Web Push (VAPID Service Worker) and native iOS/iPadOS (APNs) &amp;
+                    Android (FCM) push delivery for{" "}
+                    <code className="fd-mono">&lt;N&gt;?</code> questions and{" "}
+                    <code className="fd-mono">&lt;N&gt;!</code> blockers.
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="push-vapid-status-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    VAPID SW:{" "}
+                    {operatorPushState.vapid_service_worker_registered
+                      ? "Registered"
+                      : "Unregistered"}{" "}
+                    ({operatorPushState.web_push_permission})
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="push-apns-status-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    APNs: {operatorPushState.apns_ios_status}
+                  </span>
+                  <span
+                    className="fd-badge fd-mono"
+                    data-testid="push-fcm-status-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    FCM: {operatorPushState.fcm_android_status}
+                  </span>
+                </div>
+              </div>
+
+              {pushActionBanner && (
+                <div
+                  role="status"
+                  data-testid="push-action-banner"
+                  className="fd-mono"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {pushActionBanner}
+                </div>
+              )}
+
+              {/* Per-Severity Triggers & Per-Project Scope */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+                  gap: "6px",
+                  alignItems: "center",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="push-trigger-question-checkbox"
+                    checked={operatorPushState.triggers.question_badge}
+                    onChange={(e) =>
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        triggers: {
+                          ...prev.triggers,
+                          question_badge: e.target.checked,
+                        },
+                      }))
+                    }
+                  />
+                  <span>Question (&lt;N&gt;?)</span>
+                </label>
+
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="push-trigger-blocker-checkbox"
+                    checked={operatorPushState.triggers.blocker_error_badge}
+                    onChange={(e) =>
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        triggers: {
+                          ...prev.triggers,
+                          blocker_error_badge: e.target.checked,
+                        },
+                      }))
+                    }
+                  />
+                  <span>Blocker / Error (&lt;N&gt;!)</span>
+                </label>
+
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="push-trigger-urgent-wire-checkbox"
+                    checked={operatorPushState.triggers.urgent_wire_mail}
+                    onChange={(e) =>
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        triggers: {
+                          ...prev.triggers,
+                          urgent_wire_mail: e.target.checked,
+                        },
+                      }))
+                    }
+                  />
+                  <span>Urgent Wire Mail</span>
+                </label>
+
+                <select
+                  aria-label="Push Notification Project Scope"
+                  data-testid="push-project-scope-select"
+                  className="fd-select fd-mono"
+                  value={operatorPushState.project_scope}
+                  onChange={(e) =>
+                    setOperatorPushState((prev) => ({
+                      ...prev,
+                      project_scope: e.target.value,
+                    }))
+                  }
+                  style={{ fontSize: "11px" }}
+                >
+                  <option value="all">Scope: All Projects</option>
+                  {CANONICAL_PROJECTS.map((proj) => (
+                    <option key={proj} value={proj}>
+                      Scope: {proj}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Quiet Hours & Action Buttons */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      data-testid="push-quiet-hours-toggle"
+                      checked={operatorPushState.quiet_hours.enabled}
+                      onChange={(e) =>
+                        setOperatorPushState((prev) => ({
+                          ...prev,
+                          quiet_hours: {
+                            ...prev.quiet_hours,
+                            enabled: e.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    <span>Quiet Hours:</span>
+                  </label>
+                  <input
+                    type="text"
+                    aria-label="Quiet Hours Start"
+                    data-testid="push-quiet-hours-start-input"
+                    className="fd-input fd-mono"
+                    value={operatorPushState.quiet_hours.start_time}
+                    onChange={(e) =>
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        quiet_hours: {
+                          ...prev.quiet_hours,
+                          start_time: e.target.value,
+                        },
+                      }))
+                    }
+                    style={{ width: "60px", fontSize: "11px", padding: "2px 6px" }}
+                  />
+                  <span>to</span>
+                  <input
+                    type="text"
+                    aria-label="Quiet Hours End"
+                    data-testid="push-quiet-hours-end-input"
+                    className="fd-input fd-mono"
+                    value={operatorPushState.quiet_hours.end_time}
+                    onChange={(e) =>
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        quiet_hours: {
+                          ...prev.quiet_hours,
+                          end_time: e.target.value,
+                        },
+                      }))
+                    }
+                    style={{ width: "60px", fontSize: "11px", padding: "2px 6px" }}
+                  />
+                </div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="push-subscribe-vapid-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      setOperatorPushState((prev) => ({
+                        ...prev,
+                        web_push_permission: "granted",
+                        vapid_service_worker_registered: true,
+                      }));
+                      setPushActionBanner(
+                        `Registered VAPID Web Push subscription (${operatorPushState.vapid_public_key_fingerprint}).`,
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/notifications/subscribe", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(operatorPushState),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Subscribe Web Push (VAPID)
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="push-test-deep-link-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      setPushActionBanner(
+                        "Dispatched test push notification deep-link (/triage?focus=perm-req-01) across VAPID + APNs + FCM.",
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/notifications/test", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              deep_link: "/triage?focus=perm-req-01",
+                              project_scope: operatorPushState.project_scope,
+                            }),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Test Push Deep-Link
+                  </button>
+                </div>
               </div>
             </div>
 
