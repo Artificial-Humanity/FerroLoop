@@ -148,6 +148,15 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       expect(formatModelOptionLabel("muse-spark-1.3")).toBe(
         "Muse Spark (muse-spark-1.3)",
       );
+      expect(formatModelOptionLabel("gpt-6.1-terra")).toBe(
+        "Codex Terra 6.1 (gpt-6.1-terra)",
+      );
+      expect(formatModelOptionLabel("gpt-6.1-sol")).toBe(
+        "Codex Sol 6.1 (gpt-6.1-sol)",
+      );
+      expect(
+        getVendorModelOptions("codex", null, ["gpt-6-astra", "gpt-6-sol"]),
+      ).toEqual(["gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol"]);
       expect(getVendorModelOptions("unknown")).toEqual([]);
       expect(getVendorModelOptions(null)).toEqual([]);
       expect(getVendorModelOptions("unknown", "gemini-4-argon")).toEqual([]);

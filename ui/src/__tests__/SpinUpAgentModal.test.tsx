@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { HubApiClient } from "../lib/api";
 import type { HubWsClient } from "../api/ws";
-import { SpinUpAgentModal } from "../components/SpinUpAgentModal";
+import { SpinUpAgentModal, SPIN_UP_ROLES } from "../components/SpinUpAgentModal";
+import { RECAST_ROLE_OPTIONS } from "../components/SettingsModal";
 import type { SpinUpSessionRequest, SpinUpSessionResponse } from "../types/api";
 
 describe("SpinUpAgentModal", () => {
@@ -115,6 +116,70 @@ describe("SpinUpAgentModal", () => {
         value: "muse-spark-1.3",
         label: "Muse Spark (muse-spark-1.3)",
         text: "Muse Spark (muse-spark-1.3)",
+      },
+    ]);
+  });
+
+  it("offers all 11 default SPIN_UP_ROLES, matching RECAST_ROLE_OPTIONS, and Codex 6.1 models at the top of Codex options", () => {
+    render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+
+    expect(SPIN_UP_ROLES).toEqual([
+      { value: "assistant", label: "assistant (Assisting Engineer)" },
+      { value: "ui-developer", label: "ui-developer (UI & Full-Stack)" },
+      { value: "web-developer", label: "web-developer (Web Developer)" },
+      { value: "mobile-developer", label: "mobile-developer (Mobile Developer)" },
+      { value: "system-developer", label: "system-developer (System / Backend Developer)" },
+      { value: "data-engineer", label: "data-engineer (Data Engineer)" },
+      { value: "tester", label: "tester (QA & Tester)" },
+      { value: "strategist", label: "strategist (Research & Architecture Strategist)" },
+      { value: "journalist", label: "journalist (Journalist / Technical Scribe)" },
+      { value: "lead", label: "lead (Project Lead)" },
+      { value: "lab-manager", label: "lab-manager (Lab Manager)" },
+    ]);
+
+    const roleSelect = screen.getByTestId("spin-up-role-select") as HTMLSelectElement;
+    expect(
+      Array.from(roleSelect.options).map((o) => ({
+        value: o.value,
+        label: o.textContent,
+      })),
+    ).toEqual([...SPIN_UP_ROLES]);
+
+    expect(RECAST_ROLE_OPTIONS.map((r) => r.value)).toEqual([
+      "lead",
+      "assistant",
+      "lab_manager",
+      "custom:ui-developer",
+      "custom:web-developer",
+      "custom:mobile-developer",
+      "custom:system-developer",
+      "custom:data-engineer",
+      "custom:tester",
+      "custom:strategist",
+      "custom:journalist",
+      "custom:scribe",
+    ]);
+
+    const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
+    fireEvent.change(vendorSelect, { target: { value: "codex" } });
+
+    const datalist = screen.getByTestId("spin-up-model-options");
+    const codexOptions = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+      value: opt.getAttribute("value"),
+      label: opt.getAttribute("label"),
+      text: opt.textContent,
+    }));
+
+    expect(codexOptions.slice(0, 2)).toEqual([
+      {
+        value: "gpt-6.1-terra",
+        label: "Codex Terra 6.1 (gpt-6.1-terra)",
+        text: "Codex Terra 6.1 (gpt-6.1-terra)",
+      },
+      {
+        value: "gpt-6.1-sol",
+        label: "Codex Sol 6.1 (gpt-6.1-sol)",
+        text: "Codex Sol 6.1 (gpt-6.1-sol)",
       },
     ]);
   });

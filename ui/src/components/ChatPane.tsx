@@ -586,10 +586,39 @@ export const MUSE_MODEL_OPTIONS: ReadonlyArray<{
   },
 ];
 
+export const CODEX_MODEL_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+}> = [
+  {
+    value: "gpt-6.1-terra",
+    label: "Codex Terra 6.1 (gpt-6.1-terra)",
+  },
+  {
+    value: "gpt-6.1-sol",
+    label: "Codex Sol 6.1 (gpt-6.1-sol)",
+  },
+  {
+    value: "gpt-6-astra",
+    label: "gpt-6-astra",
+  },
+  {
+    value: "gpt-6-sol",
+    label: "gpt-6-sol",
+  },
+  {
+    value: "gpt-6-luna",
+    label: "gpt-6-luna",
+  },
+];
+
 export function formatModelOptionLabel(modelId: string): string {
   const trimmed = (modelId ?? "").trim();
-  const match = MUSE_MODEL_OPTIONS.find((m) => m.value === trimmed);
-  return match ? match.label : trimmed;
+  const museMatch = MUSE_MODEL_OPTIONS.find((m) => m.value === trimmed);
+  if (museMatch) return museMatch.label;
+  const codexMatch = CODEX_MODEL_OPTIONS.find((m) => m.value === trimmed);
+  if (codexMatch) return codexMatch.label;
+  return trimmed;
 }
 
 export function isAntigravityAdapter(adapter?: string | null): boolean {
@@ -630,6 +659,14 @@ export function getVendorModelOptions(
   let base: string[];
   if (Array.isArray(availableModels) && availableModels.length > 0) {
     base = [...availableModels];
+    if (normalized === "codex" || normalized.startsWith("codex-")) {
+      const topCodex = ["gpt-6.1-terra", "gpt-6.1-sol"].filter(
+        (id) => !base.includes(id),
+      );
+      if (topCodex.length > 0) {
+        base = [...topCodex, ...base];
+      }
+    }
   } else if (isAntigravityAdapter(normalized)) {
     base = [
       "gemini-4-argon",
@@ -641,13 +678,7 @@ export function getVendorModelOptions(
   } else if (normalized === "claude" || normalized.startsWith("claude-")) {
     base = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"];
   } else if (normalized === "codex" || normalized.startsWith("codex-")) {
-    base = [
-      "gpt-6.1-terra",
-      "gpt-6.1-sol",
-      "gpt-6-astra",
-      "gpt-6-sol",
-      "gpt-6-luna",
-    ];
+    base = CODEX_MODEL_OPTIONS.map((m) => m.value);
   } else if (normalized === "grok" || normalized.startsWith("grok-")) {
     base = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
   } else if (normalized === "muse" || normalized.startsWith("muse-")) {
