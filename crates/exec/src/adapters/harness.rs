@@ -1,5 +1,6 @@
 //! Shared process harness, pre/post git snapshot delta, and wrapper liveness emitter.
 
+use crate::child_env::child_env_from;
 use crate::runner::{AttemptOutcome, AttemptSpec};
 use fl_core::at::At;
 use fl_core::ids::ProjectId;
@@ -8,6 +9,7 @@ use fl_core::log::AttemptStatus;
 use fl_core::telemetry::{AdapterKind, AttemptHeartbeat, LivenessStatus, RateCard};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -84,6 +86,12 @@ pub struct ProcessHarness<D: CliDialect> {
     pub agent: Option<String>,
     pub host: String,
     pub heartbeat_interval: Duration,
+    /// Variables added to the child's environment after the allow-list is applied (see
+    /// [`crate::child_env`]): the key the warrant layer chose for this attempt, or a setting an
+    /// operator opted in to. They replace a same-named inherited variable.
+    pub extra_env: Vec<(OsString, OsString)>,
+    /// The parent environment the allow-list is applied to. `None`: this process's own.
+    parent_env: Option<Vec<(OsString, OsString)>>,
 }
 
 impl<D: CliDialect> ProcessHarness<D> {
@@ -98,6 +106,31 @@ impl<D: CliDialect> ProcessHarness<D> {
             agent: None,
             host: detect_host(),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            extra_env: Vec::new(),
+            parent_env: None,
+        }
+    }
+
+    /// Adds variables to the child's environment, after the allow-list (see
+    /// [`crate::child_env`]). Use it for the vendor key of one attempt.
+    pub fn with_env(mut self, extra: Vec<(OsString, OsString)>) -> Self {
+        self.extra_env = extra;
+        self
+    }
+
+    /// Test seam: the environment the allow-list is applied to, instead of this process's.
+    #[cfg(test)]
+    pub(crate) fn with_parent_env(mut self, parent: Vec<(OsString, OsString)>) -> Self {
+        self.parent_env = Some(parent);
+        self
+    }
+
+    /// The whole environment of the child: the allow-list applied to the parent's, then the
+    /// extras. The spawn clears everything else.
+    fn child_env(&self) -> Vec<(OsString, OsString)> {
+        match &self.parent_env {
+            Some(parent) => child_env_from(self.dialect.kind(), parent.clone(), &self.extra_env),
+            None => child_env_from(self.dialect.kind(), std::env::vars_os(), &self.extra_env),
         }
     }
 
@@ -178,7 +211,11 @@ impl<D: CliDialect> ProcessHarness<D> {
         let started = Instant::now();
 
         let mut cmd = Command::new(&self.binary);
+        // The child gets an allow-listed environment and nothing it inherits: the hub holds the
+        // vault key, hub and GitHub tokens and other vendors' keys in its own.
         cmd.args(self.dialect.argv(&spec))
+            .env_clear()
+            .envs(self.child_env())
             .current_dir(&spec.project_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -882,6 +919,149 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
             .count()
+    }
+
+    /// Runs a fake vendor (a shell script that dumps its environment, its process group and
+    /// its stdin) through the real spawn path, with `parent` as the environment the allow-list
+    /// is applied to. Returns `(env dump, pid, pgid, stdin target)`.
+    async fn run_fake_vendor<D: CliDialect>(
+        dialect: D,
+        parent: &[(&str, &str)],
+        extra: &[(&str, &str)],
+    ) -> (BTreeMap<String, String>, String, String, String) {
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("dump.txt");
+        let stub = d.path().join("fake-vendor.sh");
+        std::fs::write(
+            &stub,
+            r#"#!/bin/sh
+/usr/bin/env > "$FAKE_VENDOR_OUT.env"
+read -r _ _ _ _ pgrp _ < /proc/$$/stat
+{
+    echo "pid=$$"
+    echo "pgid=$pgrp"
+    echo "stdin=$(/usr/bin/readlink /proc/$$/fd/0)"
+} > "$FAKE_VENDOR_OUT"
+printf '%s\n' '{"result":"ok"}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let own = |list: &[(&str, &str)]| -> Vec<(OsString, OsString)> {
+            list.iter().map(|(k, v)| (k.into(), v.into())).collect()
+        };
+        let mut extra = own(extra);
+        extra.push(("FAKE_VENDOR_OUT".into(), out.clone().into_os_string()));
+        let harness = ProcessHarness::new(stub.to_string_lossy().into_owned(), dialect)
+            .with_parent_env(own(parent))
+            .with_env(extra);
+        let outcome = harness
+            .run(AttemptSpec {
+                project_root: d.path().to_path_buf(),
+                record: fl_core::ids::RecordId(seq_iri(1)),
+                instruction: "hi".into(),
+                timeout_secs: 20,
+                budget_usd_micros: 1_000_000,
+            })
+            .await;
+        assert_eq!(outcome.status, AttemptStatus::Completed, "{outcome:?}");
+
+        let env_text = std::fs::read_to_string(out.with_extension("txt.env")).unwrap();
+        let env = env_text
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let info = std::fs::read_to_string(&out).unwrap();
+        let field = |name: &str| {
+            info.lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                .unwrap()
+                .to_owned()
+        };
+        (env, field("pid"), field("pgid"), field("stdin"))
+    }
+
+    fn sentinel_parent() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/sentinel"),
+            ("LANG", "C.UTF-8"),
+            ("FL_VAULT_MASTER_KEY", "vault-sentinel"),
+            ("FL_HUB_TOKEN", "hub-sentinel"),
+            ("GITHUB_TOKEN", "github-sentinel"),
+            ("OPENAI_API_KEY", "openai-sentinel"),
+            ("ANTHROPIC_API_KEY", "anthropic-parent-sentinel"),
+            ("HTTPS_PROXY", "http://proxy-sentinel"),
+            ("SSH_AUTH_SOCK", "/ssh-sentinel"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_spawned_vendor_sees_the_allow_list_and_its_spliced_key_and_nothing_else() {
+        use crate::adapters::claude::ClaudeDialect;
+        let (env, pid, pgid, stdin) = run_fake_vendor(
+            ClaudeDialect,
+            &sentinel_parent(),
+            &[("ANTHROPIC_API_KEY", "spliced-sentinel")],
+        )
+        .await;
+        for denied in [
+            "FL_VAULT_MASTER_KEY",
+            "FL_HUB_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "HTTPS_PROXY",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert!(!env.contains_key(denied), "child inherited {denied}");
+        }
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/sentinel"));
+        assert_eq!(env.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("spliced-sentinel")
+        );
+        // Nothing but the allow-list, the extras and what the shell adds itself: a real
+        // `env_clear` leaves no ambient variable of this test process behind.
+        let expected = [
+            "PATH",
+            "HOME",
+            "LANG",
+            "ANTHROPIC_API_KEY",
+            "FAKE_VENDOR_OUT",
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+        ];
+        let stray: Vec<_> = env
+            .keys()
+            .filter(|k| !expected.contains(&k.as_str()))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "unexpected inherited variables: {stray:?}"
+        );
+        // Spawn behaviour is unchanged: its own process group, and no stdin.
+        assert_eq!(pid, pgid, "the child leads its own process group");
+        assert_eq!(stdin, "/dev/null");
+    }
+
+    #[tokio::test]
+    async fn a_codex_child_keeps_its_own_vendor_key_and_not_another_vendors() {
+        use crate::adapters::codex::CodexDialect;
+        let (env, ..) = run_fake_vendor(CodexDialect, &sentinel_parent(), &[]).await;
+        assert_eq!(
+            env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("openai-sentinel")
+        );
+        assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!env.contains_key("FL_VAULT_MASTER_KEY"));
     }
 
     #[tokio::test]

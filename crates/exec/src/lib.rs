@@ -1,6 +1,7 @@
 //! Everything that touches the outside world: filesystem, git, processes, vendors.
 
 pub mod adapters;
+pub mod child_env;
 pub mod command;
 pub mod decision;
 pub mod evaluate;
