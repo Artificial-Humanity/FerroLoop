@@ -352,12 +352,19 @@ fn cmd_call(
         caller_agent,
         timeout_secs: Some(timeout_secs),
     };
+    // Raw proxy only: no connector tool is named, so no response contract
+    // applies — `fl vault call` is Uncontracted by definition (Record #96).
+    // Connector tools go through `fl vault mcp` / `handle_mcp_jsonrpc_request`,
+    // which enforces contracts via `ToolOutcome`.
     let resp = execute_proxied_request(&vault, &req).map_err(|e| (1, e.to_string()))?;
     if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&resp).unwrap_or_default()
-        );
+        // Structured raw-call output carries the same `outcome` flag as the
+        // hub raw gate call: this surface is uncontracted (Record #96).
+        let mut out = serde_json::to_value(&resp).unwrap_or_default();
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("outcome".to_string(), json!("uncontracted"));
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     } else {
         print!("{}", resp.body);
         if !resp.body.ends_with('\n') {

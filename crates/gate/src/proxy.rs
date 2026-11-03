@@ -15,6 +15,56 @@ use crate::vault::{Vault, normalize_secret_name};
 
 pub const PLACEHOLDER_PREFIX: &str = "{{FERROGATE:";
 pub const PLACEHOLDER_SUFFIX: &str = "}}";
+/// Legacy (uncontracted) response-body cap: 8 MiB.
+pub const LEGACY_MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum number of response headers accepted before the body is read.
+pub const MAX_HEADERS: usize = 100;
+/// Maximum total response-header bytes (names + values) accepted.
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Read at most `cap` bytes from `reader`; one byte over refuses without
+/// buffering the full stream.
+#[cfg(test)]
+pub(crate) fn read_bounded(mut reader: impl std::io::Read, cap: u64) -> Result<Vec<u8>, GateError> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    reader
+        .by_ref()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| GateError::UpstreamHttp {
+            cause: e.to_string(),
+        })?;
+    if buf.len() as u64 > cap {
+        return Err(GateError::UpstreamHttp {
+            cause: format!("response body exceeds {cap} bytes"),
+        });
+    }
+    Ok(buf)
+}
+
+/// Enforce header count/total-size caps before any body read.
+pub(crate) fn validate_headers(
+    headers: &[(String, String)],
+    max_count: usize,
+    max_bytes: usize,
+) -> Result<(), GateError> {
+    if headers.len() > max_count {
+        return Err(GateError::UpstreamHttp {
+            cause: format!(
+                "response headers exceed {max_count} headers (got {})",
+                headers.len()
+            ),
+        });
+    }
+    let total: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total > max_bytes {
+        return Err(GateError::UpstreamHttp {
+            cause: format!("response headers exceed {max_bytes} bytes (got {total})"),
+        });
+    }
+    Ok(())
+}
 
 /// Outbound HTTP request passed to [`execute_proxied_request`] or [`prepare_proxied_request`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -762,6 +812,43 @@ pub fn execute_proxied_request(
     execute_proxied_request_with_provider(vault, req, None)
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(digest.as_ref().len() * 2);
+    for b in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Contracted dispatch: read the wire body with `contract.max_response_bytes`
+/// as the cap and decode it strictly as UTF-8. Oversize or malformed UTF-8
+/// returns a typed contract error carrying only a digest/byte count, never
+/// the body; on oversize that digest/count describe only the read prefix
+/// (`cap + 1` bytes), not the full body.
+pub fn execute_proxied_request_with_contract(
+    vault: &Vault,
+    req: &ProxyRequest,
+    contract: &crate::contract::ResponseContract,
+) -> Result<ProxyResponse, GateError> {
+    execute_proxied_request_with_provider_and_contract(vault, req, None, Some(contract))
+}
+
+/// [`execute_proxied_request_with_contract`] with an optional provider.
+pub fn execute_proxied_request_with_provider_and_contract(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    contract: Option<&crate::contract::ResponseContract>,
+) -> Result<ProxyResponse, GateError> {
+    let (cap, strict) = match contract {
+        Some(c) => (c.max_response_bytes, true),
+        None => (LEGACY_MAX_RESPONSE_BYTES, false),
+    };
+    execute_proxied_request_inner(vault, req, provider, cap, strict)
+}
+
 /// [`execute_proxied_request`] with an optional external secret provider.
 ///
 /// Response and upstream error text also redact injected external plaintext of length >= 4.
@@ -769,6 +856,16 @@ pub fn execute_proxied_request_with_provider(
     vault: &Vault,
     req: &ProxyRequest,
     provider: Option<&dyn SecretProviderAdapter>,
+) -> Result<ProxyResponse, GateError> {
+    execute_proxied_request_inner(vault, req, provider, LEGACY_MAX_RESPONSE_BYTES, false)
+}
+
+fn execute_proxied_request_inner(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    cap: u64,
+    strict_utf8: bool,
 ) -> Result<ProxyResponse, GateError> {
     let prepared_secrets = prepare_proxied_request_inner(vault, req, provider)?;
     let prepared = prepared_secrets.request;
@@ -856,6 +953,24 @@ pub fn execute_proxied_request_with_provider(
         // to the caller as it is, and the refusal to follow it is on record.
         audit_after_send("redirect_not_followed");
     }
+    // Header bounds are enforced before the body is read.
+    let raw_header_pairs: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .map(|(hk, hv)| {
+            (
+                hk.as_str().to_string(),
+                String::from_utf8_lossy(hv.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    if let Err(e) = validate_headers(&raw_header_pairs, MAX_HEADERS, MAX_HEADER_BYTES) {
+        let GateError::UpstreamHttp { cause } = e else {
+            return Err(e);
+        };
+        let (cause, _) = scrub_with_external(vault, &cause, &external);
+        return Err(GateError::UpstreamHttp { cause });
+    }
     let mut resp_headers = BTreeMap::new();
     let mut scrubbed_names = BTreeSet::new();
     for (hk, hv) in resp.headers() {
@@ -866,14 +981,53 @@ pub fn execute_proxied_request_with_provider(
         }
     }
 
-    // A body that is not UTF-8 is decoded lossily. A failed or over-limit read is an error, not
-    // an empty `200` body.
-    let raw_body = match resp.body_mut().read_to_vec() {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => {
-            let (cause, _) = scrub_with_external(vault, &e.to_string(), &external);
-            return Err(GateError::UpstreamHttp { cause });
+    // Legacy path caps at LEGACY_MAX and decodes lossily. The contracted
+    // path caps at the contract bound and decodes strictly: oversize and
+    // malformed UTF-8 become typed contract errors (digest/bytes only).
+    let raw_bytes = {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        let read = resp
+            .body_mut()
+            .as_reader()
+            .by_ref()
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut buf);
+        match read {
+            Ok(_) if buf.len() as u64 > cap => {
+                if strict_utf8 {
+                    return Err(GateError::ContractResponseTooLarge {
+                        prefix_sha256: sha256_hex(&buf),
+                        read_bytes: buf.len() as u64,
+                        max_bytes: cap,
+                        status,
+                    });
+                }
+                let cause = format!("response body exceeds {cap} bytes");
+                let (cause, _) = scrub_with_external(vault, &cause, &external);
+                return Err(GateError::UpstreamHttp { cause });
+            }
+            Ok(_) => buf,
+            Err(e) => {
+                let (cause, _) = scrub_with_external(vault, &e.to_string(), &external);
+                return Err(GateError::UpstreamHttp { cause });
+            }
         }
+    };
+    let raw_body = if strict_utf8 {
+        match String::from_utf8(raw_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let bytes = e.into_bytes();
+                return Err(GateError::ContractInvalidUtf8 {
+                    body_sha256: sha256_hex(&bytes),
+                    body_bytes: bytes.len() as u64,
+                    status,
+                });
+            }
+        }
+    } else {
+        String::from_utf8_lossy(&raw_bytes).into_owned()
     };
     let (clean_body, body_hits) = scrub_with_external(vault, &raw_body, &external);
     scrubbed_names.extend(body_hits);
@@ -1133,6 +1287,85 @@ mod tests {
         let shown = format!("{prepared:?}");
         assert!(!shown.contains("s3cr3t-value-123"), "{shown}");
         assert!(shown.contains("API_KEY"), "{shown}");
+    }
+
+    #[test]
+    fn contracted_wire_cap_and_strict_utf8_are_typed() {
+        use crate::contract::{ResponseContract, ResponseSchema};
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "K", "v123456", &["127.0.0.1"]);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = req.respond(tiny_http::Response::from_data(vec![b'x'; 2048]));
+            }
+            if let Ok(req) = server.recv() {
+                let _ = req.respond(tiny_http::Response::from_data(vec![0xff, 0xfe, 0xfd]));
+            }
+        });
+        let contract = ResponseContract {
+            schema: ResponseSchema::from_value(serde_json::json!({"type":"string"})).unwrap(),
+            max_response_bytes: 64,
+            max_response_tokens: None,
+            max_depth: 32,
+            max_array_len: 10,
+            max_string_len: 10000,
+        };
+        let req = request(
+            "GET",
+            &format!("http://127.0.0.1:{port}/a"),
+            &[("Authorization", "Bearer {{FERROGATE:K}}")],
+        );
+        let err = execute_proxied_request_with_contract(&vault, &req, &contract).unwrap_err();
+        match &err {
+            GateError::ContractResponseTooLarge {
+                prefix_sha256,
+                read_bytes,
+                max_bytes,
+                ..
+            } => {
+                assert_eq!(*read_bytes, 65);
+                assert_eq!(*max_bytes, 64);
+                assert_eq!(*prefix_sha256, sha256_hex(&[b'x'; 65]));
+                assert_ne!(*prefix_sha256, sha256_hex(&[b'x'; 2048]));
+            }
+            other => panic!("expected prefix oversize error, got {other}"),
+        }
+        // Digest/count label the read prefix (cap+1 = 65 bytes), not the
+        // full 2048-byte body.
+        assert!(err.to_string().contains("read_prefix 65 bytes"), "{err}");
+        assert!(err.to_string().contains("prefix_sha256"), "{err}");
+        assert!(!err.to_string().contains("xxxx"), "{err}");
+        let mut big = contract.clone();
+        big.max_response_bytes = 100000;
+        let err = execute_proxied_request_with_contract(&vault, &req, &big).unwrap_err();
+        assert!(
+            matches!(err, GateError::ContractInvalidUtf8 { body_bytes: 3, .. }),
+            "{err}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oversize_body_refused_before_full_buffer() {
+        let data = vec![b'x'; 2048];
+        let err = read_bounded(std::io::Cursor::new(data), 1024).unwrap_err();
+        assert!(err.to_string().contains("response body exceeds"), "{err}");
+        let ok = read_bounded(std::io::Cursor::new(vec![b'x'; 1024]), 1024).unwrap();
+        assert_eq!(ok.len(), 1024);
+    }
+
+    #[test]
+    fn header_bounds_enforced() {
+        let many: Vec<(String, String)> = (0..101)
+            .map(|i| (format!("x-h-{i}"), "v".to_string()))
+            .collect();
+        assert!(validate_headers(&many, MAX_HEADERS, MAX_HEADER_BYTES).is_err());
+        let big = vec![("x-big".to_string(), "v".repeat(MAX_HEADER_BYTES + 1))];
+        assert!(validate_headers(&big, MAX_HEADERS, MAX_HEADER_BYTES).is_err());
+        let ok = vec![("x-a".to_string(), "v".to_string())];
+        assert!(validate_headers(&ok, MAX_HEADERS, MAX_HEADER_BYTES).is_ok());
     }
 
     #[test]
