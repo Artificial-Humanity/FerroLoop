@@ -46,6 +46,36 @@ fn delivered(listener: &UnixListener) -> bool {
     listener.accept().is_ok()
 }
 
+/// Waits until the script `bin`, just written by this test, can be executed. Writing a script and
+/// running it races with every other test thread that forks: a child forked while the script's
+/// write fd is still open holds that fd until its own `execve`, and `execve` of a file any
+/// process holds open for writing fails with `ETXTBSY`. The runtime then sees a tmux that cannot
+/// be spawned (an empty call log), which is the fixture's race and not the runtime's. Only that
+/// exact error is retried, bounded; the script answers the probe argument without a side effect.
+fn wait_until_executable(bin: &Path) {
+    for _ in 0..1000 {
+        match std::process::Command::new(bin)
+            .arg(EXEC_PROBE)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Err(err) if err.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => {
+                other.unwrap_or_else(|err| panic!("{} cannot be executed: {err}", bin.display()));
+                return;
+            }
+        }
+    }
+    panic!("{} stayed busy for writing", bin.display());
+}
+
+/// The argument [`wait_until_executable`] runs a fake with; a fake exits 0 on it, logging nothing.
+const EXEC_PROBE: &str = "--fl-exec-probe";
+
 /// A fake `<home>/.local/bin/muse`, so the binary resolves to a path of the tempdir.
 fn install_home_muse(home: &Path) -> PathBuf {
     let bin = home.join(".local").join("bin").join("muse");
@@ -626,11 +656,12 @@ impl FakeTmuxWindows {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
+                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
             ),
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&bin);
         let this = Self {
             _lock: lock,
             prev_bin: std::env::var_os("FL_WIRE_TMUX_BIN"),
@@ -823,12 +854,13 @@ impl TmuxLog {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n{fail_cases}  has-session) exit {has_session};;\n  new-window|new-session) echo '{new_window_out}'; exit 0;;\n  list-windows)\n    case \"$*\" in\n    *'#{{window_id}}'*)\n{full}      exit 0;;\n    *)\n{names}      exit 0;;\n    esac;;\n  *) exit 0;;\nesac\n",
+                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n{fail_cases}  has-session) exit {has_session};;\n  new-window|new-session) echo '{new_window_out}'; exit 0;;\n  list-windows)\n    case \"$*\" in\n    *'#{{window_id}}'*)\n{full}      exit 0;;\n    *)\n{names}      exit 0;;\n    esac;;\n  *) exit 0;;\nesac\n",
                 log.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&bin);
         let this = Self {
             _lock: lock,
             prev_bin: std::env::var_os("FL_WIRE_TMUX_BIN"),

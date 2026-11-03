@@ -500,7 +500,7 @@ fn run_vendor_cli(cmd: &mut Command, kind: CliKind) -> std::io::Result<std::proc
     run_status_with_timeout(cmd, cli_timeout(kind))
 }
 
-/// Spawn `cmd` (retrying `ETXTBSY`, which a just-written script can raise) and wait up to
+/// Spawn `cmd` (retrying `ETXTBSY` for up to ~2s: a just-written script can raise it under load) and wait up to
 /// `timeout` for it. A child still running at the deadline is killed and reaped, and the call
 /// fails with `TimedOut`.
 fn run_status_with_timeout(
@@ -510,9 +510,9 @@ fn run_status_with_timeout(
     let mut attempt = 0;
     let mut child = loop {
         match cmd.spawn() {
-            Err(err) if err.raw_os_error() == Some(26) && attempt < 4 => {
+            Err(err) if err.raw_os_error() == Some(26) && attempt < 200 => {
                 attempt += 1;
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(Duration::from_millis(10));
             }
             other => break other?,
         }
