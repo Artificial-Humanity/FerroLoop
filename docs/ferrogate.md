@@ -1,9 +1,10 @@
 # FerroGate: the audit log, vault references and the RS256 signer
 
 This page covers what `crates/gate` records when it refuses or allows a use of a Vault secret, the
-`vault://` reference syntax, `Vault::sign_app_jwt`, and `[github] private_key_ref`, the config key
-that makes fl sign its GitHub App JWT through the Vault. It states the rules as they are; the last
-section says where the protection ends.
+`vault://` reference syntax, `Vault::sign_app_jwt`, `[github] private_key_ref`, the config key
+that makes fl sign its GitHub App JWT through the Vault, and the Hub's observational
+`GET /api/v1/gate/vault-consumers`. It states the rules as they are; the last section says where
+the protection ends.
 
 ## The audit log
 
@@ -184,6 +185,80 @@ the Vault one.
 
 The drill that proves the plaintext path is denied (no process outside the Vault can read the
 key) is an Owner-window action. This change does not perform it, and nothing here claims it.
+
+## Vault consumers report
+
+`GET /api/v1/gate/vault-consumers` is the Hub's observational answer to "where does each credential
+come from?". It is for the Owner: a Peer gets 403 and an unauthenticated caller 401. It reports
+configuration facts and does nothing else: it opens no Vault key, decrypts nothing, writes
+nothing and makes no network call. It never says a cutover is finished. `class: "vault-ref"` means
+a Vault reference is configured, not that it works and not that any plaintext copy is gone.
+Verifying a cutover is the Owner-window drill (the G6 acceptance step); this endpoint does not
+perform it and no field of it reports it.
+
+```json
+{ "schema_version": 1,
+  "disclaimer": "Configuration facts observed by this hub process: …",
+  "custody": { "mode": "same-unix-user", "note": "…",
+               "vault_key_readable_by_group_or_other": false, "vault_key_mode": "0600" },
+  "consumers": [
+    { "id": "github-app-private-key", "label": "GitHub App private key", "class": "vault-ref",
+      "evidence": "`[github] private_key_ref` is set to secret GITHUB_APP_KEY; the Vault lists a secret of that name",
+      "plaintext_path_present": false, "last_denied": { "outcome": "denied:host" } } ],
+  "audit": { "state": "ok", "last_denied": { "outcome": "denied:agent" } } }
+```
+
+* `class` is one of `vault-ref`, `plaintext-file`, `env`, `unconfigured` and `unknown`. `unknown`
+  means the facts conflict (for example `[github] private_key_ref` together with
+  `$FL_GITHUB_PRIVATE_KEY_PATH`), the hub was not told its configuration, or a configured Vault
+  secret name could not be checked because the Vault file could not be listed (corrupt, too
+  large or not a regular file); `evidence` says which. A Vault file that does not exist lists no
+  secrets, so a name is then not found: the GitHub key stays `vault-ref` (the reference is
+  explicit) and a vendor is `unconfigured`.
+* `env` means the credential is read from the hub's environment. For `github-app-private-key` the
+  variable holds a PATH to a plaintext PEM file (`plaintext_path_present` can be `true`). For the
+  tokens, the vendor keys and the master key the secret VALUE itself is in the process
+  environment, readable through `/proc/<pid>/environ` by the same Unix user and inherited by
+  every child process unless it is scrubbed.
+* `plaintext_path_present` is `true` when a plaintext file is configured and exists, `false` when
+  none is configured (a value held directly in an environment variable has no file), and `null`
+  when the hub cannot tell.
+* `last_denied` on a consumer is the outcome of the newest `denied:*` audit entry that names the
+  consumer's Vault secret, else `null`. `audit.last_denied` is the newest `denied:*` entry of any
+  secret. Only the outcome is reported, and only in the form the gate writes
+  (`denied:` and lowercase letters or `_`); anything else reads `denied:other`. There are no
+  timestamps, callers or hosts. `audit.state` is `ok`, `absent`, `symlink`, `not-a-regular-file`
+  or `unreadable`.
+* `custody.mode` is always `same-unix-user` (see the last section). `vault_key_mode` and
+  `vault_key_readable_by_group_or_other` come from the key file's permission bits, and are `null`
+  when there is no key file, or when the path is a symlink (it is not followed).
+
+The consumers, in order, and how each class is decided:
+
+| `id` | `vault-ref` | `plaintext-file` | `env` |
+| --- | --- | --- | --- |
+| `github-app-private-key` | `[github] private_key_ref` | `[github] private_key` | `$FL_GITHUB_PRIVATE_KEY_PATH` with `$FL_GITHUB_APP_ID` (replaces `[github]`) |
+| `github-token` | n/a | n/a | `$FL_GITHUB_TOKEN`, `$GITHUB_TOKEN` or `$GH_TOKEN` set, or a tracker with `credential = "env"` |
+| `hub-owner-token` | n/a | `--owner-token-file` or `[hub] owner_token_file` | `$FL_HUB_OWNER_TOKEN` (wins over the file) |
+| `wire-peer-token` | n/a | `[wire] token_file` | `$FL_WIRE_TOKEN` (wins over the file) |
+| `vendor:<id>`, one per API vendor that needs a key | `vault_secret` names a secret the Vault lists (`unknown` when the Vault cannot be listed) | n/a | the vendor's `env_key` variable is set (resolves first) |
+| `vault-master-key` | n/a | the key file exists | `$FL_VAULT_MASTER_KEY` is set |
+
+`github-token` looks at the hub's environment variables and the tracker bindings only. A credential
+held by `gh` (for example its hosts file) is not inspected, and its evidence says so.
+
+The owner and wire tokens are inbound: callers present them to the Hub, so the Vault cannot
+broker them. A vendor whose named Vault secret is not in the Vault, and that has no variable set,
+is `unconfigured`.
+
+What the Hub reads to decide: its configuration (`fl hub serve` hands it paths and secret names,
+never values), whether an environment variable is set and not blank (never its value), file
+metadata (existence and mode bits, never contents), the secret NAMES in the Vault file (its
+metadata list: no master key is read or created, a Vault over 8 MiB or a symlink is not listed),
+and the last 64 KiB of `gate-audit.jsonl` (opened without following a symlink, a regular file
+only; a line over 16 KiB, a corrupt line and a line cut by the window are skipped). The answer
+holds config key names, variable names and Vault secret names, and no path, environment value or
+secret value.
 
 ## What this does not protect against
 
