@@ -355,7 +355,10 @@ export interface AgentSettingsModalProps {
     action: "sync_mcp" | "reforge_session" | "prune_extra",
     report: AgentMcpPostureReport,
   ) => void;
+  initialTab?: "overview" | "permissions" | "runtime";
 }
+
+export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
 
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   isOpen,
@@ -387,8 +390,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   onAgentsUpdated,
   postureInput,
   onRemediatePosture,
+  initialTab = "overview",
 }) => {
   const { pinnedAgents } = usePinnedState();
+  const [activeTab, setActiveTab] = useState<AgentSettingsTabId>(initialTab);
   const [agentWorktreePolicy, setAgentWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
   const [agentPosture, setAgentPosture] =
@@ -426,7 +431,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastModalOpen(false);
     setPostureOverride(null);
     setPostureActionStatus(null);
-  }, [isOpen, agentName, agentProject, agentRole]);
+    setActiveTab(initialTab);
+  }, [isOpen, agentName, agentProject, agentRole, initialTab]);
   const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
   const [fetchedAdapter, setFetchedAdapter] = useState<string | null>(null);
   const [fetchedModel, setFetchedModel] = useState<string | null>(null);
@@ -588,419 +594,351 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
         style={{
-          maxWidth: "520px",
+          maxWidth: "560px",
+          width: "95vw",
+          maxHeight: "min(88vh, 860px)",
           display: "flex",
           flexDirection: "column",
-          gap: "14px",
+          overflow: "hidden",
+          gap: "0",
         }}
       >
-        {/* Header */}
+        {/* Pinned Header + 3-Tab Navigation Bar */}
         <div
           className="fd-modal-header"
+          data-testid="agent-settings-header"
           style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "8px",
-          }}
-        >
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
-              Agent Settings — {displayTarget}
-            </h2>
-            <p
-              style={{
-                margin: "3px 0 0 0",
-                fontSize: "12px",
-                color: "var(--text-secondary)",
-              }}
-            >
-              Configure live model &amp; thinking level, inspect context &amp; execution mode, and
-              manage session lifecycle.
-            </p>
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
-            <button
-              type="button"
-              data-testid="agent-pin-toggle-btn"
-              aria-pressed={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
-              title={
-                pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
-                  ? "Unpin Agent"
-                  : "Pin Agent"
-              }
-              aria-label={
-                pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
-                  ? "Unpin Agent"
-                  : "Pin Agent"
-              }
-              className={`fd-btn${pinnedAgents.has((agentName || displayTarget).trim().toLowerCase()) ? " fd-btn-active" : ""}`}
-              style={{
-                padding: "4px 6px",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                lineHeight: 1,
-              }}
-              onClick={() => togglePinnedAgent(agentName || displayTarget)}
-            >
-              <PinIcon
-                pinned={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
-                circled={true}
-                size={16}
-              />
-            </button>
-            <button
-              type="button"
-              className="fd-btn"
-              data-testid="close-agent-settings-btn"
-              aria-label="Close Agent Settings"
-              onClick={onClose}
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-
-        {/* Agent Identity Summary */}
-        <div
-          data-testid="agent-settings-identity"
-          className="fd-card"
-          style={{
-            padding: "10px 12px",
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
-            gap: "8px",
-            backgroundColor: "var(--bg-elevated)",
-            fontSize: "12px",
-          }}
-        >
-          <div>
-            <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-              Persona
-            </div>
-            <div className="fd-mono" style={{ fontWeight: 600 }}>
-              {displayTarget} {agentName ? `(@${agentName})` : ""}
-            </div>
-          </div>
-          {agentProject && (
-            <div>
-              <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-                Project
-              </div>
-              <div style={{ fontWeight: 600 }}>{agentProject}</div>
-            </div>
-          )}
-          {agentRole && (
-            <div>
-              <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-                Role
-              </div>
-              <div className="fd-mono">{canonicalizeDefaultRole(agentRole)}</div>
-            </div>
-          )}
-          <div>
-            <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-              Harness / Adapter
-            </div>
-            <div className="fd-mono">{effectiveAdapter || "unknown"}</div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-              Session ID
-            </div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "6px",
-                minWidth: 0,
-              }}
-            >
-              {sessionId && (
-                <span
-                  className="fd-badge fd-mono"
-                  data-testid="session-id-pill"
-                  title={sessionId}
-                  style={{ flexShrink: 0 }}
-                >
-                  #{sessionId.slice(-8)}
-                </span>
-              )}
-              <span
-                className="fd-mono"
-                title={sessionId || targetSessionOrAgent || "none"}
-                style={{
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {sessionId || targetSessionOrAgent || "unrouted"}
-              </span>
-            </div>
-          </div>
-          <div>
-            <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-              Active Model
-            </div>
-            <span className="fd-badge fd-mono" data-testid="chat-active-model-badge">
-              {effectiveAdapter && effectiveAdapter.toLowerCase() !== "unknown"
-                ? `${effectiveAdapter} · `
-                : ""}
-              {effectiveModel || "default"}
-              {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
-            </span>
-          </div>
-          {typeof turnCount === "number" && (
-            <div>
-              <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-                Transcript Turns
-              </div>
-              <span className="fd-badge" data-testid="turn-count-badge">
-                {turnCount} {turnCount === 1 ? "turn" : "turns"}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Model & Thinking Level Selectors */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: "10px",
-          }}
-        >
-          <div>
-            <label
-              htmlFor="fd-agent-settings-model"
-              style={{
-                display: "block",
-                fontSize: "11px",
-                fontWeight: 600,
-                color: "var(--text-muted)",
-                marginBottom: "4px",
-                textTransform: "uppercase",
-              }}
-            >
-              Session Model
-            </label>
-            <select
-              id="fd-agent-settings-model"
-              aria-label="Session Model"
-              data-testid="session-model-select"
-              className="fd-select fd-mono"
-              disabled={!targetSessionOrAgent || switchingModel}
-              value={effectiveModel}
-              onChange={(e) => onChangeModelAndThinking(e.target.value, effectiveThinking)}
-              style={{ width: "100%" }}
-            >
-              {modelOptions.length === 0 && (
-                <option value="">Default (runtime default)</option>
-              )}
-              {modelOptions.map((opt) => (
-                <option key={opt} value={opt}>
-                  {formatModelOptionLabel(opt)}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <label
-              htmlFor="fd-agent-settings-thinking"
-              style={{
-                display: "block",
-                fontSize: "11px",
-                fontWeight: 600,
-                color: "var(--text-muted)",
-                marginBottom: "4px",
-                textTransform: "uppercase",
-              }}
-            >
-              Thinking Level
-            </label>
-            <select
-              id="fd-agent-settings-thinking"
-              aria-label="Thinking Level"
-              data-testid="session-thinking-select"
-              className="fd-select fd-mono"
-              disabled={!targetSessionOrAgent || switchingModel}
-              value={effectiveThinking}
-              onChange={(e) => onChangeModelAndThinking(effectiveModel, e.target.value)}
-              style={{ width: "100%" }}
-            >
-              {thinkingOptions.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
-
-        {/* Context Meter & Quota Summary */}
-        <div
-          className="fd-card"
-          style={{
-            padding: "10px 12px",
             display: "flex",
             flexDirection: "column",
-            gap: "8px",
-            backgroundColor: "var(--bg-elevated)",
+            gap: "10px",
+            flexShrink: 0,
+            paddingBottom: "10px",
+            borderBottom: "1px solid var(--border-subtle)",
           }}
         >
           <div
-            data-testid="context-level-meter"
             style={{
               display: "flex",
-              flexDirection: "column",
-              gap: "6px",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "8px",
-              }}
-            >
-              <span
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
+                Agent Settings — {displayTarget}
+              </h2>
+              <p
                 style={{
-                  fontSize: "11px",
-                  fontWeight: 600,
-                  textTransform: "uppercase",
-                  color: "var(--text-muted)",
+                  margin: "3px 0 0 0",
+                  fontSize: "12px",
+                  color: "var(--text-secondary)",
                 }}
               >
-                Context Window Usage
-              </span>
-              <span className="fd-mono" style={{ fontSize: "12px", color: "var(--text-primary)" }}>
-                Context: {formatTokenCount(contextEstimate.usedTokens)} /{" "}
-                {formatTokenCount(contextEstimate.maxTokens)} ({contextEstimate.percent}%)
-              </span>
+                Configure live model &amp; thinking level, inspect context &amp; execution mode, and
+                manage session lifecycle.
+              </p>
             </div>
-            <div
-              role="progressbar"
-              aria-label="Context level"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={contextEstimate.percent}
-              style={{
-                width: "100%",
-                height: "8px",
-                borderRadius: "4px",
-                backgroundColor: "var(--bg-input)",
-                border: "1px solid var(--border-subtle)",
-                overflow: "hidden",
-              }}
-            >
-              <div
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+              <button
+                type="button"
+                data-testid="agent-pin-toggle-btn"
+                aria-pressed={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
+                title={
+                  pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
+                    ? "Unpin Agent"
+                    : "Pin Agent"
+                }
+                aria-label={
+                  pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())
+                    ? "Unpin Agent"
+                    : "Pin Agent"
+                }
+                className={`fd-btn${pinnedAgents.has((agentName || displayTarget).trim().toLowerCase()) ? " fd-btn-active" : ""}`}
                 style={{
-                  width: `${contextEstimate.percent}%`,
-                  height: "100%",
-                  backgroundColor:
-                    contextEstimate.percent >= 80
-                      ? "var(--status-danger)"
-                      : contextEstimate.percent >= 50
-                        ? "var(--status-stale)"
-                        : "var(--status-alive)",
+                  padding: "4px 6px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  lineHeight: 1,
                 }}
-              />
+                onClick={() => togglePinnedAgent(agentName || displayTarget)}
+              >
+                <PinIcon
+                  pinned={pinnedAgents.has((agentName || displayTarget).trim().toLowerCase())}
+                  circled={true}
+                  size={16}
+                />
+              </button>
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="close-agent-settings-btn"
+                aria-label="Close Agent Settings"
+                onClick={onClose}
+              >
+                ✕
+              </button>
             </div>
           </div>
 
           <div
-            data-testid="agent-settings-execution-mode"
+            role="tablist"
+            aria-label="Agent Settings Tabs"
+            data-testid="agent-settings-tabs"
             style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "6px",
-              paddingTop: "4px",
-              borderTop: "1px solid var(--border-subtle)",
+              display: "grid",
+              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gap: "4px",
+              padding: "3px",
+              borderRadius: "6px",
+              backgroundColor: "var(--bg-elevated)",
+              border: "1px solid var(--border-subtle)",
             }}
           >
-            <span
-              style={{
-                fontSize: "11px",
-                fontWeight: 600,
-                textTransform: "uppercase",
-                color: "var(--text-muted)",
-              }}
-            >
-              Execution Mode
-            </span>
-            <span
-              data-testid="execution-mode-badge"
-              data-mode={executionModeKey || "unknown"}
-              data-warning={executionModeIsYolo ? "true" : undefined}
-              className="fd-badge"
-              title={
-                executionModeIsYolo
-                  ? "Yolo: this session runs tools without asking for approval"
-                  : "Reported by the agent runtime"
-              }
-              style={{
-                alignSelf: "flex-start",
-                padding: "4px 8px",
-                fontWeight: 600,
-                borderColor: executionModeIsYolo
-                  ? "var(--status-stale, #F59E0B)"
-                  : "var(--border-subtle)",
-                backgroundColor: executionModeIsYolo
-                  ? "rgba(245, 158, 11, 0.14)"
-                  : "var(--bg-surface)",
-                color: executionModeIsYolo
-                  ? "var(--status-stale, #F59E0B)"
-                  : executionModeKey
-                    ? "var(--text-secondary)"
-                    : "var(--text-muted)",
-              }}
-            >
-              {formatExecutionMode(effectiveExecutionMode)}
-            </span>
-            <span
-              data-testid="execution-mode-note"
-              style={{ fontSize: "11px", color: "var(--text-muted)" }}
-            >
-              Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
-              CLI.
-            </span>
+            {(
+              [
+                { id: "overview", label: "Overview & Model" },
+                { id: "permissions", label: "Permissions & Sandbox" },
+                { id: "runtime", label: "MCP & Runtime" },
+              ] as const
+            ).map((tab) => {
+              const isSelected = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  id={`agent-settings-tab-${tab.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={isSelected}
+                  aria-controls={`agent-settings-panel-${tab.id}`}
+                  data-testid={`agent-settings-tab-${tab.id}`}
+                  className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                  style={{
+                    fontSize: "11.5px",
+                    fontWeight: isSelected ? 700 : 500,
+                    padding: "5px 8px",
+                    justifyContent: "center",
+                    textAlign: "center",
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
+                  onClick={() => setActiveTab(tab.id)}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        {/* 3-Tier MCP & Agent Posture Status (Record #95) */}
-        {(() => {
-          const mergedPostureInput: AgentMcpPostureInput = {
-            agentName: agentName ?? displayTarget,
-            project: agentProject,
-            role: agentRole,
-            adapter: effectiveAdapter,
-            sessionId,
-            ...postureInput,
-            ...(postureOverride ?? {}),
-          };
-          const posture = evaluateAgentMcpPosture(mergedPostureInput);
-          const isSynced = posture.driftKind === "synced";
-          const badgeStyle: React.CSSProperties = isSynced
-            ? {
-                backgroundColor: "rgba(16, 185, 129, 0.14)",
-                color: "#34D399",
-                borderColor: "rgba(16, 185, 129, 0.4)",
-                fontWeight: 700,
-              }
-            : {
-                backgroundColor: "rgba(245, 158, 11, 0.16)",
-                color: "#FBBF24",
-                borderColor: "rgba(245, 158, 11, 0.45)",
-                fontWeight: 700,
-              };
-
-          return (
+        {/* Scrollable Middle Body */}
+        <div
+          data-testid="agent-settings-scroll-body"
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+            padding: "12px 2px 12px 0",
+          }}
+        >
+          {/* Tab Panel 1: Overview & Model */}
+          <div
+            id="agent-settings-panel-overview"
+            role="tabpanel"
+            aria-labelledby="agent-settings-tab-overview"
+            data-testid="agent-settings-panel-overview"
+            data-active={activeTab === "overview" ? "true" : "false"}
+            style={{
+              display: activeTab === "overview" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            {/* Agent Identity Summary */}
             <div
-              data-testid="agent-posture-section"
+              data-testid="agent-settings-identity"
+              className="fd-card"
+              style={{
+                padding: "10px 12px",
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+                gap: "8px",
+                backgroundColor: "var(--bg-elevated)",
+                fontSize: "12px",
+              }}
+            >
+              <div>
+                <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Persona
+                </div>
+                <div className="fd-mono" style={{ fontWeight: 600 }}>
+                  {displayTarget} {agentName ? `(@${agentName})` : ""}
+                </div>
+              </div>
+              {agentProject && (
+                <div>
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                    Project
+                  </div>
+                  <div style={{ fontWeight: 600 }}>{agentProject}</div>
+                </div>
+              )}
+              {agentRole && (
+                <div>
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                    Role
+                  </div>
+                  <div className="fd-mono">{canonicalizeDefaultRole(agentRole)}</div>
+                </div>
+              )}
+              <div>
+                <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Harness / Adapter
+                </div>
+                <div className="fd-mono">{effectiveAdapter || "unknown"}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Session ID
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    minWidth: 0,
+                  }}
+                >
+                  {sessionId && (
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="session-id-pill"
+                      title={sessionId}
+                      style={{ flexShrink: 0 }}
+                    >
+                      #{sessionId.slice(-8)}
+                    </span>
+                  )}
+                  <span
+                    className="fd-mono"
+                    title={sessionId || targetSessionOrAgent || "none"}
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {sessionId || targetSessionOrAgent || "unrouted"}
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                  Active Model
+                </div>
+                <span className="fd-badge fd-mono" data-testid="chat-active-model-badge">
+                  {effectiveAdapter && effectiveAdapter.toLowerCase() !== "unknown"
+                    ? `${effectiveAdapter} · `
+                    : ""}
+                  {effectiveModel || "default"}
+                  {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
+                </span>
+              </div>
+              {typeof turnCount === "number" && (
+                <div>
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
+                    Transcript Turns
+                  </div>
+                  <span className="fd-badge" data-testid="turn-count-badge">
+                    {turnCount} {turnCount === 1 ? "turn" : "turns"}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {/* Model & Thinking Level Selectors */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: "10px",
+              }}
+            >
+              <div>
+                <label
+                  htmlFor="fd-agent-settings-model"
+                  style={{
+                    display: "block",
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    color: "var(--text-muted)",
+                    marginBottom: "4px",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Session Model
+                </label>
+                <select
+                  id="fd-agent-settings-model"
+                  aria-label="Session Model"
+                  data-testid="session-model-select"
+                  className="fd-select fd-mono"
+                  disabled={!targetSessionOrAgent || switchingModel}
+                  value={effectiveModel}
+                  onChange={(e) => onChangeModelAndThinking(e.target.value, effectiveThinking)}
+                  style={{ width: "100%" }}
+                >
+                  {modelOptions.length === 0 && (
+                    <option value="">Default (runtime default)</option>
+                  )}
+                  {modelOptions.map((opt) => (
+                    <option key={opt} value={opt}>
+                      {formatModelOptionLabel(opt)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="fd-agent-settings-thinking"
+                  style={{
+                    display: "block",
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    color: "var(--text-muted)",
+                    marginBottom: "4px",
+                    textTransform: "uppercase",
+                  }}
+                >
+                  Thinking Level
+                </label>
+                <select
+                  id="fd-agent-settings-thinking"
+                  aria-label="Thinking Level"
+                  data-testid="session-thinking-select"
+                  className="fd-select fd-mono"
+                  disabled={!targetSessionOrAgent || switchingModel}
+                  value={effectiveThinking}
+                  onChange={(e) => onChangeModelAndThinking(effectiveModel, e.target.value)}
+                  style={{ width: "100%" }}
+                >
+                  {thinkingOptions.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Context Meter & Execution Mode */}
+            <div
               className="fd-card"
               style={{
                 padding: "10px 12px",
@@ -1011,12 +949,74 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               }}
             >
               <div
+                data-testid="context-level-meter"
                 style={{
                   display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
+                  flexDirection: "column",
+                  gap: "6px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      fontWeight: 600,
+                      textTransform: "uppercase",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    Context Window Usage
+                  </span>
+                  <span className="fd-mono" style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                    Context: {formatTokenCount(contextEstimate.usedTokens)} /{" "}
+                    {formatTokenCount(contextEstimate.maxTokens)} ({contextEstimate.percent}%)
+                  </span>
+                </div>
+                <div
+                  role="progressbar"
+                  aria-label="Context level"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={contextEstimate.percent}
+                  style={{
+                    width: "100%",
+                    height: "8px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-input)",
+                    border: "1px solid var(--border-subtle)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${contextEstimate.percent}%`,
+                      height: "100%",
+                      backgroundColor:
+                        contextEstimate.percent >= 80
+                          ? "var(--status-danger)"
+                          : contextEstimate.percent >= 50
+                            ? "var(--status-stale)"
+                            : "var(--status-alive)",
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div
+                data-testid="agent-settings-execution-mode"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  paddingTop: "4px",
+                  borderTop: "1px solid var(--border-subtle)",
                 }}
               >
                 <span
@@ -1027,725 +1027,860 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     color: "var(--text-muted)",
                   }}
                 >
-                  3-Tier MCP &amp; Agent Posture
+                  Execution Mode
                 </span>
                 <span
+                  data-testid="execution-mode-badge"
+                  data-mode={executionModeKey || "unknown"}
+                  data-warning={executionModeIsYolo ? "true" : undefined}
                   className="fd-badge"
-                  data-testid="agent-posture-status-badge"
-                  data-posture={posture.driftKind}
-                  style={badgeStyle}
+                  title={
+                    executionModeIsYolo
+                      ? "Yolo: this session runs tools without asking for approval"
+                      : "Reported by the agent runtime"
+                  }
+                  style={{
+                    alignSelf: "flex-start",
+                    padding: "4px 8px",
+                    fontWeight: 600,
+                    borderColor: executionModeIsYolo
+                      ? "var(--status-stale, #F59E0B)"
+                      : "var(--border-subtle)",
+                    backgroundColor: executionModeIsYolo
+                      ? "rgba(245, 158, 11, 0.14)"
+                      : "var(--bg-surface)",
+                    color: executionModeIsYolo
+                      ? "var(--status-stale, #F59E0B)"
+                      : executionModeKey
+                        ? "var(--text-secondary)"
+                        : "var(--text-muted)",
+                  }}
                 >
-                  {posture.badgeLabel}
+                  {formatExecutionMode(effectiveExecutionMode)}
+                </span>
+                <span
+                  data-testid="execution-mode-note"
+                  style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                >
+                  Read-only: how this session handles tool approvals. Change it in the agent&apos;s own
+                  CLI.
                 </span>
               </div>
-
-              <div
-                data-testid="agent-posture-summary"
-                style={{
-                  fontSize: "11.5px",
-                  color: "var(--text-secondary)",
-                  lineHeight: 1.4,
-                }}
-              >
-                {posture.summary}
-              </div>
-
-              <div
-                data-testid="agent-posture-tiers"
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-                  gap: "6px",
-                  fontSize: "11px",
-                }}
-              >
-                <div
-                  data-testid="posture-tier-desired"
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-surface)",
-                    border: "1px solid var(--border-subtle)",
-                  }}
-                >
-                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
-                    1. Desired Catalog
-                  </div>
-                  <div className="fd-mono" style={{ marginTop: "2px" }}>
-                    {posture.desiredServers.join(", ")}
-                  </div>
-                </div>
-
-                <div
-                  data-testid="posture-tier-applied"
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-surface)",
-                    border:
-                      posture.missingInApplied.length > 0
-                        ? "1px solid rgba(245, 158, 11, 0.5)"
-                        : "1px solid var(--border-subtle)",
-                  }}
-                >
-                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
-                    2. Applied ({posture.vendorConfigPath})
-                  </div>
-                  <div className="fd-mono" style={{ marginTop: "2px" }}>
-                    {posture.appliedServers.join(", ") || "none"}
-                  </div>
-                </div>
-
-                <div
-                  data-testid="posture-tier-live"
-                  style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-surface)",
-                    border:
-                      posture.driftKind === "stale_session"
-                        ? "1px solid rgba(245, 158, 11, 0.5)"
-                        : "1px solid var(--border-subtle)",
-                  }}
-                >
-                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
-                    3. Live-Attested
-                  </div>
-                  <div className="fd-mono" style={{ marginTop: "2px" }}>
-                    {posture.liveServers.join(", ") || "none"}
-                  </div>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  flexWrap: "wrap",
-                }}
-              >
-                {posture.driftKind === "unapplied_catalog" && (
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid="posture-remediate-sync-btn"
-                    style={{ fontSize: "11px", padding: "4px 8px" }}
-                    onClick={() => {
-                      setPostureOverride((prev) => ({
-                        ...(prev ?? {}),
-                        appliedMcpServers: [...posture.desiredServers],
-                      }));
-                      setPostureActionStatus(
-                        `Synced Desired catalog [${posture.desiredServers.join(", ")}] to ${posture.vendorConfigPath}.`,
-                      );
-                      onRemediatePosture?.("sync_mcp", posture);
-                    }}
-                  >
-                    Sync MCP Config
-                  </button>
-                )}
-
-                {posture.driftKind === "stale_session" && (
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid="posture-remediate-reforge-btn"
-                    style={{ fontSize: "11px", padding: "4px 8px" }}
-                    onClick={() => {
-                      setPostureOverride((prev) => ({
-                        ...(prev ?? {}),
-                        liveMcpServers: [...posture.appliedServers],
-                        sessionStartedBeforeSync: false,
-                        sessionRole: agentRole ?? undefined,
-                        sessionProject: agentProject ?? undefined,
-                      }));
-                      setPostureActionStatus(
-                        `Reforged live session for ${displayTarget} with latest MCP & role posture.`,
-                      );
-                      onRemediatePosture?.("reforge_session", posture);
-                    }}
-                  >
-                    Reforge / Restart Session
-                  </button>
-                )}
-
-                {posture.driftKind === "extra_server" && (
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid="posture-remediate-prune-btn"
-                    style={{ fontSize: "11px", padding: "4px 8px" }}
-                    onClick={() => {
-                      setPostureOverride((prev) => ({
-                        ...(prev ?? {}),
-                        appliedMcpServers: [...posture.desiredServers],
-                        liveMcpServers: [...posture.desiredServers],
-                      }));
-                      setPostureActionStatus(
-                        `Pruned unregistered MCP server(s) [${posture.extraInAppliedOrLive.join(", ")}] from ${posture.vendorConfigPath}.`,
-                      );
-                      onRemediatePosture?.("prune_extra", posture);
-                    }}
-                  >
-                    Prune Extra Servers
-                  </button>
-                )}
-              </div>
-
-              {postureActionStatus && (
-                <div
-                  role="status"
-                  data-testid="posture-remediate-status"
-                  style={{
-                    fontSize: "11px",
-                    color: "#34D399",
-                    padding: "4px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "rgba(16, 185, 129, 0.12)",
-                  }}
-                >
-                  {postureActionStatus}
-                </div>
-              )}
             </div>
-          );
-        })()}
+          </div>
 
-        {/* Session Lifecycle Actions */}
-        <div>
+          {/* Tab Panel 2: Permissions & Sandbox */}
           <div
+            id="agent-settings-panel-permissions"
+            role="tabpanel"
+            aria-labelledby="agent-settings-tab-permissions"
+            data-testid="agent-settings-panel-permissions"
+            data-active={activeTab === "permissions" ? "true" : "false"}
             style={{
-              fontSize: "11px",
-              fontWeight: 600,
-              color: "var(--text-muted)",
-              marginBottom: "6px",
-              textTransform: "uppercase",
+              display: activeTab === "permissions" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
             }}
           >
-            Session Lifecycle Actions
-          </div>
-          {/* Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation */}
-          {(() => {
-            const wtPreview = computeWorktreeBootstrapPreview(
-              agentKey,
-              agentProject || "FerroLoop",
-              agentWorktreePolicy,
-            );
-            return (
-              <div
-                data-testid="agent-worktree-policy-section"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "6px",
-                  padding: "8px 10px",
-                  marginBottom: "8px",
-                  borderRadius: "6px",
-                  backgroundColor: "var(--bg-elevated)",
-                  border: "1px solid var(--border-subtle)",
-                  fontSize: "11.5px",
-                }}
-              >
+            {/* Record #103: Universal Agent Permission & Auto-Accept Management (3-Layer + Keyed Change Classes) */}
+            {(() => {
+              const hostTelemetryForPerms = resolveAgentHostSupervisorTelemetry(
+                effectiveAdapter,
+                agentName || sessionId,
+              );
+              const postureChangeClass = resolvePermissionChangeClass(
+                effectiveAdapter,
+                hostTelemetryForPerms.transportMode,
+                "posture",
+                agentPosture,
+              );
+              const sandboxChangeClass = resolvePermissionChangeClass(
+                effectiveAdapter,
+                hostTelemetryForPerms.transportMode,
+                "sandbox",
+              );
+              const compileReceipt = compileUniversalPermissions(
+                effectiveAdapter,
+                agentPosture,
+                agentSandbox,
+                agentPermissionMatrix,
+              );
+              return (
                 <div
+                  data-testid="agent-permissions-section"
                   style={{
                     display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    flexWrap: "wrap",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "11.5px",
                   }}
                 >
-                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
-                    Worktree Policy &amp; Dev-Server Ports
-                  </span>
-                  <span
-                    className="fd-badge fd-mono"
-                    data-testid="agent-allocated-ports-badge"
+                  <div
                     style={{
-                      backgroundColor: "rgba(56, 189, 248, 0.14)",
-                      borderColor: "rgba(56, 189, 248, 0.4)",
-                      color: "var(--accent-primary)",
-                      fontSize: "10.5px",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
                     }}
                   >
-                    PORT={wtPreview.allocatedPort} · VITE_PORT={wtPreview.allocatedVitePort}
-                  </span>
-                </div>
-                <select
-                  aria-label="Agent Worktree Policy"
-                  data-testid="agent-worktree-policy-select"
-                  className="fd-select fd-mono"
-                  value={agentWorktreePolicy}
-                  onChange={(e) =>
-                    setAgentWorktreePolicy(e.target.value as WorktreePolicyMode)
-                  }
-                  style={{ width: "100%", fontSize: "11.5px" }}
-                >
-                  <option value="create">
-                    create (Isolated branch worktree)
-                  </option>
-                  <option value="reuse">
-                    reuse (Existing worktree checkout)
-                  </option>
-                  <option value="shared">
-                    shared (Primary project checkout)
-                  </option>
-                </select>
-                <div
-                  className="fd-mono"
-                  data-testid="agent-bootstrap-hooks-preview"
-                  style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
-                >
-                  {wtPreview.bootstrapConfigPath}: {wtPreview.bootstrapHooks.join(" && ")}
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Record #82 (Issue #217): Native fl host Supervisor Telemetry */}
-          {(() => {
-            const hostTelemetry = resolveAgentHostSupervisorTelemetry(
-              adapter,
-              agentName || sessionId,
-            );
-            return (
-              <div
-                data-testid="agent-host-supervisor-telemetry"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "6px",
-                  padding: "8px 10px",
-                  marginBottom: "8px",
-                  borderRadius: "6px",
-                  backgroundColor: "var(--bg-elevated)",
-                  border: "1px solid var(--border-subtle)",
-                  fontSize: "11.5px",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
-                    Native `fl host` Supervisor Telemetry
-                  </span>
-                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-                    <span
-                      className="fd-badge fd-mono"
-                      data-testid="agent-host-transport-mode-badge"
-                      data-mode={hostTelemetry.transportMode}
-                      style={{
-                        backgroundColor: "rgba(52, 211, 153, 0.14)",
-                        color: "#34d399",
-                        fontSize: "10.5px",
-                      }}
-                    >
-                      Transport: {hostTelemetry.transportMode}
+                    <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                      Permission Posture, Sandbox &amp; Rules
                     </span>
-                    <span
-                      className="fd-badge fd-mono"
-                      data-testid="agent-host-route-authority-badge"
-                      style={{
-                        backgroundColor: "rgba(56, 189, 248, 0.14)",
-                        color: "#38bdf8",
-                        fontSize: "10.5px",
-                      }}
+                    <code
+                      className="fd-mono"
+                      data-testid="agent-permission-vendor-preview"
+                      style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
                     >
-                      Route Authority: {hostTelemetry.routeAuthority}
-                    </span>
+                      {resolveVendorPermissionPreview(
+                        effectiveAdapter,
+                        agentPermissionMode,
+                      )}
+                    </code>
                   </div>
-                </div>
-                <div
-                  className="fd-mono"
-                  data-testid="agent-host-ring-buffer-usage"
-                  style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
-                >
-                  {hostTelemetry.supervisorUnit} · Ring Buffer:{" "}
-                  {Math.round(hostTelemetry.ringBufferUsedBytes / 1024)} KB /{" "}
-                  {Math.round(hostTelemetry.ringBufferCapacityBytes / 1024)} KB (
-                  {Math.round(
-                    (hostTelemetry.ringBufferUsedBytes /
-                      hostTelemetry.ringBufferCapacityBytes) *
-                      100,
-                  )}
-                  %)
-                </div>
-              </div>
-            );
-          })()}
 
-          {/* Record #103: Universal Agent Permission & Auto-Accept Management (3-Layer + Keyed Change Classes) */}
-          {(() => {
-            const hostTelemetryForPerms = resolveAgentHostSupervisorTelemetry(
-              effectiveAdapter,
-              agentName || sessionId,
-            );
-            const postureChangeClass = resolvePermissionChangeClass(
-              effectiveAdapter,
-              hostTelemetryForPerms.transportMode,
-              "posture",
-              agentPosture,
-            );
-            const sandboxChangeClass = resolvePermissionChangeClass(
-              effectiveAdapter,
-              hostTelemetryForPerms.transportMode,
-              "sandbox",
-            );
-            const compileReceipt = compileUniversalPermissions(
-              effectiveAdapter,
-              agentPosture,
-              agentSandbox,
-              agentPermissionMatrix,
-            );
-            return (
-              <div
-                data-testid="agent-permissions-section"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "6px",
-                  padding: "8px 10px",
-                  marginBottom: "8px",
-                  borderRadius: "6px",
-                  backgroundColor: "var(--bg-elevated)",
-                  border: "1px solid var(--border-subtle)",
-                  fontSize: "11.5px",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
-                    Permission Posture, Sandbox &amp; Rules
-                  </span>
-                  <code
-                    className="fd-mono"
-                    data-testid="agent-permission-vendor-preview"
-                    style={{ fontSize: "10.5px", color: "var(--accent-primary)" }}
+                  {/* 3-Layer Controls with Keyed Change-Class Badges */}
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                      gap: "6px",
+                    }}
                   >
-                    {resolveVendorPermissionPreview(
-                      effectiveAdapter,
-                      agentPermissionMode,
-                    )}
-                  </code>
-                </div>
-
-                {/* 3-Layer Controls with Keyed Change-Class Badges */}
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-                    gap: "6px",
-                  }}
-                >
-                  <div>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "4px",
-                        marginBottom: "2px",
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: "10px",
-                          fontWeight: 600,
-                          color: "var(--text-muted)",
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        1. Posture
-                      </span>
-                      <span
-                        className="fd-badge fd-mono"
-                        data-testid="agent-change-class-posture"
-                        style={{ fontSize: "9.5px" }}
-                      >
-                        {postureChangeClass}
-                      </span>
-                    </div>
-                    <select
-                      aria-label="Agent Approval Posture"
-                      data-testid="agent-posture-select"
-                      className="fd-select fd-mono"
-                      value={agentPosture}
-                      onChange={(e) => {
-                        const nextPosture = e.target
-                          .value as UniversalPermissionPosture;
-                        setAgentPosture(nextPosture);
-                        if (nextPosture === "bypass") {
-                          setAgentPermissionMode("auto-accept");
-                        } else if (nextPosture === "accept-edits") {
-                          setAgentPermissionMode("workspace-write");
-                        }
-                      }}
-                      style={{ width: "100%", fontSize: "10.5px" }}
-                    >
-                      <option value="ask">ask (default)</option>
-                      <option value="accept-edits">accept-edits</option>
-                      <option value="auto">auto</option>
-                      <option value="plan">plan</option>
-                      <option value="bypass">bypass (skip prompts)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "4px",
-                        marginBottom: "2px",
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: "10px",
-                          fontWeight: 600,
-                          color: "var(--text-muted)",
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        2. Sandbox
-                      </span>
-                      <span
-                        className="fd-badge fd-mono"
-                        data-testid="agent-change-class-sandbox"
-                        style={{ fontSize: "9.5px" }}
-                      >
-                        {sandboxChangeClass}
-                      </span>
-                    </div>
-                    <select
-                      aria-label="Agent OS Sandbox Mode"
-                      data-testid="agent-sandbox-select"
-                      className="fd-select fd-mono"
-                      value={agentSandbox}
-                      onChange={(e) =>
-                        setAgentSandbox(e.target.value as UniversalSandboxMode)
-                      }
-                      style={{ width: "100%", fontSize: "10.5px" }}
-                    >
-                      <option value="vendor-default">vendor-default</option>
-                      <option value="off">off (no OS sandbox)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "4px",
-                        marginBottom: "2px",
-                      }}
-                    >
-                      <span
-                        style={{
-                          fontSize: "10px",
-                          fontWeight: 600,
-                          color: "var(--text-muted)",
-                          textTransform: "uppercase",
-                        }}
-                      >
-                        3. Rule Preset
-                      </span>
-                    </div>
-                    <select
-                      aria-label="Agent Capability Rule Preset"
-                      data-testid="agent-rule-preset-select"
-                      className="fd-select fd-mono"
-                      value={agentRulePreset}
-                      onChange={(e) => {
-                        const nextPreset = e.target
-                          .value as UniversalRulePreset;
-                        setAgentRulePreset(nextPreset);
-                        setAgentPermissionMatrix({
-                          ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
-                        });
-                      }}
-                      style={{ width: "100%", fontSize: "10.5px" }}
-                    >
-                      <option value="read-only">read-only</option>
-                      <option value="workspace">workspace</option>
-                      <option value="workspace-web">workspace-web</option>
-                      <option value="custom">custom</option>
-                    </select>
-                  </div>
-                </div>
-
-                <select
-                  aria-label="Agent Permission & Approval Mode"
-                  data-testid="agent-permission-mode-select"
-                  className="fd-select fd-mono"
-                  value={agentPermissionMode}
-                  onChange={(e) => {
-                    const nextMode = e.target.value as UniversalPermissionMode;
-                    setAgentPermissionMode(nextMode);
-                    setAgentPermissionMatrix({
-                      ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
-                    });
-                    if (nextMode === "auto-accept") {
-                      setAgentPosture("bypass");
-                    } else if (nextMode === "workspace-write") {
-                      setAgentPosture("accept-edits");
-                      setAgentRulePreset("workspace");
-                    } else {
-                      setAgentRulePreset("custom");
-                    }
-                  }}
-                  style={{ width: "100%", fontSize: "11px" }}
-                >
-                  <option value="auto-accept">
-                    auto-accept (Full autonomous bypass)
-                  </option>
-                  <option value="workspace-write">
-                    workspace-write (Auto-allow workspace, prompt external/shell)
-                  </option>
-                  <option value="granular">
-                    granular (Per-capability allow / ask / deny matrix)
-                  </option>
-                </select>
-
-                <div
-                  data-testid="agent-permission-matrix"
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                    gap: "4px",
-                  }}
-                >
-                  {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => {
-                    const capChangeClass = resolvePermissionChangeClass(
-                      effectiveAdapter,
-                      hostTelemetryForPerms.transportMode,
-                      cap,
-                    );
-                    return (
+                    <div>
                       <div
-                        key={cap}
-                        data-testid={`agent-perm-cap-${cap}`}
                         style={{
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "space-between",
                           gap: "4px",
-                          padding: "3px 6px",
-                          borderRadius: "4px",
-                          border: "1px solid var(--border-subtle)",
-                          fontSize: "10.5px",
+                          marginBottom: "2px",
                         }}
                       >
+                        <span
+                          style={{
+                            fontSize: "10px",
+                            fontWeight: 600,
+                            color: "var(--text-muted)",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          1. Posture
+                        </span>
+                        <span
+                          className="fd-badge fd-mono"
+                          data-testid="agent-change-class-posture"
+                          style={{ fontSize: "9.5px" }}
+                        >
+                          {postureChangeClass}
+                        </span>
+                      </div>
+                      <select
+                        aria-label="Agent Approval Posture"
+                        data-testid="agent-posture-select"
+                        className="fd-select fd-mono"
+                        value={agentPosture}
+                        onChange={(e) => {
+                          const nextPosture = e.target
+                            .value as UniversalPermissionPosture;
+                          setAgentPosture(nextPosture);
+                          if (nextPosture === "bypass") {
+                            setAgentPermissionMode("auto-accept");
+                          } else if (nextPosture === "accept-edits") {
+                            setAgentPermissionMode("workspace-write");
+                          }
+                        }}
+                        style={{ width: "100%", fontSize: "10.5px" }}
+                      >
+                        <option value="ask">ask (default)</option>
+                        <option value="accept-edits">accept-edits</option>
+                        <option value="auto">auto</option>
+                        <option value="plan">plan</option>
+                        <option value="bypass">bypass (skip prompts)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "4px",
+                          marginBottom: "2px",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: "10px",
+                            fontWeight: 600,
+                            color: "var(--text-muted)",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          2. Sandbox
+                        </span>
+                        <span
+                          className="fd-badge fd-mono"
+                          data-testid="agent-change-class-sandbox"
+                          style={{ fontSize: "9.5px" }}
+                        >
+                          {sandboxChangeClass}
+                        </span>
+                      </div>
+                      <select
+                        aria-label="Agent OS Sandbox Mode"
+                        data-testid="agent-sandbox-select"
+                        className="fd-select fd-mono"
+                        value={agentSandbox}
+                        onChange={(e) =>
+                          setAgentSandbox(e.target.value as UniversalSandboxMode)
+                        }
+                        style={{ width: "100%", fontSize: "10.5px" }}
+                      >
+                        <option value="vendor-default">vendor-default</option>
+                        <option value="off">off (no OS sandbox)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: "4px",
+                          marginBottom: "2px",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: "10px",
+                            fontWeight: 600,
+                            color: "var(--text-muted)",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          3. Rule Preset
+                        </span>
+                      </div>
+                      <select
+                        aria-label="Agent Capability Rule Preset"
+                        data-testid="agent-rule-preset-select"
+                        className="fd-select fd-mono"
+                        value={agentRulePreset}
+                        onChange={(e) => {
+                          const nextPreset = e.target
+                            .value as UniversalRulePreset;
+                          setAgentRulePreset(nextPreset);
+                          setAgentPermissionMatrix({
+                            ...DEFAULT_RULE_PRESET_MATRICES[nextPreset],
+                          });
+                        }}
+                        style={{ width: "100%", fontSize: "10.5px" }}
+                      >
+                        <option value="read-only">read-only</option>
+                        <option value="workspace">workspace</option>
+                        <option value="workspace-web">workspace-web</option>
+                        <option value="custom">custom</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <select
+                    aria-label="Agent Permission & Approval Mode"
+                    data-testid="agent-permission-mode-select"
+                    className="fd-select fd-mono"
+                    value={agentPermissionMode}
+                    onChange={(e) => {
+                      const nextMode = e.target.value as UniversalPermissionMode;
+                      setAgentPermissionMode(nextMode);
+                      setAgentPermissionMatrix({
+                        ...DEFAULT_UNIVERSAL_PERMISSION_MATRICES[nextMode],
+                      });
+                      if (nextMode === "auto-accept") {
+                        setAgentPosture("bypass");
+                      } else if (nextMode === "workspace-write") {
+                        setAgentPosture("accept-edits");
+                        setAgentRulePreset("workspace");
+                      } else {
+                        setAgentRulePreset("custom");
+                      }
+                    }}
+                    style={{ width: "100%", fontSize: "11px" }}
+                  >
+                    <option value="auto-accept">
+                      auto-accept (Full autonomous bypass)
+                    </option>
+                    <option value="workspace-write">
+                      workspace-write (Auto-allow workspace, prompt external/shell)
+                    </option>
+                    <option value="granular">
+                      granular (Per-capability allow / ask / deny matrix)
+                    </option>
+                  </select>
+
+                  <div
+                    data-testid="agent-permission-matrix"
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                      gap: "4px",
+                    }}
+                  >
+                    {UNIVERSAL_PERMISSION_CAPABILITIES.map((cap) => {
+                      const capChangeClass = resolvePermissionChangeClass(
+                        effectiveAdapter,
+                        hostTelemetryForPerms.transportMode,
+                        cap,
+                      );
+                      return (
                         <div
+                          key={cap}
+                          data-testid={`agent-perm-cap-${cap}`}
                           style={{
                             display: "flex",
                             alignItems: "center",
+                            justifyContent: "space-between",
                             gap: "4px",
-                            minWidth: 0,
+                            padding: "3px 6px",
+                            borderRadius: "4px",
+                            border: "1px solid var(--border-subtle)",
+                            fontSize: "10.5px",
                           }}
                         >
-                          <code className="fd-mono">{cap}</code>
-                          <span
-                            className="fd-badge fd-mono"
-                            data-testid={`agent-perm-change-class-${cap}`}
-                            style={{ fontSize: "9px", padding: "0 4px" }}
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "4px",
+                              minWidth: 0,
+                            }}
                           >
-                            {capChangeClass}
-                          </span>
+                            <code className="fd-mono">{cap}</code>
+                            <span
+                              className="fd-badge fd-mono"
+                              data-testid={`agent-perm-change-class-${cap}`}
+                              style={{ fontSize: "9px", padding: "0 4px" }}
+                            >
+                              {capChangeClass}
+                            </span>
+                          </div>
+                          <select
+                            aria-label={`Agent permission for ${cap}`}
+                            data-testid={`agent-perm-select-${cap}`}
+                            className="fd-select fd-mono"
+                            style={{ fontSize: "10px", padding: "1px 4px" }}
+                            value={agentPermissionMatrix[cap]}
+                            onChange={(e) => {
+                              const nextAction = e.target
+                                .value as PermissionRuleAction;
+                              setAgentPermissionMode("granular");
+                              setAgentRulePreset("custom");
+                              setAgentPermissionMatrix((prev) => ({
+                                ...prev,
+                                [cap]: nextAction,
+                              }));
+                            }}
+                          >
+                            <option value="allow">allow</option>
+                            <option value="ask">ask</option>
+                            <option value="deny">deny</option>
+                          </select>
                         </div>
-                        <select
-                          aria-label={`Agent permission for ${cap}`}
-                          data-testid={`agent-perm-select-${cap}`}
-                          className="fd-select fd-mono"
-                          style={{ fontSize: "10px", padding: "1px 4px" }}
-                          value={agentPermissionMatrix[cap]}
-                          onChange={(e) => {
-                            const nextAction = e.target
-                              .value as PermissionRuleAction;
-                            setAgentPermissionMode("granular");
-                            setAgentRulePreset("custom");
-                            setAgentPermissionMatrix((prev) => ({
-                              ...prev,
-                              [cap]: nextAction,
-                            }));
-                          }}
-                        >
-                          <option value="allow">allow</option>
-                          <option value="ask">ask</option>
-                          <option value="deny">deny</option>
-                        </select>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
 
-                {/* Compile Receipt & Downgrade Preview */}
+                  {/* Compile Receipt & Downgrade Preview */}
+                  <div
+                    data-testid="agent-compile-receipt"
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "4px",
+                      backgroundColor: "var(--bg-surface)",
+                      border: "1px solid var(--border-subtle)",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "4px",
+                      fontSize: "10.5px",
+                    }}
+                  >
+                    <div
+                      className="fd-mono"
+                      data-testid="agent-compile-native-flags"
+                      style={{ color: "var(--accent-primary)" }}
+                    >
+                      Compiled ({compileReceipt.vendor}):{" "}
+                      {compileReceipt.nativeFlagsOrConfig}
+                    </div>
+                    {compileReceipt.downgrades.length > 0 && (
+                      <div
+                        data-testid="agent-compile-downgrades"
+                        style={{ color: "#FBBF24" }}
+                      >
+                        Downgrade: {compileReceipt.downgrades.join(" ")}
+                      </div>
+                    )}
+                    {compileReceipt.emulationNotices.length > 0 && (
+                      <div
+                        data-testid="agent-compile-emulation"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        Emulated: {compileReceipt.emulationNotices.join(" ")}
+                      </div>
+                    )}
+                    {compileReceipt.refused.length > 0 && (
+                      <div
+                        data-testid="agent-compile-refused"
+                        style={{ color: "#F87171", fontWeight: 600 }}
+                      >
+                        Refused: {compileReceipt.refused.join(" ")}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* Tab Panel 3: MCP & Runtime */}
+          <div
+            id="agent-settings-panel-runtime"
+            role="tabpanel"
+            aria-labelledby="agent-settings-tab-runtime"
+            data-testid="agent-settings-panel-runtime"
+            data-active={activeTab === "runtime" ? "true" : "false"}
+            style={{
+              display: activeTab === "runtime" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            {/* 3-Tier MCP & Agent Posture Status (Record #95) */}
+            {(() => {
+              const mergedPostureInput: AgentMcpPostureInput = {
+                agentName: agentName ?? displayTarget,
+                project: agentProject,
+                role: agentRole,
+                adapter: effectiveAdapter,
+                sessionId,
+                ...postureInput,
+                ...(postureOverride ?? {}),
+              };
+              const posture = evaluateAgentMcpPosture(mergedPostureInput);
+              const isSynced = posture.driftKind === "synced";
+              const badgeStyle: React.CSSProperties = isSynced
+                ? {
+                    backgroundColor: "rgba(16, 185, 129, 0.14)",
+                    color: "#34D399",
+                    borderColor: "rgba(16, 185, 129, 0.4)",
+                    fontWeight: 700,
+                  }
+                : {
+                    backgroundColor: "rgba(245, 158, 11, 0.16)",
+                    color: "#FBBF24",
+                    borderColor: "rgba(245, 158, 11, 0.45)",
+                    fontWeight: 700,
+                  };
+
+              return (
                 <div
-                  data-testid="agent-compile-receipt"
+                  data-testid="agent-posture-section"
+                  className="fd-card"
                   style={{
-                    padding: "6px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-surface)",
-                    border: "1px solid var(--border-subtle)",
+                    padding: "10px 12px",
                     display: "flex",
                     flexDirection: "column",
-                    gap: "4px",
-                    fontSize: "10.5px",
+                    gap: "8px",
+                    backgroundColor: "var(--bg-elevated)",
                   }}
                 >
                   <div
-                    className="fd-mono"
-                    data-testid="agent-compile-native-flags"
-                    style={{ color: "var(--accent-primary)" }}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
                   >
-                    Compiled ({compileReceipt.vendor}):{" "}
-                    {compileReceipt.nativeFlagsOrConfig}
+                    <span
+                      style={{
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        textTransform: "uppercase",
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      3-Tier MCP &amp; Agent Posture
+                    </span>
+                    <span
+                      className="fd-badge"
+                      data-testid="agent-posture-status-badge"
+                      data-posture={posture.driftKind}
+                      style={badgeStyle}
+                    >
+                      {posture.badgeLabel}
+                    </span>
                   </div>
-                  {compileReceipt.downgrades.length > 0 && (
+
+                  <div
+                    data-testid="agent-posture-summary"
+                    style={{
+                      fontSize: "11.5px",
+                      color: "var(--text-secondary)",
+                      lineHeight: 1.4,
+                    }}
+                  >
+                    {posture.summary}
+                  </div>
+
+                  <div
+                    data-testid="agent-posture-tiers"
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                      gap: "6px",
+                      fontSize: "11px",
+                    }}
+                  >
                     <div
-                      data-testid="agent-compile-downgrades"
-                      style={{ color: "#FBBF24" }}
+                      data-testid="posture-tier-desired"
+                      style={{
+                        padding: "6px 8px",
+                        borderRadius: "4px",
+                        backgroundColor: "var(--bg-surface)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
                     >
-                      Downgrade: {compileReceipt.downgrades.join(" ")}
+                      <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                        1. Desired Catalog
+                      </div>
+                      <div className="fd-mono" style={{ marginTop: "2px" }}>
+                        {posture.desiredServers.join(", ")}
+                      </div>
                     </div>
-                  )}
-                  {compileReceipt.emulationNotices.length > 0 && (
+
                     <div
-                      data-testid="agent-compile-emulation"
-                      style={{ color: "var(--text-secondary)" }}
+                      data-testid="posture-tier-applied"
+                      style={{
+                        padding: "6px 8px",
+                        borderRadius: "4px",
+                        backgroundColor: "var(--bg-surface)",
+                        border:
+                          posture.missingInApplied.length > 0
+                            ? "1px solid rgba(245, 158, 11, 0.5)"
+                            : "1px solid var(--border-subtle)",
+                      }}
                     >
-                      Emulated: {compileReceipt.emulationNotices.join(" ")}
+                      <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                        2. Applied ({posture.vendorConfigPath})
+                      </div>
+                      <div className="fd-mono" style={{ marginTop: "2px" }}>
+                        {posture.appliedServers.join(", ") || "none"}
+                      </div>
                     </div>
-                  )}
-                  {compileReceipt.refused.length > 0 && (
+
                     <div
-                      data-testid="agent-compile-refused"
-                      style={{ color: "#F87171", fontWeight: 600 }}
+                      data-testid="posture-tier-live"
+                      style={{
+                        padding: "6px 8px",
+                        borderRadius: "4px",
+                        backgroundColor: "var(--bg-surface)",
+                        border:
+                          posture.driftKind === "stale_session"
+                            ? "1px solid rgba(245, 158, 11, 0.5)"
+                            : "1px solid var(--border-subtle)",
+                      }}
                     >
-                      Refused: {compileReceipt.refused.join(" ")}
+                      <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                        3. Live-Attested
+                      </div>
+                      <div className="fd-mono" style={{ marginTop: "2px" }}>
+                        {posture.liveServers.join(", ") || "none"}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {posture.driftKind === "unapplied_catalog" && (
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-primary"
+                        data-testid="posture-remediate-sync-btn"
+                        style={{ fontSize: "11px", padding: "4px 8px" }}
+                        onClick={() => {
+                          setPostureOverride((prev) => ({
+                            ...(prev ?? {}),
+                            appliedMcpServers: [...posture.desiredServers],
+                          }));
+                          setPostureActionStatus(
+                            `Synced Desired catalog [${posture.desiredServers.join(", ")}] to ${posture.vendorConfigPath}.`,
+                          );
+                          onRemediatePosture?.("sync_mcp", posture);
+                        }}
+                      >
+                        Sync MCP Config
+                      </button>
+                    )}
+
+                    {posture.driftKind === "stale_session" && (
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-primary"
+                        data-testid="posture-remediate-reforge-btn"
+                        style={{ fontSize: "11px", padding: "4px 8px" }}
+                        onClick={() => {
+                          setPostureOverride((prev) => ({
+                            ...(prev ?? {}),
+                            liveMcpServers: [...posture.appliedServers],
+                            sessionStartedBeforeSync: false,
+                            sessionRole: agentRole ?? undefined,
+                            sessionProject: agentProject ?? undefined,
+                          }));
+                          setPostureActionStatus(
+                            `Reforged live session for ${displayTarget} with latest MCP & role posture.`,
+                          );
+                          onRemediatePosture?.("reforge_session", posture);
+                        }}
+                      >
+                        Reforge / Restart Session
+                      </button>
+                    )}
+
+                    {posture.driftKind === "extra_server" && (
+                      <button
+                        type="button"
+                        className="fd-btn fd-btn-primary"
+                        data-testid="posture-remediate-prune-btn"
+                        style={{ fontSize: "11px", padding: "4px 8px" }}
+                        onClick={() => {
+                          setPostureOverride((prev) => ({
+                            ...(prev ?? {}),
+                            appliedMcpServers: [...posture.desiredServers],
+                            liveMcpServers: [...posture.desiredServers],
+                          }));
+                          setPostureActionStatus(
+                            `Pruned unregistered MCP server(s) [${posture.extraInAppliedOrLive.join(", ")}] from ${posture.vendorConfigPath}.`,
+                          );
+                          onRemediatePosture?.("prune_extra", posture);
+                        }}
+                      >
+                        Prune Extra Servers
+                      </button>
+                    )}
+                  </div>
+
+                  {postureActionStatus && (
+                    <div
+                      role="status"
+                      data-testid="posture-remediate-status"
+                      style={{
+                        fontSize: "11px",
+                        color: "#34D399",
+                        padding: "4px 8px",
+                        borderRadius: "4px",
+                        backgroundColor: "rgba(16, 185, 129, 0.12)",
+                      }}
+                    >
+                      {postureActionStatus}
                     </div>
                   )}
                 </div>
-              </div>
-            );
-          })()}
+              );
+            })()}
+
+            {/* Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation */}
+            {(() => {
+              const wtPreview = computeWorktreeBootstrapPreview(
+                agentKey,
+                agentProject || "FerroLoop",
+                agentWorktreePolicy,
+              );
+              return (
+                <div
+                  data-testid="agent-worktree-policy-section"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "11.5px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                      Worktree Policy &amp; Dev-Server Ports
+                    </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="agent-allocated-ports-badge"
+                      style={{
+                        backgroundColor: "rgba(56, 189, 248, 0.14)",
+                        borderColor: "rgba(56, 189, 248, 0.4)",
+                        color: "var(--accent-primary)",
+                        fontSize: "10.5px",
+                      }}
+                    >
+                      PORT={wtPreview.allocatedPort} · VITE_PORT={wtPreview.allocatedVitePort}
+                    </span>
+                  </div>
+                  <select
+                    aria-label="Agent Worktree Policy"
+                    data-testid="agent-worktree-policy-select"
+                    className="fd-select fd-mono"
+                    value={agentWorktreePolicy}
+                    onChange={(e) =>
+                      setAgentWorktreePolicy(e.target.value as WorktreePolicyMode)
+                    }
+                    style={{ width: "100%", fontSize: "11.5px" }}
+                  >
+                    <option value="create">
+                      create (Isolated branch worktree)
+                    </option>
+                    <option value="reuse">
+                      reuse (Existing worktree checkout)
+                    </option>
+                    <option value="shared">
+                      shared (Primary project checkout)
+                    </option>
+                  </select>
+                  <div
+                    className="fd-mono"
+                    data-testid="agent-bootstrap-hooks-preview"
+                    style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                  >
+                    {wtPreview.bootstrapConfigPath}: {wtPreview.bootstrapHooks.join(" && ")}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Record #82 (Issue #217): Native fl host Supervisor Telemetry */}
+            {(() => {
+              const hostTelemetry = resolveAgentHostSupervisorTelemetry(
+                adapter,
+                agentName || sessionId,
+              );
+              return (
+                <div
+                  data-testid="agent-host-supervisor-telemetry"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "6px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    backgroundColor: "var(--bg-elevated)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "11.5px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                      Native `fl host` Supervisor Telemetry
+                    </span>
+                    <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="agent-host-transport-mode-badge"
+                        data-mode={hostTelemetry.transportMode}
+                        style={{
+                          backgroundColor: "rgba(52, 211, 153, 0.14)",
+                          color: "#34d399",
+                          fontSize: "10.5px",
+                        }}
+                      >
+                        Transport: {hostTelemetry.transportMode}
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="agent-host-route-authority-badge"
+                        style={{
+                          backgroundColor: "rgba(56, 189, 248, 0.14)",
+                          color: "#38bdf8",
+                          fontSize: "10.5px",
+                        }}
+                      >
+                        Route Authority: {hostTelemetry.routeAuthority}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    className="fd-mono"
+                    data-testid="agent-host-ring-buffer-usage"
+                    style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                  >
+                    {hostTelemetry.supervisorUnit} · Ring Buffer:{" "}
+                    {Math.round(hostTelemetry.ringBufferUsedBytes / 1024)} KB /{" "}
+                    {Math.round(hostTelemetry.ringBufferCapacityBytes / 1024)} KB (
+                    {Math.round(
+                      (hostTelemetry.ringBufferUsedBytes /
+                        hostTelemetry.ringBufferCapacityBytes) *
+                        100,
+                    )}
+                    %)
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+
+        {/* Pinned Bottom Lifecycle Footer */}
+        <div
+          data-testid="agent-settings-footer"
+          style={{
+            flexShrink: 0,
+            paddingTop: "12px",
+            borderTop: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--bg-surface)",
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: "11px",
+              fontWeight: 600,
+              color: "var(--text-muted)",
+              textTransform: "uppercase",
+            }}
+          >
+            Session Lifecycle Actions
+          </div>
           <div
             style={{
               display: "flex",
@@ -1813,24 +1948,24 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               {decommissioning ? "Decommissioning..." : "Decommission"}
             </button>
           </div>
-        </div>
 
-        {recastStatusBanner && (
-          <div
-            role="status"
-            data-testid="recast-status-banner"
-            className="fd-card"
-            style={{
-              borderColor: "var(--diff-add-border)",
-              backgroundColor: "var(--diff-add-bg)",
-              color: "var(--diff-add-text)",
-              fontSize: "12px",
-              padding: "8px 12px",
-            }}
-          >
-            {recastStatusBanner}
-          </div>
-        )}
+          {recastStatusBanner && (
+            <div
+              role="status"
+              data-testid="recast-status-banner"
+              className="fd-card"
+              style={{
+                borderColor: "var(--diff-add-border)",
+                backgroundColor: "var(--diff-add-bg)",
+                color: "var(--diff-add-text)",
+                fontSize: "12px",
+                padding: "8px 12px",
+              }}
+            >
+              {recastStatusBanner}
+            </div>
+          )}
+        </div>
 
         {recastModalOpen && (() => {
           const projectOptions = CANONICAL_PROJECTS.includes(recastProject)
