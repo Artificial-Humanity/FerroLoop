@@ -546,6 +546,10 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("GET", "/api/v1/artifacts/office-preview") => {
             handle_get_artifact_office_preview(state, req)
         }
+        ("GET", "/api/v1/artifacts/consolidate") => handle_get_artifacts_consolidate(state),
+        ("POST", "/api/v1/artifacts/consolidate") => {
+            handle_post_artifacts_consolidate(state, &authority, req)
+        }
         ("POST", "/api/v1/artifacts/prune") => handle_post_artifacts_prune(state, &authority, req),
         ("POST", "/api/v1/attachments/prune") => {
             crate::attachments::handle_post_attachments_prune(state, &authority, req)
@@ -3841,6 +3845,158 @@ fn resolve_prune_worktree(
 /// `failed_deletes` (files that could not be deleted: their rows are gone anyway, so each one
 /// is an orphan file left in `managed/` or `versions/`; 0 in a dry run) and `storage` (see
 /// [`artifacts::StorageSummary`], measured after the action).
+/// Apply the `canonical_root` rule for consolidate responses.
+///
+/// Rule (placeholder rule): if `layout.canonical_root` is the
+/// `DedicatedArtifactLayoutState::default()` placeholder
+/// (`~/.local/share/fl/artifacts/`), it is not a real persisted choice, so
+/// it is replaced with `artifact_dirs::effective_system_dir(state)`. A
+/// stored state explicitly persisted with any other root keeps that root.
+/// This needs no core existence check and is deterministic for tests.
+///
+/// The rule only applies pre-persist: a real consolidation persists the
+/// resolved root via `fl_core::consolidate_artifact_layout`, so after a
+/// POST the stored root is the (non-placeholder) resolved root and a later
+/// GET returns it unchanged even if the settings (and therefore the
+/// effective system dir) have since changed.
+fn artifact_layout_for_response(
+    state: &HubState,
+    mut layout: fl_core::DedicatedArtifactLayoutState,
+) -> fl_core::DedicatedArtifactLayoutState {
+    if layout.canonical_root == fl_core::DedicatedArtifactLayoutState::default().canonical_root {
+        layout.canonical_root = crate::artifact_dirs::effective_system_dir(state)
+            .display()
+            .to_string();
+    }
+    layout
+}
+
+/// `GET /api/v1/artifacts/consolidate` (Records #77/#186/#207): current
+/// dedicated artifact layout. Any authenticated authority may read it.
+/// `canonical_root` follows the placeholder rule documented on
+/// [`artifact_layout_for_response`].
+fn handle_get_artifacts_consolidate(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::get_artifact_layout(&*store) {
+        Ok(layout) => HttpResponse::json(
+            200,
+            serde_json::to_value(artifact_layout_for_response(state, layout)).unwrap_or(json!({})),
+        ),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `POST /api/v1/artifacts/consolidate` (Records #77/#186/#207): Owner only.
+///
+/// Body: `{ dry_run?: bool, retention_policy?: ArtifactRetentionPolicyConfig }`.
+/// A missing `dry_run` defaults to `false`; a non-bool `dry_run` is a 400.
+/// A present `retention_policy` is deserialized and validated; invalid
+/// values are a 400. `dry_run: true` mutates nothing and reports the
+/// scattered totals over unconsolidated origins; its response `layout`
+/// reflects the supplied `retention_policy` in memory only (a later GET
+/// still shows the persisted policy). `dry_run: true` reads strictly, so
+/// corrupt stored state is a 500 rather than a false preview.
+/// `dry_run: false` resolves `canonical_root` (the effective system dir
+/// when the stored root is the `Default` placeholder, else the stored
+/// root) and calls `fl_core::consolidate_artifact_layout`, which persists
+/// that resolved root.
+///
+/// NOTE: consolidation marks the stored layout state only (every origin's
+/// `consolidated` flag, plus the retention policy). Physical file migration
+/// into the canonical root is a follow-up; this handler does not move files.
+fn handle_post_artifacts_consolidate(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may consolidate artifacts" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let dry_run = match body.get("dry_run") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return HttpResponse::json(400, json!({ "error": "`dry_run` must be a boolean" }));
+        }
+    };
+    let retention = match body.get("retention_policy") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let parsed: fl_core::ArtifactRetentionPolicyConfig =
+                match serde_json::from_value(value.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return HttpResponse::json(
+                            400,
+                            json!({ "error": format!("invalid `retention_policy`: {e}") }),
+                        );
+                    }
+                };
+            if let Err(e) = parsed.validate() {
+                return HttpResponse::json(400, json!({ "error": e.to_string() }));
+            }
+            Some(parsed)
+        }
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    if dry_run {
+        let mut layout = match fl_core::get_artifact_layout_strict(&*store) {
+            Ok(l) => l,
+            Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+        };
+        let (files, bytes) = fl_core::scattered_totals(&layout);
+        // In-memory only: preview the supplied retention, never persist it.
+        if let Some(r) = retention {
+            layout.retention_policy = r;
+        }
+        return HttpResponse::json(
+            200,
+            json!({
+                "dry_run": true,
+                "consolidated_files": files,
+                "consolidated_bytes": bytes,
+                "layout": artifact_layout_for_response(state, layout),
+            }),
+        );
+    }
+    let stored = match fl_core::get_artifact_layout_strict(&*store) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    let resolved_root = if stored.canonical_root
+        == fl_core::DedicatedArtifactLayoutState::default().canonical_root
+    {
+        crate::artifact_dirs::effective_system_dir(state)
+            .display()
+            .to_string()
+    } else {
+        stored.canonical_root
+    };
+    match fl_core::consolidate_artifact_layout(&*store, retention, Some(resolved_root)) {
+        Ok((layout, files, bytes)) => HttpResponse::json(
+            200,
+            json!({
+                "dry_run": false,
+                "consolidated_files": files,
+                "consolidated_bytes": bytes,
+                "layout": artifact_layout_for_response(state, layout),
+            }),
+        ),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
 fn handle_post_artifacts_prune(
     state: &HubState,
     authority: &HubAuthority,
