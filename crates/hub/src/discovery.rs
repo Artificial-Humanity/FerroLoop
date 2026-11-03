@@ -676,9 +676,13 @@ fn discover_sessions_impl(
     let registered_names = &snap.registered_names;
 
     let mut ordered_routes: Vec<_> = routes.entries.iter().collect();
-    ordered_routes.sort_by_key(|(persona, _)| {
+    ordered_routes.sort_by_key(|(persona, entry)| {
         let is_registered = registered_names.contains(&persona.to_ascii_lowercase());
-        (!is_registered, *persona)
+        (
+            !is_registered,
+            std::cmp::Reverse(entry.updated_at.unix_millis()),
+            *persona,
+        )
     });
 
     for (persona, entry) in ordered_routes {
@@ -9340,5 +9344,81 @@ mod tests {
                 max_tokens: 1_000_000,
             })
         );
+    }
+
+    #[test]
+    fn discover_sessions_prefers_registered_and_newer_route_over_alphabetical_stale_alias() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
+        store
+            .register_agent(fl_core::agent::RegisterAgentArgs {
+                display_name: "Sonya".into(),
+                email: None,
+                project: "sonora".into(),
+                role: fl_core::agent::AgentRole::Lead,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: fl_core::at::At::from_unix_millis(10),
+                by: "owner".into(),
+            })
+            .unwrap();
+
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 1. Registered `sonya` (older timestamp) vs unregistered `github-44` (newer timestamp, alphabetically earlier) sharing `sess-sonya`.
+        // 2. Unregistered `kayla` (newer timestamp) vs unregistered `highly` (older timestamp, alphabetically earlier) sharing `conv-kayla`.
+        fs::write(
+            &path,
+            serde_json::json!({
+                "entries": {
+                    "github-44": {
+                        "persona": "github-44",
+                        "updated_at": "2026-11-03T12:00:00.000Z",
+                        "route": {
+                            "kind": "claude",
+                            "pid": 1,
+                            "session_id": "sess-sonya",
+                            "socket_path": home.join("s.sock")
+                        }
+                    },
+                    "sonya": {
+                        "persona": "sonya",
+                        "updated_at": "2026-11-03T10:00:00.000Z",
+                        "route": {
+                            "kind": "claude",
+                            "pid": 1,
+                            "session_id": "sess-sonya",
+                            "socket_path": home.join("s.sock")
+                        }
+                    },
+                    "highly": {
+                        "persona": "highly",
+                        "updated_at": "2026-11-03T10:00:00.000Z",
+                        "route": {
+                            "kind": "agy",
+                            "conversation_id": "conv-kayla"
+                        }
+                    },
+                    "kayla": {
+                        "persona": "kayla",
+                        "updated_at": "2026-11-03T12:00:00.000Z",
+                        "route": {
+                            "kind": "agy",
+                            "conversation_id": "conv-kayla"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions_with_home(&store, Some(home));
+        let sonya_sess = sessions.iter().find(|s| s.id == "sess-sonya").unwrap();
+        assert_eq!(sonya_sess.persona.as_deref(), Some("sonya"));
+        let kayla_sess = sessions.iter().find(|s| s.id == "conv-kayla").unwrap();
+        assert_eq!(kayla_sess.persona.as_deref(), Some("kayla"));
     }
 }

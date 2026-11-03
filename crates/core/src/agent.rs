@@ -163,6 +163,13 @@ impl<'de> Deserialize<'de> for AgentRole {
     }
 }
 
+fn deserialize_stored_role<'de, D: Deserializer<'de>>(d: D) -> Result<AgentRole, D::Error> {
+    let raw = String::deserialize(d)?;
+    AgentRole::from_wire(&raw)
+        .or_else(|_| validate_slug(&raw).map(AgentRole::Custom))
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -184,6 +191,7 @@ pub struct AgentRecord {
     pub display_name: String,
     pub email: String,
     pub project: String,
+    #[serde(deserialize_with = "deserialize_stored_role")]
     pub role: AgentRole,
     pub extra_areas: Vec<String>,
     pub status: AgentStatus,
@@ -418,6 +426,26 @@ mod tests {
         assert_eq!(rec.role, AgentRole::UiDeveloper);
         let out = serde_json::to_string(&rec).unwrap();
         assert!(out.contains("\"role\":\"ui-developer\""), "{out}");
+    }
+
+    #[test]
+    fn stored_agent_record_deserializes_unknown_role_slug_as_custom_while_keeping_agent_role_strict()
+     {
+        assert!(
+            serde_json::from_str::<AgentRole>("\"future-specialist\"").is_err(),
+            "AgentRole deserialization must remain strict for CLI/Hub inputs"
+        );
+        let current = agent(1, "Kayla", AgentRole::Lead, "kaggle-gemma4");
+        let future_stored = serde_json::to_string(&current)
+            .unwrap()
+            .replace("\"role\":\"lead\"", "\"role\":\"future-specialist\"");
+        let rec: AgentRecord = serde_json::from_str(&future_stored).unwrap();
+        assert_eq!(rec.role, AgentRole::Custom("future-specialist".into()));
+
+        let invalid_stored = serde_json::to_string(&current)
+            .unwrap()
+            .replace("\"role\":\"lead\"", "\"role\":\"123 not a slug\"");
+        assert!(serde_json::from_str::<AgentRecord>(&invalid_stored).is_err());
     }
 
     fn agent(n: u64, name: &str, role: AgentRole, project: &str) -> AgentRecord {
