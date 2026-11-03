@@ -9,6 +9,7 @@ pub mod flow;
 pub mod gate;
 pub mod github;
 pub mod hub;
+pub mod install;
 pub mod ledger;
 pub mod manifest;
 pub mod mcp;
