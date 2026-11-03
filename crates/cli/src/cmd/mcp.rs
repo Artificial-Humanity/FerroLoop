@@ -631,7 +631,7 @@ fn upgrade(
 /// The MCP file of every registered vendor that is not built in and has one, declared to
 /// `fl-mcp`: `mcpServers` holds the servers, and `${VAR}` is not expanded (see the module
 /// note). Declared again in the same process, a target is left as it is.
-fn register_vendor_targets() -> Result<()> {
+pub(crate) fn register_vendor_targets() -> Result<()> {
     declare_targets(&VendorRegistry::global().list())
 }
 

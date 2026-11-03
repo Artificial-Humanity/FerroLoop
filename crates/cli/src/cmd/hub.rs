@@ -435,10 +435,26 @@ fn cmd_serve(
         .build()
         .map_err(|e| (2, format!("failed to initialize tokio runtime: {e}")))?;
 
+    // The hub's MCP endpoints plan like `fl mcp`: registered vendors' files, this machine's
+    // `[[mcp]]` switches.
+    if let Err(e) = crate::cmd::mcp::register_vendor_targets() {
+        eprintln!("warning: the Hub's MCP endpoints leave out registered vendors: {e:#}");
+    }
+    let mcp_switches = env.cfg.mcp.clone();
     rt.block_on(async move {
         let server = HubServer::bind(server_config)
             .await
             .map_err(|e| (2, format!("failed to bind Hub server: {e}")))?;
+        server.state().set_mcp_switches(move |project| {
+            let entry =
+                crate::config::mcp_entry(&mcp_switches, project).map_err(|e| e.to_string())?;
+            Ok(
+                entry.map_or_else(Default::default, |e| fl_mcp::sync::Switches {
+                    enable: e.enable,
+                    disable: e.disable,
+                }),
+            )
+        });
         let addr = server.local_addr();
         println!("ferroloop-hub listening on http://{addr}");
         let _ = std::io::stdout().flush();

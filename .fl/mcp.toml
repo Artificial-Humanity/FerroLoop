@@ -1,0 +1,13 @@
+# The MCP servers this project uses (docs/mcp.md). Commit this file: `fl mcp sync`
+# writes each agent CLI's own MCP file from it, and `fl mcp` keeps your comments.
+
+[server.ferrowire]
+enabled = true
+transport = "stdio"
+command = "fl"
+args = ["wire", "mcp"]
+
+[server.research-papers]
+enabled = true
+transport = "stdio"
+command = "/usr/local/bin/research-papers-mcp"

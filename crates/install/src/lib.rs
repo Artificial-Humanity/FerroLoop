@@ -60,7 +60,7 @@ pub use fromgit::{
     install as install_from_git, plan as plan_from_git,
 };
 pub use fsprobe::{FsProbe, open_regular, read_bounded};
-pub use git::{HARDENING, rev_problem, tree_path_problem};
+pub use git::{HARDENING, hardened_env, rev_problem, tree_path_problem};
 pub use journal::{Found, Journal, MAX_JOURNAL_BYTES, Pending, PendingState, read as read_journal};
 pub use lock::{LockGuard, acquire as acquire_lock, pid_alive};
 pub use observe::{Observe, UiDir, node_meta, observe};

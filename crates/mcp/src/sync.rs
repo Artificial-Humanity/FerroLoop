@@ -91,6 +91,12 @@ impl Target {
     pub fn changes(&self) -> bool {
         self.after.is_some()
     }
+
+    /// The bytes `sync` would write to the file; `None` when it does not change. They can hold
+    /// literal values from the catalog: hash them, never show them.
+    pub fn written_bytes(&self) -> Option<&[u8]> {
+        self.after.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
