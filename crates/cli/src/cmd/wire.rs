@@ -1234,7 +1234,9 @@ fn vendor_hook_response(
         Some(VendorRoute::Muse {
             session_id,
             cwd: Some(hook_cwd.clone()),
-            tmux_target: Some(format!("muse:{persona}")),
+            // The tmux window is not guessed here: route discovery ties the route to the live
+            // `<Session>:muse` window (see `RouteTable::attach_muse_tmux_windows`).
+            tmux_target: None,
             tmux_pane: std::env::var("TMUX_PANE")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -1873,6 +1875,26 @@ mod tests {
             rig.route_of("jarvis"),
             Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-1"
         ));
+    }
+
+    #[test]
+    fn muse_hook_registers_no_guessed_tmux_target() {
+        let rig = HookRig::new(Some("kacey"));
+        rig.run(
+            "muse",
+            json!({"hook_event_name": "SessionStart", "session_id": "muse-sid", "cwd": "/tmp"}),
+        );
+        match rig.route_of("kacey") {
+            Some(VendorRoute::Muse {
+                session_id,
+                tmux_target,
+                ..
+            }) => {
+                assert_eq!(session_id, "muse-sid");
+                assert_eq!(tmux_target, None, "the hook must not guess a tmux target");
+            }
+            other => panic!("expected a Muse route, got {other:?}"),
+        }
     }
 
     #[test]

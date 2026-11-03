@@ -515,6 +515,9 @@ impl RouteTable {
         self.discover_muse_routes(&home, home_override.is_some(), &at);
         self.discover_grok_routes(&home, check_proc, &at);
         self.discover_scanner_routes(&home, &at);
+        // Last, so a placeholder route for a live window cannot shadow a route a transcript
+        // scan above found for the same persona.
+        self.discover_muse_windows(&home, home_override.is_some(), &at);
     }
 
     /// Merge the routes of every scanner registered with
@@ -948,8 +951,19 @@ impl RouteTable {
                 dirs.push(xdg_dir);
             }
         }
-        let windows = muse_tmux_discovery_enabled(home, has_home_override).then(list_tmux_windows);
-        self.discover_muse_routes_in(&dirs, windows.as_deref(), at);
+        self.discover_muse_routes_in(&dirs, None, at);
+    }
+
+    /// Ties Muse routes to the live tmux windows (see
+    /// [`attach_muse_tmux_windows`](Self::attach_muse_tmux_windows)). Does nothing when tmux
+    /// discovery is off or tmux's answer cannot be trusted.
+    fn discover_muse_windows(&mut self, home: &Path, has_home_override: bool, at: &At) {
+        if !muse_tmux_discovery_enabled(home, has_home_override) {
+            return;
+        }
+        if let Some(windows) = list_tmux_windows() {
+            self.attach_muse_tmux_windows(&windows, at);
+        }
     }
 
     /// Muse routes from the transcripts under each of `sessions_dirs`, then (when `windows` is
@@ -963,7 +977,7 @@ impl RouteTable {
         for sessions_dir in sessions_dirs {
             for transcript in muse_transcripts(sessions_dir) {
                 let path = &transcript.path;
-                let Some(persona) = scan_transcript_for_persona(path, 50) else {
+                let Some(persona) = scan_muse_transcript_for_persona(path, 50) else {
                     continue;
                 };
                 let (session_id, cwd) = match &transcript.dir_session_id {
@@ -1016,7 +1030,9 @@ impl RouteTable {
     /// launches Muse in; the session is the capitalised persona).
     ///
     /// - A Muse route without a tmux target gets the persona's window, when it is live.
-    ///   A target a route already has is kept.
+    ///   A target a route already has is kept, except the old guess `muse:<persona>` (what the
+    ///   hook once stored): that counts as unset, so it is replaced by the live window or
+    ///   cleared when there is none.
     /// - A live window whose persona has no route at all gets a placeholder Muse route with an
     ///   empty session id and no cwd, so a prompt can reach Muse before its first transcript
     ///   exists. The route is only a tmux address: it never matches a session id, and a
@@ -1047,9 +1063,13 @@ impl RouteTable {
             else {
                 continue;
             };
+            let guessed = tmux_target.as_deref() == Some(format!("muse:{persona}").as_str());
             match live.get(persona) {
-                Some(target) if tmux_target.is_none() => *tmux_target = Some(target.clone()),
+                Some(target) if tmux_target.is_none() || guessed => {
+                    *tmux_target = Some(target.clone());
+                }
                 None if session_id.is_empty() => gone.push(persona.clone()),
+                None if guessed => *tmux_target = None,
                 _ => {}
             }
         }
@@ -1561,38 +1581,53 @@ fn muse_tmux_discovery_enabled(home: &Path, has_home_override: bool) -> bool {
             && std::env::var_os("FL_WIRE_TMUX_BIN").is_some())
 }
 
-/// Every live tmux window (`tmux list-windows -a`), empty when tmux is absent, has no server or
-/// takes more than a few seconds. Uses the tmux binary the dispatcher uses.
-fn list_tmux_windows() -> Vec<TmuxWindow> {
+/// How long [`list_tmux_windows`] waits for tmux.
+const TMUX_LIST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Every live tmux window (`tmux list-windows -a`), or `None` when tmux's answer is not
+/// trustworthy: it cannot be started, exits non-zero (no server running included) or takes more
+/// than a few seconds. A caller must then leave what it knows about windows untouched; an empty
+/// list means tmux answered that there are no windows. Uses the tmux binary the dispatcher uses.
+fn list_tmux_windows() -> Option<Vec<TmuxWindow>> {
+    list_tmux_windows_within(TMUX_LIST_TIMEOUT)
+}
+
+fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
 
-    let Ok(mut child) = Command::new(crate::dispatcher::tmux_bin())
+    let mut child = Command::new(crate::dispatcher::tmux_bin())
         .args(["list-windows", "-a", "-F", "#{session_name}:#{window_name}"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    else {
-        return Vec::new();
-    };
-    let deadline = Instant::now() + Duration::from_secs(3);
+        .ok()?;
+    // Drain stdout on its own thread, so a full pipe cannot hold tmux until the timeout.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = tx.send(bytes);
+    });
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return Vec::new(),
+            Ok(Some(_)) => return None,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Vec::new();
+                return None;
             }
         }
     }
-    let mut text = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = std::io::Read::read_to_string(&mut out, &mut text);
-    }
-    parse_tmux_windows(&text)
+    let bytes = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?;
+    Some(parse_tmux_windows(&String::from_utf8_lossy(&bytes)))
 }
 
 /// `session:window` lines; tmux session names hold no `:`, so the first one splits the line.
@@ -1683,7 +1718,7 @@ fn muse_transcripts(sessions_dir: &Path) -> Vec<MuseTranscript> {
 fn extract_session_id_and_cwd(path: &Path, fallback_stem: &str) -> (String, Option<PathBuf>) {
     let mut session_id = fallback_stem.to_string();
     let mut cwd = None;
-    if let Ok(text) = fs::read_to_string(path) {
+    if let Some(text) = read_head_lines(path, 20) {
         for line in text.lines().take(20) {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(sid) = val
@@ -2088,7 +2123,38 @@ fn is_tool_output_type(kind: Option<&str>) -> bool {
 
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
-    if first_system_message_is_grok_subagent(&text) {
+    scan_text_for_persona(&text, max_lines)
+}
+
+/// The most bytes [`read_head_lines`] reads for a transcript head.
+const TRANSCRIPT_HEAD_MAX_BYTES: u64 = 1 << 20;
+
+/// The first `max_lines` lines of `path` (at most [`TRANSCRIPT_HEAD_MAX_BYTES`] of it), without
+/// reading the rest of a transcript that may be many megabytes.
+fn read_head_lines(path: &Path, max_lines: usize) -> Option<String> {
+    use std::io::{BufRead, Read};
+
+    let file = fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file.take(TRANSCRIPT_HEAD_MAX_BYTES));
+    let mut text = String::new();
+    let mut line = Vec::new();
+    for _ in 0..max_lines {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            break;
+        }
+        text.push_str(&String::from_utf8_lossy(&line));
+    }
+    Some(text)
+}
+
+/// [`scan_transcript_for_persona`] for a Muse transcript: reads only the head of the file.
+fn scan_muse_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
+    scan_text_for_persona(&read_head_lines(path, max_lines)?, max_lines)
+}
+
+fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
+    if first_system_message_is_grok_subagent(text) {
         return None;
     }
     for line in text.lines().take(max_lines) {
@@ -4844,18 +4910,23 @@ mod tests {
         /// As [`TmuxEnv::unset`], then points `FL_WIRE_TMUX_BIN` at a fake `tmux` in `dir` whose
         /// `list-windows` prints `windows` (one `session:window` per line), for scans of `home`.
         fn fake(dir: &Path, home: &Path, windows: &[&str]) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-
-            let this = Self::unset();
-            let bin = dir.join("fake-tmux.sh");
             let list = windows
                 .iter()
                 .map(|w| format!("echo '{w}'\n"))
                 .collect::<String>();
+            Self::fake_script(dir, home, &list)
+        }
+
+        /// As [`TmuxEnv::fake`], but `list-windows` runs the shell `list_body`.
+        fn fake_script(dir: &Path, home: &Path, list_body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let this = Self::unset();
+            let bin = dir.join("fake-tmux.sh");
             fs::write(
                 &bin,
                 format!(
-                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"list-windows\" ]; then\n{list}fi\n",
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"list-windows\" ]; then\n{list_body}fi\n",
                     dir.join("tmux.out").display()
                 ),
             )
@@ -5224,6 +5295,198 @@ mod tests {
         let mut table = RouteTable::default();
         table.discover_muse_routes_in(&sessions, Some(&windows(&[])), &early);
         assert!(table.get("kacey").is_some());
+    }
+
+    fn muse_route_with(session_id: &str, target: Option<&str>) -> VendorRoute {
+        VendorRoute::Muse {
+            session_id: session_id.into(),
+            cwd: None,
+            tmux_target: target.map(str::to_string),
+            tmux_pane: Some("%3".into()),
+        }
+    }
+
+    #[test]
+    fn the_old_muse_persona_guess_is_replaced_by_the_live_window() {
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kacey",
+            muse_route_with("s", Some("muse:kacey")),
+            At::from_unix_millis(1),
+        );
+        table.attach_muse_tmux_windows(&windows(&[("Kacey", "muse")]), &At::from_unix_millis(2));
+        let (_, target, _) = muse_parts(&muse_route_of(&table, "kacey").unwrap());
+        assert_eq!(target.as_deref(), Some("Kacey:muse"));
+    }
+
+    #[test]
+    fn the_old_muse_persona_guess_is_cleared_when_no_window_is_live() {
+        let mut table = RouteTable::default();
+        table.upsert(
+            "kacey",
+            muse_route_with("s", Some("muse:kacey")),
+            At::from_unix_millis(1),
+        );
+        table.upsert(
+            "mira",
+            muse_route_with("s2", Some("Elsewhere:1")),
+            At::from_unix_millis(1),
+        );
+        table.attach_muse_tmux_windows(&windows(&[("Other", "muse")]), &At::from_unix_millis(2));
+        let kacey = muse_route_of(&table, "kacey").unwrap();
+        assert_eq!(muse_parts(&kacey).1, None);
+        assert!(
+            matches!(&kacey, VendorRoute::Muse { tmux_pane: Some(p), .. } if p == "%3"),
+            "the pane stays: {kacey:?}"
+        );
+        let (_, mira_target, _) = muse_parts(&muse_route_of(&table, "mira").unwrap());
+        assert_eq!(
+            mira_target.as_deref(),
+            Some("Elsewhere:1"),
+            "a real target stays"
+        );
+    }
+
+    #[test]
+    fn list_tmux_windows_answers_none_when_tmux_cannot_be_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        {
+            let _env = TmuxEnv::fake_script(tmp.path(), &home, "echo 'Kacey:muse'\nexit 1\n");
+            assert_eq!(
+                list_tmux_windows_within(Duration::from_secs(5)),
+                None,
+                "a non-zero exit (no server running) is not an empty list"
+            );
+        }
+        {
+            let _env = TmuxEnv::fake_script(tmp.path(), &home, "exec sleep 5\n");
+            let started = Instant::now();
+            assert_eq!(list_tmux_windows_within(Duration::from_millis(200)), None);
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+        {
+            let _env = TmuxEnv::unset();
+            // SAFETY: `_env` holds the tmux env lock and restores the variable.
+            unsafe { std::env::set_var("FL_WIRE_TMUX_BIN", tmp.path().join("missing-tmux")) };
+            assert_eq!(list_tmux_windows_within(Duration::from_secs(1)), None);
+        }
+        {
+            let _env = TmuxEnv::fake_script(tmp.path(), &home, "echo 'Kacey:muse'\n");
+            assert_eq!(
+                list_tmux_windows_within(Duration::from_secs(5)),
+                Some(windows(&[("Kacey", "muse")]))
+            );
+        }
+        {
+            let _env = TmuxEnv::fake_script(tmp.path(), &home, ":\n");
+            assert_eq!(
+                list_tmux_windows_within(Duration::from_secs(5)),
+                Some(Vec::new()),
+                "an answer with no windows is trustworthy"
+            );
+        }
+    }
+
+    #[test]
+    fn list_tmux_windows_reads_output_larger_than_a_pipe_without_waiting_for_the_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        // ~190 KB of output, far above a 64 KB pipe buffer.
+        let body =
+            "i=0\nwhile [ $i -lt 8000 ]; do echo \"Session$i:window-name-$i\"; i=$((i+1)); done\n";
+        let _env = TmuxEnv::fake_script(tmp.path(), &home, body);
+        let started = Instant::now();
+        let found = list_tmux_windows_within(Duration::from_secs(3)).expect("tmux answered");
+        assert_eq!(found.len(), 8000);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stalled on a full pipe: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_untrustworthy_tmux_answer_leaves_muse_routes_untouched() {
+        for body in ["exit 1\n", "exec sleep 10\n"] {
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let _env = TmuxEnv::fake_script(tmp.path(), &home, body);
+            let mut table = RouteTable::default();
+            table.upsert(
+                "kacey",
+                muse_route_with("", Some("Kacey:muse")),
+                At::from_unix_millis(1),
+            );
+            table.upsert(
+                "mira",
+                muse_route_with("s", Some("muse:mira")),
+                At::from_unix_millis(1),
+            );
+            let before = table.entries.clone();
+            table.discover_routes(Some(&home), At::from_unix_millis(5));
+            assert_eq!(
+                table.entries, before,
+                "placeholder dropped or target changed ({body:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_placeholder_muse_route_does_not_shadow_a_grok_transcript_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let grok_dir = home.join(".grok/sessions");
+        fs::create_dir_all(&grok_dir).unwrap();
+        let transcript = grok_dir.join("g1.jsonl");
+        fs::write(
+            &transcript,
+            "{\"session_id\":\"g1\",\"agentName\":\"Kacey\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        // Older than the scan, so a placeholder stamped at the scan time would beat it.
+        set_mtime(&transcript, 1);
+        let _env = TmuxEnv::fake(tmp.path(), &home, &["Kacey:muse", "Felix:muse"]);
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(&home), At::from_unix_millis(5));
+        assert!(
+            matches!(
+                muse_route_of(&table, "kacey"),
+                Some(VendorRoute::Grok { .. })
+            ),
+            "{:?}",
+            table.get("kacey")
+        );
+        // A persona with no route of its own still gets the placeholder.
+        assert_eq!(muse_parts(&muse_route_of(&table, "felix").unwrap()).0, "");
+    }
+
+    #[test]
+    fn muse_discovery_reads_only_the_head_of_a_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let dir = muse_sessions_dir(tmp.path())
+            .join("2026/10/27")
+            .join(MUSE_SESSION_A);
+        let path =
+            write_muse_transcript(&dir, &muse_transcript_rows(&muse_hydration_prompt("Kacey")));
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            // Past the head: 4 MB of rows, then bytes that are not UTF-8 (a whole-file
+            // `read_to_string` would refuse the file).
+            let row = format!("\n{{\"pad\":\"{}\"}}", "x".repeat(990));
+            for _ in 0..4000 {
+                file.write_all(row.as_bytes()).unwrap();
+            }
+            file.write_all(b"\n\xff\xfe\n").unwrap();
+        }
+        assert!(fs::metadata(&path).unwrap().len() > 3_000_000);
+        assert!(fs::read_to_string(&path).is_err());
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(tmp.path()), At::from_unix_millis(5));
+        let (session_id, _, _) = muse_parts(&muse_route_of(&table, "kacey").unwrap());
+        assert_eq!(session_id, MUSE_SESSION_A);
     }
 
     #[test]
