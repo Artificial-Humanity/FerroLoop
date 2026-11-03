@@ -1564,6 +1564,87 @@ fn a_conflict_seen_while_another_installer_holds_the_lock_is_not_final() {
 }
 
 #[test]
+fn a_replace_of_the_release_still_reads_its_artifacts_after_a_race_is_swallowed() {
+    // As above, with the release named in `--replace`: the look before the lock refuses on the
+    // conflict it can see, so it prepares no source; the plan under the lock must prepare it,
+    // or the release is replaced from nothing and the run fails with a usage error.
+    let w = std::sync::Arc::new(World::new(Kind::Explicit));
+    let m1 = w.release("0.1.0", "a");
+    let m2 = w.release("0.2.0", "b");
+    w.install(&m1);
+    w.install(&m2);
+    let rel1 = w.prefix().join("releases").join(fixture::release_name(&m1));
+    fs::set_permissions(rel1.join("bin"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(rel1.join("bin/fl"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(rel1.join("bin/fl"), "edited").unwrap();
+
+    let guard = acquire_lock(&w.prefix().join("install.lock"), Duration::ZERO, || Ok(())).unwrap();
+    let current = w.prefix().join("current");
+    let selected = fs::read_link(&current).unwrap();
+    fs::remove_file(&current).unwrap();
+    symlink("elsewhere", &current).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = {
+        let w = w.clone();
+        let d = Decisions {
+            replace: vec![rel1.to_string_lossy().into_owned()],
+            keep: vec![],
+        };
+        std::thread::spawn(move || {
+            let mut env = w.env();
+            env.lock_timeout = Duration::from_secs(300);
+            let _ = tx.send(w.apply_with(&m1, None, &d, &env));
+        })
+    };
+    assert!(rx.recv_timeout(Duration::from_millis(400)).is_err());
+    fs::remove_file(&current).unwrap();
+    symlink(&selected, &current).unwrap();
+    drop(guard);
+    let r = rx
+        .recv_timeout(Duration::from_secs(300))
+        .expect("the installer finishes once the lock is free")
+        .unwrap_or_else(|e| panic!("exit {}: {e}", e.exit_code()));
+    assert_eq!(r.outcome, Outcome::Installed);
+    worker.join().unwrap();
+    assert_eq!(
+        fs::read_to_string(rel1.join("bin/fl")).unwrap(),
+        "#!/bin/sh\necho fl a\n"
+    );
+    make_tree_writable(&w.prefix());
+}
+
+#[test]
+fn a_conflict_with_no_installer_running_is_refused_at_once_and_creates_nothing() {
+    let w = World::new(Kind::Explicit);
+    fs::create_dir_all(w.bin()).unwrap();
+    symlink("elsewhere", w.bin().join("fl")).unwrap();
+    // No lock file can be made in the prefix: a run that took the lock first would fail on that
+    // (an I/O error, exit 1) instead of giving the planner's answer.
+    let parent = w.prefix();
+    let mode = fs::metadata(&parent).unwrap().permissions();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let before = w.snap();
+    let result = w.apply_with(
+        &w.release("0.1.0", "a"),
+        None,
+        &Decisions::default(),
+        &w.env(),
+    );
+    let after = w.snap();
+    fs::set_permissions(&parent, mode).unwrap();
+    let e = result.unwrap_err();
+    assert_eq!(e.exit_code(), 3, "{e}");
+    let text = e.to_string();
+    assert!(
+        text.contains("symlink the receipt does not own") && text.contains("--replace"),
+        "{text}"
+    );
+    // no lock file, no prefix: the refusal came before anything was made
+    assert_eq!(after, before);
+    assert!(!w.prefix().join("install.lock").exists());
+}
+
+#[test]
 fn a_corrupt_journal_is_refused_not_guessed_at() {
     let w = World::new(Kind::Explicit);
     fs::create_dir_all(w.prefix()).unwrap();

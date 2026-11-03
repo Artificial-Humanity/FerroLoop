@@ -791,9 +791,17 @@ impl TestEnv {
             .stderr(Stdio::null());
         let mut child = cmd.spawn().unwrap();
         let mut reader = BufReader::new(child.stdout.take().unwrap());
+        // The guard kills the child if the banner never comes.
         let guard = RunningHubGuard { child };
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("no readiness banner from `fl hub serve` within 120s");
         let base = line
             .trim()
             .strip_prefix("ferroloop-hub listening on ")
@@ -941,4 +949,49 @@ fn a_bad_repo_root_stops_the_hub_before_it_listens() {
         stderr.contains("`[hub] repo_root` cannot be used"),
         "{stderr}"
     );
+}
+
+/// The body of an unauthenticated `GET path` (the static UI needs no token).
+fn hub_get_text(base: &str, path: &str) -> String {
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = http.get(&format!("{base}{path}")).call().unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET {path}");
+    resp.body_mut().read_to_string().unwrap()
+}
+
+#[test]
+fn the_default_ui_dir_follows_the_repo_root_and_an_explicit_ui_dir_wins() {
+    let env = TestEnv::new();
+    let (repo, other, elsewhere) = (
+        env.root.join("repo"),
+        env.root.join("other-ui"),
+        env.root.join("elsewhere"),
+    );
+    for (dir, marker) in [
+        (repo.join("ui/dist"), "UI-OF-REPO"),
+        (other.clone(), "UI-EXPLICIT"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), format!("<html>{marker}</html>")).unwrap();
+    }
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    // No `ui_dir`: `<repo_root>/ui/dist`, though the process runs elsewhere.
+    env.write_repo_root_config(&format!("repo_root = \"{}\"", repo.display()));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    assert!(hub_get_text(&base, "/").contains("UI-OF-REPO"));
+    drop(_g);
+
+    // An explicit `[hub] ui_dir` still wins.
+    env.write_repo_root_config(&format!(
+        "repo_root = \"{}\"\nui_dir = \"{}\"",
+        repo.display(),
+        other.display()
+    ));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    assert!(hub_get_text(&base, "/").contains("UI-EXPLICIT"));
 }

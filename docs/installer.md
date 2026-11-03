@@ -217,6 +217,14 @@ installer waits up to `--lock-timeout` seconds (default 30; 0 does not wait), th
 (`another install is running (pid N)`). A crash releases the lock with the process, so nothing
 is stolen and nothing needs breaking; a pid left in the file by a process that no longer exists
 is reported as a stale lock and replaced. The file is never removed after a successful install.
+The conflict check an installer makes before it takes the lock can land in the middle of
+another installer's transaction (its links made, its receipt not yet written). So when a lock
+file exists, a conflict seen there is decided again under the lock: a second installer waits up
+to `--lock-timeout` for the first, and if a long-lived installer holds the lock it exits 3
+(`another install is running (pid N)`) instead of reporting the conflict. With no lock file no
+other installer can be running, and a conflict still exits 3 at once with the planner's text
+before anything is created. If the conflict is still there under the lock, the answer is the
+same exit 3 and the same text.
 
 **Resume and rollback.** A journal left behind is an interrupted transaction. The next
 `fl install --yes`, and `fl install --resume`, find it under the lock:
@@ -333,13 +341,18 @@ diffs, architecture, commands and skills, repository paths) show nothing useful,
 answers empty and never scans the home directory (`$HOME` as the root is the only case the hub
 refuses), and an owner terminal session starts in the home directory. A hub bound to a
 repository sets `[hub] repo_root = "<repo>"` in the `fl` config (`fl hub serve --repo-root
-<repo>` wins over it). The path is absolute and an
-existing directory, else the hub exits 2 before it listens; it need not be a git work tree.
-Without either, the root is the working directory. The store units set `NoNewPrivileges=yes`; the hub does not, because
-an owner terminal session runs `sudo`. `render_unit` refuses a launcher or prefix that has
-white space, `%`, `$`, a quote, a backslash or a brace, so such an install prefix cannot get a
-unit (choose another `--prefix`). The tests parse every template, check each `ExecStart` against the built `fl` and `ferrostore`
-`--help`, and check the staging of a `--from-git` build. `contrib/ferroloop-hub.service` is the
+<repo>` wins over it). The path is absolute and an existing directory, else the hub exits 2
+before it listens; it need not be a git work tree. Without either, the root is the working
+directory. The default UI directory is `<repo_root>/ui/dist`; `--ui-dir` and `[hub] ui_dir`
+win over it. The store binding (`fl hub serve`, `fl hub pair`) still follows the working
+directory, on purpose, so both commands use the same store. A `repo_root` of `/` or of a
+system directory is allowed (not refused), but code search then scans that whole tree and the
+`$HOME` guard no longer protects it. The store units set `NoNewPrivileges=yes`; the hub
+does not, because an owner terminal session runs `sudo`. `render_unit` refuses a launcher or
+prefix that has white space, `%`, `$`, a quote, a backslash or a brace, so such an install
+prefix cannot get a unit (choose another `--prefix`). The tests parse every template, check
+each `ExecStart` against the built `fl` and `ferrostore` `--help`, and check the staging of a
+`--from-git` build. `contrib/ferroloop-hub.service` is the
 reference of a hand-deployed unit and is not a template.
 
 **What this release does not do:** `--adopt` and `--gc` (each exits 3 with
