@@ -51,9 +51,9 @@ use fl_exec::workflow::{
     reject_workflow_step, start_workflow_run,
 };
 use fl_gate::{
-    BridgeTarget, InboundBridgeEvent, ProxyRequest, SetSecretArgs, Vault, discover_connectors,
-    evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
-    handle_registry_v01_get, verify_inbound_bridge_webhook,
+    BridgeTarget, InboundBridgeEvent, ProxyRequest, SetSecretArgs, ToolOutcome, Vault,
+    discover_connectors, evaluate_inbound_bridge_event, execute_proxied_request,
+    handle_mcp_jsonrpc_request, handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
@@ -7245,8 +7245,10 @@ fn handle_post_gate_call(
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
 
+    // Raw proxy only: no connector tool is named, so no response contract
+    // applies — this surface is Uncontracted by definition (Record #96).
     match execute_proxied_request(&vault, &proxy_req) {
-        Ok(resp) => HttpResponse::json(200, json!({ "response": resp })),
+        Ok(resp) => HttpResponse::json(200, json!({ "response": resp, "outcome": "uncontracted" })),
         Err(e) => HttpResponse::json(403, json!({ "error": e.to_string() })),
     }
 }
@@ -7383,11 +7385,49 @@ fn handle_post_gate_bridge_webhook(
                 "content": plan.prompt_body,
                 "channel_id": plan.channel_id,
             });
-            match conn.execute_tool(&vault, &resolved_tool, &args, Some("bridge".to_string())) {
-                Ok((resp, projected)) => HttpResponse::json(
+            match conn.execute_tool_outcome(
+                &vault,
+                &resolved_tool,
+                &args,
+                Some("bridge".to_string()),
+            ) {
+                Ok((
+                    _resp,
+                    ToolOutcome::ContractFailedAfterExecution {
+                        body_sha256,
+                        body_bytes,
+                        violation,
+                    },
+                )) => HttpResponse::json(
+                    502,
+                    json!({ "error": "executed_result_withheld", "outcome": "executed_result_withheld", "body_sha256": body_sha256, "body_bytes": body_bytes, "violation": violation, "plan": plan }),
+                ),
+                Ok((
+                    resp,
+                    ToolOutcome::ContractOk {
+                        value: projected,
+                        token_count,
+                        count_unit,
+                    },
+                )) => {
+                    let mut body = json!({
+                        "status": "executed",
+                        "outcome": "contract_ok",
+                        "plan": plan,
+                        "upstream_status": resp.status,
+                        "result": projected,
+                    });
+                    if let Some(tc) = token_count {
+                        body["token_count"] = json!(tc);
+                        body["count_unit"] = json!(count_unit);
+                    }
+                    HttpResponse::json(200, body)
+                }
+                Ok((resp, ToolOutcome::Uncontracted(projected))) => HttpResponse::json(
                     200,
                     json!({
                         "status": "executed",
+                        "outcome": "uncontracted",
                         "plan": plan,
                         "upstream_status": resp.status,
                         "result": projected,

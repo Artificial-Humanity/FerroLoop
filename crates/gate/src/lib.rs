@@ -7,6 +7,7 @@ use std::path::PathBuf;
 pub mod adapter;
 pub mod bridge;
 pub mod connector;
+pub mod contract;
 pub mod mcp;
 pub mod proxy;
 pub mod registry;
@@ -26,16 +27,23 @@ pub use bridge::{
     evaluate_inbound_bridge_event, verify_inbound_bridge_webhook,
 };
 pub use connector::{
-    ConnectorManifest, ConnectorToolDef, discover_connectors, import_openapi_to_connector,
-    project_response_body,
+    ConnectorManifest, ConnectorToolDef, ToolOutcome, contract_outcome_for_transport_error,
+    discover_connectors, evaluate_tool_response, evaluate_tool_response_bytes,
+    import_openapi_to_connector, project_response_body,
+};
+pub use contract::{
+    ContractViolation, ResponseContract, ResponseSchema, bracket_depth, check_pre_parse_depth,
+    count_tokens_bounded, count_unit_string, validate_value,
 };
 pub use mcp::{
     build_mcp_tools_list, handle_mcp_jsonrpc_request,
     handle_mcp_jsonrpc_request_with_secret_provider,
 };
 pub use proxy::{
-    PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse,
-    execute_proxied_request, execute_proxied_request_with_provider, extract_placeholder_keys,
+    LEGACY_MAX_RESPONSE_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, PLACEHOLDER_PREFIX,
+    PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse, execute_proxied_request,
+    execute_proxied_request_with_contract, execute_proxied_request_with_provider,
+    execute_proxied_request_with_provider_and_contract, extract_placeholder_keys,
     host_matches_pattern, is_private_or_loopback_ip, parse_url_scheme_host_port,
     prepare_proxied_request, prepare_proxied_request_with_provider, scrub_secrets,
     verify_host_ssrf,
@@ -104,6 +112,39 @@ pub enum GateError {
     },
     #[error("bridge `{bridge_id}` error: {reason}")]
     BridgeError { bridge_id: String, reason: String },
+    #[error(
+        "contract_unsupported_construct: `{construct}` is outside the strict response-schema subset"
+    )]
+    ContractUnsupportedConstruct { construct: String },
+    #[error("contract_unenforceable: response contract cannot be enforced in this build")]
+    ContractUnenforceable,
+    #[error(
+        "contract_failed_after_execution: {violation} (body_sha256 {body_sha256}, body_bytes {body_bytes})"
+    )]
+    ContractFailed {
+        violation: String,
+        body_sha256: String,
+        body_bytes: u64,
+    },
+    /// `prefix_sha256`/`read_bytes` describe only the capped prefix read
+    /// (`max_bytes + 1` bytes), never the full (unread) response body.
+    #[error(
+        "contract_response_too_large: read_prefix {read_bytes} bytes above max_response_bytes {max_bytes} (prefix_sha256 {prefix_sha256})"
+    )]
+    ContractResponseTooLarge {
+        prefix_sha256: String,
+        read_bytes: u64,
+        max_bytes: u64,
+        status: u16,
+    },
+    #[error(
+        "contract_invalid_utf8: response body is not valid UTF-8 (body_sha256 {body_sha256}, body_bytes {body_bytes})"
+    )]
+    ContractInvalidUtf8 {
+        body_sha256: String,
+        body_bytes: u64,
+        status: u16,
+    },
     #[error("invalid Owner warrant request: {reason}")]
     WarrantInput { reason: String },
     #[error("Owner warrant rejected: {reason}")]

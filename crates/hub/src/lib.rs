@@ -6651,6 +6651,161 @@ default_target = "wire:felicity"
     }
 
     #[test]
+    fn cli_mcp_hub_public_result_parity() {
+        use fl_gate::{
+            ResponseContract, ResponseSchema, SetSecretArgs, ToolOutcome, Vault,
+            evaluate_tool_response, handle_mcp_jsonrpc_request,
+        };
+        use std::io::{Read as _, Write as _};
+        use std::sync::{Arc, Mutex};
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        // Upstream serving the queued fixtures, one per live call.
+        let fixtures: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::new(Mutex::new(
+            [
+                r#"{"id":"x1"}"#.to_string(),
+                r#"{"id":"x1"}"#.to_string(),
+                r#"{"id":42,"marker":"PARITY_SENTINEL"}"#.to_string(),
+                r#"{"id":42,"marker":"PARITY_SENTINEL"}"#.to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let queue = Arc::clone(&fixtures);
+        let server = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let body = queue.lock().unwrap().pop_front().unwrap_or_default();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        // Vault + contracted connector with a bridge targeting it.
+        let mut vault = Vault::open_default(Some(tmp.path())).unwrap();
+        vault
+            .set(SetSecretArgs {
+                name: "PARITY_TOKEN".into(),
+                value: "tok-value".into(),
+                description: None,
+                allowed_hosts: vec!["127.0.0.1".into()],
+                allowed_methods: vec!["GET".into()],
+                allowed_agents: vec![],
+                allow_private_network: true,
+                lease_ttl_secs: None,
+            })
+            .unwrap();
+        drop(vault);
+        let dir = tmp.path().join(".config").join("fl").join("gate");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("parity.toml"),
+            format!(
+                r#"
+id = "parity"
+title = "Parity"
+base_url = "http://127.0.0.1:{port}"
+allowed_hosts = ["127.0.0.1"]
+default_headers = {{ Authorization = "Bearer {{{{FERROGATE:PARITY_TOKEN}}}}" }}
+[[tools]]
+name = "get_thing"
+description = "Get"
+method = "GET"
+path = "/thing"
+[tools.response_contract]
+max_response_bytes = 100000
+max_depth = 32
+max_array_len = 100
+max_string_len = 10000
+[tools.response_contract.schema]
+type = "object"
+additionalProperties = false
+required = ["id"]
+[tools.response_contract.schema.properties]
+id = {{ type = "string" }}
+[[bridges]]
+id = "parity-bridge"
+kind = "webhook"
+allowed_user_ids = ["*"]
+default_target = "connector:parity:get_thing"
+"#
+            ),
+        )
+        .unwrap();
+        let contract = ResponseContract {
+            schema: ResponseSchema::from_value(json!({"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":{"type":"string"}}})).unwrap(),
+            max_response_bytes: 100000,
+            max_response_tokens: None,
+            max_depth: 32,
+            max_array_len: 100,
+            max_string_len: 10000,
+        };
+        let connectors = fl_gate::discover_connectors(Some(tmp.path()), Some(tmp.path())).unwrap();
+        let vault = Vault::open_default(Some(tmp.path())).unwrap();
+        // OK fixture: gate evaluate, gate MCP tools/call, hub bridge agree.
+        let ok_body = r#"{"id":"x1"}"#;
+        let gate_ok = evaluate_tool_response(Some(&contract), ok_body, &[]);
+        assert_eq!(gate_ok.value(), Some(&json!({"id": "x1"})));
+        let mcp_ok = handle_mcp_jsonrpc_request(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
+            &vault,
+            &connectors,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mcp_ok["result"]["structuredContent"], json!({"id": "x1"}));
+        assert_eq!(mcp_ok["result"]["_meta"]["outcome"], json!("contract_ok"));
+        let hub_ok = call(
+            &state,
+            "POST",
+            "/api/v1/gate/bridges/parity-bridge/webhook",
+            OWNER,
+            &json!({"bridge_id":"parity-bridge","sender_id":"u1","channel_id":"chan","content":"go"}),
+        );
+        assert_eq!(hub_ok.status, 200, "{}", error_text(&hub_ok));
+        let hub_ok_json = hub_ok.json_value().unwrap();
+        assert_eq!(hub_ok_json["result"], json!({"id": "x1"}));
+        assert_eq!(hub_ok_json["outcome"], json!("contract_ok"));
+        // Bad fixture: all three refuse body-free.
+        let bad_body = r#"{"id":42,"marker":"PARITY_SENTINEL"}"#;
+        let gate_bad = evaluate_tool_response(Some(&contract), bad_body, &[]);
+        assert!(matches!(
+            gate_bad,
+            ToolOutcome::ContractFailedAfterExecution { .. }
+        ));
+        let mcp_bad = handle_mcp_jsonrpc_request(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
+            &vault,
+            &connectors,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mcp_bad["result"]["isError"], json!(true));
+        assert!(!mcp_bad.to_string().contains("PARITY_SENTINEL"));
+        let hub_bad = call(
+            &state,
+            "POST",
+            "/api/v1/gate/bridges/parity-bridge/webhook",
+            OWNER,
+            &json!({"bridge_id":"parity-bridge","sender_id":"u1","channel_id":"chan","content":"go"}),
+        );
+        assert_eq!(hub_bad.status, 502, "{}", error_text(&hub_bad));
+        let hub_bad_json = hub_bad.json_value().unwrap();
+        assert_eq!(hub_bad_json["error"], json!("executed_result_withheld"));
+        assert!(!hub_bad_json.to_string().contains("PARITY_SENTINEL"));
+        server.join().unwrap();
+    }
+
+    #[test]
     fn wire_send_never_lets_a_peer_send_as_the_owner() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
