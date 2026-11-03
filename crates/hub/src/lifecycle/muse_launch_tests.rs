@@ -64,10 +64,57 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
     }
 }
 
+/// Serialises the tests that depend on `FL_WIRE_MUSE_BIN` (process-global) and restores it on
+/// drop. A test that asserts which Muse binary is launched holds one, so it does not depend on
+/// the developer's or CI's environment.
+struct MuseBinEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev: Option<std::ffi::OsString>,
+}
+
+static MUSE_BIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl MuseBinEnv {
+    /// Holds the lock with `FL_WIRE_MUSE_BIN` unset.
+    fn cleared() -> Self {
+        let lock = MUSE_BIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let this = Self {
+            _lock: lock,
+            prev: std::env::var_os("FL_WIRE_MUSE_BIN"),
+        };
+        this.set(None);
+        this
+    }
+
+    /// Sets (or, with `None`, unsets) the variable while the lock is held.
+    fn set(&self, value: Option<&str>) {
+        // SAFETY: the lock is held for the guard's life; drop restores the variable.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("FL_WIRE_MUSE_BIN", v),
+                None => std::env::remove_var("FL_WIRE_MUSE_BIN"),
+            }
+        }
+    }
+}
+
+impl Drop for MuseBinEnv {
+    fn drop(&mut self) {
+        // SAFETY: the lock is still held (fields drop after this).
+        unsafe {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("FL_WIRE_MUSE_BIN", v),
+                None => std::env::remove_var("FL_WIRE_MUSE_BIN"),
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------- what is launched
 
 #[test]
 fn spin_up_launches_muse_with_the_prompt_as_its_first_argument() {
+    let _bin = MuseBinEnv::cleared();
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
     install_home_muse(home.path());
@@ -80,6 +127,27 @@ fn spin_up_launches_muse_with_the_prompt_as_its_first_argument() {
     assert_eq!(
         launches[0].1,
         Some(muse_launch(&out.prompt.unwrap(), home.path(), "ada"))
+    );
+}
+
+#[test]
+fn the_launched_muse_binary_follows_the_environment_setting_and_the_guard_clears_it() {
+    let bin = MuseBinEnv::cleared();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+    let argv0 = |persona: &str| {
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        spin(&store, &fake.env(home.path()), persona, "muse");
+        let launches = fake.launches.borrow();
+        launches[0].1.as_ref().unwrap().argv[0].clone()
+    };
+    bin.set(Some("/ambient/muse"));
+    assert_eq!(argv0("ada"), "/ambient/muse");
+    bin.set(None);
+    assert_eq!(
+        argv0("ada"),
+        home.path().join(".local/bin/muse").to_string_lossy()
     );
 }
 
@@ -101,6 +169,7 @@ fn only_muse_is_launched_other_vendors_open_a_blank_window() {
 
 #[test]
 fn restart_launches_muse_in_the_window_it_reopens() {
+    let _bin = MuseBinEnv::cleared();
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
     install_home_muse(home.path());
@@ -239,6 +308,51 @@ fn restart_of_a_muse_whose_window_exists_delivers_the_prompt() {
     assert_eq!(fake.launches.borrow().len(), 1);
     assert!(out.record.hydration_dispatched);
     assert!(delivered(&listener));
+}
+
+#[test]
+fn a_launched_muse_that_exits_at_once_is_neither_spawned_nor_hydrated() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let listener = webhook_listener(home.path(), "ada");
+    let fake = FakeRuntime::default();
+    fake.vanish_windows.borrow_mut().push("muse".into());
+    let out = spin(&store, &fake.env(home.path()), "ada", "muse");
+
+    assert!(!out.runtime_spawned);
+    assert!(!out.hydration_dispatched);
+    assert_eq!(fake.exists_calls.get(), 5, "bounded retry");
+    assert!(!delivered(&listener), "nothing to deliver to");
+    let record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+    assert!(!record.runtime_spawned && !record.hydration_dispatched);
+}
+
+#[test]
+fn restart_of_a_launched_muse_that_exits_at_once_is_neither_spawned_nor_hydrated() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    fake.live.borrow_mut().clear();
+    fake.vanish_windows.borrow_mut().push("muse".into());
+    let listener = webhook_listener(home.path(), "ada");
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+
+    assert!(!out.record.runtime_spawned);
+    assert!(!out.record.hydration_dispatched);
+    assert!(!delivered(&listener));
+    assert_eq!(out.record.restart_count, 1);
+}
+
+#[test]
+fn a_launched_muse_that_stays_up_is_checked_once() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let out = spin(&store, &fake.env(home.path()), "ada", "muse");
+    assert!(out.runtime_spawned && out.hydration_dispatched);
+    assert_eq!(fake.exists_calls.get(), 1);
 }
 
 // ------------------------------------------------------------------- the launch itself

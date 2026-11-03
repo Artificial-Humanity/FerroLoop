@@ -296,6 +296,31 @@ pub trait SessionRuntime: std::fmt::Debug {
     fn kill(&self, session: &str) -> bool;
     /// `true` when a session of this name runs.
     fn exists(&self, session: &str) -> bool;
+    /// The pause between the checks that a launched command's session is still there (see
+    /// [`launch_survived`]). Zero for a runtime that answers at once.
+    fn settle_delay(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
+
+/// How many times [`launch_survived`] asks whether the session is there.
+const LAUNCH_SURVIVAL_CHECKS: u32 = 5;
+
+/// `true` when the session of a command just launched in it (`spawn` with a [`LaunchSpec`]) is
+/// still there: a command that exits at once (a missing binary) takes its window with it. Asks
+/// `exists` up to [`LAUNCH_SURVIVAL_CHECKS`] times, [`SessionRuntime::settle_delay`] apart, and
+/// answers at the first yes.
+fn launch_survived(env: &LifecycleEnv<'_>, session: &str) -> bool {
+    let delay = env.runtime.settle_delay();
+    for check in 0..LAUNCH_SURVIVAL_CHECKS {
+        if env.runtime.exists(session) {
+            return true;
+        }
+        if check + 1 < LAUNCH_SURVIVAL_CHECKS && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    false
 }
 
 /// The command a runtime window starts in place of a blank shell: run as an argument vector,
@@ -364,6 +389,10 @@ impl SessionRuntime for TmuxRuntime {
     fn exists(&self, session: &str) -> bool {
         tmux_session_exists(session)
     }
+
+    fn settle_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(100)
+    }
 }
 
 /// A runtime that only records: `live` holds the session names it runs. A spawn fails when the
@@ -376,6 +405,10 @@ pub(crate) struct FakeRuntime {
     pub(crate) calls: std::cell::RefCell<Vec<String>>,
     /// The launch command of each `spawn` call that was not refused, by `session:window`.
     pub(crate) launches: std::cell::RefCell<Vec<(String, Option<LaunchSpec>)>>,
+    /// Windows whose session is gone right after its spawn (a launched command that exits).
+    pub(crate) vanish_windows: std::cell::RefCell<Vec<String>>,
+    /// How many times `exists` was asked.
+    pub(crate) exists_calls: std::cell::Cell<u32>,
 }
 
 #[cfg(test)]
@@ -460,6 +493,9 @@ impl SessionRuntime for FakeRuntime {
             self.launches
                 .borrow_mut()
                 .push((format!("{session}:{window}"), launch.cloned()));
+            if self.vanish_windows.borrow().iter().any(|w| w == window) {
+                self.live.borrow_mut().remove(session);
+            }
         }
         started
     }
@@ -471,6 +507,7 @@ impl SessionRuntime for FakeRuntime {
     }
 
     fn exists(&self, session: &str) -> bool {
+        self.exists_calls.set(self.exists_calls.get() + 1);
         self.is_live(session)
     }
 }
@@ -1480,10 +1517,18 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         && env
             .runtime
             .spawn(&display, &v.vendor, v.cwd.as_deref(), launch.as_ref());
-    // A runtime launched with the prompt as its first input has the prompt already.
-    let hydration_dispatched =
-        (spawned && launch.is_some()) || deliver_prompt(env, &v.persona, &session_id, by, &prompt);
-    record.runtime_spawned |= spawned;
+    // A runtime launched with the prompt as its first input has the prompt already, provided the
+    // command stayed up: one that exited at once took its session with it, and there is nothing
+    // to deliver to.
+    let launched = spawned && launch.is_some();
+    let survived = !launched || launch_survived(env, &display);
+    let spawned = spawned && survived;
+    let hydration_dispatched = if launched {
+        survived
+    } else {
+        deliver_prompt(env, &v.persona, &session_id, by, &prompt)
+    };
+    record.runtime_spawned = (record.runtime_spawned || spawned) && survived;
     record.hydration_dispatched = hydration_dispatched;
     record.updated_at_ms = now_ms();
     // A runtime may have started: the next discovery must scan the host again.
@@ -1966,6 +2011,7 @@ pub fn restart_hosted_session<S: StateStore>(
     let prompt = prompt_for(&display, &record.project, &record.role);
     let launch = launch_spec_for(env, &record.vendor, &record.persona, &prompt);
     let mut launched_with_prompt = false;
+    let mut launch_died = false;
     if record.hosted
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
@@ -1976,12 +2022,22 @@ pub fn restart_hosted_session<S: StateStore>(
             launch.as_ref(),
         )
     {
-        record.runtime_spawned = true;
-        // A runtime launched with the prompt as its first input has the prompt already.
-        launched_with_prompt = launch.is_some();
+        if launch.is_some() && !launch_survived(env, &display) {
+            // The command exited at once and took its session with it: nothing to deliver to.
+            launch_died = true;
+            record.runtime_spawned = false;
+        } else {
+            record.runtime_spawned = true;
+            // A runtime launched with the prompt as its first input has the prompt already.
+            launched_with_prompt = launch.is_some();
+        }
     }
-    record.hydration_dispatched = launched_with_prompt
-        || deliver_prompt(env, &record.persona, &record.session_id, by, &prompt);
+    record.hydration_dispatched = if launch_died {
+        false
+    } else {
+        launched_with_prompt
+            || deliver_prompt(env, &record.persona, &record.session_id, by, &prompt)
+    };
     // A runtime may have reopened: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
