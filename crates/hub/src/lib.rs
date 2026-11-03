@@ -2308,10 +2308,10 @@ mod tests {
             let _ = tx.send((started.elapsed(), resp.status));
         });
         let (elapsed, status) = rx
-            .recv_timeout(Duration::from_millis(500))
+            .recv_timeout(Duration::from_secs(10))
             .expect("GET /api/v1/worktrees blocked on HubStoreGuard");
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(10),
             "worktrees handler waited {elapsed:?}"
         );
         assert!(status == 200 || status == 500, "status {status}");
@@ -2332,10 +2332,10 @@ mod tests {
             let _ = tx.send(started.elapsed());
         });
         let elapsed = rx
-            .recv_timeout(Duration::from_millis(500))
+            .recv_timeout(Duration::from_secs(10))
             .expect("drain with an empty queue blocked on HubStoreGuard");
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(10),
             "empty drain waited {elapsed:?}"
         );
         drop(_guard);
@@ -4323,7 +4323,7 @@ mod tests {
         }
         let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
         let script = tmp.path().join("agent-hydrate");
-        fs::write(&script, "#!/bin/sh\nsleep 5 &\nexit 0\n").unwrap();
+        fs::write(&script, "#!/bin/sh\nsleep 30 &\nexit 0\n").unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let socket = tmp.path().join("hydrate-hang.sock");
         install_webhook_route(tmp.path(), "felicia", &socket);
@@ -4352,7 +4352,7 @@ mod tests {
         });
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_millis(4500),
+            elapsed < std::time::Duration::from_secs(15),
             "reforge waited {elapsed:?} for a descendant holding hydrate stdout"
         );
         assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));

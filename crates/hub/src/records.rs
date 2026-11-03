@@ -2221,7 +2221,7 @@ mod tests {
                 assert_eq!(status, 200, "{query}");
                 assert_eq!(got, vec![want], "{query}");
                 assert!(
-                    took < Duration::from_secs(1),
+                    took < BOUND,
                     "{query} waited {took:?} behind a held project"
                 );
             }

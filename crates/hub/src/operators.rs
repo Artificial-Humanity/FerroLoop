@@ -5035,21 +5035,43 @@ mod tests {
         let state = state(&tmp);
         let current = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        // Deterministic overlap: each verification blocks inside the hook until all
+        // MAX_INFLIGHT_VERIFICATIONS slots are concurrently inside it. The hook runs after
+        // `try_verify_permit` increments `inflight` (see `password_login`), so reaching the
+        // target proves that many permits are held at once. The bounded wait lets a broken
+        // (serialising) impl fail the peak assertions instead of hanging forever.
+        let arrived = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
         {
-            let (current, peak) = (current.clone(), peak.clone());
+            let (current, peak, arrived) = (current.clone(), peak.clone(), arrived.clone());
             set_hook(&state, move || {
                 let now = current.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
+                let (lock, cvar) = &*arrived;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                if *count >= MAX_INFLIGHT_VERIFICATIONS {
+                    cvar.notify_all();
+                }
+                while *count < MAX_INFLIGHT_VERIFICATIONS {
+                    let (guard, timeout) =
+                        cvar.wait_timeout(count, Duration::from_secs(30)).unwrap();
+                    count = guard;
+                    if timeout.timed_out() {
+                        break;
+                    }
+                }
+                drop(count);
                 current.fetch_sub(1, Ordering::SeqCst);
             });
         }
         let busy_seen = AtomicUsize::new(0);
+        let start = Arc::new(std::sync::Barrier::new(48));
         // Distinct names, so no per-name limit gets in the way: only the cap can hold them back.
         std::thread::scope(|scope| {
             for i in 0..48 {
-                let (state, busy_seen) = (&state, &busy_seen);
+                let (state, busy_seen, start) = (&state, &busy_seen, start.clone());
                 scope.spawn(move || {
+                    start.wait();
                     let resp = password_login(state, &format!("name{i}"), "wrong password");
                     match resp.status {
                         401 => {}
