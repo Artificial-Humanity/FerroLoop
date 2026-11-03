@@ -136,11 +136,14 @@ The wire crate has no adapter config, so these launches have no `env_pass`: they
 dialect allow-list and nothing else. A proxy, `AWS_*` or `SSH_AUTH_SOCK` set on the hub does not
 reach them (follow-up: the hub loads `[adapters.*].env_pass` and hands it to the dispatcher). This
 is a behaviour change for a host where a fallback needed a proxy to reach its vendor.
+`DBUS_SESSION_BUS_ADDRESS` is in no baseline or dialect list either, so a vendor CLI that keeps its
+credentials in the desktop keyring does not find the session bus when a fallback (or a
+`ProcessHarness` spawn) runs (follow-up: reconsider whether the baseline should carry it).
 
 The dispatcher's `tmux` client calls (`list-panes`, `load-buffer`, `paste-buffer`, `send-keys`,
 `capture-pane`, and the same in `identity.rs`) are not vendor launches. They keep the hub's
-environment: tmux finds its server from `TMUX`, `TMUX_TMPDIR` and `XDG_RUNTIME_DIR`, which the
-baseline does not hold, and they start no agent code.
+environment: tmux finds its server from `TMUX` and `TMUX_TMPDIR` (which the baseline does not
+hold) and `XDG_RUNTIME_DIR` (which it does), and they start no agent code.
 
 ## Not covered
 
