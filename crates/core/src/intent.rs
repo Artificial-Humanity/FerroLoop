@@ -414,6 +414,33 @@ impl CommitteeTally {
         }
         result
     }
+    /// Advance an unvoted member's controller-issued attempt. The caller must first confirm
+    /// that the previous attempt was never dispatched and must persist this change atomically
+    /// with the newly issued attempt. `expected_attempt` fences a stale controller update.
+    pub fn advance_attempt(
+        &mut self,
+        member: &Binding,
+        expected_attempt: u32,
+        new_attempt: u32,
+    ) -> Result<(), IntentError> {
+        if self.outcome.is_some() {
+            return Err(IntentError::Final);
+        }
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|slot| &slot.binding == member)
+            .ok_or(IntentError::Result)?;
+        if slot.verdict.is_some()
+            || slot.attempt != expected_attempt
+            || new_attempt <= expected_attempt
+        {
+            return Err(IntentError::Result);
+        }
+        slot.attempt = new_attempt;
+        Ok(())
+    }
+
     pub fn record(
         &mut self,
         result: &IntentResult,
@@ -606,6 +633,49 @@ mod tests {
         );
         assert_eq!(t.counts().rejections, 1);
     }
+    #[test]
+    fn advance_attempt_preserves_votes_and_rejects_stale_results() {
+        let mut t = tally();
+        t.record(&result("a", 1, CommitteeVerdict::Approve, ""))
+            .unwrap();
+        t.advance_attempt(&binding("b"), 3, 4).unwrap();
+        assert_eq!(t.counts().approvals, 1);
+        assert!(
+            t.record(&result("b", 3, CommitteeVerdict::Approve, ""))
+                .is_err()
+        );
+        assert_eq!(
+            t.record(&result("b", 4, CommitteeVerdict::Approve, ""))
+                .unwrap(),
+            Some(CommitteeOutcome::Approved)
+        );
+    }
+
+    #[test]
+    fn advance_attempt_rejects_invalid_changes_without_mutation() {
+        let mut t = tally();
+        t.record(&result("a", 1, CommitteeVerdict::Approve, ""))
+            .unwrap();
+        let before = t.clone();
+        assert!(t.advance_attempt(&binding("a"), 1, 2).is_err()); // voted
+        assert!(t.advance_attempt(&binding("missing"), 1, 2).is_err());
+        assert!(t.advance_attempt(&binding("b"), 2, 4).is_err()); // stale expected
+        assert!(t.advance_attempt(&binding("b"), 3, 3).is_err());
+        assert!(t.advance_attempt(&binding("b"), 3, 2).is_err());
+        assert_eq!(t, before);
+        t.advance_attempt(&binding("b"), 3, u32::MAX).unwrap();
+        let before = t.clone();
+        assert!(t.advance_attempt(&binding("b"), u32::MAX, 0).is_err());
+        assert_eq!(t, before);
+        t.cancel();
+        let before = t.clone();
+        assert_eq!(
+            t.advance_attempt(&binding("c"), 1, 2),
+            Err(IntentError::Final)
+        );
+        assert_eq!(t, before);
+    }
+
     #[test]
     fn committee_mixed_votes_abstentions_deterministic_outcome() {
         let mut t = tally();
