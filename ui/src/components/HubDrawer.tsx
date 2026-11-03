@@ -30,6 +30,20 @@ import {
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
 } from "./AgentSettingsModal";
+import {
+  BUILTIN_ROLE_REGISTRY,
+  DEFAULT_OPERATOR_PUSH_STATE,
+  type ConfigurableRoleRecord,
+  type OperatorPushSubscriptionState,
+  type RoleReviewPolicy,
+} from "./SettingsModal";
+export {
+  BUILTIN_ROLE_REGISTRY,
+  DEFAULT_OPERATOR_PUSH_STATE,
+  type ConfigurableRoleRecord,
+  type OperatorPushSubscriptionState,
+  type RoleReviewPolicy,
+};
 
 export type HubSubTab = "workflows" | "routines" | "architecture" | "stats";
 
