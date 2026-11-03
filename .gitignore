@@ -42,3 +42,10 @@ vault.enc
 !/crates/store/src/ferrostore/testdata/tls/server.key
 !/crates/store/src/ferrostore/testdata/tls/server.pem
 !/crates/store/src/ferrostore/testdata/tls/wrong-host.pem
+
+# MCP vendor files: `fl mcp sync` writes them on each machine from .fl/mcp.toml (docs/mcp.md).
+/.mcp.json
+/.codex/config.toml
+/.agents/mcp_config.json
+/.muse/settings.json
+/.grok/config.toml

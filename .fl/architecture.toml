@@ -236,3 +236,8 @@ label = "runs fl install (plan, apply, resume, rollback) and fl doctor over the 
 from = "fl_hub"
 to = "fl_install"
 label = "serves GET /api/v1/doctor and the UI build-info reader"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_mcp"
+label = "serves GET /api/v1/mcp/catalog and POST /api/v1/mcp/sync over the committed MCP catalog"

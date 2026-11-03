@@ -17,6 +17,7 @@ pub mod discovery;
 mod doctor_api;
 pub mod github_pr;
 pub mod lifecycle;
+mod mcp_api;
 pub mod nodes;
 mod operators;
 mod records;
@@ -209,6 +210,8 @@ pub struct HubState {
     /// The `/api/v1/watch/*` store reads, shared for [`watch_api::WATCH_SNAPSHOT_TTL`] and
     /// dropped with [`HubState::discovery_snapshots`] (see [`watch_api`]).
     pub(crate) watch_caches: Arc<watch_api::WatchCaches>,
+    /// The MCP catalog endpoints' sync gate and settings (see [`mcp_api`]).
+    pub(crate) mcp: Arc<mcp_api::McpHub>,
 }
 
 /// How long the read-only discovery endpoints reuse one store snapshot. A snapshot costs
@@ -326,7 +329,17 @@ impl HubState {
             attachment_sweep_running: Arc::new(AtomicBool::new(false)),
             discovery_snapshots: Arc::new(discovery::TtlCache::new(DISCOVERY_SNAPSHOT_TTL)),
             watch_caches: Arc::new(watch_api::WatchCaches::default()),
+            mcp: Arc::default(),
         }
+    }
+
+    /// Sets how the MCP endpoints find this machine's `[[mcp]]` switches for a project
+    /// directory (see [`mcp_api`]). Without it the catalog's team defaults apply.
+    pub fn set_mcp_switches<F>(&self, resolver: F)
+    where
+        F: Fn(&Path) -> Result<fl_mcp::sync::Switches, String> + Send + Sync + 'static,
+    {
+        self.mcp.set_switches(Arc::new(resolver));
     }
 
     /// The discovery snapshot for a read-only endpoint: shared for [`DISCOVERY_SNAPSHOT_TTL`],

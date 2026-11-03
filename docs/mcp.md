@@ -420,3 +420,47 @@ waits for.
 A record fl cannot read is refused, naming it: delete it, and the next `sync` adopts every entry
 that is exactly as fl would write it. An entry that differs is then refused as one fl did not
 write, and `--replace` takes it back.
+
+## Hub API
+
+The hub (`fl hub serve`) shows and syncs the catalog of the repository it serves, its
+`repo_root`; it does not list `[[project]]` roots. Both endpoints answer the Owner only (a Peer
+gets 403, an unauthenticated caller 401), and both plan with the same library calls as `fl mcp
+check` and `fl mcp sync`, with this machine's `[[mcp]]` switches. The project directory is found
+as above, from the root up.
+
+`GET /api/v1/mcp/catalog` answers `{ "repos": [ … ] }`, one row per known repo:
+
+| field | meaning |
+|---|---|
+| `repo`, `root`, `catalog_path` | The root's directory name, its canonical path, and the catalog's path. |
+| `status` | `synced` (`fl mcp check` exits 0), `drift` (a sync would change a file), `missing` (no catalog) or `error`. |
+| `error`, `refusals` | For `error`: the library's refusal text, and one line per refused entry. The text never quotes a value. |
+| `enabled_servers` | The servers on, by name, or `null` when the plan failed first. |
+| `vendors` | Per agent CLI, `synced`, `drift` or `refused`, or `null` when no plan was made. |
+| `deduplicated_daemons`, `active_vendor_sessions`, `spawned_mcp_processes` | Always `null`: nothing in the hub measures them. |
+
+`error` covers a catalog that does not parse or validate, a vendor file fl refuses (see above),
+and a vendor file git would commit. FerroDeck's row type knows the first three statuses only.
+Only names and statuses leave the hub: no `env` or header value, command, argument or secret
+variable.
+
+`POST /api/v1/mcp/sync` takes `{}`, an empty body (every known repo) or `{ "repo": "<name>" }`;
+`repo` is a row's `repo`, or the absolute path of a known root. Any other name or path is a 404
+(a name two roots share is a 400), and any other key a 400. It answers `{ "ok": bool, "repos":
+[ { "repo", "status_before", "status_after", "written", "error"? } ] }`: `written` lists the
+vendor files written, relative to the project. A request the hub can read is a 200 whatever the
+repos did; `ok` is `false` when any repo has an `error`, and then that repo wrote nothing. A repo
+with no catalog is skipped with a `note`. Syncs and catalog reads take turns.
+
+A sync writes the vendor files of the table above under the project directory and nothing else
+there; the hub refuses a plan with any target outside the project, and never reads or writes an
+agent CLI's user-level file. The ownership records stay in fl's state directory, as `fl mcp`
+keeps them.
+
+## This repository's catalog
+
+`.fl/mcp.toml` in this repository names the workspace's two MCP servers: `ferrowire`
+(`fl wire mcp`) and `research-papers` (`/usr/local/bin/research-papers-mcp`). It holds no secret
+and no `env`. The repository's `.gitignore` holds the vendor-file lines above, so `fl mcp sync`
+writes the agent CLIs' files here and git ignores them.
