@@ -332,8 +332,10 @@ It is the headless, UI-serving shape: the views that need a repository (worktree
 diffs, architecture, commands and skills, repository paths) show nothing useful, code search
 answers empty and never scans the home directory (`$HOME` as the root is the only case the hub
 refuses), and an owner terminal session starts in the home directory. A hub bound to a
-repository needs `WorkingDirectory=<repo>` in a drop-in (`systemctl --user edit
-ferroloop-hub.service`). The store units set `NoNewPrivileges=yes`; the hub does not, because
+repository sets `[hub] repo_root = "<repo>"` in the `fl` config (`fl hub serve --repo-root
+<repo>` wins over it). The path is absolute and an
+existing directory, else the hub exits 2 before it listens; it need not be a git work tree.
+Without either, the root is the working directory. The store units set `NoNewPrivileges=yes`; the hub does not, because
 an owner terminal session runs `sudo`. `render_unit` refuses a launcher or prefix that has
 white space, `%`, `$`, a quote, a backslash or a brace, so such an install prefix cannot get a
 unit (choose another `--prefix`). The tests parse every template, check each `ExecStart` against the built `fl` and `ferrostore`

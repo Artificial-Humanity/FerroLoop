@@ -28,9 +28,14 @@ pub enum HubCmd {
         /// TCP listen address (defaults to `[hub].listen` or `127.0.0.1:8420`).
         #[arg(long)]
         listen: Option<String>,
-        /// Static `FerroDeck` UI directory (defaults to `[hub].ui_dir` or `<cwd>/ui/dist`).
+        /// Static `FerroDeck` UI directory (defaults to `[hub].ui_dir` or `<repo root>/ui/dist`).
         #[arg(long)]
         ui_dir: Option<PathBuf>,
+        /// Repository the hub's repository views read and an Owner terminal starts in: an
+        /// absolute path to an existing directory (defaults to `[hub].repo_root`, else the
+        /// working directory).
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
         /// File containing the Hub owner token (overrides `[hub].owner_token_file`).
         #[arg(long)]
         owner_token_file: Option<PathBuf>,
@@ -137,6 +142,7 @@ pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
         HubCmd::Serve {
             listen,
             ui_dir,
+            repo_root,
             owner_token_file,
             trust_tailscale_headers,
             no_terminal,
@@ -144,6 +150,7 @@ pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
             env,
             listen,
             ui_dir,
+            repo_root,
             owner_token_file,
             trust_tailscale_headers,
             no_terminal,
@@ -329,10 +336,41 @@ fn hub_github(
     })
 }
 
+/// The repository the hub reads: `--repo-root`, else `[hub].repo_root`, else the working
+/// directory. Both explicit forms must be absolute and name an existing directory (a git work
+/// tree is not required: a headless hub is legitimate); the config value is already shaped by the
+/// config loader, the flag gets the same check here. The working directory is taken as it is.
+fn resolve_repo_root(
+    flag: Option<PathBuf>,
+    hub_cfg: Option<&crate::config::HubConfig>,
+    cwd: &Path,
+) -> Result<PathBuf, (i32, String)> {
+    let (source, path) = match (flag, hub_cfg.and_then(|h| h.repo_root.clone())) {
+        (Some(p), _) => ("`--repo-root`", p),
+        (None, Some(p)) => ("`[hub] repo_root`", p),
+        (None, None) => return Ok(cwd.to_path_buf()),
+    };
+    if let Some(why) = crate::config::repo_root_shape_error(&path) {
+        return Err((2, format!("{source} {why} (got `{}`)", path.display())));
+    }
+    match fs::metadata(&path) {
+        Ok(m) if m.is_dir() => Ok(path),
+        Ok(_) => Err((
+            2,
+            format!("{source} is not a directory (got `{}`)", path.display()),
+        )),
+        Err(e) => Err((
+            2,
+            format!("{source} cannot be used (got `{}`): {e}", path.display()),
+        )),
+    }
+}
+
 fn cmd_serve(
     env: &StateEnv<'_>,
     listen_flag: Option<String>,
     ui_dir_flag: Option<PathBuf>,
+    repo_root_flag: Option<PathBuf>,
     owner_token_file_flag: Option<PathBuf>,
     trust_tailscale_flag: bool,
     no_terminal_flag: bool,
@@ -346,13 +384,13 @@ fn cmd_serve(
     // Absolute once, here: the store, and the `attachments/` dir beside it that uploads, serving
     // and expiry share, never depend on a relative `--db` / `FL_DB`.
     let store_path = absolute_path(env.cwd, resolve_hub_store_path(env));
-    let repo_root = env.cwd.to_path_buf();
+    let repo_root = resolve_repo_root(repo_root_flag, hub_cfg_sec, env.cwd)?;
 
     let ui_dir = ui_dir_flag
         .map(|p| if p.is_absolute() { p } else { env.cwd.join(p) })
         .or_else(|| hub_cfg_sec.and_then(|h| h.ui_dir.clone()))
         .or_else(|| {
-            let candidate = env.cwd.join("ui").join("dist");
+            let candidate = repo_root.join("ui").join("dist");
             candidate.is_dir().then_some(candidate)
         });
 
@@ -1262,6 +1300,82 @@ mod tests {
             backend: Some(backend),
             ..StoreOptions::default()
         }
+    }
+
+    fn hub_cfg_with_root(root: Option<PathBuf>) -> crate::config::HubConfig {
+        crate::config::HubConfig {
+            repo_root: root,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_repo_root_is_the_flag_then_the_config_then_the_working_directory() {
+        let flag = tempfile::tempdir().unwrap();
+        let cfg = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let hub = hub_cfg_with_root(Some(cfg.path().to_path_buf()));
+
+        let got = resolve_repo_root(Some(flag.path().to_path_buf()), Some(&hub), cwd.path());
+        assert_eq!(got.unwrap(), flag.path());
+        let got = resolve_repo_root(None, Some(&hub), cwd.path());
+        assert_eq!(got.unwrap(), cfg.path());
+        let got = resolve_repo_root(None, Some(&hub_cfg_with_root(None)), cwd.path());
+        assert_eq!(got.unwrap(), cwd.path());
+        let got = resolve_repo_root(None, None, cwd.path());
+        assert_eq!(got.unwrap(), cwd.path());
+        // A bad flag is refused even when the config is fine, and a good flag hides a bad config.
+        let err = resolve_repo_root(Some("rel".into()), Some(&hub), cwd.path()).unwrap_err();
+        assert_eq!(err.0, 2);
+        assert!(
+            err.1.contains("`--repo-root` must be an absolute path"),
+            "{}",
+            err.1
+        );
+        let bad = hub_cfg_with_root(Some(cwd.path().join("nope")));
+        let got = resolve_repo_root(Some(flag.path().to_path_buf()), Some(&bad), cwd.path());
+        assert_eq!(got.unwrap(), flag.path());
+    }
+
+    #[test]
+    fn a_repo_root_that_is_not_a_directory_is_refused_with_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        fs::write(&file, "x").unwrap();
+        let missing = dir.path().join("missing");
+        let hub_of = |p: &Path| hub_cfg_with_root(Some(p.to_path_buf()));
+
+        let err = resolve_repo_root(Some(missing.clone()), None, dir.path()).unwrap_err();
+        assert_eq!(err.0, 2);
+        assert!(
+            err.1.starts_with("`--repo-root` cannot be used"),
+            "{}",
+            err.1
+        );
+        assert!(err.1.contains(&missing.display().to_string()), "{}", err.1);
+        let err = resolve_repo_root(Some(file.clone()), None, dir.path()).unwrap_err();
+        assert!(
+            err.1.starts_with("`--repo-root` is not a directory"),
+            "{}",
+            err.1
+        );
+        let err = resolve_repo_root(None, Some(&hub_of(&missing)), dir.path()).unwrap_err();
+        assert!(
+            err.1.starts_with("`[hub] repo_root` cannot be used"),
+            "{}",
+            err.1
+        );
+        let err = resolve_repo_root(None, Some(&hub_of(&file)), dir.path()).unwrap_err();
+        assert!(
+            err.1.starts_with("`[hub] repo_root` is not a directory"),
+            "{}",
+            err.1
+        );
+        let nul = PathBuf::from("/srv/re\0po");
+        let err = resolve_repo_root(Some(nul), None, dir.path()).unwrap_err();
+        assert!(err.1.contains("must not contain a NUL byte"), "{}", err.1);
+        // No repository is needed: a plain directory is a valid root.
+        assert!(resolve_repo_root(Some(dir.path().to_path_buf()), None, &missing).is_ok());
     }
 
     #[test]

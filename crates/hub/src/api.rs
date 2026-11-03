@@ -2248,7 +2248,7 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
                 "symbols": [],
                 "tokens_saved_this_query": 0,
                 "token_gain": load_token_gain(&*store),
-                "note": "the hub runs in the home directory, which is not searched; start it with the repository as its working directory",
+                "note": "the hub runs in the home directory, which is not searched; name the repository with `[hub] repo_root` or `fl hub serve --repo-root`",
             }),
         );
     }

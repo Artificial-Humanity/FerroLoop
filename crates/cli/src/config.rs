@@ -272,6 +272,12 @@ pub struct HubConfig {
     /// Static `FerroDeck` UI directory (defaults to `<repo_root>/ui/dist` when present).
     #[serde(default)]
     pub ui_dir: Option<PathBuf>,
+    /// The repository the hub's repository-bound views read (worktrees, diffs, architecture,
+    /// commands and skills, code search) and where an Owner terminal session starts. An absolute
+    /// path to an existing directory; `fl hub serve --repo-root` wins over it. Defaults to the
+    /// working directory of `fl hub serve`, which is the home directory for a user service.
+    #[serde(default)]
+    pub repo_root: Option<PathBuf>,
     /// Optional path to file containing the Hub owner token (falls back to `$FL_HUB_OWNER_TOKEN`).
     #[serde(default)]
     pub owner_token_file: Option<PathBuf>,
@@ -284,6 +290,20 @@ pub struct HubConfig {
     /// Browser session TTL in hours (defaults to `24`).
     #[serde(default)]
     pub session_ttl_hours: Option<u64>,
+}
+
+/// Why `p` cannot be a hub `repo_root`, judged by its text alone (the same rule for
+/// `[hub] repo_root` and `fl hub serve --repo-root`): it must be absolute, like `hub.ui_dir`, and
+/// no path holds a NUL byte. Whether it is an existing directory is checked at startup.
+#[must_use]
+pub fn repo_root_shape_error(p: &Path) -> Option<&'static str> {
+    if p.to_string_lossy().contains('\0') {
+        Some("must not contain a NUL byte")
+    } else if !p.is_absolute() {
+        Some("must be an absolute path")
+    } else {
+        None
+    }
 }
 
 /// Per-adapter `[adapters.<name>]` configuration (Adapters & Telemetry spec §1.2).
@@ -733,6 +753,15 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
                 "{}: `hub.ui_dir` must be an absolute path (got `{}`)",
                 path.display(),
                 u.display()
+            );
+        }
+        if let Some(r) = &h.repo_root
+            && let Some(why) = repo_root_shape_error(r)
+        {
+            bail!(
+                "{}: `hub.repo_root` {why} (got `{}`)",
+                path.display(),
+                r.display()
             );
         }
         if let Some(otf) = &h.owner_token_file
@@ -1985,6 +2014,48 @@ mod tests {
         assert!(h.trust_tailscale_headers);
         assert_eq!(h.enable_terminal, Some(false));
         assert_eq!(h.session_ttl_hours, Some(48));
+    }
+
+    #[test]
+    fn hub_repo_root_is_validated_like_ui_dir() {
+        // (toml value, expected error fragment or None when valid)
+        let table: [(&str, Option<&str>); 6] = [
+            ("\"/srv/repo\"", None),
+            ("\"/srv/repo/\"", None),
+            (
+                "\"relative/repo\"",
+                Some("`hub.repo_root` must be an absolute path"),
+            ),
+            ("\".\"", Some("`hub.repo_root` must be an absolute path")),
+            ("\"\"", Some("`hub.repo_root` must be an absolute path")),
+            (
+                "\"/srv/re\\u0000po\"",
+                Some("`hub.repo_root` must not contain a NUL byte"),
+            ),
+        ];
+        for (value, want) in table {
+            let got = load_text(&format!("[hub]\nrepo_root = {value}\n"));
+            match want {
+                None => {
+                    let cfg = got.unwrap_or_else(|e| panic!("{value}: {e:#}"));
+                    let root = cfg.hub.unwrap().repo_root.unwrap();
+                    assert!(root.starts_with("/srv/repo"), "{value}: {root:?}");
+                }
+                Some(frag) => {
+                    let err = format!("{:#}", got.expect_err(value));
+                    assert!(err.contains(frag), "{value}: {err}");
+                }
+            }
+        }
+        // unset stays unset
+        assert_eq!(
+            load_text("[hub]\nlisten = \"127.0.0.1:1\"\n")
+                .unwrap()
+                .hub
+                .unwrap()
+                .repo_root,
+            None
+        );
     }
 
     fn err_of(text: &str) -> String {
