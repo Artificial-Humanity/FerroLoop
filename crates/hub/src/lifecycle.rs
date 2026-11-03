@@ -356,6 +356,15 @@ fn runtime_unit(tmux_target: &str) -> &str {
     }
 }
 
+/// `true` when `vendor` is Muse, the runtime may be touched, and the window `unit` this
+/// lifecycle once opened is gone. Its `runtime_spawned` flag is then stale: whoever opens a
+/// window of that name next (`muse-sessions`, a person) made a window we did not, and only a
+/// successful spawn of ours may set the flag again. (A Muse window is addressed by name alone,
+/// so the name alone cannot tell the two apart.)
+fn muse_window_gone(env: &LifecycleEnv<'_>, vendor: &str, unit: &str) -> bool {
+    vendor == "muse" && env.spawn_runtime && !env.runtime.exists(unit)
+}
+
 /// How many times [`launch_survived`] asks whether the session is there.
 const LAUNCH_SURVIVAL_CHECKS: u32 = 5;
 
@@ -668,15 +677,14 @@ impl SessionRuntime for FakeRuntime {
 
     fn kill(&self, unit: &str) -> bool {
         self.calls.borrow_mut().push(format!("kill {unit}"));
+        if !is_killable_unit(unit) {
+            return false;
+        }
         if unit.contains(':') {
             self.windows.borrow_mut().remove(unit);
             self.sync_muse_session();
         } else {
             self.live.borrow_mut().remove(unit);
-            if unit == MUSE_SESSION {
-                // Killing the shared session takes every window with it.
-                self.windows.borrow_mut().clear();
-            }
         }
         true
     }
@@ -1382,11 +1390,27 @@ fn tmux_muse_spawn_args(
     args
 }
 
+/// `false` for a unit that must never be killed: the shared Muse session itself (other agents'
+/// windows live in it, so a hand-edited record naming `muse` cannot `kill-session -t =muse`), a
+/// window with an empty session or window part (`muse:`), and an empty unit.
+fn is_killable_unit(unit: &str) -> bool {
+    if unit.is_empty() || unit == MUSE_SESSION {
+        return false;
+    }
+    match unit.split_once(':') {
+        Some((session, window)) => !session.is_empty() && !window.is_empty(),
+        None => true,
+    }
+}
+
 /// Stop a runtime unit this lifecycle created; `true` when it is gone afterwards. A window unit
 /// (`muse:<persona>`) is stopped with `kill-window` on exactly that window, and only when
 /// exactly one window has that name: never the session, whose other windows belong to other
 /// agents.
 fn kill_tmux_runtime(unit: &str) -> bool {
+    if !is_killable_unit(unit) {
+        return false;
+    }
     let Some((session, window)) = unit.split_once(':') else {
         let target = format!("={unit}");
         return tmux_ok(&["kill-session", "-t", &target]) || !tmux_session_exists(unit);
@@ -1795,6 +1819,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
 
     let display = capitalize(&v.persona);
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
+    let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
     let prompt = prompt_for(&display, &v.project, &v.role);
 
     let now = now_ms();
@@ -1819,7 +1844,10 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         // record's session) is not the one now under this name.
         runtime_spawned: has_runtime
             && previous.as_ref().is_some_and(|r| {
-                r.runtime_spawned && is_live_hosted(r) && r.tmux_target == tmux_target
+                r.runtime_spawned
+                    && is_live_hosted(r)
+                    && r.tmux_target == tmux_target
+                    && !muse_window_gone(env, &v.vendor, &unit)
             }),
         created_at_ms: previous.as_ref().map_or(now, |r| r.created_at_ms),
         updated_at_ms: now,
@@ -1829,7 +1857,6 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
 
     let launch = launch_spec_for(env, &v.vendor, &v.persona, v.model.as_deref(), &prompt);
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
-    let unit = tmux_target.as_deref().map_or("", runtime_unit).to_string();
     let spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
@@ -2336,20 +2363,41 @@ pub fn restart_hosted_session<S: StateStore>(
         record.model.as_deref(),
         &prompt,
     );
+    // A stale `<Display>:muse` record whose old session still runs: that one Muse is the agent.
+    // No second Muse is opened beside it; the prompt goes to it by delivery and the ownership
+    // flag stays as recorded.
+    let mut adopted_old_session = false;
     if record.hosted
         && record.vendor == "muse"
         && env.spawn_runtime
         && record.tmux_target.as_deref() != Some(want_target.as_str())
     {
-        // An older record addressed Muse as `<Display>:muse`. The window now under the shared
-        // name is not what that record created, so it does not own it: a teardown must not kill
-        // it unless this restart opens it.
-        record.tmux_target = Some(want_target.clone());
+        if record
+            .tmux_target
+            .as_deref()
+            .map(runtime_unit)
+            .is_some_and(|old| env.runtime.exists(old))
+        {
+            adopted_old_session = true;
+        } else {
+            // The window now under the shared name is not what that record created, so it does
+            // not own it: a teardown must not kill it unless this restart opens it.
+            record.tmux_target = Some(want_target.clone());
+            record.runtime_spawned = false;
+        }
+    }
+    if record.hosted
+        && !adopted_old_session
+        && record.runtime_spawned
+        && muse_window_gone(env, &record.vendor, &unit)
+    {
+        // Our window died. A window of the name that exists after this point is someone else's.
         record.runtime_spawned = false;
     }
     let mut launched_with_prompt = false;
     let mut launch_died = false;
     if record.hosted
+        && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
         && env.runtime.spawn(

@@ -5117,10 +5117,11 @@ mod tests {
         );
         assert_eq!(bad_body.status, 400);
         // The pre-delivery check asks tmux whether the route's pane exists (`display-message`,
-        // a read); nothing is typed into it.
+        // or `list-panes`, a read); nothing is typed into it.
         let log = tmux.log();
         assert!(
-            log.lines().all(|l| l.starts_with("display-message ")),
+            log.lines()
+                .all(|l| l.starts_with("display-message ") || l.starts_with("list-panes ")),
             "an interrupt types nothing into the pane: {log}"
         );
     }
@@ -5206,7 +5207,7 @@ mod tests {
         let log = tmux.log();
         assert_eq!(log.matches("paste-buffer").count(), 1, "{log}");
         assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("-t muse:ada"), "{log}");
+        assert!(log.contains("-t =muse:=ada"), "{log}");
     }
 
     #[test]
@@ -5909,7 +5910,7 @@ mod tests {
             fs::write(
                 &bin,
                 format!(
-                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
                     out.display()
                 ),
             )

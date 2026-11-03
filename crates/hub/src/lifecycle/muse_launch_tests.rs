@@ -1182,3 +1182,134 @@ fn the_shared_session_name_is_not_a_muse_persona() {
     let out = spin(&store, &fake.env(home.path()), "muse", "claude");
     assert_eq!(out.tmux_target.as_deref(), Some("Muse:claude"));
 }
+
+// ------------------------------------------------- a stale ownership flag, a stale old session
+
+/// Our `muse:ada` window died; the next window of that name is someone else's.
+fn our_window_dies_then_a_foreign_one_opens(fake: &FakeRuntime) {
+    fake.windows.borrow_mut().remove("muse:ada");
+    fake.sync_muse_session();
+}
+
+fn a_foreign_window_opens(fake: &FakeRuntime) {
+    fake.windows.borrow_mut().insert("muse:ada".to_string());
+    fake.sync_muse_session();
+}
+
+#[test]
+fn a_restart_drops_the_ownership_flag_of_a_window_that_died() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    our_window_dies_then_a_foreign_one_opens(&fake);
+    // The reopening fails (tmux does not answer), so nothing of ours is under the name.
+    fake.fail_windows.borrow_mut().push("ada".to_string());
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+    assert!(!out.record.runtime_spawned, "our window is gone");
+
+    fake.fail_windows.borrow_mut().clear();
+    a_foreign_window_opens(&fake);
+    let stopped = teardown(&store, &env, "muse:ada").runtime_stopped;
+    assert!(!stopped);
+    assert!(killed(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"), "the foreign window was killed");
+}
+
+#[test]
+fn a_restart_that_reopens_the_window_owns_it_again() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    our_window_dies_then_a_foreign_one_opens(&fake);
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+    assert!(out.record.runtime_spawned);
+    assert_eq!(fake.launches.borrow().len(), 2);
+    assert!(teardown(&store, &env, "muse:ada").runtime_stopped);
+    assert_eq!(killed(&fake), ["kill muse:ada"]);
+}
+
+#[test]
+fn a_spin_up_drops_the_ownership_flag_of_a_window_that_died() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    our_window_dies_then_a_foreign_one_opens(&fake);
+    fake.fail_windows.borrow_mut().push("ada".to_string());
+    spin(&store, &env, "ada", "muse");
+    let record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+    assert!(!record.runtime_spawned, "our window is gone");
+
+    fake.fail_windows.borrow_mut().clear();
+    a_foreign_window_opens(&fake);
+    assert!(!teardown(&store, &env, "muse:ada").runtime_stopped);
+    assert!(killed(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"), "the foreign window was killed");
+}
+
+#[test]
+fn a_spin_up_keeps_the_ownership_flag_of_a_window_that_still_runs() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    spin(&store, &env, "ada", "muse");
+    let record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+    assert!(record.runtime_spawned);
+    assert!(teardown(&store, &env, "muse:ada").runtime_stopped);
+}
+
+#[test]
+fn a_restart_of_a_stale_display_record_with_a_live_old_session_opens_no_second_muse() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin(&store, &env, "ada", "muse");
+    // An older record addressed Muse as `Ada:muse`, and that session still runs.
+    let mut record = find_hosted_session(&store, &["muse:ada"]).unwrap().unwrap();
+    record.tmux_target = Some("Ada:muse".into());
+    record.runtime_spawned = true;
+    persist_hosted_session(&store, &record, "owner").unwrap();
+    fake.live.borrow_mut().insert("Ada".to_string());
+    fake.windows.borrow_mut().clear();
+    fake.sync_muse_session();
+    fake.calls.borrow_mut().clear();
+    fake.launches.borrow_mut().clear();
+    let listener = webhook_listener(home.path(), "ada");
+
+    let out = restart_hosted_session(&store, &env, "muse:ada", "owner").unwrap();
+    assert_eq!(out.record.tmux_target.as_deref(), Some("Ada:muse"));
+    assert!(out.record.runtime_spawned, "ownership is unchanged");
+    assert!(
+        fake.calls.borrow().iter().all(|c| !c.starts_with("spawn")),
+        "{:?}",
+        fake.calls.borrow()
+    );
+    assert!(fake.launches.borrow().is_empty());
+    assert!(!fake.is_live("muse:ada"));
+    assert!(out.record.hydration_dispatched);
+    assert!(delivered(&listener), "the prompt goes to the existing Muse");
+}
+
+#[test]
+fn the_shared_session_and_an_empty_window_are_never_killed() {
+    let dir = TempDir::new().unwrap();
+    let tmux = TmuxLog::install(dir.path(), true, &["ada"]);
+    for unit in ["muse", "muse:", ":ada", ":", ""] {
+        assert!(!TmuxRuntime.kill(unit), "{unit:?}");
+    }
+    assert!(tmux.calls().is_empty(), "{:?}", tmux.calls());
+
+    let fake = FakeRuntime::with_muse_windows(&["ada", "bob"]);
+    for unit in ["muse", "muse:", ":ada", ""] {
+        assert!(!fake.kill(unit), "{unit:?}");
+    }
+    assert!(fake.is_live("muse:ada") && fake.is_live("muse:bob") && fake.is_live("muse"));
+}
