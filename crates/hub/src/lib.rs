@@ -2914,7 +2914,7 @@ mod tests {
         let missing_route = handle_http_request(
             &state,
             &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
-                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_header("Authorization", "Bearer owner-tok-secret")
                 .with_json_body(&json!({ "mode": "clear" })),
         );
         assert_eq!(missing_route.status, 404);
@@ -2962,7 +2962,7 @@ mod tests {
         let alias = handle_http_request(
             &state,
             &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
-                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_header("Authorization", "Bearer owner-tok-secret")
                 .with_json_body(&json!({ "mode": "clear_only" })),
         );
         assert_eq!(alias.status, 200);
@@ -5211,20 +5211,131 @@ mod tests {
     }
 
     #[test]
-    fn prompt_and_clear_stay_callable_by_a_peer() {
+    fn prompt_stays_callable_by_a_peer() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
-        for (path, body) in [
-            (
-                "/api/v1/sessions/nobody/prompt",
-                json!({ "prompt": "hello" }),
-            ),
-            ("/api/v1/sessions/nobody/clear", json!({ "mode": "clear" })),
-        ] {
-            let resp = call(&state, "POST", path, PEER, &body);
-            assert_ne!(resp.status, 403, "{path}: {}", resp.json_value().unwrap());
-            assert_ne!(resp.status, 401, "{path}");
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/nobody/prompt",
+            PEER,
+            &json!({ "prompt": "hello" }),
+        );
+        assert_ne!(resp.status, 403, "{}", resp.json_value().unwrap());
+        assert_ne!(resp.status, 401);
+    }
+
+    #[test]
+    fn clear_and_reforge_are_owner_only_and_a_peer_changes_nothing() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
         }
+        let socket = tmp.path().join("felicia.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        // The Owner's `clear` is one webhook line; its `reforge` is a reset line and a prompt.
+        let lines = collect_webhook_lines(socket, 3);
+        state.enqueue_session_prompt(
+            "felicia",
+            Some("felicia".into()),
+            "queued prompt".into(),
+            "queued prompt".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        state.set_session_model_override(
+            "webhook-felicia",
+            session_actions::ModelOverride {
+                model: "model-a".into(),
+                thinking_level: None,
+            },
+        );
+        let mut frames = state.subscribe();
+
+        // A Peer is refused in both modes, and with an unparsable body too: the gate comes
+        // before the body is read.
+        for body in [
+            json!({ "mode": "clear" }),
+            json!({ "mode": "clear_only" }),
+            json!({ "mode": "reforge" }),
+            json!({ "mode": "rehydrate" }),
+            json!({ "mode": "wipe" }),
+        ] {
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/sessions/felicia/clear",
+                PEER,
+                &body,
+            );
+            assert_eq!(resp.status, 403, "{body}: {}", error_text(&resp));
+            assert!(error_text(&resp).contains("Owner"), "{body}");
+        }
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", format!("Bearer {PEER}"))
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+
+        // Nothing changed: the queue and the model override are intact and nothing was broadcast.
+        assert_eq!(state.session_queue("felicia").len(), 1);
+        assert_eq!(
+            state
+                .session_model_override("webhook-felicia")
+                .unwrap()
+                .model,
+            "model-a"
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a rejected call must broadcast nothing"
+        );
+
+        // The Owner still can, in both modes.
+        let cleared = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/felicia/clear",
+            OWNER,
+            &json!({ "mode": "clear" }),
+        );
+        assert_eq!(cleared.status, 200, "{}", error_text(&cleared));
+        assert!(state.session_queue("felicia").is_empty());
+        assert!(state.session_model_override("webhook-felicia").is_none());
+        let reforged = api::with_hydrate_lock(|| {
+            call(
+                &state,
+                "POST",
+                "/api/v1/sessions/felicia/clear",
+                OWNER,
+                &json!({ "mode": "reforge" }),
+            )
+        });
+        assert_eq!(reforged.status, 200, "{}", error_text(&reforged));
+        assert_eq!(reforged.json_value().unwrap()["mode"], "reforge");
+
+        // Only the Owner's two calls reached the route.
+        let delivered = lines.join().unwrap();
+        assert_eq!(delivered.len(), 3);
     }
 
     #[test]
