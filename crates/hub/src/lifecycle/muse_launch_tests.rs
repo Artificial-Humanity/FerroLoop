@@ -59,6 +59,9 @@ fn muse_launch(prompt: &str, home: &Path, persona: &str) -> LaunchSpec {
         env: vec![("AGENT_PERSONA".into(), persona.into())],
         argv: vec![
             home.join(".local/bin/muse").to_string_lossy().into_owned(),
+            "--model".into(),
+            MUSE_DEFAULT_MODEL.into(),
+            "--".into(),
             prompt.to_string(),
         ],
     }
@@ -108,6 +111,127 @@ impl Drop for MuseBinEnv {
             }
         }
     }
+}
+
+// ------------------------------------------------------------------- the model id
+
+#[test]
+fn muse_model_names_normalise_to_catalog_ids() {
+    let rows: [(Option<&str>, &str); 14] = [
+        (Some("muse-wonder-full"), "muse-wonder-full-1.0"),
+        (Some("muse-wonder"), "muse-wonder-1.0"),
+        (Some("muse-spark"), "muse-spark-1.3"),
+        (Some("  Muse-Wonder-Full  "), "muse-wonder-full-1.0"),
+        (Some("MUSE-SPARK"), "muse-spark-1.3"),
+        (Some("muse-wonder-full-1.0"), "muse-wonder-full-1.0"),
+        (Some("muse-wonder-1.0"), "muse-wonder-1.0"),
+        (Some("muse-spark-1.3"), "muse-spark-1.3"),
+        (Some("MUSE-SPARK-1.3"), "muse-spark-1.3"),
+        (None, "muse-wonder-full-1.0"),
+        (Some(""), "muse-wonder-full-1.0"),
+        (Some("   "), "muse-wonder-full-1.0"),
+        // Any other plain id passes through, as typed.
+        (Some("muse-future-2.0"), "muse-future-2.0"),
+        (Some(" Local_Model.v2 "), "Local_Model.v2"),
+    ];
+    for (requested, want) in rows {
+        assert_eq!(normalize_muse_model(requested), want, "{requested:?}");
+    }
+}
+
+#[test]
+fn a_muse_model_that_is_not_a_plain_id_falls_back_to_the_default() {
+    let too_long = "a".repeat(65);
+    let longest = "a".repeat(64);
+    for bad in [
+        "--help",
+        "-m",
+        "-muse-spark",
+        "--model=x",
+        ".hidden",
+        "_x",
+        "a b",
+        "a;b",
+        "a\nb",
+        "mu$e",
+        "modèle",
+        too_long.as_str(),
+    ] {
+        assert_eq!(
+            normalize_muse_model(Some(bad)),
+            MUSE_DEFAULT_MODEL,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(normalize_muse_model(Some(&longest)), longest);
+}
+
+#[test]
+fn the_launch_argv_puts_the_model_before_the_separator_and_the_prompt_last() {
+    let _bin = MuseBinEnv::cleared();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+    let bin = home
+        .path()
+        .join(".local/bin/muse")
+        .to_string_lossy()
+        .into_owned();
+    for (requested, want) in [
+        (None, "muse-wonder-full-1.0"),
+        (Some("muse-spark"), "muse-spark-1.3"),
+        (Some("--evil"), "muse-wonder-full-1.0"),
+    ] {
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let mut request = req("ada", "muse");
+        request.model = requested.map(Into::into);
+        let out = spin_up(
+            &store,
+            &fake.env(home.path()),
+            &request,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let launches = fake.launches.borrow();
+        let argv = &launches[0].1.as_ref().unwrap().argv;
+        assert_eq!(
+            argv,
+            &[
+                bin.clone(),
+                "--model".to_string(),
+                want.to_string(),
+                "--".to_string(),
+                out.prompt.unwrap(),
+            ],
+            "{requested:?}"
+        );
+    }
+}
+
+#[test]
+fn a_restart_launches_with_the_recorded_model_normalised() {
+    let _bin = MuseBinEnv::cleared();
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    install_home_muse(home.path());
+    let first = FakeRuntime::default();
+    let mut request = req("ada", "muse");
+    request.model = Some("muse-wonder".into());
+    let out = spin_up(
+        &store,
+        &first.env(home.path()),
+        &request,
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    // The tmux session is gone, so the restart reopens it.
+    let second = FakeRuntime::default();
+    restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
+    let launches = second.launches.borrow();
+    let argv = &launches[0].1.as_ref().expect("restart launches").argv;
+    assert_eq!(&argv[1..4], ["--model", "muse-wonder-1.0", "--"]);
 }
 
 // ------------------------------------------------------------------- what is launched

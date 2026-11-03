@@ -333,12 +333,60 @@ pub struct LaunchSpec {
     pub argv: Vec<String>,
 }
 
+/// The Muse model used when none is requested (or the request is unusable).
+pub(crate) const MUSE_DEFAULT_MODEL: &str = "muse-wonder-full-1.0";
+
+/// The Muse catalog model ids the CLI accepts for `--model`, default first. Discovery offers
+/// these as the selectable models; [`normalize_muse_model`] maps a request onto them.
+pub(crate) const MUSE_CATALOG_MODELS: [&str; 3] =
+    [MUSE_DEFAULT_MODEL, "muse-wonder-1.0", "muse-spark-1.3"];
+
+/// Unversioned names the CLI rejects ("model ... does not exist"), with the catalog id each means.
+const MUSE_MODEL_ALIASES: [(&str, &str); 3] = [
+    ("muse-wonder-full", MUSE_DEFAULT_MODEL),
+    ("muse-wonder", "muse-wonder-1.0"),
+    ("muse-spark", "muse-spark-1.3"),
+];
+
+/// The model id to hand to `muse --model` for a requested `model`: a catalog id as is (any
+/// case), an unversioned name as its catalog id, nothing as [`MUSE_DEFAULT_MODEL`], and any
+/// other value as is only when it is a plain id (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, so it
+/// can never start with `-` and be read as a flag). An unusable value falls back to the default
+/// instead of failing the spin-up.
+pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
+    let trimmed = requested.map_or("", str::trim);
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(id) = MUSE_CATALOG_MODELS.iter().find(|id| **id == lower) {
+        return (*id).to_string();
+    }
+    if let Some((_, id)) = MUSE_MODEL_ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        return (*id).to_string();
+    }
+    let plain = trimmed.len() <= 64
+        && trimmed
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if plain {
+        trimmed.to_string()
+    } else {
+        MUSE_DEFAULT_MODEL.to_string()
+    }
+}
+
 /// The vendor CLI to start in a new runtime window, with `prompt` as its first input; `None`
-/// where the window stays a blank shell. Only Muse is launched so far.
+/// where the window stays a blank shell. Only Muse is launched so far. For Muse the argument
+/// vector is `<bin> --model <id> -- <prompt>`: `--model` is the CLI's flag (`muse --help`:
+/// `--model <MODEL>  Model id for non-echo providers`), and `--` keeps the prompt from ever
+/// being read as a flag.
 fn launch_spec_for(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     persona: &str,
+    model: Option<&str>,
     prompt: &str,
 ) -> Option<LaunchSpec> {
     (vendor == "muse").then(|| LaunchSpec {
@@ -351,6 +399,9 @@ fn launch_spec_for(
                     .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
                     .as_deref(),
             ),
+            "--model".to_string(),
+            normalize_muse_model(model),
+            "--".to_string(),
             prompt.to_string(),
         ],
     })
@@ -1510,7 +1561,7 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     };
     persist_hosted_session(store, &record, by)?;
 
-    let launch = launch_spec_for(env, &v.vendor, &v.persona, &prompt);
+    let launch = launch_spec_for(env, &v.vendor, &v.persona, v.model.as_deref(), &prompt);
     let spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
@@ -2009,7 +2060,13 @@ pub fn restart_hosted_session<S: StateStore>(
     }
     let display = capitalize(&record.persona);
     let prompt = prompt_for(&display, &record.project, &record.role);
-    let launch = launch_spec_for(env, &record.vendor, &record.persona, &prompt);
+    let launch = launch_spec_for(
+        env,
+        &record.vendor,
+        &record.persona,
+        record.model.as_deref(),
+        &prompt,
+    );
     let mut launched_with_prompt = false;
     let mut launch_died = false;
     if record.hosted
