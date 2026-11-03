@@ -727,6 +727,18 @@ export type SettingsTabId =
   | "accessibility"
   | "auth";
 
+export type ProjectSettingsSubTabId =
+  | "overview"
+  | "agents"
+  | "roles"
+  | "runtimes";
+
+export type AgentsSubTabId = "roster" | "roles" | "runtimes";
+
+export type SystemSubTabId = "general" | "storage" | "notifications";
+
+export type ProductsSubTabId = "catalog" | "installer";
+
 export interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -1288,6 +1300,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     null,
   );
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
+  const [projectSubTab, setProjectSubTab] =
+    useState<ProjectSettingsSubTabId>("overview");
+  const [agentsSubTab, setAgentsSubTab] = useState<AgentsSubTabId>("roster");
+  const [systemSubTab, setSystemSubTab] = useState<SystemSubTabId>("general");
+  const [productsSubTab, setProductsSubTab] =
+    useState<ProductsSubTabId>("catalog");
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
   );
@@ -1466,6 +1484,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     );
     if (initialProject) {
       setActiveTab("agents");
+      setProjectSubTab("overview");
     }
   }, [initialProject]);
 
@@ -1489,6 +1508,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
     );
     setActiveTab(initialProject ? "agents" : initialTab);
+    setProjectSubTab("overview");
+    setAgentsSubTab("roster");
+    setSystemSubTab("general");
+    setProductsSubTab("catalog");
     setTotpEnrollment(null);
     setTotpVerifyCode("");
     setTotpVerified(false);
@@ -2228,6 +2251,248 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const projectSummaryCardNode =
+    resolvedProjectFilter !== "all" ? (
+      <div
+        data-testid="settings-project-summary-card"
+        className="fd-card"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+          backgroundColor: "var(--bg-elevated)",
+          borderColor: "var(--border-accent)",
+          padding: "10px 12px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <strong
+              data-testid="settings-project-summary-name"
+              style={{ fontSize: "13px" }}
+            >
+              {resolvedProjectFilter}
+            </strong>
+            <span
+              className="fd-badge fd-mono"
+              data-testid="settings-project-summary-lead"
+            >
+              Lead: {projectSummaryLead}
+            </span>
+            <span
+              className="fd-badge fd-mono"
+              data-testid="session-cwd-badge"
+              title={`~/Projects/Artificial-Humanity/${resolvedProjectFilter}`}
+              style={{ color: "var(--text-muted)" }}
+            >
+              ~/Projects/Artificial-Humanity/{resolvedProjectFilter}
+            </span>
+            <span className="fd-badge fd-mono">
+              {filteredAgents.length}{" "}
+              {filteredAgents.length === 1 ? "agent" : "agents"}
+            </span>
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              type="button"
+              data-testid="project-pin-toggle-btn"
+              aria-pressed={pinnedProjects.has(
+                resolvedProjectFilter.trim().toLowerCase(),
+              )}
+              title={
+                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
+                  ? "Unpin Project"
+                  : "Pin Project"
+              }
+              aria-label={
+                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
+                  ? "Unpin Project"
+                  : "Pin Project"
+              }
+              className={`fd-btn${pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
+              style={{
+                padding: "4px 6px",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                lineHeight: 1,
+              }}
+              onClick={() => togglePinnedProject(resolvedProjectFilter)}
+            >
+              <PinIcon
+                pinned={pinnedProjects.has(
+                  resolvedProjectFilter.trim().toLowerCase(),
+                )}
+                circled={true}
+                size={16}
+              />
+            </button>
+            <button
+              type="button"
+              data-testid="settings-project-open-git-btn"
+              className="fd-btn"
+              style={{ fontSize: "11px", padding: "3px 8px" }}
+              onClick={() => {
+                onSelectCockpitTab?.("git");
+                onClose();
+              }}
+            >
+              Git &amp; PRs
+            </button>
+            <button
+              type="button"
+              data-testid="settings-project-open-board-btn"
+              className="fd-btn"
+              style={{ fontSize: "11px", padding: "3px 8px" }}
+              onClick={() => {
+                onSelectCockpitTab?.("board");
+                onClose();
+              }}
+            >
+              Board
+            </button>
+            <button
+              type="button"
+              data-testid="settings-project-open-artifacts-btn"
+              className="fd-btn"
+              style={{ fontSize: "11px", padding: "3px 8px" }}
+              onClick={() => {
+                onSelectCockpitTab?.("artifacts");
+                onClose();
+              }}
+            >
+              Project Artifacts
+            </button>
+          </div>
+        </div>
+
+        {/* Project Artifacts Directory row (Issue #207) */}
+        {(() => {
+          const projArtifactsInfo = getProjectArtifactsDirState(
+            resolvedProjectFilter,
+          );
+          return (
+            <div
+              data-testid="settings-project-artifacts-dir-row"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                paddingTop: "8px",
+                borderTop: "1px solid var(--border-subtle)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: "11.5px",
+                      fontWeight: 600,
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    Artifacts Directory:
+                  </span>
+                  <code
+                    data-testid="settings-project-artifacts-dir-value"
+                    className="fd-badge fd-mono"
+                    title={projArtifactsInfo.effectiveDir}
+                    style={{
+                      fontSize: "11px",
+                      maxWidth: "100%",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                  >
+                    {projArtifactsInfo.effectiveDir}
+                  </code>
+                  {projArtifactsInfo.artifactsDir && (
+                    <span
+                      data-testid="settings-project-artifacts-dir-override-badge"
+                      className="fd-badge fd-mono"
+                      style={{
+                        fontSize: "10px",
+                        color: "var(--accent-primary, #f59e0b)",
+                      }}
+                    >
+                      Override
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  data-testid="settings-project-change-artifacts-dir-btn"
+                  className="fd-btn"
+                  style={{ fontSize: "11px", padding: "3px 8px" }}
+                  onClick={() =>
+                    openProjectArtifactsDirModal(resolvedProjectFilter)
+                  }
+                >
+                  Change Artifacts Directory
+                </button>
+              </div>
+
+              {projectArtifactsDirStatus && (
+                <div
+                  role="status"
+                  data-testid="project-artifacts-dir-status"
+                  className="fd-card"
+                  style={{
+                    borderColor: "var(--diff-add-border)",
+                    backgroundColor: "var(--diff-add-bg)",
+                    color: "var(--diff-add-text)",
+                    fontSize: "11.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  {projectArtifactsDirStatus}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
+    ) : null;
+
   return (
     <div
       className="fd-modal-backdrop"
@@ -2248,7 +2513,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           maxWidth: "740px",
           width: "95vw",
           maxHeight: "88vh",
-          overflowY: "auto",
+          overflow: "hidden",
           display: "flex",
           flexDirection: "column",
           gap: "12px",
@@ -2256,11 +2521,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       >
         <div
           className="fd-modal-header"
+          data-testid="settings-modal-header"
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
             gap: "12px",
+            flexShrink: 0,
           }}
         >
           <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}>
@@ -2290,6 +2557,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             flexWrap: "wrap",
             borderBottom: "1px solid var(--border-subtle)",
             paddingBottom: "8px",
+            flexShrink: 0,
           }}
         >
           <button
@@ -2360,6 +2628,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           )}
         </div>
 
+        {/* Scrollable Middle Body */}
+        <div
+          data-testid="settings-scroll-body"
+          style={{
+            flex: 1,
+            minHeight: 0,
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+            paddingRight: "2px",
+          }}
+        >
         {error && (
           <div
             role="alert"
@@ -2475,6 +2756,140 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
+          {initialProject ? (
+            <div
+              role="tablist"
+              aria-label="Project Settings Sub-Tabs"
+              data-testid="project-settings-subtab-bar"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                gap: "4px",
+                padding: "3px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                position: "sticky",
+                top: 0,
+                zIndex: 2,
+              }}
+            >
+              {(
+                [
+                  { id: "overview", label: "Overview & Storage" },
+                  { id: "agents", label: "Agents & Bulk Ops" },
+                  { id: "roles", label: "Roles" },
+                  { id: "runtimes", label: "Cloud & Local Runtimes" },
+                ] as const
+              ).map((sub) => {
+                const isSelected = projectSubTab === sub.id;
+                return (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    data-testid={`project-tab-${sub.id}`}
+                    className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                    style={{
+                      fontSize: "11.5px",
+                      fontWeight: isSelected ? 700 : 500,
+                      padding: "5px 8px",
+                      justifyContent: "center",
+                      textAlign: "center",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                    onClick={() => setProjectSubTab(sub.id)}
+                  >
+                    {sub.label}
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div
+              role="tablist"
+              aria-label="Agents Settings Sub-Tabs"
+              data-testid="agents-subtab-bar"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                gap: "4px",
+                padding: "3px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                position: "sticky",
+                top: 0,
+                zIndex: 2,
+              }}
+            >
+              {(
+                [
+                  { id: "roster", label: "Roster & Bulk Ops" },
+                  { id: "roles", label: "Role Registry" },
+                  { id: "runtimes", label: "Cloud & Local Runtimes" },
+                ] as const
+              ).map((sub) => {
+                const isSelected = agentsSubTab === sub.id;
+                return (
+                  <button
+                    key={sub.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    data-testid={`agents-subtab-${sub.id}`}
+                    className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                    style={{
+                      fontSize: "11.5px",
+                      fontWeight: isSelected ? 700 : 500,
+                      padding: "5px 8px",
+                      justifyContent: "center",
+                      textAlign: "center",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                    }}
+                    onClick={() => setAgentsSubTab(sub.id)}
+                  >
+                    {sub.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {initialProject && (
+            <div
+              data-testid="project-subpanel-overview"
+              style={{
+                display: projectSubTab === "overview" ? "flex" : "none",
+                flexDirection: "column",
+                gap: "12px",
+              }}
+            >
+              {projectSummaryCardNode}
+            </div>
+          )}
+
+          <div
+            data-testid={
+              initialProject ? "project-subpanel-agents" : "agents-subpanel-roster"
+            }
+            style={{
+              display: (
+                initialProject
+                  ? projectSubTab === "agents"
+                  : agentsSubTab === "roster"
+              )
+                ? "flex"
+                : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
           <div
             className="fd-card"
             style={{
@@ -2610,225 +3025,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             </div>
 
-            {/* Scoped Project Summary Card (shown when a project is selected) */}
-            {resolvedProjectFilter !== "all" && (
-              <div
-                data-testid="settings-project-summary-card"
-                className="fd-card"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "8px",
-                  backgroundColor: "var(--bg-elevated)",
-                  borderColor: "var(--border-accent)",
-                  padding: "10px 12px",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                    <strong
-                      data-testid="settings-project-summary-name"
-                      style={{ fontSize: "13px" }}
-                    >
-                      {resolvedProjectFilter}
-                    </strong>
-                    <span className="fd-badge fd-mono" data-testid="settings-project-summary-lead">
-                      Lead: {projectSummaryLead}
-                    </span>
-                    <span
-                      className="fd-badge fd-mono"
-                      data-testid="session-cwd-badge"
-                      title={`~/Projects/Artificial-Humanity/${resolvedProjectFilter}`}
-                      style={{ color: "var(--text-muted)" }}
-                    >
-                      ~/Projects/Artificial-Humanity/{resolvedProjectFilter}
-                    </span>
-                    <span className="fd-badge fd-mono">
-                      {filteredAgents.length} {filteredAgents.length === 1 ? "agent" : "agents"}
-                    </span>
-                  </div>
-
-                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      data-testid="project-pin-toggle-btn"
-                      aria-pressed={pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())}
-                      title={
-                        pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                          ? "Unpin Project"
-                          : "Pin Project"
-                      }
-                      aria-label={
-                        pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                          ? "Unpin Project"
-                          : "Pin Project"
-                      }
-                      className={`fd-btn${pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
-                      style={{
-                        padding: "4px 6px",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        lineHeight: 1,
-                      }}
-                      onClick={() => togglePinnedProject(resolvedProjectFilter)}
-                    >
-                      <PinIcon
-                        pinned={pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())}
-                        circled={true}
-                        size={16}
-                      />
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="settings-project-open-git-btn"
-                      className="fd-btn"
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => {
-                        onSelectCockpitTab?.("git");
-                        onClose();
-                      }}
-                    >
-                      Git &amp; PRs
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="settings-project-open-board-btn"
-                      className="fd-btn"
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => {
-                        onSelectCockpitTab?.("board");
-                        onClose();
-                      }}
-                    >
-                      Board
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="settings-project-open-artifacts-btn"
-                      className="fd-btn"
-                      style={{ fontSize: "11px", padding: "3px 8px" }}
-                      onClick={() => {
-                        onSelectCockpitTab?.("artifacts");
-                        onClose();
-                      }}
-                    >
-                      Project Artifacts
-                    </button>
-                  </div>
-                </div>
-
-                {/* Project Artifacts Directory row (Issue #207) */}
-                {(() => {
-                  const projArtifactsInfo = getProjectArtifactsDirState(
-                    resolvedProjectFilter,
-                  );
-                  return (
-                    <div
-                      data-testid="settings-project-artifacts-dir-row"
-                      style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        gap: "6px",
-                        paddingTop: "8px",
-                        borderTop: "1px solid var(--border-subtle)",
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          gap: "8px",
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "8px",
-                            flexWrap: "wrap",
-                            minWidth: 0,
-                          }}
-                        >
-                          <span
-                            style={{
-                              fontSize: "11.5px",
-                              fontWeight: 600,
-                              color: "var(--text-secondary)",
-                            }}
-                          >
-                            Artifacts Directory:
-                          </span>
-                          <code
-                            data-testid="settings-project-artifacts-dir-value"
-                            className="fd-badge fd-mono"
-                            title={projArtifactsInfo.effectiveDir}
-                            style={{
-                              fontSize: "11px",
-                              maxWidth: "100%",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                            }}
-                          >
-                            {projArtifactsInfo.effectiveDir}
-                          </code>
-                          {projArtifactsInfo.artifactsDir && (
-                            <span
-                              data-testid="settings-project-artifacts-dir-override-badge"
-                              className="fd-badge fd-mono"
-                              style={{
-                                fontSize: "10px",
-                                color: "var(--accent-primary, #f59e0b)",
-                              }}
-                            >
-                              Override
-                            </span>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          data-testid="settings-project-change-artifacts-dir-btn"
-                          className="fd-btn"
-                          style={{ fontSize: "11px", padding: "3px 8px" }}
-                          onClick={() =>
-                            openProjectArtifactsDirModal(resolvedProjectFilter)
-                          }
-                        >
-                          Change Artifacts Directory
-                        </button>
-                      </div>
-
-                      {projectArtifactsDirStatus && (
-                        <div
-                          role="status"
-                          data-testid="project-artifacts-dir-status"
-                          className="fd-card"
-                          style={{
-                            borderColor: "var(--diff-add-border)",
-                            backgroundColor: "var(--diff-add-bg)",
-                            color: "var(--diff-add-text)",
-                            fontSize: "11.5px",
-                            padding: "6px 10px",
-                          }}
-                        >
-                          {projectArtifactsDirStatus}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
+            {/* Scoped Project Summary Card (shown in General Settings when a project is selected) */}
+            {!initialProject && projectSummaryCardNode}
 
             <div
               data-testid="settings-agents-list"
@@ -3203,7 +3401,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
           </div>
+          </div>
 
+          <div
+            data-testid={
+              initialProject ? "project-subpanel-roles" : "agents-subpanel-roles"
+            }
+            style={{
+              display: (
+                initialProject
+                  ? projectSubTab === "roles"
+                  : agentsSubTab === "roles"
+              )
+                ? "flex"
+                : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
           {/* Record #74: User-Configurable Agent Role Registry */}
           <div
             className="fd-card"
@@ -3491,7 +3706,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             </div>
           </div>
+          </div>
 
+          <div
+            data-testid={
+              initialProject
+                ? "project-subpanel-runtimes"
+                : "agents-subpanel-runtimes"
+            }
+            style={{
+              display: (
+                initialProject
+                  ? projectSubTab === "runtimes"
+                  : agentsSubTab === "runtimes"
+              )
+                ? "flex"
+                : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
           {/* Record #71: Manage Vendor Cloud Sessions in FerroDeck */}
           <div
             className="fd-card"
@@ -3984,6 +4218,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </button>
             </div>
           </div>
+          </div>
         </div>
 
         {/* TAB 2: System */}
@@ -3999,6 +4234,65 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 gap: "12px",
               }}
             >
+              <div
+                role="tablist"
+                aria-label="System Settings Sub-Tabs"
+                data-testid="system-subtab-bar"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                  gap: "4px",
+                  padding: "3px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  position: "sticky",
+                  top: 0,
+                  zIndex: 2,
+                }}
+              >
+                {(
+                  [
+                    { id: "general", label: "General & Connectivity" },
+                    { id: "storage", label: "Storage & Artifacts" },
+                    { id: "notifications", label: "Notifications & Push" },
+                  ] as const
+                ).map((sub) => {
+                  const isSelected = systemSubTab === sub.id;
+                  return (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      data-testid={`system-subtab-${sub.id}`}
+                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                      style={{
+                        fontSize: "11.5px",
+                        fontWeight: isSelected ? 700 : 500,
+                        padding: "5px 8px",
+                        justifyContent: "center",
+                        textAlign: "center",
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                      onClick={() => setSystemSubTab(sub.id)}
+                    >
+                      {sub.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                data-testid="system-subpanel-general"
+                style={{
+                  display: systemSubTab === "general" ? "flex" : "none",
+                  flexDirection: "column",
+                  gap: "12px",
+                }}
+              >
           {/* Fleet Nodes & Connectivity Launcher */}
           <div
             className="fd-card"
@@ -4229,6 +4523,393 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </select>
             </div>
 
+            <hr
+              style={{
+                border: "none",
+                borderTop: "1px solid var(--border-subtle)",
+                margin: 0,
+              }}
+            />
+
+            {/* Hub & Polling Connection */}
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: "12.5px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Hub &amp; Polling Connection
+              </h3>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "wrap",
+                  fontSize: "12.5px",
+                }}
+              >
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    data-testid="toggle-auto-reconnect"
+                    checked={settings.hub_connection.auto_reconnect_ws}
+                    onChange={(e) => {
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        hub_connection: {
+                          ...prev.hub_connection,
+                          auto_reconnect_ws: e.target.checked,
+                        },
+                      }));
+                    }}
+                  />
+                  <span>Auto-reconnect WebSocket</span>
+                </label>
+
+                <label
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                  }}
+                >
+                  <span>Poll Interval (secs):</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={60}
+                    aria-label="Poll Interval (secs)"
+                    data-testid="input-poll-interval"
+                    className="fd-input fd-mono"
+                    value={settings.hub_connection.poll_interval_secs}
+                    onChange={(e) => {
+                      const parsed = Number(e.target.value);
+                      setSettingsSaved(false);
+                      setSettings((prev) => ({
+                        ...prev,
+                        hub_connection: {
+                          ...prev.hub_connection,
+                          poll_interval_secs:
+                            Number.isFinite(parsed) && parsed > 0 ? parsed : 1,
+                        },
+                      }));
+                    }}
+                    style={{ width: "68px", fontSize: "12px", padding: "4px 8px" }}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                data-testid="save-settings-btn"
+                className="fd-btn fd-btn-primary"
+                disabled={savingSettings}
+                onClick={() => void handleSaveSettings()}
+              >
+                {savingSettings ? "Saving..." : "Save Settings"}
+              </button>
+            </div>
+          </div>
+
+          {/* Records 52 & 53: Cloud Sync & Edge Gate Adapters Section */}
+          <div
+            className="fd-card"
+            data-testid="settings-cloud-adapters-section"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            <div>
+              <h3
+                style={{
+                  margin: "0 0 4px 0",
+                  fontSize: "13px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Cloud Sync &amp; Edge Gate Adapters
+              </h3>
+              <p
+                style={{
+                  margin: 0,
+                  fontSize: "12px",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                Configure multi-cloud FerroStore synchronization (`GCP`, `AWS`,
+                `Azure`) and FerroGate cloud registry, Secret Manager + IAM, and
+                Model Armor edge protection.
+              </p>
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: "10px",
+                fontSize: "12px",
+              }}
+            >
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>Store Sync Provider</span>
+                <select
+                  aria-label="Store Sync Provider"
+                  data-testid="cloud-sync-provider-select"
+                  className="fd-select fd-mono"
+                  value={cloudAdapters.store_sync.provider}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      store_sync: {
+                        ...prev.store_sync,
+                        provider:
+                          e.target.value as CloudAdaptersConfig["store_sync"]["provider"],
+                      },
+                    }));
+                  }}
+                >
+                  <option value="none">none</option>
+                  <option value="gcp">gcp (Cloud SQL + GCS)</option>
+                  <option value="aws">aws (Aurora + S3)</option>
+                  <option value="azure">azure (Postgres + Blob)</option>
+                </select>
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>Store Sync Mode</span>
+                <select
+                  aria-label="Store Sync Mode"
+                  data-testid="cloud-sync-mode-select"
+                  className="fd-select fd-mono"
+                  value={cloudAdapters.store_sync.sync_mode}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      store_sync: {
+                        ...prev.store_sync,
+                        sync_mode:
+                          e.target.value as CloudAdaptersConfig["store_sync"]["sync_mode"],
+                      },
+                    }));
+                  }}
+                >
+                  <option value="write_through">write_through</option>
+                  <option value="write_behind">write_behind</option>
+                  <option value="local_cache">local_cache</option>
+                  <option value="cloud_pre_cache">cloud_pre_cache</option>
+                </select>
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>Store Sync Endpoint URL</span>
+                <input
+                  type="text"
+                  aria-label="Store Sync Endpoint URL"
+                  data-testid="cloud-sync-endpoint-input"
+                  className="fd-input fd-mono"
+                  placeholder="https://store-sync.example.com"
+                  value={cloudAdapters.store_sync.endpoint_url}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      store_sync: {
+                        ...prev.store_sync,
+                        endpoint_url: e.target.value,
+                      },
+                    }));
+                  }}
+                />
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>Gate Cloud Registry Provider</span>
+                <select
+                  aria-label="Gate Cloud Registry Provider"
+                  data-testid="cloud-gate-provider-select"
+                  className="fd-select fd-mono"
+                  value={cloudAdapters.gate_cloud.registry_provider}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      gate_cloud: {
+                        ...prev.gate_cloud,
+                        registry_provider:
+                          e.target.value as CloudAdaptersConfig["gate_cloud"]["registry_provider"],
+                      },
+                    }));
+                  }}
+                >
+                  <option value="none">none</option>
+                  <option value="gcp">gcp (Cloud API Registry)</option>
+                  <option value="aws">aws</option>
+                  <option value="azure">azure</option>
+                </select>
+              </label>
+
+              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+                <span>Cloud Run MCP Relay Endpoint URL</span>
+                <input
+                  type="text"
+                  aria-label="Cloud Run MCP Relay Endpoint URL"
+                  data-testid="cloud-relay-endpoint-input"
+                  className="fd-input fd-mono"
+                  placeholder="https://ferrogate-relay.a.run.app"
+                  value={cloudAdapters.gate_cloud.relay_endpoint_url}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      gate_cloud: {
+                        ...prev.gate_cloud,
+                        relay_endpoint_url: e.target.value,
+                      },
+                    }));
+                  }}
+                />
+              </label>
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                gap: "16px",
+                flexWrap: "wrap",
+                fontSize: "12.5px",
+              }}
+            >
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  data-testid="toggle-cloud-sync-enabled"
+                  checked={cloudAdapters.store_sync.enabled}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      store_sync: {
+                        ...prev.store_sync,
+                        enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Enable Cloud Store Sync</span>
+              </label>
+
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  data-testid="toggle-cloud-secret-manager"
+                  checked={cloudAdapters.gate_cloud.secret_manager_enabled}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      gate_cloud: {
+                        ...prev.gate_cloud,
+                        secret_manager_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Secret Manager + IAM Vault</span>
+              </label>
+
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  data-testid="toggle-cloud-model-armor"
+                  checked={cloudAdapters.gate_cloud.model_armor_enabled}
+                  onChange={(e) => {
+                    setCloudAdaptersSaved(false);
+                    setCloudAdapters((prev) => ({
+                      ...prev,
+                      gate_cloud: {
+                        ...prev.gate_cloud,
+                        model_armor_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Model Armor Edge Guard</span>
+              </label>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "flex-end" }}>
+              <button
+                type="button"
+                data-testid="save-cloud-adapters-btn"
+                className="fd-btn fd-btn-primary"
+                disabled={savingCloudAdapters}
+                onClick={() => void handleSaveCloudAdapters()}
+              >
+                {savingCloudAdapters ? "Saving..." : "Save Cloud Adapters"}
+              </button>
+            </div>
+          </div>
+              </div>
+
+              <div
+                data-testid="system-subpanel-storage"
+                style={{
+                  display: systemSubTab === "storage" ? "flex" : "none",
+                  flexDirection: "column",
+                  gap: "12px",
+                }}
+              >
+          <div
+            className="fd-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
             {/* Screenshot & Attachment Retention */}
             <div
               data-testid="settings-attachment-retention-row"
@@ -4491,14 +5172,384 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               )}
             </div>
 
-            <hr
+            {/* Record #186 & Record #77: Dedicated FerroDeck Artifact Directory Layout & Retention Lifecycle */}
+            <div
+              data-testid="dedicated-artifact-layout-card"
               style={{
-                border: "none",
-                borderTop: "1px solid var(--border-subtle)",
-                margin: 0,
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                padding: "10px 12px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                fontSize: "11.5px",
               }}
-            />
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h4
+                    style={{
+                      margin: 0,
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Dedicated FerroDeck Artifact Layout &amp; Consolidation (#186 / #77)
+                  </h4>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Consolidate scattered vendor CLI brain/scratch directories into
+                    canonical FerroDeck session storage.
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <code
+                    className="fd-badge fd-mono"
+                    data-testid="artifact-canonical-root-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    Root: {dedicatedArtifactLayout.canonical_root}
+                  </code>
+                  <code
+                    className="fd-badge fd-mono"
+                    data-testid="artifact-session-pattern-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    Layout: {dedicatedArtifactLayout.session_layout_pattern}
+                  </code>
+                </div>
+              </div>
 
+              {artifactConsolidateBanner && (
+                <div
+                  role="status"
+                  data-testid="artifact-consolidate-status-banner"
+                  className="fd-mono"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {artifactConsolidateBanner}
+                </div>
+              )}
+
+              {/* Scattered Vendor CLI Origins */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+                  gap: "6px",
+                }}
+              >
+                {dedicatedArtifactLayout.vendor_origins.map((origin) => (
+                  <div
+                    key={origin.vendor}
+                    data-testid={`artifact-vendor-origin-row-${origin.vendor}`}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "4px",
+                      border: "1px solid var(--border-subtle)",
+                      backgroundColor: "var(--bg-surface)",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "2px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "6px",
+                      }}
+                    >
+                      <strong>{origin.vendor_label}</strong>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`artifact-vendor-origin-status-${origin.vendor}`}
+                        style={{ fontSize: "10px" }}
+                      >
+                        {origin.consolidated ? "consolidated" : "scattered"}
+                      </span>
+                    </div>
+                    <code className="fd-mono" style={{ fontSize: "10px" }}>
+                      {origin.legacy_path} ({origin.discovered_files} files)
+                    </code>
+                  </div>
+                ))}
+              </div>
+
+              {/* Per-Kind & Per-Project Breakdown Badges */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {(
+                    ["image", "markdown", "diff", "log", "bundle"] as const
+                  ).map((kind) => (
+                    <span
+                      key={kind}
+                      className="fd-badge fd-mono"
+                      data-testid={`artifact-kind-breakdown-badge-${kind}`}
+                      style={{ fontSize: "10px" }}
+                    >
+                      {kind}:{" "}
+                      {(
+                        dedicatedArtifactLayout.by_kind_bytes[kind] /
+                        (1024 * 1024)
+                      ).toFixed(2)}{" "}
+                      MB
+                    </span>
+                  ))}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {Object.entries(dedicatedArtifactLayout.by_project_bytes).map(
+                    ([proj, bytes]) => (
+                      <span
+                        key={proj}
+                        className="fd-badge fd-mono"
+                        data-testid={`artifact-project-breakdown-badge-${proj}`}
+                        style={{ fontSize: "10px" }}
+                      >
+                        {proj}: {(bytes / (1024 * 1024)).toFixed(2)} MB
+                      </span>
+                    ),
+                  )}
+                </div>
+              </div>
+
+              {/* Retention Policy Controls & Consolidation Actions */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                    }}
+                  >
+                    <span>Keep Versions:</span>
+                    <input
+                      type="number"
+                      aria-label="Artifact Keep Latest Versions"
+                      data-testid="artifact-retention-keep-versions-input"
+                      className="fd-input fd-mono"
+                      value={
+                        dedicatedArtifactLayout.retention_policy
+                          .keep_latest_versions
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            keep_latest_versions: Number(e.target.value) || 1,
+                          },
+                        }))
+                      }
+                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
+                    />
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                    }}
+                  >
+                    <span>Auto-Archive Days:</span>
+                    <input
+                      type="number"
+                      aria-label="Artifact Auto Archive Days"
+                      data-testid="artifact-retention-archive-days-input"
+                      className="fd-input fd-mono"
+                      value={
+                        dedicatedArtifactLayout.retention_policy
+                          .auto_archive_days
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            auto_archive_days: Number(e.target.value) || 7,
+                          },
+                        }))
+                      }
+                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
+                    />
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      data-testid="artifact-retention-pin-specs-checkbox"
+                      checked={
+                        dedicatedArtifactLayout.retention_policy
+                          .pin_ratified_specs
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            pin_ratified_specs: e.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    <span>Pin Ratified Specs</span>
+                  </label>
+                </div>
+
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="artifact-consolidate-dryrun-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      const scatteredCount =
+                        dedicatedArtifactLayout.vendor_origins
+                          .filter((o) => !o.consolidated)
+                          .reduce((acc, o) => acc + o.discovered_files, 0);
+                      setArtifactConsolidateBanner(
+                        `Dry-run consolidation preview: ${scatteredCount} scattered vendor files ready to migrate into ${dedicatedArtifactLayout.session_layout_pattern}.`,
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/artifacts/consolidate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              dry_run: true,
+                              retention_policy:
+                                dedicatedArtifactLayout.retention_policy,
+                            }),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Preview Consolidation (Dry Run)
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="artifact-consolidate-apply-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      setDedicatedArtifactLayout((prev) => ({
+                        ...prev,
+                        vendor_origins: prev.vendor_origins.map((o) => ({
+                          ...o,
+                          consolidated: true,
+                        })),
+                      }));
+                      setArtifactConsolidateBanner(
+                        `Consolidated all scattered vendor artifacts into ${dedicatedArtifactLayout.canonical_root} (keep_latest_versions=${dedicatedArtifactLayout.retention_policy.keep_latest_versions}, auto_archive_days=${dedicatedArtifactLayout.retention_policy.auto_archive_days}).`,
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/artifacts/consolidate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              dry_run: false,
+                              retention_policy:
+                                dedicatedArtifactLayout.retention_policy,
+                            }),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Consolidate Vendor Artifacts
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+              </div>
+
+              <div
+                data-testid="system-subpanel-notifications"
+                style={{
+                  display: systemSubTab === "notifications" ? "flex" : "none",
+                  flexDirection: "column",
+                  gap: "12px",
+                }}
+              >
+          <div
+            className="fd-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
             {/* Notification Rules */}
             <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
               <h3
@@ -4969,736 +6020,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
             </div>
-
-            {/* Record #186 & Record #77: Dedicated FerroDeck Artifact Directory Layout & Retention Lifecycle */}
-            <div
-              data-testid="dedicated-artifact-layout-card"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "8px",
-                padding: "10px 12px",
-                borderRadius: "6px",
-                backgroundColor: "var(--bg-elevated)",
-                border: "1px solid var(--border-subtle)",
-                fontSize: "11.5px",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div>
-                  <h4
-                    style={{
-                      margin: 0,
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.04em",
-                    }}
-                  >
-                    Dedicated FerroDeck Artifact Layout &amp; Consolidation (#186 / #77)
-                  </h4>
-                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                    Consolidate scattered vendor CLI brain/scratch directories into
-                    canonical FerroDeck session storage.
-                  </span>
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <code
-                    className="fd-badge fd-mono"
-                    data-testid="artifact-canonical-root-badge"
-                    style={{ fontSize: "10px" }}
-                  >
-                    Root: {dedicatedArtifactLayout.canonical_root}
-                  </code>
-                  <code
-                    className="fd-badge fd-mono"
-                    data-testid="artifact-session-pattern-badge"
-                    style={{ fontSize: "10px" }}
-                  >
-                    Layout: {dedicatedArtifactLayout.session_layout_pattern}
-                  </code>
-                </div>
-              </div>
-
-              {artifactConsolidateBanner && (
-                <div
-                  role="status"
-                  data-testid="artifact-consolidate-status-banner"
-                  className="fd-mono"
-                  style={{
-                    fontSize: "11px",
-                    color: "#34D399",
-                    padding: "4px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "rgba(16, 185, 129, 0.12)",
-                  }}
-                >
-                  {artifactConsolidateBanner}
-                </div>
-              )}
-
-              {/* Scattered Vendor CLI Origins */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
-                  gap: "6px",
-                }}
-              >
-                {dedicatedArtifactLayout.vendor_origins.map((origin) => (
-                  <div
-                    key={origin.vendor}
-                    data-testid={`artifact-vendor-origin-row-${origin.vendor}`}
-                    style={{
-                      padding: "6px 8px",
-                      borderRadius: "4px",
-                      border: "1px solid var(--border-subtle)",
-                      backgroundColor: "var(--bg-surface)",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: "2px",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "6px",
-                      }}
-                    >
-                      <strong>{origin.vendor_label}</strong>
-                      <span
-                        className="fd-badge fd-mono"
-                        data-testid={`artifact-vendor-origin-status-${origin.vendor}`}
-                        style={{ fontSize: "10px" }}
-                      >
-                        {origin.consolidated ? "consolidated" : "scattered"}
-                      </span>
-                    </div>
-                    <code className="fd-mono" style={{ fontSize: "10px" }}>
-                      {origin.legacy_path} ({origin.discovered_files} files)
-                    </code>
-                  </div>
-                ))}
-              </div>
-
-              {/* Per-Kind & Per-Project Breakdown Badges */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "4px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  {(
-                    ["image", "markdown", "diff", "log", "bundle"] as const
-                  ).map((kind) => (
-                    <span
-                      key={kind}
-                      className="fd-badge fd-mono"
-                      data-testid={`artifact-kind-breakdown-badge-${kind}`}
-                      style={{ fontSize: "10px" }}
-                    >
-                      {kind}:{" "}
-                      {(
-                        dedicatedArtifactLayout.by_kind_bytes[kind] /
-                        (1024 * 1024)
-                      ).toFixed(2)}{" "}
-                      MB
-                    </span>
-                  ))}
-                </div>
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "4px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  {Object.entries(dedicatedArtifactLayout.by_project_bytes).map(
-                    ([proj, bytes]) => (
-                      <span
-                        key={proj}
-                        className="fd-badge fd-mono"
-                        data-testid={`artifact-project-breakdown-badge-${proj}`}
-                        style={{ fontSize: "10px" }}
-                      >
-                        {proj}: {(bytes / (1024 * 1024)).toFixed(2)} MB
-                      </span>
-                    ),
-                  )}
-                </div>
-              </div>
-
-              {/* Retention Policy Controls & Consolidation Actions */}
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                  }}
-                >
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "4px",
-                    }}
-                  >
-                    <span>Keep Versions:</span>
-                    <input
-                      type="number"
-                      aria-label="Artifact Keep Latest Versions"
-                      data-testid="artifact-retention-keep-versions-input"
-                      className="fd-input fd-mono"
-                      value={
-                        dedicatedArtifactLayout.retention_policy
-                          .keep_latest_versions
-                      }
-                      onChange={(e) =>
-                        setDedicatedArtifactLayout((prev) => ({
-                          ...prev,
-                          retention_policy: {
-                            ...prev.retention_policy,
-                            keep_latest_versions: Number(e.target.value) || 1,
-                          },
-                        }))
-                      }
-                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
-                    />
-                  </label>
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "4px",
-                    }}
-                  >
-                    <span>Auto-Archive Days:</span>
-                    <input
-                      type="number"
-                      aria-label="Artifact Auto Archive Days"
-                      data-testid="artifact-retention-archive-days-input"
-                      className="fd-input fd-mono"
-                      value={
-                        dedicatedArtifactLayout.retention_policy
-                          .auto_archive_days
-                      }
-                      onChange={(e) =>
-                        setDedicatedArtifactLayout((prev) => ({
-                          ...prev,
-                          retention_policy: {
-                            ...prev.retention_policy,
-                            auto_archive_days: Number(e.target.value) || 7,
-                          },
-                        }))
-                      }
-                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
-                    />
-                  </label>
-                  <label
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: "4px",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      data-testid="artifact-retention-pin-specs-checkbox"
-                      checked={
-                        dedicatedArtifactLayout.retention_policy
-                          .pin_ratified_specs
-                      }
-                      onChange={(e) =>
-                        setDedicatedArtifactLayout((prev) => ({
-                          ...prev,
-                          retention_policy: {
-                            ...prev.retention_policy,
-                            pin_ratified_specs: e.target.checked,
-                          },
-                        }))
-                      }
-                    />
-                    <span>Pin Ratified Specs</span>
-                  </label>
-                </div>
-
-                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    data-testid="artifact-consolidate-dryrun-btn"
-                    style={{ fontSize: "11px", padding: "3px 8px" }}
-                    onClick={() => {
-                      const scatteredCount =
-                        dedicatedArtifactLayout.vendor_origins
-                          .filter((o) => !o.consolidated)
-                          .reduce((acc, o) => acc + o.discovered_files, 0);
-                      setArtifactConsolidateBanner(
-                        `Dry-run consolidation preview: ${scatteredCount} scattered vendor files ready to migrate into ${dedicatedArtifactLayout.session_layout_pattern}.`,
-                      );
-                      if (typeof globalThis.fetch === "function") {
-                        void globalThis
-                          .fetch("/api/v1/artifacts/consolidate", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                              dry_run: true,
-                              retention_policy:
-                                dedicatedArtifactLayout.retention_policy,
-                            }),
-                          })
-                          .catch(() => {});
-                      }
-                    }}
-                  >
-                    Preview Consolidation (Dry Run)
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid="artifact-consolidate-apply-btn"
-                    style={{ fontSize: "11px", padding: "3px 8px" }}
-                    onClick={() => {
-                      setDedicatedArtifactLayout((prev) => ({
-                        ...prev,
-                        vendor_origins: prev.vendor_origins.map((o) => ({
-                          ...o,
-                          consolidated: true,
-                        })),
-                      }));
-                      setArtifactConsolidateBanner(
-                        `Consolidated all scattered vendor artifacts into ${dedicatedArtifactLayout.canonical_root} (keep_latest_versions=${dedicatedArtifactLayout.retention_policy.keep_latest_versions}, auto_archive_days=${dedicatedArtifactLayout.retention_policy.auto_archive_days}).`,
-                      );
-                      if (typeof globalThis.fetch === "function") {
-                        void globalThis
-                          .fetch("/api/v1/artifacts/consolidate", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                              dry_run: false,
-                              retention_policy:
-                                dedicatedArtifactLayout.retention_policy,
-                            }),
-                          })
-                          .catch(() => {});
-                      }
-                    }}
-                  >
-                    Consolidate Vendor Artifacts
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <hr
-              style={{
-                border: "none",
-                borderTop: "1px solid var(--border-subtle)",
-                margin: 0,
-              }}
-            />
-
-            {/* Hub & Polling Connection */}
-            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-              <h3
-                style={{
-                  margin: 0,
-                  fontSize: "12.5px",
-                  fontWeight: 700,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.04em",
-                }}
-              >
-                Hub &amp; Polling Connection
-              </h3>
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "12px",
-                  flexWrap: "wrap",
-                  fontSize: "12.5px",
-                }}
-              >
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    data-testid="toggle-auto-reconnect"
-                    checked={settings.hub_connection.auto_reconnect_ws}
-                    onChange={(e) => {
-                      setSettingsSaved(false);
-                      setSettings((prev) => ({
-                        ...prev,
-                        hub_connection: {
-                          ...prev.hub_connection,
-                          auto_reconnect_ws: e.target.checked,
-                        },
-                      }));
-                    }}
-                  />
-                  <span>Auto-reconnect WebSocket</span>
-                </label>
-
-                <label
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "6px",
-                  }}
-                >
-                  <span>Poll Interval (secs):</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={60}
-                    aria-label="Poll Interval (secs)"
-                    data-testid="input-poll-interval"
-                    className="fd-input fd-mono"
-                    value={settings.hub_connection.poll_interval_secs}
-                    onChange={(e) => {
-                      const parsed = Number(e.target.value);
-                      setSettingsSaved(false);
-                      setSettings((prev) => ({
-                        ...prev,
-                        hub_connection: {
-                          ...prev.hub_connection,
-                          poll_interval_secs:
-                            Number.isFinite(parsed) && parsed > 0 ? parsed : 1,
-                        },
-                      }));
-                    }}
-                    style={{ width: "68px", fontSize: "12px", padding: "4px 8px" }}
-                  />
-                </label>
-              </div>
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button
-                type="button"
-                data-testid="save-settings-btn"
-                className="fd-btn fd-btn-primary"
-                disabled={savingSettings}
-                onClick={() => void handleSaveSettings()}
-              >
-                {savingSettings ? "Saving..." : "Save Settings"}
-              </button>
-            </div>
           </div>
-
-          {/* Records 52 & 53: Cloud Sync & Edge Gate Adapters Section */}
-          <div
-            className="fd-card"
-            data-testid="settings-cloud-adapters-section"
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "12px",
-            }}
-          >
-            <div>
-              <h3
-                style={{
-                  margin: "0 0 4px 0",
-                  fontSize: "13px",
-                  fontWeight: 700,
-                  textTransform: "uppercase",
-                  letterSpacing: "0.04em",
-                }}
-              >
-                Cloud Sync &amp; Edge Gate Adapters
-              </h3>
-              <p
-                style={{
-                  margin: 0,
-                  fontSize: "12px",
-                  color: "var(--text-secondary)",
-                }}
-              >
-                Configure multi-cloud FerroStore synchronization (`GCP`, `AWS`,
-                `Azure`) and FerroGate cloud registry, Secret Manager + IAM, and
-                Model Armor edge protection.
-              </p>
-            </div>
-
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                gap: "10px",
-                fontSize: "12px",
-              }}
-            >
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                <span>Store Sync Provider</span>
-                <select
-                  aria-label="Store Sync Provider"
-                  data-testid="cloud-sync-provider-select"
-                  className="fd-select fd-mono"
-                  value={cloudAdapters.store_sync.provider}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      store_sync: {
-                        ...prev.store_sync,
-                        provider:
-                          e.target.value as CloudAdaptersConfig["store_sync"]["provider"],
-                      },
-                    }));
-                  }}
-                >
-                  <option value="none">none</option>
-                  <option value="gcp">gcp (Cloud SQL + GCS)</option>
-                  <option value="aws">aws (Aurora + S3)</option>
-                  <option value="azure">azure (Postgres + Blob)</option>
-                </select>
-              </label>
-
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                <span>Store Sync Mode</span>
-                <select
-                  aria-label="Store Sync Mode"
-                  data-testid="cloud-sync-mode-select"
-                  className="fd-select fd-mono"
-                  value={cloudAdapters.store_sync.sync_mode}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      store_sync: {
-                        ...prev.store_sync,
-                        sync_mode:
-                          e.target.value as CloudAdaptersConfig["store_sync"]["sync_mode"],
-                      },
-                    }));
-                  }}
-                >
-                  <option value="write_through">write_through</option>
-                  <option value="write_behind">write_behind</option>
-                  <option value="local_cache">local_cache</option>
-                  <option value="cloud_pre_cache">cloud_pre_cache</option>
-                </select>
-              </label>
-
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                <span>Store Sync Endpoint URL</span>
-                <input
-                  type="text"
-                  aria-label="Store Sync Endpoint URL"
-                  data-testid="cloud-sync-endpoint-input"
-                  className="fd-input fd-mono"
-                  placeholder="https://store-sync.example.com"
-                  value={cloudAdapters.store_sync.endpoint_url}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      store_sync: {
-                        ...prev.store_sync,
-                        endpoint_url: e.target.value,
-                      },
-                    }));
-                  }}
-                />
-              </label>
-
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                <span>Gate Cloud Registry Provider</span>
-                <select
-                  aria-label="Gate Cloud Registry Provider"
-                  data-testid="cloud-gate-provider-select"
-                  className="fd-select fd-mono"
-                  value={cloudAdapters.gate_cloud.registry_provider}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      gate_cloud: {
-                        ...prev.gate_cloud,
-                        registry_provider:
-                          e.target.value as CloudAdaptersConfig["gate_cloud"]["registry_provider"],
-                      },
-                    }));
-                  }}
-                >
-                  <option value="none">none</option>
-                  <option value="gcp">gcp (Cloud API Registry)</option>
-                  <option value="aws">aws</option>
-                  <option value="azure">azure</option>
-                </select>
-              </label>
-
-              <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-                <span>Cloud Run MCP Relay Endpoint URL</span>
-                <input
-                  type="text"
-                  aria-label="Cloud Run MCP Relay Endpoint URL"
-                  data-testid="cloud-relay-endpoint-input"
-                  className="fd-input fd-mono"
-                  placeholder="https://ferrogate-relay.a.run.app"
-                  value={cloudAdapters.gate_cloud.relay_endpoint_url}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      gate_cloud: {
-                        ...prev.gate_cloud,
-                        relay_endpoint_url: e.target.value,
-                      },
-                    }));
-                  }}
-                />
-              </label>
-            </div>
-
-            <div
-              style={{
-                display: "flex",
-                gap: "16px",
-                flexWrap: "wrap",
-                fontSize: "12.5px",
-              }}
-            >
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  cursor: "pointer",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  data-testid="toggle-cloud-sync-enabled"
-                  checked={cloudAdapters.store_sync.enabled}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      store_sync: {
-                        ...prev.store_sync,
-                        enabled: e.target.checked,
-                      },
-                    }));
-                  }}
-                />
-                <span>Enable Cloud Store Sync</span>
-              </label>
-
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  cursor: "pointer",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  data-testid="toggle-cloud-secret-manager"
-                  checked={cloudAdapters.gate_cloud.secret_manager_enabled}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      gate_cloud: {
-                        ...prev.gate_cloud,
-                        secret_manager_enabled: e.target.checked,
-                      },
-                    }));
-                  }}
-                />
-                <span>Secret Manager + IAM Vault</span>
-              </label>
-
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  cursor: "pointer",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  data-testid="toggle-cloud-model-armor"
-                  checked={cloudAdapters.gate_cloud.model_armor_enabled}
-                  onChange={(e) => {
-                    setCloudAdaptersSaved(false);
-                    setCloudAdapters((prev) => ({
-                      ...prev,
-                      gate_cloud: {
-                        ...prev.gate_cloud,
-                        model_armor_enabled: e.target.checked,
-                      },
-                    }));
-                  }}
-                />
-                <span>Model Armor Edge Guard</span>
-              </label>
-            </div>
-
-            <div style={{ display: "flex", justifyContent: "flex-end" }}>
-              <button
-                type="button"
-                data-testid="save-cloud-adapters-btn"
-                className="fd-btn fd-btn-primary"
-                disabled={savingCloudAdapters}
-                onClick={() => void handleSaveCloudAdapters()}
-              >
-                {savingCloudAdapters ? "Saving..." : "Save Cloud Adapters"}
-              </button>
-            </div>
-          </div>
+              </div>
         </div>
 
         {/* TAB: Products (FerroLoop Installed Products & Subsystem Toggles) */}
@@ -5712,6 +6035,96 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
+          {/* Sub-tab bar for Products Settings */}
+          <div
+            role="tablist"
+            aria-label="Products Settings Sub-Sections"
+            data-testid="products-subtab-bar"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              flexWrap: "wrap",
+              padding: "4px",
+              borderRadius: "8px",
+              background: "var(--bg-elevated)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            {(
+              [
+                {
+                  id: "catalog" as const,
+                  label: "Products & Profiles",
+                  testId: "products-subtab-catalog",
+                },
+                {
+                  id: "installer" as const,
+                  label: "Installer, Doctor & Releases",
+                  testId: "products-subtab-installer",
+                },
+              ]
+            ).map((sub) => {
+              const isSelected = productsSubTab === sub.id;
+              return (
+                <button
+                  key={sub.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isSelected}
+                  data-testid={sub.testId}
+                  className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                  style={{ fontSize: "11.5px", padding: "5px 12px" }}
+                  onClick={() => setProductsSubTab(sub.id)}
+                >
+                  {sub.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {(() => {
+            const activeProfile = inferInstallProfilePreset(
+              settings.subsystems,
+              labProfilePreferred,
+            );
+            const selectedIds: string[] = [];
+            if (settings.subsystems.ferrodeck_enabled ?? true) {
+              selectedIds.push("ferrodeck");
+            }
+            if (settings.subsystems.ferrowire_enabled ?? true) {
+              selectedIds.push("ferrowire");
+            }
+            if (settings.subsystems.ferrostate_enabled) {
+              selectedIds.push("ferrostate");
+            }
+            if (settings.subsystems.ferrogate_enabled) {
+              selectedIds.push("ferrogate");
+            }
+            if (settings.subsystems.ferrotrack_enabled ?? true) {
+              selectedIds.push("ferrotrack");
+            }
+            if (settings.subsystems.ferrowatch_enabled ?? true) {
+              selectedIds.push("ferrowatch");
+            }
+            if (settings.subsystems.ferrostep_enabled) {
+              selectedIds.push("fl-flow");
+            }
+            const closure = computeProductDependencyClosure(
+              selectedIds,
+              activeProfile,
+            );
+
+            return (
+              <>
+                <div
+                  data-testid="products-subpanel-catalog"
+                  style={{
+                    display: productsSubTab === "catalog" ? "flex" : "none",
+                    flexDirection: "column",
+                    gap: "12px",
+                  }}
+                >
           <div
             className="fd-card"
             style={{
@@ -6952,41 +7365,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          {/* Record #84 (Issue #205 Phase B): Dependency Closure & Planned Service / Integration Actions */}
-          {(() => {
-            const activeProfile = inferInstallProfilePreset(
-              settings.subsystems,
-              labProfilePreferred,
-            );
-            const selectedIds: string[] = [];
-            if (settings.subsystems.ferrodeck_enabled ?? true) {
-              selectedIds.push("ferrodeck");
-            }
-            if (settings.subsystems.ferrowire_enabled ?? true) {
-              selectedIds.push("ferrowire");
-            }
-            if (settings.subsystems.ferrostate_enabled) {
-              selectedIds.push("ferrostate");
-            }
-            if (settings.subsystems.ferrogate_enabled) {
-              selectedIds.push("ferrogate");
-            }
-            if (settings.subsystems.ferrotrack_enabled ?? true) {
-              selectedIds.push("ferrotrack");
-            }
-            if (settings.subsystems.ferrowatch_enabled ?? true) {
-              selectedIds.push("ferrowatch");
-            }
-            if (settings.subsystems.ferrostep_enabled) {
-              selectedIds.push("fl-flow");
-            }
-            const closure = computeProductDependencyClosure(
-              selectedIds,
-              activeProfile,
-            );
-
-            return (
-              <>
+                {/* Record #84 (Issue #205 Phase B): Dependency Closure & Planned Service / Integration Actions */}
                 <div
                   className="fd-card"
                   data-testid="install-plan-preview"
@@ -7104,7 +7483,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </div>
                 </div>
+                </div>
 
+                <div
+                  data-testid="products-subpanel-installer"
+                  style={{
+                    display: productsSubTab === "installer" ? "flex" : "none",
+                    flexDirection: "column",
+                    gap: "12px",
+                  }}
+                >
                 {/* Record #84 (Issue #205 Phase B): Install Receipt & Release Provenance Inspector */}
                 <div
                   className="fd-card"
@@ -7733,6 +8121,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   );
                 })()}
+                </div>
               </>
             );
           })()}
@@ -8460,6 +8849,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
         )}
+        </div>
 
         {recastModalAgentKey && (() => {
           const modalAgent = effectiveAgents.find(
