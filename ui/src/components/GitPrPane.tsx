@@ -8,7 +8,7 @@ import type {
   WorktreeFileStatus,
   WorktreeSummary,
 } from "../types/api";
-import { DiffViewer } from "./DiffViewer";
+import { DiffViewer, type DiffReviewBatchPayload } from "./DiffViewer";
 
 export type PrReviewPayload = PrReviewRequest;
 export type PrMergePayload = PrMergeRequest;
@@ -25,6 +25,11 @@ export interface GitPrPaneProps {
   onRefreshWorktrees?: () => void;
   onReviewPr?: (number: number, payload: PrReviewPayload) => Promise<unknown> | void;
   onMergePr?: (number: number, payload: PrMergePayload) => Promise<unknown> | void;
+  onSubmitDiffReview?: (
+    batch: DiffReviewBatchPayload,
+  ) => Promise<{ queued?: boolean; status?: string } | unknown> | void;
+  sessionId?: string | null;
+  agentName?: string | null;
   loading?: boolean;
   error?: string | null;
   apiClient?: HubApiClient;
@@ -132,6 +137,9 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
   onRefreshWorktrees,
   onReviewPr,
   onMergePr,
+  onSubmitDiffReview,
+  sessionId = null,
+  agentName = null,
   loading = false,
   error = null,
   apiClient,
@@ -674,6 +682,10 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
                 diff={effectiveDiff.diff}
                 selectedFile={selectedFile}
                 onSelectFile={setSelectedFile}
+                sessionId={sessionId}
+                agentName={agentName}
+                apiClient={apiClient}
+                onSubmitReview={onSubmitDiffReview}
               />
             ) : (
               <div

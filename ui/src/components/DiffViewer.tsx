@@ -1,6 +1,25 @@
 import React from "react";
+import type { HubApiClient } from "../api/client";
 
 export type DiffLayoutMode = "unified" | "split";
+export type DiffCommentSide = "old" | "new" | "context";
+
+export interface DiffInlineComment {
+  id: string;
+  filePath: string;
+  hunkHeader: string;
+  oldLine: number | null;
+  newLine: number | null;
+  side: DiffCommentSide;
+  lineContent: string;
+  comment: string;
+}
+
+export interface DiffReviewBatchPayload {
+  summary: string;
+  comments: DiffInlineComment[];
+  formattedPrompt: string;
+}
 
 export interface ParsedDiffLine {
   type: "add" | "del" | "context";
@@ -32,6 +51,46 @@ export interface DiffViewerProps {
   selectedFile?: string | null;
   onSelectFile?: (path: string | null) => void;
   defaultMode?: DiffLayoutMode;
+  sessionId?: string | null;
+  agentName?: string | null;
+  apiClient?: HubApiClient;
+  onSubmitReview?: (
+    batch: DiffReviewBatchPayload,
+  ) => Promise<{ queued?: boolean; status?: string } | unknown> | void;
+}
+
+export function formatDiffReviewPrompt(
+  comments: DiffInlineComment[],
+  summary = "",
+): string {
+  const lines: string[] = ["## Inline Diff Review"];
+  const trimmedSummary = summary.trim();
+  if (trimmedSummary) {
+    lines.push("", trimmedSummary);
+  }
+
+  const byFile = new Map<string, DiffInlineComment[]>();
+  for (const item of comments) {
+    const bucket = byFile.get(item.filePath) ?? [];
+    bucket.push(item);
+    byFile.set(item.filePath, bucket);
+  }
+
+  for (const [filePath, fileComments] of byFile.entries()) {
+    lines.push("", `### \`${filePath}\``);
+    for (const c of fileComments) {
+      const lineNum = c.newLine ?? c.oldLine ?? 1;
+      const sidePrefix =
+        c.side === "new" ? "+" : c.side === "old" ? "-" : "context ";
+      const snippet = c.lineContent.trim();
+      const snippetLabel = snippet ? ` (\`${snippet}\`)` : "";
+      lines.push(
+        `- **Line ${lineNum} (${sidePrefix}L${lineNum})**${snippetLabel}: ${c.comment.trim()}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
 
 const HUNK_HEADER_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
@@ -190,13 +249,54 @@ function buildSplitPairs(lines: ParsedDiffLine[]): SplitPair[] {
   return pairs;
 }
 
+interface ActiveInlineEditorTarget {
+  lineKey: string;
+  filePath: string;
+  hunkHeader: string;
+  oldLine: number | null;
+  newLine: number | null;
+  side: DiffCommentSide;
+  lineContent: string;
+  editingCommentId?: string;
+}
+
+function lineSideFromType(type: ParsedDiffLine["type"]): DiffCommentSide {
+  if (type === "add") return "new";
+  if (type === "del") return "old";
+  return "context";
+}
+
+function makeLineKey(
+  filePath: string,
+  side: DiffCommentSide,
+  oldLine: number | null,
+  newLine: number | null,
+): string {
+  return `${filePath}::${side}::${oldLine ?? "-"}::${newLine ?? "-"}`;
+}
+
 export const DiffViewer: React.FC<DiffViewerProps> = ({
   diff,
   selectedFile = null,
   onSelectFile,
   defaultMode = "unified",
+  sessionId = null,
+  agentName = null,
+  apiClient,
+  onSubmitReview,
 }) => {
   const [mode, setMode] = React.useState<DiffLayoutMode>(defaultMode);
+  const [comments, setComments] = React.useState<DiffInlineComment[]>([]);
+  const [reviewSummary, setReviewSummary] = React.useState<string>("");
+  const [activeEditor, setActiveEditor] =
+    React.useState<ActiveInlineEditorTarget | null>(null);
+  const [editorText, setEditorText] = React.useState<string>("");
+  const [draftPanelOpen, setDraftPanelOpen] = React.useState<boolean>(false);
+  const [submittingReview, setSubmittingReview] = React.useState<boolean>(false);
+  const [reviewStatus, setReviewStatus] = React.useState<string | null>(null);
+  const [reviewError, setReviewError] = React.useState<string | null>(null);
+  const nextIdRef = React.useRef<number>(1);
+
   const parsedFiles = React.useMemo(() => parseUnifiedDiff(diff), [diff]);
 
   const visibleFiles = React.useMemo(() => {
@@ -240,6 +340,340 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       ),
     [visibleFiles],
   );
+
+  const openLineCommentEditor = (
+    filePath: string,
+    hunkHeader: string,
+    line: ParsedDiffLine,
+    overrideSide?: DiffCommentSide,
+    existingComment?: DiffInlineComment,
+  ) => {
+    const side = existingComment?.side ?? overrideSide ?? lineSideFromType(line.type);
+    const oldLine = existingComment ? existingComment.oldLine : line.oldLine;
+    const newLine = existingComment ? existingComment.newLine : line.newLine;
+    const lineKey = makeLineKey(filePath, side, oldLine, newLine);
+    setActiveEditor({
+      lineKey,
+      filePath,
+      hunkHeader,
+      oldLine,
+      newLine,
+      side,
+      lineContent: existingComment ? existingComment.lineContent : line.content,
+      editingCommentId: existingComment?.id,
+    });
+    setEditorText(existingComment?.comment ?? "");
+    setReviewError(null);
+  };
+
+  const handleSaveInlineComment = () => {
+    if (!activeEditor) return;
+    const trimmed = editorText.trim();
+    if (!trimmed) return;
+
+    if (activeEditor.editingCommentId) {
+      const targetId = activeEditor.editingCommentId;
+      setComments((prev) =>
+        prev.map((item) =>
+          item.id === targetId ? { ...item, comment: trimmed } : item,
+        ),
+      );
+    } else {
+      const id = `diff-comment-${nextIdRef.current++}`;
+      const created: DiffInlineComment = {
+        id,
+        filePath: activeEditor.filePath,
+        hunkHeader: activeEditor.hunkHeader,
+        oldLine: activeEditor.oldLine,
+        newLine: activeEditor.newLine,
+        side: activeEditor.side,
+        lineContent: activeEditor.lineContent,
+        comment: trimmed,
+      };
+      setComments((prev) => [...prev, created]);
+      setDraftPanelOpen(true);
+    }
+    setActiveEditor(null);
+    setEditorText("");
+  };
+
+  const handleDeleteComment = (commentId: string) => {
+    setComments((prev) => prev.filter((item) => item.id !== commentId));
+    if (activeEditor?.editingCommentId === commentId) {
+      setActiveEditor(null);
+      setEditorText("");
+    }
+  };
+
+  const handleEditCommentFromDraft = (comment: DiffInlineComment) => {
+    const lineKey = makeLineKey(
+      comment.filePath,
+      comment.side,
+      comment.oldLine,
+      comment.newLine,
+    );
+    setActiveEditor({
+      lineKey,
+      filePath: comment.filePath,
+      hunkHeader: comment.hunkHeader,
+      oldLine: comment.oldLine,
+      newLine: comment.newLine,
+      side: comment.side,
+      lineContent: comment.lineContent,
+      editingCommentId: comment.id,
+    });
+    setEditorText(comment.comment);
+  };
+
+  const handleSubmitReviewBatch = async () => {
+    if (submittingReview) return;
+    if (comments.length === 0 && !reviewSummary.trim()) return;
+
+    const formattedPrompt = formatDiffReviewPrompt(comments, reviewSummary);
+    const batch: DiffReviewBatchPayload = {
+      summary: reviewSummary.trim(),
+      comments: [...comments],
+      formattedPrompt,
+    };
+
+    setSubmittingReview(true);
+    setReviewError(null);
+    setReviewStatus(null);
+    try {
+      let res: { queued?: boolean; status?: string } | unknown;
+      if (onSubmitReview) {
+        res = await onSubmitReview(batch);
+      } else if (apiClient) {
+        const targetId = (sessionId || agentName || "").trim();
+        if (!targetId) {
+          throw new Error("No active agent session selected to receive the review.");
+        }
+        res = await apiClient.sendSessionPrompt(targetId, {
+          prompt: formattedPrompt,
+        });
+      }
+      const typedRes = res as { queued?: boolean; status?: string } | undefined;
+      const isQueued =
+        typedRes?.queued === true || typedRes?.status === "queued";
+      const countLabel = `${batch.comments.length} ${
+        batch.comments.length === 1 ? "comment" : "comments"
+      }`;
+      setReviewStatus(
+        isQueued
+          ? `Queued review batch (${countLabel}) for busy session.`
+          : `Dispatched review batch (${countLabel}) to agent session.`,
+      );
+      setComments([]);
+      setReviewSummary("");
+      setActiveEditor(null);
+      setEditorText("");
+    } catch (err) {
+      setReviewError(
+        err instanceof Error ? err.message : "Failed to submit diff review batch.",
+      );
+    } finally {
+      setSubmittingReview(false);
+    }
+  };
+
+  const renderInlineEditorAndComments = (
+    filePath: string,
+    hunkHeader: string,
+    side: DiffCommentSide,
+    oldLine: number | null,
+    newLine: number | null,
+    colSpan: number,
+  ) => {
+    const lineKey = makeLineKey(filePath, side, oldLine, newLine);
+    const matchingComments = comments.filter(
+      (c) =>
+        makeLineKey(c.filePath, c.side, c.oldLine, c.newLine) === lineKey,
+    );
+    const isEditingHere = activeEditor?.lineKey === lineKey;
+
+    if (matchingComments.length === 0 && !isEditingHere) {
+      return null;
+    }
+
+    return (
+      <>
+        {matchingComments.map((item) => {
+          const lineNum = item.newLine ?? item.oldLine ?? 1;
+          const sideBadge =
+            item.side === "new"
+              ? `+L${lineNum}`
+              : item.side === "old"
+                ? `-L${lineNum}`
+                : `L${lineNum}`;
+          return (
+            <tr
+              key={item.id}
+              data-testid={`diff-inline-comment-card-${item.id}`}
+              style={{
+                backgroundColor: "var(--bg-surface)",
+                borderTop: "1px solid var(--border-subtle)",
+                borderBottom: "1px solid var(--border-subtle)",
+              }}
+            >
+              <td colSpan={colSpan} style={{ padding: "8px 12px" }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "4px",
+                      minWidth: 0,
+                      flex: 1,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                        {item.filePath} {sideBadge}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        fontSize: "12px",
+                        color: "var(--text-primary)",
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {item.comment}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid={`diff-comment-edit-btn-${item.id}`}
+                      onClick={() => handleEditCommentFromDraft(item)}
+                      style={{ padding: "2px 8px", fontSize: "11px" }}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="fd-btn"
+                      data-testid={`diff-comment-delete-btn-${item.id}`}
+                      onClick={() => handleDeleteComment(item.id)}
+                      style={{ padding: "2px 8px", fontSize: "11px" }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          );
+        })}
+        {isEditingHere && activeEditor && (
+          <tr
+            data-testid="diff-inline-comment-editor"
+            style={{
+              backgroundColor: "var(--bg-elevated)",
+              borderTop: "1px solid var(--border-accent)",
+              borderBottom: "1px solid var(--border-accent)",
+            }}
+          >
+            <td colSpan={colSpan} style={{ padding: "10px 12px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "8px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span className="fd-badge fd-mono" style={{ fontSize: "11px" }}>
+                    {filePath}{" "}
+                    {activeEditor.side === "new"
+                      ? `+L${activeEditor.newLine ?? 1}`
+                      : activeEditor.side === "old"
+                        ? `-L${activeEditor.oldLine ?? 1}`
+                        : `L${activeEditor.newLine ?? activeEditor.oldLine ?? 1}`}
+                  </span>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    {hunkHeader}
+                  </span>
+                </div>
+                <textarea
+                  aria-label="Inline diff comment"
+                  data-testid="diff-inline-comment-input"
+                  className="fd-input"
+                  rows={2}
+                  placeholder="Write an inline review comment for this line..."
+                  value={editorText}
+                  onChange={(e) => setEditorText(e.target.value)}
+                  style={{
+                    width: "100%",
+                    fontSize: "12px",
+                    padding: "6px 8px",
+                    boxSizing: "border-box",
+                    resize: "vertical",
+                  }}
+                />
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "flex-end",
+                    gap: "6px",
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="diff-inline-comment-cancel-btn"
+                    onClick={() => {
+                      setActiveEditor(null);
+                      setEditorText("");
+                    }}
+                    style={{ padding: "4px 10px", fontSize: "11px" }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="diff-inline-comment-save-btn"
+                    disabled={!editorText.trim()}
+                    onClick={handleSaveInlineComment}
+                    style={{ padding: "4px 10px", fontSize: "11px" }}
+                  >
+                    {activeEditor.editingCommentId ? "Update Comment" : "Add to Review"}
+                  </button>
+                </div>
+              </div>
+            </td>
+          </tr>
+        )}
+      </>
+    );
+  };
 
   return (
     <div
@@ -294,6 +728,19 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           >
             -{totalDeletions}
           </span>
+          {comments.length > 0 && (
+            <span
+              className="fd-badge"
+              data-testid="diff-review-count-badge"
+              style={{
+                backgroundColor: "var(--accent-subtle)",
+                borderColor: "var(--border-accent)",
+                color: "var(--accent-hover)",
+              }}
+            >
+              {comments.length} {comments.length === 1 ? "comment" : "comments"}
+            </span>
+          )}
           {selectedFile && (
             <div style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
               <span className="fd-badge fd-mono" data-testid="selected-file-pill">
@@ -324,6 +771,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         >
           <button
             type="button"
+            data-testid="diff-review-toggle-btn"
+            className={`fd-btn ${draftPanelOpen || comments.length > 0 ? "fd-btn-active" : ""}`}
+            onClick={() => setDraftPanelOpen((prev) => !prev)}
+            disabled={visibleFiles.length === 0 && comments.length === 0}
+            style={{ padding: "4px 8px", fontSize: "11px" }}
+          >
+            Review Draft ({comments.length})
+          </button>
+          <button
+            type="button"
             className={`fd-btn ${mode === "unified" ? "fd-btn-active" : ""}`}
             aria-pressed={mode === "unified"}
             onClick={() => setMode("unified")}
@@ -344,6 +801,217 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           </button>
         </div>
       </div>
+
+      {reviewStatus && (
+        <div
+          role="status"
+          data-testid="diff-review-status-banner"
+          className="fd-card"
+          style={{
+            padding: "8px 12px",
+            fontSize: "12px",
+            borderColor: "rgba(16, 185, 129, 0.45)",
+            backgroundColor: "rgba(16, 185, 129, 0.12)",
+            color: "var(--diff-add-text)",
+          }}
+        >
+          {reviewStatus}
+        </div>
+      )}
+
+      {reviewError && (
+        <div
+          role="alert"
+          data-testid="diff-review-error-banner"
+          className="fd-card"
+          style={{
+            padding: "8px 12px",
+            fontSize: "12px",
+            borderColor: "rgba(239, 68, 68, 0.45)",
+            backgroundColor: "rgba(239, 68, 68, 0.12)",
+            color: "#FCA5A5",
+          }}
+        >
+          {reviewError}
+        </div>
+      )}
+
+      {(draftPanelOpen || comments.length > 0) && (
+        <div
+          className="fd-card"
+          data-testid="diff-review-draft-panel"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            padding: "12px",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <strong style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                Pending Diff Review
+              </strong>
+              <span className="fd-badge" data-testid="diff-draft-panel-count">
+                {comments.length} pending {comments.length === 1 ? "comment" : "comments"}
+              </span>
+            </div>
+            {comments.length > 0 && (
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="diff-review-clear-btn"
+                onClick={() => {
+                  setComments([]);
+                  setActiveEditor(null);
+                  setEditorText("");
+                }}
+                style={{ padding: "3px 8px", fontSize: "11px" }}
+              >
+                Clear All
+              </button>
+            )}
+          </div>
+
+          {comments.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              {comments.map((item) => {
+                const lineNum = item.newLine ?? item.oldLine ?? 1;
+                const sideBadge =
+                  item.side === "new"
+                    ? `+L${lineNum}`
+                    : item.side === "old"
+                      ? `-L${lineNum}`
+                      : `L${lineNum}`;
+                return (
+                  <div
+                    key={item.id}
+                    data-testid={`diff-draft-item-${item.id}`}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      padding: "6px 8px",
+                      backgroundColor: "var(--bg-elevated)",
+                      border: "1px solid var(--border-subtle)",
+                      borderRadius: "var(--radius-sm)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "2px",
+                        minWidth: 0,
+                        flex: 1,
+                      }}
+                    >
+                      <span className="fd-mono" style={{ fontSize: "11px", fontWeight: 600 }}>
+                        {item.filePath}:{lineNum} ({sideBadge})
+                      </span>
+                      <span
+                        style={{
+                          fontSize: "12px",
+                          color: "var(--text-secondary)",
+                          whiteSpace: "pre-wrap",
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        {item.comment}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`diff-draft-edit-btn-${item.id}`}
+                        onClick={() => handleEditCommentFromDraft(item)}
+                        style={{ padding: "2px 6px", fontSize: "11px" }}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`diff-draft-delete-btn-${item.id}`}
+                        onClick={() => handleDeleteComment(item.id)}
+                        style={{ padding: "2px 6px", fontSize: "11px" }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div>
+            <label
+              htmlFor="diff-review-summary-input"
+              style={{
+                display: "block",
+                fontSize: "11px",
+                fontWeight: 600,
+                color: "var(--text-muted)",
+                marginBottom: "4px",
+                textTransform: "uppercase",
+              }}
+            >
+              Overall Review Summary (Optional)
+            </label>
+            <textarea
+              id="diff-review-summary-input"
+              aria-label="Overall review summary"
+              data-testid="diff-review-summary-input"
+              className="fd-input"
+              rows={2}
+              placeholder="Optional summary instructions for the agent..."
+              value={reviewSummary}
+              onChange={(e) => setReviewSummary(e.target.value)}
+              style={{
+                width: "100%",
+                fontSize: "12px",
+                padding: "6px 8px",
+                boxSizing: "border-box",
+                resize: "vertical",
+              }}
+            />
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "flex-end",
+              gap: "8px",
+            }}
+          >
+            <button
+              type="button"
+              className="fd-btn fd-btn-primary"
+              data-testid="diff-review-submit-btn"
+              disabled={
+                submittingReview ||
+                (comments.length === 0 && !reviewSummary.trim())
+              }
+              onClick={() => void handleSubmitReviewBatch()}
+              style={{ padding: "5px 12px", fontSize: "12px" }}
+            >
+              {submittingReview ? "Submitting Review..." : "Submit Review to Agent"}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Diff Sections */}
       {visibleFiles.length === 0 ? (
@@ -457,48 +1125,104 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                                 : line.type === "del"
                                   ? "var(--diff-del-text)"
                                   : "var(--text-secondary)";
+                            const side = lineSideFromType(line.type);
+                            const lineNum = line.newLine ?? line.oldLine ?? lineIdx + 1;
 
                             return (
-                              <tr
-                                key={lineIdx}
-                                style={{
-                                  backgroundColor: bg,
-                                  color,
-                                }}
-                              >
-                                <td
+                              <React.Fragment key={lineIdx}>
+                                <tr
+                                  data-testid={`diff-line-row-${file.displayPath}-${hunkIdx}-${lineIdx}`}
+                                  onClick={() =>
+                                    openLineCommentEditor(
+                                      file.displayPath,
+                                      hunk.header,
+                                      line,
+                                      side,
+                                    )
+                                  }
                                   style={{
-                                    width: "44px",
-                                    padding: "1px 8px",
-                                    textAlign: "right",
-                                    color: "var(--text-dim)",
-                                    userSelect: "none",
-                                    borderRight: "1px solid var(--border-subtle)",
+                                    backgroundColor: bg,
+                                    color,
+                                    cursor: "pointer",
                                   }}
                                 >
-                                  {line.oldLine ?? ""}
-                                </td>
-                                <td
-                                  style={{
-                                    width: "44px",
-                                    padding: "1px 8px",
-                                    textAlign: "right",
-                                    color: "var(--text-dim)",
-                                    userSelect: "none",
-                                    borderRight: "1px solid var(--border-subtle)",
-                                  }}
-                                >
-                                  {line.newLine ?? ""}
-                                </td>
-                                <td
-                                  style={{
-                                    padding: "1px 10px",
-                                    whiteSpace: "pre",
-                                  }}
-                                >
-                                  {line.raw}
-                                </td>
-                              </tr>
+                                  <td
+                                    style={{
+                                      width: "26px",
+                                      padding: "1px 4px",
+                                      textAlign: "center",
+                                      userSelect: "none",
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    <button
+                                      type="button"
+                                      aria-label={`Comment on ${file.displayPath} ${side} line ${lineNum}`}
+                                      data-testid={`diff-line-comment-btn-${file.displayPath}-${side}-${lineNum}`}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        openLineCommentEditor(
+                                          file.displayPath,
+                                          hunk.header,
+                                          line,
+                                          side,
+                                        );
+                                      }}
+                                      style={{
+                                        border: "none",
+                                        background: "transparent",
+                                        color: "var(--text-muted)",
+                                        cursor: "pointer",
+                                        padding: "0 4px",
+                                        fontSize: "11px",
+                                        fontWeight: 700,
+                                      }}
+                                    >
+                                      +
+                                    </button>
+                                  </td>
+                                  <td
+                                    style={{
+                                      width: "44px",
+                                      padding: "1px 8px",
+                                      textAlign: "right",
+                                      color: "var(--text-dim)",
+                                      userSelect: "none",
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    {line.oldLine ?? ""}
+                                  </td>
+                                  <td
+                                    style={{
+                                      width: "44px",
+                                      padding: "1px 8px",
+                                      textAlign: "right",
+                                      color: "var(--text-dim)",
+                                      userSelect: "none",
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    {line.newLine ?? ""}
+                                  </td>
+                                  <td
+                                    style={{
+                                      padding: "1px 10px",
+                                      whiteSpace: "pre",
+                                    }}
+                                  >
+                                    {line.raw}
+                                  </td>
+                                </tr>
+                                {renderInlineEditorAndComments(
+                                  file.displayPath,
+                                  hunk.header,
+                                  side,
+                                  line.oldLine,
+                                  line.newLine,
+                                  4,
+                                )}
+                              </React.Fragment>
                             );
                           })}
                         </tbody>
@@ -528,59 +1252,119 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                               pair.right?.type === "add"
                                 ? "var(--diff-add-text)"
                                 : "var(--text-secondary)";
+                            const targetLine = pair.right ?? pair.left;
+                            const targetSide: DiffCommentSide = pair.right
+                              ? lineSideFromType(pair.right.type)
+                              : "old";
 
                             return (
-                              <tr key={pairIdx}>
-                                <td
-                                  style={{
-                                    width: "40px",
-                                    padding: "1px 6px",
-                                    textAlign: "right",
-                                    color: "var(--text-dim)",
-                                    userSelect: "none",
-                                    backgroundColor: leftBg,
-                                    borderRight: "1px solid var(--border-subtle)",
+                              <React.Fragment key={pairIdx}>
+                                <tr
+                                  data-testid={`diff-split-row-${file.displayPath}-${hunkIdx}-${pairIdx}`}
+                                  onClick={() => {
+                                    if (targetLine) {
+                                      openLineCommentEditor(
+                                        file.displayPath,
+                                        hunk.header,
+                                        targetLine,
+                                        targetSide,
+                                      );
+                                    }
                                   }}
+                                  style={{ cursor: targetLine ? "pointer" : "default" }}
                                 >
-                                  {pair.left?.oldLine ?? ""}
-                                </td>
-                                <td
-                                  style={{
-                                    width: "50%",
-                                    padding: "1px 8px",
-                                    whiteSpace: "pre",
-                                    backgroundColor: leftBg,
-                                    color: leftColor,
-                                    borderRight: "1px solid var(--border-subtle)",
-                                  }}
-                                >
-                                  {pair.left ? pair.left.raw : ""}
-                                </td>
-                                <td
-                                  style={{
-                                    width: "40px",
-                                    padding: "1px 6px",
-                                    textAlign: "right",
-                                    color: "var(--text-dim)",
-                                    userSelect: "none",
-                                    backgroundColor: rightBg,
-                                    borderRight: "1px solid var(--border-subtle)",
-                                  }}
-                                >
-                                  {pair.right?.newLine ?? ""}
-                                </td>
-                                <td
-                                  style={{
-                                    width: "50%",
-                                    padding: "1px 8px",
-                                    whiteSpace: "pre",
-                                    backgroundColor: rightBg,
-                                    color: rightColor,
-                                  }}
-                                >
-                                  {pair.right ? pair.right.raw : ""}
-                                </td>
-                              </tr>
+                                  <td
+                                    style={{
+                                      width: "40px",
+                                      padding: "1px 6px",
+                                      textAlign: "right",
+                                      color: "var(--text-dim)",
+                                      userSelect: "none",
+                                      backgroundColor: leftBg,
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    {pair.left?.oldLine ?? ""}
+                                  </td>
+                                  <td
+                                    onClick={(e) => {
+                                      if (pair.left) {
+                                        e.stopPropagation();
+                                        openLineCommentEditor(
+                                          file.displayPath,
+                                          hunk.header,
+                                          pair.left,
+                                          lineSideFromType(pair.left.type),
+                                        );
+                                      }
+                                    }}
+                                    style={{
+                                      width: "50%",
+                                      padding: "1px 8px",
+                                      whiteSpace: "pre",
+                                      backgroundColor: leftBg,
+                                      color: leftColor,
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    {pair.left ? pair.left.raw : ""}
+                                  </td>
+                                  <td
+                                    style={{
+                                      width: "40px",
+                                      padding: "1px 6px",
+                                      textAlign: "right",
+                                      color: "var(--text-dim)",
+                                      userSelect: "none",
+                                      backgroundColor: rightBg,
+                                      borderRight: "1px solid var(--border-subtle)",
+                                    }}
+                                  >
+                                    {pair.right?.newLine ?? ""}
+                                  </td>
+                                  <td
+                                    onClick={(e) => {
+                                      if (pair.right) {
+                                        e.stopPropagation();
+                                        openLineCommentEditor(
+                                          file.displayPath,
+                                          hunk.header,
+                                          pair.right,
+                                          lineSideFromType(pair.right.type),
+                                        );
+                                      }
+                                    }}
+                                    style={{
+                                      width: "50%",
+                                      padding: "1px 8px",
+                                      whiteSpace: "pre",
+                                      backgroundColor: rightBg,
+                                      color: rightColor,
+                                    }}
+                                  >
+                                    {pair.right ? pair.right.raw : ""}
+                                  </td>
+                                </tr>
+                                {pair.left &&
+                                  pair.left.type === "del" &&
+                                  renderInlineEditorAndComments(
+                                    file.displayPath,
+                                    hunk.header,
+                                    "old",
+                                    pair.left.oldLine,
+                                    pair.left.newLine,
+                                    4,
+                                  )}
+                                {pair.right &&
+                                  renderInlineEditorAndComments(
+                                    file.displayPath,
+                                    hunk.header,
+                                    lineSideFromType(pair.right.type),
+                                    pair.right.oldLine,
+                                    pair.right.newLine,
+                                    4,
+                                  )}
+                              </React.Fragment>
                             );
                           })}
                         </tbody>
@@ -596,3 +1380,5 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     </div>
   );
 };
+
+export const DiffPane = DiffViewer;

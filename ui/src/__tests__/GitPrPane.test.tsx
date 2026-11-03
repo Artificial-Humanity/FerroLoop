@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { DiffViewer } from "../components/DiffViewer";
+import { HubApiClient } from "../api/client";
+import { DiffPane, DiffViewer, formatDiffReviewPrompt } from "../components/DiffViewer";
 import { GitPrPane } from "../components/GitPrPane";
 import type { PullRequestItem, WorktreeDiff, WorktreeSummary } from "../types/api";
 
@@ -326,5 +327,170 @@ describe("empty-state muting", () => {
     expect(screen.getByTestId("git-worktrees-project-badge")).toHaveTextContent(
       "FerroLoop",
     );
+  });
+
+  it("supports inline diff line commenting, pending review draft list (count badge, edit/delete, summary), and structured batch dispatch via sendSessionPrompt (immediate and busy-queued)", async () => {
+    const promptRequests: Array<{ sessionId: string; prompt: string }> = [];
+    let shouldQueue = false;
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/api/v1/sessions/") && url.endsWith("/prompt") && method === "POST") {
+        const match = /\/api\/v1\/sessions\/([^/]+)\/prompt$/.exec(url);
+        const body = JSON.parse(String(init?.body ?? "{}")) as { prompt?: string };
+        promptRequests.push({
+          sessionId: match?.[1] ?? "",
+          prompt: body.prompt ?? "",
+        });
+        return new Response(
+          JSON.stringify({
+            session_id: match?.[1] ?? "sess-felix",
+            status: shouldQueue ? "queued" : "dispatched",
+            queued: shouldQueue,
+            is_busy: shouldQueue,
+            queue: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <DiffPane
+        diff={SAMPLE_DIFF}
+        sessionId="sess-felix"
+        agentName="felix"
+        apiClient={apiClient}
+      />,
+    );
+
+    // Click an added diff line in crates/hub/src/api.rs (new line 11: + .route("/api/v1/health", get(health_check)))
+    fireEvent.click(
+      screen.getByTestId("diff-line-comment-btn-crates/hub/src/api.rs-new-11"),
+    );
+    expect(screen.getByTestId("diff-inline-comment-editor")).toBeInTheDocument();
+
+    const commentInput = screen.getByTestId(
+      "diff-inline-comment-input",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(commentInput, {
+      target: { value: "Verify rate limiting on /api/v1/health endpoint." },
+    });
+    fireEvent.click(screen.getByTestId("diff-inline-comment-save-btn"));
+
+    // Pending count badge and draft panel appear
+    expect(screen.getByTestId("diff-review-count-badge")).toHaveTextContent(
+      "1 comment",
+    );
+    expect(screen.getByTestId("diff-review-draft-panel")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("diff-inline-comment-card-diff-comment-1"),
+    ).toHaveTextContent("Verify rate limiting on /api/v1/health endpoint.");
+
+    // Add a second comment on ui/src/App.tsx line 2
+    fireEvent.click(
+      screen.getByTestId("diff-line-row-ui/src/App.tsx-0-1"),
+    );
+    fireEvent.change(screen.getByTestId("diff-inline-comment-input"), {
+      target: { value: "Keep imports sorted alphabetically." },
+    });
+    fireEvent.click(screen.getByTestId("diff-inline-comment-save-btn"));
+
+    expect(screen.getByTestId("diff-review-count-badge")).toHaveTextContent(
+      "2 comments",
+    );
+    expect(screen.getByTestId("diff-draft-panel-count")).toHaveTextContent(
+      "2 pending comments",
+    );
+
+    // Edit the first comment from the draft list
+    fireEvent.click(screen.getByTestId("diff-draft-edit-btn-diff-comment-1"));
+    expect(
+      (screen.getByTestId("diff-inline-comment-input") as HTMLTextAreaElement)
+        .value,
+    ).toBe("Verify rate limiting on /api/v1/health endpoint.");
+    fireEvent.change(screen.getByTestId("diff-inline-comment-input"), {
+      target: { value: "Ensure /api/v1/health returns 200 without auth." },
+    });
+    fireEvent.click(screen.getByTestId("diff-inline-comment-save-btn"));
+    expect(
+      screen.getByTestId("diff-draft-item-diff-comment-1"),
+    ).toHaveTextContent("Ensure /api/v1/health returns 200 without auth.");
+
+    // Delete the second comment
+    fireEvent.click(screen.getByTestId("diff-draft-delete-btn-diff-comment-2"));
+    expect(screen.getByTestId("diff-review-count-badge")).toHaveTextContent(
+      "1 comment",
+    );
+
+    // Add overall review summary and submit review to agent
+    fireEvent.change(screen.getByTestId("diff-review-summary-input"), {
+      target: { value: "Please address the inline finding below before merging." },
+    });
+    fireEvent.click(screen.getByTestId("diff-review-submit-btn"));
+
+    await waitFor(() => {
+      expect(promptRequests.length).toBe(1);
+    });
+    expect(promptRequests[0].sessionId).toBe("sess-felix");
+    expect(promptRequests[0].prompt).toContain("## Inline Diff Review");
+    expect(promptRequests[0].prompt).toContain(
+      "Please address the inline finding below before merging.",
+    );
+    expect(promptRequests[0].prompt).toContain("### `crates/hub/src/api.rs`");
+    expect(promptRequests[0].prompt).toContain(
+      "**Line 11 (+L11)** (`.route(\"/api/v1/health\", get(health_check))`): Ensure /api/v1/health returns 200 without auth.",
+    );
+    expect(screen.getByTestId("diff-review-status-banner")).toHaveTextContent(
+      /Dispatched review batch \(1 comment\) to agent session/i,
+    );
+    expect(screen.queryByTestId("diff-review-count-badge")).toBeNull();
+
+    // Verify busy-session queueing path in Side-by-Side mode
+    shouldQueue = true;
+    fireEvent.click(screen.getByRole("button", { name: /Side-by-Side/i }));
+    fireEvent.click(
+      screen.getByTestId("diff-split-row-crates/hub/src/api.rs-0-1"),
+    );
+    fireEvent.change(screen.getByTestId("diff-inline-comment-input"), {
+      target: { value: "Remove legacy /health route handler once migrated." },
+    });
+    fireEvent.click(screen.getByTestId("diff-inline-comment-save-btn"));
+    fireEvent.click(screen.getByTestId("diff-review-submit-btn"));
+
+    await waitFor(() => {
+      expect(promptRequests.length).toBe(2);
+    });
+    expect(screen.getByTestId("diff-review-status-banner")).toHaveTextContent(
+      /Queued review batch \(1 comment\) for busy session/i,
+    );
+
+    // Also unit-test formatDiffReviewPrompt directly
+    const formatted = formatDiffReviewPrompt(
+      [
+        {
+          id: "c1",
+          filePath: "src/lib.rs",
+          hunkHeader: "@@ -1,3 +1,4 @@",
+          oldLine: 4,
+          newLine: null,
+          side: "old",
+          lineContent: "let x = 1;",
+          comment: "Unused binding.",
+        },
+      ],
+      "Quick nit.",
+    );
+    expect(formatted).toContain("Quick nit.");
+    expect(formatted).toContain("- **Line 4 (-L4)** (`let x = 1;`): Unused binding.");
   });
 });
