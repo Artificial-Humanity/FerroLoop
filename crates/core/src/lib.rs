@@ -35,6 +35,7 @@ pub mod model;
 pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
+pub mod routine;
 pub mod routing;
 pub mod session_protocol;
 pub mod split;
@@ -135,6 +136,11 @@ pub use pr_policy::{
 pub use ref_index::{
     MAX_REF_SOURCES, RefIndexError, RefIndexPlan, RefIndexReport, RefIndexStatus, RefKind,
     RefLocatorClass, RefSource, classify_locator, index_local_source,
+};
+pub use routine::{
+    Allocation, Approval, CatchUp, CatchUpEvaluation, Concurrency, FiringRecord, FiringState,
+    RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork, Schedule,
+    ScheduledInstant, Window, firing_key,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use session_protocol::{
