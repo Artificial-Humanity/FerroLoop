@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use crate::attachment_policy::{
     BLOCKED_UPLOAD_EXTENSIONS, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_PROMPT,
-    MAX_ATTACHMENTS_TOTAL_BYTES, MAX_STATIC_FILE_BYTES,
+    MAX_ATTACHMENTS_TOTAL_BYTES, MAX_STATIC_FILE_BYTES, sanitize_upload_name,
 };
 use crate::{HttpRequest, HttpResponse, HubServerConfig, HubState, handle_http_request};
 
@@ -308,6 +308,30 @@ fn too_many_attachments_is_413_and_writes_nothing() {
     let ok = post_prompt(&env, many(MAX_ATTACHMENTS_PER_PROMPT));
     assert_eq!(ok.status, 200);
     assert_eq!(env.stored_count(), MAX_ATTACHMENTS_PER_PROMPT);
+}
+
+#[test]
+fn a_long_name_cannot_hide_a_blocked_extension_in_the_cut_off_tail() {
+    let env = env();
+    // The raw extension is `htmlBBBB...`; the saved name is cut to 120 characters and ends `.html`.
+    let sneaky = format!("{}.html{}", "A".repeat(115), "B".repeat(30));
+    assert!(sanitize_upload_name(&sneaky).ends_with(".html"));
+    let resp = post_prompt(&env, vec![attachment(&sneaky, "text/plain", b"hi")]);
+    assert_eq!(resp.status, 415);
+    assert!(
+        resp.json_value().unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains(&sneaky),
+        "the 415 names the raw name"
+    );
+    assert_eq!(env.stored_count(), 0);
+
+    // An ordinary long .png is still accepted.
+    let long_png = format!("{}.png", "n".repeat(200));
+    let ok = post_prompt(&env, vec![attachment(&long_png, "image/png", PNG)]);
+    assert_eq!(ok.status, 200, "{:?}", ok.json_value());
+    assert_eq!(env.stored_count(), 1);
 }
 
 #[test]

@@ -1235,26 +1235,55 @@ fn handle_delete_node(state: &HubState, authority: &HubAuthority, raw_id: &str) 
     }
 }
 
+/// The outcome of [`authenticate_headers`].
+pub(crate) enum AuthLookup {
+    Authorized(HubAuthority),
+    Rejected,
+    /// A session lookup was needed and the store would not open.
+    StoreUnavailable,
+}
+
+/// Authenticate a request's headers. Owner, peer and Tailscale credentials and the sessions in
+/// memory are decided without the store. Only a cookie or bearer token that is not in memory
+/// opens it, behind the global store lock, and a token the store has already rejected is not
+/// looked up again for a while (see `auth::SessionMissCache`). A request with no session
+/// credential at all never opens the store.
+pub(crate) fn authenticate_headers(
+    state: &HubState,
+    headers: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+) -> AuthLookup {
+    if let Some(authority) = state.auth.authenticate_request(None, headers, query) {
+        return AuthLookup::Authorized(authority);
+    }
+    if !state.auth.session_store_lookup_needed(headers, query) {
+        return AuthLookup::Rejected;
+    }
+    let Ok(store) = open_store_response(state) else {
+        return AuthLookup::StoreUnavailable;
+    };
+    match state
+        .auth
+        .authenticate_request(Some(&*store), headers, query)
+    {
+        Some(authority) => AuthLookup::Authorized(authority),
+        None => AuthLookup::Rejected,
+    }
+}
+
 fn authenticate_api_request(
     state: &HubState,
     req: &HttpRequest,
 ) -> Result<HubAuthority, HttpResponse> {
-    if let Some(authority) = state
-        .auth
-        .authenticate_request(None, &req.headers, &req.query)
-    {
-        return Ok(authority);
-    }
-    let Ok(store) = open_store_response(state) else {
-        return Err(HttpResponse::json(
+    match authenticate_headers(state, &req.headers, &req.query) {
+        AuthLookup::Authorized(authority) => Ok(authority),
+        // The same body whether the store was read or the rejection was remembered.
+        AuthLookup::Rejected => Err(HttpResponse::json(401, json!({ "error": "unauthorized" }))),
+        AuthLookup::StoreUnavailable => Err(HttpResponse::json(
             500,
             json!({ "error": "failed to open store: store unavailable" }),
-        ));
-    };
-    state
-        .auth
-        .authenticate_request(Some(&*store), &req.headers, &req.query)
-        .ok_or_else(|| HttpResponse::json(401, json!({ "error": "unauthorized" })))
+        )),
+    }
 }
 
 fn handle_auth_logout(state: &HubState, req: &HttpRequest) -> HttpResponse {

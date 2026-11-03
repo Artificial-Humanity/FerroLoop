@@ -474,7 +474,11 @@ pub(crate) fn check_attachment_names<'a>(
         return Err(AttachmentRefusal::TooMany { count: names.len() });
     }
     for name in names {
-        if let Some(ext) = blocked_upload_extension(name) {
+        // The name that is saved is the sanitised, possibly cut one: a long name can lose the
+        // tail that hid a blocked extension, so test both.
+        if let Some(ext) = blocked_upload_extension(name)
+            .or_else(|| blocked_upload_extension(&sanitize_upload_name(name)))
+        {
             return Err(AttachmentRefusal::BlockedExtension {
                 name: name.to_string(),
                 ext,

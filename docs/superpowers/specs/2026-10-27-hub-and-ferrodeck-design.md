@@ -205,6 +205,7 @@ pub enum HubAuthority {
      3. Header `Tailscale-User-Login` when `trust_tailscale_headers == true` -> `HubAuthority::Owner { login }`.
      4. `Authorization: Bearer <wire_token>` matching `[wire].token_file` or `$FL_WIRE_TOKEN` (constant-time comparison) -> `HubAuthority::Peer { agent: header_x_fl_agent }`.
      5. Otherwise returns HTTP `401 Unauthorized` with `{ "error": "unauthorized" }`.
+   - Only a session cookie or bearer token that is not a session in memory makes the hub open the store. A token the store has rejected (absent, revoked or expired) is remembered by its SHA-256 for 30 seconds, in a cache of at most 1024 entries (oldest out first), and the hub answers `401` for it without opening the store. The answer is the same bytes either way. Minting a session removes its hash, so a new session works at once. A session entry written to the store by another process can be refused for up to 30 seconds if its token was presented first. A valid token is never cached. Requests with no cookie or bearer token never open the store.
 
 ### 2.3 Static `FerroDeck` Serving
 - For `GET` and `HEAD` requests outside `/api/*` and `/ws/*`:
@@ -287,6 +288,7 @@ pub struct HubWsFrame {
 ```
 
 - Upon connection, the server sends `{ "channel": "system", "event": "connected", "data": { "authority": authority } }`.
+- Concurrency caps (`ws::ConnectionLimits`, defaults `MAX_CONCURRENT_CONNECTIONS = 256`, `MAX_WS_SESSIONS = 64`, `MAX_PEER_WS_SESSIONS = 32`): the accept loop answers a connection past 256 (any phase, WebSocket sessions included) with a fixed `503 Service Unavailable` and `Retry-After: 1`, without reading a request. A connection holds its slot until it closes. An authenticated upgrade past 64 sessions in all, or 32 held by Peer authority, gets `503` with `Retry-After: 5`; the Owner can always use the 32 slots Peers cannot take. The caps are per authority tier, not per name, because the `X-Fl-Agent` and `Tailscale-User-Login` names are chosen by the client. `GET /api/v1/health` has no bypass: it is a request like any other. A request buffer starts at 2 KiB and grows only with the bytes received, up to 24 MiB.
 - Server broadcast hub (`tokio::sync::broadcast::Sender<HubWsFrame>`) pushes `wire`, `session`, and `workflow` frames to all connected WebSocket clients.
 
 ### 4.2 Interactive Terminal Channel (`terminal`, `HubAuthority::Owner` only)

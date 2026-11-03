@@ -3,6 +3,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -13,10 +14,11 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, watch};
 
 use crate::api::{
-    HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
+    AuthLookup, HttpRequest, HttpResponse, authenticate_headers, drain_ready_session_queues,
+    handle_http_request, parse_http_request,
 };
 use crate::auth::HubAuthority;
 use crate::terminal::TerminalManager;
@@ -27,6 +29,104 @@ pub(crate) const MAX_HTTP_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_WS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The most connections the hub serves at once, every phase counted: reading a request,
+/// running a handler, and a WebSocket session. The accept loop answers `503` to any more. A
+/// FerroDeck tab uses a handful of short connections and one WebSocket, so 256 leaves room for
+/// many tabs, peers and CLI calls; it is low enough that the request buffers an attacker can
+/// hold open stay in the low gigabytes at worst (each grows only with the bytes it receives).
+pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+/// The most upgraded WebSocket sessions at once. Each holds a broadcast receiver and a
+/// terminal manager for as long as the client stays.
+pub(crate) const MAX_WS_SESSIONS: usize = 64;
+/// The most of those the peer tier may hold, so a peer-token holder cannot take every slot from
+/// the Owner. A peer's identity (`X-Fl-Agent`) and an Owner's login (`Tailscale-User-Login`) are
+/// names the client chooses, so a per-name cap would not bind; the cap is per authority tier.
+pub(crate) const MAX_PEER_WS_SESSIONS: usize = MAX_WS_SESSIONS / 2;
+/// `Retry-After` seconds on a refused WebSocket upgrade.
+const WS_RETRY_AFTER_SECS: u32 = 5;
+
+/// The concurrency caps of one [`HubServer`]. [`HubServer::with_limits`] replaces the defaults;
+/// there is no config file key, as for the other server limits in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimits {
+    /// Connections in any phase, past which the accept loop answers `503`.
+    pub connections: usize,
+    /// Upgraded WebSocket sessions in all.
+    pub ws_sessions: usize,
+    /// Upgraded WebSocket sessions held by peer-tier authority.
+    pub peer_ws_sessions: usize,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            connections: MAX_CONCURRENT_CONNECTIONS,
+            ws_sessions: MAX_WS_SESSIONS,
+            peer_ws_sessions: MAX_PEER_WS_SESSIONS,
+        }
+    }
+}
+
+/// The semaphores behind [`ConnectionLimits`]. A permit is held for exactly as long as what it
+/// counts lives, and released by `Drop`, including when the task panics or returns early.
+#[derive(Debug, Clone)]
+struct ConnectionGates {
+    connections: Arc<Semaphore>,
+    ws_total: Arc<Semaphore>,
+    ws_peer: Arc<Semaphore>,
+}
+
+/// The WebSocket slots one session holds; dropping it frees them.
+struct WsSlots {
+    _total: OwnedSemaphorePermit,
+    _peer: Option<OwnedSemaphorePermit>,
+}
+
+impl ConnectionGates {
+    fn new(limits: ConnectionLimits) -> Self {
+        Self {
+            connections: Arc::new(Semaphore::new(limits.connections)),
+            ws_total: Arc::new(Semaphore::new(limits.ws_sessions)),
+            ws_peer: Arc::new(Semaphore::new(limits.peer_ws_sessions)),
+        }
+    }
+
+    fn try_acquire_ws(&self, authority: &HubAuthority) -> Option<WsSlots> {
+        let peer = if authority.is_owner() {
+            None
+        } else {
+            Some(self.ws_peer.clone().try_acquire_owned().ok()?)
+        };
+        // If this fails, `peer` drops here and frees its slot.
+        let total = self.ws_total.clone().try_acquire_owned().ok()?;
+        Some(WsSlots {
+            _total: total,
+            _peer: peer,
+        })
+    }
+}
+
+/// The reply to a connection past the cap (`Retry-After` one second). Fixed bytes: the request is
+/// never parsed.
+const OVERLOADED_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Refuse `stream` without awaiting, so a slow or hostile client cannot hold up the accept
+/// loop: a non-blocking write of a few bytes into a fresh socket buffer, one non-blocking read of
+/// at most 1 KiB into a scratch buffer, to discard what has already arrived without keeping or
+/// parsing it (closing a socket with unread data resets the connection
+/// and can destroy the reply), then the stream drops.
+fn reject_overloaded(stream: TcpStream) {
+    // `TcpStream::try_write` would do, but it waits on readiness tokio has not polled yet for a
+    // stream just accepted, and refuses with `WouldBlock`. A std socket asks the kernel.
+    let Ok(mut std_stream) = stream.into_std() else {
+        return;
+    };
+    let _ = std_stream.set_nonblocking(true);
+    let _ = std_stream.write(OVERLOADED_RESPONSE);
+    let mut scratch = [0u8; 1024];
+    let _ = std_stream.read(&mut scratch);
+}
+
 /// Bound FerroLoop Hub HTTP/1.1 + `/ws/v1` WebSocket server (spec §2, §3, §4).
 pub struct HubServer {
     state: HubState,
@@ -34,6 +134,7 @@ pub struct HubServer {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    gates: ConnectionGates,
 }
 
 impl HubServer {
@@ -49,6 +150,7 @@ impl HubServer {
             local_addr,
             shutdown_tx,
             shutdown_rx,
+            gates: ConnectionGates::new(ConnectionLimits::default()),
         })
     }
 
@@ -68,7 +170,15 @@ impl HubServer {
             local_addr,
             shutdown_tx,
             shutdown_rx,
+            gates: ConnectionGates::new(ConnectionLimits::default()),
         })
+    }
+
+    /// Replace the default [`ConnectionLimits`]. Call it before [`HubServer::serve`].
+    #[must_use]
+    pub fn with_limits(mut self, limits: ConnectionLimits) -> Self {
+        self.gates = ConnectionGates::new(limits);
+        self
     }
 
     /// Bound local socket address (useful when `config.listen` uses port `0`).
@@ -100,10 +210,19 @@ impl HubServer {
                 accept_res = self.listener.accept() => {
                     match accept_res {
                         Ok((stream, _peer_addr)) => {
-                            let state = self.state.clone();
-                            tokio::spawn(async move {
-                                let _ = handle_connection(stream, state).await;
-                            });
+                            // The permit is taken before the task exists and moves into it, so
+                            // it lives as long as the connection and is freed on any exit.
+                            match self.gates.connections.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    let state = self.state.clone();
+                                    let gates = self.gates.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let _ = handle_connection(stream, state, gates).await;
+                                    });
+                                }
+                                Err(_) => reject_overloaded(stream),
+                            }
                         }
                         Err(e) => return Err(e),
                     }
@@ -144,13 +263,17 @@ fn has_websocket_upgrade_header(req: &HttpRequest) -> bool {
 }
 
 fn authenticate_ws_request(state: &HubState, req: &HttpRequest) -> Option<HubAuthority> {
-    let store = state.open_store().ok();
-    state
-        .auth
-        .authenticate_request(store.as_deref(), &req.headers, &req.query)
+    match authenticate_headers(state, &req.headers, &req.query) {
+        AuthLookup::Authorized(authority) => Some(authority),
+        AuthLookup::Rejected | AuthLookup::StoreUnavailable => None,
+    }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: HubState) -> io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    state: HubState,
+    gates: ConnectionGates,
+) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 4096];
@@ -214,9 +337,17 @@ async fn handle_connection(mut stream: TcpStream, state: HubState) -> io::Result
             return Ok(());
         };
 
+        let Some(slots) = gates.try_acquire_ws(&authority) else {
+            let resp = HttpResponse::json(503, json!({ "error": "too many WebSocket sessions" }))
+                .with_header("Retry-After", WS_RETRY_AFTER_SECS.to_string());
+            stream.write_all(&resp.to_http_bytes(false)).await?;
+            stream.flush().await?;
+            return Ok(());
+        };
+
         let accept = compute_accept_key(sec_key);
         let leftover = buf[consumed..].to_vec();
-        return handle_websocket_session(stream, state, authority, &accept, leftover).await;
+        return handle_websocket_session(stream, state, authority, &accept, leftover, slots).await;
     }
 
     let is_head = req.method == "HEAD";
@@ -239,6 +370,8 @@ async fn handle_websocket_session(
     authority: HubAuthority,
     accept_key: &str,
     mut read_buf: Vec<u8>,
+    // Held until this function returns, whatever the way out.
+    _slots: WsSlots,
 ) -> io::Result<()> {
     let mut bcast_rx = state.subscribe();
 
