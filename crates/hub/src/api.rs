@@ -2281,6 +2281,7 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let token_gain = match record_token_gain_query(
         &*store,
         ranked.outcome.tokens_saved_this_query,
+        ranked.outcome.tokens_saved_this_query_counted,
         ranked.outcome.files_indexed,
         ranked.outcome.symbols_indexed,
         stamp::now(),
@@ -2294,6 +2295,8 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
         "kind": kind.as_wire(),
         "symbols": ranked.outcome.symbols,
         "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+        "tokens_saved_this_query_counted": ranked.outcome.tokens_saved_this_query_counted,
+        "count_unit": ranked.outcome.count_unit(),
         "token_gain": token_gain,
     });
     ranked.annotate_json(&mut body);

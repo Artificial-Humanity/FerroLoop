@@ -37,6 +37,7 @@ pub mod state;
 pub mod store;
 pub mod telemetry;
 pub mod tiered;
+pub mod token_count;
 pub mod ui_bundle;
 pub mod vendor;
 pub mod verdict;
@@ -116,6 +117,7 @@ pub use store::{
     node_id_shape,
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
+pub use token_count::{CountUnit, count_unit, counted_tokens};
 pub use vendor::{
     ApiDialect, VendorDescriptor, VendorError, VendorRegistry, VendorTransport,
     ensure_vendor_registered, lookup_vendor, register_vendor, validate_api_base_url,

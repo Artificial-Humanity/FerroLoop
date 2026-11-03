@@ -21,7 +21,8 @@
 //! embedder is hashed and lexical, so a bare nearest neighbour is noise). The
 //! final hits are built from the [`CodeIndex`]'s own symbol data, so snippets
 //! and token estimates are exact, and `tokens_saved_this_query` is recomputed
-//! from them by [`fl_core::outcome_from_hits`], the rule the exact path uses.
+//! from them by [`CodeIndex::outcome`](fl_core::CodeIndex::outcome), the rule
+//! the exact path uses; it counts only the returned hits' files.
 //! Order: fused score, then path, then start line (then kind and name, so the
 //! order is total).
 //!
@@ -123,7 +124,7 @@ use crate::knowledge::{
 use crate::{AnyStore, FerroStore, IndexPolicy, SearchMode};
 use fl_core::{
     CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, CodeSymbolRef, Embedder,
-    StoreError, cosine, outcome_from_hits,
+    StoreError, cosine,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -823,9 +824,8 @@ impl<'a> CodeSession<'a> {
             }
         }
 
-        let lexical = index
-            .search(CodeSearchKind::Search, query, LEXICAL_CAP)
-            .symbols;
+        // Uncounted candidates: only the returned hits' files are counted.
+        let lexical = index.search_hits(CodeSearchKind::Search, query, LEXICAL_CAP);
         let vec_rank: HashMap<&str, usize> = vector_order
             .iter()
             .enumerate()
@@ -866,7 +866,7 @@ impl<'a> CodeSession<'a> {
         });
         let hits: Vec<CodeSymbolHit> = kept.into_iter().take(limit).map(|(_, h)| h).collect();
         Ok(RankedCode {
-            outcome: outcome_from_hits(hits, index.files_indexed(), index.symbols_indexed()),
+            outcome: index.outcome(hits),
             mode: SearchMode::Knowledge,
             note: None,
             cause: None,
@@ -1444,7 +1444,7 @@ fn write_group(
 mod tests {
     use super::*;
     use crate::{BackendKind, StoreOptions, open_redb, open_store_with};
-    use fl_core::{HashingEmbedder, scan_code_index};
+    use fl_core::{HashingEmbedder, outcome_from_hits, scan_code_index};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 

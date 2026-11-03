@@ -40,4 +40,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = "1.15"
 webpki-roots = "1.0"
 zeroize = "1.9"
+# MIT (github/rust-gems): o200k_base BPE for the counted token-savings ledger.
+bpe-openai = "0.3.2"
 

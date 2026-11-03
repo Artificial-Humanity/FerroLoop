@@ -7,11 +7,20 @@
 //! file as `max(0, file_tokens - sum(snippet_tokens of returned hits in
 //! that file))`, summed over files: two hits in one file never count that
 //! file's tokens twice.
+//!
+//! Token sizes come in two units. The `estimated_*`/`snippet_tokens` fields
+//! are the `ceil(chars / 4)` estimate ([`estimate_tokens`]); the `*_counted`
+//! fields are exact `o200k_base` counts ([`crate::token_count`]), OpenAI's
+//! public BPE, not the tokenizer of the model reading the result (Claude,
+//! Gemini, ... count differently). Counted fields are `None` without the
+//! `counted-tokens` feature, and a file is counted only when a returned hit
+//! is in it, once per scan.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +30,7 @@ use crate::state::{
     UpsertStateArgs, estimate_tokens,
 };
 use crate::store::{StateStore, StoreError};
+use crate::token_count::{CountUnit, count_unit, counted_tokens};
 
 /// Workspace/`Runtime` slug holding the token-gain ledger JSON.
 pub const TOKEN_GAIN_SLUG: &str = "ferrostate-token-gain";
@@ -46,9 +56,24 @@ pub struct CodeSymbolHit {
     pub estimated_file_tokens: u64,
     pub snippet_tokens: u64,
     pub tokens_saved: u64,
+    /// Exact `o200k_base` count of the file's indexed text (see
+    /// [`CodeIndex::outcome`]); `None` before counting or without the
+    /// `counted-tokens` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_tokens_counted: Option<u64>,
+    /// Exact `o200k_base` count of `snippet`; `None` like
+    /// `file_tokens_counted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_tokens_counted: Option<u64>,
 }
 
 /// Cumulative token-savings ledger persisted at [`TOKEN_GAIN_SLUG`].
+///
+/// `queries_count`/`tokens_saved` book every query in the `chars / 4`
+/// estimate. `queries_counted`/`tokens_saved_counted` book only the queries
+/// that carried an exact count, in `count_unit` (`o200k_base`, OpenAI's
+/// public BPE — a real count, not the reading model's tokenizer). A ledger
+/// written before counting reads with zeroes and no unit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenGainSummary {
     #[serde(default)]
@@ -59,6 +84,12 @@ pub struct TokenGainSummary {
     pub files_indexed: u64,
     #[serde(default)]
     pub symbols_indexed: u64,
+    #[serde(default)]
+    pub tokens_saved_counted: u64,
+    #[serde(default)]
+    pub queries_counted: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_unit: Option<CountUnit>,
 }
 
 /// Which search a caller asked for: definition lookup, ranked text
@@ -82,13 +113,26 @@ crate::wire::wire_parse!(CodeSearchKind as code_search_kind_parse);
 ///
 /// `tokens_saved_this_query` is computed per distinct file:
 /// `max(0, file_tokens - sum(snippet_tokens of returned hits in that
-/// file))`, summed over files.
+/// file))`, summed over files. `tokens_saved_this_query_counted` is the
+/// same rule over the counted fields, in `o200k_base` tokens; it is `None`
+/// when any hit lacks a count.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeSearchOutcome {
     pub symbols: Vec<CodeSymbolHit>,
     pub tokens_saved_this_query: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_saved_this_query_counted: Option<u64>,
     pub files_indexed: u64,
     pub symbols_indexed: u64,
+}
+
+impl CodeSearchOutcome {
+    /// The unit of `tokens_saved_this_query_counted`: `o200k_base` when it is
+    /// counted, `None` when it is not.
+    pub fn count_unit(&self) -> Option<CountUnit> {
+        self.tokens_saved_this_query_counted
+            .map(|_| CountUnit::O200kBase)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +152,27 @@ struct IndexedFile {
     lines: Vec<String>,
     estimated_tokens: u64,
     symbols: Vec<IndexedSymbol>,
+    /// Memoized [`IndexedFile::counted`]: unset until a returned hit is in
+    /// this file, and never set without the `counted-tokens` feature.
+    counted_tokens: OnceLock<Option<u64>>,
+}
+
+impl IndexedFile {
+    /// Exact `o200k_base` count of the indexed text: every line followed by
+    /// `\n` (the text [`CodeFileRef::content_digest`] hashes; it differs from
+    /// the file only by `\r` and a missing final newline). Counted on first
+    /// use, then remembered. `None` without the `counted-tokens` feature.
+    fn counted(&self) -> Option<u64> {
+        count_unit()?;
+        *self.counted_tokens.get_or_init(|| {
+            let mut text = String::with_capacity(self.lines.iter().map(|l| l.len() + 1).sum());
+            for line in &self.lines {
+                text.push_str(line);
+                text.push('\n');
+            }
+            counted_tokens(&text)
+        })
+    }
 }
 
 /// A read-only view of one indexed file.
@@ -175,8 +240,9 @@ impl<'a> CodeSymbolRef<'a> {
         &self.sym.signature
     }
 
-    /// The same hit a search returns for this declaration: snippet and token
-    /// estimates included.
+    /// The same hit a search returns for this declaration, snippet and token
+    /// estimates included, before counting: the counted fields are `None`
+    /// until [`CodeIndex::outcome`] fills them for the hits it returns.
     pub fn hit(&self) -> CodeSymbolHit {
         symbol_hit(self.file, self.sym)
     }
@@ -222,12 +288,18 @@ impl CodeIndex {
     /// Run one search. `limit == 0`, or an empty query for `Def`/`Search`,
     /// returns no symbols (the scan counts are still reported).
     pub fn search(&self, kind: CodeSearchKind, q: &str, limit: usize) -> CodeSearchOutcome {
-        let (files, symbols) = (self.files_indexed(), self.symbols_indexed());
+        self.outcome(self.search_hits(kind, q, limit))
+    }
+
+    /// The hits [`CodeIndex::search`] would return, before counting: for a
+    /// ranker that draws a wide candidate pool and returns only some of it
+    /// through [`CodeIndex::outcome`], so unreturned files are never counted.
+    pub fn search_hits(&self, kind: CodeSearchKind, q: &str, limit: usize) -> Vec<CodeSymbolHit> {
         if limit == 0 {
-            return outcome_from_hits(Vec::new(), files, symbols);
+            return Vec::new();
         }
         let query = q.trim();
-        let hits: Vec<CodeSymbolHit> = match kind {
+        match kind {
             CodeSearchKind::Def => {
                 if query.is_empty() {
                     Vec::new()
@@ -243,8 +315,24 @@ impl CodeIndex {
                 }
             }
             CodeSearchKind::Outline => self.search_outline(query, limit),
-        };
-        outcome_from_hits(hits, files, symbols)
+        }
+    }
+
+    /// The outcome of a search over this index that returned `hits`: fills
+    /// each hit's counted fields (its file is counted on first use, then
+    /// remembered; a hit whose file is not in this index stays uncounted)
+    /// and books the gain by [`outcome_from_hits`].
+    pub fn outcome(&self, mut hits: Vec<CodeSymbolHit>) -> CodeSearchOutcome {
+        for hit in &mut hits {
+            let file = self
+                .files
+                .binary_search_by(|f| f.path.as_str().cmp(&hit.path))
+                .ok()
+                .map(|i| &self.files[i]);
+            hit.file_tokens_counted = file.and_then(IndexedFile::counted);
+            hit.snippet_tokens_counted = file.and_then(|_| counted_tokens(&hit.snippet));
+        }
+        outcome_from_hits(hits, self.files_indexed(), self.symbols_indexed())
     }
 
     /// The indexed files in relative-path order, for a ranker that keeps
@@ -385,8 +473,10 @@ pub fn search_code_index(
 }
 
 /// The outcome of a search that returned `hits`: `tokens_saved_this_query`
-/// is computed per distinct file from those hits, so every ranker (the
-/// built-in tiers or an external one) books token gain by the same rule.
+/// (and its counted twin) is computed per distinct file from those hits, so
+/// every ranker (the built-in tiers or an external one) books token gain by
+/// the same rule. The hits' counted fields are used as they are; see
+/// [`CodeIndex::outcome`] to fill them.
 pub fn outcome_from_hits(
     hits: Vec<CodeSymbolHit>,
     files_indexed: u64,
@@ -394,6 +484,7 @@ pub fn outcome_from_hits(
 ) -> CodeSearchOutcome {
     CodeSearchOutcome {
         tokens_saved_this_query: tokens_saved_per_file(&hits),
+        tokens_saved_this_query_counted: counted_saved_per_file(&hits),
         symbols: hits,
         files_indexed,
         symbols_indexed,
@@ -411,6 +502,21 @@ fn tokens_saved_per_file(hits: &[CodeSymbolHit]) -> u64 {
     per_file.values().fold(0u64, |acc, (file_tokens, snippet)| {
         acc.saturating_add(file_tokens.saturating_sub(*snippet))
     })
+}
+
+/// [`tokens_saved_per_file`] over the counted fields; `None` if any hit
+/// lacks a count.
+fn counted_saved_per_file(hits: &[CodeSymbolHit]) -> Option<u64> {
+    let mut per_file: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for hit in hits {
+        let e = per_file
+            .entry(hit.path.as_str())
+            .or_insert((hit.file_tokens_counted?, 0));
+        e.1 = e.1.saturating_add(hit.snippet_tokens_counted?);
+    }
+    Some(per_file.values().fold(0u64, |acc, (file_tokens, snippet)| {
+        acc.saturating_add(file_tokens.saturating_sub(*snippet))
+    }))
 }
 
 fn split_terms(query: &str) -> Vec<String> {
@@ -465,6 +571,8 @@ fn symbol_hit(file: &IndexedFile, sym: &IndexedSymbol) -> CodeSymbolHit {
         estimated_file_tokens: file.estimated_tokens,
         snippet_tokens,
         tokens_saved: file.estimated_tokens.saturating_sub(snippet_tokens),
+        file_tokens_counted: None,
+        snippet_tokens_counted: None,
     }
 }
 
@@ -482,6 +590,8 @@ fn line_hit(file: &IndexedFile, line_no: u64, line: &str) -> CodeSymbolHit {
         estimated_file_tokens: file.estimated_tokens,
         snippet_tokens,
         tokens_saved: file.estimated_tokens.saturating_sub(snippet_tokens),
+        file_tokens_counted: None,
+        snippet_tokens_counted: None,
     }
 }
 
@@ -613,6 +723,7 @@ fn index_file(path: &Path, rel: String) -> Option<IndexedFile> {
         lines,
         estimated_tokens,
         symbols,
+        counted_tokens: OnceLock::new(),
     })
 }
 
@@ -980,12 +1091,17 @@ fn save_token_gain(
     at: At,
     by: &str,
 ) -> Result<TokenGainSummary, StoreError> {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "queries_count": summary.queries_count,
         "tokens_saved": summary.tokens_saved,
         "files_indexed": summary.files_indexed,
         "symbols_indexed": summary.symbols_indexed,
+        "tokens_saved_counted": summary.tokens_saved_counted,
+        "queries_counted": summary.queries_counted,
     });
+    if let Some(unit) = summary.count_unit {
+        value["count_unit"] = serde_json::json!(unit);
+    }
     store.upsert_state(UpsertStateArgs {
         scope: StateScope::Workspace,
         slug: TOKEN_GAIN_SLUG.to_string(),
@@ -1020,13 +1136,17 @@ pub fn record_token_gain_index(
 
 /// Record one query: increment `queries_count` by 1, add
 /// `saved_this_query` to `tokens_saved` (saturating), and refresh the
-/// latest file/symbol counts.
+/// latest file/symbol counts. A `saved_counted` of `Some` (the query's
+/// `tokens_saved_this_query_counted`, in `o200k_base` tokens) also
+/// increments `queries_counted`, adds to `tokens_saved_counted` (saturating)
+/// and sets `count_unit`; `None` leaves those three untouched.
 ///
 /// Propagates an error (writing nothing) when the existing ledger entry
 /// cannot be trusted — see `try_load_token_gain`.
 pub fn record_token_gain_query(
     store: &impl StateStore,
     saved_this_query: u64,
+    saved_counted: Option<u64>,
     files_indexed: u64,
     symbols_indexed: u64,
     at: At,
@@ -1035,6 +1155,11 @@ pub fn record_token_gain_query(
     let mut summary = try_load_token_gain(store)?;
     summary.queries_count = summary.queries_count.saturating_add(1);
     summary.tokens_saved = summary.tokens_saved.saturating_add(saved_this_query);
+    if let Some(saved) = saved_counted {
+        summary.queries_counted = summary.queries_counted.saturating_add(1);
+        summary.tokens_saved_counted = summary.tokens_saved_counted.saturating_add(saved);
+        summary.count_unit = Some(CountUnit::O200kBase);
+    }
     summary.files_indexed = files_indexed;
     summary.symbols_indexed = symbols_indexed;
     save_token_gain(store, summary, at, by)
@@ -1330,6 +1455,129 @@ mod tests {
         assert!(out.tokens_saved_this_query > 0);
     }
 
+    fn counted_hit(path: &str, file: Option<u64>, snippet: Option<u64>) -> CodeSymbolHit {
+        CodeSymbolHit {
+            name: "n".into(),
+            kind: "fn".into(),
+            path: path.into(),
+            start_line: 1,
+            end_line: 1,
+            signature: String::new(),
+            snippet: String::new(),
+            estimated_file_tokens: 0,
+            snippet_tokens: 0,
+            tokens_saved: 0,
+            file_tokens_counted: file,
+            snippet_tokens_counted: snippet,
+        }
+    }
+
+    #[test]
+    fn counted_saving_is_per_distinct_file_and_needs_every_count() {
+        let hits = vec![
+            counted_hit("a.rs", Some(100), Some(10)),
+            counted_hit("a.rs", Some(100), Some(15)),
+            counted_hit("b.rs", Some(40), Some(50)),
+        ];
+        // a.rs: 100 - (10 + 15); b.rs saturates at 0.
+        assert_eq!(
+            outcome_from_hits(hits.clone(), 2, 3).tokens_saved_this_query_counted,
+            Some(75)
+        );
+        assert_eq!(
+            outcome_from_hits(Vec::new(), 2, 3).tokens_saved_this_query_counted,
+            Some(0)
+        );
+        for missing in [
+            counted_hit("a.rs", None, Some(1)),
+            counted_hit("c.rs", Some(9), None),
+        ] {
+            let mut partial = hits.clone();
+            partial.push(missing);
+            assert_eq!(
+                outcome_from_hits(partial, 2, 3).tokens_saved_this_query_counted,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn search_counts_only_the_files_of_returned_hits_once() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "a.rs",
+            "pub fn alpha() {}\npub fn alpine() {}\n",
+        );
+        write(tmp.path(), "b.rs", "pub fn beta() {}\n");
+        write(tmp.path(), "c.rs", "pub fn gamma() {}\n");
+        let index = scan_code_index(tmp.path());
+        assert!(index.files.iter().all(|f| f.counted_tokens.get().is_none()));
+        let out = index.search(CodeSearchKind::Def, "alp", 10);
+        assert_eq!(out.symbols.len(), 2);
+        let state = |path: &str| {
+            index
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .unwrap()
+                .counted_tokens
+                .get()
+                .copied()
+        };
+        assert_eq!(state("b.rs"), None, "a file without a hit was counted");
+        assert_eq!(state("c.rs"), None, "a file without a hit was counted");
+        assert_eq!(state("a.rs").is_some(), count_unit().is_some());
+        // Uncounted hits, counted later, book the same outcome as `search`.
+        let raw = index.search_hits(CodeSearchKind::Def, "alp", 10);
+        assert!(raw.iter().all(|h| h.file_tokens_counted.is_none()));
+        assert_eq!(index.outcome(raw), out);
+    }
+
+    #[cfg(feature = "counted-tokens")]
+    #[test]
+    fn counted_fields_follow_the_indexed_text_and_snippets() {
+        let tmp = TempDir::new().unwrap();
+        let mut text = String::from("pub fn alpha() {\n");
+        for i in 0..30 {
+            text.push_str(&format!("    let pad_a_{i} = {i};\n"));
+        }
+        text.push_str("}\npub fn beta() {\n    let x = 1;\n}\n");
+        write(tmp.path(), "big.rs", &text);
+        let out = search_code_index(tmp.path(), CodeSearchKind::Outline, "big.rs", 10);
+        assert_eq!(out.symbols.len(), 2);
+        // Every line ends in `\n` here, so the indexed text is the file text.
+        let file_counted = counted_tokens(&text).unwrap();
+        let mut snippet_sum = 0;
+        for hit in &out.symbols {
+            assert_eq!(hit.file_tokens_counted, Some(file_counted));
+            assert_eq!(hit.snippet_tokens_counted, counted_tokens(&hit.snippet));
+            snippet_sum += hit.snippet_tokens_counted.unwrap();
+        }
+        assert_eq!(
+            out.tokens_saved_this_query_counted,
+            Some(file_counted - snippet_sum)
+        );
+        assert!(out.tokens_saved_this_query_counted.unwrap() > 0);
+        let json = serde_json::to_value(&out.symbols[0]).unwrap();
+        assert_eq!(json["file_tokens_counted"], file_counted);
+    }
+
+    #[cfg(not(feature = "counted-tokens"))]
+    #[test]
+    fn without_the_feature_hits_carry_no_counts() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.rs", "pub fn alpha() {}\n");
+        let out = search_code_index(tmp.path(), CodeSearchKind::Def, "alpha", 10);
+        assert_eq!(out.symbols.len(), 1);
+        assert_eq!(out.symbols[0].file_tokens_counted, None);
+        assert_eq!(out.symbols[0].snippet_tokens_counted, None);
+        assert_eq!(out.tokens_saved_this_query_counted, None);
+        let json = serde_json::to_value(&out.symbols[0]).unwrap();
+        assert!(json.get("file_tokens_counted").is_none(), "{json}");
+        assert!(json.get("snippet_tokens_counted").is_none(), "{json}");
+    }
+
     #[test]
     fn outcome_from_hits_books_the_gain_like_search_and_in_any_order() {
         let tmp = TempDir::new().unwrap();
@@ -1429,7 +1677,7 @@ mod tests {
         );
         assert_eq!(
             syms[0].hit(),
-            index.search(CodeSearchKind::Def, "alpha", 5).symbols[0]
+            index.search_hits(CodeSearchKind::Def, "alpha", 5)[0]
         );
         // The digest follows the text: stable on a rescan, new when a line changes.
         let digest = files[0].content_digest();
@@ -1525,20 +1773,22 @@ mod tests {
                 queries_count: 0,
                 tokens_saved: 0,
                 files_indexed: 3,
-                symbols_indexed: 10
+                symbols_indexed: 10,
+                ..TokenGainSummary::default()
             }
         );
-        let after_q1 = record_token_gain_query(&store, 100, 3, 10, at(), "tester").unwrap();
+        let after_q1 = record_token_gain_query(&store, 100, None, 3, 10, at(), "tester").unwrap();
         assert_eq!(after_q1.queries_count, 1);
         assert_eq!(after_q1.tokens_saved, 100);
-        let after_q2 = record_token_gain_query(&store, 50, 4, 12, at(), "tester").unwrap();
+        let after_q2 = record_token_gain_query(&store, 50, None, 4, 12, at(), "tester").unwrap();
         assert_eq!(
             after_q2,
             TokenGainSummary {
                 queries_count: 2,
                 tokens_saved: 150,
                 files_indexed: 4,
-                symbols_indexed: 12
+                symbols_indexed: 12,
+                ..TokenGainSummary::default()
             }
         );
         assert_eq!(load_token_gain(&store), after_q2);
@@ -1560,6 +1810,79 @@ mod tests {
                 assert_eq!(rt.value["files_indexed"], 4);
                 assert_eq!(rt.value["symbols_indexed"], 12);
             }
+            other => panic!("expected Runtime payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_ledger_stored_before_counting_reads_with_empty_counted_fields() {
+        let store = MemStore::default();
+        seed_ledger(
+            &store,
+            serde_json::json!({
+                "queries_count": 7,
+                "tokens_saved": 99,
+                "files_indexed": 1,
+                "symbols_indexed": 2
+            }),
+            SensitivityPatch::Inherit,
+        );
+        let old = load_token_gain(&store);
+        assert_eq!(
+            old,
+            TokenGainSummary {
+                queries_count: 7,
+                tokens_saved: 99,
+                files_indexed: 1,
+                symbols_indexed: 2,
+                tokens_saved_counted: 0,
+                queries_counted: 0,
+                count_unit: None,
+            }
+        );
+        let json = serde_json::to_value(old).unwrap();
+        assert!(json.get("count_unit").is_none(), "{json}");
+    }
+
+    #[test]
+    fn counted_queries_add_to_the_counted_ledger_and_uncounted_leave_it() {
+        let store = MemStore::default();
+        let q1 = record_token_gain_query(&store, 100, Some(80), 3, 10, at(), "tester").unwrap();
+        assert_eq!(
+            (q1.queries_count, q1.tokens_saved),
+            (1, 100),
+            "the estimate is booked as before"
+        );
+        assert_eq!((q1.queries_counted, q1.tokens_saved_counted), (1, 80));
+        assert_eq!(q1.count_unit, Some(CountUnit::O200kBase));
+        let q2 = record_token_gain_query(&store, 50, None, 3, 10, at(), "tester").unwrap();
+        assert_eq!((q2.queries_count, q2.tokens_saved), (2, 150));
+        assert_eq!((q2.queries_counted, q2.tokens_saved_counted), (1, 80));
+        assert_eq!(q2.count_unit, Some(CountUnit::O200kBase));
+        let q3 = record_token_gain_query(&store, 1, Some(u64::MAX), 3, 10, at(), "tester").unwrap();
+        assert_eq!((q3.queries_counted, q3.tokens_saved_counted), (2, u64::MAX));
+        assert_eq!(load_token_gain(&store), q3);
+        match stored_ledger(&store).payload {
+            StatePayload::Runtime(rt) => {
+                assert_eq!(rt.value["queries_counted"], 2);
+                assert_eq!(rt.value["tokens_saved_counted"], u64::MAX);
+                assert_eq!(rt.value["count_unit"], "o200k_base");
+            }
+            other => panic!("expected Runtime payload, got {other:?}"),
+        }
+        // A ledger that never counted stays without a unit.
+        let fresh = MemStore::default();
+        let only = record_token_gain_query(&fresh, 5, None, 1, 1, at(), "tester").unwrap();
+        assert_eq!(
+            (
+                only.queries_counted,
+                only.tokens_saved_counted,
+                only.count_unit
+            ),
+            (0, 0, None)
+        );
+        match stored_ledger(&fresh).payload {
+            StatePayload::Runtime(rt) => assert!(rt.value.get("count_unit").is_none()),
             other => panic!("expected Runtime payload, got {other:?}"),
         }
     }
@@ -1597,7 +1920,7 @@ mod tests {
         let bogus = serde_json::json!({"queries_count": "oops"});
         seed_ledger(&store, bogus.clone(), SensitivityPatch::Inherit);
         assert_eq!(load_token_gain(&store), TokenGainSummary::default());
-        assert!(record_token_gain_query(&store, 10, 1, 1, at(), "tester").is_err());
+        assert!(record_token_gain_query(&store, 10, Some(10), 1, 1, at(), "tester").is_err());
         assert!(record_token_gain_index(&store, 1, 1, at(), "tester").is_err());
         match stored_ledger(&store).payload {
             StatePayload::Runtime(rt) => assert_eq!(rt.value, bogus),
@@ -1618,7 +1941,7 @@ mod tests {
         let seeded = stored_ledger(&store);
         assert!(seeded.sensitive || seeded.ever_sensitive);
         assert_eq!(load_token_gain(&store), TokenGainSummary::default());
-        assert!(record_token_gain_query(&store, 10, 1, 1, at(), "tester").is_err());
+        assert!(record_token_gain_query(&store, 10, Some(10), 1, 1, at(), "tester").is_err());
         assert!(record_token_gain_index(&store, 1, 1, at(), "tester").is_err());
         match stored_ledger(&store).payload {
             StatePayload::Runtime(rt) => assert_eq!(rt.value, secret),
