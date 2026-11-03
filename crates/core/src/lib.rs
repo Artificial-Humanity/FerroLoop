@@ -19,6 +19,7 @@ pub mod ferrostate;
 pub mod ferrowire;
 pub mod finding;
 pub mod ids;
+pub mod install;
 pub mod iri;
 pub mod log;
 pub mod mem;

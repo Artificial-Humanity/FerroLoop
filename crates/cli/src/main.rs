@@ -121,6 +121,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Plan an install of the FerroLoop products (`--dry-run` only; nothing is written).
+    Install(cmd::install::Cmd),
 }
 
 impl Command {
@@ -150,7 +152,8 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
-            | Command::Version { .. } => Vec::new(),
+            | Command::Version { .. }
+            | Command::Install(_) => Vec::new(),
         }
     }
 
@@ -192,7 +195,8 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
-            | Command::Version { .. } => false,
+            | Command::Version { .. }
+            | Command::Install(_) => false,
         }
     }
 
@@ -228,7 +232,8 @@ impl Command {
             | Command::Vault { .. }
             | Command::Auth { .. }
             | Command::Watch { .. }
-            | Command::Version { .. } => false,
+            | Command::Version { .. }
+            | Command::Install(_) => false,
         }
     }
 }
@@ -837,6 +842,23 @@ fn run_mcp_entry() -> Result<i32> {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // `fl install` plans from a manifest and the install prefix alone: it opens no store and
+    // reads no project config, so a broken config cannot stop it and it cannot touch one.
+    let cli = match cli {
+        Cli {
+            db,
+            command: Command::Install(c),
+        } => {
+            if db.is_some() {
+                bail!(
+                    "`fl install` opens no store, so `--db` names nothing here. Drop it; \
+                     `--prefix` chooses where the install lives"
+                );
+            }
+            return cmd::install::run(c);
+        }
+        other => other,
+    };
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
     let cfg = config::load(config::path().as_deref())?;
     // MCP spec §1.1: `fl mcp` never opens a store, so it returns here, before
@@ -1414,7 +1436,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Vault { .. }
         | Command::Auth { .. }
         | Command::Watch { .. }
-        | Command::Version { .. } => {
+        | Command::Version { .. }
+        | Command::Install(_) => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };
