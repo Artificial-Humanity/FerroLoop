@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 
-use fl_core::agent::{AgentRecord, AgentRole, AgentStatus};
+use fl_core::agent::{AgentRecord, AgentRole, AgentStatus, RoleError, RoleRecord};
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
@@ -552,6 +552,8 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         }
         ("GET", "/api/v1/records") => records::handle_get_records(state, req),
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
+        ("GET", "/api/v1/roles") => handle_get_roles(state),
+        ("POST", "/api/v1/roles") => handle_post_role(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("GET", "/api/v1/version") => crate::version_api::handle_get(state),
         ("GET", "/api/v1/doctor") => crate::doctor_api::handle_get(state, &authority),
@@ -4095,6 +4097,78 @@ fn handle_put_settings(
     }
 }
 
+fn role_error_response(err: &RoleError) -> HttpResponse {
+    let status = match err {
+        RoleError::BuiltinRole(_) => 400,
+        RoleError::NotFound(_) => 404,
+        RoleError::InvalidReviewPolicy(_) | RoleError::InvalidSlug(_) | RoleError::EmptyLabel => {
+            400
+        }
+        RoleError::Store(_) => 500,
+    };
+    HttpResponse::json(status, json!({ "error": err.to_string() }))
+}
+
+/// `GET /api/v1/roles` (Record #74): all roles. Any authenticated caller.
+fn handle_get_roles(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::agent::list_roles(&*store) {
+        Ok(roles) => HttpResponse::json(200, serde_json::to_value(&roles).unwrap_or(json!([]))),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+/// `POST /api/v1/roles` (Record #74): validate and persist a role. Owner only,
+/// like `PUT /api/v1/settings`. 201 for a new slug, 200 for an override.
+fn handle_post_role(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change roles" }),
+        );
+    }
+    let record: RoleRecord = match serde_json::from_slice(&req.body) {
+        Ok(record) => record,
+        Err(e) => {
+            return HttpResponse::json(400, json!({ "error": format!("invalid role: {e}") }));
+        }
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let existed = matches!(fl_core::agent::get_role(&*store, &record.slug), Ok(Some(_)));
+    match fl_core::agent::upsert_role(&*store, record) {
+        Ok(saved) => HttpResponse::json(
+            if existed { 200 } else { 201 },
+            serde_json::to_value(&saved).unwrap_or(json!({})),
+        ),
+        Err(e) => role_error_response(&e),
+    }
+}
+
+/// `DELETE /api/v1/roles/{slug}` (Record #74): delete a custom role. Owner only.
+fn handle_delete_role(state: &HubState, authority: &HubAuthority, raw_slug: &str) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change roles" }),
+        );
+    }
+    let slug = percent_decode(raw_slug);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match fl_core::agent::delete_role(&*store, &slug) {
+        Ok(()) => {
+            let normalized = fl_core::agent::normalize_role_slug(&slug).unwrap_or(slug);
+            HttpResponse::json(200, json!({ "deleted": true, "slug": normalized }))
+        }
+        Err(e) => role_error_response(&e),
+    }
+}
+
 /// `GET /api/v1/cloud/adapters` (Records 52 and 53): the saved cloud adapter config, or the
 /// defaults. A saved file that cannot be used is a 500, never a silent reset.
 fn handle_get_cloud_adapters(state: &HubState) -> HttpResponse {
@@ -4520,6 +4594,16 @@ fn handle_dynamic_api_routes(
             let bridge_id = percent_decode(segments[4]);
             return handle_post_gate_bridge_webhook(state, authority, &bridge_id, req);
         }
+    }
+
+    // /api/v1/roles/:slug
+    if segments.len() == 4
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "roles"
+        && method == "DELETE"
+    {
+        return handle_delete_role(state, authority, segments[3]);
     }
 
     // /api/v1/nodes/:id — after sessions and attachments so those prefixes win.
@@ -6863,6 +6947,175 @@ mod tests {
         )
         .unwrap();
         (dir, store)
+    }
+
+    fn roles_test_state() -> (tempfile::TempDir, HubState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().join("repo"),
+            owner_token: Some("owner-test-tok".to_string()),
+            peer_token: Some("peer-test-tok".to_string()),
+            home_override: Some(tmp.path().join("home")),
+            ..crate::HubServerConfig::default()
+        };
+        fs::create_dir_all(&cfg.repo_root).unwrap();
+        (tmp, HubState::new(cfg))
+    }
+
+    fn roles_call(
+        state: &HubState,
+        method: &str,
+        target: &str,
+        token: &str,
+        body: Option<Vec<u8>>,
+    ) -> (u16, Value) {
+        let mut req = HttpRequest::new(method, target);
+        req.headers
+            .insert("authorization".to_string(), format!("Bearer {token}"));
+        if let Some(body) = body {
+            req.body = body;
+        }
+        let resp = handle_http_request(state, &req);
+        let value = serde_json::from_slice(&resp.body).unwrap_or(json!(null));
+        (resp.status, value)
+    }
+
+    fn role_body(slug: &str, label: &str, builtin: bool) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "slug": slug, "label": label, "description": "d", "builtin": builtin,
+            "review_policy": "lead-review", "prompt_template": "p"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn roles_endpoints_list_create_override_and_delete() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let (status, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
+        assert_eq!(status, 200);
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 11);
+        assert!(list.iter().all(|r| r["builtin"] == true));
+
+        // Custom create -> 201, builtin=false; then listed.
+        let (status, saved) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(role_body("reviewer", "Reviewer", false)),
+        );
+        assert_eq!(status, 201, "{saved}");
+        assert_eq!(saved["slug"], "reviewer");
+        assert_eq!(saved["builtin"], false);
+        let (_, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
+        assert_eq!(list.as_array().unwrap().len(), 12);
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["slug"] == "reviewer" && r["builtin"] == false)
+        );
+
+        // Spoofed builtin:true on a custom slug is corrected to false.
+        let (status, saved) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(role_body("spoof", "Spoof", true)),
+        );
+        assert_eq!(status, 201, "{saved}");
+        assert_eq!(saved["builtin"], false);
+
+        // Builtin override keeps builtin=true (and existed -> 200).
+        let (status, saved) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(role_body("lead", "Boss", false)),
+        );
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["builtin"], true);
+        assert_eq!(saved["label"], "Boss");
+
+        // lab_manager normalizes to the builtin lab-manager.
+        let (status, saved) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(role_body("lab_manager", "Lab Boss", false)),
+        );
+        assert_eq!(status, 200, "{saved}");
+        assert_eq!(saved["slug"], "lab-manager");
+        assert_eq!(saved["builtin"], true);
+
+        // Deletes: builtin 400 (also via lab_manager alias), unknown 404, custom 200 then absent.
+        let (status, err) = roles_call(&state, "DELETE", "/api/v1/roles/lead", owner, None);
+        assert_eq!(status, 400, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("built-in"));
+        let (status, _) = roles_call(&state, "DELETE", "/api/v1/roles/lab_manager", owner, None);
+        assert_eq!(status, 400);
+        let (status, err) = roles_call(&state, "DELETE", "/api/v1/roles/nope", owner, None);
+        assert_eq!(status, 404, "{err}");
+        assert!(err.get("error").is_some());
+        let (status, _) = roles_call(&state, "DELETE", "/api/v1/roles/reviewer", owner, None);
+        assert_eq!(status, 200);
+        let (_, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
+        assert!(
+            !list
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["slug"] == "reviewer")
+        );
+    }
+
+    #[test]
+    fn roles_endpoints_reject_invalid_and_require_owner_for_writes() {
+        let (_tmp, state) = roles_test_state();
+        let owner = "owner-test-tok";
+        let (status, err) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(b"{not json".to_vec()),
+        );
+        assert_eq!(status, 400, "{err}");
+        assert!(err.get("error").is_some());
+        let bad_policy = serde_json::to_vec(&json!({
+            "slug": "x", "label": "X", "description": "", "builtin": false,
+            "review_policy": "bogus", "prompt_template": ""
+        }))
+        .unwrap();
+        let (status, _) = roles_call(&state, "POST", "/api/v1/roles", owner, Some(bad_policy));
+        assert_eq!(status, 400);
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            owner,
+            Some(role_body("x", "  ", false)),
+        );
+        assert_eq!(status, 400);
+        // Peer may read but not write.
+        let (status, _) = roles_call(&state, "GET", "/api/v1/roles", "peer-test-tok", None);
+        assert_eq!(status, 200);
+        let (status, _) = roles_call(
+            &state,
+            "POST",
+            "/api/v1/roles",
+            "peer-test-tok",
+            Some(role_body("y", "Y", false)),
+        );
+        assert_eq!(status, 403);
+        let (status, _) = roles_call(&state, "DELETE", "/api/v1/roles/y", "peer-test-tok", None);
+        assert_eq!(status, 403);
     }
 
     fn put_memory(

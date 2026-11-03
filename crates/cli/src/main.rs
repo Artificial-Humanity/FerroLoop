@@ -71,6 +71,11 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::agent::AgentCmd,
     },
+    /// Manage the configurable role registry (builtins plus custom roles).
+    Role {
+        #[command(subcommand)]
+        cmd: cmd::role::RoleCmd,
+    },
     /// Manage durable memories, handoffs, runtime state, and git state sync.
     State {
         #[command(subcommand)]
@@ -148,6 +153,7 @@ impl Command {
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
+            | Command::Role { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
@@ -192,6 +198,7 @@ impl Command {
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
+            | Command::Role { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
@@ -230,6 +237,7 @@ impl Command {
             | Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
+            | Command::Role { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
             | Command::Hub { .. }
@@ -939,6 +947,26 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cli {
             db,
+            command: Command::Role { cmd },
+        } => {
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let state_env = cmd::state::StateEnv {
+                explicit_db: explicit.as_deref(),
+                default_store: &default_store,
+                cfg: &cfg,
+                cwd: &cwd,
+            };
+            return match cmd::role::run(&state_env, cmd) {
+                Ok(()) => Ok(0),
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    Ok(1)
+                }
+            };
+        }
+        Cli {
+            db,
             command: Command::State { cmd },
         } => {
             let explicit = explicit_db(db);
@@ -1456,6 +1484,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Mcp(_)
         | Command::Agent { .. }
         | Command::State { .. }
+        | Command::Role { .. }
         | Command::Wire { .. }
         | Command::Arch { .. }
         | Command::Hub { .. }
