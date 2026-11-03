@@ -2279,6 +2279,14 @@ mod tests {
             6_000,
         );
         let entries = store.list_state(None, None).unwrap();
+        // Exactly the changed revision is embedded again.
+        let ferro = store.as_ferro().unwrap();
+        let col = vector_collection_name(default_embedder());
+        let refs: Vec<&StateEntry> = entries.iter().collect();
+        let stats = sync_index(ferro, default_embedder(), &col, &refs, 100).unwrap();
+        assert_eq!(stats.written, 1, "only the updated entry is re-embedded");
+        let stats = sync_index(ferro, default_embedder(), &col, &refs, 100).unwrap();
+        assert_eq!(stats.written, 0, "and the sync is idempotent");
         assert!(!order(&entries).contains(&"build-cache".to_string()));
 
         // Supersede: the old entry keeps its vector but is weighted below
