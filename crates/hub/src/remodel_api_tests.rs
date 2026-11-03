@@ -178,7 +178,7 @@ fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
     assert_eq!(status_of(&state, "felicity"), AgentStatus::Active);
 
     // A remodel with no model takes the new vendor's default: no override is left at all.
-    let resp = remodel(&state, "felicity", PEER, &json!({ "vendor": "grok" }));
+    let resp = remodel(&state, "felicity", OWNER, &json!({ "vendor": "grok" }));
     assert_eq!(resp.status, 200, "{}", body_text(&resp));
     assert_eq!(resp.json_value().unwrap()["model"], Value::Null);
     for key in ["felicity", "codex:felicity", "grok:felicity"] {
@@ -216,7 +216,7 @@ fn errors_map_like_the_sibling_lifecycle_endpoints_and_change_nothing() {
     );
     assert_eq!(unauth.status, 401);
     for (id, token, body, want) in [
-        // A Peer may not adopt an unmanaged session.
+        // A Peer may not remodel any session, hosted or not.
         ("claude%3Ajarvis", PEER, json!({ "vendor": "codex" }), 403),
         ("ghost", OWNER, json!({ "vendor": "codex" }), 404),
         (
@@ -267,6 +267,68 @@ fn errors_map_like_the_sibling_lifecycle_endpoints_and_change_nothing() {
     assert_eq!(status_of(&state, "jarvis"), AgentStatus::Active);
     assert_eq!(status_of(&state, "felicity"), AgentStatus::Active);
     assert!(frames.try_recv().is_err());
+}
+
+#[test]
+fn a_peer_cannot_remodel_a_hosted_session_and_nothing_changes() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    spin_up(&state, "felicity", "assistant", "claude");
+    state.set_session_model_override(
+        "claude:felicity",
+        ModelOverride {
+            model: "claude-opus-5-5".into(),
+            thinking_level: None,
+        },
+    );
+    state.enqueue_session_prompt(
+        "claude:felicity",
+        Some("felicity".into()),
+        "queued".into(),
+        "queued".into(),
+        "owner".into(),
+        Vec::new(),
+    );
+    let before = records(&state);
+    let invalidations =
+        || crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(std::cell::Cell::get);
+    let invalidated = invalidations();
+    let mut frames = state.subscribe();
+
+    // Both phases, and an unparsable body: the gate comes before the body is read.
+    for body in [
+        json!({ "vendor": "codex" }),
+        json!({ "vendor": "codex", "mode": "prepare" }),
+        json!({}),
+    ] {
+        let resp = remodel(&state, "claude%3Afelicity", PEER, &body);
+        assert_eq!(resp.status, 403, "{body}: {}", body_text(&resp));
+        assert!(body_text(&resp).contains("Owner"), "{body}");
+    }
+    let raw = handle_http_request(
+        &state,
+        &HttpRequest::new("POST", "/api/v1/sessions/claude%3Afelicity/remodel")
+            .with_header("Authorization", format!("Bearer {PEER}"))
+            .with_body(b"{nope".to_vec()),
+    );
+    assert_eq!(raw.status, 403);
+
+    assert_eq!(records(&state), before);
+    assert_eq!(status_of(&state, "felicity"), AgentStatus::Active);
+    assert_eq!(state.session_queue("claude:felicity").len(), 1);
+    assert_eq!(
+        override_model(&state, "claude:felicity").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(invalidations(), invalidated, "no runtime was touched");
+    assert!(
+        frames.try_recv().is_err(),
+        "a refused call broadcasts nothing"
+    );
+
+    // The Owner still can.
+    let resp = remodel(&state, "felicity", OWNER, &json!({ "vendor": "codex" }));
+    assert_eq!(resp.status, 200, "{}", body_text(&resp));
 }
 
 #[test]

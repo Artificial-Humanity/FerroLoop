@@ -2914,7 +2914,7 @@ mod tests {
         let missing_route = handle_http_request(
             &state,
             &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
-                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_header("Authorization", "Bearer owner-tok-secret")
                 .with_json_body(&json!({ "mode": "clear" })),
         );
         assert_eq!(missing_route.status, 404);
@@ -2962,7 +2962,7 @@ mod tests {
         let alias = handle_http_request(
             &state,
             &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
-                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_header("Authorization", "Bearer owner-tok-secret")
                 .with_json_body(&json!({ "mode": "clear_only" })),
         );
         assert_eq!(alias.status, 200);
@@ -3085,7 +3085,7 @@ mod tests {
             assert!(store.get_area("ferroloop").unwrap().is_some());
         }
 
-        // A Peer may spin up too (same gate as the session clear endpoint); the override fields stick.
+        // A Peer may spin up a hosted session (spin-up has its own gate); the override fields stick.
         let peer = handle_http_request(
             &state,
             &authed(
@@ -3228,7 +3228,7 @@ mod tests {
 
         // Prepare without a route falls back to the session prompt queue.
         let queued = decommission(
-            Some("peer-tok-secret"),
+            Some("owner-tok-secret"),
             "claude:ada",
             json!({ "mode": "prepare" }),
         )
@@ -3454,7 +3454,9 @@ mod tests {
         assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
         assert_eq!(hosted_count(), 0);
 
-        // The refused spin-up did not make it hosted, so the Peer still cannot retire it.
+        // The refused spin-up did not make it hosted, and a Peer cannot decommission at all:
+        // the API's Owner gate answers first; the lifecycle gate itself is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         for mode in ["prepare", "teardown"] {
             let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
             assert_eq!(
@@ -3490,6 +3492,9 @@ mod tests {
 
     #[test]
     fn peer_cannot_reach_a_reregistered_agent_through_its_stale_decommissioned_record() {
+        // The spin-up half asserts the lifecycle's spin-up gate. The decommission half asserts the
+        // API's Owner 403 and no side effect; the lifecycle gate itself is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         use fl_core::agent::{AgentRole, AgentStatus, RegisterAgentArgs};
         use fl_core::store::AgentRegistry;
 
@@ -3570,7 +3575,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_teardown_needs_a_hosted_record_and_malformed_ids_are_400_without_side_effects() {
+    fn peer_decommission_is_403_and_malformed_ids_are_400_without_side_effects() {
         use fl_core::agent::{AgentRole, AgentStatus};
         use fl_core::store::AgentRegistry;
 
@@ -3615,7 +3620,9 @@ mod tests {
             assert!(listed["sessions"].as_array().unwrap().is_empty());
         };
 
-        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id.
+        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id. This asserts
+        // the API's Owner 403 and no side effect; the lifecycle gate is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", "teardown");
         assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
         jarvis_is_untouched();
@@ -3636,10 +3643,22 @@ mod tests {
         assert_eq!(state.session_queue("claude:Foo Bar").len(), 1);
         jarvis_is_untouched();
 
-        // A Peer may tear down a hosted session; the Owner may adopt an unmanaged one.
+        // A Peer cannot tear down a hosted session either (even with an unparsable body); the
+        // Owner can, and may adopt an unmanaged one.
         assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
         assert_eq!(
             decommission_as(&state, "peer-tok-secret", "claude:ada", "teardown").status,
+            403
+        );
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/claude:ada/decommission")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
             200
         );
         assert_eq!(
@@ -3654,7 +3673,78 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_cannot_decommission_a_hosted_session_and_nothing_changes() {
+        use fl_core::agent::AgentStatus;
+        use fl_core::store::AgentRegistry;
+        use fl_wire::identity::RouteTable;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let socket = tmp.path().join("ada.sock");
+        install_webhook_route(tmp.path(), "ada", &socket);
+        let routes_path = tmp.path().join(".cache/agent-bus/routes.json");
+        state.enqueue_session_prompt(
+            "claude:ada",
+            Some("ada".into()),
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let hosted = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .clone()
+        };
+        let before = hosted();
+        let mut frames = state.subscribe();
+
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Aada", mode);
+            assert_eq!(resp.status, 403, "{mode}: {}", error_text(&resp));
+            assert!(error_text(&resp).contains("Owner"), "{mode}");
+        }
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/claude%3Aada/decommission")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+
+        assert_eq!(hosted(), before);
+        assert_eq!(state.session_queue("claude:ada").len(), 1);
+        assert!(RouteTable::load(Some(&routes_path)).get("ada").is_some());
+        assert_eq!(
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("ada")
+                .unwrap()
+                .unwrap()
+                .status,
+            AgentStatus::Active
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a refused call must broadcast nothing"
+        );
+    }
+
+    #[test]
     fn peer_prepare_of_an_unmanaged_session_is_403_and_cannot_unlock_teardown() {
+        // Asserts the API's Owner 403 and no side effect; the lifecycle gate is covered by the
+        // `Caller::Peer` unit tests in lifecycle.rs.
         use fl_core::agent::{AgentRole, AgentStatus};
         use fl_core::store::AgentRegistry;
 
@@ -5211,20 +5301,131 @@ mod tests {
     }
 
     #[test]
-    fn prompt_and_clear_stay_callable_by_a_peer() {
+    fn prompt_stays_callable_by_a_peer() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
-        for (path, body) in [
-            (
-                "/api/v1/sessions/nobody/prompt",
-                json!({ "prompt": "hello" }),
-            ),
-            ("/api/v1/sessions/nobody/clear", json!({ "mode": "clear" })),
-        ] {
-            let resp = call(&state, "POST", path, PEER, &body);
-            assert_ne!(resp.status, 403, "{path}: {}", resp.json_value().unwrap());
-            assert_ne!(resp.status, 401, "{path}");
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/nobody/prompt",
+            PEER,
+            &json!({ "prompt": "hello" }),
+        );
+        assert_ne!(resp.status, 403, "{}", resp.json_value().unwrap());
+        assert_ne!(resp.status, 401);
+    }
+
+    #[test]
+    fn clear_and_reforge_are_owner_only_and_a_peer_changes_nothing() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
         }
+        let socket = tmp.path().join("felicia.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        // The Owner's `clear` is one webhook line; its `reforge` is a reset line and a prompt.
+        let lines = collect_webhook_lines(socket, 3);
+        state.enqueue_session_prompt(
+            "felicia",
+            Some("felicia".into()),
+            "queued prompt".into(),
+            "queued prompt".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        state.set_session_model_override(
+            "webhook-felicia",
+            session_actions::ModelOverride {
+                model: "model-a".into(),
+                thinking_level: None,
+            },
+        );
+        let mut frames = state.subscribe();
+
+        // A Peer is refused in both modes, and with an unparsable body too: the gate comes
+        // before the body is read.
+        for body in [
+            json!({ "mode": "clear" }),
+            json!({ "mode": "clear_only" }),
+            json!({ "mode": "reforge" }),
+            json!({ "mode": "rehydrate" }),
+            json!({ "mode": "wipe" }),
+        ] {
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/sessions/felicia/clear",
+                PEER,
+                &body,
+            );
+            assert_eq!(resp.status, 403, "{body}: {}", error_text(&resp));
+            assert!(error_text(&resp).contains("Owner"), "{body}");
+        }
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", format!("Bearer {PEER}"))
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+
+        // Nothing changed: the queue and the model override are intact and nothing was broadcast.
+        assert_eq!(state.session_queue("felicia").len(), 1);
+        assert_eq!(
+            state
+                .session_model_override("webhook-felicia")
+                .unwrap()
+                .model,
+            "model-a"
+        );
+        assert!(
+            frames.try_recv().is_err(),
+            "a rejected call must broadcast nothing"
+        );
+
+        // The Owner still can, in both modes.
+        let cleared = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/felicia/clear",
+            OWNER,
+            &json!({ "mode": "clear" }),
+        );
+        assert_eq!(cleared.status, 200, "{}", error_text(&cleared));
+        assert!(state.session_queue("felicia").is_empty());
+        assert!(state.session_model_override("webhook-felicia").is_none());
+        let reforged = api::with_hydrate_lock(|| {
+            call(
+                &state,
+                "POST",
+                "/api/v1/sessions/felicia/clear",
+                OWNER,
+                &json!({ "mode": "reforge" }),
+            )
+        });
+        assert_eq!(reforged.status, 200, "{}", error_text(&reforged));
+        assert_eq!(reforged.json_value().unwrap()["mode"], "reforge");
+
+        // Only the Owner's two calls reached the route.
+        let delivered = lines.join().unwrap();
+        assert_eq!(delivered.len(), 3);
     }
 
     #[test]
@@ -7478,8 +7679,8 @@ default_target = "wire:felicity"
             decommission_as(&state, OWNER, "claude%3Aada", "teardown").status,
             200
         );
-        // The persona registers again outside the lifecycle: a Peer may not retire it, but the
-        // stale record still names the worktree.
+        // The persona registers again outside the lifecycle: the API's Owner gate refuses a Peer,
+        // and the stale record still names the worktree.
         state
             .open_store()
             .unwrap()

@@ -5051,6 +5051,11 @@ pub(crate) fn with_hydrate_lock<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+/// `POST /api/v1/sessions/:id/clear` (mode `clear` or `reforge`): drop the session's queued
+/// prompts and model override and reset its live route; `reforge` then sends the synthesized
+/// startup prompt. Owner only (403 for a Peer, checked before the body is read and before any
+/// side effect), for both modes: it erases another actor's queue and injects a prompt into a
+/// live vendor conversation.
 fn handle_post_session_clear(
     state: &HubState,
     authority: &HubAuthority,
@@ -5060,6 +5065,13 @@ fn handle_post_session_clear(
     #[derive(Deserialize)]
     struct ClearPayload {
         mode: String,
+    }
+
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may clear or reforge a session" }),
+        );
     }
 
     let payload: ClearPayload = match req.json() {
@@ -5178,8 +5190,8 @@ fn optional_reason(req: &HttpRequest) -> Result<Option<String>, HttpResponse> {
 }
 
 /// `POST /api/v1/sessions/:id/interrupt` (Record 47): stop the turn the session is running.
-/// Owner only (403 for a Peer, checked before anything else), unlike prompt and clear: it
-/// cancels another actor's work. 404 when the session has no live route; 502 when the
+/// Owner only (403 for a Peer, checked before anything else): it cancels another actor's
+/// work. 404 when the session has no live route; 502 when the
 /// interrupt cannot be delivered. See [`session_actions::interrupt_route`] for the per-vendor
 /// mechanism and the test-mode no-op.
 fn handle_post_session_interrupt(
@@ -5253,7 +5265,7 @@ fn hosted_record_for(
 }
 
 /// `POST /api/v1/sessions/:id/model` (Records 48 and 57): switch the model of a session.
-/// Owner only (403 for a Peer, checked before the body is read), unlike prompt and clear. The
+/// Owner only (403 for a Peer, checked before the body is read). The
 /// choice is kept in `HubState` and overlaid on `GET /api/v1/sessions` (in memory: gone after
 /// a hub restart), written to the hosted-session record when one exists, and sent to a live
 /// CLI as `/model <id>`. Antigravity is not sent anything: its method is `override-only`.
@@ -5513,6 +5525,9 @@ fn handle_post_session_spin_up(
     }
 }
 
+/// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
+/// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
+/// a Peer, checked before the body is read and before any discovery, store access or side effect.
 fn handle_post_session_decommission(
     state: &HubState,
     authority: &HubAuthority,
@@ -5525,6 +5540,12 @@ fn handle_post_session_decommission(
         mode: String,
     }
 
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may decommission a session" }),
+        );
+    }
     let payload: DecommissionPayload = match req.json() {
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
@@ -5615,12 +5636,21 @@ fn handle_post_session_decommission(
 /// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
 /// (`restored` or `down`). When the old session was restored, the operator's model override
 /// (and thinking level) the teardown cleared is put back as it was (see [`run_remodel`]).
+///
+/// Owner only: 403 for a Peer, checked before the body is read and before any discovery, store
+/// access or side effect.
 fn handle_post_session_remodel(
     state: &HubState,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may remodel a session" }),
+        );
+    }
     let payload: RemodelRequest = match req.json() {
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
