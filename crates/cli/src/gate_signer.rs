@@ -31,7 +31,9 @@ use fl_gate::{
     Vault, VaultRef, load_existing_master_key, resolve_master_key_path, resolve_vault_path,
 };
 use fl_github::{FileKeySigner, JwtSigner};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
