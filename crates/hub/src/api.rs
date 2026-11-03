@@ -5943,8 +5943,24 @@ pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
     }
 }
 
+/// The FerroState scope token (`project:<slug>`) that names `project`, for the `--scope` flag of
+/// `fl state`. The slug comes from [`derive_import_slug`], the same slugger the checkpoint scope
+/// uses. A project name that cannot be slugged falls back to `workspace`, which always parses.
+pub(crate) fn project_state_scope(project: &str) -> String {
+    derive_import_slug(project)
+        .map(|slug| format!("project:{slug}"))
+        .filter(|token| StateScope::from_wire(token).is_ok())
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
 pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) -> String {
     let name_lower = name.to_ascii_lowercase();
+    let scope = project_state_scope(project);
+    let render_scopes = if scope == "workspace" {
+        "--scope workspace".to_string()
+    } else {
+        format!("--scope workspace --scope {scope}")
+    };
     format!(
         "Take the name of {name} and take up residence in {project}/ as the {role}.\n\
          \n\
@@ -5952,12 +5968,13 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
          1. Read `.agents/AGENTS.md` and `.agents/REGISTRY.md`.\n\
          2. Read your role file(s): `.agents/roles/{role}.md`.\n\
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
-         4. Read your project's current working state note: `Notes/{project}/STATE.md`.\n\
-         5. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
+         4. Read your working state from FerroState, the primary state source: run `fl state render {render_scopes}` for the startup summary, `fl state get current --scope {scope}` for your latest handoff, and `fl state search \"<query>\"` to look up anything specific.\n\
+         5. Optional legacy reference: if `Notes/{project}/STATE.md` exists, skim it; FerroState wins wherever the two disagree. Do not require it.\n\
+         6. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
             ```bash\n\
             AGENT_PERSONA={name_lower} agent-msg register {name} --project {project} --role {role} --replace\n\
             ```\n\
-         6. Check and acknowledge any pending NATS messages:\n\
+         7. Check and acknowledge any pending NATS messages:\n\
             ```bash\n\
             AGENT_PERSONA={name_lower} agent-msg read --ack\n\
             ```\n\
@@ -5970,6 +5987,7 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
 /// its work. `role` is a [`reforge_role_label`] value; a Lead hands off to `jarvis`.
 pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &str) -> String {
     let name_lower = name.to_ascii_lowercase();
+    let scope = project_state_scope(project);
     let recipient = match role {
         "lead" => "`jarvis`".to_string(),
         "lab_manager" => "the owner".to_string(),
@@ -5980,16 +5998,14 @@ pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &s
     let to = if role == "lead" { "jarvis" } else { "<lead>" };
     format!(
         "{name}, you are being prepared for decommission. This session will be shut down after you finish; do not start new work. Complete these steps now:\n\
-         1. Save unsaved progress, findings and your handoff in `Notes/{project}/STATE.md` and in FerroState (`fl state handoff set` for the handoff, `fl state checkpoint` for the git checkpoint).\n\
+         1. Save unsaved progress, findings and your handoff in FerroState, the primary state source: `fl state handoff set --scope {scope} --summary \"<one line, at most 240 characters>\" --by {name_lower}` for the handoff (the summary must be ONE line of at most 240 characters; put the detail in repeatable `--shipped`, `--in-flight`, `--blocker`, `--next` flags or in `--notes`), then `fl state checkpoint --scope {scope} --by {name_lower}` for the git checkpoint. `Notes/{project}/STATE.md` is an optional legacy note; update it only if it exists.\n\
          2. Commit and push your work, or clean up your temp worktrees and branches (`git worktree remove`, `git branch -d`). Leave nothing only on this session's disk.\n\
-         3. Send a final handoff to {recipient} over both channels:\n\
+         3. Send your final handoff to {recipient} once:\n\
             ```bash\n\
             fl wire send {to} \"{name} decommission handoff\" \"<what is done, open, and where it lives>\" --from {name_lower}\n\
-            AGENT_PERSONA={name_lower} agent-msg send {to} \"{name} decommission handoff\" \"<same summary>\"\n\
             ```\n\
          4. Acknowledge the remaining inbox messages:\n\
             ```bash\n\
-            fl wire read --ack\n\
             AGENT_PERSONA={name_lower} agent-msg read --ack\n\
             ```\n\
          \n\
