@@ -11,9 +11,13 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 globset.workspace = true
+tiktoken-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [features]
 conformance = []
+# Exact o200k_base token counts beside the chars/4 estimate (`token_count`).
+# Off by default so light dependents (fl-gate) never build the vocabulary.
+counted-tokens = ["dep:tiktoken-rs"]
