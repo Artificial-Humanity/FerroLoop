@@ -248,6 +248,252 @@ const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
     "Immediately stop every active runtime session, clear queues and routes, and unregister each persona.",
 };
 
+// Record #84 (Issue #205 Phase B): Sub-Product Component Picker, Profile Presets & Provenance Truth
+export type InstallProfilePreset = "minimal" | "headless" | "full" | "lab";
+
+export type SubProductId =
+  | "ferroloop"
+  | "ferrostore"
+  | "ferrodeck"
+  | "ferrowire"
+  | "ferrostate"
+  | "ferrogate"
+  | "ferrotrack"
+  | "ferrowatch"
+  | "fl-flow";
+
+export interface SubProductNode {
+  id: SubProductId;
+  displayName: string;
+  required: boolean;
+  hiddenDefault: boolean;
+  dependsOn: readonly SubProductId[];
+  managedUnits: readonly string[];
+  managedMcpEntries: readonly string[];
+}
+
+export const SUBPRODUCT_DEPENDENCY_GRAPH: Record<SubProductId, SubProductNode> = {
+  ferroloop: {
+    id: "ferroloop",
+    displayName: "FerroLoop Core Engine (fl)",
+    required: true,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore"],
+    managedUnits: [],
+    managedMcpEntries: [],
+  },
+  ferrostore: {
+    id: "ferrostore",
+    displayName: "FerroStore Embedded Storage (.fls / FERRSTR1)",
+    required: true,
+    hiddenDefault: true,
+    dependsOn: [],
+    managedUnits: [],
+    managedMcpEntries: [],
+  },
+  ferrodeck: {
+    id: "ferrodeck",
+    displayName: "FerroDeck (fl hub)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore", "ferrowire"],
+    managedUnits: ["ferroloop-hub.service"],
+    managedMcpEntries: [],
+  },
+  ferrowire: {
+    id: "ferrowire",
+    displayName: "FerroWire (fl wire)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore"],
+    managedUnits: ["ferrowire.service", "agent-bus-dispatcher.service"],
+    managedMcpEntries: ["fl-wire-mcp"],
+  },
+  ferrostate: {
+    id: "ferrostate",
+    displayName: "FerroState (fl state)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore"],
+    managedUnits: [],
+    managedMcpEntries: ["fl-state-mcp"],
+  },
+  ferrogate: {
+    id: "ferrogate",
+    displayName: "FerroGate (fl vault / fl auth)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: [],
+    managedUnits: [],
+    managedMcpEntries: ["fl-gate-mcp"],
+  },
+  ferrotrack: {
+    id: "ferrotrack",
+    displayName: "FerroTrack (fl github)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore"],
+    managedUnits: [],
+    managedMcpEntries: [],
+  },
+  ferrowatch: {
+    id: "ferrowatch",
+    displayName: "FerroWatch (fl stats)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferrostore"],
+    managedUnits: [],
+    managedMcpEntries: [],
+  },
+  "fl-flow": {
+    id: "fl-flow",
+    displayName: "DAG Workflow Runner (fl flow)",
+    required: false,
+    hiddenDefault: false,
+    dependsOn: ["ferroloop", "ferrostore"],
+    managedUnits: [],
+    managedMcpEntries: [],
+  },
+};
+
+export interface ProductDependencyClosureResult {
+  resolvedProducts: SubProductId[];
+  autoIncludedBy: Partial<Record<SubProductId, SubProductId[]>>;
+  plannedUnits: string[];
+  plannedMcpCatalog: string[];
+  storeMode: "embedded" | "lab-socket-daemon";
+}
+
+function normalizeSubProductId(raw: string): SubProductId | null {
+  const clean = raw.trim().toLowerCase();
+  if (clean === "ferrostep" || clean === "fl-flow" || clean === "flow") {
+    return "fl-flow";
+  }
+  if (clean in SUBPRODUCT_DEPENDENCY_GRAPH) {
+    return clean as SubProductId;
+  }
+  return null;
+}
+
+export function computeProductDependencyClosure(
+  selectedIds: readonly string[],
+  profile: InstallProfilePreset | "custom" = "full",
+): ProductDependencyClosureResult {
+  const resolved = new Set<SubProductId>(["ferroloop", "ferrostore"]);
+  const autoIncludedBy: Partial<Record<SubProductId, SubProductId[]>> = {
+    ferrostore: ["ferroloop"],
+  };
+
+  const queue: SubProductId[] = ["ferroloop"];
+  for (const raw of selectedIds) {
+    const id = normalizeSubProductId(raw);
+    if (id) {
+      resolved.add(id);
+      queue.push(id);
+    }
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const node = SUBPRODUCT_DEPENDENCY_GRAPH[current];
+    if (!node) continue;
+    for (const dep of node.dependsOn) {
+      const existingRequirers = autoIncludedBy[dep] ?? [];
+      if (!existingRequirers.includes(current)) {
+        autoIncludedBy[dep] = [...existingRequirers, current];
+      }
+      if (!resolved.has(dep)) {
+        resolved.add(dep);
+        queue.push(dep);
+      }
+    }
+  }
+
+  const orderedIds: SubProductId[] = (
+    Object.keys(SUBPRODUCT_DEPENDENCY_GRAPH) as SubProductId[]
+  ).filter((id) => resolved.has(id));
+
+  const plannedUnitsSet = new Set<string>();
+  const plannedMcpSet = new Set<string>();
+  for (const id of orderedIds) {
+    const node = SUBPRODUCT_DEPENDENCY_GRAPH[id];
+    for (const u of node.managedUnits) plannedUnitsSet.add(u);
+    for (const m of node.managedMcpEntries) plannedMcpSet.add(m);
+  }
+  if (profile === "lab") {
+    plannedUnitsSet.add("ferrostore@ferroloop.service");
+    plannedUnitsSet.add("ferrostore@workspace.service");
+  }
+
+  return {
+    resolvedProducts: orderedIds,
+    autoIncludedBy,
+    plannedUnits: Array.from(plannedUnitsSet),
+    plannedMcpCatalog: Array.from(plannedMcpSet),
+    storeMode: profile === "lab" ? "lab-socket-daemon" : "embedded",
+  };
+}
+
+export function resolveProfileSubsystems(
+  profile: InstallProfilePreset,
+): HubSettings["subsystems"] {
+  if (profile === "minimal") {
+    return {
+      ferrogate_enabled: false,
+      ferrostate_enabled: false,
+      ferrostep_enabled: false,
+      ferrodeck_enabled: false,
+      ferrowire_enabled: false,
+      ferrotrack_enabled: false,
+      ferrowatch_enabled: false,
+    };
+  }
+  if (profile === "headless") {
+    return {
+      ferrogate_enabled: true,
+      ferrostate_enabled: true,
+      ferrostep_enabled: true,
+      ferrodeck_enabled: false,
+      ferrowire_enabled: true,
+      ferrotrack_enabled: true,
+      ferrowatch_enabled: true,
+    };
+  }
+  return {
+    ferrogate_enabled: true,
+    ferrostate_enabled: true,
+    ferrostep_enabled: true,
+    ferrodeck_enabled: true,
+    ferrowire_enabled: true,
+    ferrotrack_enabled: true,
+    ferrowatch_enabled: true,
+  };
+}
+
+export function inferInstallProfilePreset(
+  subsystems: HubSettings["subsystems"],
+  preferredLab = false,
+): InstallProfilePreset | "custom" {
+  const deck = subsystems.ferrodeck_enabled ?? true;
+  const wire = subsystems.ferrowire_enabled ?? true;
+  const state = subsystems.ferrostate_enabled;
+  const gate = subsystems.ferrogate_enabled;
+  const track = subsystems.ferrotrack_enabled ?? true;
+  const watch = subsystems.ferrowatch_enabled ?? true;
+  const flow = subsystems.ferrostep_enabled;
+
+  if (!deck && !wire && !state && !gate && !track && !watch && !flow) {
+    return "minimal";
+  }
+  if (!deck && wire && state && gate && track && watch && flow) {
+    return "headless";
+  }
+  if (deck && wire && state && gate && track && watch && flow) {
+    return preferredLab ? "lab" : "full";
+  }
+  return "custom";
+}
+
 export function getBulkActionLabel(
   action: BulkSessionAction,
   selectedCount: number,
@@ -339,6 +585,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [reconciledPostureAgents, setReconciledPostureAgents] = useState<
     Set<string>
   >(() => new Set());
+  // Record #84 (Issue #205 Phase B): Profile preset, auto-closure & receipt provenance state
+  const [labProfilePreferred, setLabProfilePreferred] = useState(false);
+  const [autoClosureNotice, setAutoClosureNotice] = useState<string | null>(
+    null,
+  );
+  const [receiptAdoptionState, setReceiptAdoptionState] = useState<
+    "managed" | "unmanaged_adopt_required"
+  >("managed");
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
@@ -3207,25 +3461,141 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 FerroLoop Installed Products &amp; Subsystem Toggles
               </h3>
               <p
+                data-testid="products-shared-cli-banner"
                 style={{
                   margin: 0,
                   fontSize: "12px",
                   color: "var(--text-secondary)",
                 }}
               >
-                Manage installed Ferro Suite products, core engine guarantees, and
-                per-product runtime configuration.
+                Shared CLI included; select the services and integrations to enable.
               </p>
             </div>
-            <button
-              type="button"
-              data-testid="save-products-settings-btn"
-              className="fd-btn fd-btn-primary"
-              disabled={savingSettings}
-              onClick={() => void handleSaveSettings()}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <span
+                className="fd-badge fd-mono"
+                data-testid="active-install-profile-badge"
+              >
+                Profile: {inferInstallProfilePreset(settings.subsystems, labProfilePreferred)}
+              </span>
+              <button
+                type="button"
+                data-testid="save-products-settings-btn"
+                className="fd-btn fd-btn-primary"
+                disabled={savingSettings}
+                onClick={() => void handleSaveSettings()}
+              >
+                {savingSettings ? "Saving..." : "Save Product Settings"}
+              </button>
+            </div>
+          </div>
+
+          {/* Record #84 (Issue #205 Phase B): Installation Profile Presets Selector */}
+          <div
+            className="fd-card"
+            data-testid="products-profile-presets-card"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "8px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "10px",
+                flexWrap: "wrap",
+              }}
             >
-              {savingSettings ? "Saving..." : "Save Product Settings"}
-            </button>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                  Installation Profile Presets (`fl install --profile`)
+                </div>
+                <div style={{ fontSize: "11.5px", color: "var(--text-secondary)" }}>
+                  Apply a curated component profile or customize individual services below with automatic dependency closure.
+                </div>
+              </div>
+              <div
+                style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}
+                role="group"
+                aria-label="Installation Profile Presets"
+              >
+                {(
+                  [
+                    {
+                      id: "minimal" as const,
+                      label: "minimal",
+                      desc: "FerroLoop CLI + embedded FerroStore only",
+                    },
+                    {
+                      id: "headless" as const,
+                      label: "headless",
+                      desc: "CLI + daemons/MCP (without FerroDeck web UI)",
+                    },
+                    {
+                      id: "full" as const,
+                      label: "full",
+                      desc: "All products including FerroDeck + systemd/LaunchAgent units",
+                    },
+                    {
+                      id: "lab" as const,
+                      label: "lab",
+                      desc: "full + ai-lab-0 per-project ferrostore@ socket daemons",
+                    },
+                  ] as const
+                ).map((preset) => {
+                  const activeProfile = inferInstallProfilePreset(
+                    settings.subsystems,
+                    labProfilePreferred,
+                  );
+                  const isSelected = activeProfile === preset.id;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      data-testid={`profile-preset-${preset.id}`}
+                      aria-pressed={isSelected}
+                      title={preset.desc}
+                      className={
+                        isSelected ? "fd-btn fd-btn-primary" : "fd-btn"
+                      }
+                      style={{ fontSize: "11.5px", padding: "4px 10px" }}
+                      onClick={() => {
+                        setSettingsSaved(false);
+                        setLabProfilePreferred(preset.id === "lab");
+                        setAutoClosureNotice(
+                          `Applied '${preset.id}' profile preset (${preset.desc}).`,
+                        );
+                        setSettings((prev) => ({
+                          ...prev,
+                          subsystems: resolveProfileSubsystems(preset.id),
+                        }));
+                      }}
+                    >
+                      {preset.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            {autoClosureNotice && (
+              <div
+                role="status"
+                data-testid="product-autoclose-notice"
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: "6px",
+                  background: "rgba(56, 189, 248, 0.12)",
+                  border: "1px solid rgba(56, 189, 248, 0.35)",
+                  color: "var(--accent-primary)",
+                  fontSize: "11.5px",
+                }}
+              >
+                {autoClosureNotice}
+              </div>
+            )}
           </div>
 
           <div
@@ -3360,6 +3730,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <span>Enable DAG Workflow Runner (`fl flow`)</span>
                 </label>
                 <div
+                  data-testid="embedded-ferrostore-dependency"
                   style={{
                     display: "inline-flex",
                     alignItems: "center",
@@ -3377,7 +3748,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     style={{ borderRadius: "3px", objectFit: "cover" }}
                   />
                   <span>
-                    Storage Engine: FerroStore (`.fls` / `redb` automatic dependency)
+                    {labProfilePreferred
+                      ? "Storage Engine: FerroStore (ai-lab-0 ferrostore@ socket daemon)"
+                      : "Storage Engine: FerroStore (.fls / FERRSTR1 embedded default dependency)"}
                   </span>
                 </div>
               </div>
@@ -3449,12 +3822,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       aria-label="Enable FerroDeck"
                       checked={settings.subsystems.ferrodeck_enabled ?? true}
                       onChange={(e) => {
+                        const nextChecked = e.target.checked;
                         setSettingsSaved(false);
+                        if (
+                          nextChecked &&
+                          !(settings.subsystems.ferrowire_enabled ?? true)
+                        ) {
+                          setAutoClosureNotice(
+                            "Auto-enabled FerroWire (required runtime dependency for FerroDeck).",
+                          );
+                        }
                         setSettings((prev) => ({
                           ...prev,
                           subsystems: {
                             ...prev.subsystems,
-                            ferrodeck_enabled: e.target.checked,
+                            ferrodeck_enabled: nextChecked,
+                            ferrowire_enabled: nextChecked
+                              ? true
+                              : prev.subsystems.ferrowire_enabled,
                           },
                         }));
                       }}
@@ -3555,6 +3940,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       flexShrink: 0,
                     }}
                   >
+                    {(settings.subsystems.ferrodeck_enabled ?? true) && (
+                      <span
+                        className="fd-badge"
+                        data-testid="autoclose-badge-ferrowire"
+                        title="Required runtime dependency when FerroDeck is enabled"
+                      >
+                        Required by FerroDeck
+                      </span>
+                    )}
                     <span className="fd-badge">
                       {(settings.subsystems.ferrowire_enabled ?? true)
                         ? "Enabled"
@@ -3566,12 +3960,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       aria-label="Enable FerroWire"
                       checked={settings.subsystems.ferrowire_enabled ?? true}
                       onChange={(e) => {
+                        const nextChecked = e.target.checked;
                         setSettingsSaved(false);
+                        if (
+                          !nextChecked &&
+                          (settings.subsystems.ferrodeck_enabled ?? true)
+                        ) {
+                          setAutoClosureNotice(
+                            "Disabled FerroDeck because its required dependency FerroWire was disabled.",
+                          );
+                        }
                         setSettings((prev) => ({
                           ...prev,
                           subsystems: {
                             ...prev.subsystems,
-                            ferrowire_enabled: e.target.checked,
+                            ferrowire_enabled: nextChecked,
+                            ferrodeck_enabled: !nextChecked
+                              ? false
+                              : prev.subsystems.ferrodeck_enabled,
                           },
                         }));
                       }}
@@ -4125,6 +4531,283 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             </div>
           </div>
+
+          {/* Record #84 (Issue #205 Phase B): Dependency Closure & Planned Service / Integration Actions */}
+          {(() => {
+            const activeProfile = inferInstallProfilePreset(
+              settings.subsystems,
+              labProfilePreferred,
+            );
+            const selectedIds: string[] = [];
+            if (settings.subsystems.ferrodeck_enabled ?? true) {
+              selectedIds.push("ferrodeck");
+            }
+            if (settings.subsystems.ferrowire_enabled ?? true) {
+              selectedIds.push("ferrowire");
+            }
+            if (settings.subsystems.ferrostate_enabled) {
+              selectedIds.push("ferrostate");
+            }
+            if (settings.subsystems.ferrogate_enabled) {
+              selectedIds.push("ferrogate");
+            }
+            if (settings.subsystems.ferrotrack_enabled ?? true) {
+              selectedIds.push("ferrotrack");
+            }
+            if (settings.subsystems.ferrowatch_enabled ?? true) {
+              selectedIds.push("ferrowatch");
+            }
+            if (settings.subsystems.ferrostep_enabled) {
+              selectedIds.push("fl-flow");
+            }
+            const closure = computeProductDependencyClosure(
+              selectedIds,
+              activeProfile,
+            );
+
+            return (
+              <>
+                <div
+                  className="fd-card"
+                  data-testid="install-plan-preview"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                      Dependency Closure &amp; Planned Service / Integration Actions
+                    </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="install-plan-store-mode"
+                    >
+                      Store Mode:{" "}
+                      {closure.storeMode === "lab-socket-daemon"
+                        ? "ferrostore@ socket daemon"
+                        : "embedded .fls (FERRSTR1)"}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                      gap: "8px",
+                      fontSize: "11.5px",
+                    }}
+                  >
+                    <div
+                      data-testid="install-plan-resolved-products"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontWeight: 700,
+                          fontSize: "10.5px",
+                          textTransform: "uppercase",
+                          color: "var(--text-muted)",
+                          marginBottom: "4px",
+                        }}
+                      >
+                        Resolved Component Closure ({closure.resolvedProducts.length})
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        {closure.resolvedProducts.join(", ")}
+                      </code>
+                    </div>
+                    <div
+                      data-testid="install-plan-units"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontWeight: 700,
+                          fontSize: "10.5px",
+                          textTransform: "uppercase",
+                          color: "var(--text-muted)",
+                          marginBottom: "4px",
+                        }}
+                      >
+                        Planned Service Units ({closure.plannedUnits.length})
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        {closure.plannedUnits.length > 0
+                          ? closure.plannedUnits.join(", ")
+                          : "None (CLI-only / embedded)"}
+                      </code>
+                    </div>
+                    <div
+                      data-testid="install-plan-mcp"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontWeight: 700,
+                          fontSize: "10.5px",
+                          textTransform: "uppercase",
+                          color: "var(--text-muted)",
+                          marginBottom: "4px",
+                        }}
+                      >
+                        Planned MCP Catalog Entries ({closure.plannedMcpCatalog.length})
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        {closure.plannedMcpCatalog.length > 0
+                          ? closure.plannedMcpCatalog.join(", ")
+                          : "None"}
+                      </code>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Record #84 (Issue #205 Phase B): Install Receipt & Release Provenance Inspector */}
+                <div
+                  className="fd-card"
+                  data-testid="install-receipt-inspector"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                      <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                        Install Receipt &amp; Release Provenance (`receipt.json`)
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="receipt-adoption-badge"
+                        style={{
+                          background:
+                            receiptAdoptionState === "managed"
+                              ? "rgba(52, 211, 153, 0.14)"
+                              : "rgba(251, 191, 36, 0.16)",
+                          color:
+                            receiptAdoptionState === "managed"
+                              ? "#34d399"
+                              : "#fbbf24",
+                        }}
+                      >
+                        {receiptAdoptionState === "managed"
+                          ? "Managed Receipt (Schema v1)"
+                          : "Unmanaged Artifact (--adopt required)"}
+                      </span>
+                    </div>
+                    <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                      <button
+                        type="button"
+                        data-testid="receipt-simulate-unmanaged-btn"
+                        className="fd-btn"
+                        style={{ fontSize: "11px", padding: "3px 8px" }}
+                        onClick={() => {
+                          setReceiptAdoptionState((prev) =>
+                            prev === "managed"
+                              ? "unmanaged_adopt_required"
+                              : "managed",
+                          );
+                        }}
+                      >
+                        {receiptAdoptionState === "managed"
+                          ? "Simulate Unmanaged Binary"
+                          : "Restore Managed State"}
+                      </button>
+                      {receiptAdoptionState === "unmanaged_adopt_required" && (
+                        <button
+                          type="button"
+                          data-testid="receipt-adopt-btn"
+                          className="fd-btn fd-btn-primary"
+                          style={{ fontSize: "11px", padding: "3px 8px" }}
+                          onClick={() => {
+                            setReceiptAdoptionState("managed");
+                            setAutoClosureNotice(
+                              "Adopted existing ~/.local/bin/fl and systemd units into ~/.local/share/fl/receipt.json (--adopt).",
+                            );
+                          }}
+                        >
+                          Adopt Existing Installation (`--adopt`)
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                      gap: "8px",
+                      fontSize: "11.5px",
+                    }}
+                  >
+                    <div
+                      data-testid="receipt-provenance-release"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
+                        Release ID &amp; Source Provenance
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        0.9.4+b0888c6bc1ed · signed_release · dirty=false
+                      </code>
+                    </div>
+                    <div
+                      data-testid="receipt-provenance-paths"
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: "6px",
+                        background: "var(--bg-elevated)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
+                        Atomic Layout &amp; Stable Launcher
+                      </div>
+                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                        ~/.local/share/fl/current -&gt; releases/0.9.4+b0888c6bc1ed · ~/.local/bin/fl
+                      </code>
+                    </div>
+                  </div>
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         {/* TAB 3: Auth */}
