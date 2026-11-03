@@ -23,13 +23,20 @@ import {
   DEFAULT_RULE_PRESET_MATRICES,
   DEFAULT_UNIVERSAL_PERMISSION_MATRICES,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  buildCanonicalPermissionPolicy,
+  canonicalDefaultEffect,
   compileUniversalPermissions,
   computeWorktreeBootstrapPreview,
   resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
+  type CanonicalPermissionPolicy,
+  type CanonicalPermissionRule,
+  type CanonicalRulePattern,
   type PermissionChangeClass,
   type PermissionCompileReceipt,
   type PermissionRuleAction,
+  type ProtectedPathClass,
+  type UnenforcedDefaultsMode,
   type UniversalPermissionCapability,
   type UniversalPermissionMatrix,
   type UniversalPermissionMode,
@@ -43,12 +50,19 @@ export {
   DEFAULT_RULE_PRESET_MATRICES,
   DEFAULT_UNIVERSAL_PERMISSION_MATRICES,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  buildCanonicalPermissionPolicy,
+  canonicalDefaultEffect,
   compileUniversalPermissions,
   resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
+  type CanonicalPermissionPolicy,
+  type CanonicalPermissionRule,
+  type CanonicalRulePattern,
   type PermissionChangeClass,
   type PermissionCompileReceipt,
   type PermissionRuleAction,
+  type ProtectedPathClass,
+  type UnenforcedDefaultsMode,
   type UniversalPermissionCapability,
   type UniversalPermissionMatrix,
   type UniversalPermissionMode,
@@ -408,6 +422,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     useState<UniversalPermissionMatrix>(
       () => DEFAULT_RULE_PRESET_MATRICES.workspace,
     );
+  const [agentRequireFsEnforcement, setAgentRequireFsEnforcement] =
+    useState(false);
+  const [agentUnenforcedDefaults, setAgentUnenforcedDefaults] =
+    useState<UnenforcedDefaultsMode>("refuse");
+  const [agentPermissionSavedStatus, setAgentPermissionSavedStatus] =
+    useState<string | null>(null);
   const [recastModalOpen, setRecastModalOpen] = useState(false);
   const [recastProject, setRecastProject] = useState(agentProject || "Workspace");
   const [recastRole, setRecastRole] = useState(
@@ -1104,6 +1124,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                 agentPosture,
                 agentSandbox,
                 agentPermissionMatrix,
+                {
+                  requireFsEnforcement: agentRequireFsEnforcement,
+                  unenforcedDefaults: agentUnenforcedDefaults,
+                },
               );
               return (
                 <div
@@ -1190,6 +1214,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           setAgentPosture(nextPosture);
                           if (nextPosture === "bypass") {
                             setAgentPermissionMode("auto-accept");
+                            setAgentRequireFsEnforcement(false);
                           } else if (nextPosture === "accept-edits") {
                             setAgentPermissionMode("workspace-write");
                           }
@@ -1237,9 +1262,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                         data-testid="agent-sandbox-select"
                         className="fd-select fd-mono"
                         value={agentSandbox}
-                        onChange={(e) =>
-                          setAgentSandbox(e.target.value as UniversalSandboxMode)
-                        }
+                        onChange={(e) => {
+                          const nextSandbox = e.target
+                            .value as UniversalSandboxMode;
+                          setAgentSandbox(nextSandbox);
+                          if (nextSandbox === "off") {
+                            setAgentRequireFsEnforcement(false);
+                          }
+                        }}
                         style={{ width: "100%", fontSize: "10.5px" }}
                       >
                         <option value="vendor-default">vendor-default</option>
@@ -1291,6 +1321,78 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Canonical PermissionPolicy v1 enforcement & unenforced_defaults controls */}
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        fontSize: "10.5px",
+                        color: "var(--text-secondary)",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        data-testid="agent-require-fs-enforcement-checkbox"
+                        checked={agentRequireFsEnforcement}
+                        disabled={
+                          agentSandbox === "off" || agentPosture === "bypass"
+                        }
+                        onChange={(e) =>
+                          setAgentRequireFsEnforcement(e.target.checked)
+                        }
+                      />
+                      <span>
+                        require_fs_enforcement (OS boundary for
+                        fs_write_protected)
+                      </span>
+                    </label>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                    >
+                      <label
+                        htmlFor="fd-agent-unenforced-defaults"
+                        style={{
+                          fontSize: "10px",
+                          color: "var(--text-muted)",
+                          fontWeight: 600,
+                        }}
+                      >
+                        unenforced_defaults:
+                      </label>
+                      <select
+                        id="fd-agent-unenforced-defaults"
+                        aria-label="Agent Unenforced Defaults Policy"
+                        data-testid="agent-unenforced-defaults-select"
+                        className="fd-select fd-mono"
+                        value={agentUnenforcedDefaults}
+                        onChange={(e) =>
+                          setAgentUnenforcedDefaults(
+                            e.target.value as UnenforcedDefaultsMode,
+                          )
+                        }
+                        style={{ fontSize: "10px", padding: "1px 4px" }}
+                      >
+                        <option value="refuse">refuse (default)</option>
+                        <option value="acknowledge">acknowledge</option>
+                      </select>
+                    </div>
+                  </div>
+
                   <select
                     aria-label="Agent Permission & Approval Mode"
                     data-testid="agent-permission-mode-select"
@@ -1304,6 +1406,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       });
                       if (nextMode === "auto-accept") {
                         setAgentPosture("bypass");
+                        setAgentRequireFsEnforcement(false);
                       } else if (nextMode === "workspace-write") {
                         setAgentPosture("accept-edits");
                         setAgentRulePreset("workspace");
@@ -1418,6 +1521,17 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       Compiled ({compileReceipt.vendor}):{" "}
                       {compileReceipt.nativeFlagsOrConfig}
                     </div>
+                    <div
+                      className="fd-mono"
+                      data-testid="agent-canonical-policy-preview"
+                      style={{ color: "var(--text-secondary)", fontSize: "10px" }}
+                    >
+                      Policy v{compileReceipt.policy.schema_version}: posture=
+                      {compileReceipt.policy.posture} · sandbox=
+                      {compileReceipt.policy.sandbox} · rules=
+                      {compileReceipt.policy.rules.length} · unenforced_defaults=
+                      {compileReceipt.policy.unenforced_defaults ?? "refuse"}
+                    </div>
                     {compileReceipt.downgrades.length > 0 && (
                       <div
                         data-testid="agent-compile-downgrades"
@@ -1441,6 +1555,41 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       >
                         Refused: {compileReceipt.refused.join(" ")}
                       </div>
+                    )}
+                  </div>
+
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <button
+                      type="button"
+                      className="fd-btn fd-btn-primary"
+                      data-testid="agent-save-permissions-btn"
+                      style={{ fontSize: "11px", padding: "4px 8px" }}
+                      disabled={compileReceipt.refused.length > 0}
+                      onClick={() => {
+                        setAgentPermissionSavedStatus(
+                          `Saved PermissionPolicy v${compileReceipt.policy.schema_version} (posture=${compileReceipt.policy.posture}, sandbox=${compileReceipt.policy.sandbox}, rules=${compileReceipt.policy.rules.length}) for ${displayTarget}.`,
+                        );
+                      }}
+                    >
+                      Save Permission Policy
+                    </button>
+                    {agentPermissionSavedStatus && (
+                      <span
+                        role="status"
+                        data-testid="agent-permissions-saved-banner"
+                        className="fd-mono"
+                        style={{ fontSize: "10.5px", color: "#34D399" }}
+                      >
+                        {agentPermissionSavedStatus}
+                      </span>
                     )}
                   </div>
                 </div>

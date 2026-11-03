@@ -4,10 +4,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentSettingsModal,
   UNIVERSAL_PERMISSION_CAPABILITIES as ReExportedCapabilities,
+  buildCanonicalPermissionPolicy as ReExportedBuildPolicy,
+  canonicalDefaultEffect as ReExportedDefaultEffect,
   compileUniversalPermissions as ReExportedCompile,
   resolvePermissionChangeClass as ReExportedChangeClass,
   resolveVendorPermissionPreview as ReExportedVendorPreview,
 } from "../components/AgentSettingsModal";
+import {
+  ChatPane,
+  DEFAULT_PENDING_PERMISSION_PROMPTS as ReExportedChatPrompts,
+  detectTranscriptPermissionPrompts,
+} from "../components/ChatPane";
 import {
   DEFAULT_RELEASE_SLOTS,
   SettingsModal,
@@ -17,6 +24,8 @@ import {
   DEFAULT_RULE_PRESET_MATRICES,
   SpinUpAgentModal,
   UNIVERSAL_PERMISSION_CAPABILITIES,
+  buildCanonicalPermissionPolicy,
+  canonicalDefaultEffect,
   compileUniversalPermissions,
   resolvePermissionChangeClass,
   resolveVendorPermissionPreview,
@@ -346,5 +355,239 @@ describe("Wave 8 & Wave 9 (Record #103): Universal Agent Permission 3-Layer Mode
     expect(
       screen.getByTestId("triage-permission-prompt-banner").textContent,
     ).toContain("no verified permission grant recorded");
+  });
+
+  it("builds canonical PermissionPolicy v1 wire objects matching crates/core/src/permissions/{policy,plan}.rs", () => {
+    expect(ReExportedBuildPolicy).toBe(buildCanonicalPermissionPolicy);
+    expect(ReExportedDefaultEffect).toBe(canonicalDefaultEffect);
+    expect(ReExportedChatPrompts).toBe(DEFAULT_PENDING_PERMISSION_PROMPTS);
+
+    expect(canonicalDefaultEffect("fs_write_protected")).toBe("deny");
+    expect(canonicalDefaultEffect("shell_exec")).toBe("ask");
+
+    const policy = buildCanonicalPermissionPolicy(
+      "ask",
+      "vendor-default",
+      DEFAULT_RULE_PRESET_MATRICES.workspace,
+      {
+        requireFsEnforcement: true,
+        unenforcedDefaults: "acknowledge",
+        patternRules: [
+          {
+            capability: "shell_exec",
+            effect: "allow",
+            pattern: { kind: "argv_prefix", argv: ["git", "status"] },
+          },
+          {
+            capability: "fs_write_protected",
+            effect: "deny",
+            pattern: { kind: "path_class", class: "git" },
+          },
+        ],
+      },
+    );
+
+    expect(Object.keys(policy).sort()).toEqual([
+      "posture",
+      "require_fs_enforcement",
+      "rules",
+      "sandbox",
+      "schema_version",
+      "unenforced_defaults",
+    ]);
+    expect(policy.schema_version).toBe(1);
+    expect(policy.posture).toBe("ask");
+    expect(policy.sandbox).toBe("vendor-default");
+    expect(policy.require_fs_enforcement).toBe(true);
+    expect(policy.unenforced_defaults).toBe("acknowledge");
+    expect(policy.rules).toEqual([
+      { capability: "fs_read_workspace", effect: "allow" },
+      { capability: "fs_write_workspace", effect: "allow" },
+      {
+        capability: "fs_write_protected",
+        effect: "deny",
+        pattern: { kind: "path_class", class: "git" },
+      },
+      {
+        capability: "shell_exec",
+        effect: "allow",
+        pattern: { kind: "argv_prefix", argv: ["git", "status"] },
+      },
+      { capability: "mcp_tool_call", effect: "allow" },
+    ]);
+
+    // Under bypass, deny/ask rules and require_fs_enforcement are normalized out to satisfy policy.rs validation
+    const bypassPolicy = buildCanonicalPermissionPolicy(
+      "bypass",
+      "vendor-default",
+      DEFAULT_RULE_PRESET_MATRICES["read-only"],
+      { requireFsEnforcement: true },
+    );
+    expect(bypassPolicy.require_fs_enforcement).toBe(false);
+    expect(bypassPolicy.rules.every((r) => r.effect === "allow")).toBe(true);
+
+    // Under sandbox=off, require_fs_enforcement is false and compileReceipt reports refusal if requested
+    const sandboxOffReceipt = compileUniversalPermissions(
+      "claude",
+      "ask",
+      "off",
+      DEFAULT_RULE_PRESET_MATRICES.workspace,
+      { requireFsEnforcement: true },
+    );
+    expect(sandboxOffReceipt.policy.require_fs_enforcement).toBe(false);
+    expect(sandboxOffReceipt.refused.join(" ")).toContain(
+      "require_fs_enforcement=true requires sandbox=vendor-default",
+    );
+  });
+
+  it("renders canonical policy controls in SpinUpAgentModal and AgentSettingsModal and live permission approval cards in ChatPane", () => {
+    render(<SpinUpAgentModal isOpen={true} onClose={() => {}} />);
+
+    const spinUpFsCheckbox = screen.getByTestId(
+      "spin-up-require-fs-enforcement-checkbox",
+    ) as HTMLInputElement;
+    const spinUpUnenforcedSelect = screen.getByTestId(
+      "spin-up-unenforced-defaults-select",
+    ) as HTMLSelectElement;
+    expect(spinUpFsCheckbox.checked).toBe(false);
+    expect(spinUpUnenforcedSelect.value).toBe("refuse");
+
+    fireEvent.click(spinUpFsCheckbox);
+    fireEvent.change(spinUpUnenforcedSelect, {
+      target: { value: "acknowledge" },
+    });
+    expect(
+      screen.getByTestId("spin-up-canonical-policy-preview").textContent,
+    ).toContain("unenforced_defaults=acknowledge");
+
+    cleanup();
+
+    render(
+      <AgentSettingsModal
+        isOpen={true}
+        onClose={() => {}}
+        agentName="felicia"
+        agentDisplayName="Felicia"
+        agentProject="FerroLoop"
+        agentRole="assistant"
+        adapter="claude"
+        sessionId="sess-felicia-01"
+        selectedModel="claude-opus-4-7"
+        selectedThinkingLevel="high"
+        onChangeModelAndThinking={() => {}}
+        contextEstimate={{ usedTokens: 1000, maxTokens: 200000, percent: 1 }}
+        executionMode="auto"
+        canCompact={false}
+        compacting={false}
+        onCompactContext={() => {}}
+        canClear={true}
+        clearing={false}
+        onOpenClearModal={() => {}}
+        canDecommission={true}
+        decommissioning={false}
+        onOpenDecommissionModal={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("agent-settings-tab-permissions"));
+
+    const agentFsCheckbox = screen.getByTestId(
+      "agent-require-fs-enforcement-checkbox",
+    ) as HTMLInputElement;
+    const agentUnenforcedSelect = screen.getByTestId(
+      "agent-unenforced-defaults-select",
+    ) as HTMLSelectElement;
+    fireEvent.click(agentFsCheckbox);
+    fireEvent.change(agentUnenforcedSelect, {
+      target: { value: "acknowledge" },
+    });
+    expect(
+      screen.getByTestId("agent-canonical-policy-preview").textContent,
+    ).toContain("unenforced_defaults=acknowledge");
+
+    fireEvent.click(screen.getByTestId("agent-save-permissions-btn"));
+    expect(
+      screen.getByTestId("agent-permissions-saved-banner").textContent,
+    ).toContain("Saved PermissionPolicy v1");
+
+    cleanup();
+
+    const onRespond = vi.fn();
+    render(
+      <ChatPane
+        agentName="felicia"
+        adapter="claude"
+        sessionId="sess-felicia-01"
+        turns={[]}
+        pendingPermissionPrompts={DEFAULT_PENDING_PERMISSION_PROMPTS}
+        onRespondPermissionPrompt={onRespond}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-permission-prompt-banner")).toBeTruthy();
+    expect(
+      screen.getByTestId("chat-permission-pending-count").textContent,
+    ).toContain("3 pending");
+
+    // 1. Approve Once on RPC prompt perm-req-01
+    fireEvent.click(
+      screen.getByTestId("chat-perm-approve-once-btn-perm-req-01"),
+    );
+    expect(onRespond).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "perm-req-01" }),
+      "approve_once",
+    );
+    expect(
+      screen.getByTestId("chat-perm-status-badge-perm-req-01").textContent,
+    ).toBe("approve_once");
+    expect(
+      screen.getByTestId("chat-permission-resolution-status").textContent,
+    ).toContain("Approved Once for felix");
+
+    // 2. Always Allow disabled on perm-req-02 (Codex fileChange RPC)
+    expect(
+      (
+        screen.getByTestId(
+          "chat-perm-always-allow-btn-perm-req-02",
+        ) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    fireEvent.click(screen.getByTestId("chat-perm-deny-btn-perm-req-02"));
+    expect(
+      screen.getByTestId("chat-perm-status-badge-perm-req-02").textContent,
+    ).toBe("deny");
+
+    // 3. PTY snapshot prompt perm-req-03 shows Notification Only + Send keys — unverified
+    expect(
+      screen.getByTestId("chat-perm-notification-only-badge-perm-req-03"),
+    ).toBeTruthy();
+    expect(
+      screen.queryByTestId("chat-perm-approve-once-btn-perm-req-03"),
+    ).toBeNull();
+    fireEvent.click(
+      screen.getByTestId("chat-perm-send-keys-unverified-btn-perm-req-03"),
+    );
+    expect(
+      screen.getByTestId("chat-perm-status-badge-perm-req-03").textContent,
+    ).toBe("send_keys_unverified");
+
+    // 4. Transcript-based permission prompt detection
+    const detected = detectTranscriptPermissionPrompts(
+      [
+        {
+          index: 4,
+          role: "assistant",
+          content: "control_request: Bash(cargo test --workspace)",
+          thinking: null,
+          tool_calls: [],
+          created_at: "2026-11-03T19:55:00Z",
+        },
+      ],
+      "felicia",
+      "claude",
+      "sess-felicia-01",
+    );
+    expect(detected).toHaveLength(1);
+    expect(detected[0].channel_kind).toBe("rpc");
+    expect(detected[0].capability).toBe("shell_exec");
   });
 });

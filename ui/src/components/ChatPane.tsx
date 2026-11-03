@@ -20,7 +20,20 @@ import {
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
+import {
+  DEFAULT_PENDING_PERMISSION_PROMPTS,
+  type PendingPermissionPromptItem,
+  type PermissionChannelKind,
+  type PermissionResponseDecision,
+} from "./TriageQueuePane";
 import { ThinkingBlock } from "./ThinkingBlock";
+
+export {
+  DEFAULT_PENDING_PERMISSION_PROMPTS,
+  type PendingPermissionPromptItem,
+  type PermissionChannelKind,
+  type PermissionResponseDecision,
+};
 import {
   EXPAND_TURN_EVENT,
   extractTurnAttachments,
@@ -966,7 +979,68 @@ export interface ChatPaneProps {
   ) => Promise<SetSessionModelResponse | unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
   onOpenHelpTopic?: (topic: HelpTopicId) => void;
+  /** Record #103: Live permission-prompt interception & channel-honest remote approval cards. */
+  pendingPermissionPrompts?: PendingPermissionPromptItem[];
+  onRespondPermissionPrompt?: (
+    item: PendingPermissionPromptItem,
+    decision: PermissionResponseDecision,
+  ) => Promise<void> | void;
   apiClient?: HubApiClient;
+}
+
+export function detectTranscriptPermissionPrompts(
+  turns: TranscriptTurn[],
+  agentName?: string | null,
+  adapter?: string | null,
+  sessionId?: string | null,
+): PendingPermissionPromptItem[] {
+  if (!Array.isArray(turns) || turns.length === 0) {
+    return [];
+  }
+  const vendor = (adapter ?? "claude").trim().toLowerCase() || "claude";
+  const isRpcChannel =
+    vendor.includes("claude") ||
+    vendor.includes("codex") ||
+    vendor.includes("muse");
+  const channelKind: PermissionChannelKind = isRpcChannel
+    ? "rpc"
+    : "pty-snapshot";
+  const transport = vendor.includes("claude")
+    ? "stdio-control_request"
+    : vendor.includes("codex")
+      ? "app-server-rpc"
+      : vendor.includes("muse")
+        ? "msp-socket"
+        : "tmux-pty-snapshot";
+
+  const results: PendingPermissionPromptItem[] = [];
+  for (const turn of turns) {
+    const content = turn.content ?? "";
+    if (
+      content.includes("control_request") ||
+      content.includes("requestApproval") ||
+      content.includes("[PERMISSION PROMPT]")
+    ) {
+      results.push({
+        id: `turn-perm-${turn.index}`,
+        session_id: sessionId || `sess-${agentName || "agent"}`,
+        agent: agentName || "agent",
+        vendor,
+        transport,
+        channel_kind: channelKind,
+        request_kind: content.includes("fileChange")
+          ? "item/fileChange/requestApproval"
+          : "canUseTool",
+        capability: content.includes("fileChange")
+          ? "fs_write_workspace"
+          : "shell_exec",
+        command_or_target: content.trim().slice(0, 160),
+        always_allow_supported: isRpcChannel,
+        status: "pending",
+      });
+    }
+  }
+  return results;
 }
 
 function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
@@ -1022,9 +1096,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onSetSessionModel,
   onOpenArtifact,
   onOpenHelpTopic,
+  pendingPermissionPrompts,
+  onRespondPermissionPrompt,
   apiClient,
 }) => {
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
+  const [permPromptOverrides, setPermPromptOverrides] = React.useState<
+    Record<string, PendingPermissionPromptItem["status"]>
+  >({});
+  const [permResolutionStatus, setPermResolutionStatus] = React.useState<
+    string | null
+  >(null);
   const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
   const [editingQueueId, setEditingQueueId] = React.useState<string | null>(null);
@@ -2730,6 +2812,325 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           })()}
         </div>
       )}
+
+      {/* Record #103: Live Permission-Prompt Interception & Remote Approval Banner */}
+      {(() => {
+        const basePrompts =
+          pendingPermissionPrompts !== undefined
+            ? pendingPermissionPrompts
+            : detectTranscriptPermissionPrompts(
+                effectiveTurns,
+                agentName,
+                adapter,
+                sessionId,
+              );
+        const resolvedPrompts = basePrompts.map((p) =>
+          permPromptOverrides[p.id]
+            ? { ...p, status: permPromptOverrides[p.id] }
+            : p,
+        );
+        if (resolvedPrompts.length === 0) {
+          return null;
+        }
+        const pendingCount = resolvedPrompts.filter(
+          (p) => p.status === "pending",
+        ).length;
+
+        const handlePromptDecision = async (
+          item: PendingPermissionPromptItem,
+          decision: PermissionResponseDecision,
+        ) => {
+          setPermPromptOverrides((prev) => ({
+            ...prev,
+            [item.id]: decision,
+          }));
+          const label =
+            decision === "approve_once"
+              ? "Approved Once"
+              : decision === "approve_session"
+                ? "Approved for Session"
+                : decision === "always_allow_rule"
+                  ? "Added Always Allow Rule"
+                  : decision === "deny"
+                    ? "Denied"
+                    : "Sent unverified PTY keys";
+          setPermResolutionStatus(
+            `${label} for ${item.agent} (${item.capability}: ${item.request_kind || "request"}) via ${item.transport}.`,
+          );
+          await onRespondPermissionPrompt?.(item, decision);
+        };
+
+        return (
+          <div
+            data-testid="chat-permission-prompt-banner"
+            style={{
+              padding: "8px clamp(8px, 1.4vw, 14px)",
+              borderBottom: "1px solid var(--border-subtle)",
+              backgroundColor: "var(--bg-elevated)",
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              flexShrink: 0,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  color: "#FBBF24",
+                }}
+              >
+                Live Permission-Prompt Interception &amp; Remote Approval
+              </span>
+              <span
+                className="fd-badge fd-mono"
+                data-testid="chat-permission-pending-count"
+                style={{
+                  backgroundColor:
+                    pendingCount > 0
+                      ? "rgba(245, 158, 11, 0.18)"
+                      : "rgba(16, 185, 129, 0.14)",
+                  color: pendingCount > 0 ? "#FBBF24" : "#34D399",
+                  fontSize: "10px",
+                }}
+              >
+                {pendingCount} pending
+              </span>
+            </div>
+
+            {permResolutionStatus && (
+              <div
+                role="status"
+                data-testid="chat-permission-resolution-status"
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  padding: "4px 8px",
+                  borderRadius: "4px",
+                  backgroundColor: "rgba(16, 185, 129, 0.14)",
+                  color: "#34D399",
+                }}
+              >
+                {permResolutionStatus}
+              </div>
+            )}
+
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              {resolvedPrompts.map((item) => {
+                const isPending = item.status === "pending";
+                const isRpc = item.channel_kind === "rpc";
+                return (
+                  <div
+                    key={item.id}
+                    data-testid={`chat-perm-prompt-card-${item.id}`}
+                    data-status={item.status}
+                    data-channel-kind={item.channel_kind}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "6px",
+                      backgroundColor: "var(--bg-surface)",
+                      border: isPending
+                        ? "1px solid rgba(245, 158, 11, 0.45)"
+                        : "1px solid var(--border-subtle)",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "5px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "6px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <code className="fd-mono" style={{ fontWeight: 700 }}>
+                          {item.capability}
+                        </code>
+                        <span
+                          className="fd-badge fd-mono"
+                          style={{ fontSize: "9.5px" }}
+                        >
+                          {item.vendor} · {item.transport}
+                        </span>
+                        {isRpc ? (
+                          <span
+                            className="fd-badge fd-mono"
+                            style={{
+                              fontSize: "9.5px",
+                              backgroundColor: "rgba(16, 185, 129, 0.14)",
+                              color: "#34D399",
+                            }}
+                          >
+                            Verified RPC Channel
+                          </span>
+                        ) : (
+                          <span
+                            className="fd-badge fd-mono"
+                            data-testid={`chat-perm-notification-only-badge-${item.id}`}
+                            style={{
+                              fontSize: "9.5px",
+                              backgroundColor: "rgba(245, 158, 11, 0.18)",
+                              color: "#FBBF24",
+                            }}
+                          >
+                            Notification Only (No Verified Approval RPC)
+                          </span>
+                        )}
+                      </div>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`chat-perm-status-badge-${item.id}`}
+                        style={{ fontSize: "9.5px" }}
+                      >
+                        {item.status}
+                      </span>
+                    </div>
+
+                    <div
+                      className="fd-mono"
+                      data-testid={`chat-perm-command-${item.id}`}
+                      style={{
+                        fontSize: "10.5px",
+                        padding: "3px 6px",
+                        borderRadius: "4px",
+                        backgroundColor: "var(--bg-elevated)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      [{item.request_kind || item.capability}]{" "}
+                      {item.command_or_target}
+                    </div>
+
+                    {isPending && (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        {isRpc ? (
+                          <>
+                            <button
+                              type="button"
+                              className="fd-btn fd-btn-primary"
+                              data-testid={`chat-perm-approve-once-btn-${item.id}`}
+                              style={{ fontSize: "10.5px", padding: "3px 8px" }}
+                              onClick={() =>
+                                void handlePromptDecision(item, "approve_once")
+                              }
+                            >
+                              Approve Once
+                            </button>
+                            <button
+                              type="button"
+                              className="fd-btn"
+                              data-testid={`chat-perm-approve-session-btn-${item.id}`}
+                              style={{ fontSize: "10.5px", padding: "3px 8px" }}
+                              onClick={() =>
+                                void handlePromptDecision(
+                                  item,
+                                  "approve_session",
+                                )
+                              }
+                            >
+                              Approve for Session
+                            </button>
+                            <button
+                              type="button"
+                              className="fd-btn"
+                              data-testid={`chat-perm-always-allow-btn-${item.id}`}
+                              disabled={item.always_allow_supported === false}
+                              title={
+                                item.always_allow_supported === false
+                                  ? "Vendor does not support durable rule writeback on this RPC"
+                                  : "Persist durable allow rule"
+                              }
+                              style={{ fontSize: "10.5px", padding: "3px 8px" }}
+                              onClick={() =>
+                                void handlePromptDecision(
+                                  item,
+                                  "always_allow_rule",
+                                )
+                              }
+                            >
+                              Always Allow Rule
+                            </button>
+                            <button
+                              type="button"
+                              className="fd-btn"
+                              data-testid={`chat-perm-deny-btn-${item.id}`}
+                              style={{
+                                fontSize: "10.5px",
+                                padding: "3px 8px",
+                                color: "#F87171",
+                              }}
+                              onClick={() =>
+                                void handlePromptDecision(item, "deny")
+                              }
+                            >
+                              Deny
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="fd-btn"
+                            data-testid={`chat-perm-send-keys-unverified-btn-${item.id}`}
+                            style={{
+                              fontSize: "10.5px",
+                              padding: "3px 8px",
+                              borderColor: "rgba(245, 158, 11, 0.55)",
+                              color: "#FBBF24",
+                            }}
+                            onClick={() =>
+                              void handlePromptDecision(
+                                item,
+                                "send_keys_unverified",
+                              )
+                            }
+                          >
+                            Send keys — unverified
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Transcript Stream */}
       <div
