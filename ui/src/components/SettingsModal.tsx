@@ -550,6 +550,157 @@ export const DEFAULT_LOCAL_MODEL_PROVIDERS: LocalModelProviderPreset[] = [
     lifecycle_ops: ["spin-up", "compact", "reforge", "recast"],
   },
 ];
+
+/**
+ * Record #186 & Record #77: Dedicated FerroDeck Artifact Directory Layout & Retention Lifecycle.
+ */
+export interface VendorArtifactScatterOrigin {
+  vendor: "antigravity" | "claude" | "codex";
+  vendor_label: string;
+  legacy_path: string;
+  discovered_files: number;
+  discovered_bytes: number;
+  consolidated: boolean;
+}
+
+export interface ArtifactRetentionPolicyConfig {
+  keep_latest_versions: number;
+  auto_archive_days: number;
+  pin_ratified_specs: boolean;
+}
+
+export interface DedicatedArtifactLayoutState {
+  canonical_root: string;
+  session_layout_pattern: string;
+  vendor_origins: VendorArtifactScatterOrigin[];
+  by_kind_bytes: Record<"image" | "markdown" | "diff" | "log" | "bundle", number>;
+  by_project_bytes: Record<string, number>;
+  retention_policy: ArtifactRetentionPolicyConfig;
+}
+
+export const DEFAULT_DEDICATED_ARTIFACT_LAYOUT: DedicatedArtifactLayoutState = {
+  canonical_root: "~/.local/share/fl/artifacts/",
+  session_layout_pattern: "[home]/artifacts/[project-name]/[session-id]/",
+  vendor_origins: [
+    {
+      vendor: "antigravity",
+      vendor_label: "Antigravity CLI Brain",
+      legacy_path: "~/.gemini/antigravity-cli/brain/",
+      discovered_files: 18,
+      discovered_bytes: 4194304,
+      consolidated: false,
+    },
+    {
+      vendor: "claude",
+      vendor_label: "Claude Code Projects",
+      legacy_path: "~/.claude/projects/",
+      discovered_files: 11,
+      discovered_bytes: 1572864,
+      consolidated: false,
+    },
+    {
+      vendor: "codex",
+      vendor_label: "Codex CLI Sessions",
+      legacy_path: "~/.codex/sessions/",
+      discovered_files: 7,
+      discovered_bytes: 851968,
+      consolidated: true,
+    },
+  ],
+  by_kind_bytes: {
+    image: 3145728,
+    markdown: 1441792,
+    diff: 917504,
+    log: 655360,
+    bundle: 458752,
+  },
+  by_project_bytes: {
+    FerroLoop: 3670016,
+    FerroDeck: 1835008,
+    Sonora: 1114112,
+  },
+  retention_policy: {
+    keep_latest_versions: 5,
+    auto_archive_days: 30,
+    pin_ratified_specs: true,
+  },
+};
+
+/**
+ * Record #68: FerroDeck System Console Layout Mode Selector.
+ */
+export type SystemConsoleLayoutMode =
+  | "left-panel"
+  | "modal-consoles"
+  | "dual-right-header"
+  | "bottom-dock";
+
+export const CONSOLE_LAYOUT_MODE_STORAGE_KEY = "fd_console_layout_mode";
+
+export interface SystemConsoleLayoutOption {
+  id: SystemConsoleLayoutMode;
+  label: string;
+  recommended?: boolean;
+  description: string;
+  panesSummary: string;
+}
+
+export const SYSTEM_CONSOLE_LAYOUT_OPTIONS: readonly SystemConsoleLayoutOption[] =
+  [
+    {
+      id: "left-panel",
+      label: "Left-Panel System Consoles + Resizable Side Panels",
+      recommended: true,
+      description:
+        "Keep System Consoles in the left sidebar alongside the Agent Roster with drag-resizable side panels.",
+      panesSummary:
+        "Left: Roster + System Consoles · Center: Chat/Terminal · Right: Workspace Panes",
+    },
+    {
+      id: "modal-consoles",
+      label: "Modal System Consoles",
+      description:
+        "Open Hub & Arch, Vault & Gate, FerroState, and Nodes in a centered modal overlay when selected.",
+      panesSummary:
+        "Left: Roster Only · Modal Overlay: System Consoles · Right: Workspace Panes",
+    },
+    {
+      id: "dual-right-header",
+      label: "Dual-Group Right-Panel Header",
+      description:
+        "Group workspace panes (Artifacts, Wire, Git, Board) and System Consoles together in a dual-group right split header.",
+      panesSummary:
+        "Left: Roster Only · Center: Chat/Terminal · Right: Workspace + System Consoles",
+    },
+    {
+      id: "bottom-dock",
+      label: "Bottom Icon Dock (Middle Pane Switcher)",
+      description:
+        "Toggle the middle pane across Chat, Terminal, Hub & Arch, Vault & Gate, FerroState, and Nodes via a bottom icon dock.",
+      panesSummary:
+        "Middle Pane Dock: Chat | Terminal | Hub & Arch | Vault & Gate | FerroState | Nodes",
+    },
+  ];
+
+export function getInitialConsoleLayoutMode(): SystemConsoleLayoutMode {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const saved = window.localStorage.getItem(CONSOLE_LAYOUT_MODE_STORAGE_KEY);
+      if (
+        saved === "left-panel" ||
+        saved === "modal-consoles" ||
+        saved === "dual-right-header" ||
+        saved === "bottom-dock"
+      ) {
+        return saved;
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return "left-panel";
+}
+
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -1563,6 +1714,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [localProviderDraftMaxOutput, setLocalProviderDraftMaxOutput] =
     useState("16384");
   const [localProviderBanner, setLocalProviderBanner] = useState<string | null>(
+    null,
+  );
+  const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
+    useState<DedicatedArtifactLayoutState>(
+      () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
+    );
+  const [artifactConsolidateBanner, setArtifactConsolidateBanner] = useState<
+    string | null
+  >(null);
+  const [consoleLayoutMode, setConsoleLayoutMode] =
+    useState<SystemConsoleLayoutMode>(() => getInitialConsoleLayoutMode());
+  const [consoleLayoutBanner, setConsoleLayoutBanner] = useState<string | null>(
     null,
   );
 
@@ -4807,6 +4970,366 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             </div>
 
+            {/* Record #186 & Record #77: Dedicated FerroDeck Artifact Directory Layout & Retention Lifecycle */}
+            <div
+              data-testid="dedicated-artifact-layout-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                padding: "10px 12px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                fontSize: "11.5px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h4
+                    style={{
+                      margin: 0,
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Dedicated FerroDeck Artifact Layout &amp; Consolidation (#186 / #77)
+                  </h4>
+                  <span style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+                    Consolidate scattered vendor CLI brain/scratch directories into
+                    canonical FerroDeck session storage.
+                  </span>
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <code
+                    className="fd-badge fd-mono"
+                    data-testid="artifact-canonical-root-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    Root: {dedicatedArtifactLayout.canonical_root}
+                  </code>
+                  <code
+                    className="fd-badge fd-mono"
+                    data-testid="artifact-session-pattern-badge"
+                    style={{ fontSize: "10px" }}
+                  >
+                    Layout: {dedicatedArtifactLayout.session_layout_pattern}
+                  </code>
+                </div>
+              </div>
+
+              {artifactConsolidateBanner && (
+                <div
+                  role="status"
+                  data-testid="artifact-consolidate-status-banner"
+                  className="fd-mono"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {artifactConsolidateBanner}
+                </div>
+              )}
+
+              {/* Scattered Vendor CLI Origins */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+                  gap: "6px",
+                }}
+              >
+                {dedicatedArtifactLayout.vendor_origins.map((origin) => (
+                  <div
+                    key={origin.vendor}
+                    data-testid={`artifact-vendor-origin-row-${origin.vendor}`}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: "4px",
+                      border: "1px solid var(--border-subtle)",
+                      backgroundColor: "var(--bg-surface)",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "2px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "6px",
+                      }}
+                    >
+                      <strong>{origin.vendor_label}</strong>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid={`artifact-vendor-origin-status-${origin.vendor}`}
+                        style={{ fontSize: "10px" }}
+                      >
+                        {origin.consolidated ? "consolidated" : "scattered"}
+                      </span>
+                    </div>
+                    <code className="fd-mono" style={{ fontSize: "10px" }}>
+                      {origin.legacy_path} ({origin.discovered_files} files)
+                    </code>
+                  </div>
+                ))}
+              </div>
+
+              {/* Per-Kind & Per-Project Breakdown Badges */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {(
+                    ["image", "markdown", "diff", "log", "bundle"] as const
+                  ).map((kind) => (
+                    <span
+                      key={kind}
+                      className="fd-badge fd-mono"
+                      data-testid={`artifact-kind-breakdown-badge-${kind}`}
+                      style={{ fontSize: "10px" }}
+                    >
+                      {kind}:{" "}
+                      {(
+                        dedicatedArtifactLayout.by_kind_bytes[kind] /
+                        (1024 * 1024)
+                      ).toFixed(2)}{" "}
+                      MB
+                    </span>
+                  ))}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "4px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  {Object.entries(dedicatedArtifactLayout.by_project_bytes).map(
+                    ([proj, bytes]) => (
+                      <span
+                        key={proj}
+                        className="fd-badge fd-mono"
+                        data-testid={`artifact-project-breakdown-badge-${proj}`}
+                        style={{ fontSize: "10px" }}
+                      >
+                        {proj}: {(bytes / (1024 * 1024)).toFixed(2)} MB
+                      </span>
+                    ),
+                  )}
+                </div>
+              </div>
+
+              {/* Retention Policy Controls & Consolidation Actions */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                    }}
+                  >
+                    <span>Keep Versions:</span>
+                    <input
+                      type="number"
+                      aria-label="Artifact Keep Latest Versions"
+                      data-testid="artifact-retention-keep-versions-input"
+                      className="fd-input fd-mono"
+                      value={
+                        dedicatedArtifactLayout.retention_policy
+                          .keep_latest_versions
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            keep_latest_versions: Number(e.target.value) || 1,
+                          },
+                        }))
+                      }
+                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
+                    />
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                    }}
+                  >
+                    <span>Auto-Archive Days:</span>
+                    <input
+                      type="number"
+                      aria-label="Artifact Auto Archive Days"
+                      data-testid="artifact-retention-archive-days-input"
+                      className="fd-input fd-mono"
+                      value={
+                        dedicatedArtifactLayout.retention_policy
+                          .auto_archive_days
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            auto_archive_days: Number(e.target.value) || 7,
+                          },
+                        }))
+                      }
+                      style={{ width: "54px", fontSize: "11px", padding: "2px 6px" }}
+                    />
+                  </label>
+                  <label
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      data-testid="artifact-retention-pin-specs-checkbox"
+                      checked={
+                        dedicatedArtifactLayout.retention_policy
+                          .pin_ratified_specs
+                      }
+                      onChange={(e) =>
+                        setDedicatedArtifactLayout((prev) => ({
+                          ...prev,
+                          retention_policy: {
+                            ...prev.retention_policy,
+                            pin_ratified_specs: e.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    <span>Pin Ratified Specs</span>
+                  </label>
+                </div>
+
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="artifact-consolidate-dryrun-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      const scatteredCount =
+                        dedicatedArtifactLayout.vendor_origins
+                          .filter((o) => !o.consolidated)
+                          .reduce((acc, o) => acc + o.discovered_files, 0);
+                      setArtifactConsolidateBanner(
+                        `Dry-run consolidation preview: ${scatteredCount} scattered vendor files ready to migrate into ${dedicatedArtifactLayout.session_layout_pattern}.`,
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/artifacts/consolidate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              dry_run: true,
+                              retention_policy:
+                                dedicatedArtifactLayout.retention_policy,
+                            }),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Preview Consolidation (Dry Run)
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="artifact-consolidate-apply-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      setDedicatedArtifactLayout((prev) => ({
+                        ...prev,
+                        vendor_origins: prev.vendor_origins.map((o) => ({
+                          ...o,
+                          consolidated: true,
+                        })),
+                      }));
+                      setArtifactConsolidateBanner(
+                        `Consolidated all scattered vendor artifacts into ${dedicatedArtifactLayout.canonical_root} (keep_latest_versions=${dedicatedArtifactLayout.retention_policy.keep_latest_versions}, auto_archive_days=${dedicatedArtifactLayout.retention_policy.auto_archive_days}).`,
+                      );
+                      if (typeof globalThis.fetch === "function") {
+                        void globalThis
+                          .fetch("/api/v1/artifacts/consolidate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                              dry_run: false,
+                              retention_policy:
+                                dedicatedArtifactLayout.retention_policy,
+                            }),
+                          })
+                          .catch(() => {});
+                      }
+                    }}
+                  >
+                    Consolidate Vendor Artifacts
+                  </button>
+                </div>
+              </div>
+            </div>
+
             <hr
               style={{
                 border: "none",
@@ -7632,6 +8155,172 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   Reset (100%)
                 </button>
+              </div>
+            </div>
+
+            {/* Record #68: System Console Layout Mode Selector */}
+            <div
+              className="fd-card"
+              data-testid="system-console-layout-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    System Console Layout Mode (#68)
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Configure where System Consoles (`Hub &amp; Arch`, `Vault &amp; Gate`,
+                    `FerroState`, `Nodes`) are docked across the FerroDeck cockpit.
+                  </span>
+                </div>
+                <span
+                  data-testid="console-layout-active-badge"
+                  className="fd-badge fd-mono"
+                >
+                  Mode: {consoleLayoutMode}
+                </span>
+              </div>
+
+              {consoleLayoutBanner && (
+                <div
+                  role="status"
+                  data-testid="console-layout-status-banner"
+                  className="fd-mono"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {consoleLayoutBanner}
+                </div>
+              )}
+
+              <div
+                role="group"
+                aria-label="System Console Layout Options"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gap: "8px",
+                }}
+              >
+                {SYSTEM_CONSOLE_LAYOUT_OPTIONS.map((opt) => {
+                  const isSelected = consoleLayoutMode === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      data-testid={`console-layout-option-${opt.id}`}
+                      aria-pressed={isSelected}
+                      className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "flex-start",
+                        gap: "4px",
+                        padding: "8px 10px",
+                        textAlign: "left",
+                      }}
+                      onClick={() => {
+                        setConsoleLayoutMode(opt.id);
+                        setConsoleLayoutBanner(
+                          `Applied System Console layout mode '${opt.id}' (${opt.label}).`,
+                        );
+                        try {
+                          if (
+                            typeof window !== "undefined" &&
+                            window.localStorage
+                          ) {
+                            window.localStorage.setItem(
+                              CONSOLE_LAYOUT_MODE_STORAGE_KEY,
+                              opt.id,
+                            );
+                          }
+                          if (typeof document !== "undefined") {
+                            document.documentElement.setAttribute(
+                              "data-console-layout",
+                              opt.id,
+                            );
+                          }
+                        } catch {
+                          // Ignore storage write errors
+                        }
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <strong style={{ fontSize: "11.5px" }}>{opt.label}</strong>
+                        {opt.recommended && (
+                          <span
+                            className="fd-badge fd-mono"
+                            style={{ fontSize: "9.5px" }}
+                          >
+                            Recommended
+                          </span>
+                        )}
+                      </div>
+                      <span
+                        style={{
+                          fontSize: "10.5px",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {opt.description}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                data-testid="console-layout-preview-summary"
+                className="fd-mono"
+                style={{
+                  fontSize: "11px",
+                  color: "var(--text-secondary)",
+                  padding: "6px 8px",
+                  borderRadius: "4px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                }}
+              >
+                {
+                  (
+                    SYSTEM_CONSOLE_LAYOUT_OPTIONS.find(
+                      (o) => o.id === consoleLayoutMode,
+                    ) ?? SYSTEM_CONSOLE_LAYOUT_OPTIONS[0]
+                  ).panesSummary
+                }
               </div>
             </div>
           </div>
