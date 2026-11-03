@@ -1325,6 +1325,58 @@ export interface GateConnectorsResponse {
   connectors: GateConnectorSummary[];
 }
 
+/**
+ * Record #86 (Gate G6): Observational `GET /api/v1/gate/vault-consumers` report
+ * (`crates/hub/src/vault_consumers_api.rs`).
+ */
+export type VaultConsumerSourceClass =
+  | "vault-ref"
+  | "plaintext-file"
+  | "env"
+  | "unconfigured"
+  | "unknown";
+
+export type VaultAuditState =
+  | "ok"
+  | "absent"
+  | "symlink"
+  | "unreadable"
+  | "not-a-regular-file"
+  | "unverified";
+
+export interface VaultConsumerDeniedInfo {
+  outcome: string;
+}
+
+export interface VaultConsumerReportEntry {
+  id: string;
+  label: string;
+  class: VaultConsumerSourceClass;
+  evidence: string;
+  plaintext_path_present: boolean | null;
+  last_denied: VaultConsumerDeniedInfo | null;
+}
+
+export interface VaultCustodySummary {
+  mode: string;
+  note: string;
+  vault_key_readable_by_group_or_other: boolean | null;
+  vault_key_mode: string | null;
+}
+
+export interface VaultConsumersAuditSummary {
+  state: VaultAuditState | string;
+  last_denied: VaultConsumerDeniedInfo | null;
+}
+
+export interface VaultConsumersReport {
+  schema_version: number;
+  disclaimer: string;
+  custody: VaultCustodySummary;
+  consumers: VaultConsumerReportEntry[];
+  audit: VaultConsumersAuditSummary;
+}
+
 export interface EnrolledNode {
   node_id: string;
   display_name: string;
