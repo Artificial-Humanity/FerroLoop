@@ -42,6 +42,199 @@ export const THINKING_LEVEL_OPTIONS = [
   { value: "xhigh", label: "xhigh (Maximum Reasoning)" },
 ] as const;
 
+export const CANONICAL_DESIRED_MCP_SERVERS = [
+  "fl-state",
+  "agent-bus",
+] as const;
+
+export type PostureDriftKind =
+  | "synced"
+  | "unapplied_catalog"
+  | "stale_session"
+  | "extra_server";
+
+export interface AgentMcpPostureInput {
+  agentName?: string | null;
+  project?: string | null;
+  role?: string | null;
+  adapter?: string | null;
+  sessionId?: string | null;
+  desiredMcpServers?: string[];
+  appliedMcpServers?: string[];
+  liveMcpServers?: string[];
+  sessionStartedBeforeSync?: boolean;
+  sessionRole?: string | null;
+  sessionProject?: string | null;
+}
+
+export interface AgentMcpPostureReport {
+  agentKey: string;
+  driftKind: PostureDriftKind;
+  badgeLabel: string;
+  summary: string;
+  vendorConfigPath: string;
+  desiredServers: string[];
+  appliedServers: string[];
+  liveServers: string[];
+  missingInApplied: string[];
+  missingInLive: string[];
+  extraInAppliedOrLive: string[];
+  remediationLabel: string;
+}
+
+export function resolveVendorConfigPath(adapter?: string | null): string {
+  const key = (adapter ?? "").trim().toLowerCase();
+  if (key.includes("claude")) return "~/.claude.json";
+  if (key.includes("antigravity") || key.includes("gemini")) {
+    return "~/.gemini/settings.json";
+  }
+  if (key.includes("codex")) return "~/.codex/config.toml";
+  if (key.includes("grok")) return "~/.grok/settings.json";
+  if (key.includes("muse")) return "~/.muse/config.json";
+  return "~/.config/fl/mcp-vendors.json";
+}
+
+export function evaluateAgentMcpPosture(
+  input: AgentMcpPostureInput,
+): AgentMcpPostureReport {
+  const agentKey = (input.agentName || input.sessionId || "agent")
+    .trim()
+    .toLowerCase();
+  const vendorConfigPath = resolveVendorConfigPath(input.adapter);
+  const desiredServers = Array.from(
+    new Set(
+      (input.desiredMcpServers && input.desiredMcpServers.length > 0
+        ? input.desiredMcpServers
+        : [...CANONICAL_DESIRED_MCP_SERVERS]
+      ).map((s) => s.trim()),
+    ),
+  ).filter(Boolean);
+
+  const appliedServers = Array.from(
+    new Set(
+      (input.appliedMcpServers !== undefined
+        ? input.appliedMcpServers
+        : desiredServers
+      ).map((s) => s.trim()),
+    ),
+  ).filter(Boolean);
+
+  const hasLiveSession = Boolean((input.sessionId ?? "").trim());
+  const liveServers = Array.from(
+    new Set(
+      (input.liveMcpServers !== undefined
+        ? input.liveMcpServers
+        : hasLiveSession
+          ? appliedServers
+          : desiredServers
+      ).map((s) => s.trim()),
+    ),
+  ).filter(Boolean);
+
+  const desiredSet = new Set(desiredServers);
+  const appliedSet = new Set(appliedServers);
+  const liveSet = new Set(liveServers);
+
+  const missingInApplied = desiredServers.filter((s) => !appliedSet.has(s));
+  const missingInLive = appliedServers.filter((s) => !liveSet.has(s));
+  const extraInAppliedOrLive = Array.from(
+    new Set([
+      ...appliedServers.filter((s) => !desiredSet.has(s)),
+      ...liveServers.filter((s) => !desiredSet.has(s)),
+    ]),
+  );
+
+  const roleMismatch =
+    Boolean(input.role && input.sessionRole) &&
+    canonicalizeDefaultRole(input.role ?? "") !==
+      canonicalizeDefaultRole(input.sessionRole ?? "");
+  const projectMismatch =
+    Boolean(input.project && input.sessionProject) &&
+    input.project!.trim().toLowerCase() !==
+      input.sessionProject!.trim().toLowerCase();
+
+  if (missingInApplied.length > 0) {
+    return {
+      agentKey,
+      driftKind: "unapplied_catalog",
+      badgeLabel: "Drift: Unapplied Catalog Change",
+      summary: `Desired catalog defines [${missingInApplied.join(", ")}] not yet synced to ${vendorConfigPath}.`,
+      vendorConfigPath,
+      desiredServers,
+      appliedServers,
+      liveServers,
+      missingInApplied,
+      missingInLive,
+      extraInAppliedOrLive,
+      remediationLabel: "Sync MCP Config",
+    };
+  }
+
+  if (extraInAppliedOrLive.length > 0) {
+    return {
+      agentKey,
+      driftKind: "extra_server",
+      badgeLabel: "Drift: Unregistered Extra Server",
+      summary: `Unregistered MCP server(s) [${extraInAppliedOrLive.join(", ")}] present outside Desired catalog.`,
+      vendorConfigPath,
+      desiredServers,
+      appliedServers,
+      liveServers,
+      missingInApplied,
+      missingInLive,
+      extraInAppliedOrLive,
+      remediationLabel: "Prune Extra Servers",
+    };
+  }
+
+  if (
+    input.sessionStartedBeforeSync === true ||
+    missingInLive.length > 0 ||
+    roleMismatch ||
+    projectMismatch
+  ) {
+    const reasons: string[] = [];
+    if (missingInLive.length > 0) {
+      reasons.push(`live session missing [${missingInLive.join(", ")}]`);
+    }
+    if (input.sessionStartedBeforeSync) {
+      reasons.push("session started before last MCP config sync");
+    }
+    if (roleMismatch || projectMismatch) {
+      reasons.push("live session role/project predates latest registry assignment");
+    }
+    return {
+      agentKey,
+      driftKind: "stale_session",
+      badgeLabel: "Drift: Stale Session (Needs Reforge)",
+      summary: `Applied config matches Desired catalog, but ${reasons.join("; ") || "live session needs reforge"}.`,
+      vendorConfigPath,
+      desiredServers,
+      appliedServers,
+      liveServers,
+      missingInApplied,
+      missingInLive,
+      extraInAppliedOrLive,
+      remediationLabel: "Reforge / Restart Session",
+    };
+  }
+
+  return {
+    agentKey,
+    driftKind: "synced",
+    badgeLabel: "3-Tier Posture: Synced",
+    summary: `Desired catalog (${desiredServers.length} MCP), Applied config (${vendorConfigPath}), and Live-Attested session are in sync.`,
+    vendorConfigPath,
+    desiredServers,
+    appliedServers,
+    liveServers,
+    missingInApplied,
+    missingInLive,
+    extraInAppliedOrLive,
+    remediationLabel: "Verify Posture",
+  };
+}
+
 export interface AgentSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -80,6 +273,11 @@ export interface AgentSettingsModalProps {
   onOpenDecommissionModal: () => void;
   apiClient?: HubApiClient;
   onAgentsUpdated?: () => void;
+  postureInput?: Partial<AgentMcpPostureInput>;
+  onRemediatePosture?: (
+    action: "sync_mcp" | "reforge_session" | "prune_extra",
+    report: AgentMcpPostureReport,
+  ) => void;
 }
 
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
@@ -110,6 +308,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   onOpenDecommissionModal,
   apiClient,
   onAgentsUpdated,
+  postureInput,
+  onRemediatePosture,
 }) => {
   const { pinnedAgents } = usePinnedState();
   const [recastModalOpen, setRecastModalOpen] = useState(false);
@@ -122,6 +322,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const [recasting, setRecasting] = useState(false);
   const [recastError, setRecastError] = useState<string | null>(null);
   const [recastStatusBanner, setRecastStatusBanner] = useState<string | null>(null);
+  const [postureOverride, setPostureOverride] =
+    useState<Partial<AgentMcpPostureInput> | null>(null);
+  const [postureActionStatus, setPostureActionStatus] = useState<string | null>(null);
 
   useEffect(() => {
     setRecastProject(agentProject || "Workspace");
@@ -130,6 +333,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastError(null);
     setRecastStatusBanner(null);
     setRecastModalOpen(false);
+    setPostureOverride(null);
+    setPostureActionStatus(null);
   }, [isOpen, agentName, agentProject, agentRole]);
   const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
   const [fetchedAdapter, setFetchedAdapter] = useState<string | null>(null);
@@ -674,6 +879,247 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             </span>
           </div>
         </div>
+
+        {/* 3-Tier MCP & Agent Posture Status (Record #95) */}
+        {(() => {
+          const mergedPostureInput: AgentMcpPostureInput = {
+            agentName: agentName ?? displayTarget,
+            project: agentProject,
+            role: agentRole,
+            adapter: effectiveAdapter,
+            sessionId,
+            ...postureInput,
+            ...(postureOverride ?? {}),
+          };
+          const posture = evaluateAgentMcpPosture(mergedPostureInput);
+          const isSynced = posture.driftKind === "synced";
+          const badgeStyle: React.CSSProperties = isSynced
+            ? {
+                backgroundColor: "rgba(16, 185, 129, 0.14)",
+                color: "#34D399",
+                borderColor: "rgba(16, 185, 129, 0.4)",
+                fontWeight: 700,
+              }
+            : {
+                backgroundColor: "rgba(245, 158, 11, 0.16)",
+                color: "#FBBF24",
+                borderColor: "rgba(245, 158, 11, 0.45)",
+                fontWeight: 700,
+              };
+
+          return (
+            <div
+              data-testid="agent-posture-section"
+              className="fd-card"
+              style={{
+                padding: "10px 12px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                backgroundColor: "var(--bg-elevated)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "11px",
+                    fontWeight: 600,
+                    textTransform: "uppercase",
+                    color: "var(--text-muted)",
+                  }}
+                >
+                  3-Tier MCP &amp; Agent Posture
+                </span>
+                <span
+                  className="fd-badge"
+                  data-testid="agent-posture-status-badge"
+                  data-posture={posture.driftKind}
+                  style={badgeStyle}
+                >
+                  {posture.badgeLabel}
+                </span>
+              </div>
+
+              <div
+                data-testid="agent-posture-summary"
+                style={{
+                  fontSize: "11.5px",
+                  color: "var(--text-secondary)",
+                  lineHeight: 1.4,
+                }}
+              >
+                {posture.summary}
+              </div>
+
+              <div
+                data-testid="agent-posture-tiers"
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                  gap: "6px",
+                  fontSize: "11px",
+                }}
+              >
+                <div
+                  data-testid="posture-tier-desired"
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                    1. Desired Catalog
+                  </div>
+                  <div className="fd-mono" style={{ marginTop: "2px" }}>
+                    {posture.desiredServers.join(", ")}
+                  </div>
+                </div>
+
+                <div
+                  data-testid="posture-tier-applied"
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
+                    border:
+                      posture.missingInApplied.length > 0
+                        ? "1px solid rgba(245, 158, 11, 0.5)"
+                        : "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                    2. Applied ({posture.vendorConfigPath})
+                  </div>
+                  <div className="fd-mono" style={{ marginTop: "2px" }}>
+                    {posture.appliedServers.join(", ") || "none"}
+                  </div>
+                </div>
+
+                <div
+                  data-testid="posture-tier-live"
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
+                    border:
+                      posture.driftKind === "stale_session"
+                        ? "1px solid rgba(245, 158, 11, 0.5)"
+                        : "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div style={{ fontSize: "10px", color: "var(--text-muted)", fontWeight: 600 }}>
+                    3. Live-Attested
+                  </div>
+                  <div className="fd-mono" style={{ marginTop: "2px" }}>
+                    {posture.liveServers.join(", ") || "none"}
+                  </div>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                {posture.driftKind === "unapplied_catalog" && (
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="posture-remediate-sync-btn"
+                    style={{ fontSize: "11px", padding: "4px 8px" }}
+                    onClick={() => {
+                      setPostureOverride((prev) => ({
+                        ...(prev ?? {}),
+                        appliedMcpServers: [...posture.desiredServers],
+                      }));
+                      setPostureActionStatus(
+                        `Synced Desired catalog [${posture.desiredServers.join(", ")}] to ${posture.vendorConfigPath}.`,
+                      );
+                      onRemediatePosture?.("sync_mcp", posture);
+                    }}
+                  >
+                    Sync MCP Config
+                  </button>
+                )}
+
+                {posture.driftKind === "stale_session" && (
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="posture-remediate-reforge-btn"
+                    style={{ fontSize: "11px", padding: "4px 8px" }}
+                    onClick={() => {
+                      setPostureOverride((prev) => ({
+                        ...(prev ?? {}),
+                        liveMcpServers: [...posture.appliedServers],
+                        sessionStartedBeforeSync: false,
+                        sessionRole: agentRole ?? undefined,
+                        sessionProject: agentProject ?? undefined,
+                      }));
+                      setPostureActionStatus(
+                        `Reforged live session for ${displayTarget} with latest MCP & role posture.`,
+                      );
+                      onRemediatePosture?.("reforge_session", posture);
+                    }}
+                  >
+                    Reforge / Restart Session
+                  </button>
+                )}
+
+                {posture.driftKind === "extra_server" && (
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid="posture-remediate-prune-btn"
+                    style={{ fontSize: "11px", padding: "4px 8px" }}
+                    onClick={() => {
+                      setPostureOverride((prev) => ({
+                        ...(prev ?? {}),
+                        appliedMcpServers: [...posture.desiredServers],
+                        liveMcpServers: [...posture.desiredServers],
+                      }));
+                      setPostureActionStatus(
+                        `Pruned unregistered MCP server(s) [${posture.extraInAppliedOrLive.join(", ")}] from ${posture.vendorConfigPath}.`,
+                      );
+                      onRemediatePosture?.("prune_extra", posture);
+                    }}
+                  >
+                    Prune Extra Servers
+                  </button>
+                )}
+              </div>
+
+              {postureActionStatus && (
+                <div
+                  role="status"
+                  data-testid="posture-remediate-status"
+                  style={{
+                    fontSize: "11px",
+                    color: "#34D399",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "rgba(16, 185, 129, 0.12)",
+                  }}
+                >
+                  {postureActionStatus}
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {/* Session Lifecycle Actions */}
         <div>

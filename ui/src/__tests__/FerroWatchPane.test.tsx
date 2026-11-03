@@ -4,7 +4,12 @@ import { App } from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { ChatPane } from "../components/ChatPane";
-import { FerroWatchPane } from "../components/FerroWatchPane";
+import {
+  FerroWatchPane,
+  computeTelemetryVirtualEquivMicros,
+  computeVirtualApiEquivMicros,
+  resolveCanonicalTokenRate,
+} from "../components/FerroWatchPane";
 import {
   RosterSidebar,
   hasTrailingIncompleteWork,
@@ -479,6 +484,135 @@ describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness
     await waitFor(() => {
       expect(requestLog.some((r) => r.url.includes("warn_quota_pct=70"))).toBe(true);
     });
+  });
+
+  it("displays virtual API-equivalent dollar value alongside $0 billed subscription CLI runs (Record #221)", async () => {
+    // 1M in + 100k out on Claude Opus ($15/$75 per 1M) = $15 + $7.50 = $22.50 (22,500,000 micros)
+    expect(resolveCanonicalTokenRate("claude", "claude-opus-4-7").inputUsdPer1M).toBe(15);
+    expect(
+      computeVirtualApiEquivMicros({
+        tokensIn: 1_000_000,
+        tokensOut: 100_000,
+        costUsdMicros: 0,
+        vendor: "claude",
+        model: "claude-opus-4-7",
+      }),
+    ).toBe(22_500_000);
+
+    // 1M in + 200k out on Codex Pro ($10/$30 per 1M) = $10 + $6 = $16.00 (16,000,000 micros)
+    expect(
+      computeVirtualApiEquivMicros({
+        tokensIn: 1_000_000,
+        tokensOut: 200_000,
+        costUsdMicros: 0,
+        vendor: "codex",
+        model: "gpt-5.4",
+      }),
+    ).toBe(16_000_000);
+
+    const zeroBilledSummary = makeSampleWatchSummary();
+    zeroBilledSummary.telemetry.totals = {
+      ...zeroBilledSummary.telemetry.totals,
+      tokens_in: 2_000_000,
+      tokens_out: 300_000,
+      cost_usd_micros: 0,
+    };
+    zeroBilledSummary.telemetry.by_adapter = [
+      {
+        key: "claude",
+        attempts: 80,
+        succeeded: 80,
+        failed: 0,
+        crashed: 0,
+        timed_out: 0,
+        tokens_in: 1_000_000,
+        tokens_out: 100_000,
+        cost_usd_micros: 0,
+        duration_ms: 120000,
+      },
+      {
+        key: "codex",
+        attempts: 40,
+        succeeded: 40,
+        failed: 0,
+        crashed: 0,
+        timed_out: 0,
+        tokens_in: 1_000_000,
+        tokens_out: 200_000,
+        cost_usd_micros: 0,
+        duration_ms: 90000,
+      },
+    ];
+    zeroBilledSummary.telemetry.by_agent = [
+      {
+        key: "ferris",
+        attempts: 80,
+        succeeded: 80,
+        failed: 0,
+        crashed: 0,
+        timed_out: 0,
+        tokens_in: 1_000_000,
+        tokens_out: 100_000,
+        cost_usd_micros: 0,
+        duration_ms: 120000,
+      },
+    ];
+
+    expect(computeTelemetryVirtualEquivMicros(zeroBilledSummary.telemetry)).toBe(
+      38_500_000,
+    );
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (payload: unknown) =>
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (url.includes("/api/v1/watch/summary")) {
+        return json(zeroBilledSummary);
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+      />,
+    );
+
+    const kpiEquiv = await screen.findByTestId("watch-kpi-virtual-equiv");
+    await waitFor(() => {
+      expect(kpiEquiv).toHaveTextContent("API Eq: $38.50");
+    });
+    expect(screen.getByTestId("watch-kpi-spend")).toHaveTextContent("$0.00");
+
+    // Per-vendor card virtual equivalence
+    expect(screen.getByTestId("watch-vendor-virtual-value-claude")).toHaveTextContent(
+      "Billed: $0.00 · API-Eq: $22.50",
+    );
+    expect(screen.getByTestId("watch-vendor-virtual-value-codex")).toHaveTextContent(
+      "Billed: $0.00 · API-Eq: $16.00",
+    );
+
+    // Rollups virtual equivalence
+    expect(screen.getByTestId("watch-rollups-virtual-equiv")).toHaveTextContent(
+      "Virtual API-Eq: $38.50",
+    );
+    expect(screen.getByTestId("watch-rollup-adapter-virtual-claude")).toHaveTextContent(
+      "$22.50 API-eq",
+    );
+    expect(screen.getByTestId("watch-rollup-adapter-virtual-codex")).toHaveTextContent(
+      "$16.00 API-eq",
+    );
+    expect(screen.getByTestId("watch-rollup-agent-virtual-ferris")).toHaveTextContent(
+      "$22.50 API-eq",
+    );
   });
 });
 
