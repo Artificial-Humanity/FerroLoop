@@ -2171,12 +2171,11 @@ fn is_same_dir(root: &Path, home: &Path) -> bool {
     )
 }
 
-/// Whether the hub runs in the user's home directory: its `repo_root` is `$HOME`. A hub with
-/// its own `home_override` (tests) is never treated so.
+/// Whether the hub runs in the user's home directory: its `repo_root` is the effective home
+/// (`home_override`, else `$HOME`; see [`crate::commands::resolve_home`]).
 fn repo_root_is_home(state: &HubState) -> bool {
-    state.config.home_override.is_none()
-        && std::env::var_os("HOME")
-            .is_some_and(|h| is_same_dir(&state.config.repo_root, Path::new(&h)))
+    crate::commands::resolve_home(state.config.home_override.as_deref())
+        .is_some_and(|home| is_same_dir(&state.config.repo_root, &home))
 }
 
 fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
