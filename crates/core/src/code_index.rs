@@ -504,9 +504,10 @@ fn tokens_saved_per_file(hits: &[CodeSymbolHit]) -> u64 {
     })
 }
 
-/// [`tokens_saved_per_file`] over the counted fields; `None` if any hit
-/// lacks a count.
+/// [`tokens_saved_per_file`] over the counted fields; `None` when this build
+/// has no counter (even for zero hits) or any hit lacks a count.
 fn counted_saved_per_file(hits: &[CodeSymbolHit]) -> Option<u64> {
+    count_unit()?;
     let mut per_file: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for hit in hits {
         let e = per_file
@@ -1479,14 +1480,17 @@ mod tests {
             counted_hit("a.rs", Some(100), Some(15)),
             counted_hit("b.rs", Some(40), Some(50)),
         ];
+        // A build without a counter books no counted value, even for hits
+        // that carry counts.
+        let counted = |v: u64| count_unit().map(|_| v);
         // a.rs: 100 - (10 + 15); b.rs saturates at 0.
         assert_eq!(
             outcome_from_hits(hits.clone(), 2, 3).tokens_saved_this_query_counted,
-            Some(75)
+            counted(75)
         );
         assert_eq!(
             outcome_from_hits(Vec::new(), 2, 3).tokens_saved_this_query_counted,
-            Some(0)
+            counted(0)
         );
         for missing in [
             counted_hit("a.rs", None, Some(1)),
@@ -1576,6 +1580,28 @@ mod tests {
         let json = serde_json::to_value(&out.symbols[0]).unwrap();
         assert!(json.get("file_tokens_counted").is_none(), "{json}");
         assert!(json.get("snippet_tokens_counted").is_none(), "{json}");
+        // Zero hits: still no counted value, so the ledger books no count.
+        let none = search_code_index(tmp.path(), CodeSearchKind::Def, "no_such_symbol", 10);
+        assert!(none.symbols.is_empty());
+        assert_eq!(none.tokens_saved_this_query_counted, None);
+        assert_eq!(
+            outcome_from_hits(Vec::new(), 0, 0).tokens_saved_this_query_counted,
+            None
+        );
+    }
+
+    #[cfg(feature = "counted-tokens")]
+    #[test]
+    fn with_the_feature_zero_hits_count_zero() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "a.rs", "pub fn alpha() {}\n");
+        let none = search_code_index(tmp.path(), CodeSearchKind::Def, "no_such_symbol", 10);
+        assert!(none.symbols.is_empty());
+        assert_eq!(none.tokens_saved_this_query_counted, Some(0));
+        assert_eq!(
+            outcome_from_hits(Vec::new(), 0, 0).tokens_saved_this_query_counted,
+            Some(0)
+        );
     }
 
     #[test]

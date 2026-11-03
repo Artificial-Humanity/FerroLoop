@@ -24,15 +24,26 @@ pub fn count_unit() -> Option<CountUnit> {
     cfg!(feature = "counted-tokens").then_some(CountUnit::O200kBase)
 }
 
+/// The process-wide `o200k_base` encoder (`tiktoken-rs`), built on the first
+/// count only: a process that never counts never builds it. `None` when the
+/// build failed; the failure is kept, so it is not retried.
+#[cfg(feature = "counted-tokens")]
+fn o200k_base() -> Option<&'static tiktoken_rs::CoreBPE> {
+    static ENCODER: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+    ENCODER
+        .get_or_init(|| tiktoken_rs::o200k_base().ok())
+        .as_ref()
+}
+
 /// The exact `o200k_base` token count of `text` (empty text is `0`), or
-/// `None` without the `counted-tokens` feature. The tokenizer is a
-/// process-wide lazy static, loaded on the first count.
+/// `None` without the `counted-tokens` feature or when the encoder could not
+/// be built. Text is data: special-token strings are counted as ordinary text.
 #[cfg(feature = "counted-tokens")]
 pub fn counted_tokens(text: &str) -> Option<u64> {
     if text.is_empty() {
         return Some(0);
     }
-    Some(bpe_openai::o200k_base().count(text) as u64)
+    Some(o200k_base()?.encode_ordinary(text).len() as u64)
 }
 
 /// The exact `o200k_base` token count of `text`, or `None` without the
