@@ -13,6 +13,9 @@ use fl_core::ferrostate::{
 };
 use fl_core::ids::{Kind, RevisionId, StateId};
 use fl_core::iri::Iri;
+use fl_core::ref_index::{
+    RefIndexPlan, RefIndexReport, RefIndexStatus, RefKind, RefSource, index_local_source,
+};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
@@ -492,6 +495,20 @@ pub enum StateCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Index a local reference source, or validate a remote one (no fetch, nothing stored).
+    #[command(name = "ref-index")]
+    RefIndex {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        locator: String,
+        #[arg(long)]
+        revision: Option<String>,
+        #[arg(long, default_value = "code")]
+        kind: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Register the `ferrostate` MCP server (`fl state mcp`) across vendor CLI configs.
     Install {
         /// Write to user-home vendor configurations instead of the project files.
@@ -650,6 +667,90 @@ pub fn parse_memory_basis(s: &str) -> Result<MemoryBasis, String> {
             MemoryBasis::wire_values()
         )
     })
+}
+
+pub fn parse_ref_kind(s: &str) -> Result<RefKind, String> {
+    RefKind::from_wire(s).ok_or_else(|| {
+        format!(
+            "invalid kind `{s}`: expected `code` or `docs` (one of: {})",
+            RefKind::wire_values()
+        )
+    })
+}
+
+/// Human line for a ref-index report (same fields as the JSON shape).
+pub fn format_ref_index_report(report: &RefIndexReport) -> String {
+    let revision = report.revision.as_deref().unwrap_or("none");
+    let mut line = format!(
+        "ref-index name={} kind={} locator={} revision={} status={} scanned={} files_indexed={} symbols_indexed={} revision_applied={}",
+        report.name,
+        report.kind.as_wire(),
+        report.locator,
+        revision,
+        report.status.as_wire(),
+        report.scanned,
+        report.files_indexed,
+        report.symbols_indexed,
+        report.revision_applied
+    );
+    match report.status {
+        RefIndexStatus::RemoteNotFetched => {
+            line.push_str("; remote source validated; fetch not performed; nothing stored");
+            if report.revision.is_some() {
+                line.push_str("; revision not applied: remote fetch deferred");
+            }
+        }
+        RefIndexStatus::Scanned => {
+            if report.revision.is_some() {
+                line.push_str("; revision not applied: local scan indexes the tree as-is");
+            }
+        }
+    }
+    line
+}
+
+/// Pretty-JSON shape for a ref-index report (same fields as the human line).
+pub fn ref_index_report_json(report: &RefIndexReport) -> serde_json::Value {
+    serde_json::json!({
+        "name": report.name,
+        "kind": report.kind.as_wire(),
+        "locator": report.locator,
+        "revision": report.revision,
+        "status": report.status.as_wire(),
+        "scanned": report.scanned,
+        "files_indexed": report.files_indexed,
+        "symbols_indexed": report.symbols_indexed,
+        "revision_applied": report.revision_applied,
+    })
+}
+
+/// Build the `ref-index` output (human or JSON) for one source.
+pub fn format_ref_index_output(
+    name: &str,
+    locator: &str,
+    revision: Option<&str>,
+    kind: &str,
+    json: bool,
+) -> Result<String, String> {
+    let kind = parse_ref_kind(kind)?;
+    let source = RefSource::new(
+        name.to_string(),
+        locator.to_string(),
+        revision.map(str::to_string),
+        kind,
+    )
+    .map_err(|e| e.to_string())?;
+    let plan = RefIndexPlan::build(vec![source]).map_err(|e| e.to_string())?;
+    let source = plan
+        .sources()
+        .first()
+        .ok_or_else(|| "ref-index plan is empty".to_string())?;
+    let report = index_local_source(source).map_err(|e| e.to_string())?;
+    if json {
+        serde_json::to_string_pretty(&ref_index_report_json(&report)).map_err(|e| e.to_string())
+    } else {
+        Ok(format_ref_index_report(&report))
+    }
 }
 
 pub fn parse_merge_mode(s: &str) -> Result<MergeMode, String> {
@@ -1648,6 +1749,19 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             limit,
             json,
         } => run_code_query(env, CodeSearchKind::Outline, &file_path, root, limit, json),
+        StateCmd::RefIndex {
+            name,
+            locator,
+            revision,
+            kind,
+            json,
+        } => {
+            println!(
+                "{}",
+                format_ref_index_output(&name, &locator, revision.as_deref(), &kind, json)?
+            );
+            Ok(())
+        }
         StateCmd::Install { user, json } => crate::cmd::vault::run_mcp_install(
             env.cwd,
             user,
@@ -1718,6 +1832,99 @@ mod tests {
     use super::*;
     use fl_core::MemStore;
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
+
+    #[test]
+    fn ref_index_local_scan_exact_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\npub struct Widget;\n",
+        )
+        .unwrap();
+        let locator = dir.path().to_string_lossy().into_owned();
+        let out = format_ref_index_output("demo", &locator, None, "code", true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "demo");
+        assert_eq!(v["kind"], "code");
+        assert_eq!(v["locator"], locator);
+        assert_eq!(v["revision"], serde_json::Value::Null);
+        assert_eq!(v["status"], "scanned");
+        assert_eq!(v["scanned"], true);
+        assert_eq!(v["files_indexed"], 1);
+        assert_eq!(v["symbols_indexed"], 3);
+        assert_eq!(v["revision_applied"], false);
+        let human = format_ref_index_output("demo", &locator, None, "code", false).unwrap();
+        assert!(human.contains("status=scanned"), "{human}");
+        assert!(human.contains("files_indexed=1"), "{human}");
+        assert!(human.contains("symbols_indexed=3"), "{human}");
+    }
+
+    #[test]
+    fn ref_index_remote_json_and_human_carry_same_fields() {
+        let args = ("demo", "https://example.com/r.git", Some("v1"), "code");
+        let out = format_ref_index_output(args.0, args.1, args.2, args.3, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["name"], "demo");
+        assert_eq!(v["kind"], "code");
+        assert_eq!(v["locator"], "https://example.com/r.git");
+        assert_eq!(v["revision"], "v1");
+        assert_eq!(v["status"], "remote-not-fetched");
+        assert_eq!(v["scanned"], false);
+        assert_eq!(v["files_indexed"], 0);
+        assert_eq!(v["symbols_indexed"], 0);
+        assert_eq!(v["revision_applied"], false);
+        let human = format_ref_index_output(args.0, args.1, args.2, args.3, false).unwrap();
+        for needle in [
+            "name=demo",
+            "kind=code",
+            "locator=https://example.com/r.git",
+            "revision=v1",
+            "status=remote-not-fetched",
+            "scanned=false",
+            "files_indexed=0",
+            "symbols_indexed=0",
+            "revision_applied=false",
+            "remote source validated; fetch not performed; nothing stored",
+            "revision not applied: remote fetch deferred",
+        ] {
+            assert!(human.contains(needle), "missing {needle} in {human}");
+        }
+        assert!(!human.contains("registered"), "{human}");
+    }
+
+    #[test]
+    fn ref_index_missing_path_error_names_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let locator = missing.to_string_lossy().into_owned();
+        let err = format_ref_index_output("demo", &locator, None, "code", false).unwrap_err();
+        assert!(err.contains(&locator), "{err}");
+    }
+
+    #[test]
+    fn ref_index_invalid_kind_and_revision_applied_false() {
+        let err =
+            format_ref_index_output("demo", "https://example.com/r.git", None, "bogus", false)
+                .unwrap_err();
+        assert!(
+            err.contains("bogus") && err.contains("code") && err.contains("docs"),
+            "{err}"
+        );
+        // Revision given on a local scan: not applied, tree indexed as-is.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let locator = dir.path().to_string_lossy().into_owned();
+        let out = format_ref_index_output("demo", &locator, Some("v2"), "code", true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["revision"], "v2");
+        assert_eq!(v["revision_applied"], false);
+        let human = format_ref_index_output("demo", &locator, Some("v2"), "code", false).unwrap();
+        assert!(human.contains("revision_applied=false"), "{human}");
+        assert!(
+            human.contains("revision not applied: local scan indexes the tree as-is"),
+            "{human}"
+        );
+    }
 
     /// `scan_owns` answers for a store it can open, and fails (never "not mine") on one it cannot.
     #[test]

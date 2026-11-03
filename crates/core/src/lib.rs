@@ -30,6 +30,7 @@ pub mod mem;
 pub mod mem_issues;
 pub mod model;
 pub mod pr_policy;
+pub mod ref_index;
 pub mod routing;
 pub mod split;
 pub mod stale;
@@ -98,6 +99,10 @@ pub use pr_policy::{
     authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, extract_review_marker,
     format_review_body, is_protected_path, parse_co_authors, verify_merge_approvals,
     verify_review_integrity,
+};
+pub use ref_index::{
+    MAX_REF_SOURCES, RefIndexError, RefIndexPlan, RefIndexReport, RefIndexStatus, RefKind,
+    RefLocatorClass, RefSource, classify_locator, index_local_source,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
