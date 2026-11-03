@@ -65,6 +65,25 @@ fn state_index_and_code_def_record_token_gain() {
     assert_eq!(def["token_gain"]["queries_count"], 1, "{def}");
     assert_eq!(def["token_gain"]["files_indexed"], 1, "{def}");
     assert_eq!(def["token_gain"]["symbols_indexed"], 2, "{def}");
+    // The exact o200k_base count rides beside the chars/4 estimate.
+    assert!(
+        def["tokens_saved_this_query_counted"].as_u64().unwrap() > 0,
+        "{def}"
+    );
+    assert_eq!(def["count_unit"], "o200k_base", "{def}");
+    assert!(
+        def["symbols"][0]["file_tokens_counted"].as_u64().unwrap()
+            > def["symbols"][0]["snippet_tokens_counted"]
+                .as_u64()
+                .unwrap(),
+        "{def}"
+    );
+    assert_eq!(def["token_gain"]["queries_counted"], 1, "{def}");
+    assert_eq!(
+        def["token_gain"]["tokens_saved_counted"], def["tokens_saved_this_query_counted"],
+        "{def}"
+    );
+    assert_eq!(def["token_gain"]["count_unit"], "o200k_base", "{def}");
 
     // Human output is one `path:start kind name — signature` line.
     let out = fl(&cfg, &db, root.path())
@@ -101,6 +120,7 @@ fn state_index_and_code_def_record_token_gain() {
     assert_eq!(before["symbols"].as_array().unwrap().len(), 0, "{before}");
     assert_eq!(before["tokens_saved_this_query"], 0, "{before}");
     assert_eq!(before["token_gain"]["queries_count"], 2, "{before}");
+    assert_eq!(before["token_gain"]["queries_counted"], 2, "{before}");
 
     // Blank queries are refused instead of matching everything.
     fl(&cfg, &db, root.path())

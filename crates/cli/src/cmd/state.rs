@@ -229,6 +229,8 @@ pub fn code_search_response_json(
         "kind": kind.as_wire(),
         "symbols": ranked.outcome.symbols,
         "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+        "tokens_saved_this_query_counted": ranked.outcome.tokens_saved_this_query_counted,
+        "count_unit": ranked.outcome.count_unit(),
         "token_gain": token_gain,
     });
     ranked.annotate_json(&mut out);
@@ -294,6 +296,7 @@ pub fn search_and_record_in(
     let token_gain = record_token_gain_query(
         store,
         ranked.outcome.tokens_saved_this_query,
+        ranked.outcome.tokens_saved_this_query_counted,
         ranked.outcome.files_indexed,
         ranked.outcome.symbols_indexed,
         now_at(),

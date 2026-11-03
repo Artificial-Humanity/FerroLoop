@@ -40,4 +40,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = "1.15"
 webpki-roots = "1.0"
 zeroize = "1.9"
+# MIT (zurawiki/tiktoken-rs): o200k_base BPE for the counted token-savings ledger.
+# No default features: the optional async-openai integration stays out.
+tiktoken-rs = { version = "0.12.1", default-features = false }
 

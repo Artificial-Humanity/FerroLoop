@@ -10,7 +10,7 @@ name = "fl"
 path = "src/main.rs"
 
 [dependencies]
-fl-core = { path = "../core" }
+fl-core = { path = "../core", features = ["counted-tokens"] }
 fl-store = { path = "../store", features = ["cli"] }
 fl-exec = { path = "../exec" }
 fl-github = { path = "../github" }

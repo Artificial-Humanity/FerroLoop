@@ -42,6 +42,7 @@ use fl_core::telemetry::{
     AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, audit_transition_regret, evaluate_liveness,
     liveness_agent_slug,
 };
+use fl_core::token_count::count_unit;
 use fl_core::workflow::{ApprovalTier, StepCompletion};
 use fl_exec::stamp;
 use fl_exec::workflow::{
@@ -2222,6 +2223,9 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     };
 
     let query = req.query.get("q").cloned().unwrap_or_default();
+    // The early answers below return no symbols but keep the shape of a search
+    // body: the counted saving is 0 when this build counts, else null.
+    let no_hits_counted = count_unit().map(|_| 0u64);
     // Missing/blank `q`, and an explicit `limit` of 0, return no symbols
     // and record nothing; `token_gain` is the stored ledger unchanged.
     if query.trim().is_empty() || limit == 0 {
@@ -2235,6 +2239,8 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
                 "kind": kind.as_wire(),
                 "symbols": [],
                 "tokens_saved_this_query": 0,
+                "tokens_saved_this_query_counted": no_hits_counted,
+                "count_unit": count_unit(),
                 "token_gain": load_token_gain(&*store),
             }),
         );
@@ -2253,6 +2259,8 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
                 "kind": kind.as_wire(),
                 "symbols": [],
                 "tokens_saved_this_query": 0,
+                "tokens_saved_this_query_counted": no_hits_counted,
+                "count_unit": count_unit(),
                 "token_gain": load_token_gain(&*store),
                 "note": "the hub runs in the home directory, which is not searched; name the repository with `[hub] repo_root` or `fl hub serve --repo-root`",
             }),
@@ -2281,6 +2289,7 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let token_gain = match record_token_gain_query(
         &*store,
         ranked.outcome.tokens_saved_this_query,
+        ranked.outcome.tokens_saved_this_query_counted,
         ranked.outcome.files_indexed,
         ranked.outcome.symbols_indexed,
         stamp::now(),
@@ -2294,6 +2303,8 @@ fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
         "kind": kind.as_wire(),
         "symbols": ranked.outcome.symbols,
         "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+        "tokens_saved_this_query_counted": ranked.outcome.tokens_saved_this_query_counted,
+        "count_unit": ranked.outcome.count_unit(),
         "token_gain": token_gain,
     });
     ranked.annotate_json(&mut body);

@@ -2510,6 +2510,7 @@ mod tests {
         assert_eq!(blank_json["symbols"].as_array().unwrap().len(), 0);
         assert_eq!(blank_json["tokens_saved_this_query"], 0);
         assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
+        assert_no_hit_body_keeps_the_search_shape(&blank_json);
     }
 
     /// Seed one store, on the engine named, with a fixed ledger; the store is closed on return.
@@ -2684,6 +2685,19 @@ mod tests {
         );
         // nothing was scanned or recorded
         assert_eq!(body["token_gain"]["queries_count"], 0, "{body}");
+        assert_no_hit_body_keeps_the_search_shape(&body);
+    }
+
+    /// An early no-hit code-search answer carries the counted keys of a search body: the
+    /// counted saving is 0 in this build's unit, or both are null without a counter.
+    fn assert_no_hit_body_keeps_the_search_shape(body: &Value) {
+        let unit = fl_core::token_count::count_unit();
+        assert_eq!(
+            body.get("tokens_saved_this_query_counted"),
+            Some(&json!(unit.map(|_| 0u64))),
+            "{body}"
+        );
+        assert_eq!(body.get("count_unit"), Some(&json!(unit)), "{body}");
     }
 
     #[test]

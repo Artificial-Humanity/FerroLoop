@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-fl-core = { path = "../core" }
+fl-core = { path = "../core", features = ["counted-tokens"] }
 fl-exec = { path = "../exec" }
 fl-gate = { path = "../gate" }
 fl-install = { path = "../install" }

@@ -423,6 +423,8 @@ fn run_batch_queries(
             "kind": sub.kind.as_wire(),
             "symbols": ranked.outcome.symbols,
             "tokens_saved_this_query": ranked.outcome.tokens_saved_this_query,
+            "tokens_saved_this_query_counted": ranked.outcome.tokens_saved_this_query_counted,
+            "count_unit": ranked.outcome.count_unit(),
         });
         ranked.annotate_json(&mut result);
         results.push(result);
@@ -1687,7 +1689,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_code_def",
-            "description": "Find symbol definitions by exact/prefix name in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "description": "Find symbol definitions by exact/prefix name in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, tokens_saved_this_query_counted, count_unit, token_gain}. tokens_saved_this_query is a chars/4 estimate; tokens_saved_this_query_counted is an exact count in count_unit (o200k_base, OpenAI's public BPE, not your model's tokenizer).",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -1700,7 +1702,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_code_search",
-            "description": "Ranked text search over declarations and lines in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "description": "Ranked text search over declarations and lines in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, tokens_saved_this_query_counted, count_unit, token_gain}. tokens_saved_this_query is a chars/4 estimate; tokens_saved_this_query_counted is an exact count in count_unit (o200k_base, OpenAI's public BPE, not your model's tokenizer).",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -1713,7 +1715,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_code_outline",
-            "description": "List the symbols declared in a file (q is a file path or suffix) in source order. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "description": "List the symbols declared in a file (q is a file path or suffix) in source order. Returns {query, kind, symbols, tokens_saved_this_query, tokens_saved_this_query_counted, count_unit, token_gain}. tokens_saved_this_query is a chars/4 estimate; tokens_saved_this_query_counted is an exact count in count_unit (o200k_base, OpenAI's public BPE, not your model's tokenizer).",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -1726,7 +1728,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "fl_batch_search",
-            "description": "Run up to 20 code subqueries ({kind: def|search|outline, q, limit?}) over one scan. Returns {results: [{query, kind, symbols, tokens_saved_this_query}], token_gain}.",
+            "description": "Run up to 20 code subqueries ({kind: def|search|outline, q, limit?}) over one scan. Returns {results: [{query, kind, symbols, tokens_saved_this_query, tokens_saved_this_query_counted, count_unit}], token_gain}. tokens_saved_this_query is a chars/4 estimate; tokens_saved_this_query_counted is an exact count in count_unit (o200k_base, OpenAI's public BPE, not your model's tokenizer).",
             "inputSchema": {
                 "type": "object",
                 "required": ["queries"],
@@ -1919,6 +1921,15 @@ mod tests {
             );
         }
         assert_eq!(batch["token_gain"]["queries_count"], 4, "{batch}");
+        // Every subquery, the hybrid one included, carries its exact count.
+        for result in results {
+            assert_eq!(result["count_unit"], "o200k_base", "{result}");
+            assert!(
+                result["tokens_saved_this_query_counted"].is_u64(),
+                "{result}"
+            );
+        }
+        assert_eq!(batch["token_gain"]["queries_counted"], 4, "{batch}");
     }
 
     /// A batch opens (and syncs) the code sidecar once, whatever the number of
