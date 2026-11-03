@@ -1113,7 +1113,9 @@ pub fn migrate<S: Scratch>(
         dir.close()
             .map_err(|e| Error::context("could not remove the dry-run copy", e))?;
     }
-    // The file's real mode: a chmod that failed leaves it writable.
+    // The file's real mode, read again: the migration fails rather than return
+    // a clean report without its chmod, but the mode is what keeps redb writes
+    // out, so the report states what the file is now.
     let redb_kept_read_only = !dry_run && report.is_clean() && mode_is_read_only(redb);
     Ok(MigrateReport {
         pair: pair.clone(),

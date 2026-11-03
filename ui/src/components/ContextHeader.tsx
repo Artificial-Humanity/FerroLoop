@@ -487,40 +487,33 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             style={{
               display: "inline-flex",
               alignItems: "center",
-              gap: "7px",
+              gap: "10px",
               flexShrink: 0,
             }}
           >
-            <svg
+            <img
               data-testid="ferrodeck-brand-icon"
-              width="18"
-              height="18"
-              viewBox="0 0 20 20"
-              fill="none"
+              src="/brand/ferrodeck-icon.jpg"
+              alt=""
+              width="32"
+              height="32"
               aria-hidden="true"
-              style={{ flexShrink: 0 }}
-            >
-              <polygon
-                points="10 1.8 17.6 6.2 17.6 13.8 10 18.2 2.4 13.8 2.4 6.2"
-                fill="var(--accent-subtle)"
-                stroke="var(--accent-primary)"
-                strokeWidth="1.5"
-                strokeLinejoin="round"
-              />
-              <path
-                d="M6.2 8.2L10 6L13.8 8.2M6.2 11.8L10 14L13.8 11.8M10 6V14"
-                stroke="var(--accent-hover)"
-                strokeWidth="1.4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
+              style={{
+                width: "32px",
+                height: "32px",
+                flexShrink: 0,
+                borderRadius: "6px",
+                objectFit: "cover",
+                border: "1px solid var(--border-subtle)",
+              }}
+            />
             <span
               data-testid="ferrodeck-brand-title"
               style={{
                 fontWeight: 700,
-                fontSize: "14px",
-                letterSpacing: "-0.01em",
+                fontSize: "22px",
+                lineHeight: 1.1,
+                letterSpacing: "-0.015em",
                 color: "var(--text-primary)",
                 whiteSpace: "nowrap",
               }}

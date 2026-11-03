@@ -1,7 +1,8 @@
 //! Artifact registry (Record 29): which files the hub has shown as artifacts, plus archived
 //! copies of the user-facing ones so they outlive the worktree that held them.
 //!
-//! Layout under `<home>/.local/share/fl/artifacts/`: `registry.json` and `managed/`. This module
+//! Layout under the system artifacts directory (`<home>/artifacts` unless a setting moves it, see
+//! `artifact_dirs`): `registry.json`, `versions/` and `managed/`. This module
 //! holds the pure registry and file logic; path vetting (forbidden names, allowed roots) stays
 //! with the API handlers, which call in here only with paths they already checked.
 
@@ -56,7 +57,9 @@ const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `<home>/.local/share/fl/artifacts`.
+/// `<home>/.local/share/fl/artifacts`. The hub now derives its root in `artifact_dirs`; this
+/// is the root the unit tests below give a throwaway home.
+#[cfg(test)]
 pub(crate) fn data_root(home: &Path) -> PathBuf {
     home.join(".local/share/fl/artifacts")
 }
@@ -776,6 +779,16 @@ pub(crate) fn read_version_bytes(
         return Err("version content exceeds the size limit");
     }
     Ok(bytes)
+}
+
+/// Run `f` while holding the process-wide registry lock, so no registry read-modify-write can
+/// interleave. `f` must not call anything that takes the lock itself (`with_registry`,
+/// `cleanup`); the lock is not reentrant.
+pub(crate) fn with_registry_lock<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = REGISTRY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f()
 }
 
 /// Run `f` on the registry under the process-wide lock, and save it when `f` changed it. A

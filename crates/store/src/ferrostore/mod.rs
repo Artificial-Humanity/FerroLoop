@@ -106,6 +106,9 @@ use std::thread::ThreadId;
 pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use transaction::Transaction;
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
+pub(crate) use verify::migrate_verified_checked;
+#[cfg(test)]
+pub(crate) use verify::{MigrateFailure, migrate_verified_with_faults};
 pub use verify::{
     PER_ITEM_SAMPLE, ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore,
 };

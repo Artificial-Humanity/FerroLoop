@@ -3,14 +3,16 @@
 //! Loading never fails: a missing file gives the defaults, and a partial or damaged one keeps
 //! every field it can still read and takes the default for the rest.
 
+use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::artifacts::write_file_atomic;
+use crate::records::normalize_project;
 
 pub(crate) const MIN_POLL_INTERVAL_SECS: u64 = 2;
 pub(crate) const MAX_POLL_INTERVAL_SECS: u64 = 300;
@@ -67,6 +69,15 @@ pub(crate) struct Settings {
     /// deletion off. Expiry does not check whether a message still refers to the file, so an
     /// expired attachment breaks its image link in old chat transcripts.
     pub attachment_retention_days: u64,
+    /// Where the hub keeps its artifact registry and archived copies, instead of
+    /// `<home>/artifacts`. `None` (serialized as `null`) means the default. Absolute, with no
+    /// `..` component. Changed only through `POST /api/v1/settings/artifacts-dir`, never through
+    /// `PUT /api/v1/settings`.
+    pub artifacts_dir: Option<String>,
+    /// Per-project overrides of `<system artifacts dir>/<project>`, keyed by project slug. Same
+    /// rules as [`Settings::artifacts_dir`]; changed only through
+    /// `POST /api/v1/projects/:id/artifacts-dir`.
+    pub project_artifacts_dirs: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -90,8 +101,20 @@ impl Default for Settings {
                 poll_interval_secs: 10,
             },
             attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
+            artifacts_dir: None,
+            project_artifacts_dirs: BTreeMap::new(),
         }
     }
+}
+
+/// Whether `raw` may be stored as an artifacts directory: an absolute path with no NUL byte and
+/// no `..` component. Anything else in a stored file is dropped (the default applies).
+pub(crate) fn is_valid_stored_dir(raw: &str) -> bool {
+    let path = Path::new(raw);
+    !raw.is_empty()
+        && !raw.contains('\0')
+        && path.is_absolute()
+        && !path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
 /// A `PUT /api/v1/settings` body: every field optional, merged field by field. Unknown fields
@@ -300,6 +323,26 @@ impl Settings {
         {
             s.attachment_retention_days = days;
         }
+        if let Some(dir) = root
+            .get("artifacts_dir")
+            .and_then(Value::as_str)
+            .filter(|dir| is_valid_stored_dir(dir))
+        {
+            s.artifacts_dir = Some(dir.to_string());
+        }
+        if let Some(map) = root
+            .get("project_artifacts_dirs")
+            .and_then(Value::as_object)
+        {
+            for (slug, dir) in map {
+                // A key must already be a normalized slug, so it can never name a path.
+                let slug_ok = normalize_project(Some(slug)).as_deref() == Ok(slug.as_str());
+                if let Some(dir) = dir.as_str().filter(|d| slug_ok && is_valid_stored_dir(d)) {
+                    s.project_artifacts_dirs
+                        .insert(slug.clone(), dir.to_string());
+                }
+            }
+        }
         s
     }
 }
@@ -397,6 +440,24 @@ pub(crate) fn update(home: &Path, patch: SettingsPatch) -> Result<Settings, Upda
     Ok(next)
 }
 
+/// Change the artifacts directory settings (and nothing else) under the settings lock.
+///
+/// Refuses a damaged settings file with [`UpdateError::Damaged`] and writes nothing: there is no
+/// repair here, and the lenient [`load`] would otherwise rewrite the file with retention `7`.
+pub(crate) fn update_artifact_dirs(
+    home: &Path,
+    f: impl FnOnce(&mut Settings),
+) -> Result<Settings, UpdateError> {
+    let _guard = SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    load_attachment_retention_strict(home).map_err(UpdateError::Damaged)?;
+    let mut next = load(home);
+    f(&mut next);
+    save(home, &next).map_err(UpdateError::Io)?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,8 +484,128 @@ mod tests {
                 },
                 "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
                 "attachment_retention_days": 7,
+                "artifacts_dir": null,
+                "project_artifacts_dirs": {},
             })
         );
+    }
+
+    #[test]
+    fn artifact_dirs_round_trip_and_leave_other_fields_alone() {
+        let tmp = TempDir::new().unwrap();
+        let out = update_artifact_dirs(tmp.path(), |s| {
+            s.artifacts_dir = Some("/data/art".into());
+            s.project_artifacts_dirs
+                .insert("ferroloop".into(), "/data/fl".into());
+        })
+        .unwrap();
+        assert_eq!(load(tmp.path()), out);
+        assert_eq!(out.artifacts_dir.as_deref(), Some("/data/art"));
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(settings_path(tmp.path())).unwrap()).unwrap();
+        assert_eq!(doc["artifacts_dir"], "/data/art");
+        assert_eq!(
+            doc["project_artifacts_dirs"],
+            json!({ "ferroloop": "/data/fl" })
+        );
+        // A normal patch keeps them.
+        let patch =
+            serde_json::from_value::<SettingsPatch>(json!({ "timezone": "Asia/Tokyo" })).unwrap();
+        let after = update(tmp.path(), patch).unwrap();
+        assert_eq!(after.artifacts_dir.as_deref(), Some("/data/art"));
+        assert_eq!(after.project_artifacts_dirs.len(), 1);
+        // And a later artifact-dirs change keeps the other settings.
+        let again = update_artifact_dirs(tmp.path(), |s| s.artifacts_dir = None).unwrap();
+        assert_eq!(again.timezone, "Asia/Tokyo");
+        assert_eq!(again.artifacts_dir, None);
+    }
+
+    #[test]
+    fn artifact_dirs_are_not_patchable_through_the_settings_patch() {
+        for body in [
+            json!({ "artifacts_dir": "/x" }),
+            json!({ "project_artifacts_dirs": {} }),
+        ] {
+            assert!(
+                serde_json::from_value::<SettingsPatch>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_artifact_dirs_that_are_not_safe_absolute_paths_are_dropped_per_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for bad in [
+            json!("relative/dir"),
+            json!(""),
+            json!("/a/../b"),
+            json!("/a/\u{0}b"),
+            json!(7),
+            json!(null),
+        ] {
+            let doc = json!({ "artifacts_dir": bad, "timezone": "Asia/Tokyo" });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            let loaded = load(tmp.path());
+            assert_eq!(loaded.artifacts_dir, None, "{bad}");
+            assert_eq!(loaded.timezone, "Asia/Tokyo", "{bad}");
+        }
+        let doc = json!({
+            "artifacts_dir": "/ok/dir",
+            "project_artifacts_dirs": {
+                "good": "/p/good",
+                "Upper": "/p/upper",
+                "bad slug": "/p/slug",
+                "../x": "/p/x",
+                "": "/p/empty",
+                "rel": "p/rel",
+                "dots": "/p/../etc",
+                "num": 3,
+            },
+        });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.artifacts_dir.as_deref(), Some("/ok/dir"));
+        let keys: Vec<&str> = loaded
+            .project_artifacts_dirs
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["good"]);
+        // A map that is not an object drops the whole map and nothing else.
+        let doc = json!({ "project_artifacts_dirs": ["/p"], "artifacts_dir": "/ok/dir" });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert!(loaded.project_artifacts_dirs.is_empty());
+        assert_eq!(loaded.artifacts_dir.as_deref(), Some("/ok/dir"));
+    }
+
+    #[test]
+    fn update_artifact_dirs_refuses_a_damaged_file_and_writes_nothing() {
+        for stored in [
+            &b"{ not json"[..],
+            b"[7]",
+            br#"{"attachment_retention_days":1000}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = settings_path(tmp.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, stored).unwrap();
+            let mut ran = false;
+            let res = update_artifact_dirs(tmp.path(), |s| {
+                ran = true;
+                s.artifacts_dir = Some("/data/x".into());
+            });
+            assert!(matches!(res, Err(UpdateError::Damaged(_))), "{stored:?}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                stored,
+                "file must not change"
+            );
+            assert!(!ran, "the closure must not run on a damaged file");
+        }
     }
 
     #[test]

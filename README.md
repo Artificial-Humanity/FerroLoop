@@ -1,6 +1,10 @@
 # FerroLoop
 
-**FerroLoop** gates the actions that cost you. You declare what has to be true before a step
+<p align="center">
+  <img src="docs/assets/ferroloop-hero.jpg" alt="FerroLoop — Sovereign Agent Orchestration Suite" width="100%" />
+</p>
+
+**FerroLoop** ([ferroloop.ai](https://ferroloop.ai)) gates the actions that cost you. You declare what has to be true before a step
 may happen, `fl` checks it against your working tree, and the step is refused when the check
 fails. Its command is `fl`.
 
@@ -48,15 +52,15 @@ carry their own copy of the code in the last column; FerroState is a facade crat
 repository's `fl-core` and `fl-store`. Every one but FerroGate takes `fl-core` from this
 repository as a git dependency.
 
-| Part | What it is | Where it lives here |
-| --- | --- | --- |
-| [FerroDeck](https://github.com/Artificial-Humanity/FerroDeck) | The command-center web app (React PWA) for supervising coding agents, and the hub daemon that serves it. | `ui/`, `crates/hub` |
-| [FerroStore](https://github.com/Artificial-Humanity/FerroStore) | The embedded store: the redb-backed local store and the single-file `.fls` store (documents, queue, tables, vectors). | `crates/store` |
-| [FerroState](https://github.com/Artificial-Humanity/FerroState) | Durable agent memory. The `fl-state` crate re-exports the state model and code index from `fl-core` and the redb backend from `fl-store`, and adds ranked recall and sensitivity redaction. | `crates/core` (state modules), `crates/store`, `fl state` in `crates/cli`, redaction in `crates/hub` |
-| [FerroWire](https://github.com/Artificial-Humanity/FerroWire) | Agent-to-agent messaging transport: the local daemon, peer relay, route table and push to vendor CLIs. Its message model and mailbox traits come from `fl-core`. | `crates/wire` |
-| [FerroTrack](https://github.com/Artificial-Humanity/FerroTrack) | Two-tier tracking: GitHub Issues as a tier, the `fl/ledger` branch, and the pull-request client. | `crates/github` |
-| [FerroGate](https://github.com/Artificial-Humanity/FerroGate) | The zero-knowledge secrets vault, credential proxy and API-to-MCP gateway. | `crates/gate` |
-| FerroWatch | Reserved name for observability and monitoring: no repository and no code yet. See [Roadmap](#roadmap). | — |
+| Part | Website | What it is | Where it lives here |
+| --- | --- | --- | --- |
+| [FerroDeck](https://github.com/Artificial-Humanity/FerroDeck) | [ferroloop.ai/ferrodeck](https://ferroloop.ai/ferrodeck) | The command-center web app (React PWA) for supervising coding agents, and the hub daemon that serves it. | `ui/`, `crates/hub` |
+| [FerroStore](https://github.com/Artificial-Humanity/FerroStore) | [ferroloop.ai/ferrostore](https://ferroloop.ai/ferrostore) | The embedded store: the redb-backed local store and the single-file `.fls` store (documents, queue, tables, vectors). | `crates/store` |
+| [FerroState](https://github.com/Artificial-Humanity/FerroState) | [ferroloop.ai/ferrostate](https://ferroloop.ai/ferrostate) | Durable agent memory. The `fl-state` crate re-exports the state model and code index from `fl-core` and the redb backend from `fl-store`, and adds ranked recall and sensitivity redaction. | `crates/core` (state modules), `crates/store`, `fl state` in `crates/cli`, redaction in `crates/hub` |
+| [FerroWire](https://github.com/Artificial-Humanity/FerroWire) | [ferroloop.ai/ferrowire](https://ferroloop.ai/ferrowire) | Agent-to-agent messaging transport: the local daemon, peer relay, route table and push to vendor CLIs. Its message model and mailbox traits come from `fl-core`. | `crates/wire` |
+| [FerroTrack](https://github.com/Artificial-Humanity/FerroTrack) | [ferroloop.ai/ferrotrack](https://ferroloop.ai/ferrotrack) | Two-tier tracking: GitHub Issues as a tier, the `fl/ledger` branch, and the pull-request client. | `crates/github` |
+| [FerroGate](https://github.com/Artificial-Humanity/FerroGate) | [ferroloop.ai/ferrogate](https://ferroloop.ai/ferrogate) | The zero-knowledge secrets vault, credential proxy and API-to-MCP gateway. | `crates/gate` |
+| FerroWatch | [ferroloop.ai/ferrowatch](https://ferroloop.ai/ferrowatch) | Observability and monitoring. It has no repository of its own. The `fl-watch` crate computes telemetry rollups, agent liveness and alerts, and balances subscription usage; the `fl watch` CLI (`status`, `rollups`, `liveness`, `alerts`, `balance`) and the hub's `/api/v1/watch/*` routes serve them. | `crates/watch`, `fl watch` in `crates/cli`, `crates/hub` (`watch_api.rs`, `balance_api.rs`) |
 
 The six repositories are mounted as optional git submodules under `submodules/`. The build does
 not use them. See [Submodules](docs/getting-started.md#submodules).
@@ -118,7 +122,7 @@ others can reach. Which store `fl` opens, and the permission details, are in
   `fl hub serve` serves.
 * Multi-hub federation across tailnets for `fl wire` and `fl hub`.
 * A cherry-pick installer: install `fl` and optional components without building from source.
-* FerroWatch: observability and monitoring.
+* FerroWatch: extraction into its own repository.
 
 ---
 
@@ -130,6 +134,7 @@ others can reach. Which store `fl` opens, and the permission details, are in
 * [docs/github-ledger.md](docs/github-ledger.md) — publish each decision's evidence to the tracker's repository.
 * [docs/routing.md](docs/routing.md) — keep developer-level items in the local store and human-level items in GitHub.
 * [docs/mcp.md](docs/mcp.md) — one committed catalog of a project's MCP servers, written into each agent CLI's own file.
+* [docs/hub-home-and-artifacts.md](docs/hub-home-and-artifacts.md) — where the Hub keeps its data and artifact registry, per-project artifact directories, and relocating them.
 * [docs/vendor-runtimes.md](docs/vendor-runtimes.md) — on-disk session, transcript and prompt-delivery shapes of the five vendor CLIs.
 * [docs/README.md](docs/README.md) — index of the public documentation directory.
 * [AGENTS.md](AGENTS.md) — working rules, core stack matrix, and file-naming conventions for agents and contributors.

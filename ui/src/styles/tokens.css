@@ -178,7 +178,7 @@ body,
 }
 
 .fd-header {
-  min-height: 54px;
+  min-height: 58px;
   background-color: var(--bg-surface);
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
@@ -392,7 +392,7 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 .fd-gear-icon {
-  font-size: calc(16px * var(--fd-font-scale, 1));
+  font-size: calc(20px * var(--fd-font-scale, 1));
   line-height: 1;
   display: inline-block;
 }

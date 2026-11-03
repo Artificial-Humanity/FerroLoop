@@ -1487,10 +1487,22 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             data-testid="settings-modal-btn"
             className="fd-btn"
             onClick={() => onOpenSettingsModal?.()}
-            title="Open Settings (Agents, System, Accessibility, Auth)"
-            style={{ flex: 1, justifyContent: "center", fontSize: "11.5px", padding: "4px 8px" }}
+            title="Open Settings (Agents, System, Products, Accessibility, Auth)"
+            style={{
+              flex: 1,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "6px",
+              fontSize: "12px",
+              padding: "4px 8px",
+            }}
           >
-            <span className="fd-gear-icon" aria-hidden="true" style={{ fontSize: "15px", lineHeight: 1 }}>
+            <span
+              className="fd-gear-icon"
+              aria-hidden="true"
+              style={{ fontSize: "20px", lineHeight: 1 }}
+            >
               ⚙
             </span>{" "}
             Settings

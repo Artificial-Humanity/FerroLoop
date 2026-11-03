@@ -253,6 +253,10 @@ export interface HubSettings {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
     ferrostep_enabled: boolean;
+    ferrodeck_enabled?: boolean;
+    ferrowire_enabled?: boolean;
+    ferrotrack_enabled?: boolean;
+    ferrowatch_enabled?: boolean;
   };
   notifications: {
     notify_on_pr_review: boolean;
