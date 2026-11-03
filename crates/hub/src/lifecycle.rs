@@ -3728,20 +3728,82 @@ mod tests {
         let p = synthesize_decommission_prompt("Felicity", "FerroLoop", "assistant");
         for needle in [
             "Felicity",
-            "Notes/FerroLoop/STATE.md",
-            "fl state handoff",
-            "fl state checkpoint",
+            "fl state handoff set --scope FerroLoop",
+            "fl state checkpoint --scope FerroLoop",
             "worktrees",
-            "fl wire send",
-            "agent-msg send",
-            "fl wire read --ack",
+            "fl wire send <lead> \"Felicity decommission handoff\"",
             "agent-msg read --ack",
+            "decommission-ready",
             "Lead",
         ] {
             assert!(p.contains(needle), "missing {needle}: {p}");
         }
         assert!(synthesize_decommission_prompt("Ferris", "FerroLoop", "lead").contains("jarvis"));
         assert!(!p.contains("jarvis"));
+    }
+
+    #[test]
+    fn decommission_prompt_sends_the_final_handoff_exactly_once() {
+        // `agent-msg` is a symlink to `fl`, so a second send line delivers the handoff twice.
+        for role in ["lead", "lab_manager", "assistant"] {
+            let p = synthesize_decommission_prompt("Felicity", "FerroLoop", role);
+            let sends = p.matches("fl wire send").count() + p.matches("agent-msg send").count();
+            assert_eq!(sends, 1, "{role}: {p}");
+            // One ack command only, and the prompt counts four steps.
+            assert_eq!(p.matches("read --ack").count(), 1, "{role}: {p}");
+            assert!(p.contains("all four steps"), "{role}: {p}");
+        }
+    }
+
+    #[test]
+    fn decommission_prompt_makes_ferrostate_primary_and_state_md_optional() {
+        let p = synthesize_decommission_prompt("Felicity", "FerroLoop", "assistant");
+        let step1 = p
+            .lines()
+            .find(|l| l.trim_start().starts_with("1."))
+            .expect("step 1");
+        assert!(step1.contains("fl state handoff set"), "{step1}");
+        assert!(step1.contains("fl state checkpoint"), "{step1}");
+        assert!(step1.contains("primary"), "{step1}");
+        for mention in p.match_indices("STATE.md") {
+            let around = &p[mention.0.saturating_sub(40)..(mention.0 + 120).min(p.len())];
+            assert!(around.contains("optional legacy"), "{around}");
+        }
+    }
+
+    #[test]
+    fn decommission_prompt_names_the_right_recipient_per_role() {
+        let lead = synthesize_decommission_prompt("Ferris", "FerroLoop", "lead");
+        assert!(lead.contains("to `jarvis` once"), "{lead}");
+        assert!(lead.contains("fl wire send jarvis \"Ferris decommission handoff\""));
+        let manager = synthesize_decommission_prompt("Wendy", "FerroLoop", "lab_manager");
+        assert!(manager.contains("to the owner once"), "{manager}");
+        assert!(!manager.contains("jarvis"));
+        let other = synthesize_decommission_prompt("Felicity", "FerroLoop", "ui-developer");
+        assert!(other.contains("to the FerroLoop Lead"), "{other}");
+        assert!(other.contains("fl wire send <lead> \"Felicity decommission handoff\""));
+        assert!(!other.contains("jarvis"));
+    }
+
+    #[test]
+    fn reforge_prompt_reads_ferrostate_first_and_state_md_only_as_legacy() {
+        let p = canonical_reforge_prompt("Felicity", "FerroLoop", "assistant");
+        assert!(p.contains("fl state render --scope FerroLoop"), "{p}");
+        assert!(p.contains("fl state get current --scope FerroLoop"), "{p}");
+        assert!(p.contains("primary state source"), "{p}");
+        let state_md: Vec<&str> = p.lines().filter(|l| l.contains("STATE.md")).collect();
+        assert_eq!(state_md.len(), 1, "{p}");
+        assert!(
+            state_md[0].contains("Optional legacy") && state_md[0].contains("if "),
+            "{p}"
+        );
+        // FerroState is read before the legacy note.
+        assert!(p.find("fl state render").unwrap() < p.find("STATE.md").unwrap());
+        // Registration and inbox steps stay.
+        assert!(p.contains(
+            "agent-msg register Felicity --project FerroLoop --role assistant --replace"
+        ));
+        assert!(p.contains("AGENT_PERSONA=felicity agent-msg read --ack"));
     }
 
     #[test]

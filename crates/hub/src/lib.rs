@@ -3200,9 +3200,7 @@ mod tests {
         assert_eq!(out["unregistered"], false);
         assert_eq!(out["runtime_stopped"], false);
         let prompt = out["prompt"].as_str().unwrap();
-        assert!(
-            prompt.contains("Notes/FerroLoop/STATE.md") && prompt.contains("agent-msg read --ack")
-        );
+        assert!(prompt.contains("fl state handoff set") && prompt.contains("agent-msg read --ack"));
         let delivered: Value = serde_json::from_str(&lines.join().unwrap()[0]).unwrap();
         assert_eq!(delivered["kind"], "operator_prompt");
         assert_eq!(delivered["body"], prompt);

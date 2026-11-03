@@ -304,7 +304,7 @@ fn decommission_prepare_then_teardown_retires_the_agent_and_removes_the_route() 
         out["prompt"]
             .as_str()
             .unwrap()
-            .contains("fl wire read --ack")
+            .contains("agent-msg read --ack")
     );
     assert_eq!(env.hosted_records()[0]["status"], "decommissioning");
     assert!(

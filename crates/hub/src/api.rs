@@ -5952,12 +5952,13 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
          1. Read `.agents/AGENTS.md` and `.agents/REGISTRY.md`.\n\
          2. Read your role file(s): `.agents/roles/{role}.md`.\n\
          3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
-         4. Read your project's current working state note: `Notes/{project}/STATE.md`.\n\
-         5. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
+         4. Read your working state from FerroState, the primary state source: run `fl state render --scope {project}` for the startup summary, `fl state get current --scope {project}` for your latest handoff, and `fl state search \"<query>\"` to look up anything specific.\n\
+         5. Optional legacy reference: if `Notes/{project}/STATE.md` exists, skim it; FerroState wins wherever the two disagree. Do not require it.\n\
+         6. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
             ```bash\n\
             AGENT_PERSONA={name_lower} agent-msg register {name} --project {project} --role {role} --replace\n\
             ```\n\
-         6. Check and acknowledge any pending NATS messages:\n\
+         7. Check and acknowledge any pending NATS messages:\n\
             ```bash\n\
             AGENT_PERSONA={name_lower} agent-msg read --ack\n\
             ```\n\
@@ -5980,16 +5981,14 @@ pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &s
     let to = if role == "lead" { "jarvis" } else { "<lead>" };
     format!(
         "{name}, you are being prepared for decommission. This session will be shut down after you finish; do not start new work. Complete these steps now:\n\
-         1. Save unsaved progress, findings and your handoff in `Notes/{project}/STATE.md` and in FerroState (`fl state handoff set` for the handoff, `fl state checkpoint` for the git checkpoint).\n\
+         1. Save unsaved progress, findings and your handoff in FerroState, the primary state source: `fl state handoff set --scope {project} --summary \"<what is done, open, and next>\" --by {name_lower}` for the handoff, then `fl state checkpoint --scope {project} --by {name_lower}` for the git checkpoint. `Notes/{project}/STATE.md` is an optional legacy note; update it only if it exists.\n\
          2. Commit and push your work, or clean up your temp worktrees and branches (`git worktree remove`, `git branch -d`). Leave nothing only on this session's disk.\n\
-         3. Send a final handoff to {recipient} over both channels:\n\
+         3. Send your final handoff to {recipient} once:\n\
             ```bash\n\
             fl wire send {to} \"{name} decommission handoff\" \"<what is done, open, and where it lives>\" --from {name_lower}\n\
-            AGENT_PERSONA={name_lower} agent-msg send {to} \"{name} decommission handoff\" \"<same summary>\"\n\
             ```\n\
          4. Acknowledge the remaining inbox messages:\n\
             ```bash\n\
-            fl wire read --ack\n\
             AGENT_PERSONA={name_lower} agent-msg read --ack\n\
             ```\n\
          \n\
