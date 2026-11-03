@@ -29,6 +29,8 @@ predicates = "3.1.4"
 uuid = { version = "1.26", features = ["v7"] }
 toml = "1.1"
 sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 ureq = { version = "3.4", features = ["json"] }
 ring = "0.17"
 base64 = "0.22"

@@ -25,6 +25,7 @@ pub mod finding;
 pub mod governor;
 pub mod ids;
 pub mod install;
+pub mod intent;
 pub mod iri;
 pub mod local_providers;
 pub mod log;
@@ -36,6 +37,7 @@ pub mod model;
 pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
+pub mod routine;
 pub mod routing;
 pub mod session_protocol;
 pub mod split;
@@ -113,6 +115,12 @@ pub use ids::{
     AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
     WorkflowId, WorkflowRunId,
 };
+pub use intent::{
+    AllocationAmount, AllocationCarve, AllocationPool, Binding, CarveRequest, CommitteeCounts,
+    CommitteeIntent, CommitteeOutcome, CommitteeTally, CommitteeVerdict, DelegateIntent,
+    DelegateTarget, IntentError, IntentResult, QuorumRule, ResultSchema, TypedResult,
+    validate_ancestry,
+};
 pub use iri::{Iri, IriError};
 pub use local_providers::{
     KEYLESS_LOOPBACK_REF, LOCAL_MODEL_PROVIDERS_SLUG, LocalLifecycleOp, LocalModelProviderKind,
@@ -144,6 +152,11 @@ pub use pr_policy::{
 pub use ref_index::{
     MAX_REF_SOURCES, RefIndexError, RefIndexPlan, RefIndexReport, RefIndexStatus, RefKind,
     RefLocatorClass, RefSource, classify_locator, index_local_source,
+};
+pub use routine::{
+    Allocation, Approval, CatchUp, CatchUpEvaluation, CatchUpPage, CatchUpScan, Concurrency,
+    FiringRecord, FiringState, RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork,
+    Schedule, ScheduledInstant, Window, firing_key,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use session_protocol::{
