@@ -598,48 +598,124 @@ fn rollback_after_a_kill_restores_exactly_the_previous_install() {
 
 // ---------------------------------------------------------------- concurrency
 
+/// One finished child: its exit code and what it printed.
+struct Out {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// A running child whose output goes to files (a full pipe cannot stall it) and whose handle we
+/// keep, so a hang is killed by pid and reported, not waited on for ever.
+struct Proc {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl Proc {
+    fn start(mut cmd: std::process::Command, dir: &Path, n: usize) -> Self {
+        let stdout = dir.join(format!("proc{n}.out"));
+        let stderr = dir.join(format!("proc{n}.err"));
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap());
+        Self {
+            child: cmd.spawn().unwrap(),
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// Wait for every child, at most `limit` in all. On the deadline the unfinished children are
+/// killed and the panic names each child's pid, state and output so far.
+fn wait_all(mut procs: Vec<Proc>, limit: std::time::Duration) -> Vec<Out> {
+    let deadline = std::time::Instant::now() + limit;
+    let mut codes: Vec<Option<Option<i32>>> = vec![None; procs.len()];
+    while codes.iter().any(Option::is_none) {
+        for (p, c) in procs.iter_mut().zip(codes.iter_mut()) {
+            if c.is_none()
+                && let Some(st) = p.child.try_wait().unwrap()
+            {
+                *c = Some(st.code());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let mut report = String::new();
+            for (i, (p, c)) in procs.iter_mut().zip(&codes).enumerate() {
+                if c.is_none() {
+                    let _ = p.child.kill();
+                    let _ = p.child.wait();
+                }
+                report += &format!(
+                    "child {i} pid {}: {}\n  stdout: {}\n  stderr: {}\n",
+                    p.child.id(),
+                    c.map_or("still running at the deadline".to_string(), |c| format!(
+                        "exited {c:?}"
+                    )),
+                    std::fs::read_to_string(&p.stdout)
+                        .unwrap_or_default()
+                        .trim(),
+                    std::fs::read_to_string(&p.stderr)
+                        .unwrap_or_default()
+                        .trim(),
+                );
+            }
+            panic!("the installers did not all finish within {limit:?}\n{report}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    procs
+        .iter()
+        .zip(codes)
+        .map(|(p, c)| Out {
+            code: c.unwrap(),
+            stdout: std::fs::read_to_string(&p.stdout).unwrap_or_default(),
+            stderr: std::fs::read_to_string(&p.stderr).unwrap_or_default(),
+        })
+        .collect()
+}
+
 #[test]
 fn many_processes_installing_at_once_never_corrupt_the_install() {
     let w = World::new();
     let (_, man) = w.release("0.1.0", "a");
     let bin = assert_cmd::cargo::cargo_bin("fl");
-    let spawn = |man: &Path| {
-        std::process::Command::new(&bin)
-            .env_clear()
-            .env("HOME", w.home.path())
-            .current_dir(w.cwd.path())
-            .args(["install", "--yes", "--profile", "headless", "--prefix"])
-            .arg(w.prefix())
-            .arg("--manifest")
-            .arg(man)
-            .arg("--artifact-dir")
-            .arg(w.art.path())
-            .output()
-            .unwrap()
+    // Every installer waits for the lock far longer than a loaded machine needs, and the whole
+    // batch has a deadline: a hang fails with what each child had written, it does not stall.
+    let batch = |mans: Vec<&Path>| -> Vec<Out> {
+        let procs: Vec<Proc> = mans
+            .iter()
+            .enumerate()
+            .map(|(i, man)| {
+                let mut c = std::process::Command::new(&bin);
+                c.env_clear()
+                    .env("HOME", w.home.path())
+                    .current_dir(w.cwd.path())
+                    .args(["install", "--yes", "--profile", "headless"])
+                    .args(["--lock-timeout", "600", "--prefix"])
+                    .arg(w.prefix())
+                    .arg("--manifest")
+                    .arg(man)
+                    .arg("--artifact-dir")
+                    .arg(w.art.path());
+                Proc::start(c, w.cwd.path(), i)
+            })
+            .collect();
+        wait_all(procs, std::time::Duration::from_secs(240))
     };
-    let outs: Vec<_> = std::thread::scope(|s| {
-        (0..6)
-            .map(|_| s.spawn(|| spawn(&man)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect()
-    });
+    let outs = batch(vec![man.as_path(); 6]);
     for o in &outs {
-        assert_eq!(
-            o.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        assert_eq!(o.code, Some(0), "{}", o.stderr);
     }
     let installed = outs
         .iter()
-        .filter(|o| String::from_utf8_lossy(&o.stdout).contains("installed release"))
+        .filter(|o| o.stdout.contains("installed release"))
         .count();
     let already = outs
         .iter()
-        .filter(|o| String::from_utf8_lossy(&o.stdout).contains("already installed"))
+        .filter(|o| o.stdout.contains("already installed"))
         .count();
     assert_eq!((installed, already), (1, 5));
     let (_, v) = w.doctor();
@@ -649,25 +725,9 @@ fn many_processes_installing_at_once_never_corrupt_the_install() {
     let (_, m2) = w.release("0.2.0", "b");
     let (_, m3) = w.release("0.3.0", "c");
     let mans = [m2, m3];
-    let outs: Vec<_> = std::thread::scope(|s| {
-        (0..6)
-            .map(|i| {
-                let m = &mans[i % 2];
-                let spawn = &spawn;
-                s.spawn(move || spawn(m))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .collect()
-    });
+    let outs = batch((0..6).map(|i| mans[i % 2].as_path()).collect());
     for o in &outs {
-        assert_eq!(
-            o.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
+        assert_eq!(o.code, Some(0), "{}", o.stderr);
     }
     let receipt: Value =
         serde_json::from_str(&std::fs::read_to_string(w.prefix().join("receipt.json")).unwrap())

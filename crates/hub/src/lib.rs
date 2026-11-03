@@ -2651,6 +2651,50 @@ mod tests {
     }
 
     #[test]
+    fn the_configured_repo_root_not_the_process_directory_feeds_the_repo_views() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("configured-repo");
+        fs::create_dir_all(&repo).unwrap();
+        let hub_git = |repo: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        hub_git(&repo, &["init", "-q", "-b", "main"]);
+        hub_git(&repo, &["config", "user.name", "Root Tester"]);
+        hub_git(&repo, &["config", "user.email", "tester@example.invalid"]);
+        fs::write(repo.join("tracked.txt"), "x\n").unwrap();
+        hub_git(&repo, &["add", "tracked.txt"]);
+        hub_git(&repo, &["commit", "-qm", "init"]);
+        // the process directory (this crate) is a different repository from `repo`
+        assert_ne!(
+            fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+            fs::canonicalize(&repo).unwrap()
+        );
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let state = test_hub_state_at(&tmp, &repo, &home);
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/worktrees")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        let paths: Vec<_> = body["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| fs::canonicalize(w["path"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(paths, vec![fs::canonicalize(&repo).unwrap()], "{body}");
+    }
+
+    #[test]
     fn code_search_scans_a_root_that_is_not_the_home_directory() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state_away_from_home(&tmp);

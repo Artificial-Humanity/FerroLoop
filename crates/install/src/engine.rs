@@ -615,6 +615,22 @@ struct Resolved {
     keep: Vec<String>,
 }
 
+/// Whether the release directory is to be (re)made, so its artifacts must be read and verified:
+/// it does not exist yet, or the caller named it in `--replace`. Used before the lock and again
+/// under it, so both ask the same thing.
+fn release_needs_source(plan: &InstallPlan, decisions: &Decisions, safe: &Safe) -> bool {
+    plan.paths
+        .iter()
+        .find(|p| p.role == PathRole::Release)
+        .is_some_and(|p| {
+            p.disposition == Disposition::Create
+                || decisions
+                    .replace
+                    .iter()
+                    .any(|r| safe.lexical(r).ok() == safe.lexical(&p.path).ok())
+        })
+}
+
 fn resolve_decisions(plan: &InstallPlan, d: &Decisions, safe: &Safe) -> Result<Resolved> {
     let conflicts = conflicts_needing_decision(plan);
     let key = |s: &str| safe.lexical(s).map(|p| p.to_string_lossy().into_owned());
@@ -1987,21 +2003,24 @@ fn apply_trusted(env: &Env, args: &ApplyArgs<'_>) -> Result<ApplyReport> {
     // recovery that runs under the lock.)
     let mut source = None;
     if lstat(&paths.journal)?.is_none() {
-        let pre = make_plan(env, &paths, args, &probe)?;
-        resolve_decisions(&pre.plan, args.decisions, &safe)?;
-        let will_stage = {
-            let rd = pre.plan.paths.iter().find(|p| p.role == PathRole::Release);
-            rd.is_some_and(|p| {
-                p.disposition == Disposition::Create
-                    || args
-                        .decisions
-                        .replace
-                        .iter()
-                        .any(|r| safe.lexical(r).ok() == safe.lexical(&p.path).ok())
-            })
-        };
-        if will_stage {
-            source = Some(prepare_source(args, &pre.plan)?);
+        // This look is taken without the lock, so it can land in the middle of another
+        // installer's transaction (its links made, its receipt not yet written) and read that
+        // as a conflict. That is possible only once the lock file exists: an installer makes it
+        // before anything else. So a refusal with a lock file in place is not final here: the
+        // plan is made again under the lock, which decides. With no lock file, or for any other
+        // error, nothing else can be running and the answer stands, before anything is created.
+        let pre = make_plan(env, &paths, args, &probe).and_then(|pre| {
+            resolve_decisions(&pre.plan, args.decisions, &safe)?;
+            Ok(pre)
+        });
+        match pre {
+            Ok(pre) => {
+                if release_needs_source(&pre.plan, args.decisions, &safe) {
+                    source = Some(prepare_source(args, &pre.plan)?);
+                }
+            }
+            Err(InstallError::Refused(_)) if lstat(&paths.lock)?.is_some() => {}
+            Err(e) => return Err(e),
         }
     }
 
@@ -2085,13 +2104,7 @@ fn apply_locked(
         });
     }
 
-    if source.is_none()
-        && planned
-            .plan
-            .paths
-            .iter()
-            .any(|p| p.role == PathRole::Release && p.disposition == Disposition::Create)
-    {
+    if source.is_none() && release_needs_source(&planned.plan, args.decisions, safe) {
         *source = Some(prepare_source(args, &planned.plan)?);
     }
 

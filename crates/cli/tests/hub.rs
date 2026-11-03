@@ -740,3 +740,258 @@ fn fl_hub_init_preserves_existing_project() {
     assert_eq!(projects[0]["name"].as_str(), Some("keep-me"));
     assert_eq!(doc["wire"]["peers"][0].as_str(), Some("ws://127.0.0.1:9"));
 }
+
+// ---- `[hub] repo_root` and `fl hub serve --repo-root` (#205 A4d) ------------------------------
+
+const REPO_ROOT_OWNER_TOKEN: &str = "repo-root-owner-token";
+
+/// A git repository with one commit and one source file holding `symbol`.
+fn make_repo(dir: &Path, symbol: &str) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        format!("pub fn {symbol}() -> u32 {{ 1 }}\n"),
+    )
+    .unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "ferris@artificialhumanity.io"][..],
+        &["config", "user.name", "Ferris"][..],
+        &["add", "."][..],
+        &["commit", "-qm", "initial"][..],
+    ] {
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} in {}", dir.display());
+    }
+}
+
+impl TestEnv {
+    /// A config with the `[hub]` table the test asks for (`hub_extra` is raw TOML lines).
+    fn write_repo_root_config(&self, hub_extra: &str) {
+        fs::write(&self.owner_token_file, format!("{REPO_ROOT_OWNER_TOKEN}\n")).unwrap();
+        let cfg_toml = format!(
+            "[state]\nstore = \"{store}\"\n\n\
+             [hub]\nowner_token_file = \"{owner_tok}\"\n{hub_extra}\n",
+            store = self.store_path.display(),
+            owner_tok = self.owner_token_file.display(),
+        );
+        fs::write(self.cfg_dir.join("fl/config.toml"), cfg_toml).unwrap();
+    }
+
+    /// Start `fl hub serve` in `cwd` on an ephemeral port; returns the guard and the base URL.
+    fn serve_in(&self, cwd: &Path, extra_args: &[&str]) -> (RunningHubGuard, String) {
+        let mut cmd = self.fl_in(cwd);
+        cmd.args(["hub", "serve", "--listen", "127.0.0.1:0"])
+            .args(extra_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let mut reader = BufReader::new(child.stdout.take().unwrap());
+        // The guard kills the child if the banner never comes.
+        let guard = RunningHubGuard { child };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+        });
+        let line = rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("no readiness banner from `fl hub serve` within 120s");
+        let base = line
+            .trim()
+            .strip_prefix("ferroloop-hub listening on ")
+            .unwrap_or_else(|| panic!("no readiness banner from `fl hub serve`: {line:?}"))
+            .to_string();
+        (guard, base)
+    }
+}
+
+fn hub_get(base: &str, path: &str) -> Value {
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = http
+        .get(&format!("{base}{path}"))
+        .header("Authorization", &format!("Bearer {REPO_ROOT_OWNER_TOKEN}"))
+        .call()
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET {path}");
+    resp.body_mut().read_json().unwrap()
+}
+
+/// The canonical paths `/api/v1/worktrees` lists.
+fn worktree_paths(base: &str) -> Vec<PathBuf> {
+    let body = hub_get(base, "/api/v1/worktrees");
+    body["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| fs::canonicalize(w["path"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+#[test]
+fn the_hub_repo_root_is_the_flag_then_the_config_then_the_working_directory() {
+    let env = TestEnv::new();
+    let (repo_a, repo_b, elsewhere) = (
+        env.root.join("repo-a"),
+        env.root.join("repo-b"),
+        env.root.join("elsewhere"),
+    );
+    make_repo(&repo_a, "alpha_symbol");
+    make_repo(&repo_b, "beta_symbol");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let (canon_a, canon_b) = (
+        fs::canonicalize(&repo_a).unwrap(),
+        fs::canonicalize(&repo_b).unwrap(),
+    );
+
+    // The config names repo A; the process runs somewhere that is not a repository at all.
+    env.write_repo_root_config(&format!("repo_root = \"{}\"", repo_a.display()));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    assert_eq!(worktree_paths(&base), vec![canon_a.clone()], "config");
+    let search = hub_get(&base, "/api/v1/state/code-search?q=alpha_symbol&kind=def");
+    assert_eq!(search["symbols"][0]["name"], "alpha_symbol", "{search}");
+    drop(_g);
+
+    // The flag beats the config.
+    let b = repo_b.display().to_string();
+    let (_g, base) = env.serve_in(&elsewhere, &["--repo-root", &b]);
+    assert_eq!(worktree_paths(&base), vec![canon_b.clone()], "flag");
+    let search = hub_get(&base, "/api/v1/state/code-search?q=beta_symbol&kind=def");
+    assert_eq!(search["symbols"][0]["name"], "beta_symbol", "{search}");
+    drop(_g);
+
+    // Neither: the working directory.
+    env.write_repo_root_config("");
+    let (_g, base) = env.serve_in(&repo_b, &[]);
+    assert_eq!(worktree_paths(&base), vec![canon_b], "cwd");
+}
+
+#[test]
+fn a_hub_whose_configured_root_is_the_home_directory_does_not_scan_it() {
+    let env = TestEnv::new();
+    let elsewhere = env.root.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    // HOME is `env.root` (see `fl_in`); put code under it that a scan would find.
+    fs::create_dir_all(env.root.join("src")).unwrap();
+    fs::write(env.root.join("src/lib.rs"), "pub fn home_symbol() {}\n").unwrap();
+    env.write_repo_root_config(&format!("repo_root = \"{}\"", env.root.display()));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    let search = hub_get(&base, "/api/v1/state/code-search?q=home_symbol&kind=def");
+    assert_eq!(search["symbols"].as_array().unwrap().len(), 0, "{search}");
+    let note = search["note"].as_str().unwrap_or_default();
+    assert!(note.contains("repo_root"), "{search}");
+}
+
+#[test]
+fn a_bad_repo_root_stops_the_hub_before_it_listens() {
+    let env = TestEnv::new();
+    env.write_repo_root_config("");
+    let file = env.root.join("a-file");
+    fs::write(&file, "x").unwrap();
+    let missing = env.root.join("missing");
+    let cases: [(PathBuf, &str); 3] = [
+        (
+            PathBuf::from("rel/repo"),
+            "`--repo-root` must be an absolute path",
+        ),
+        (missing, "`--repo-root` cannot be used"),
+        (file, "`--repo-root` is not a directory"),
+    ];
+    for (path, want) in cases {
+        let out = env
+            .fl()
+            .args(["hub", "serve", "--listen", "127.0.0.1:0", "--repo-root"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(2), "{path:?}: {stdout}{stderr}");
+        assert!(stderr.contains(want), "{path:?}: {stderr}");
+        assert!(!stdout.contains("listening"), "{path:?}: {stdout}");
+    }
+    // The config value is refused by the loader (absolute) or at startup (a directory).
+    env.write_repo_root_config("repo_root = \"rel/repo\"");
+    let out = env
+        .fl()
+        .args(["hub", "serve", "--listen", "127.0.0.1:0"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`hub.repo_root` must be an absolute path"),
+        "{stderr}"
+    );
+    env.write_repo_root_config(&format!(
+        "repo_root = \"{}\"",
+        env.root.join("gone").display()
+    ));
+    let out = env
+        .fl()
+        .args(["hub", "serve", "--listen", "127.0.0.1:0"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`[hub] repo_root` cannot be used"),
+        "{stderr}"
+    );
+}
+
+/// The body of an unauthenticated `GET path` (the static UI needs no token).
+fn hub_get_text(base: &str, path: &str) -> String {
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = http.get(&format!("{base}{path}")).call().unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET {path}");
+    resp.body_mut().read_to_string().unwrap()
+}
+
+#[test]
+fn the_default_ui_dir_follows_the_repo_root_and_an_explicit_ui_dir_wins() {
+    let env = TestEnv::new();
+    let (repo, other, elsewhere) = (
+        env.root.join("repo"),
+        env.root.join("other-ui"),
+        env.root.join("elsewhere"),
+    );
+    for (dir, marker) in [
+        (repo.join("ui/dist"), "UI-OF-REPO"),
+        (other.clone(), "UI-EXPLICIT"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), format!("<html>{marker}</html>")).unwrap();
+    }
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    // No `ui_dir`: `<repo_root>/ui/dist`, though the process runs elsewhere.
+    env.write_repo_root_config(&format!("repo_root = \"{}\"", repo.display()));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    assert!(hub_get_text(&base, "/").contains("UI-OF-REPO"));
+    drop(_g);
+
+    // An explicit `[hub] ui_dir` still wins.
+    env.write_repo_root_config(&format!(
+        "repo_root = \"{}\"\nui_dir = \"{}\"",
+        repo.display(),
+        other.display()
+    ));
+    let (_g, base) = env.serve_in(&elsewhere, &[]);
+    assert!(hub_get_text(&base, "/").contains("UI-EXPLICIT"));
+}

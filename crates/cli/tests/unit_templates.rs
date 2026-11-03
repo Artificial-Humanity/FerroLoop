@@ -82,6 +82,9 @@ fn the_hub_unit_ui_dir_is_the_flag_the_hub_reads() {
         .unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();
     assert!(help.contains("--ui-dir <UI_DIR>"), "{help}");
+    // the repository a bound hub names is `--repo-root`, which the unit's comment points at
+    assert!(help.contains("--repo-root <REPO_ROOT>"), "{help}");
+    assert!(unit("ferroloop-hub.service").contains("repo_root"));
 }
 
 #[test]

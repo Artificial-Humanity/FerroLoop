@@ -5,8 +5,9 @@
 # directory, which is also its repository root: the views that need a repository (worktrees,
 # worktree diffs, architecture, commands and skills, repo paths) show nothing useful, code
 # search answers empty (it never scans the home directory), and an owner terminal session starts
-# in the home directory. A hub bound to a repository needs a drop-in:
-#   systemctl --user edit ferroloop-hub.service   # [Service] WorkingDirectory=/path/to/repo
+# in the home directory. A hub bound to a repository names it in the fl config:
+#   [hub]
+#   repo_root = "/path/to/repo"     # absolute, an existing directory; --repo-root wins over it
 # NoNewPrivileges is not set: an owner terminal session runs sudo.
 # This unit holds no secret; the owner token comes from [hub] owner_token_file.
 [Unit]
