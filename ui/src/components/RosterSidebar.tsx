@@ -356,6 +356,7 @@ export interface RosterSidebarProps {
 
 export type LeftPanelTab =
   | "roster"
+  | "triage"
   | "terminal"
   | "hub"
   | "gate"
@@ -364,6 +365,7 @@ export type LeftPanelTab =
 
 export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
   { id: "roster", label: "Agent Roster" },
+  { id: "triage", label: "Today & Incidents" },
   { id: "terminal", label: "Terminal" },
   { id: "hub", label: "Hub & Arch" },
   { id: "gate", label: "Vault & Gate" },
@@ -373,6 +375,27 @@ export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
 
 function renderLeftPanelTabIcon(tabId: LeftPanelTab): React.ReactNode {
   switch (tabId) {
+    case "triage":
+      return (
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M8 2.25L14 13H2L8 2.25Z"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinejoin="round"
+          />
+          <line
+            x1="8"
+            y1="6.25"
+            x2="8"
+            y2="9.25"
+            stroke="currentColor"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+          />
+          <circle cx="8" cy="11.15" r="0.75" fill="currentColor" />
+        </svg>
+      );
     case "roster":
       return (
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -939,12 +962,30 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 flexShrink: 0,
               }}
             >
-              <strong
-                data-testid="left-panel-pane-title"
-                style={{ fontSize: "14px", color: "var(--text-primary)" }}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                }}
               >
-                Agent Roster
-              </strong>
+                <strong
+                  data-testid="left-panel-pane-title"
+                  style={{ fontSize: "14px", color: "var(--text-primary)" }}
+                >
+                  Agent Roster
+                </strong>
+                <button
+                  type="button"
+                  className="fd-btn"
+                  data-testid="roster-triage-toggle-btn"
+                  onClick={() => handleSelectLeftTab("triage")}
+                  style={{ padding: "2px 8px", fontSize: "11px" }}
+                >
+                  Today &amp; Incidents
+                </button>
+              </div>
               <input
                 type="search"
                 className="fd-input"

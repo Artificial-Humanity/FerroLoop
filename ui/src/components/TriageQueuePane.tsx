@@ -1,0 +1,921 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import type { HubApiClient } from "../api/client";
+import {
+  resolveLivenessState,
+  type AgentLivenessItem,
+  type CockpitTab,
+  type DiscoveredSessionSummary,
+  type ProjectRecordItem,
+  type PullRequestItem,
+  type WatchAgentHealth,
+  type WatchAlert,
+  type WireInboxItem,
+  type WorkflowRun,
+} from "../types/api";
+import type { LeftPanelTab } from "./RosterSidebar";
+
+export type TriageIncidentCategory =
+  | "heartbeat"
+  | "review"
+  | "budget"
+  | "wire";
+
+export type TriageIncidentSeverity = "critical" | "warning" | "info";
+
+export type TriageCategoryFilter = "all" | TriageIncidentCategory;
+
+export interface TriageNavigationTarget {
+  kind: "session" | "record" | "pr" | "wire" | "watch" | "workflow";
+  agentName?: string | null;
+  sessionId?: string | null;
+  project?: string | null;
+  recordId?: string | null;
+  prNumber?: number | null;
+  wireMessageId?: string | null;
+  workflowRunId?: string | null;
+  tab?: CockpitTab;
+  leftPanelTab?: LeftPanelTab;
+}
+
+export interface TriageIncident {
+  id: string;
+  category: TriageIncidentCategory;
+  severity: TriageIncidentSeverity;
+  title: string;
+  subtitle: string;
+  project?: string | null;
+  agentName?: string | null;
+  badgeLabel: string;
+  actionLabel: string;
+  target: TriageNavigationTarget;
+}
+
+export interface TriageAggregateInput {
+  liveness?: AgentLivenessItem[];
+  sessions?: DiscoveredSessionSummary[];
+  workflowRuns?: WorkflowRun[];
+  prs?: PullRequestItem[];
+  records?: ProjectRecordItem[];
+  watchAlerts?: WatchAlert[];
+  watchAgentHealth?: WatchAgentHealth[];
+  wireMessages?: WireInboxItem[];
+}
+
+export interface TriageQueuePaneProps extends TriageAggregateInput {
+  apiClient?: HubApiClient;
+  loading?: boolean;
+  onRefresh?: () => void;
+  onNavigate?: (target: TriageNavigationTarget, incident: TriageIncident) => void;
+  onSelectAgent?: (agentName: string) => void;
+  onSelectSession?: (sessionId: string) => void;
+  onSelectTab?: (tab: CockpitTab) => void;
+  onSelectLeftPanelTab?: (tab: LeftPanelTab) => void;
+  onAckWireMessage?: (messageId: string) => Promise<unknown> | void;
+}
+
+const SEVERITY_RANK: Record<TriageIncidentSeverity, number> = {
+  critical: 0,
+  warning: 1,
+  info: 2,
+};
+
+function isWireItemUnacked(item: WireInboxItem): boolean {
+  if (item.receipt && item.receipt.status === "acked") {
+    return false;
+  }
+  if (
+    Array.isArray(item.receipts) &&
+    item.receipts.length > 0 &&
+    item.receipts.every((r) => r.status === "acked")
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function aggregateTriageIncidents(
+  input: TriageAggregateInput,
+): TriageIncident[] {
+  const incidents: TriageIncident[] = [];
+  const seenHeartbeatAgents = new Set<string>();
+
+  // 1. Failed or timed-out attempts / unverifiable or stale agent heartbeats
+  for (const item of input.liveness ?? []) {
+    const agentKey = (item.agent ?? "").trim().toLowerCase();
+    if (!agentKey) continue;
+    const rawState = (
+      item.verdict?.state ??
+      item.verdict?.status ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+    const resolved = resolveLivenessState(item.verdict, item.has_route);
+    const isUnverifiableOrTimedOut =
+      rawState === "unverifiable" ||
+      rawState === "timed_out" ||
+      rawState === "timeout" ||
+      rawState === "failed" ||
+      rawState === "crashed";
+    const isStale = resolved === "stale" || rawState === "stale";
+    const isDeadWithRoute = resolved === "dead" && Boolean(item.has_route);
+
+    if (isUnverifiableOrTimedOut || isStale || isDeadWithRoute) {
+      seenHeartbeatAgents.add(agentKey);
+      const severity: TriageIncidentSeverity =
+        isUnverifiableOrTimedOut || isDeadWithRoute ? "critical" : "warning";
+      const reason =
+        item.verdict?.reason ||
+        (isDeadWithRoute
+          ? "Session route is unresponsive (dead heartbeat)"
+          : isUnverifiableOrTimedOut
+            ? `Heartbeat ${rawState}`
+            : "Agent heartbeat is stale");
+      incidents.push({
+        id: `heartbeat-agent-${agentKey}`,
+        category: "heartbeat",
+        severity,
+        title: `${item.agent} — ${isStale ? "Stale Heartbeat" : "Unresponsive / Failed Session"}`,
+        subtitle: `${reason} (${item.project || "Workspace"})`,
+        project: item.project || null,
+        agentName: item.agent,
+        badgeLabel: isStale ? "stale" : rawState || "offline",
+        actionLabel: "Open Session",
+        target: {
+          kind: "session",
+          agentName: item.agent,
+          project: item.project || null,
+          tab: "chat",
+        },
+      });
+    }
+  }
+
+  for (const health of input.watchAgentHealth ?? []) {
+    const agentKey = (health.agent ?? "").trim().toLowerCase();
+    if (!agentKey || seenHeartbeatAgents.has(agentKey)) continue;
+    if (
+      health.liveness === "stale" ||
+      (health.active &&
+        (health.liveness === "dead" ||
+          health.liveness === "exited" ||
+          health.liveness === "missing"))
+    ) {
+      seenHeartbeatAgents.add(agentKey);
+      const severity: TriageIncidentSeverity =
+        health.liveness === "stale" ? "warning" : "critical";
+      incidents.push({
+        id: `heartbeat-watch-${agentKey}`,
+        category: "heartbeat",
+        severity,
+        title: `${health.agent} — Heartbeat ${health.liveness.toUpperCase()}`,
+        subtitle:
+          health.verdict?.reason ||
+          `Active agent session reported ${health.liveness} heartbeat`,
+        project: health.project ?? null,
+        agentName: health.agent,
+        badgeLabel: health.liveness,
+        actionLabel: "Open Session",
+        target: {
+          kind: "session",
+          agentName: health.agent,
+          sessionId: health.hosted_session?.session_id ?? null,
+          project: health.project ?? null,
+          tab: "chat",
+        },
+      });
+    }
+  }
+
+  for (const sess of input.sessions ?? []) {
+    const statusLower = (sess.status ?? "").trim().toLowerCase();
+    if (
+      statusLower === "failed" ||
+      statusLower === "error" ||
+      statusLower === "timed_out" ||
+      statusLower === "crashed"
+    ) {
+      const personaKey = (sess.persona ?? "").trim().toLowerCase();
+      if (personaKey && seenHeartbeatAgents.has(personaKey)) continue;
+      if (personaKey) seenHeartbeatAgents.add(personaKey);
+      incidents.push({
+        id: `attempt-session-${sess.id}`,
+        category: "heartbeat",
+        severity: "critical",
+        title: `Session ${sess.persona || sess.id} — ${statusLower.toUpperCase()}`,
+        subtitle: `Session ${sess.id} reported ${statusLower} status`,
+        agentName: sess.persona ?? null,
+        badgeLabel: statusLower,
+        actionLabel: "Inspect Session",
+        target: {
+          kind: "session",
+          sessionId: sess.id,
+          agentName: sess.persona ?? null,
+          tab: "chat",
+        },
+      });
+    }
+  }
+
+  for (const run of input.workflowRuns ?? []) {
+    const statusLower = (run.status ?? "").trim().toLowerCase();
+    const failedSteps = Object.values(run.steps ?? {}).filter(
+      (s) => s.last_outcome === "fail" || s.state === "failed",
+    );
+    if (statusLower === "failed" || failedSteps.length > 0) {
+      const assignedAgent = failedSteps[0]?.assigned_agent ?? null;
+      incidents.push({
+        id: `attempt-workflow-${run.id}`,
+        category: "heartbeat",
+        severity: "critical",
+        title: `Workflow Failed: ${run.title || run.workflow_id}`,
+        subtitle:
+          failedSteps.length > 0
+            ? `Step ${failedSteps[0].step_id} failed after ${failedSteps[0].attempt_count} attempt(s)`
+            : `Workflow run ${run.id} failed in ${run.project}`,
+        project: run.project,
+        agentName: assignedAgent,
+        badgeLabel: "failed attempt",
+        actionLabel: "Open Workflow",
+        target: {
+          kind: "workflow",
+          workflowRunId: run.id,
+          project: run.project,
+          agentName: assignedAgent,
+          tab: "hub",
+        },
+      });
+    } else if (statusLower === "needs_human" || statusLower === "awaiting_gate") {
+      const stepList = Object.values(run.steps ?? {});
+      const gateStep = stepList.find(
+        (s) => s.last_outcome === "needs_human" || Boolean(s.needs_human_reason),
+      );
+      incidents.push({
+        id: `review-workflow-${run.id}`,
+        category: "review",
+        severity: "warning",
+        title: `Gate Approval Needed: ${run.title || run.workflow_id}`,
+        subtitle:
+          gateStep?.needs_human_reason ||
+          `Active step ${run.active_steps[0] ?? "gate"} awaiting operator sign-off`,
+        project: run.project,
+        agentName: gateStep?.assigned_agent ?? null,
+        badgeLabel: "needs sign-off",
+        actionLabel: "Review Gate",
+        target: {
+          kind: "workflow",
+          workflowRunId: run.id,
+          project: run.project,
+          agentName: gateStep?.assigned_agent ?? null,
+          tab: "hub",
+        },
+      });
+    }
+  }
+
+  // 2. Pending pull-request / review requests or blocked tasks
+  for (const pr of input.prs ?? []) {
+    const statusLower = (pr.status ?? "open").trim().toLowerCase();
+    if (statusLower === "merged" || statusLower === "closed") continue;
+    const reviews = pr.reviews ?? [];
+    const hasChangesRequested = reviews.some((r) =>
+      r.state.toUpperCase().includes("CHANGES_REQUESTED"),
+    );
+    const hasApproval = reviews.some((r) =>
+      r.state.toUpperCase().includes("APPROV"),
+    );
+
+    if (hasChangesRequested || !hasApproval) {
+      incidents.push({
+        id: `review-pr-${pr.project || "repo"}-${pr.number}`,
+        category: "review",
+        severity: hasChangesRequested ? "critical" : "warning",
+        title: `PR #${pr.number}: ${pr.title || "Pull Request"}`,
+        subtitle: hasChangesRequested
+          ? `Changes requested on ${pr.project || "repository"} (${pr.author || "author"})`
+          : `Pending review approval on ${pr.project || "repository"} (${pr.author || "author"})`,
+        project: pr.project ?? null,
+        agentName: pr.author ?? null,
+        badgeLabel: hasChangesRequested ? "changes_requested" : "review_required",
+        actionLabel: "Open PR",
+        target: {
+          kind: "pr",
+          prNumber: pr.number,
+          project: pr.project ?? null,
+          agentName: pr.author ?? null,
+          tab: "git",
+        },
+      });
+    }
+  }
+
+  for (const rec of input.records ?? []) {
+    if (rec.state === "done") continue;
+    const openFindings = rec.findings_open ?? 0;
+    const isBlockedTitle = /\bblocked\b/i.test(rec.title);
+    if (openFindings > 0 || isBlockedTitle) {
+      incidents.push({
+        id: `review-record-${rec.id}`,
+        category: "review",
+        severity: openFindings > 0 ? "warning" : "info",
+        title: `${rec.display_id}: ${rec.title}`,
+        subtitle:
+          openFindings > 0
+            ? `${openFindings} open finding(s) in ${rec.project}`
+            : `Blocked record in ${rec.project}`,
+        project: rec.project,
+        badgeLabel:
+          openFindings > 0 ? `${openFindings} findings` : "blocked",
+        actionLabel: "Open Record",
+        target: {
+          kind: "record",
+          recordId: rec.id,
+          project: rec.project,
+          tab: "board",
+        },
+      });
+    }
+  }
+
+  // 3. Budget threshold alerts from FerroWatch
+  for (const alert of input.watchAlerts ?? []) {
+    const entityObj = alert.entity as unknown as Record<string, unknown> | undefined;
+    const entityAgent =
+      typeof entityObj?.agent === "string"
+        ? entityObj.agent
+        : typeof entityObj?.persona === "string"
+          ? entityObj.persona
+          : null;
+    const entityProject =
+      typeof entityObj?.project === "string" ? entityObj.project : null;
+    const severity: TriageIncidentSeverity =
+      alert.severity === "critical"
+        ? "critical"
+        : alert.severity === "warning"
+          ? "warning"
+          : "info";
+
+    incidents.push({
+      id: `budget-alert-${alert.id}`,
+      category: "budget",
+      severity,
+      title: `FerroWatch: ${alert.message}`,
+      subtitle: alert.remediation || `Rule: ${alert.rule}`,
+      project: entityProject,
+      agentName: entityAgent,
+      badgeLabel: alert.rule.replace(/_/g, " "),
+      actionLabel: "Open FerroWatch",
+      target: {
+        kind: "watch",
+        agentName: entityAgent,
+        project: entityProject,
+        leftPanelTab: "watch",
+        tab: "state",
+      },
+    });
+  }
+
+  // 4. Unread mail/urgent or operator-targeted wire messages
+  for (const item of input.wireMessages ?? []) {
+    if (!isWireItemUnacked(item)) continue;
+    const msg = item.message;
+    const urgencyLower = (msg.urgency ?? "").trim().toLowerCase();
+    const kindLower = (msg.kind ?? "").trim().toLowerCase();
+    const toLower = (msg.to ?? "").trim().toLowerCase();
+    const combinedText = `${msg.subject ?? ""} ${msg.body ?? ""}`;
+
+    const isUrgent =
+      urgencyLower === "urgent" ||
+      kindLower.includes("urgent") ||
+      kindLower === "approval_request";
+    const isOperatorTargeted =
+      toLower === "owner" ||
+      toLower === "operator" ||
+      toLower === "lmcfarlin" ||
+      toLower === "all";
+    const hasBlockerKeyword =
+      /\b(\[blocked\]|blocker:|urgent:|action required)\b/i.test(combinedText);
+
+    if (isUrgent || isOperatorTargeted || hasBlockerKeyword) {
+      const targetAgent =
+        toLower &&
+        toLower !== "owner" &&
+        toLower !== "operator" &&
+        toLower !== "lmcfarlin" &&
+        toLower !== "all"
+          ? msg.to
+          : msg.sender_name || null;
+
+      incidents.push({
+        id: `wire-msg-${msg.id}`,
+        category: "wire",
+        severity: isUrgent || hasBlockerKeyword ? "critical" : "warning",
+        title: `Wire [${msg.sender_name} → ${msg.to}]: ${msg.subject || "(no subject)"}`,
+        subtitle:
+          msg.body.length > 120 ? `${msg.body.slice(0, 117)}...` : msg.body,
+        agentName: targetAgent,
+        badgeLabel: isUrgent ? "mail/urgent" : "operator wire",
+        actionLabel: "Open Wire Mail",
+        target: {
+          kind: "wire",
+          wireMessageId: msg.id,
+          agentName: targetAgent,
+          tab: "mail",
+        },
+      });
+    }
+  }
+
+  incidents.sort((a, b) => {
+    const rankDiff = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+    if (rankDiff !== 0) return rankDiff;
+    return a.id.localeCompare(b.id);
+  });
+
+  return incidents;
+}
+
+function getSeverityStyle(severity: TriageIncidentSeverity): React.CSSProperties {
+  if (severity === "critical") {
+    return {
+      backgroundColor: "rgba(239, 68, 68, 0.16)",
+      color: "#F87171",
+      borderColor: "rgba(239, 68, 68, 0.45)",
+      fontWeight: 700,
+    };
+  }
+  if (severity === "warning") {
+    return {
+      backgroundColor: "rgba(245, 158, 11, 0.16)",
+      color: "#FBBF24",
+      borderColor: "rgba(245, 158, 11, 0.4)",
+      fontWeight: 700,
+    };
+  }
+  return {
+    backgroundColor: "rgba(56, 189, 248, 0.14)",
+    color: "#38BDF8",
+    borderColor: "rgba(56, 189, 248, 0.35)",
+    fontWeight: 700,
+  };
+}
+
+const CATEGORY_LABELS: Record<TriageCategoryFilter, string> = {
+  all: "All",
+  heartbeat: "Heartbeats & Attempts",
+  review: "PRs & Blocked",
+  budget: "Budget & Watch",
+  wire: "Urgent Wire",
+};
+
+export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
+  liveness,
+  sessions,
+  workflowRuns,
+  prs,
+  records,
+  watchAlerts,
+  watchAgentHealth,
+  wireMessages,
+  apiClient,
+  loading = false,
+  onRefresh,
+  onNavigate,
+  onSelectAgent,
+  onSelectSession,
+  onSelectTab,
+  onSelectLeftPanelTab,
+  onAckWireMessage,
+}) => {
+  const [categoryFilter, setCategoryFilter] =
+    useState<TriageCategoryFilter>("all");
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set());
+  const [fetchedWatchAlerts, setFetchedWatchAlerts] = useState<WatchAlert[]>([]);
+  const [fetchedWatchHealth, setFetchedWatchHealth] = useState<
+    WatchAgentHealth[]
+  >([]);
+  const [fetchedRecords, setFetchedRecords] = useState<ProjectRecordItem[]>([]);
+
+  const loadSupplementalData = useCallback(async () => {
+    if (!apiClient) return;
+    try {
+      const promises: Array<Promise<void>> = [];
+      if (
+        watchAlerts === undefined &&
+        typeof apiClient.getWatchSummary === "function"
+      ) {
+        promises.push(
+          apiClient
+            .getWatchSummary()
+            .then((summary) => {
+              setFetchedWatchAlerts(summary?.alerts ?? []);
+              setFetchedWatchHealth(summary?.health?.agents ?? []);
+            })
+            .catch(() => {}),
+        );
+      }
+      if (records === undefined && typeof apiClient.listRecords === "function") {
+        promises.push(
+          apiClient
+            .listRecords("ferroloop")
+            .then((res) => {
+              setFetchedRecords(res?.records ?? []);
+            })
+            .catch(() => {}),
+        );
+      }
+      await Promise.all(promises);
+    } catch {
+      // Ignore supplemental fetch errors
+    }
+  }, [apiClient, watchAlerts, records]);
+
+  useEffect(() => {
+    void loadSupplementalData();
+  }, [loadSupplementalData]);
+
+  const allIncidents = useMemo(
+    () =>
+      aggregateTriageIncidents({
+        liveness,
+        sessions,
+        workflowRuns,
+        prs,
+        records: records ?? fetchedRecords,
+        watchAlerts: watchAlerts ?? fetchedWatchAlerts,
+        watchAgentHealth: watchAgentHealth ?? fetchedWatchHealth,
+        wireMessages,
+      }),
+    [
+      liveness,
+      sessions,
+      workflowRuns,
+      prs,
+      records,
+      fetchedRecords,
+      watchAlerts,
+      fetchedWatchAlerts,
+      watchAgentHealth,
+      fetchedWatchHealth,
+      wireMessages,
+    ],
+  );
+
+  const activeIncidents = useMemo(
+    () => allIncidents.filter((item) => !dismissedIds.has(item.id)),
+    [allIncidents, dismissedIds],
+  );
+
+  const filteredIncidents = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return activeIncidents.filter((item) => {
+      if (categoryFilter !== "all" && item.category !== categoryFilter) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        item.title.toLowerCase().includes(q) ||
+        item.subtitle.toLowerCase().includes(q) ||
+        (item.project ?? "").toLowerCase().includes(q) ||
+        (item.agentName ?? "").toLowerCase().includes(q) ||
+        item.badgeLabel.toLowerCase().includes(q)
+      );
+    });
+  }, [activeIncidents, categoryFilter, searchQuery]);
+
+  const criticalCount = useMemo(
+    () => activeIncidents.filter((i) => i.severity === "critical").length,
+    [activeIncidents],
+  );
+
+  const countByCategory = useMemo(() => {
+    const counts: Record<TriageCategoryFilter, number> = {
+      all: activeIncidents.length,
+      heartbeat: 0,
+      review: 0,
+      budget: 0,
+      wire: 0,
+    };
+    for (const item of activeIncidents) {
+      counts[item.category] += 1;
+    }
+    return counts;
+  }, [activeIncidents]);
+
+  const handleIncidentClick = (incident: TriageIncident) => {
+    const { target } = incident;
+    if (onNavigate) {
+      onNavigate(target, incident);
+    }
+    if (target.agentName && onSelectAgent) {
+      onSelectAgent(target.agentName);
+    }
+    if (target.sessionId && onSelectSession) {
+      onSelectSession(target.sessionId);
+    }
+    if (target.leftPanelTab && onSelectLeftPanelTab) {
+      onSelectLeftPanelTab(target.leftPanelTab);
+    } else if (target.tab && onSelectTab) {
+      onSelectTab(target.tab);
+    }
+  };
+
+  return (
+    <section
+      className="fd-pane"
+      data-testid="triage-queue-pane"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        height: "100%",
+        minWidth: 0,
+      }}
+    >
+      {/* Header */}
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+          padding: "8px 12px",
+          borderBottom: "1px solid var(--border-subtle)",
+          backgroundColor: "var(--bg-surface)",
+          flexShrink: 0,
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <strong
+              data-testid="triage-pane-title"
+              style={{ fontSize: "14px", color: "var(--text-primary)" }}
+            >
+              Today &amp; Incidents
+            </strong>
+            <span className="fd-badge" data-testid="triage-total-badge">
+              {activeIncidents.length}{" "}
+              {activeIncidents.length === 1 ? "incident" : "incidents"}
+            </span>
+            {criticalCount > 0 && (
+              <span
+                className="fd-badge"
+                data-testid="triage-critical-badge"
+                style={getSeverityStyle("critical")}
+              >
+                {criticalCount} critical
+              </span>
+            )}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            {dismissedIds.size > 0 && (
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="triage-restore-dismissed-btn"
+                onClick={() => setDismissedIds(new Set())}
+                style={{ padding: "3px 8px", fontSize: "11px" }}
+              >
+                Restore ({dismissedIds.size})
+              </button>
+            )}
+            <button
+              type="button"
+              className="fd-btn"
+              data-testid="triage-refresh-btn"
+              disabled={loading}
+              onClick={() => {
+                onRefresh?.();
+                void loadSupplementalData();
+              }}
+              style={{ padding: "3px 8px", fontSize: "11px" }}
+            >
+              {loading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </div>
+
+        {/* Category Filter Pills */}
+        <div
+          role="tablist"
+          aria-label="Incident category filter"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            flexWrap: "wrap",
+          }}
+        >
+          {(
+            ["all", "heartbeat", "review", "budget", "wire"] as TriageCategoryFilter[]
+          ).map((cat) => {
+            const isActive = categoryFilter === cat;
+            return (
+              <button
+                key={cat}
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                data-testid={`triage-filter-${cat}`}
+                className={`fd-btn ${isActive ? "fd-btn-active" : ""}`}
+                onClick={() => setCategoryFilter(cat)}
+                style={{ padding: "3px 8px", fontSize: "11px" }}
+              >
+                {CATEGORY_LABELS[cat]} ({countByCategory[cat]})
+              </button>
+            );
+          })}
+        </div>
+
+        <input
+          type="search"
+          aria-label="Search incidents"
+          data-testid="triage-search-input"
+          className="fd-input"
+          placeholder="Filter incidents by agent, project, rule, PR..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          style={{ width: "100%", fontSize: "12px" }}
+        />
+      </div>
+
+      {/* Incident List */}
+      <div
+        className="fd-scroll"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+          padding: "10px 12px",
+          flex: 1,
+        }}
+      >
+        {filteredIncidents.length === 0 ? (
+          <div
+            className="fd-card"
+            data-testid="triage-empty-state"
+            style={{
+              textAlign: "center",
+              padding: "24px 12px",
+              color: "var(--text-muted)",
+              fontSize: "12px",
+            }}
+          >
+            All clear — zero active incidents or blocked items across the fleet.
+          </div>
+        ) : (
+          filteredIncidents.map((incident) => (
+            <div
+              key={incident.id}
+              role="button"
+              tabIndex={0}
+              data-testid={`triage-incident-${incident.id}`}
+              data-category={incident.category}
+              data-severity={incident.severity}
+              onClick={() => handleIncidentClick(incident)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  handleIncidentClick(incident);
+                }
+              }}
+              className="fd-card"
+              style={{
+                padding: "10px 12px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                cursor: "pointer",
+                borderLeft:
+                  incident.severity === "critical"
+                    ? "3px solid #EF4444"
+                    : incident.severity === "warning"
+                      ? "3px solid #F59E0B"
+                      : "3px solid #38BDF8",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    flexWrap: "wrap",
+                    minWidth: 0,
+                  }}
+                >
+                  <span
+                    className="fd-badge"
+                    style={{
+                      ...getSeverityStyle(incident.severity),
+                      fontSize: "10px",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {incident.severity}
+                  </span>
+                  <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                    {incident.badgeLabel}
+                  </span>
+                  {incident.project && (
+                    <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                      {incident.project}
+                    </span>
+                  )}
+                  {incident.agentName && (
+                    <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                      @{incident.agentName}
+                    </span>
+                  )}
+                </div>
+
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "4px" }}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {incident.target.kind === "wire" &&
+                    incident.target.wireMessageId &&
+                    onAckWireMessage && (
+                      <button
+                        type="button"
+                        className="fd-btn"
+                        data-testid={`triage-incident-ack-${incident.id}`}
+                        onClick={() =>
+                          void onAckWireMessage(incident.target.wireMessageId!)
+                        }
+                        style={{ padding: "2px 8px", fontSize: "11px" }}
+                      >
+                        Ack
+                      </button>
+                    )}
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid={`triage-incident-action-${incident.id}`}
+                    onClick={() => handleIncidentClick(incident)}
+                    style={{ padding: "2px 8px", fontSize: "11px" }}
+                  >
+                    {incident.actionLabel}
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    aria-label={`Dismiss ${incident.title}`}
+                    data-testid={`triage-incident-dismiss-${incident.id}`}
+                    onClick={() =>
+                      setDismissedIds((prev) => {
+                        const next = new Set(prev);
+                        next.add(incident.id);
+                        return next;
+                      })
+                    }
+                    style={{ padding: "2px 6px", fontSize: "11px" }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  fontWeight: 600,
+                  fontSize: "12.5px",
+                  color: "var(--text-primary)",
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {incident.title}
+              </div>
+
+              <div
+                style={{
+                  fontSize: "11.5px",
+                  color: "var(--text-secondary)",
+                  overflowWrap: "anywhere",
+                }}
+              >
+                {incident.subtitle}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </section>
+  );
+};

@@ -34,6 +34,7 @@ import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
 import { FerroWatchPane } from "./components/FerroWatchPane";
+import { TriageQueuePane } from "./components/TriageQueuePane";
 import { WireMailPane } from "./components/WireMailPane";
 import {
   setActiveTimeZone,
@@ -825,7 +826,9 @@ export const App: React.FC<AppProps> = ({
           ? "chat"
           : leftPanelTab === "watch"
             ? "state"
-            : leftPanelTab,
+            : leftPanelTab === "triage"
+              ? "hub"
+              : leftPanelTab,
       );
     } else {
       setSecondaryTab(tab);
@@ -849,6 +852,8 @@ export const App: React.FC<AppProps> = ({
         );
       } else if (tab === "watch") {
         setActiveTab("state");
+      } else if (tab === "triage") {
+        setActiveTab("hub");
       } else {
         setActiveTab(tab);
       }
@@ -1968,6 +1973,56 @@ export const App: React.FC<AppProps> = ({
 
   const renderSecondaryPane = (paneTab: CockpitTab | LeftPanelTab) => {
     switch (paneTab) {
+      case "triage":
+        return (
+          <TriageQueuePane
+            liveness={liveness}
+            sessions={mergedRoutes}
+            workflowRuns={workflowRuns}
+            prs={prs}
+            wireMessages={wireMessages}
+            apiClient={apiClient}
+            loading={loading}
+            onRefresh={() => void loadAllInitialState()}
+            onSelectAgent={(nameKey) => {
+              const nextKey = nameKey.trim().toLowerCase();
+              if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+                selectedAgentNameRef.current = nameKey;
+                selectedSessionIdRef.current = null;
+                setTranscriptTurns(
+                  preserveOptimisticTurn(
+                    backgroundTranscriptsRef.current[nextKey] ?? [],
+                    optimisticPromptRef.current,
+                    Date.now(),
+                    nextKey,
+                  ),
+                );
+                setSessionQueue([]);
+                setIsSessionBusy(false);
+                setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
+                setSessionQuotaUsage(null);
+              }
+              setSelectedAgentName(nameKey);
+              setSelectedSessionId(null);
+              void refreshSessionsAndTranscript();
+            }}
+            onSelectSession={(sessionId) => {
+              if (sessionId !== selectedSessionIdRef.current) {
+                selectedSessionIdRef.current = sessionId;
+                setTranscriptTurns([]);
+                setSessionQueue([]);
+                setIsSessionBusy(false);
+                setSessionContextUsage(null);
+                setSessionQuotaUsage(null);
+              }
+              setSelectedSessionId(sessionId);
+              void refreshSessionsAndTranscript(sessionId);
+            }}
+            onSelectTab={(tab) => handleSelectTab(tab)}
+            onSelectLeftPanelTab={(tab) => handleSelectLeftPanelTab(tab)}
+            onAckWireMessage={(id) => handleAckWireMessage(id)}
+          />
+        );
       case "watch":
         return (
           <FerroWatchPane
@@ -2277,7 +2332,9 @@ export const App: React.FC<AppProps> = ({
             ? "chat"
             : leftPanelTab === "watch"
               ? "state"
-              : leftPanelTab,
+              : leftPanelTab === "triage"
+                ? "hub"
+                : leftPanelTab,
       );
       if (next) {
         setMobileRosterOpen(false);
@@ -2296,7 +2353,9 @@ export const App: React.FC<AppProps> = ({
             ? "chat"
             : leftPanelTab === "watch"
               ? "state"
-              : leftPanelTab,
+              : leftPanelTab === "triage"
+                ? "hub"
+                : leftPanelTab,
         );
       }
       return next;
