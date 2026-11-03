@@ -45,6 +45,9 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // A clean release clears the record, so a pid still in the file after a run means the
+        // holder died without releasing.
+        let _ = self.file.set_len(0);
         // SAFETY: the descriptor is open and owned by `self.file`.
         unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
@@ -192,8 +195,14 @@ mod tests {
             other => panic!("{other}"),
         }
         drop(first);
+        assert_eq!(
+            fs::read_to_string(&p).unwrap(),
+            "",
+            "a clean release clears the pid"
+        );
         let again = acquire(&p, Duration::ZERO, || Ok(())).unwrap();
         assert!(!again.created, "the file stays between installs");
+        assert_eq!(again.stale_pid, None, "a finished run is not a stale lock");
     }
 
     #[test]
