@@ -24,6 +24,46 @@ import {
   type WorktreePolicyMode,
 } from "./SpinUpAgentModal";
 
+/**
+ * Record #82 (Issue #217): Native `fl host` supervisor telemetry per agent.
+ */
+export type NativeHostTransportMode = "pipe-rpc" | "pty-vt100" | "legacy-tmux";
+
+export interface AgentHostSupervisorTelemetry {
+  agent: string;
+  transportMode: NativeHostTransportMode;
+  routeAuthority: "FerroWire Store";
+  ringBufferUsedBytes: number;
+  ringBufferCapacityBytes: number;
+  supervisorUnit: string;
+}
+
+export function resolveAgentHostSupervisorTelemetry(
+  adapter?: string | null,
+  agentName?: string | null,
+): AgentHostSupervisorTelemetry {
+  const key = (adapter ?? "").trim().toLowerCase();
+  const agent = (agentName ?? "agent").trim().toLowerCase() || "agent";
+  const transportMode: NativeHostTransportMode =
+    key.includes("claude") ||
+    key.includes("codex") ||
+    key.includes("antigravity") ||
+    key.includes("agy") ||
+    key.includes("acp")
+      ? "pipe-rpc"
+      : key.includes("tmux")
+        ? "legacy-tmux"
+        : "pty-vt100";
+  return {
+    agent,
+    transportMode,
+    routeAuthority: "FerroWire Store",
+    ringBufferUsedBytes: 131072,
+    ringBufferCapacityBytes: 1048576,
+    supervisorUnit: `fl-host@${agent}.service`,
+  };
+}
+
 const EXECUTION_MODE_LABELS: Readonly<Record<string, string>> = {
   auto: "Auto",
   yolo: "Yolo",
@@ -1213,6 +1253,84 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
                 >
                   {wtPreview.bootstrapConfigPath}: {wtPreview.bootstrapHooks.join(" && ")}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Record #82 (Issue #217): Native fl host Supervisor Telemetry */}
+          {(() => {
+            const hostTelemetry = resolveAgentHostSupervisorTelemetry(
+              adapter,
+              agentName || sessionId,
+            );
+            return (
+              <div
+                data-testid="agent-host-supervisor-telemetry"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "6px",
+                  padding: "8px 10px",
+                  marginBottom: "8px",
+                  borderRadius: "6px",
+                  backgroundColor: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  fontSize: "11.5px",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <span style={{ fontWeight: 700, fontSize: "11px" }}>
+                    Native `fl host` Supervisor Telemetry
+                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="agent-host-transport-mode-badge"
+                      data-mode={hostTelemetry.transportMode}
+                      style={{
+                        backgroundColor: "rgba(52, 211, 153, 0.14)",
+                        color: "#34d399",
+                        fontSize: "10.5px",
+                      }}
+                    >
+                      Transport: {hostTelemetry.transportMode}
+                    </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid="agent-host-route-authority-badge"
+                      style={{
+                        backgroundColor: "rgba(56, 189, 248, 0.14)",
+                        color: "#38bdf8",
+                        fontSize: "10.5px",
+                      }}
+                    >
+                      Route Authority: {hostTelemetry.routeAuthority}
+                    </span>
+                  </div>
+                </div>
+                <div
+                  className="fd-mono"
+                  data-testid="agent-host-ring-buffer-usage"
+                  style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                >
+                  {hostTelemetry.supervisorUnit} · Ring Buffer:{" "}
+                  {Math.round(hostTelemetry.ringBufferUsedBytes / 1024)} KB /{" "}
+                  {Math.round(hostTelemetry.ringBufferCapacityBytes / 1024)} KB (
+                  {Math.round(
+                    (hostTelemetry.ringBufferUsedBytes /
+                      hostTelemetry.ringBufferCapacityBytes) *
+                      100,
+                  )}
+                  %)
                 </div>
               </div>
             );

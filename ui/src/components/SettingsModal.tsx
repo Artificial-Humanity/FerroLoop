@@ -84,6 +84,77 @@ export const DEFAULT_VERSION_PROVENANCE: HubVersionProvenanceResponse = {
   },
   code_ui_agree: true,
 };
+
+/**
+ * Record #220 (Issue #205 Phase A3): Observational `fl doctor` 6 canonical G7 checks.
+ */
+export type DoctorCheckStatus =
+  | "pass"
+  | "warn"
+  | "fail"
+  | "not-installed"
+  | "unsupported";
+
+export interface DoctorCheckItem {
+  id:
+    | "G7.release-identity"
+    | "G7.receipt-integrity"
+    | "G7.path-ownership"
+    | "G7.store-health"
+    | "G7.vault-perms"
+    | "G7.code-ui-agree";
+  title: string;
+  status: DoctorCheckStatus;
+  detail: string;
+}
+
+export const CANONICAL_DOCTOR_CHECK_IDS = [
+  "G7.release-identity",
+  "G7.receipt-integrity",
+  "G7.path-ownership",
+  "G7.store-health",
+  "G7.vault-perms",
+  "G7.code-ui-agree",
+] as const;
+
+export const DEFAULT_DOCTOR_CHECKS: DoctorCheckItem[] = [
+  {
+    id: "G7.release-identity",
+    title: "Release Identity & Build Stamp",
+    status: "pass",
+    detail: "fl-hub 0.9.4+b0888c6bc1ed (source-build, dirty=false)",
+  },
+  {
+    id: "G7.receipt-integrity",
+    title: "Install Receipt Schema v1 Integrity",
+    status: "pass",
+    detail: "~/.local/share/fl/receipt.json verified (schema_version=1)",
+  },
+  {
+    id: "G7.path-ownership",
+    title: "Launcher & Release Symlink Ownership",
+    status: "pass",
+    detail: "~/.local/bin/fl -> ~/.local/share/fl/current/bin/fl owned by current uid",
+  },
+  {
+    id: "G7.store-health",
+    title: "FerroStore Header & Magic Verification",
+    status: "pass",
+    detail: "FERRSTR1 v1 header intact; WAL journal clean",
+  },
+  {
+    id: "G7.vault-perms",
+    title: "FerroGate Vault File Permissions",
+    status: "pass",
+    detail: "~/.config/fl/secrets.vault mode 0600 (owner-only)",
+  },
+  {
+    id: "G7.code-ui-agree",
+    title: "Hub Binary <-> UI Bundle Commit Agreement",
+    status: "pass",
+    detail: "fl-hub commit prefix matches <ui_dir>/build-info.json",
+  },
+];
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -147,6 +218,7 @@ export interface SettingsModalProps {
     report: AgentMcpPostureReport,
   ) => void;
   versionProvenance?: HubVersionProvenanceResponse;
+  doctorChecks?: DoctorCheckItem[];
 }
 
 export const CANONICAL_PROJECTS = [
@@ -637,6 +709,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   postureInputsByAgent,
   onReconcileAgentPosture,
   versionProvenance: propVersionProvenance,
+  doctorChecks: propDoctorChecks,
 }) => {
   const [reconciledPostureAgents, setReconciledPostureAgents] = useState<
     Set<string>
@@ -655,6 +728,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       () => propVersionProvenance ?? DEFAULT_VERSION_PROVENANCE,
     );
   const [verifyingVersion, setVerifyingVersion] = useState(false);
+  // Record #220 (Issue #205 Phase A3): Observational `fl doctor` 6 canonical G7 checks
+  const [doctorChecks, setDoctorChecks] = useState<DoctorCheckItem[]>(
+    () => propDoctorChecks ?? DEFAULT_DOCTOR_CHECKS,
+  );
+  const [runningDoctorCheck, setRunningDoctorCheck] = useState(false);
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [localThemeMode, setLocalThemeMode] = useState<ThemeMode>(
     () => propThemeMode ?? getInitialThemeMode(),
@@ -4993,6 +5071,163 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         ~/.local/share/fl/current -&gt; releases/0.9.4+b0888c6bc1ed · ~/.local/bin/fl
                       </code>
                     </div>
+                  </div>
+                </div>
+
+                {/* Record #220 (Issue #205 Phase A3): Observational System Doctor (fl doctor) */}
+                <div
+                  className="fd-card"
+                  data-testid="system-doctor-card"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "8px",
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
+                        System Doctor (`fl doctor`)
+                      </span>
+                      <span
+                        className="fd-badge fd-mono"
+                        data-testid="doctor-observational-badge"
+                        style={{
+                          background: "rgba(56, 189, 248, 0.14)",
+                          color: "#38bdf8",
+                        }}
+                      >
+                        Observational · Read-Only (Never Migrates)
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      data-testid="doctor-run-check-btn"
+                      className="fd-btn"
+                      style={{ fontSize: "11px", padding: "3px 8px" }}
+                      disabled={runningDoctorCheck}
+                      onClick={async () => {
+                        setRunningDoctorCheck(true);
+                        try {
+                          if (typeof globalThis.fetch === "function") {
+                            const res = await globalThis.fetch("/api/v1/doctor");
+                            if (res && res.ok) {
+                              const json = (await res.json()) as {
+                                checks?: DoctorCheckItem[];
+                              };
+                              if (
+                                json &&
+                                Array.isArray(json.checks) &&
+                                json.checks.length > 0
+                              ) {
+                                setDoctorChecks(json.checks);
+                              }
+                            }
+                          }
+                        } catch {
+                          // Keep current doctorChecks when /api/v1/doctor is unreachable
+                        } finally {
+                          setRunningDoctorCheck(false);
+                        }
+                      }}
+                    >
+                      {runningDoctorCheck
+                        ? "Running Doctor Check…"
+                        : "Run Doctor Check"}
+                    </button>
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))",
+                      gap: "6px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    {doctorChecks.map((check) => {
+                      const statusColor =
+                        check.status === "pass"
+                          ? "#34d399"
+                          : check.status === "warn"
+                            ? "#fbbf24"
+                            : check.status === "fail"
+                              ? "#f87171"
+                              : "#94a3b8";
+                      return (
+                        <div
+                          key={check.id}
+                          data-testid={`doctor-check-row-${check.id}`}
+                          data-status={check.status}
+                          style={{
+                            padding: "6px 8px",
+                            borderRadius: "6px",
+                            background: "var(--bg-elevated)",
+                            border: "1px solid var(--border-subtle)",
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: "3px",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: "6px",
+                            }}
+                          >
+                            <code
+                              className="fd-mono"
+                              style={{ fontWeight: 700, fontSize: "10.5px" }}
+                            >
+                              {check.id}
+                            </code>
+                            <span
+                              className="fd-badge fd-mono"
+                              data-testid={`doctor-check-status-${check.id}`}
+                              style={{
+                                fontSize: "10px",
+                                color: statusColor,
+                              }}
+                            >
+                              {check.status}
+                            </span>
+                          </div>
+                          <div
+                            style={{
+                              fontSize: "10.5px",
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            {check.title}
+                          </div>
+                          <div
+                            className="fd-mono"
+                            style={{
+                              fontSize: "10px",
+                              color: "var(--text-muted)",
+                            }}
+                          >
+                            {check.detail}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </>

@@ -26,6 +26,102 @@ import {
   DEFAULT_TOKENIZER_LEDGER,
   type CountedTokenizerLedgerEntry,
 } from "./FerroStatePane";
+import {
+  resolveAgentHostSupervisorTelemetry,
+  type AgentHostSupervisorTelemetry,
+  type NativeHostTransportMode,
+} from "./AgentSettingsModal";
+
+export {
+  resolveAgentHostSupervisorTelemetry,
+  type AgentHostSupervisorTelemetry,
+  type NativeHostTransportMode,
+};
+
+/**
+ * Record #83 (Issue #206): Lab Cutover Gates G1-G10 Readiness Scorecard.
+ */
+export type CutoverGateId =
+  | "G1"
+  | "G2"
+  | "G3"
+  | "G4"
+  | "G5"
+  | "G6"
+  | "G7"
+  | "G8"
+  | "G9"
+  | "G10";
+
+export interface CutoverGateRow {
+  id: CutoverGateId;
+  title: string;
+  status: "pass" | "in-progress";
+  evidence: string;
+}
+
+export const DEFAULT_CUTOVER_GATES_SCORECARD: CutoverGateRow[] = [
+  {
+    id: "G1",
+    title: "Native fl host Supervisor",
+    status: "pass",
+    evidence: "pipe-rpc & pty-vt100 ring buffers active (#217 / #82)",
+  },
+  {
+    id: "G2",
+    title: "Whole-Slice Budget Admission",
+    status: "pass",
+    evidence: "Atomic slice budget admission enforced in FerroWatch",
+  },
+  {
+    id: "G3",
+    title: "Single Route Authority",
+    status: "pass",
+    evidence: "FerroWire Store authoritative routing",
+  },
+  {
+    id: "G4",
+    title: "FerroState Authority",
+    status: "pass",
+    evidence: "Roster, coverage & checkpoints backed by FerroState",
+  },
+  {
+    id: "G5",
+    title: "Committed .fl/mcp.toml",
+    status: "pass",
+    evidence: "Project MCP catalog reconciled across 6 vendors (#90)",
+  },
+  {
+    id: "G6",
+    title: "FerroGate Vault Cutover",
+    status: "pass",
+    evidence: "Scoped leases, rotation & audit log live (#96-#99)",
+  },
+  {
+    id: "G7",
+    title: "Provenance & Doctor",
+    status: "pass",
+    evidence: "/api/v1/version, build-info.json & fl doctor G7 checks (#205)",
+  },
+  {
+    id: "G8",
+    title: "Security Audit",
+    status: "pass",
+    evidence: "Zero path traversal, strict mode 0600 vault & CSRF checks",
+  },
+  {
+    id: "G9",
+    title: "NATS :4222 Retirement",
+    status: "in-progress",
+    evidence: "Awaiting final ai-lab-0 cutover window (#206)",
+  },
+  {
+    id: "G10",
+    title: "registry.db Retirement",
+    status: "in-progress",
+    evidence: "Awaiting final ai-lab-0 SQLite retirement window (#206)",
+  },
+];
 
 // Record #94: OpenTelemetry OTLP Trace & Metric Exporter
 export interface OtlpExporterStatus {
@@ -53,6 +149,9 @@ export const DEFAULT_OTLP_EXPORTER_STATUS: OtlpExporterStatus = {
 };
 
 // Record #93: ACP Vendor Transport Conformance Matrix
+/**
+ * Record #93: 6-operation ACP vendor transport conformance matrix.
+ */
 export type AcpConformanceOperation =
   | "approvals"
   | "interrupt"
@@ -3038,6 +3137,133 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                         </span>
                       );
                     })}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Record #82 (Issue #217): Native fl host Supervisor Telemetry Summary */}
+            <div
+              data-testid="host-supervisor-telemetry-card"
+              style={{
+                padding: "10px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "11.5px",
+                    fontWeight: 700,
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  Native `fl host` Supervisor Telemetry
+                </span>
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="host-supervisor-route-authority-badge"
+                  style={{ fontSize: "10.5px", color: "#38BDF8" }}
+                >
+                  Route Authority: FerroWire Store
+                </span>
+              </div>
+              <div
+                className="fd-mono"
+                data-testid="host-supervisor-transports-summary"
+                style={{ fontSize: "11px", color: "var(--text-secondary)" }}
+              >
+                Transports: pipe-rpc · pty-vt100 · legacy-tmux | Ring Buffer: 128 KB / 1,024 KB per session
+              </div>
+            </div>
+
+            {/* Record #83 (Issue #206): Lab Cutover Gates G1-G10 Readiness Scorecard */}
+            <div
+              data-testid="cutover-gates-scorecard"
+              style={{
+                padding: "10px",
+                borderRadius: "6px",
+                backgroundColor: "var(--bg-elevated)",
+                border: "1px solid var(--border-subtle)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "11.5px",
+                    fontWeight: 700,
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  Lab Cutover Gates Readiness Scorecard (G1–G10)
+                </span>
+                <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
+                  ai-lab-0 Cutover Gates (#206 / #83)
+                </span>
+              </div>
+              {DEFAULT_CUTOVER_GATES_SCORECARD.map((gate) => (
+                <div
+                  key={gate.id}
+                  data-testid={`cutover-gate-row-${gate.id}`}
+                  data-status={gate.status}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    fontSize: "11px",
+                    padding: "4px 6px",
+                    borderRadius: "4px",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                    <strong className="fd-mono">{gate.id}</strong>
+                    <span>{gate.title}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+                    <span
+                      className="fd-mono"
+                      data-testid={`cutover-gate-evidence-${gate.id}`}
+                      style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+                    >
+                      {gate.evidence}
+                    </span>
+                    <span
+                      className="fd-badge fd-mono"
+                      data-testid={`cutover-gate-status-${gate.id}`}
+                      style={{
+                        fontSize: "10px",
+                        color: gate.status === "pass" ? "#34D399" : "#FBBF24",
+                      }}
+                    >
+                      {gate.status}
+                    </span>
                   </div>
                 </div>
               ))}
