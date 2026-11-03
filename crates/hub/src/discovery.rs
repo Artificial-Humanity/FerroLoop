@@ -744,12 +744,19 @@ fn discover_sessions_impl(
             VendorRoute::Muse {
                 session_id, cwd, ..
             } => {
+                // A route made from a live tmux window has no id until Muse writes a transcript.
+                let id = if session_id.is_empty() {
+                    format!("muse-{persona}")
+                } else {
+                    session_id.clone()
+                };
                 let tpath = home
                     .as_deref()
-                    .and_then(|h| find_transcript_file_in_home(h, session_id));
+                    .filter(|_| !session_id.is_empty())
+                    .and_then(|h| find_transcript_file_in_home(h, &id));
                 (
                     "muse",
-                    session_id.clone(),
+                    id,
                     cwd.as_ref().map(|p| p.display().to_string()),
                     tpath,
                 )
@@ -825,17 +832,22 @@ fn discover_sessions_impl(
             let endpoint = agy_endpoints.get(&session.id);
             let agy_address = endpoint.and_then(|(addr, _)| addr.as_deref());
             let agy_csrf = endpoint.and_then(|(_, csrf)| csrf.as_deref());
-            let info = session_model_info(
-                &session.adapter,
-                &session.id,
-                session.transcript_path.as_deref(),
-                home.as_deref(),
-                agy_address,
-                agy_csrf,
-                agy_env_fallback_allowed(home_override),
-            );
-            // One read per transcript file serves the quota, context and mode reads below.
+            // One read per transcript file serves the model, quota, context and mode reads.
             let mut files = TranscriptReads::default();
+            // Muse's model comes from its transcript text, read once through `files`.
+            let info = if session.adapter == "muse" {
+                muse_model_info(session.transcript_path.as_deref(), &mut files)
+            } else {
+                session_model_info(
+                    &session.adapter,
+                    &session.id,
+                    session.transcript_path.as_deref(),
+                    home.as_deref(),
+                    agy_address,
+                    agy_csrf,
+                    agy_env_fallback_allowed(home_override),
+                )
+            };
             // The quota read needs the model: Antigravity keeps separate buckets per model family.
             session.quota_usage = quota_for_resolved_route_with_reads(
                 &session.adapter,
@@ -888,7 +900,6 @@ const CODEX_DEFAULT_MODELS: [&str; 5] = [
     "gpt-6-luna",
 ];
 const GROK_DEFAULT_MODELS: [&str; 4] = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
-const MUSE_MODEL: &str = "muse-spark";
 
 const AGY_LS_SERVICE: &str = "/exa.language_server_pb.LanguageServerService";
 /// Connect and per-read timeout for each language-server call.
@@ -947,13 +958,35 @@ fn session_model_info(
         "claude" => claude_model_info(transcript_path, home),
         "codex" => codex_model_info(transcript_path, home),
         "grok" => grok_model_info(transcript_path, home),
-        "muse" => SessionModelInfo {
-            model: Some(MUSE_MODEL.to_string()),
-            thinking_level: None,
-            available_models: vec![MUSE_MODEL.to_string()],
-        },
         _ => SessionModelInfo::default(),
     }
+}
+
+/// Muse's model: the `payload.record.model_id` of the transcript's last `runtime.session.metadata`
+/// record, else the default. The text comes through `files`, so it has the transcript read cap.
+// Record layout per the Lead's inspection of Muse 1.4.14; unverified against a live file.
+fn muse_model_info(transcript_path: Option<&str>, files: &mut TranscriptReads) -> SessionModelInfo {
+    let model = transcript_path
+        .and_then(|path| files.raw(path))
+        .and_then(muse_transcript_model_id)
+        .unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string());
+    SessionModelInfo {
+        model: Some(model),
+        thinking_level: None,
+        available_models: owned_strings(&crate::lifecycle::MUSE_CATALOG_MODELS),
+    }
+}
+
+/// `payload.record.model_id` of the last `runtime.session.metadata` record in `raw`.
+fn muse_transcript_model_id(raw: &str) -> Option<String> {
+    raw.lines()
+        .rev()
+        .filter(|line| line.contains("runtime.session.metadata"))
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|val| {
+            val.get("payload_type").and_then(Value::as_str) == Some("runtime.session.metadata")
+        })
+        .find_map(|val| non_empty_str(val.pointer("/payload/record/model_id")))
 }
 
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
@@ -6932,9 +6965,12 @@ mod tests {
         );
         let sessions = discover_in(home);
         let muse = session_for(&sessions, "muse-persona");
-        assert_eq!(muse.model.as_deref(), Some("muse-spark"));
+        assert_eq!(muse.model.as_deref(), Some("muse-wonder-full-1.0"));
         assert_eq!(muse.thinking_level, None);
-        assert_eq!(muse.available_models, strings(&["muse-spark"]));
+        assert_eq!(
+            muse.available_models,
+            strings(&["muse-wonder-full-1.0", "muse-wonder-1.0", "muse-spark-1.3"])
+        );
         let hook = session_for(&sessions, "hook");
         assert_eq!(hook.model, None);
         assert_eq!(hook.thinking_level, None);
@@ -6944,11 +6980,94 @@ mod tests {
         assert!(json.get("thinking_level").is_none());
         assert!(json.get("available_models").is_none());
         let muse_json = serde_json::to_value(muse).unwrap();
-        assert_eq!(muse_json["model"], "muse-spark");
+        assert_eq!(muse_json["model"], "muse-wonder-full-1.0");
         assert_eq!(
             muse_json["available_models"],
-            serde_json::json!(["muse-spark"])
+            serde_json::json!(["muse-wonder-full-1.0", "muse-wonder-1.0", "muse-spark-1.3"])
         );
+    }
+
+    /// A Muse `session.jsonl` line of `payload_type` with `payload`.
+    /// Layout per Lead's inspection of Muse 1.4.14; unverified against a live file.
+    fn muse_line(payload_type: &str, payload: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": 1,
+            "recorded_at": 1_793_104_670_899_152_i64,
+            "payload_type": payload_type,
+            "payload": payload,
+        })
+        .to_string()
+    }
+
+    fn muse_metadata_line(model_id: &str) -> String {
+        muse_line(
+            "runtime.session.metadata",
+            serde_json::json!({"record": {"model_id": model_id}}),
+        )
+    }
+
+    /// Discovery of one Muse route whose synthetic transcript holds `lines` (none: no file).
+    fn muse_session_with_transcript(lines: Option<&[String]>) -> DiscoveredSessionSummary {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let id = "01a17d5b-482d-7ec0-a974-eaa56ef667a7";
+        write_routes(
+            home,
+            &[(
+                "muse-persona",
+                &format!(r#"{{"kind":"muse","session_id":"{id}"}}"#),
+            )],
+        );
+        if let Some(lines) = lines {
+            let dir = home.join(".local/share/muse/sessions/2026/10/27").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("session.jsonl"), lines.join("\n")).unwrap();
+        }
+        let sessions = discover_in(home);
+        session_for(&sessions, "muse-persona").clone()
+    }
+
+    #[test]
+    fn muse_model_is_the_last_session_metadata_model_id() {
+        let turn = muse_line(
+            "runtime.session",
+            serde_json::json!({"kind":"run","event":{"kind":"assistant_message_committed","text":"hi"}}),
+        );
+        let session = muse_session_with_transcript(Some(&[
+            muse_metadata_line("muse-wonder-1.0"),
+            turn.clone(),
+            muse_metadata_line("muse-spark-1.3"),
+            turn,
+            // Another record type that merely mentions the metadata name is not a metadata record.
+            muse_line(
+                "runtime.session",
+                serde_json::json!({"note": "runtime.session.metadata", "record": {"model_id": "muse-wonder-1.0"}}),
+            ),
+        ]));
+        assert!(session.transcript_path.is_some());
+        assert_eq!(session.model.as_deref(), Some("muse-spark-1.3"));
+        assert_eq!(
+            session.available_models,
+            strings(&["muse-wonder-full-1.0", "muse-wonder-1.0", "muse-spark-1.3"])
+        );
+    }
+
+    #[test]
+    fn muse_model_defaults_without_a_metadata_record() {
+        // A transcript with no metadata record, one whose record has no model_id, and no file.
+        let other = muse_line(
+            "runtime.session",
+            serde_json::json!({"model_id":"muse-spark-1.3"}),
+        );
+        let no_id = muse_line("runtime.session.metadata", serde_json::json!({"record":{}}));
+        for lines in [
+            Some(vec![other]),
+            Some(vec![no_id, "not json".to_string()]),
+            None,
+        ] {
+            let session = muse_session_with_transcript(lines.as_deref());
+            assert_eq!(session.model.as_deref(), Some("muse-wonder-full-1.0"));
+        }
     }
 
     #[test]

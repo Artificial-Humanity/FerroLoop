@@ -139,7 +139,7 @@ fn spin_up_registers_the_agent_and_persists_a_hosted_record() {
         .assert()
         .success()
         .stdout(contains(
-            "muse:ada\trunning\tAda:muse\thydration_dispatched=false",
+            "muse:ada\trunning\tmuse:ada\thydration_dispatched=false",
         ));
     let records = env.hosted_records();
     let ada = records.iter().find(|r| r["persona"] == "ada").unwrap();

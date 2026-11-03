@@ -642,6 +642,15 @@ fn deliver_to_muse_route(
         }
     }
 
+    // A route made from a live tmux window has no session id until Muse writes a transcript.
+    // `muse exec --session-id ""` would start a stray session, so refuse it.
+    if session_id.trim().is_empty() {
+        return Err(
+            "muse route has no session id yet and its tmux window is not live, so the prompt \
+             cannot be delivered"
+                .to_string(),
+        );
+    }
     let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("muse"));
@@ -1354,9 +1363,10 @@ fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
 
 fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
     let tmux = tmux_bin();
+    let target = tmux_exact_target(target);
     for key in ["C-u", slash, "Enter"] {
         let status = Command::new(&tmux)
-            .args(["send-keys", "-t", target, key])
+            .args(["send-keys", "-t", &target, key])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1478,7 +1488,7 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
                 .find(|t| tmux_target_alive(t))
                 .ok_or_else(|| "no live tmux target for the session".to_string())?;
             let status = Command::new(tmux_bin())
-                .args(["send-keys", "-t", target, key])
+                .args(["send-keys", "-t", &tmux_exact_target(target), key])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
@@ -1535,9 +1545,55 @@ pub(crate) fn tmux_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("tmux"))
 }
 
+/// The exact-match spelling of a tmux target. tmux resolves a window NAME by prefix when no
+/// window has exactly that name (`muse:kacey` lands in `kacey-2` once `kacey` is gone), and a
+/// session name the same way. For `session:window` where both parts are names, this returns
+/// `=session:=window` (a trailing `.pane` index or `.%id` is kept), which resolves only to a
+/// window of exactly that name or not at all. A pane id (`%3`), a window id (`@2`), a numeric
+/// window index, a bare session name and a target that already carries `=` are returned as given.
+pub(crate) fn tmux_exact_target(target: &str) -> String {
+    let Some((session, rest)) = target.split_once(':') else {
+        return target.to_string();
+    };
+    let (window, pane) = match rest.rsplit_once('.') {
+        Some((w, p))
+            if p.strip_prefix('%')
+                .unwrap_or(p)
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                && !p.is_empty()
+                && p != "%" =>
+        {
+            (w, Some(p))
+        }
+        _ => (rest, None),
+    };
+    let is_name = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with(['=', '@', '%', '$'])
+            && !part.bytes().all(|b| b.is_ascii_digit())
+    };
+    if !is_name(session) || !is_name(window) {
+        return target.to_string();
+    }
+    match pane {
+        Some(p) => format!("={session}:={window}.{p}"),
+        None => format!("={session}:={window}"),
+    }
+}
+
 fn tmux_target_alive(target: &str) -> bool {
-    let Ok(out) = Command::new(tmux_bin())
-        .args(["display-message", "-p", "-t", target, "#{pane_id}"])
+    let exact = tmux_exact_target(target);
+    // `display-message` answers for the current window when an exact `session:window` target
+    // matches nothing, so a window-qualified target is asked with `list-panes`, which fails.
+    let by_window = exact != target;
+    let mut cmd = Command::new(tmux_bin());
+    if by_window {
+        cmd.args(["list-panes", "-t", &exact, "-F", "#{pane_id}"]);
+    } else {
+        cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
+    }
+    let Ok(out) = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1557,6 +1613,8 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
 /// does not paste the message a second time.
 fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
     let tmux = tmux_bin();
+    let exact = tmux_exact_target(target);
+    let target = exact.as_str();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1925,6 +1983,12 @@ pub fn dispatch_message_for_store<S: MessageStore>(
     updated
 }
 
+/// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
+/// being unset) must hold this lock for the whole test, including the earlier vendor dispatch that
+/// treats a set tmux bin as permission to use tmux.
+#[cfg(test)]
+pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1934,11 +1998,6 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux
-    /// must hold this lock for the whole test, including the earlier vendor
-    /// dispatch that treats a set tmux bin as permission to use tmux.
-    static TMUX_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Antigravity reset reads `FL_WIRE_AGY_BIN`, `ANTIGRAVITY_LS_ADDRESS`, and
     /// `ANTIGRAVITY_CSRF_TOKEN`. Tests that change those variables hold this lock
@@ -2161,7 +2220,7 @@ mod tests {
         fs::write(
             &tmux_bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nelif [ \"$1\" = \"capture-pane\" ]; then\n  echo \"[Pasted Content 28 chars]\"\nfi\n",
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nelif [ \"$1\" = \"capture-pane\" ]; then\n  echo \"[Pasted Content 28 chars]\"\nfi\n",
                 tmux_out.display(),
                 tmux_stdin_out.display()
             ),
@@ -2190,10 +2249,10 @@ mod tests {
             std::env::remove_var("FL_WIRE_TMUX_BIN");
         }
         let tmux_cmds = fs::read_to_string(&tmux_out).unwrap();
-        assert!(tmux_cmds.contains("display-message -p -t muse:felicia #{pane_id}"));
+        assert!(tmux_cmds.contains("list-panes -t =muse:=felicia -F #{pane_id}"));
         assert!(tmux_cmds.contains("load-buffer -b fl-wire-muse-"));
-        assert!(tmux_cmds.contains("-t muse:felicia"));
-        assert!(tmux_cmds.contains("send-keys -t muse:felicia Enter"));
+        assert!(tmux_cmds.contains("-t =muse:=felicia"));
+        assert!(tmux_cmds.contains("send-keys -t =muse:=felicia Enter"));
         let pasted_stdin = fs::read_to_string(&tmux_stdin_out).unwrap();
         assert_eq!(pasted_stdin.trim(), "Hello Felicia via tmux");
 
@@ -2298,7 +2357,7 @@ mod tests {
         fs::write(
             &bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  {display}\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  {display}\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
                 out.display(),
                 stdin_out.display()
             ),
@@ -2406,6 +2465,73 @@ mod tests {
         );
         assert_eq!(updated.len(), 1);
         updated.into_iter().next().unwrap()
+    }
+
+    /// A `muse` stand-in that records that it ran. A regression that reaches `muse exec` runs
+    /// this script, never the real binary.
+    fn write_marker_muse(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = dir.join("muse-ran");
+        let bin = dir.join("marker-muse.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, marker)
+    }
+
+    fn muse_route_without_session_id() -> VendorRoute {
+        VendorRoute::Muse {
+            session_id: String::new(),
+            cwd: None,
+            tmux_target: Some("Kacey:muse".into()),
+            tmux_pane: None,
+        }
+    }
+
+    #[test]
+    fn a_muse_route_without_a_session_id_is_pasted_into_its_live_window() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (muse_bin, muse_marker) = write_marker_muse(tmp.path());
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let _muse = EnvGuard::set("FL_WIRE_MUSE_BIN", &muse_bin);
+
+        dispatch_operator_prompt_to_route(&muse_route_without_session_id(), "owner", "hello")
+            .unwrap();
+
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("list-panes -t =Kacey:=muse"), "{cmds}");
+        assert!(fs::read_to_string(&tmux_stdin).unwrap().contains("hello"));
+        assert!(!muse_marker.exists(), "muse exec ran");
+    }
+
+    #[test]
+    fn a_muse_route_without_a_session_id_never_reaches_muse_exec() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        // The window is not live, so the paste fails over to `muse exec --session-id ""`.
+        let (tmux_bin, _, _) = write_fake_tmux(tmp.path(), false);
+        let (muse_bin, muse_marker) = write_marker_muse(tmp.path());
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let _muse = EnvGuard::set("FL_WIRE_MUSE_BIN", &muse_bin);
+
+        let err =
+            dispatch_operator_prompt_to_route(&muse_route_without_session_id(), "owner", "hello")
+                .unwrap_err();
+
+        assert!(err.contains("no session id yet"), "{err}");
+        assert!(
+            !muse_marker.exists(),
+            "muse exec ran with an empty session id"
+        );
     }
 
     #[test]
@@ -2908,7 +3034,7 @@ mod tests {
         fs::write(
             &tmux_bin,
             format!(
-                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
                 tmux_out.display(),
                 tmux_stdin.display()
             ),
@@ -2946,13 +3072,13 @@ mod tests {
         assert!(log.contains("send-keys -t %9 C-u"));
         assert!(log.contains("send-keys -t %9 /new"));
         assert!(log.contains("send-keys -t %9 Enter"));
-        assert!(log.contains("send-keys -t muse:felicia C-u"));
-        assert!(log.contains("send-keys -t muse:felicia /clear"));
-        assert!(log.contains("send-keys -t muse:felicia Enter"));
+        assert!(log.contains("send-keys -t =muse:=felicia C-u"));
+        assert!(log.contains("send-keys -t =muse:=felicia /clear"));
+        assert!(log.contains("send-keys -t =muse:=felicia Enter"));
         assert!(log.contains("load-buffer -b fl-wire-muse-"));
         let pasted = fs::read_to_string(&tmux_stdin).unwrap();
         assert_eq!(pasted.trim(), "reforge muse now");
-        let reset_at = log.find("send-keys -t muse:felicia /clear").unwrap();
+        let reset_at = log.find("send-keys -t =muse:=felicia /clear").unwrap();
         let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
         assert!(reset_at < paste_at);
     }
@@ -3023,6 +3149,113 @@ mod tests {
             plan_interrupt(&agy, None).unwrap().method(),
             INTERRUPT_METHOD_AGY
         );
+    }
+
+    /// A fake tmux that behaves like tmux 3.6 about window names: the only live window is
+    /// `muse:kacey-2`; an exact target (`=muse:=kacey-2`) matches only it, and a plain
+    /// `muse:kacey` falls back to it by prefix. `display-message` always answers (it falls back to
+    /// the current window); `list-panes`, `paste-buffer` and `send-keys` fail on a miss.
+    fn write_fake_tmux_prefix_matching(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let out = dir.join("tmux.out");
+        let bin = dir.join("fake-tmux-prefix.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nlast=\"\"; for a in \"$@\"; do case \"$prev\" in -t) last=\"$a\";; esac; prev=\"$a\"; done\nhit() {{ case \"$last\" in =muse:=kacey-2|muse:kacey|muse:kacey-2|%5) return 0;; *) return 1;; esac; }}\ncase \"$1\" in\n  display-message) echo \"%9\" ;;\n  list-panes) hit && echo \"%5\" || exit 1 ;;\n  load-buffer) cat > /dev/null ;;\n  paste-buffer|send-keys|capture-pane) hit || exit 1 ;;\nesac\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, out)
+    }
+
+    #[test]
+    fn tmux_exact_target_pins_the_window_name_and_leaves_ids_alone() {
+        assert_eq!(tmux_exact_target("muse:kacey"), "=muse:=kacey");
+        assert_eq!(tmux_exact_target("Kacey:muse"), "=Kacey:=muse");
+        assert_eq!(tmux_exact_target("muse:kacey.1"), "=muse:=kacey.1");
+        assert_eq!(tmux_exact_target("muse:kacey.%7"), "=muse:=kacey.%7");
+        for same in [
+            "%12",
+            "@3",
+            "Wendy:@6.%12",
+            "muse:1",
+            "muse:",
+            ":kacey",
+            "Kacey",
+            "=muse:=kacey",
+            "=muse:kacey",
+            "$1:kacey",
+        ] {
+            assert_eq!(tmux_exact_target(same), same);
+        }
+    }
+
+    #[test]
+    fn a_gone_window_is_not_alive_when_a_longer_named_window_is() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, out) = write_fake_tmux_prefix_matching(tmp.path());
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        assert!(
+            !tmux_target_alive("muse:kacey"),
+            "prefix fallback must not count"
+        );
+        assert!(tmux_target_alive("muse:kacey-2"));
+        assert!(tmux_target_alive("%5"), "a pane id is asked as given");
+        drop(_env);
+        let log = fs::read_to_string(&out).unwrap();
+        assert!(log.contains("list-panes -t =muse:=kacey -F"), "{log}");
+        assert!(log.contains("display-message -p -t %5"), "{log}");
+    }
+
+    #[test]
+    fn muse_prompt_for_a_gone_window_does_not_land_in_the_prefix_neighbour() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, out) = write_fake_tmux_prefix_matching(tmp.path());
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        // `kacey` is gone, `kacey-2` is live; the route has no session id yet.
+        let gone = deliver_to_muse_route("", None, Some("muse:kacey"), None, "hello");
+        assert!(gone.is_err(), "{gone:?}");
+        let live = deliver_to_muse_route("", None, Some("muse:kacey-2"), None, "hello");
+        assert!(live.is_ok(), "{live:?}");
+        // The paste and the Enter name the window exactly.
+        deliver_via_tmux_paste("muse:kacey-2", "x").unwrap();
+        assert!(deliver_via_tmux_paste("muse:kacey", "x").is_err());
+        drop(_env);
+        let log = fs::read_to_string(&out).unwrap();
+        assert!(log.contains("paste-buffer -d -b"), "{log}");
+        assert!(log.contains("-t =muse:=kacey-2"), "{log}");
+        assert!(
+            !log.lines()
+                .any(|l| l.starts_with("paste-buffer") && l.ends_with("-t muse:kacey")),
+            "{log}"
+        );
+        assert!(log.contains("send-keys -t =muse:=kacey-2 Enter"), "{log}");
+    }
+
+    #[test]
+    fn interrupt_and_reset_keys_name_the_window_exactly() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, out) = write_fake_tmux_prefix_matching(tmp.path());
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let plan = InterruptPlan::TmuxKey {
+            targets: vec!["muse:kacey".into(), "muse:kacey-2".into()],
+            key: "Escape",
+        };
+        run_interrupt(&plan).unwrap();
+        send_tmux_reset_keys("muse:kacey-2", "/clear").unwrap();
+        assert!(send_tmux_reset_keys("muse:kacey", "/clear").is_err());
+        drop(_env);
+        let log = fs::read_to_string(&out).unwrap();
+        assert!(log.contains("send-keys -t =muse:=kacey-2 Escape"), "{log}");
+        assert!(log.contains("send-keys -t =muse:=kacey-2 C-u"), "{log}");
+        assert!(!log.contains("send-keys -t muse:kacey"), "{log}");
     }
 
     #[test]

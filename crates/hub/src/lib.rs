@@ -725,6 +725,11 @@ mod artifact_dirs_tests;
 #[cfg(test)]
 mod remodel_api_tests;
 
+/// `FL_WIRE_TMUX_BIN` is process-global. A test that points it at a fake tmux holds this lock
+/// while it is set.
+#[cfg(test)]
+pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3118,7 +3123,7 @@ mod tests {
         assert_eq!(rec["status"], "running");
         assert_eq!(rec["restart_policy"], "on-failure");
         assert_eq!(rec["restart_count"], 0);
-        assert_eq!(rec["tmux_target"], "Ada-2:muse");
+        assert_eq!(rec["tmux_target"], "muse:ada-2");
         assert_eq!(rec["hydration_dispatched"], false);
         assert!(rec["decommission_prepared_at_ms"].is_null());
         assert!(rec["created_at_ms"].as_u64().unwrap() > 0);
@@ -5112,10 +5117,11 @@ mod tests {
         );
         assert_eq!(bad_body.status, 400);
         // The pre-delivery check asks tmux whether the route's pane exists (`display-message`,
-        // a read); nothing is typed into it.
+        // or `list-panes`, a read); nothing is typed into it.
         let log = tmux.log();
         assert!(
-            log.lines().all(|l| l.starts_with("display-message ")),
+            log.lines()
+                .all(|l| l.starts_with("display-message ") || l.starts_with("list-panes ")),
             "an interrupt types nothing into the pane: {log}"
         );
     }
@@ -5201,7 +5207,7 @@ mod tests {
         let log = tmux.log();
         assert_eq!(log.matches("paste-buffer").count(), 1, "{log}");
         assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("-t muse:ada"), "{log}");
+        assert!(log.contains("-t =muse:=ada"), "{log}");
     }
 
     #[test]
@@ -5888,8 +5894,6 @@ mod tests {
 
     // ---- Operator prompts reach a terminal as direct input for the owner only -----------
 
-    static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Points `FL_WIRE_TMUX_BIN` at a fake tmux that records its arguments in `<dir>/tmux.out`
     /// and reports every pane alive, then restores the variable on drop. Hold `TMUX_ENV_LOCK`.
     struct FakeTmux {
@@ -5906,7 +5910,7 @@ mod tests {
             fs::write(
                 &bin,
                 format!(
-                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
                     out.display()
                 ),
             )

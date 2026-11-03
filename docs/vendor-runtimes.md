@@ -324,6 +324,35 @@ and windows are kept, a missing CLI window falls back to the file, and the trans
 FerroLoop pastes into the session tmux pane. The CLI fallback is
 `muse exec --session-id <id> --json`.
 
+### Hosting
+
+A hosted Muse agent runs as a window named `<persona>` (lowercase) in the one shared tmux
+session `muse`; its target is `muse:<persona>`. Spin-up uses `new-window` when the session
+exists and `new-session` when not. A window of that name that already exists (for example from
+`muse-sessions`) is not touched: the prompt is delivered to it.
+
+Spin-up marks the window it creates. It adds `-P -F '#{window_id}'` to `new-window` or
+`new-session`, reads back the window id (`@12`), and runs
+`set-option -w -t @12 @fl_hosted <session_id>` (the hosted record id, `muse:<persona>`). If the
+id cannot be read, or the mark cannot be set, it removes the new window by id and the spawn
+fails. A window is ours only when it carries the mark with our id; the name alone cannot tell
+it from a window that someone opened under the same name after ours died.
+
+* Teardown lists the windows with `#{window_id}`, `#{window_name}` and `#{@fl_hosted}`. It runs
+  `kill-window -t @id` only when exactly one window has the name and its mark equals the record
+  id. A window of the name without the mark, or with another mark, is not killed and not
+  reported as stopped. The session is never killed.
+* Restart and spin-up clear `runtime_spawned` when no window of the name carries our mark.
+  A foreign window of the same name then gives `runtime_spawned=false`; the prompt goes through
+  delivery and teardown does not kill it. The launch survival check also asks for the marked
+  window, not any window of the name.
+* Remodel refuses (409) to leave a Muse window that the record claims but that carries no mark
+  of its own, because the teardown would not stop it.
+* Read-only checks (`exists`, the adoption of a window that is already there) accept any window
+  of the name and never claim ownership.
+
+Discovery also accepts a `<Session>:muse` window and prefers `muse:<persona>` when both exist.
+
 ## Store guard
 
 HTTP authentication opens the store only long enough to resolve a session token, then drops

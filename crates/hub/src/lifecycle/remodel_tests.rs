@@ -1316,3 +1316,193 @@ fn a_peers_failed_remodel_restores_exactly_the_session_it_tore_down() {
     assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
     assert!(fake.is_live("Felicity"));
 }
+
+// ------------------------------------------------------------------- the shared `muse` session
+
+fn muse_req(persona: &str) -> SpinUpRequest {
+    SpinUpRequest {
+        persona: persona.into(),
+        project: "FerroLoop".into(),
+        role: "assistant".into(),
+        vendor: "muse".into(),
+        ..SpinUpRequest::default()
+    }
+}
+
+fn kills(fake: &FakeRuntime) -> Vec<String> {
+    fake.calls
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with("kill"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_muse_spin_up_whose_record_cannot_be_saved_kills_its_window_and_not_the_session() {
+    let store = FaultyStore::default();
+    let home = TempDir::new().unwrap();
+    // `mira` shares the `muse` session and must survive.
+    let fake = FakeRuntime::with_muse_windows(&["mira"]);
+    let env = fake.env(home.path());
+    // The first record write lands; the second, made once the window started, fails.
+    *store.fail_state_write.borrow_mut() = Some((hosted_session_slug("muse:ada"), 2));
+    let err = spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+
+    assert_eq!(*fake.calls.borrow(), ["spawn muse:ada", "kill muse:ada"]);
+    assert!(fake.is_live("muse:mira") && fake.is_live("muse"));
+    assert!(!fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_muse_spin_up_whose_record_cannot_be_saved_leaves_a_window_it_did_not_open() {
+    let store = FaultyStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::with_muse_windows(&["ada"]);
+    let env = fake.env(home.path());
+    *store.fail_state_write.borrow_mut() = Some((hosted_session_slug("muse:ada"), 2));
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap_err();
+
+    assert!(kills(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_muse_remodel_stops_and_reopens_only_its_own_window() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::with_muse_windows(&["mira"]);
+    let env = fake.env(home.path());
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
+    fake.calls.borrow_mut().clear();
+
+    let req = RemodelRequest {
+        model: Some("muse-spark".into()),
+        ..remodel_req("muse")
+    };
+    let out = remodel(&store, &env, "muse:ada", &req, Caller::Owner).unwrap();
+    assert!(out.runtime_stopped);
+    assert_eq!(out.tmux_target.as_deref(), Some("muse:ada"));
+    assert_eq!(
+        *fake.calls.borrow(),
+        ["kill muse:ada", "spawn muse:ada"],
+        "the window is replaced, the session is not touched"
+    );
+    assert!(fake.is_live("muse:mira") && fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_failed_remodel_of_a_muse_session_restores_its_window_without_killing_the_session() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::with_muse_windows(&["mira"]);
+    let env = fake.env(home.path());
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
+    fake.calls.borrow_mut().clear();
+    fake.fail_windows.borrow_mut().push("codex".into());
+
+    let err = remodel(
+        &store,
+        &env,
+        "muse:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(restored_of(&err), Some("muse:ada"), "{err}");
+    assert_eq!(
+        *fake.calls.borrow(),
+        ["kill muse:ada", "spawn Ada:codex", "spawn muse:ada"]
+    );
+    assert!(fake.is_live("muse:ada") && fake.is_live("muse:mira"));
+}
+
+#[test]
+fn a_remodel_away_from_a_muse_window_it_did_not_open_is_refused_and_kills_nothing() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    // `muse-sessions` started `ada`; the hosted record never owned the window.
+    let fake = FakeRuntime::with_muse_windows(&["ada"]);
+    let env = fake.env(home.path());
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
+    assert!(!record(&store, "muse:ada").runtime_spawned);
+
+    let err = remodel(
+        &store,
+        &env,
+        "muse:ada",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(err.to_string().contains("did not start it"), "{err}");
+    assert!(err.to_string().contains("muse:ada"), "{err}");
+    assert!(kills(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_remodel_away_from_a_foreign_window_under_a_dead_ones_name_is_refused() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    spin_up(&store, &env, &muse_req("ada"), "owner", Caller::Owner).unwrap();
+    assert!(record(&store, "muse:ada").runtime_spawned);
+    // Our window died and a foreign one took the name; the flag still says ours.
+    fake.close_window("muse:ada");
+    fake.open_foreign_window("muse:ada");
+    fake.calls.borrow_mut().clear();
+
+    let err = remodel(
+        &store,
+        &env,
+        "muse:ada",
+        &remodel_req("claude"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert_eq!(err.status(), 409, "{err}");
+    assert!(
+        err.to_string().contains("did not start the window"),
+        "{err}"
+    );
+    assert!(kills(&fake).is_empty(), "{:?}", fake.calls.borrow());
+    assert!(fake.is_live("muse:ada"));
+}
+
+#[test]
+fn a_remodel_onto_a_muse_window_that_exists_adopts_it() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::with_muse_windows(&["ada"]);
+    let env = fake.env(home.path());
+    spin_up(
+        &store,
+        &env,
+        &SpinUpRequest {
+            vendor: "claude".into(),
+            ..muse_req("ada")
+        },
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    fake.calls.borrow_mut().clear();
+
+    let out = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("muse"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.tmux_target.as_deref(), Some("muse:ada"));
+    assert!(!record(&store, "muse:ada").runtime_spawned, "not ours");
+    // Only the old Claude session was stopped; the foreign window was never touched.
+    assert_eq!(*fake.calls.borrow(), ["kill Ada", "spawn muse:ada"],);
+    assert!(fake.is_live("muse:ada"));
+}
