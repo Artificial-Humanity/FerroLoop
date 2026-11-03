@@ -1361,3 +1361,44 @@ fn get_and_put_over_wss_with_a_psk_and_a_ca_file() {
         Some(serde_json::json!({"over": "wss"}))
     );
 }
+
+#[test]
+fn version_prints_the_build_and_json_prints_the_stamp_and_formats() {
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ferrostore"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let line = run(&["--version"]);
+    assert!(
+        line.starts_with(&format!("ferrostore {} (", env!("CARGO_PKG_VERSION"))),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1);
+    let v: Value = serde_json::from_str(&run(&["--version", "--json"])).unwrap();
+    assert_eq!(v["name"], "ferrostore");
+    assert_eq!(v["source"], "source-build");
+    assert_eq!(v["store_formats"], fl_store::formats::store_formats());
+    for key in [
+        "commit",
+        "commit_short",
+        "dirty",
+        "build_time_unix",
+        "release_id",
+    ] {
+        assert!(v.get(key).is_some(), "missing {key}");
+    }
+    let short = v["commit_short"].as_str().unwrap();
+    assert!(line.contains(if short == "unknown" {
+        "unknown commit"
+    } else {
+        short
+    }));
+    assert_eq!(
+        v,
+        serde_json::from_str::<Value>(&run(&["-V", "--json"])).unwrap()
+    );
+}

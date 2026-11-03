@@ -27,6 +27,10 @@ File naming in this directory follows
 * [hub-home-and-artifacts.md](hub-home-and-artifacts.md) — where the Hub keeps its data and
   artifact registry, the per-project directories, and the Owner-only endpoints that relocate
   them, with migration.
+* [build-provenance.md](build-provenance.md) — how a binary says what it was built from:
+  `fl --version [--json]`, `fl version`, `ferrostore --version [--json]`, the Hub's
+  `GET /api/v1/version`, the UI bundle's `build-info.json`, and the build-time stamps behind
+  them.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.

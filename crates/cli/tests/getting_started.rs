@@ -75,6 +75,13 @@ struct Step {
 /// Replace anything that legitimately differs between two runs.
 fn normalize(line: &str, demo_root: &str) -> String {
     let line = line.replace(demo_root, "<ROOT>");
+    // `fl 0.1.0 (<short commit>[, dirty])`: the build stamp differs per checkout and tree.
+    let line = match line.strip_prefix("fl ").and_then(|r| r.split_once(" (")) {
+        Some((version, note)) if note.ends_with(')') && !version.contains(' ') => {
+            format!("fl {version} (<BUILD>)")
+        }
+        _ => line,
+    };
     let bytes: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut i = 0;

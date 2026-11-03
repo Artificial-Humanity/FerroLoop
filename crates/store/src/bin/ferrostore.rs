@@ -23,7 +23,7 @@ const WORDING: Wording<'static> = Wording {
 #[derive(Parser)]
 #[command(
     name = "ferrostore",
-    version,
+    version = build_version(),
     about = "Look at, tend, serve and query a FerroStore (.fls) file."
 )]
 struct Cli {
@@ -305,7 +305,35 @@ fn chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// How this build was made: `0.1.0 (abc123456789, dirty)`; clap prints `ferrostore ` before it.
+fn build_version() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        let b = fl_core::build_info!();
+        format!("{} ({})", b.version, b.note())
+    })
+}
+
+/// `ferrostore --version --json` (either order, `-V` too): the build stamp and the store
+/// formats this build opens, as one JSON object. A bare `--version` is clap's.
+fn is_json_version_request(args: &[std::ffi::OsString]) -> bool {
+    let strs: Vec<&str> = args.iter().filter_map(|a| a.to_str()).collect();
+    args.len() == 2
+        && strs.len() == 2
+        && strs.contains(&"--json")
+        && (strs.contains(&"--version") || strs.contains(&"-V"))
+}
+
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if is_json_version_request(&args) {
+        let mut v = fl_core::build_info!().to_json("ferrostore");
+        if let serde_json::Value::Object(o) = &mut v {
+            o.insert("store_formats".into(), fl_store::formats::store_formats());
+        }
+        println!("{v}");
+        std::process::exit(0);
+    }
     let cli = Cli::parse();
     let code = match run(cli.cmd) {
         Ok(code) => code,
