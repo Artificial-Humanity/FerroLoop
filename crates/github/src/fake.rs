@@ -167,6 +167,8 @@ pub struct State {
     pub token_requests: u64,
     /// The body of every installation-token request, in order.
     pub token_bodies: Vec<String>,
+    /// The bearer JWT of every installation lookup and `GET /app`, in order.
+    pub jwts: Vec<String>,
     /// "METHOD /path?query" of every request, in order.
     pub requests: Vec<String>,
     /// Largest page the fake serves, whatever `per_page` asks. 0 = 100.
@@ -1522,6 +1524,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     json!({"message": "A JSON web token could not be decoded"}),
                 );
             }
+            s.jwts.push(auth.trim_start_matches("Bearer ").to_string());
             if let Some(to) = s.off_origin_redirect_next.take() {
                 let mut a = answer(301, json!({"message": "Moved Permanently"}));
                 a.headers.push(("Location".into(), to));
@@ -1557,6 +1560,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     json!({"message": "A JSON web token could not be decoded"}),
                 );
             }
+            s.jwts.push(auth.trim_start_matches("Bearer ").to_string());
             answer(200, json!({"slug": APP_SLUG}))
         }
         ("POST", ["app", "installations", _, "access_tokens"]) => {

@@ -14,13 +14,14 @@ use fl_core::pr_policy::{
 };
 use fl_core::store::{AgentRegistry, MessageStore};
 use fl_github::{
-    AppCredentials, Client, EnvToken, GithubTracker, MergeMethod, create_pr, get_pr,
-    list_pr_commits, list_pr_files, list_pr_reviews, merge_pr, request_pr_reviewers,
-    submit_pr_review,
+    AppCredentials, Client, EnvToken, FileKeySigner, GithubTracker, JwtSigner, MergeMethod,
+    create_pr, get_pr, list_pr_commits, list_pr_files, list_pr_reviews, merge_pr,
+    request_pr_reviewers, submit_pr_review,
 };
 use fl_store::AnyStore;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Subcommand)]
 pub enum PrCmd {
@@ -124,26 +125,34 @@ fn reviewer_client(
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    let (app_id, private_key) = match (env_app_id, env_key_path) {
+    // A `private_key_ref` beside the variable is ambiguous, whatever else is set.
+    crate::config::refuse_env_key_path_with_ref(github_app, env_key_path.is_some())?;
+    let (app_id, signer): (u64, Arc<dyn JwtSigner>) = match (env_app_id, env_key_path) {
         (Some(raw_id), Some(raw_path)) => {
             let id: u64 = raw_id
                 .trim()
                 .parse()
                 .with_context(|| format!("invalid $FL_GITHUB_APP_ID `{raw_id}`"))?;
-            (id, PathBuf::from(raw_path.trim()))
+            (
+                id,
+                Arc::new(FileKeySigner::open(&PathBuf::from(raw_path.trim()))?),
+            )
         }
         _ => match github_app {
-            Some(app) => (app.app_id, app.private_key.clone()),
+            Some(app) => (
+                app.app_id,
+                crate::gate_signer::signer_for(app, &crate::gate_signer::cli_caller())?,
+            ),
             None => bail!(
                 "agent pull-request review and merge require a GitHub App (`[github]` with \
-                 `app_id` and `private_key` in config.toml, or `$FL_GITHUB_APP_ID` + \
-                 `$FL_GITHUB_PRIVATE_KEY_PATH`)"
+                 `app_id` and `private_key` or `private_key_ref` in config.toml, or \
+                 `$FL_GITHUB_APP_ID` + `$FL_GITHUB_PRIVATE_KEY_PATH`)"
             ),
         },
     };
 
     let api = resolve_api_url()?;
-    let creds = AppCredentials::from_file(&api, app_id, &private_key, &gh.repo().full_name)?;
+    let creds = AppCredentials::with_signer(&api, app_id, signer, &gh.repo().full_name);
     Ok(Some(Client::new(&api, Box::new(creds))))
 }
 
