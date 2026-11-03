@@ -57,7 +57,9 @@ pub struct HookSpec {
     pub needs_network: bool,
     #[serde(default)]
     pub required: bool,
+    #[serde(default = "default_hook_timeout")]
     pub timeout_secs: u64,
+    #[serde(default = "default_hook_output_limit")]
     pub output_limit_bytes: u64,
     #[serde(default)]
     pub environment_names: Vec<String>,
@@ -119,10 +121,31 @@ fn valid_argv(a: &[String]) -> bool {
         && a.iter().all(|s| valid_text(s, 4096))
         && !a[0].starts_with('-')
 }
+fn default_hook_timeout() -> u64 {
+    120
+}
+fn default_hook_output_limit() -> u64 {
+    65_536
+}
+
 fn valid_env(a: &[String]) -> bool {
     a.len() <= 64
-        && a.iter()
-            .all(|s| valid_id(s) && !s.contains('.') && !s.contains('-'))
+        && a.iter().all(|s| {
+            matches!(
+                s.as_str(),
+                "PATH"
+                    | "TMPDIR"
+                    | "TMP"
+                    | "TEMP"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "TERM"
+                    | "FL_PROJECT_ID"
+                    | "FL_WORKTREE_ID"
+                    | "FL_OPERATION_ID"
+                    | "FL_SESSION_INCARNATION"
+            )
+        })
         && a.iter().collect::<BTreeSet<_>>().len() == a.len()
 }
 impl WorkspacePolicy {
@@ -171,9 +194,9 @@ impl WorkspacePolicy {
                 || !valid_argv(&h.argv)
                 || !valid_env(&h.environment_names)
                 || h.timeout_secs == 0
-                || h.timeout_secs > 86400
+                || h.timeout_secs > 600
                 || h.output_limit_bytes == 0
-                || h.output_limit_bytes > 16 * 1024 * 1024
+                || h.output_limit_bytes > 65_536
                 || h.content_paths.len() > 128
                 || h.content_paths.iter().any(|p| !valid_text(p, 4096))
                 || h.credential_bundle.as_ref().is_some_and(|b| !valid_id(b))
@@ -458,6 +481,13 @@ last = 29999
             sha256: executable_digest(b"script"),
         });
         assert!(workspace_policy_digest(&policy, &paths, &base, &interpreter_and_script).is_ok());
+        policy.post_create[0].argv = vec![
+            "python3".into(),
+            "-W".into(),
+            "ignore".into(),
+            "tools/task.py".into(),
+        ];
+        assert!(workspace_policy_digest(&policy, &paths, &base, &interpreter_and_script).is_err());
         policy.post_create[0].argv = vec!["./bootstrap".into()];
         policy.post_create[0].timeout_secs += 1;
         assert_ne!(
@@ -481,11 +511,12 @@ last = 29999
             policy_digest: digest,
             base_oid: base.clone(),
         };
-        let success = BTreeSet::new();
+        let success = Vec::new();
         let input = |approval, owner_invoked, automatic_profile_proven| PlanInputs {
             approval,
             owner_invoked,
             automatic_profile_proven,
+            operation_id: "op-1",
             successful_manual_hooks: &success,
         };
         let unapproved = plan_workspace(
@@ -563,6 +594,235 @@ last = 29999
             unsupported.hooks[0].refusal,
             Some(PlanRefusal::HookProfileUnsupported)
         );
+    }
+
+    #[test]
+    fn required_manual_receipt_unblocks_later_automatic_plan() {
+        let (dir, repo, common) = fixture();
+        let policy = WorkspacePolicy::parse(POLICY).unwrap();
+        let path = paths(dir.path(), &repo, &common);
+        let base = "a".repeat(40);
+        let contents = vec![ContentEvidence {
+            path: "./bootstrap".into(),
+            sha256: executable_digest(b"script"),
+        }];
+        let approval = WorkspaceApproval {
+            policy_digest: workspace_policy_digest(&policy, &path, &base, &contents).unwrap(),
+            base_oid: base.clone(),
+        };
+        let success = vec![HookRun {
+            id: "run-1".into(),
+            operation_id: "op-1".into(),
+            phase: "post_create".into(),
+            hook_id: "deps".into(),
+            approved_digest: approval.policy_digest.clone(),
+            invocation_mode: HookExecution::OwnerManual,
+            execution_profile: "manual".into(),
+            owner_invocation_receipt: Some("owner-receipt".into()),
+            execution_id: "exec-1".into(),
+            state: HookRunState::Succeeded,
+            exit_status: Some(0),
+            started_at: None,
+            ended_at: None,
+            output_excerpt_ref: None,
+            timeout_reason: None,
+        }];
+        let plan = plan_workspace(
+            &policy,
+            path,
+            &base,
+            &contents,
+            PlanInputs {
+                approval: Some(&approval),
+                owner_invoked: false,
+                automatic_profile_proven: true,
+                operation_id: "op-1",
+                successful_manual_hooks: &success,
+            },
+        )
+        .unwrap();
+        assert!(!plan.preparation_blocked);
+    }
+
+    #[test]
+    fn manual_receipt_must_match_operation_phase_hook_digest_and_authority() {
+        let (dir, repo, common) = fixture();
+        let policy = WorkspacePolicy::parse(POLICY).unwrap();
+        let path = paths(dir.path(), &repo, &common);
+        let base = "a".repeat(40);
+        let contents = vec![ContentEvidence {
+            path: "./bootstrap".into(),
+            sha256: executable_digest(b"script"),
+        }];
+        let approval = WorkspaceApproval {
+            policy_digest: workspace_policy_digest(&policy, &path, &base, &contents).unwrap(),
+            base_oid: base.clone(),
+        };
+        let valid = HookRun {
+            id: "run".into(),
+            operation_id: "op".into(),
+            phase: "post_create".into(),
+            hook_id: "deps".into(),
+            approved_digest: approval.policy_digest.clone(),
+            invocation_mode: HookExecution::OwnerManual,
+            execution_profile: "manual".into(),
+            owner_invocation_receipt: Some("receipt".into()),
+            execution_id: "e".into(),
+            state: HookRunState::Succeeded,
+            exit_status: Some(0),
+            started_at: None,
+            ended_at: None,
+            output_excerpt_ref: None,
+            timeout_reason: None,
+        };
+        let check = |run: HookRun| {
+            plan_workspace(
+                &policy,
+                path.clone(),
+                &base,
+                &contents,
+                PlanInputs {
+                    approval: Some(&approval),
+                    owner_invoked: false,
+                    automatic_profile_proven: true,
+                    operation_id: "op",
+                    successful_manual_hooks: &[run],
+                },
+            )
+            .unwrap()
+        };
+        let plan = check(valid.clone());
+        assert!(!plan.preparation_blocked);
+        assert!(
+            plan.hooks[0]
+                .refusals
+                .contains(&PlanRefusal::OwnerManualRequiresOwner)
+        );
+        assert!(
+            !plan.hooks[0]
+                .refusals
+                .contains(&PlanRefusal::PreparationBlocked)
+        );
+        let mut invalid = Vec::new();
+        let mut r = valid.clone();
+        r.operation_id = "other".into();
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.phase = "pre_teardown".into();
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.hook_id = "other".into();
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.approved_digest = "stale".into();
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.owner_invocation_receipt = None;
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.owner_invocation_receipt = Some("".into());
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.invocation_mode = HookExecution::Automatic;
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.state = HookRunState::Failed;
+        invalid.push(r);
+        let mut r = valid.clone();
+        r.exit_status = None;
+        invalid.push(r);
+        for r in invalid {
+            assert!(check(r).preparation_blocked);
+        }
+    }
+
+    #[test]
+    fn default_and_maximum_hook_limits_are_validated() {
+        let without = POLICY
+            .replace("timeout_secs = 30\n", "")
+            .replace("output_limit_bytes = 65536\n", "");
+        let mut policy = WorkspacePolicy::parse(&without).unwrap();
+        assert_eq!(policy.post_create[0].timeout_secs, 120);
+        assert_eq!(policy.post_create[0].output_limit_bytes, 65_536);
+        policy.post_create[0].timeout_secs = 600;
+        assert!(policy.validate().is_ok());
+        policy.post_create[0].timeout_secs = 601;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn opaque_env_wrapper_cannot_be_approved_without_its_chain() {
+        let (dir, repo, common) = fixture();
+        let mut policy = WorkspacePolicy::parse(POLICY).unwrap();
+        policy.post_create[0].argv =
+            vec!["/usr/bin/env".into(), "python3".into(), "./hook.py".into()];
+        let contents = vec![ContentEvidence {
+            path: "/usr/bin/env".into(),
+            sha256: executable_digest(b"env"),
+        }];
+        assert!(
+            workspace_policy_digest(
+                &policy,
+                &paths(dir.path(), &repo, &common),
+                &"a".repeat(40),
+                &contents
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hook_limits_and_credential_environment_are_refused() {
+        let policy = WorkspacePolicy::parse(POLICY).unwrap();
+        let mut bad = policy.clone();
+        bad.post_create[0].timeout_secs = 601;
+        assert!(bad.validate().is_err());
+        bad = policy.clone();
+        bad.post_create[0].output_limit_bytes = 65537;
+        assert!(bad.validate().is_err());
+        for secret in ["AWS_SECRET_ACCESS_KEY", "ANTHROPIC_API_KEY"] {
+            bad = policy.clone();
+            bad.post_create[0].environment_names = vec![secret.into()];
+            assert!(bad.validate().is_err(), "{secret}");
+        }
+    }
+
+    #[test]
+    fn service_only_policy_requires_approval() {
+        let (dir, repo, common) = fixture();
+        let mut policy = WorkspacePolicy::parse(POLICY).unwrap();
+        policy.post_create.clear();
+        policy.services.push(ServiceSpec {
+            name: "web".into(),
+            argv: vec!["./server".into()],
+            adapter: "vite-node-v1".into(),
+            ready_protocol: "fl-dev-ready-v1".into(),
+            ready_timeout_secs: 15,
+            environment_names: vec![],
+            credential_bundle: None,
+            content_paths: vec![],
+        });
+        let contents = vec![ContentEvidence {
+            path: "./server".into(),
+            sha256: executable_digest(b"server"),
+        }];
+        let success = Vec::new();
+        let plan = plan_workspace(
+            &policy,
+            paths(dir.path(), &repo, &common),
+            &"a".repeat(40),
+            &contents,
+            PlanInputs {
+                approval: None,
+                owner_invoked: false,
+                automatic_profile_proven: true,
+                operation_id: "op-1",
+                successful_manual_hooks: &success,
+            },
+        )
+        .unwrap();
+        assert!(plan.preparation_blocked);
+        assert_eq!(plan.policy_refusal, Some(PlanRefusal::UnapprovedPolicy));
     }
 
     #[test]
@@ -805,6 +1065,8 @@ pub enum PlanRefusal {
     HookNetworkRequiresOwner,
     HookProfileUnsupported,
     UnapprovedHook,
+    UnapprovedPolicy,
+    OwnerManualRequiresOwner,
     PreparationBlocked,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +1083,8 @@ pub struct WorkspacePlan {
     pub policy_digest: String,
     pub base_oid: String,
     pub hooks: Vec<HookPlan>,
+    /// Policy-level refusal covers service-only policies as well as hooks.
+    pub policy_refusal: Option<PlanRefusal>,
     pub preparation_blocked: bool,
 }
 /// Create the canonical digest for the full policy, resolved paths, base and all content evidence.
@@ -870,6 +1134,23 @@ pub fn workspace_policy_digest(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
+        // These executables dispatch another command, so binding only their own bytes would
+        // misrepresent what was approved. A future explicit wrapper resolver may support them.
+        if matches!(
+            executable,
+            "env"
+                | "busybox"
+                | "sudo"
+                | "doas"
+                | "nohup"
+                | "nice"
+                | "timeout"
+                | "xargs"
+                | "setsid"
+                | "command"
+        ) {
+            return Err(WorkspaceError::Content("unresolved command wrapper".into()));
+        }
         let interpreter = matches!(
             executable,
             "sh" | "bash" | "dash" | "zsh" | "python" | "python3" | "node" | "ruby" | "perl"
@@ -884,10 +1165,11 @@ pub fn workspace_policy_digest(
                     "inline or module interpreter command".into(),
                 ));
             }
+            // Interpreter switches can consume additional arguments or change what runs.
+            // Accept only an explicit first script; opaque interpreter options fail closed.
             let script = argv
-                .iter()
-                .skip(1)
-                .find(|arg| !arg.starts_with('-'))
+                .get(1)
+                .filter(|arg| !arg.starts_with('-'))
                 .ok_or_else(|| WorkspaceError::Content("interpreter script".into()))?;
             if !artifacts.contains_key(script) {
                 return Err(WorkspaceError::Content(script.clone()));
@@ -904,8 +1186,10 @@ pub struct PlanInputs<'a> {
     pub approval: Option<&'a WorkspaceApproval>,
     pub owner_invoked: bool,
     pub automatic_profile_proven: bool,
-    /// IDs with a successful Owner invocation matching the current digest.
-    pub successful_manual_hooks: &'a BTreeSet<String>,
+    /// Identity of the operation whose prerequisites are being evaluated.
+    pub operation_id: &'a str,
+    /// Trusted, durable hook-run evidence; matching is performed here.
+    pub successful_manual_hooks: &'a [HookRun],
 }
 pub fn plan_workspace(
     policy: &WorkspacePolicy,
@@ -919,13 +1203,32 @@ pub fn plan_workspace(
         .approval
         .is_some_and(|a| a.policy_digest == digest && a.base_oid.eq_ignore_ascii_case(base_oid));
     let mut hooks = Vec::new();
-    let mut preparation_blocked = false;
+    if !valid_text(input.operation_id, 256) || input.operation_id.trim().is_empty() {
+        return Err(WorkspaceError::Policy("invalid operation id".into()));
+    }
+    let policy_refusal = (!approved).then_some(PlanRefusal::UnapprovedPolicy);
+    let mut preparation_blocked = !approved;
     for (phase, hook) in policy
         .post_create
         .iter()
         .map(|h| ("post_create", h))
         .chain(policy.pre_teardown.iter().map(|h| ("pre_teardown", h)))
     {
+        let completed_manual = approved
+            && hook.execution == HookExecution::OwnerManual
+            && input.successful_manual_hooks.iter().any(|run| {
+                run.operation_id == input.operation_id
+                    && run.phase == phase
+                    && run.hook_id == hook.id
+                    && run.approved_digest == digest
+                    && run.invocation_mode == HookExecution::OwnerManual
+                    && run.state == HookRunState::Succeeded
+                    && run.exit_status == Some(0)
+                    && run
+                        .owner_invocation_receipt
+                        .as_deref()
+                        .is_some_and(|r| valid_text(r, 4096) && !r.trim().is_empty())
+            });
         let mut refusals = Vec::new();
         if hook.needs_network && !input.owner_invoked {
             refusals.push(PlanRefusal::HookNetworkRequiresOwner);
@@ -934,19 +1237,22 @@ pub fn plan_workspace(
             refusals.push(PlanRefusal::UnapprovedHook);
         }
         if hook.execution == HookExecution::OwnerManual && !input.owner_invoked {
-            refusals.push(PlanRefusal::PreparationBlocked);
+            refusals.push(PlanRefusal::OwnerManualRequiresOwner);
+            if hook.required && !completed_manual {
+                refusals.push(PlanRefusal::PreparationBlocked);
+            }
         }
         if hook.execution == HookExecution::Automatic && !input.automatic_profile_proven {
             refusals.push(PlanRefusal::HookProfileUnsupported);
         }
         let refusal = refusals.first().copied();
-        if phase == "post_create"
-            && hook.required
-            && (refusal.is_some()
-                || (hook.execution == HookExecution::OwnerManual
-                    && !input.successful_manual_hooks.contains(&hook.id)))
-        {
-            preparation_blocked = true;
+        if phase == "post_create" && hook.required {
+            let blocked = if hook.execution == HookExecution::OwnerManual {
+                !completed_manual
+            } else {
+                refusal.is_some()
+            };
+            preparation_blocked |= blocked;
         }
         hooks.push(HookPlan {
             id: hook.id.clone(),
@@ -960,6 +1266,7 @@ pub fn plan_workspace(
         policy_digest: digest,
         base_oid: base_oid.to_ascii_lowercase(),
         hooks,
+        policy_refusal,
         preparation_blocked,
     })
 }
