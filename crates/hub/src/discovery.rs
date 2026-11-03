@@ -2211,6 +2211,151 @@ fn is_antigravity_transcript(path: &Path) -> bool {
         || lossy.contains(".system_generated\\logs\\transcript.jsonl")
 }
 
+/// Hydrate truncated `content` and `thinking` fields on Antigravity `transcript.jsonl` turns
+/// from the sibling `transcript_full.jsonl` when present, while keeping tool outputs (`GENERIC`,
+/// `TOOL_RESULT`, `CHECKPOINT`) and `tool_calls` compact.
+fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader, Read};
+
+    if !is_antigravity_transcript(path) || !compact_raw.contains("\"truncated_fields\"") {
+        return None;
+    }
+    let full_path = path.with_file_name("transcript_full.jsonl");
+    if !fs::metadata(&full_path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+
+    struct PendingHydration {
+        compact_idx: usize,
+        step_index: Option<u64>,
+        created_at: Option<String>,
+        line_type: Option<String>,
+        needs_content: bool,
+        needs_thinking: bool,
+        val: Value,
+        hydrated: bool,
+    }
+
+    let compact_lines: Vec<&str> = compact_raw.lines().collect();
+    let mut pending = Vec::new();
+    for (compact_idx, line) in compact_lines.iter().enumerate() {
+        if !line.contains("\"truncated_fields\"") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let line_type = val.get("type").and_then(Value::as_str).map(str::to_string);
+        if matches!(
+            line_type.as_deref(),
+            Some("GENERIC" | "TOOL_RESULT" | "tool_result" | "tool" | "CHECKPOINT")
+        ) {
+            continue;
+        }
+        let Some(trunc_arr) = val.get("truncated_fields").and_then(Value::as_array) else {
+            continue;
+        };
+        let needs_content = trunc_arr.iter().any(|v| v.as_str() == Some("content"));
+        let needs_thinking = trunc_arr.iter().any(|v| v.as_str() == Some("thinking"));
+        if !needs_content && !needs_thinking {
+            continue;
+        }
+        let step_index = val.get("step_index").and_then(Value::as_u64);
+        let created_at = val
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        pending.push(PendingHydration {
+            compact_idx,
+            step_index,
+            created_at,
+            line_type,
+            needs_content,
+            needs_thinking,
+            val,
+            hydrated: false,
+        });
+    }
+
+    if pending.is_empty() {
+        return None;
+    }
+
+    let file = fs::File::open(&full_path).ok()?;
+    let mut reader = BufReader::new(file.take(TRANSCRIPT_READ_MAX_BYTES * 2));
+    let mut buf = Vec::new();
+    let mut full_idx = 0usize;
+    while reader
+        .read_until(b'\n', &mut buf)
+        .ok()
+        .filter(|&n| n > 0)
+        .is_some()
+    {
+        let full_line = String::from_utf8_lossy(&buf);
+        let trimmed = full_line.trim();
+        if !trimmed.is_empty() {
+            let candidate = pending.iter().any(|p| {
+                !p.hydrated
+                    && (p.compact_idx == full_idx
+                        || p.created_at
+                            .as_deref()
+                            .is_some_and(|ca| trimmed.contains(ca))
+                        || (p.created_at.is_none() && p.step_index.is_some()))
+            });
+            if candidate && let Ok(full_val) = serde_json::from_str::<Value>(trimmed) {
+                let full_step = full_val.get("step_index").and_then(Value::as_u64);
+                let full_ca = full_val.get("created_at").and_then(Value::as_str);
+                let full_type = full_val.get("type").and_then(Value::as_str);
+                if let Some(p) = pending.iter_mut().find(|p| {
+                    !p.hydrated
+                        && p.step_index == full_step
+                        && p.created_at.as_deref() == full_ca
+                        && p.line_type.as_deref() == full_type
+                }) {
+                    if let Some(obj) = p.val.as_object_mut() {
+                        if p.needs_content
+                            && let Some(full_content) = full_val.get("content")
+                        {
+                            obj.insert("content".to_string(), full_content.clone());
+                        }
+                        if p.needs_thinking
+                            && let Some(full_thinking) = full_val.get("thinking")
+                        {
+                            obj.insert("thinking".to_string(), full_thinking.clone());
+                        }
+                        if let Some(trunc) = obj
+                            .get_mut("truncated_fields")
+                            .and_then(Value::as_array_mut)
+                        {
+                            trunc.retain(|v| !matches!(v.as_str(), Some("content" | "thinking")));
+                        }
+                    }
+                    p.hydrated = true;
+                    if pending.iter().all(|p| p.hydrated) {
+                        break;
+                    }
+                }
+            }
+        }
+        buf.clear();
+        full_idx += 1;
+    }
+
+    if !pending.iter().any(|p| p.hydrated) {
+        return None;
+    }
+
+    let mut out_lines: Vec<String> = compact_lines.iter().map(|&s| s.to_string()).collect();
+    for p in pending {
+        if p.hydrated
+            && let Ok(serialized) = serde_json::to_string(&p.val)
+        {
+            out_lines[p.compact_idx] = serialized;
+        }
+    }
+    Some(out_lines.join("\n"))
+}
+
 fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage> {
     let lines: Vec<&str> = raw.lines().collect();
     let mut last_step_index: Option<u64> = None;
@@ -2280,7 +2425,9 @@ impl TranscriptReads {
     /// The file's turns, parsed on the first call for `path` only; `None` when it cannot be read.
     fn turns(&mut self, path: &str) -> Option<&[TranscriptTurn]> {
         if !self.turns.contains_key(path) {
-            let parsed = parse_jsonl_transcript(self.raw(path)?);
+            let raw = self.raw(path)?;
+            let hydrated = hydrate_agy_truncated_turns(Path::new(path), raw);
+            let parsed = parse_jsonl_transcript(hydrated.as_deref().unwrap_or(raw));
             self.turns.insert(path.to_string(), parsed);
         }
         self.turns.get(path).map(Vec::as_slice)
@@ -9420,5 +9567,150 @@ mod tests {
         assert_eq!(sonya_sess.persona.as_deref(), Some("sonya"));
         let kayla_sess = sessions.iter().find(|s| s.id == "conv-kayla").unwrap();
         assert_eq!(kayla_sess.persona.as_deref(), Some("kayla"));
+    }
+
+    #[test]
+    fn agy_transcript_hydrates_truncated_content_and_thinking_from_transcript_full() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
+        let logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("agy-hydrate-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+
+        let compact = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "created_at": "2026-11-03T17:00:00Z",
+                "content": "short prefix... <truncated 457 bytes>",
+                "truncated_fields": ["content"]
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-03T17:00:05Z",
+                "content": "reply prefix... <truncated 512 bytes>",
+                "thinking": "thought prefix... <truncated 300 bytes>",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "arguments": {"CommandLine": "cargo test <truncated 200 bytes>"}
+                }],
+                "truncated_fields": ["content", "thinking", "tool_calls"]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "created_at": "2026-11-03T17:00:06Z",
+                "content": "Created At: 2026-11-03\ncompact tool output <truncated 9000 bytes>",
+                "truncated_fields": ["content"]
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let full = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "created_at": "2026-11-03T17:00:00Z",
+                "content": "short prefix... and the complete user prompt without truncation"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-03T17:00:05Z",
+                "content": "reply prefix... and the full planner response body",
+                "thinking": "thought prefix... and the full chain of thought",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "arguments": {"CommandLine": "cargo test --all-targets --workspace --verbose"}
+                }]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "created_at": "2026-11-03T17:00:06Z",
+                "content": "Created At: 2026-11-03\nfull giant 9000-byte tool output that should stay compact"
+            }),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        fs::write(logs.join("transcript.jsonl"), format!("{compact}\n")).unwrap();
+        fs::write(logs.join("transcript_full.jsonl"), format!("{full}\n")).unwrap();
+
+        let (turns, costs) = cost_counters::measure(|| {
+            read_session_transcript_with_home("agy-hydrate-1", &store, Some(home))
+        });
+        assert_eq!(costs.transcript_reads, 1);
+        assert_eq!(costs.transcript_parses, 1);
+        assert_eq!(turns.len(), 3);
+
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(
+            turns[0].content,
+            "short prefix... and the complete user prompt without truncation"
+        );
+
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(
+            turns[1].content,
+            "reply prefix... and the full planner response body"
+        );
+        assert_eq!(
+            turns[1].thinking.as_deref(),
+            Some("thought prefix... and the full chain of thought")
+        );
+        assert_eq!(turns[1].tool_calls.len(), 1);
+        assert_eq!(
+            turns[1].tool_calls[0].arguments["CommandLine"],
+            "cargo test <truncated 200 bytes>"
+        );
+
+        assert_eq!(turns[2].role, "tool");
+        assert_eq!(
+            turns[2].content,
+            "Created At: 2026-11-03\ncompact tool output <truncated 9000 bytes>"
+        );
+    }
+
+    #[test]
+    fn agy_transcript_falls_back_cleanly_when_transcript_full_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = fl_store::open_redb(&home.join("store.redb")).unwrap();
+        let logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("agy-no-full-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+
+        let compact = serde_json::json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-03T17:00:05Z",
+            "content": "compact only <truncated 100 bytes>",
+            "truncated_fields": ["content"]
+        })
+        .to_string();
+        fs::write(logs.join("transcript.jsonl"), format!("{compact}\n")).unwrap();
+
+        let turns = read_session_transcript_with_home("agy-no-full-1", &store, Some(home));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[0].content, "compact only <truncated 100 bytes>");
     }
 }
