@@ -1235,7 +1235,8 @@ fn vendor_hook_response(
             session_id,
             cwd: Some(hook_cwd.clone()),
             // The tmux window is not guessed here: route discovery ties the route to the live
-            // `<Session>:muse` window (see `RouteTable::attach_muse_tmux_windows`).
+            // `muse:<persona>` or `<Session>:muse` window (see
+            // `RouteTable::attach_muse_tmux_windows`).
             tmux_target: None,
             tmux_pane: std::env::var("TMUX_PANE")
                 .ok()

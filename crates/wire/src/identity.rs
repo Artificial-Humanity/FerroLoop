@@ -1,6 +1,6 @@
 //! Sender persona resolution, live vendor route table, and passive route discovery (spec §3.1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -1026,33 +1026,47 @@ impl RouteTable {
         }
     }
 
-    /// Tie Muse routes to the live `<Session>:muse` tmux windows (the window a lifecycle
-    /// launches Muse in; the session is the capitalised persona).
+    /// Tie Muse routes to the live tmux windows a Muse agent runs in. Two forms are recognised:
+    /// `muse:<persona>` (a window of the shared `muse` session, the form `muse-sessions` and the
+    /// lifecycle use) and `<Session>:muse` (a session named by the capitalised persona). When a
+    /// persona has both, `muse:<persona>` is preferred. A window of the shared session whose name
+    /// is not a valid persona (a window literally named `muse` included) is skipped, as is a
+    /// `<Session>:muse` whose session is not.
     ///
-    /// - A Muse route without a tmux target gets the persona's window, when it is live.
-    ///   A target a route already has is kept, except the old guess `muse:<persona>` (what the
-    ///   hook once stored): that counts as unset, so it is replaced by the live window or
-    ///   cleared when there is none.
+    /// - A route's tmux target is kept exactly when that window is live (any listed
+    ///   `session:window`); otherwise it is replaced by the persona's live window, or cleared
+    ///   when there is none. So `muse:<persona>` is a legitimate stored target, and a stale one
+    ///   goes when its window does. The caller passes a window list only when tmux answered, so
+    ///   a tmux failure never reaches here and leaves every target alone.
     /// - A live window whose persona has no route at all gets a placeholder Muse route with an
     ///   empty session id and no cwd, so a prompt can reach Muse before its first transcript
     ///   exists. The route is only a tmux address: it never matches a session id, and a
     ///   delivery on it fails unless the window is alive (see `deliver_to_muse_route`).
-    /// - A placeholder whose window is gone is dropped.
+    /// - A placeholder with no live window is dropped.
     fn attach_muse_tmux_windows(&mut self, windows: &[TmuxWindow], at: &At) {
-        let mut live: BTreeMap<String, String> = BTreeMap::new();
+        let mut shared: BTreeMap<String, String> = BTreeMap::new();
+        let mut per_persona: BTreeMap<String, String> = BTreeMap::new();
+        let mut live_targets: BTreeSet<String> = BTreeSet::new();
         for (session, window) in windows {
-            if window != "muse" {
-                continue;
-            }
-            let Some(persona) = normalize_claude_session_name(session) else {
+            live_targets.insert(format!("{session}:{window}"));
+            // The shared session's windows are named by persona; any other session names the
+            // persona and holds a window called `muse`.
+            let (persona, found) = if session == "muse" {
+                (normalize_claude_session_name(window), &mut shared)
+            } else if window == "muse" {
+                (normalize_claude_session_name(session), &mut per_persona)
+            } else {
                 continue;
             };
-            if persona == "muse" {
+            let Some(persona) = persona.filter(|p| p != "muse") else {
                 continue;
-            }
-            live.entry(persona)
-                .or_insert_with(|| format!("{session}:muse"));
+            };
+            found
+                .entry(persona)
+                .or_insert_with(|| format!("{session}:{window}"));
         }
+        let mut live: BTreeMap<String, String> = per_persona;
+        live.extend(shared);
         let mut gone = Vec::new();
         for (persona, entry) in &mut self.entries {
             let VendorRoute::Muse {
@@ -1063,14 +1077,16 @@ impl RouteTable {
             else {
                 continue;
             };
-            let guessed = tmux_target.as_deref() == Some(format!("muse:{persona}").as_str());
+            if tmux_target
+                .as_deref()
+                .is_some_and(|t| live_targets.contains(t))
+            {
+                continue;
+            }
             match live.get(persona) {
-                Some(target) if tmux_target.is_none() || guessed => {
-                    *tmux_target = Some(target.clone());
-                }
+                Some(target) => *tmux_target = Some(target.clone()),
                 None if session_id.is_empty() => gone.push(persona.clone()),
-                None if guessed => *tmux_target = None,
-                _ => {}
+                None => *tmux_target = None,
             }
         }
         for persona in gone {
@@ -5113,26 +5129,73 @@ mod tests {
             target_for(Some(&windows(&[("Kacey", "muse")]))).as_deref(),
             Some("Kacey:muse")
         );
-        // The old `muse:<persona>` guess is gone: a live `muse` session does not make a target.
-        assert_eq!(target_for(Some(&windows(&[("muse", "kacey")]))), None);
+        // A window of the shared `muse` session named by the persona is hers.
+        assert_eq!(
+            target_for(Some(&windows(&[("muse", "kacey")]))).as_deref(),
+            Some("muse:kacey")
+        );
+        // Another persona's window of the shared session, a window literally named `muse` and
+        // a name that is no persona are not hers.
+        assert_eq!(
+            target_for(Some(&windows(&[
+                ("muse", "mira"),
+                ("muse", "muse"),
+                ("muse", "Bad Name"),
+                ("muse", "artificial-humanity-kacey"),
+            ]))),
+            None
+        );
+        // With both forms live the shared session's window is preferred, whatever the order.
+        for pairs in [
+            [("Kacey", "muse"), ("muse", "kacey")],
+            [("muse", "kacey"), ("Kacey", "muse")],
+        ] {
+            assert_eq!(
+                target_for(Some(&windows(&pairs))).as_deref(),
+                Some("muse:kacey"),
+                "{pairs:?}"
+            );
+        }
     }
 
     #[test]
-    fn a_muse_route_keeps_the_tmux_target_it_has() {
-        let mut table = RouteTable::default();
-        table.upsert(
-            "kacey",
-            VendorRoute::Muse {
-                session_id: "s".into(),
-                cwd: None,
-                tmux_target: Some("Elsewhere:1".into()),
-                tmux_pane: None,
-            },
-            At::from_unix_millis(1),
+    fn a_muse_route_keeps_its_tmux_target_exactly_while_that_window_is_live() {
+        let route = || {
+            let mut table = RouteTable::default();
+            table.upsert(
+                "kacey",
+                VendorRoute::Muse {
+                    session_id: "s".into(),
+                    cwd: None,
+                    tmux_target: Some("Elsewhere:1".into()),
+                    tmux_pane: None,
+                },
+                At::from_unix_millis(1),
+            );
+            table
+        };
+        let target_after = |pairs: &[(&str, &str)]| {
+            let mut table = route();
+            table.attach_muse_tmux_windows(&windows(pairs), &At::from_unix_millis(2));
+            muse_parts(&muse_route_of(&table, "kacey").unwrap()).1
+        };
+        // Its window is live: kept, even though the persona has live windows of the two forms.
+        assert_eq!(
+            target_after(&[("Elsewhere", "1"), ("Kacey", "muse"), ("muse", "kacey")]).as_deref(),
+            Some("Elsewhere:1")
         );
-        table.attach_muse_tmux_windows(&windows(&[("Kacey", "muse")]), &At::from_unix_millis(2));
-        let (_, target, _) = muse_parts(&muse_route_of(&table, "kacey").unwrap());
-        assert_eq!(target.as_deref(), Some("Elsewhere:1"));
+        // Its window is gone: replaced by the persona's live window (shared form first) ...
+        assert_eq!(
+            target_after(&[("Kacey", "muse")]).as_deref(),
+            Some("Kacey:muse")
+        );
+        assert_eq!(
+            target_after(&[("Kacey", "muse"), ("muse", "kacey")]).as_deref(),
+            Some("muse:kacey")
+        );
+        // ... or cleared when she has none.
+        assert_eq!(target_after(&[("Other", "muse"), ("muse", "mira")]), None);
+        assert_eq!(target_after(&[]), None);
     }
 
     #[test]
@@ -5245,6 +5308,37 @@ mod tests {
     }
 
     #[test]
+    fn a_live_window_of_the_shared_muse_session_makes_a_route_through_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let _env = TmuxEnv::fake(
+            tmp.path(),
+            &home,
+            &[
+                "muse:mira",
+                "muse:muse",
+                "muse:Bad Name",
+                "Kacey:muse",
+                "muse:kacey",
+            ],
+        );
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(&home), At::from_unix_millis(5));
+        let targets: Vec<(String, Option<String>)> = table
+            .entries
+            .keys()
+            .map(|p| (p.clone(), muse_parts(&muse_route_of(&table, p).unwrap()).1))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                ("kacey".to_string(), Some("muse:kacey".to_string())),
+                ("mira".to_string(), Some("muse:mira".to_string())),
+            ]
+        );
+    }
+
+    #[test]
     fn a_muse_window_does_not_replace_a_route_the_persona_already_has() {
         let at = At::from_unix_millis(5);
         let mut table = RouteTable::default();
@@ -5307,44 +5401,99 @@ mod tests {
     }
 
     #[test]
-    fn the_old_muse_persona_guess_is_replaced_by_the_live_window() {
-        let mut table = RouteTable::default();
-        table.upsert(
-            "kacey",
-            muse_route_with("s", Some("muse:kacey")),
-            At::from_unix_millis(1),
+    fn a_stored_shared_session_target_is_kept_while_its_window_is_live_and_cleared_when_not() {
+        let table_with = |target: &str| {
+            let mut table = RouteTable::default();
+            table.upsert(
+                "kacey",
+                muse_route_with("s", Some(target)),
+                At::from_unix_millis(1),
+            );
+            table
+        };
+        let target_after = |stored: &str, pairs: &[(&str, &str)]| {
+            let mut table = table_with(stored);
+            table.attach_muse_tmux_windows(&windows(pairs), &At::from_unix_millis(2));
+            let route = muse_route_of(&table, "kacey").unwrap();
+            assert!(
+                matches!(&route, VendorRoute::Muse { tmux_pane: Some(p), .. } if p == "%3"),
+                "the pane stays: {route:?}"
+            );
+            muse_parts(&route).1
+        };
+        // Live: kept (it is a legitimate target now, not a guess).
+        assert_eq!(
+            target_after("muse:kacey", &[("muse", "kacey")]).as_deref(),
+            Some("muse:kacey")
         );
-        table.attach_muse_tmux_windows(&windows(&[("Kacey", "muse")]), &At::from_unix_millis(2));
-        let (_, target, _) = muse_parts(&muse_route_of(&table, "kacey").unwrap());
-        assert_eq!(target.as_deref(), Some("Kacey:muse"));
+        // Neither form live: cleared.
+        assert_eq!(target_after("muse:kacey", &[("Other", "muse")]), None);
+        assert_eq!(target_after("muse:kacey", &[("muse", "mira")]), None);
+        assert_eq!(target_after("muse:kacey", &[]), None);
+        // Its own window is gone but the other form is live: moves to it.
+        assert_eq!(
+            target_after("muse:kacey", &[("Kacey", "muse")]).as_deref(),
+            Some("Kacey:muse")
+        );
+        // The same holds for the per-persona form.
+        assert_eq!(
+            target_after("Kacey:muse", &[("Kacey", "muse")]).as_deref(),
+            Some("Kacey:muse")
+        );
+        assert_eq!(target_after("Kacey:muse", &[("Other", "muse")]), None);
+        assert_eq!(
+            target_after("Kacey:muse", &[("muse", "kacey")]).as_deref(),
+            Some("muse:kacey")
+        );
     }
 
     #[test]
-    fn the_old_muse_persona_guess_is_cleared_when_no_window_is_live() {
+    fn a_live_window_of_either_form_makes_a_placeholder_route_preferring_the_shared_one() {
+        let at = At::from_unix_millis(5);
         let mut table = RouteTable::default();
-        table.upsert(
-            "kacey",
-            muse_route_with("s", Some("muse:kacey")),
-            At::from_unix_millis(1),
+        table.attach_muse_tmux_windows(
+            &windows(&[
+                ("Kacey", "muse"),
+                ("muse", "kacey"),
+                ("Felix", "muse"),
+                ("muse", "mira"),
+                // Not personas, or not Muse windows.
+                ("muse", "muse"),
+                ("muse", "Bad Name"),
+                ("muse", "artificial-humanity-x"),
+                ("Bad Name", "muse"),
+                ("Other", "zsh"),
+            ]),
+            &at,
         );
-        table.upsert(
-            "mira",
-            muse_route_with("s2", Some("Elsewhere:1")),
-            At::from_unix_millis(1),
-        );
-        table.attach_muse_tmux_windows(&windows(&[("Other", "muse")]), &At::from_unix_millis(2));
-        let kacey = muse_route_of(&table, "kacey").unwrap();
-        assert_eq!(muse_parts(&kacey).1, None);
-        assert!(
-            matches!(&kacey, VendorRoute::Muse { tmux_pane: Some(p), .. } if p == "%3"),
-            "the pane stays: {kacey:?}"
-        );
-        let (_, mira_target, _) = muse_parts(&muse_route_of(&table, "mira").unwrap());
+        let targets: Vec<(String, Option<String>)> = table
+            .entries
+            .keys()
+            .map(|p| (p.clone(), muse_parts(&muse_route_of(&table, p).unwrap()).1))
+            .collect();
         assert_eq!(
-            mira_target.as_deref(),
-            Some("Elsewhere:1"),
-            "a real target stays"
+            targets,
+            [
+                ("felix".to_string(), Some("Felix:muse".to_string())),
+                ("kacey".to_string(), Some("muse:kacey".to_string())),
+                ("mira".to_string(), Some("muse:mira".to_string())),
+            ]
         );
+        for persona in ["felix", "kacey", "mira"] {
+            let (session_id, _, cwd) = muse_parts(&muse_route_of(&table, persona).unwrap());
+            assert_eq!((session_id.as_str(), cwd), ("", None), "{persona}");
+        }
+    }
+
+    #[test]
+    fn a_placeholder_for_a_shared_session_window_goes_with_its_window() {
+        let at = At::from_unix_millis(5);
+        let mut table = RouteTable::default();
+        table.attach_muse_tmux_windows(&windows(&[("muse", "kacey")]), &at);
+        assert!(table.get("kacey").is_some());
+        table.attach_muse_tmux_windows(&windows(&[("muse", "mira")]), &at);
+        assert!(table.get("kacey").is_none(), "{:?}", table.entries);
+        assert!(table.get("mira").is_some());
     }
 
     #[test]
