@@ -47,7 +47,8 @@ pub use ferrostore::{
     migrate_redb_to_ferrostore,
 };
 pub use knowledge::{
-    DEFAULT_SYNC_BUDGET, IndexPolicy, RankedHits, SearchMode, rank_bm25, rank_state_entries,
+    DEFAULT_SYNC_BUDGET, IndexPolicy, MAX_SYNC_ROUNDS, RankMode, RankedHits, SearchMode,
+    default_embedder, rank_bm25, rank_state_entries, rank_state_entries_mode,
     rank_state_entries_read_only, rank_state_entries_with,
 };
 pub use rollup::{
