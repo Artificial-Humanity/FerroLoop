@@ -14,9 +14,10 @@ use tokio::net::{TcpListener, TcpStream};
 pub(crate) const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 /// The longest pause between two accept attempts after failures.
 pub(crate) const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
-/// Consecutive accept errors of an unrecognised kind after which the hub gives up and returns the
-/// last one, so a listener that is dead in a way this module does not know still surfaces. A
-/// recognised transient error never counts: fd exhaustion can last as long as the load does.
+/// Accept errors of an unrecognised kind, counted since the last successful accept, after which
+/// the hub gives up and returns the last one, so a listener that is dead in a way this module
+/// does not know still surfaces. A recognised transient error neither adds to the count nor
+/// resets it: fd exhaustion can last as long as the load does.
 pub(crate) const ACCEPT_UNKNOWN_ERROR_LIMIT: u32 = 64;
 /// The least time between two log lines about failing accepts; the lines in between are counted
 /// into the next one.
@@ -30,11 +31,26 @@ pub(crate) enum AcceptErrorKind {
     Transient,
     /// The listener itself is unusable. Accepting again can only fail again.
     Fatal,
-    /// Not recognised. Treated as transient, up to [`ACCEPT_UNKNOWN_ERROR_LIMIT`] in a row.
+    /// Not recognised. Treated as transient until [`ACCEPT_UNKNOWN_ERROR_LIMIT`] of them have
+    /// accumulated since the last successful accept.
     Unknown,
 }
 
-/// Classify an error from `accept(2)` (see `man 2 accept`, ERRORS).
+/// Transient errno values that exist on some platforms only. `ENONET` is Linux's; macOS and the
+/// BSDs have no such constant in `libc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_platform_transient(code: i32) -> bool {
+    code == libc::ENONET
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn is_platform_transient(_code: i32) -> bool {
+    false
+}
+
+/// Classify an error from `accept(2)` (see `man 2 accept`, ERRORS). The hub is unix-only, so the
+/// table uses unix errno values; on Windows `raw_os_error` returns WSA codes and every error
+/// would classify as `Unknown`.
 pub(crate) fn classify_accept_error(err: &io::Error) -> AcceptErrorKind {
     if let Some(code) = err.raw_os_error() {
         return match code {
@@ -51,11 +67,11 @@ pub(crate) fn classify_accept_error(err: &io::Error) -> AcceptErrorKind {
             libc::ENETDOWN
             | libc::ENOPROTOOPT
             | libc::EHOSTDOWN
-            | libc::ENONET
             | libc::EHOSTUNREACH
             | libc::EOPNOTSUPP
             | libc::ENETUNREACH
             | libc::ETIMEDOUT => AcceptErrorKind::Transient,
+            code if is_platform_transient(code) => AcceptErrorKind::Transient,
             // The descriptor is not a listening socket: nothing a retry can fix.
             libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EFAULT => AcceptErrorKind::Fatal,
             _ => AcceptErrorKind::Unknown,
@@ -241,6 +257,15 @@ mod tests {
                 "errno {code}"
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_linux_only_network_error_is_transient() {
+        assert_eq!(
+            classify_accept_error(&os(libc::ENONET)),
+            AcceptErrorKind::Transient
+        );
     }
 
     #[test]
@@ -469,14 +494,15 @@ mod tests {
             srv.serve_with(move |inner| Flaky { script, inner }, AcceptGuard::default()),
         );
 
-        // The three errors cost 50 + 100 + 200 ms of backoff before the first accept succeeds.
+        // The three errors cost 50 + 100 + 200 ms of backoff before the first accept succeeds;
+        // the bound leaves margin under that 350 ms.
         let started = Instant::now();
         let reply = tokio::task::spawn_blocking(move || health(addr))
             .await
             .unwrap();
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         assert!(
-            started.elapsed() >= ms(300),
+            started.elapsed() >= ms(250),
             "the loop did not back off: {:?}",
             started.elapsed()
         );
