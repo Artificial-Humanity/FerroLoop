@@ -27,6 +27,7 @@ pub mod terminal;
 mod warrants;
 mod watch_api;
 pub mod ws;
+mod ws_accept;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;

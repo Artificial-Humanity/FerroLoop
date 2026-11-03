@@ -22,6 +22,7 @@ use crate::api::{
 };
 use crate::auth::HubAuthority;
 use crate::terminal::TerminalManager;
+use crate::ws_accept::{AcceptAction, AcceptGuard, Acceptor};
 use crate::{HubServerConfig, HubState, HubWsFrame};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -197,25 +198,54 @@ impl HubServer {
     }
 
     /// Run the accept loop until shutdown is signaled or an unrecoverable accept error occurs.
-    pub async fn serve(mut self) -> io::Result<()> {
-        crate::artifact_dirs::ensure_startup_dirs(&self.state);
+    /// A transient accept error (no free descriptors, a connection reset in the queue, ...) is
+    /// logged and retried after a backoff; see [`crate::ws_accept`].
+    pub async fn serve(self) -> io::Result<()> {
+        self.serve_with(|listener| listener, AcceptGuard::default())
+            .await
+    }
+
+    /// [`HubServer::serve`] with the accept source and the error policy replaced, so a test can
+    /// make `accept` fail on cue.
+    pub(crate) async fn serve_with<A: Acceptor>(
+        self,
+        make_acceptor: impl FnOnce(TcpListener) -> A,
+        mut guard: AcceptGuard,
+    ) -> io::Result<()> {
+        // `shutdown_tx` stays alive for the whole loop: with every sender gone, the receiver
+        // reports a change and the loop would end.
+        let HubServer {
+            state,
+            listener,
+            shutdown_tx: _shutdown_tx,
+            mut shutdown_rx,
+            gates,
+            ..
+        } = self;
+        let mut acceptor = make_acceptor(listener);
+        crate::artifact_dirs::ensure_startup_dirs(&state);
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
         let mut attachment_sweep_tick =
             tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
         attachment_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Between a failed accept and the next one the loop sleeps, but only on this arm: the
+        // drain, the sweep and shutdown keep running.
+        let cooldown = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(cooldown);
+        let mut cooling = false;
         loop {
             tokio::select! {
-                accept_res = self.listener.accept() => {
-                    match accept_res {
-                        Ok((stream, _peer_addr)) => {
+                accept_res = acceptor.accept(), if !cooling => {
+                    match guard.on_result(accept_res, std::time::Instant::now()) {
+                        AcceptAction::Serve(stream, _peer_addr) => {
                             // The permit is taken before the task exists and moves into it, so
                             // it lives as long as the connection and is freed on any exit.
-                            match self.gates.connections.clone().try_acquire_owned() {
+                            match gates.connections.clone().try_acquire_owned() {
                                 Ok(permit) => {
-                                    let state = self.state.clone();
-                                    let gates = self.gates.clone();
+                                    let state = state.clone();
+                                    let gates = gates.clone();
                                     tokio::spawn(async move {
                                         let _permit = permit;
                                         let _ = handle_connection(stream, state, gates).await;
@@ -224,12 +254,22 @@ impl HubServer {
                                 Err(_) => reject_overloaded(stream),
                             }
                         }
-                        Err(e) => return Err(e),
+                        AcceptAction::Retry { delay, log } => {
+                            if let Some(line) = log {
+                                eprintln!("{line}");
+                            }
+                            cooldown.as_mut().reset(tokio::time::Instant::now() + delay);
+                            cooling = true;
+                        }
+                        AcceptAction::Stop(e) => return Err(e),
                     }
                 }
+                () = &mut cooldown, if cooling => {
+                    cooling = false;
+                }
                 _ = drain_tick.tick() => {
-                    if !self.state.queued_session_keys().is_empty() {
-                        let state = self.state.clone();
+                    if !state.queued_session_keys().is_empty() {
+                        let state = state.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             drain_ready_session_queues(&state);
                         }).await;
@@ -237,13 +277,13 @@ impl HubServer {
                 }
                 _ = attachment_sweep_tick.tick() => {
                     // Not awaited: a sweep never holds up the accept loop.
-                    let state = self.state.clone();
+                    let state = state.clone();
                     drop(tokio::task::spawn_blocking(move || {
                         crate::attachments::run_attachment_sweep(&state);
                     }));
                 }
-                changed = self.shutdown_rx.changed() => {
-                    if changed.is_err() || *self.shutdown_rx.borrow() {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         return Ok(());
                     }
                 }
