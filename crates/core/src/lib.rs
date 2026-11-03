@@ -19,6 +19,7 @@ pub mod embed;
 pub mod escalate;
 pub mod escalation;
 pub mod fault;
+pub mod feedback;
 pub mod ferrostate;
 pub mod ferrowire;
 pub mod finding;
@@ -89,6 +90,15 @@ pub use embed::{
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
+pub use feedback::{
+    BindingAuthorization, BindingStatus, DiffSide, EventSource, ExistingMessage,
+    FeedbackDeliveryState, FeedbackError, FeedbackFreshness, FeedbackInput, FeedbackKind,
+    FeedbackOutboxRecord, FeedbackRouteDecision, FeedbackTrust, FeedbackWireEnvelope,
+    GithubFeedbackV1, MAX_FEEDBACK_ENVELOPE_BYTES, MAX_FEEDBACK_EXCERPT_BYTES, PrAuthorBinding,
+    ReviewState, RoutingContext, RunClassification, RunConclusion, classify_run,
+    compare_existing_message, event_key, normalize_feedback, route_feedback_event,
+    sanitize_excerpt,
+};
 pub use ferrostate::{
     GitRepoProbe, MAX_CHECKPOINT_DIRTY_ENTRIES, StateCheckpointReport, WorkspaceImportReport,
     WorkspaceImportScan, apply_workspace_import, build_checkpoint_upsert, create_state_checkpoint,
