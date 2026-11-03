@@ -105,6 +105,13 @@ pub(crate) fn fingerprint_capped<R: Read>(r: R, cap: u64) -> std::io::Result<Fil
 /// read; it must never write.
 pub trait HostProbe {
     fn probe(&self, path: &str) -> PathState;
+
+    /// A shown path as the file system spells it (a leading `~/` becomes the home directory).
+    /// A symlink's target is compared in this form, because `readlink` returns it. The default
+    /// changes nothing.
+    fn expand(&self, shown: &str) -> String {
+        shown.to_string()
+    }
 }
 
 /// A probe over a fixed map, for tests. Records every path asked about.
@@ -208,6 +215,13 @@ fn forbidden_tree(norm: &str) -> bool {
     FORBIDDEN_TREES
         .iter()
         .any(|t| norm == *t || norm.starts_with(&format!("{t}/")))
+}
+
+/// Whether an absolute, normalised path may never be an install root: `/`, a bare system
+/// directory or anything inside a system tree. The apply step asks it of the CANONICAL path,
+/// after every symlink of the existing ancestors is resolved.
+pub fn is_forbidden_install_root(norm: &str) -> bool {
+    norm == "/" || FORBIDDEN_EXACT.contains(&norm) || forbidden_tree(norm)
 }
 
 pub(crate) fn join(base: &str, rel: &str) -> String {
@@ -767,7 +781,7 @@ fn unit_file(state: &PathState, owned: Option<(&str, &str)>, release: &str) -> C
 }
 
 /// `<version>+<sha12>`; a manifest with no commit is `<version>+unstamped`.
-pub(crate) fn release_dir_name(manifest: &ReleaseManifest) -> String {
+pub fn release_dir_name(manifest: &ReleaseManifest) -> String {
     let stamp = manifest
         .release
         .commit
@@ -872,7 +886,7 @@ impl Builder<'_> {
 
     fn link(&mut self, path: String, target: String, role: PathRole, product: Option<Product>) {
         let state = self.probe.probe(&path);
-        let r = symlink(&state, &target, self.owned_link(&path));
+        let r = symlink(&state, &self.probe.expand(&target), self.owned_link(&path));
         let d = self.finish(&path, &state, r);
         self.push(
             path,

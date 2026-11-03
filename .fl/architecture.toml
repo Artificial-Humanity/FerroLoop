@@ -78,7 +78,7 @@ paths = ["crates/watch/**"]
 id = "fl_install"
 title = "Installer I/O"
 kind = "crate"
-description = "The I/O side of the installer: the read-only host probe behind install planning, doctor observation (receipt, owned paths, vault modes, UI build info), and later the transactional install writes"
+description = "The I/O side of the installer: the read-only host probe behind install planning, doctor observation (receipt, owned paths, vault modes, UI build info), and the transactional install (lock, journal, staging, verification, the atomic switch of current, receipt, resume and rollback)"
 package = "fl-install"
 paths = ["crates/install/**"]
 
@@ -230,7 +230,7 @@ label = "feeds the pure install planner and doctor engine the facts they judge"
 [[edges]]
 from = "fl_cli"
 to = "fl_install"
-label = "runs fl install --dry-run and fl doctor over the host probe"
+label = "runs fl install (plan, apply, resume, rollback) and fl doctor over the host probe"
 
 [[edges]]
 from = "fl_hub"

@@ -1,13 +1,16 @@
-# Installer: manifest, receipt, plan and `fl install --dry-run`
+# Installer: manifest, receipt, plan and `fl install`
 
-`fl install` plans an install of the FerroLoop products. Only `--dry-run` exists. It reads a
-release manifest, the install receipt if one exists, and the paths the plan names, and it
-writes nothing. Without `--dry-run` it exits 3 with
-`installing is not implemented in this release; use --dry-run`.
+`fl install` plans an install of the FerroLoop products and, with `--yes`, applies the SAME plan
+as a journaled transaction. `--dry-run` reads a release manifest, the install receipt if one
+exists, and the paths the plan names, and writes nothing. `--yes` installs verified files from a
+local `--artifact-dir`, switches `current`, writes the launcher and the receipt, and can be
+resumed or rolled back after a crash. Without `--dry-run` and without `--yes` it prints the
+plan and exits 3 with `pass --yes to apply (or --dry-run)`.
 
-Code: `fl_core::install` (pure types, the planner and the read-only probe `FsProbe`),
-`crates/cli/src/cmd/install.rs` (the command). `fl doctor` ([doctor.md](doctor.md)) reads the same
-receipt with the same probe.
+Code: `fl_core::install` (pure types, the planner, the transaction model in `txn.rs`),
+`fl_install` (the I/O side: `FsProbe`, the transaction in `engine.rs`, the lock, the journal,
+the path guard, the tree reader), `crates/cli/src/cmd/install.rs` (the command). `fl doctor`
+([doctor.md](doctor.md)) reads the same receipt with the same probe.
 
 ## Products and profiles
 
@@ -63,7 +66,8 @@ The built-in manifest (`default_manifest()`) is a `source_build` manifest with n
 **`install-receipt.json`** (`InstallReceipt`): what an install owns: the release, the profile,
 the explicit product selection, the layout, artifact hashes, owned paths (file hash or symlink
 target), aliases, units (hash and release), catalog entries and config blocks (hashes), and a
-journal of the install transaction (types only; a later phase writes it). It records no
+journal of committed transactions (one `committed` entry per transaction; `seq` is the
+transaction counter and `at_ms` is always 0, because a receipt carries no clock). It records no
 credential: no field can hold one, and `deny_unknown_fields` refuses a document that carries
 any other field.
 
@@ -136,18 +140,182 @@ paths, actions, conflicts, unmanaged paths, notes. It has no timestamp and no ra
 11. **Actions left out.** An action the manifest does not plan in the selected profile is
     listed as a note (`action X is not planned in profile Y`), never dropped silently.
 
+## The install transaction (`fl install --yes`)
+
+```
+fl install --yes [--profile P] [--add X]... [--remove X]... --manifest M --artifact-dir DIR
+           [--prefix PATH] [--replace PATH]... [--keep PATH]... [--lock-timeout SECONDS]
+fl install --resume | --rollback [--prefix PATH]
+```
+
+**Source.** A local directory of EXTRACTED artifacts. Each artifact's `file` in the manifest is a
+directory under `--artifact-dir`, and its `sha256` is the TREE DIGEST of that directory: the
+SHA-256 over one line `<file sha256> <size> <path>\n` per regular file, sorted by path.
+`size` is the total bytes of those files. An archive, a download and a source build are not
+unpacked or fetched in this release. The built-in manifest is a source build with no artifacts,
+so `--yes` needs `--manifest`.
+
+**Layout.** Under the prefix (mutable data, config, keys and logs are never inside it):
+
+```
+releases/<version>+<sha12>/{bin,ui/dist,contrib/units,release.json}   sealed read-only
+releases/.stage-<txn>/                                                 while staging
+current -> releases/<version>+<sha12>      relative symlink, switched by rename(2)
+receipt.json    install.lock    journal.jsonl (only during a transaction)    backups/<n>/
+<bin_dir>/fl -> <prefix>/current/bin/fl    the stable launcher (a symlink)
+<bin_dir>/agent-msg -> fl, <bin_dir>/agent-bus-mcp -> fl     owned aliases of the launcher
+```
+
+The launcher is a symlink into `current`, not a script: the plan already shows it, the doctor
+checks it as a link, and one `rename(2)` of `current` moves the launcher, the aliases and every
+reader at once. The cost is that `current_exe()` resolves through the links to the versioned
+path, so a generated command never uses `current_exe()`; it names `<bin_dir>/fl`. A link target
+is written with `~` expanded (a symlink cannot hold `~`); the receipt holds the real target.
+Release directories and files are sealed (`0555` binaries and directories, `0444` files). The
+installer creates the prefix, `releases/` and the launcher directory `0755` and `backups/` and
+staging directories `0700`, whatever the umask.
+
+**Steps.** One journal line is written and flushed BEFORE each step runs.
+
+| Step | What it does |
+|---|---|
+| `begin` | `journal.jsonl` is created holding the whole intent (release, files and hashes, steps, directories it created, the previous receipt byte for byte). |
+| `backup` | Each `--replace` path is moved to `backups/<n>/<role>-<name>`. |
+| `stage` | The selected products' files are copied into `releases/.stage-<txn>/`, hashed while copying; `release.json` is written. |
+| `verify` | The staged tree is read back and compared with the verified hashes (no missing, extra or changed file) and sealed read-only. |
+| `publish` | The staging directory is renamed to `releases/<name>/`. |
+| `link_current` | A temp symlink replaces `current` by `rename(2)`. |
+| `write_launcher`, `write_aliases` | The launcher and aliases are placed the same way. |
+| `write_receipt` | `receipt.json` is written to a temp file, flushed, renamed over the old one, and the directory is flushed. LAST. |
+| `commit` | The `commit` line is written and `journal.jsonl` is removed. |
+
+A step the transaction does not need is not in its list (the launcher already right, an
+installed release, no `--replace`). The artifacts are hashed BEFORE `begin`: a mismatch, a
+symlink, a special file, a name outside `[A-Za-z0-9._+@/-]`, more than 2500 files, or a size
+other than the manifest's is refused with nothing created. The directory a transaction creates
+(the prefix, `releases/`, the launcher directory) is recorded so a rollback removes exactly it,
+and only if it is empty.
+
+**The lock.** `install.lock` is a held `flock(2)`, with the holder's pid written in it. A second
+installer waits up to `--lock-timeout` seconds (default 30; 0 does not wait), then exits 3
+(`another install is running (pid N)`). A crash releases the lock with the process, so nothing
+is stolen and nothing needs breaking; a pid left in the file by a process that no longer exists
+is reported as a stale lock and replaced. The file is never removed after a successful install.
+
+**Resume and rollback.** A journal left behind is an interrupted transaction. The next
+`fl install --yes`, and `fl install --resume`, find it under the lock:
+* a `commit` line is last: the transaction had committed; the leftover journal is removed;
+* the staged data was verified (the `verify` line is there, or there was nothing to stage): the
+  remaining steps run again, each idempotent, and the transaction completes;
+* otherwise, or if a step cannot complete, every step is undone, newest first: the receipt
+  goes back to the previous bytes (or is removed), the launcher and aliases are removed or
+  pointed back, `current` goes back, the staged and published release this transaction created
+  is removed, the backups are moved back, then the directories it created. An undo only touches
+  what is still exactly what the transaction placed; a link somebody else put there is left.
+
+`fl install --rollback` always undoes. A failing step (a full disk, a permission error) undoes
+the transaction at once and exits 1. A crash during the undo is finished by the next run. A
+journal that does not parse is refused (exit 3) and left for a person to read.
+
+**Ownership and decisions.** The plan's conflicts are decided per path. Without a decision the
+install exits 3 and lists each conflict with the flags that would resolve it.
+* `--replace PATH` moves the existing file, link or directory to `<prefix>/backups/<n>/`
+  (`<n>` counts up, no clock) and installs over the empty slot. The backup is owned by the
+  receipt, with its hash. A release directory that `current` points to cannot be replaced.
+  A conflict inside a release is decided on the release directory.
+* `--keep PATH` (launcher or alias only) leaves it alone and does not own it; keeping the
+  launcher also skips the aliases.
+* A decision for a path that is not a conflict, or both for one path, exits 2.
+* A unit file conflict is information: no unit is written in this release.
+
+**Idempotence and versions.** The same install again exits 0 with `already installed` and
+rewrites nothing. A different version installs side by side and flips `current`. Installing a
+different selection of the SAME release is refused when it needs files the release lacks;
+a change that needs only the receipt is a short transaction (`begin`, `write_receipt`,
+`commit`). Retention is reported, never applied: `current` plus the two previous releases, the
+rest listed as eligible for a later `--gc`.
+
+**Where it may write.** The declared root is `--prefix`, else `$FL_INSTALL_ROOT`, else `$HOME`.
+Every path of the install must lie inside it. The root's existing ancestors are resolved first
+and the result may not be `/` or inside a system tree (`/usr`, `/etc`, `/bin`, `/lib*`, `/boot`,
+`/sys`, `/proc`, `/dev`, ...). The root itself, and every component below it, must not be a
+symlink the installer did not create (only `$HOME` may be a link). Nothing outside the root is
+created, written or removed.
+
+**Journal checks.** `journal.jsonl` is read back from disk, so nothing in it is trusted before it
+is checked: the release name is a plain file name that extends its version, every file path
+passes the in-release path rules, every link is absolute, normalised, under the declared root
+and in the launcher directory, backups sit under `<prefix>/backups/`, and the layout in the
+journal equals the layout of this run. A journal that fails any check is refused with exit 3
+and nothing is touched.
+
+**Directories the install made.** The journal records every directory the transaction created,
+the missing ancestors of the prefix included (a fresh `--prefix /new/dir/fl` makes `/new` and
+`/new/dir`, which lie above the declared root). One rule applies when it is written, checked
+and undone: an entry is a plain absolute path (no `.` or `..`) on the way to, or inside, the
+prefix or the launcher directory, and never `/`, a system directory, the home directory or
+one above it. An undo removes each with `rmdir` (empty directories only), deepest first, and
+only those the journal lists, so it never goes below that floor and never removes a directory
+that holds anything.
+
+**The release directory in an undo.** `releases/<name>` is removed by an undo only when it is
+provably this transaction's: the journal holds a `published` line (written after the rename of
+the staging directory), or the directory holds exactly the files this transaction staged (same
+paths, hashes and sizes), which covers a crash between the rename and its journal line. Any
+other directory there is somebody else's: it is neither adopted by a resume nor removed by an
+undo, and the install is refused over it. "Exactly what was staged" means the same files (hash,
+size and mode bits), the same subdirectories (`0555`) and nothing more. An undo also never
+removes a release that the committed receipt lists or that `current` resolves to, so a journal
+cannot take a committed release away; created directories inside the install root must have no
+symlinked component. The residual limit: a journal is a file of the same user, so anyone who can
+write it can still make an undo `rmdir` an EMPTY directory on the way to the install, or restore
+a backup the journal names; the checks bound that to the install root and its ancestors, never to
+a directory that holds anything.
+
+**Known limit.** Paths are walked with `lstat` and then used by path (no `openat` with a
+directory descriptor), so a process of the same user that races the installer can swap a
+directory component for a symlink between the check and the use. The guard defends against
+what is on disk when the install starts, not against a concurrent hostile process of the same
+user; descriptor-relative walking is future work. Staged files are sealed and hashed through
+open descriptors (`O_NOFOLLOW`, `fchmod`).
+
+**Separate actions.** Registering services, enabling at boot, starting listeners, MCP catalogs,
+the `PATH` change, credentials and state migration are listed after the install as
+`not executed: <action> <subject> [not implemented in this release]`, with the commands a
+service manager (`systemctl --user`, `launchctl`) WOULD run. The service managers are a trait
+(`fl_install::ServiceManager`); the real ones only plan, and the tests use fakes that record
+every call. No unit file is written outside a release directory.
+
+**What this release does not do:** `--adopt`, `--gc`, `--from-git` (each exits 3 with
+`not implemented in this release`), downloads, signatures, unpacking archives, upgrade
+preflight, a rollback between releases, service activation, shell `PATH` edits, MCP catalog
+writes, credential setup and state migration.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | A plan was printed (including a plan with conflicts: read `status`). |
-| 2 | The request is not well formed: unknown product or profile, a product both added and removed, a relative or malformed prefix or `$FL_INSTALL_ROOT`, an unknown flag, `--db`. |
-| 3 | The plan is refused: no `--dry-run`, `--adopt`, an invalid or unreadable manifest or receipt, a forbidden prefix, a removal of a required or needed product, an unsupported platform, a missing artifact. |
+| 0 | A plan was printed (including a plan with conflicts: read `status`); an install, `--resume` or `--rollback` completed; the install was already there. |
+| 1 | A step failed and the transaction was undone (or the undo failed too: run `--resume`); a file system error such as a read-only root. |
+| 2 | The request is not well formed: unknown product or profile, a product both added and removed, a relative or malformed prefix or `$FL_INSTALL_ROOT`, an unknown flag, `--db`, `--dry-run` with `--yes`, `--resume` with `--rollback`, `--yes` with `--resume`, a decision for a path that is not a conflict, `--yes` without `--artifact-dir` when a release must be staged. |
+| 3 | Refused: no `--dry-run` or `--yes` (the plan is printed first), `--adopt`, `--gc`, `--from-git`, an invalid or unreadable manifest or receipt, a source-build manifest, a forbidden prefix or one that resolves into a system tree, a symlinked prefix component, an artifact that fails its size or hash or holds a symlink, an unresolved conflict, another installer holding the lock, a corrupt journal, a removal of a required or needed product, an unsupported platform, a missing artifact. |
+| 70 | Test builds only: a simulated crash returned as an error. |
 
-## What dry-run does NOT do
+## What `--dry-run` does NOT do
 
 It creates, modifies and deletes nothing: no directory, link, unit, catalog, PATH entry,
-receipt or lock file. It starts no process and no service, makes no network call, opens no
-store, reads no project config and no credential, and never reads `$HOME` except to look at
-the paths the plan names. It does not download, verify a signature, build from source, adopt,
-upgrade, roll back, garbage-collect or uninstall; those are later phases.
+receipt, journal or lock file. It starts no process and no service, makes no network call,
+opens no store, reads no project config and no credential, and never reads `$HOME` except to
+look at the paths the plan names.
+
+## Tests
+
+Every run is confined to a temporary root. The crash seam is `fl_install::Faults`: a `FaultPoint`
+(`before` or `after` any step) makes the transaction return a simulated crash with nothing
+undone; the `fl` binary reads `FL_INSTALL_FAULT` only when `fl-install` is built with the
+`fault-injection` feature, which only fl-cli's tests enable; an optimized build with it is a
+compile error. Release builds are `cargo build --release --locked -p fl-cli`, never `--all-targets`
+or `--tests`. The tests crash a fresh install, an
+upgrade and a `--replace` at every point and check, by full directory snapshots, that `--resume`,
+`--rollback` and the next install each end in exactly "fully installed" or exactly the
+pre-state.

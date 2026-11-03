@@ -121,7 +121,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Plan an install of the FerroLoop products (`--dry-run` only; nothing is written).
+    /// Plan an install of the FerroLoop products (`--dry-run`), or apply it as a journaled transaction (`--yes`).
     Install(cmd::install::Cmd),
     /// Check this install's health and change nothing (exit 1 when a check fails)
     Doctor(cmd::doctor::Cmd),

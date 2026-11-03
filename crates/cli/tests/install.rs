@@ -346,22 +346,28 @@ fn refusals_exit_3() {
 }
 
 #[test]
-fn without_dry_run_it_refuses_and_creates_nothing() {
+fn without_yes_it_prints_the_plan_refuses_and_creates_nothing() {
     let w = World::new();
     let before = w.trees();
     for args in [
         vec!["install"],
         vec!["install", "--profile", "lab"],
-        vec!["install", "--json"],
         vec!["install", "--add", "ferrodeck"],
     ] {
-        w.fl()
-            .args(&args)
-            .assert()
-            .code(3)
-            .stdout("")
-            .stderr("error: installing is not implemented in this release; use --dry-run\n");
+        let out = w.fl().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.starts_with("fl install plan"), "{stdout}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            "error: pass --yes to apply (or --dry-run)\n"
+        );
     }
+    // the JSON plan too
+    let out = w.fl().args(["install", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], 1);
     assert_eq!(w.trees(), before);
     assert!(!w.prefix().exists());
 }

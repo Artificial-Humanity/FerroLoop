@@ -121,6 +121,12 @@ impl FsProbe {
 }
 
 impl HostProbe for FsProbe {
+    fn expand(&self, shown: &str) -> String {
+        self.resolve(shown)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| shown.to_string())
+    }
+
     fn probe(&self, shown: &str) -> PathState {
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return PathState::Unreadable {
