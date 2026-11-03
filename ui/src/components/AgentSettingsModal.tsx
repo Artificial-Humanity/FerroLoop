@@ -4,6 +4,7 @@ import type { SessionQuotaUsage } from "../types/api";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
   CANONICAL_PROJECTS,
+  canonicalizeDefaultRole,
   CREATE_CUSTOM_ROLE_VALUE,
   extractRecastConflict,
   normalizeRecastRole,
@@ -113,7 +114,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const { pinnedAgents } = usePinnedState();
   const [recastModalOpen, setRecastModalOpen] = useState(false);
   const [recastProject, setRecastProject] = useState(agentProject || "Workspace");
-  const [recastRole, setRecastRole] = useState(agentRole || "assistant");
+  const [recastRole, setRecastRole] = useState(
+    canonicalizeDefaultRole(agentRole || "assistant"),
+  );
   const [recastCustomRoleInput, setRecastCustomRoleInput] = useState("");
   const [recastConflict, setRecastConflict] = useState<RecastConflictState | null>(null);
   const [recasting, setRecasting] = useState(false);
@@ -122,7 +125,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
 
   useEffect(() => {
     setRecastProject(agentProject || "Workspace");
-    setRecastRole(agentRole || "assistant");
+    setRecastRole(canonicalizeDefaultRole(agentRole || "assistant"));
     setRecastConflict(null);
     setRecastError(null);
     setRecastStatusBanner(null);
@@ -397,7 +400,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
                 Role
               </div>
-              <div className="fd-mono">{agentRole}</div>
+              <div className="fd-mono">{canonicalizeDefaultRole(agentRole)}</div>
             </div>
           )}
           <div>
@@ -700,7 +703,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               title="Reassign agent project or role in the registry without clearing the live session"
               onClick={() => {
                 setRecastProject(agentProject || "Workspace");
-                setRecastRole(agentRole || "assistant");
+                setRecastRole(canonicalizeDefaultRole(agentRole || "assistant"));
                 setRecastConflict(null);
                 setRecastError(null);
                 setRecastModalOpen(true);

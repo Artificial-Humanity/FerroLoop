@@ -740,6 +740,9 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     );
     fireEvent.click(screen.getByTestId("recast-agent-btn-felix"));
     expect(screen.getByTestId("recast-modal")).toBeInTheDocument();
+    expect(
+      (screen.getByTestId("recast-role-select-felix") as HTMLSelectElement).value,
+    ).toBe("ui-developer");
 
     fireEvent.change(screen.getByTestId("recast-role-select-felix"), {
       target: { value: "__create_custom__" },
