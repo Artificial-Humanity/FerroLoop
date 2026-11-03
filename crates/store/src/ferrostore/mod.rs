@@ -48,6 +48,8 @@ mod tests_crash;
 #[cfg(test)]
 mod tests_group;
 #[cfg(test)]
+mod tests_health;
+#[cfg(test)]
 mod tests_reentry;
 #[cfg(test)]
 mod tests_retry;

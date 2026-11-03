@@ -123,6 +123,8 @@ enum Command {
     },
     /// Plan an install of the FerroLoop products (`--dry-run` only; nothing is written).
     Install(cmd::install::Cmd),
+    /// Check this install's health and change nothing (exit 1 when a check fails)
+    Doctor(cmd::doctor::Cmd),
 }
 
 impl Command {
@@ -153,7 +155,8 @@ impl Command {
             | Command::Auth { .. }
             | Command::Watch { .. }
             | Command::Version { .. }
-            | Command::Install(_) => Vec::new(),
+            | Command::Install(_)
+            | Command::Doctor(_) => Vec::new(),
         }
     }
 
@@ -196,7 +199,8 @@ impl Command {
             | Command::Auth { .. }
             | Command::Watch { .. }
             | Command::Version { .. }
-            | Command::Install(_) => false,
+            | Command::Install(_)
+            | Command::Doctor(_) => false,
         }
     }
 
@@ -233,7 +237,8 @@ impl Command {
             | Command::Auth { .. }
             | Command::Watch { .. }
             | Command::Version { .. }
-            | Command::Install(_) => false,
+            | Command::Install(_)
+            | Command::Doctor(_) => false,
         }
     }
 }
@@ -859,6 +864,15 @@ fn run(cli: Cli) -> Result<i32> {
         }
         other => other,
     };
+    // `fl doctor` reads and reports: a broken config or store must not stop it, so it
+    // resolves its own stores and returns before any store path is made or opened.
+    let cli = match cli {
+        Cli {
+            db,
+            command: Command::Doctor(c),
+        } => return cmd::doctor::run(c, db),
+        other => other,
+    };
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
     let cfg = config::load(config::path().as_deref())?;
     // MCP spec §1.1: `fl mcp` never opens a store, so it returns here, before
@@ -1437,7 +1451,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::Auth { .. }
         | Command::Watch { .. }
         | Command::Version { .. }
-        | Command::Install(_) => {
+        | Command::Install(_)
+        | Command::Doctor(_) => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

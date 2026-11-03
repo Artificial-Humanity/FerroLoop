@@ -3,6 +3,7 @@ pub mod arch;
 pub mod attempt;
 pub mod auth;
 pub mod check;
+pub mod doctor;
 pub mod escalate;
 pub mod finding;
 pub mod flow;

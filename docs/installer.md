@@ -5,8 +5,9 @@ release manifest, the install receipt if one exists, and the paths the plan name
 writes nothing. Without `--dry-run` it exits 3 with
 `installing is not implemented in this release; use --dry-run`.
 
-Code: `fl_core::install` (pure types and planner), `crates/cli/src/cmd/install.rs` (the command
-and the read-only probe).
+Code: `fl_core::install` (pure types, the planner and the read-only probe `FsProbe`),
+`crates/cli/src/cmd/install.rs` (the command). `fl doctor` ([doctor.md](doctor.md)) reads the same
+receipt with the same probe.
 
 ## Products and profiles
 
@@ -43,7 +44,9 @@ before the rest of the document is read.
 `source_build`, commit, toolchain), `compat` (protocol major, store format range), `artifacts`
 (id, target os/arch, archive path, sha256, size, provided products), `products` (dependencies,
 supported targets, files, aliases, actions), `profiles`. Unknown fields are rejected.
-`validate()` rejects: an unsupported schema version, unknown products, duplicate products, a
+`validate()` rejects: an unsupported schema version, a release version that is not a plain name
+(letters, digits, `.` and `-`, up to 64, never `.`, `..` or a leading `-`: the receipt refuses the
+same names), unknown products, duplicate products, a
 missing `ferroloop`/`ferrostore`, a dependency on an undeclared product, a dependency cycle, a
 product that is both required and optional, a `ferroloop` that does not require `ferrostore`,
 duplicate or ambiguous artifacts, a hash that is not 64 lowercase hex digits, a size outside

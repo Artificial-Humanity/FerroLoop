@@ -15,6 +15,7 @@
 
 mod arch_check;
 mod defaults;
+mod fsprobe;
 mod manifest;
 mod plan;
 #[cfg(test)]
@@ -23,6 +24,7 @@ mod receipt;
 
 pub use arch_check::{ArchitectureCheck, RUNTIME_ONLY, SHARED_COMPONENTS};
 pub use defaults::default_manifest;
+pub use fsprobe::{BUDGET_EXCEEDED, FsProbe, open_regular, read_bounded, resolve_layout};
 pub use manifest::{
     ActionKind, ActionSpec, Artifact, Compat, FileKind, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES,
     ManifestError, ProductEntry, ProductFile, ProfileEntry, ReleaseInfo, ReleaseKind,

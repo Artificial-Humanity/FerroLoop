@@ -363,8 +363,10 @@ dependencies = [
  "fl-wire",
  "libc",
  "predicates",
+ "redb",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tiny_http",
  "tokio",
@@ -377,6 +379,7 @@ name = "fl-core"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
