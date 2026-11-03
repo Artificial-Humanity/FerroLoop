@@ -100,6 +100,10 @@ pub use pr_policy::{
     format_review_body, is_protected_path, parse_co_authors, verify_merge_approvals,
     verify_review_integrity,
 };
+pub use ref_index::{
+    MAX_REF_SOURCES, RefIndexError, RefIndexPlan, RefIndexReport, RefIndexStatus, RefKind,
+    RefLocatorClass, RefSource, classify_locator, index_local_source,
+};
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,

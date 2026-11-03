@@ -8,13 +8,13 @@
 //!
 //! It deliberately does **not** do any of the following yet:
 //!
-//! * clone, fetch, or otherwise retrieve a source (no network or filesystem
-//!   access of any kind);
-//! * wire the plan into a CLI command;
+//! * clone, fetch, or otherwise retrieve a remote source (no network access);
 //! * persist a plan or an index in the store.
 //!
-//! Those land after Record #92. This module is pure validation and planning
-//! only. Construction through [`RefSource::new`], [`RefIndexPlan::build`],
+//! [`index_local_source`] scans an existing local-path source only; remote
+//! sources are validated with status `remote-not-fetched`, no fetch is
+//! performed, and nothing is stored.
+//! Construction through [`RefSource::new`], [`RefIndexPlan::build`],
 //! or `Deserialize` validates (and slug-normalizes) the value, so a value
 //! obtained through those paths satisfies the documented invariants.
 //! `Deserialize` is implemented manually (not derived) for both types and
@@ -38,6 +38,106 @@ pub enum RefKind {
     Code,
     /// Documentation to search and read.
     Docs,
+}
+
+crate::wire::wire_names!(RefKind as ref_kind_wire {
+    Code => "code",
+    Docs => "docs",
+});
+crate::wire::wire_parse!(RefKind as ref_kind_parse);
+
+/// Status discriminator for a [`RefIndexReport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RefIndexStatus {
+    #[serde(rename = "scanned")]
+    Scanned,
+    #[serde(rename = "remote-not-fetched")]
+    RemoteNotFetched,
+}
+
+impl RefIndexStatus {
+    pub const ALL: &'static [Self] = &[Self::Scanned, Self::RemoteNotFetched];
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Scanned => "scanned",
+            Self::RemoteNotFetched => "remote-not-fetched",
+        }
+    }
+}
+
+/// Whether a locator is local or remote. The one classification used here
+/// and by callers; do not re-derive it elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefLocatorClass {
+    Local,
+    Remote,
+}
+
+pub fn classify_locator(locator: &str) -> RefLocatorClass {
+    if Path::new(locator).is_absolute() {
+        RefLocatorClass::Local
+    } else {
+        RefLocatorClass::Remote
+    }
+}
+
+/// Outcome of indexing one [`RefSource`] via [`index_local_source`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefIndexReport {
+    pub name: String,
+    pub kind: RefKind,
+    pub locator: String,
+    pub revision: Option<String>,
+    pub status: RefIndexStatus,
+    pub files_indexed: u64,
+    pub symbols_indexed: u64,
+    pub scanned: bool,
+    pub revision_applied: bool,
+}
+
+/// Index a local source with [`crate::code_index::scan_code_index`].
+///
+/// Remote locators are validated only: status `remote-not-fetched`,
+/// counts 0, no fetch, nothing stored. A missing local path is an error
+/// naming the path. `revision_applied` is always `false`: a local scan
+/// indexes the tree as-is and a remote revision is not fetched, so no
+/// revision is ever checked out or applied by this function.
+pub fn index_local_source(source: &RefSource) -> Result<RefIndexReport, RefIndexError> {
+    let base = RefIndexReport {
+        name: source.name().to_string(),
+        kind: source.kind(),
+        locator: source.locator().to_string(),
+        revision: source.revision().map(str::to_string),
+        status: RefIndexStatus::RemoteNotFetched,
+        files_indexed: 0,
+        symbols_indexed: 0,
+        scanned: false,
+        revision_applied: false,
+    };
+    if classify_locator(source.locator()) == RefLocatorClass::Remote {
+        return Ok(base);
+    }
+    let path = Path::new(source.locator());
+    if !path.exists() {
+        return Err(RefIndexError::MissingLocalPath {
+            name: source.name().to_string(),
+            locator: source.locator().to_string(),
+        });
+    }
+    let index = crate::code_index::scan_code_index(path);
+    if !index.scanned() {
+        return Err(RefIndexError::LocalPathNotScanned {
+            name: source.name().to_string(),
+            locator: source.locator().to_string(),
+        });
+    }
+    Ok(RefIndexReport {
+        files_indexed: index.files_indexed(),
+        symbols_indexed: index.symbols_indexed(),
+        status: RefIndexStatus::Scanned,
+        scanned: true,
+        ..base
+    })
 }
 
 /// One named external reference source in a [`RefIndexPlan`].
@@ -196,6 +296,14 @@ pub enum RefIndexError {
          plan; split the plan or remove sources"
     )]
     TooManySources { count: usize },
+    #[error(
+        "reference `{name}` local path `{locator}` does not exist: check the path and try again"
+    )]
+    MissingLocalPath { name: String, locator: String },
+    #[error(
+        "reference `{name}` local path `{locator}` could not be scanned: check that it is a readable file or directory (not a symlink)"
+    )]
+    LocalPathNotScanned { name: String, locator: String },
 }
 
 /// Replace any userinfo in `locator` with `***` so errors never leak it.
@@ -880,6 +988,79 @@ mod tests {
         assert_eq!(plan.sources().len(), 3);
         assert!(!plan.is_empty());
         assert!(RefIndexPlan::build(Vec::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn index_local_source_scans_local_temp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "pub fn demo_fn() {}\n").unwrap();
+        let src = RefSource::new(
+            "demo",
+            dir.path().to_string_lossy().into_owned(),
+            None,
+            RefKind::Code,
+        )
+        .unwrap();
+        let report = index_local_source(&src).unwrap();
+        assert_eq!(report.name, "demo");
+        assert_eq!(report.kind, RefKind::Code);
+        assert!(report.scanned);
+        assert_eq!(report.status, RefIndexStatus::Scanned);
+        assert_eq!(report.files_indexed, 1);
+        assert_eq!(report.symbols_indexed, 1);
+        assert!(!report.revision_applied);
+    }
+
+    #[test]
+    fn index_local_source_remote_is_not_scanned() {
+        let src = source("rust-ref", "https://github.com/rust-lang/rust.git");
+        let report = index_local_source(&src).unwrap();
+        assert!(!report.scanned);
+        assert_eq!(report.status, RefIndexStatus::RemoteNotFetched);
+        assert_eq!(report.status.as_wire(), "remote-not-fetched");
+        assert_eq!(report.locator, "https://github.com/rust-lang/rust.git");
+        assert_eq!(report.files_indexed, 0);
+        assert_eq!(report.symbols_indexed, 0);
+        assert!(!report.revision_applied);
+    }
+
+    #[test]
+    fn index_local_source_missing_path_errors_naming_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let src = RefSource::new(
+            "missing-ref",
+            missing.to_string_lossy().into_owned(),
+            None,
+            RefKind::Code,
+        )
+        .unwrap();
+        let err = index_local_source(&src).unwrap_err().to_string();
+        assert!(
+            err.contains(&missing.to_string_lossy().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn classify_locator_is_the_one_classification() {
+        assert_eq!(classify_locator("/tmp/refs/demo"), RefLocatorClass::Local);
+        assert_eq!(
+            classify_locator("https://example.com/r.git"),
+            RefLocatorClass::Remote
+        );
+        assert_eq!(
+            classify_locator("git@example.com:r.git"),
+            RefLocatorClass::Remote
+        );
+    }
+
+    #[test]
+    fn ref_kind_parse_names_both_values() {
+        assert_eq!(RefKind::from_wire("code"), Some(RefKind::Code));
+        assert_eq!(RefKind::from_wire("docs"), Some(RefKind::Docs));
+        assert_eq!(RefKind::from_wire("bogus"), None);
+        assert_eq!(RefKind::wire_values(), "code, docs");
     }
 
     #[test]
