@@ -2133,6 +2133,22 @@ command = "local-mcp"
 
     // MCP spec §4: a registered custom target is planned and written like the built-ins.
 
+    /// Held while targets that clash with each other are registered, and by the test that plans
+    /// "every registered target": the registry is process-wide, so that plan would otherwise meet
+    /// the clash and refuse it.
+    static CLASH_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes the ids out of the registry again when dropped.
+    struct Unregister(&'static [&'static str]);
+
+    impl Drop for Unregister {
+        fn drop(&mut self) {
+            for id in self.0 {
+                vendor::unregister_target(id);
+            }
+        }
+    }
+
     /// Registers a Claude-shaped target for this test, under an id no other test uses.
     fn custom(id: &str, file: &str, expands: bool) -> VendorName {
         let target = vendor::CustomTarget::new(id, "Sync Agent", file, "mcpServers", expands);
@@ -2334,7 +2350,14 @@ command = "local-mcp"
         );
         assert_eq!(first_shared_file(&[("a", "x.json"), ("b", "y.json")]), None);
 
-        // A custom target on a built-in's file, spelled differently.
+        // A custom target on a built-in's file, spelled differently. These targets clash, so
+        // they are registered only while the window is held and are removed at the end.
+        let _window = CLASH_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+        let _gone = Unregister(&[
+            "sync-test-clash-claude",
+            "sync-test-clash-a",
+            "sync-test-clash-b",
+        ]);
         let f = fixture();
         let clash = custom("sync-test-clash-claude", "./.MCP.json", false);
         let (root, records) = (&f.root, &f.records);
@@ -2459,6 +2482,7 @@ command = "local-mcp"
 
     #[test]
     fn plan_writes_every_registered_target_and_a_built_in_alone_is_unchanged() {
+        let _window = CLASH_WINDOW.lock().unwrap_or_else(|e| e.into_inner());
         let f = fixture();
         let v = custom("sync-test-global", ".sync-test/global.json", true);
         // The public `plan` plans what is registered, built-ins first.

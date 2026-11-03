@@ -15,6 +15,8 @@ mod muse;
 pub use antigravity::Antigravity;
 pub use claude::Claude;
 pub use codex::Codex;
+#[cfg(test)]
+pub(crate) use custom::unregister_target;
 pub use custom::{
     CustomId, CustomRefusal, CustomTarget, TargetError, custom_target, custom_targets,
     register_target, target_file_key,

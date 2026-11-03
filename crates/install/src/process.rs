@@ -153,6 +153,29 @@ fn kill_group(pid: i32) {
     unsafe { libc::kill(-pid, libc::SIGKILL) };
 }
 
+/// How long [`spawn_retrying_busy`] keeps asking.
+const BUSY_RETRY: Duration = Duration::from_secs(2);
+
+/// `cmd.spawn()`, asked again for a short while when `execve` says `ETXTBSY` ("Text file busy").
+///
+/// The installer copies the built `bin/fl` into the artifact tree and runs it at once. The copy's
+/// write fd is closed before the run, but a thread of this process that forks at the wrong moment
+/// (another install step, a parallel test) gives its child a copy of that fd until the child's
+/// own `execve`, and `execve` of a file any process holds open for writing fails with `ETXTBSY`.
+/// That state ends by itself within milliseconds, so only this exact error is retried, bounded;
+/// every other error, and a still-busy file after [`BUSY_RETRY`], is returned as it is.
+fn spawn_retrying_busy(cmd: &mut Command) -> io::Result<std::process::Child> {
+    let give_up = Instant::now() + BUSY_RETRY;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run `spec` to completion or to its deadline. On the deadline, and also when the child has
 /// exited, the child's whole process group is killed, so nothing it started outlives the run.
 pub fn run(spec: &Spec<'_>) -> io::Result<Outcome> {
@@ -176,7 +199,7 @@ pub fn run(spec: &Spec<'_>) -> io::Result<Outcome> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = cmd.spawn()?;
+    let mut child = spawn_retrying_busy(&mut cmd)?;
     let pid = child.id() as i32;
     let sink = Arc::new(Mutex::new(Sink {
         file,
@@ -274,6 +297,34 @@ mod tests {
             capture_cap: 1024,
             stdout_only: false,
         })
+    }
+
+    #[test]
+    fn a_program_still_open_for_writing_is_run_once_the_writer_lets_go() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("tool.sh");
+        let mut open = File::create(&script).unwrap();
+        open.write_all(b"#!/bin/sh\necho ran\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // While `open` lives, execve of the script says ETXTBSY.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(open);
+        });
+        let o = run(&Spec {
+            program: &script,
+            args: vec![],
+            cwd: d.path(),
+            env: &[],
+            timeout: Duration::from_secs(10),
+            log: None,
+            capture_cap: 1024,
+            stdout_only: false,
+        })
+        .unwrap();
+        closer.join().unwrap();
+        assert_eq!(o.text().trim(), "ran");
     }
 
     #[test]
