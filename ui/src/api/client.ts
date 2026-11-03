@@ -213,6 +213,18 @@ export function normalizeHubSettings(
         typeof subRaw.ferrostep_enabled === "boolean"
           ? subRaw.ferrostep_enabled
           : fallback.subsystems.ferrostep_enabled,
+      ...(typeof subRaw.ferrodeck_enabled === "boolean"
+        ? { ferrodeck_enabled: subRaw.ferrodeck_enabled }
+        : {}),
+      ...(typeof subRaw.ferrowire_enabled === "boolean"
+        ? { ferrowire_enabled: subRaw.ferrowire_enabled }
+        : {}),
+      ...(typeof subRaw.ferrotrack_enabled === "boolean"
+        ? { ferrotrack_enabled: subRaw.ferrotrack_enabled }
+        : {}),
+      ...(typeof subRaw.ferrowatch_enabled === "boolean"
+        ? { ferrowatch_enabled: subRaw.ferrowatch_enabled }
+        : {}),
     },
     notifications: {
       notify_on_pr_review:
