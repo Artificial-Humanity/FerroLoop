@@ -31,6 +31,8 @@ File naming in this directory follows
   `fl --version [--json]`, `fl version`, `ferrostore --version [--json]`, the Hub's
   `GET /api/v1/version`, the UI bundle's `build-info.json`, and the build-time stamps behind
   them.
+* [installer.md](installer.md) — the release manifest and install receipt schemas, the profiles,
+  and `fl install --dry-run`: the deterministic plan, its exit codes, and what it never does.
 * [vendor-runtimes.md](vendor-runtimes.md) — on-disk session, transcript, context-usage,
   account-quota, and prompt-delivery shapes for Antigravity, Claude Code, Codex, Grok, and
   Muse, and the Hub fields that expose them.

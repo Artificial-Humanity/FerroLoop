@@ -612,18 +612,19 @@ fn install_manifest_matches_the_code() {
         problems.join("\n")
     );
 
-    // compat data names the constants it describes
-    assert_eq!(
-        u64::from(manifest.compat.protocol_major),
-        u64::from(fl_wire::peer::WIRE_PROTOCOL_VERSION)
-    );
+    // compat data is the range `fl --version --json` reports, read from the same constants
+    let formats = fl_store::formats::store_formats();
     assert_eq!(
         u64::from(manifest.compat.store_format_min),
-        fl_store::FORMAT_VERSION
+        formats["redb_schema"]["min"].as_u64().unwrap()
     );
     assert_eq!(
         u64::from(manifest.compat.store_format_max),
-        fl_store::FORMAT_WITH_WORKFLOW
+        formats["redb_schema"]["max"].as_u64().unwrap()
+    );
+    assert_eq!(
+        manifest.compat.protocol_major,
+        fl_wire::peer::WIRE_PROTOCOL_VERSION
     );
     // the shipped hub unit exists in the repo under the name the manifest gives it
     assert!(repo.join("contrib/ferroloop-hub.service").is_file());
