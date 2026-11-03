@@ -298,6 +298,15 @@ pub fn register_target(target: CustomTarget) -> Result<(), TargetError> {
     Ok(())
 }
 
+/// Takes a target out of the registry again. Test only: a registry is for the life of the process,
+/// so a test that registers targets which clash with others must remove them before any other
+/// test plans "every registered target".
+#[cfg(test)]
+pub(crate) fn unregister_target(id: &str) {
+    let mut map = targets().write().unwrap_or_else(|e| e.into_inner());
+    map.remove(id);
+}
+
 /// The registered target with this id.
 pub fn custom_target(id: &str) -> Option<&'static CustomTarget> {
     let map = targets().read().unwrap_or_else(|e| e.into_inner());
