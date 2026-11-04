@@ -896,6 +896,12 @@ export interface SessionDraft {
   attachments: PromptAttachment[];
 }
 
+interface PendingPrompt {
+  content: string;
+  attachments: PromptAttachment[];
+  matchingBefore: number;
+}
+
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
 
@@ -1202,6 +1208,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     });
   }, []);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
+  const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>({});
+  const [pendingByTarget, setPendingByTarget] = React.useState<Record<string, PendingPrompt>>({});
+  const activeSendsRef = React.useRef(new Set<string>());
+  const mountedRef = React.useRef(false);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const draftRef = React.useRef({ promptText, attachments });
+  draftRef.current = { promptText, attachments };
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -1847,12 +1865,29 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     void fetchTranscript();
   }, [fetchTranscript]);
 
+  const pendingPrompt = pendingByTarget[targetSessionOrAgent];
   const filteredTurns = React.useMemo(() => {
+    let visible = effectiveTurns;
+    if (pendingPrompt) {
+      const matches = effectiveTurns.reduce<number[]>((indices, turn, index) => {
+        const body = extractTurnAttachments(turn.content || "", {
+          stripAgyWrapper: true,
+        }).cleanedContent.trim();
+        if (turn.role.toLowerCase() === "user" && body === pendingPrompt.content) {
+          indices.push(index);
+        }
+        return indices;
+      }, []);
+      if (matches.length > pendingPrompt.matchingBefore) {
+        const duplicate = matches[matches.length - 1];
+        visible = effectiveTurns.filter((_, index) => index !== duplicate);
+      }
+    }
     const q = filterQuery.trim().toLowerCase();
     if (!q) {
-      return effectiveTurns;
+      return visible;
     }
-    return effectiveTurns.filter((t) => {
+    return visible.filter((t) => {
       if (t.content.toLowerCase().includes(q)) return true;
       if (t.thinking && t.thinking.toLowerCase().includes(q)) return true;
       if (t.role.toLowerCase().includes(q)) return true;
@@ -1862,7 +1897,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           JSON.stringify(tc.arguments ?? "").toLowerCase().includes(q),
       );
     });
-  }, [effectiveTurns, filterQuery]);
+  }, [effectiveTurns, filterQuery, pendingPrompt]);
 
   const { displayedTurns, hiddenTurnCount } = React.useMemo(() => {
     if (filterQuery.trim() || filteredTurns.length <= visibleTurnLimit) {
@@ -2138,78 +2173,126 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const submitPrompt = async () => {
     const trimmedPrompt = promptText.trim();
-    if ((!trimmedPrompt && attachments.length === 0) || submitting || !targetSessionOrAgent) {
+    if (
+      (!trimmedPrompt && attachments.length === 0) ||
+      submitting ||
+      !targetSessionOrAgent ||
+      activeSendsRef.current.has(targetSessionOrAgent)
+    ) {
       return;
     }
-
+    const submittedTarget = targetSessionOrAgent;
+    const submittedDraft = { promptText, attachments: [...attachments] };
+    const content = trimmedPrompt || "Attached file(s).";
+    const matchingBefore = effectiveTurns.filter((turn) =>
+      turn.role.toLowerCase() === "user" &&
+      extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
+        .cleanedContent.trim() === content,
+    ).length;
     const payload: PromptRequest = {
-      prompt: trimmedPrompt || "Attached file(s).",
+      prompt: content,
       urgency: "normal",
       subject: undefined,
-      ...(attachments.length > 0 ? { attachments } : {}),
+      ...(submittedDraft.attachments.length > 0
+        ? { attachments: submittedDraft.attachments }
+        : {}),
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
-    const submittedTarget = targetSessionOrAgent;
+    activeSendsRef.current.add(submittedTarget);
     beginTargetSubmitting(submittedTarget);
     setSubmitError(null);
+    setSendErrorsByTarget((prev) => {
+      const next = { ...prev };
+      delete next[submittedTarget];
+      return next;
+    });
+    setPendingByTarget((prev) => ({
+      ...prev,
+      [submittedTarget]: { content, attachments: submittedDraft.attachments, matchingBefore },
+    }));
+    clearSessionDraft(submittedTarget);
+    draftRef.current = { promptText: "", attachments: [] };
+    setPromptText("");
+    setAttachments([]);
+    scrollToBottom("smooth");
     try {
-      let wasQueued = false;
+      let res: PromptResponse | undefined;
       if (onSendPrompt) {
-        const res = (await onSendPrompt(submittedTarget, payload)) as
+        res = (await onSendPrompt(submittedTarget, payload)) as
           | PromptResponse
           | undefined;
-        if (res && (res.queued || res.status === "queued")) {
-          wasQueued = true;
-        }
       } else if (apiClient) {
-        const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
-        if (res.queued || res.status === "queued") {
-          wasQueued = true;
-        }
-        if (currentTargetRef.current === submittedTarget) {
-          if (Array.isArray(res.queue)) {
-            setInternalQueue(res.queue);
-          }
-          if (typeof res.is_busy === "boolean") {
-            setInternalIsBusy(res.is_busy);
-          }
-          if (!wasQueued) {
-            const content = res.effective_body || payload.prompt;
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
-          }
-          await fetchTranscript();
-        }
+        res = await apiClient.sendSessionPrompt(submittedTarget, payload);
+      } else {
+        throw new Error("No prompt connection is available");
       }
-      clearSessionDraft(submittedTarget);
-      // The operator may have switched agents while the request was in
-      // flight: the composer now holds another target's draft, which must
-      // not be wiped (or scrolled) on behalf of the finished send.
-      if (currentTargetRef.current === submittedTarget) {
-        setPromptText("");
-        setAttachments([]);
+      const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
+      if (!wasQueued && res?.delivered === false) {
+        throw new Error(res.delivery_error || "Message delivery failed");
+      }
+      if (
+        mountedRef.current && !onSendPrompt && apiClient && res &&
+        currentTargetRef.current === submittedTarget
+      ) {
+        if (Array.isArray(res.queue)) setInternalQueue(res.queue);
+        if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
         if (!wasQueued) {
-          scrollToBottom("smooth");
-          // Run again after the optimistic turn and live indicator render.
-          requestAnimationFrame(() => scrollToBottom("smooth"));
+          const body = res.effective_body || payload.prompt;
+          setInternalTurns((prev) => {
+            const matches = prev.filter((turn) =>
+              turn.role.toLowerCase() === "user" &&
+              extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
+                .cleanedContent.trim() === content,
+            ).length;
+            if (matches > matchingBefore) return prev;
+            return [...prev, {
+              index: prev.length,
+              role: "user",
+              content: body,
+              thinking: null,
+              tool_calls: [],
+              created_at: new Date().toISOString(),
+            }];
+          });
         }
+        void fetchTranscript();
+      }
+      if (mountedRef.current && currentTargetRef.current === submittedTarget && !wasQueued) {
+        scrollToBottom("smooth");
+        requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
-        setSubmitError(err instanceof Error ? err.message : "Failed to send message");
+      const message = err instanceof Error ? err.message : "Failed to send message";
+      if (mountedRef.current) {
+        setSendErrorsByTarget((prev) => ({ ...prev, [submittedTarget]: message }));
+      }
+      const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget
+        ? draftRef.current
+        : loadSessionDraft(submittedTarget);
+      if (currentDraft.promptText.length === 0 && currentDraft.attachments.length === 0) {
+        sessionDraftMemory.set(submittedTarget, submittedDraft);
+        try {
+          window.localStorage.setItem(DRAFT_STORAGE_PREFIX + submittedTarget, submittedDraft.promptText);
+        } catch {
+          // Ignore storage errors.
+        }
+        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
+          draftRef.current = submittedDraft;
+          setPromptText(submittedDraft.promptText);
+          setAttachments(submittedDraft.attachments);
+        }
       }
     } finally {
-      endTargetSubmitting(submittedTarget);
+      activeSendsRef.current.delete(submittedTarget);
+      if (mountedRef.current) {
+        setPendingByTarget((prev) => {
+          const next = { ...prev };
+          delete next[submittedTarget];
+          return next;
+        });
+        endTargetSubmitting(submittedTarget);
+      }
     }
   };
 
@@ -3158,7 +3241,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
-        {filteredTurns.length === 0 ? (
+        {filteredTurns.length === 0 && !pendingPrompt ? (
           <div
             className="fd-card"
             data-testid="chat-empty-state"
@@ -3238,6 +3321,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </>
         )}
 
+        {pendingPrompt && (
+          <div data-testid="optimistic-user-turn" aria-live="polite">
+            <TurnCard turn={{
+              index: -1,
+              role: "user",
+              content: pendingPrompt.content,
+              thinking: null,
+              tool_calls: [],
+              created_at: null,
+            }} />
+            {pendingPrompt.attachments.map((attachment, index) => (
+              <span key={`${attachment.name}-${index}`}>{attachment.name}</span>
+            ))}
+            <span>Sending...</span>
+          </div>
+        )}
+
         {effectiveIsBusy &&
           !displayedTurns[displayedTurns.length - 1]?.thinking?.trim() && (
             <div data-testid="live-thinking-indicator">
@@ -3297,7 +3397,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
-        {submitError && (
+        {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
             style={{
@@ -3305,7 +3405,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               color: "#FCA5A5",
             }}
           >
-            {submitError}
+            {submitError || sendErrorsByTarget[targetSessionOrAgent]}
           </div>
         )}
 

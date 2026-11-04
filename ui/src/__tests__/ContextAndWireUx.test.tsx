@@ -1138,6 +1138,22 @@ describe("Agent switch transcript isolation", () => {
       await screen.findByText(/Waiting for operator instructions\./),
     ).toBeInTheDocument();
 
+    // A failed push is broadcast too; it must not become a sent transcript turn.
+    act(() => {
+      sessionListener?.({
+        type: "event",
+        topic: "session",
+        event: "prompt_sent",
+        data: {
+          session_id: "sess-ferris",
+          persona: "ferris",
+          effective_body: "Failed delivery must not appear as sent",
+          delivered: false,
+        },
+      });
+    });
+    expect(screen.queryByText("Failed delivery must not appear as sent")).toBeNull();
+
     // Emit a prompt_sent WebSocket event (e.g. auto-drained queued prompt)
     act(() => {
       sessionListener?.({

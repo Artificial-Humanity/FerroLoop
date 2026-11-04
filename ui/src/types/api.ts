@@ -736,6 +736,7 @@ export interface PromptResponse {
   queued?: boolean;
   is_busy?: boolean;
   delivered?: boolean;
+  delivery_error?: string | null;
   prompt_id?: string;
   prompt?: string;
   effective_body?: string;

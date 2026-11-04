@@ -1327,7 +1327,7 @@ export const App: React.FC<AppProps> = ({
           (rawSessionId && rawSessionId === selectedSessionIdRef.current
             ? activeKey
             : "");
-        if (rawContent) {
+        if (rawContent && data.delivered !== false) {
           recordOptimisticPrompt(rawContent, targetAgentKey || activeKey);
           if (!targetAgentKey || targetAgentKey === activeKey) {
             setTranscriptTurns((prev) =>
@@ -1708,7 +1708,16 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
+    const submittedAgent = selectedAgentNameRef.current;
+    const submittedSession = selectedSessionIdRef.current;
     const res = await apiClient.sendSessionPrompt(targetId, payload);
+    if (
+      (!res.queued && res.status !== "queued" && res.delivered === false) ||
+      selectedAgentNameRef.current !== submittedAgent ||
+      selectedSessionIdRef.current !== submittedSession
+    ) {
+      return res;
+    }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
     }
