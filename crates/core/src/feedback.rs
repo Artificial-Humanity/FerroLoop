@@ -638,7 +638,8 @@ pub fn route_feedback_event(
     {
         return FeedbackRouteDecision::OperatorPending;
     }
-    if event.freshness == FeedbackFreshness::Stale
+    if event.outdated
+        || event.freshness == FeedbackFreshness::Stale
         || !event
             .source_head_sha
             .eq_ignore_ascii_case(&current.head_sha)
@@ -1059,6 +1060,44 @@ mod tests {
             FeedbackRouteDecision::OperatorPending
         );
     }
+    #[test]
+    fn deserialized_outdated_comment_cannot_claim_current_freshness() {
+        let mut binding = binding();
+        binding.status = BindingStatus::Active;
+        binding.authorization = Some(BindingAuthorization::Owner {
+            approval_receipt: "owner-receipt".into(),
+        });
+        let context = RoutingContext {
+            api_origin: "https://api.github.com".into(),
+            repository_id: 42,
+            pr_number: 5,
+            head_repository_id: 42,
+            head_sha: "a".repeat(40),
+            binding_revision: 3,
+            session_incarnation: "incarnation".into(),
+            session_live: true,
+            dispatch_ambiguous: false,
+            binding_verified: true,
+        };
+        let source = EventSource::review_comment(9, "2026-01-01T00:00:00Z", "bad").unwrap();
+        let current = normalize_feedback(&feedback_input(&source, "bad"))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            route_feedback_event(&binding, &context, &current),
+            FeedbackRouteDecision::ManagedSession { .. }
+        ));
+        let mut inconsistent = current;
+        inconsistent.outdated = true;
+        let decoded: GithubFeedbackV1 =
+            serde_json::from_str(&serde_json::to_string(&inconsistent).unwrap()).unwrap();
+        assert_eq!(decoded.freshness, FeedbackFreshness::Current);
+        assert_eq!(
+            route_feedback_event(&binding, &context, &decoded),
+            FeedbackRouteDecision::Stale
+        );
+    }
+
     #[test]
     fn outdated_comment_and_oversized_wire_envelope_fail_closed() {
         let source = EventSource::review_comment(9, "2026-01-01T00:00:00Z", "bad").unwrap();
