@@ -111,8 +111,9 @@ pub struct QueuedOperatorPrompt {
 
 #[derive(Debug, Clone)]
 struct InFlightPrompt {
-    baseline_turn_count: usize,
+    baseline_turn_count: Option<usize>,
     baseline_busy: bool,
+    require_observed_completion: bool,
     dispatched_at_ms: i64,
 }
 
@@ -580,30 +581,51 @@ impl HubState {
     }
 
     pub fn is_session_busy(&self, store: &AnyStore, session_id: &str) -> bool {
-        let turns = read_session_transcript_with_home(
+        let snap = discovery::snapshot_discovery_store(store);
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_id,
-            store,
+            &snap,
             self.config.home_override.as_deref(),
         );
-        self.is_session_busy_from_turns(session_id, &turns)
+        self.is_session_busy_from_observation(session_id, turns.as_deref())
     }
 
     /// Busy check from turns already read. Does not open the store or the transcript file.
     pub fn is_session_busy_from_turns(&self, session_id: &str, turns: &[TranscriptTurn]) -> bool {
+        self.is_session_busy_from_observation(session_id, Some(turns))
+    }
+
+    /// An unreadable or changing transcript is not evidence that a session is idle.
+    pub(crate) fn is_session_busy_from_observation(
+        &self,
+        session_id: &str,
+        observation: Option<&[TranscriptTurn]>,
+    ) -> bool {
+        let Some(turns) = observation else {
+            return true;
+        };
         let transcript_busy = is_transcript_busy(turns);
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        let in_flight_active = if let Some(in_flight) = guard.in_flight.get(session_id) {
-            let expired = now_ms - in_flight.dispatched_at_ms > 300_000;
-            // An empty slice is not a transcript observation. Do not clear in-flight
-            // just because the caller has no turns yet.
-            let completed = !turns.is_empty()
-                && (turns.len() > in_flight.baseline_turn_count || in_flight.baseline_busy)
-                && !transcript_busy;
-            if expired || completed {
-                guard.in_flight.remove(session_id);
-                false
+        let in_flight_active = if let Some(in_flight) = guard.in_flight.get_mut(session_id) {
+            if let Some(baseline) = in_flight.baseline_turn_count {
+                let expired = !in_flight.require_observed_completion
+                    && now_ms - in_flight.dispatched_at_ms > 300_000;
+                let completed = !turns.is_empty()
+                    && (turns.len() > baseline || in_flight.baseline_busy)
+                    && !transcript_busy;
+                if expired || completed {
+                    guard.in_flight.remove(session_id);
+                    false
+                } else {
+                    true
+                }
             } else {
+                // The first reliable observation after an unstable read establishes a baseline;
+                // its existing idle turns do not prove completion of the just-sent prompt.
+                in_flight.baseline_turn_count = Some(turns.len());
+                in_flight.baseline_busy = transcript_busy;
+                in_flight.dispatched_at_ms = now_ms;
                 true
             }
         } else {
@@ -619,33 +641,42 @@ impl HubState {
             Ok(store) => discovery::snapshot_discovery_store(&store),
             Err(_) => discovery::DiscoveryStoreSnapshot::default(),
         };
-        let turns = discovery::read_session_transcript_from_snapshot(
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_id,
             &snap,
             self.config.home_override.as_deref(),
         );
-        self.is_session_busy_from_turns(session_id, &turns)
+        self.is_session_busy_from_observation(session_id, turns.as_deref())
     }
 
     pub fn mark_session_in_flight(&self, store: &AnyStore, session_key: &str) {
-        let turns = read_session_transcript_with_home(
+        let snap = discovery::snapshot_discovery_store(store);
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_key,
-            store,
+            &snap,
             self.config.home_override.as_deref(),
         );
-        self.mark_session_in_flight_from_turns(session_key, &turns);
+        self.mark_session_in_flight_from_observation(session_key, turns.as_deref());
     }
 
     /// Record an in-flight prompt from turns already read. Does not touch the store.
     pub fn mark_session_in_flight_from_turns(&self, session_key: &str, turns: &[TranscriptTurn]) {
-        let baseline_busy = is_transcript_busy(turns);
+        self.mark_session_in_flight_from_observation(session_key, Some(turns));
+    }
+
+    pub(crate) fn mark_session_in_flight_from_observation(
+        &self,
+        session_key: &str,
+        observation: Option<&[TranscriptTurn]>,
+    ) {
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.in_flight.insert(
             session_key.to_string(),
             InFlightPrompt {
-                baseline_turn_count: turns.len(),
-                baseline_busy,
+                baseline_turn_count: observation.map(<[TranscriptTurn]>::len),
+                baseline_busy: observation.is_some_and(is_transcript_busy),
+                require_observed_completion: observation.is_none(),
                 dispatched_at_ms: now_ms,
             },
         );
@@ -658,12 +689,12 @@ impl HubState {
             Ok(store) => discovery::snapshot_discovery_store(&store),
             Err(_) => discovery::DiscoveryStoreSnapshot::default(),
         };
-        let turns = discovery::read_session_transcript_from_snapshot(
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_key,
             &snap,
             self.config.home_override.as_deref(),
         );
-        self.mark_session_in_flight_from_turns(session_key, &turns);
+        self.mark_session_in_flight_from_observation(session_key, turns.as_deref());
     }
 
     /// Open the workspace `AnyStore` for the duration of a single operation, retrying
@@ -2009,6 +2040,53 @@ mod tests {
         assert_eq!(get_att_resp.status, 200);
         assert_eq!(get_att_resp.content_type, "image/png");
         assert_eq!(get_att_resp.body, png_bytes);
+    }
+
+    #[test]
+    fn an_unreliable_post_dispatch_read_does_not_release_on_old_idle_turns() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = discovery::parse_jsonl_transcript(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"old\"}}\n",
+        );
+        let new = discovery::parse_jsonl_transcript(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"old\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"new prompt\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"new reply\"}}\n",
+        ));
+        state.mark_session_in_flight_from_observation("test", None);
+        // Unreliable observations cannot time out a fence before any reliable baseline.
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .in_flight
+            .get_mut("test")
+            .unwrap()
+            .dispatched_at_ms = 0;
+        assert!(state.is_session_busy_from_observation("test", None));
+        assert!(state.is_session_busy_from_turns("test", &old));
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .in_flight
+            .get_mut("test")
+            .unwrap()
+            .dispatched_at_ms = 0;
+        assert!(state.is_session_busy_from_turns("test", &old));
+        assert!(!state.is_session_busy_from_turns("test", &new));
+    }
+
+    #[test]
+    fn a_genuinely_missing_transcript_allows_first_reply_to_finish() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        state.mark_session_in_flight_from_observation("test", Some(&[]));
+        let reply = discovery::parse_jsonl_transcript(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}\n",
+        );
+        assert!(!state.is_session_busy_from_turns("test", &reply));
     }
 
     #[test]

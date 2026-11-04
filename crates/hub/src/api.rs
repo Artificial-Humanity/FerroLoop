@@ -78,9 +78,10 @@ use crate::discovery::{
     DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
     discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
     list_git_worktrees, lookup_one_route_session, lookup_sessions,
-    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
+    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot,
+    read_session_transcript_observation_from_snapshot, read_worktree_diff,
     scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
-    transcript_from_sessions,
+    transcript_observation_from_sessions,
 };
 use crate::github_pr;
 use crate::lifecycle::{
@@ -4821,15 +4822,29 @@ fn handle_dynamic_api_routes(
                 let sessions = lookup_sessions(&snap, home);
                 let mut files = TranscriptReads::default();
                 let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
-                let all_turns =
-                    transcript_from_sessions(&session_id, &sessions, &snap, home, &mut files);
-                // The busy check reads the canonical id's transcript. It is the same read
-                // unless the persona resolved to another id; a file both reach is parsed once.
-                let canonical_turns = (canonical_id != session_id.trim()).then(|| {
-                    transcript_from_sessions(&canonical_id, &sessions, &snap, home, &mut files)
-                });
-                let busy_turns = canonical_turns.as_deref().unwrap_or(&all_turns);
-                let is_busy = state.is_session_busy_from_turns(&canonical_id, busy_turns);
+                let all_observation = transcript_observation_from_sessions(
+                    &session_id,
+                    &sessions,
+                    &snap,
+                    home,
+                    &mut files,
+                );
+                let canonical_observation = if canonical_id != session_id.trim() {
+                    transcript_observation_from_sessions(
+                        &canonical_id,
+                        &sessions,
+                        &snap,
+                        home,
+                        &mut files,
+                    )
+                } else {
+                    all_observation.clone()
+                };
+                let is_busy = state.is_session_busy_from_observation(
+                    &canonical_id,
+                    canonical_observation.as_deref(),
+                );
+                let all_turns = all_observation.unwrap_or_default();
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -5285,8 +5300,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
     };
     let home = state.config.home_override.as_deref();
     for session_id in keys {
-        let turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
-        if !state.is_session_busy_from_turns(&session_id, &turns)
+        let turns = read_session_transcript_observation_from_snapshot(&session_id, &snap, home);
+        if !state.is_session_busy_from_observation(&session_id, turns.as_deref())
             && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
         {
             let delivery_res = dispatch_operator_prompt_for_session(
@@ -5296,8 +5311,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &item.by,
                 &item.effective_body,
             );
-            let after = read_session_transcript_from_snapshot(&session_id, &snap, home);
-            state.mark_session_in_flight_from_turns(&session_id, &after);
+            let after = read_session_transcript_observation_from_snapshot(&session_id, &snap, home);
+            state.mark_session_in_flight_from_observation(&session_id, after.as_deref());
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
@@ -5631,9 +5646,14 @@ fn handle_post_session_prompt(
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
     let busy = !payload.send_now && {
-        let turns =
-            transcript_from_sessions(&canonical_session_id, &sessions, &snap, home, &mut files);
-        state.is_session_busy_from_turns(&canonical_session_id, &turns)
+        let turns = transcript_observation_from_sessions(
+            &canonical_session_id,
+            &sessions,
+            &snap,
+            home,
+            &mut files,
+        );
+        state.is_session_busy_from_observation(&canonical_session_id, turns.as_deref())
     };
 
     if !payload.send_now && (busy || has_queued) {
@@ -5678,8 +5698,14 @@ fn handle_post_session_prompt(
         &effective_body,
     );
     // A changed transcript is refreshed; an unchanged one reuses the busy check's parse.
-    let after = transcript_from_sessions(&canonical_session_id, &sessions, &snap, home, &mut files);
-    state.mark_session_in_flight_from_turns(&canonical_session_id, &after);
+    let after = transcript_observation_from_sessions(
+        &canonical_session_id,
+        &sessions,
+        &snap,
+        home,
+        &mut files,
+    );
+    state.mark_session_in_flight_from_observation(&canonical_session_id, after.as_deref());
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({

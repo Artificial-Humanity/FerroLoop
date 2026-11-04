@@ -2462,8 +2462,19 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
     latest
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_TRANSCRIPT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Transcript files one request has read. Reuse a successful read and its parsed turns only
 /// when file identity and metadata remain stable. Failed reads are retried on the next access.
+#[cfg(test)]
+pub(crate) fn after_next_transcript_read(f: impl FnOnce() + 'static) {
+    AFTER_TRANSCRIPT_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptReads {
     raw: BTreeMap<String, String>,
@@ -2541,6 +2552,12 @@ impl TranscriptReads {
         if !self.raw.contains_key(path) {
             let before = Self::stamp(path);
             let text = read_transcript(path).ok()?;
+            #[cfg(test)]
+            AFTER_TRANSCRIPT_READ.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
             let after = Self::stamp(path);
             // A change or lost identity during the read cannot establish a safe baseline.
             if before != after {
@@ -3154,45 +3171,79 @@ pub(crate) fn transcript_from_sessions(
     home_override: Option<&Path>,
     files: &mut TranscriptReads,
 ) -> Vec<TranscriptTurn> {
+    transcript_observation_from_sessions(session_id, sessions, snap, home_override, files)
+        .unwrap_or_default()
+}
+
+/// `None` means a discovered transcript could not be read consistently, not an empty transcript.
+pub(crate) fn transcript_observation_from_sessions(
+    session_id: &str,
+    sessions: &[DiscoveredSessionSummary],
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    files: &mut TranscriptReads,
+) -> Option<Vec<TranscriptTurn>> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     for s in sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
-            && let Some(turns) = files.turns(tpath)
-            && !turns.is_empty()
         {
-            return turns.to_vec();
+            // A path already absent at observation time is different from a file that
+            // existed but could not be read consistently. The former is an empty baseline.
+            match fs::metadata(tpath) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+                Ok(_) => {}
+            }
+            let turns = files.turns(tpath)?;
+            if !turns.is_empty() {
+                return Some(turns.to_vec());
+            }
         }
     }
-
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     if let Some(ref h) = home
         && let Some(tpath) = find_transcript_file_in_home(h, trimmed)
-        && let Some(turns) = files.turns(&tpath)
-        && !turns.is_empty()
     {
-        return turns.to_vec();
+        let turns = files.turns(&tpath)?;
+        if !turns.is_empty() {
+            return Some(turns.to_vec());
+        }
     }
-
     for attempt in &snap.attempts {
         if attempt.id == trimmed || attempt.record_str == trimmed {
-            return vec![TranscriptTurn {
+            return Some(vec![TranscriptTurn {
                 index: 0,
                 role: "assistant".to_string(),
                 content: attempt.output_excerpt.clone().unwrap_or_default(),
                 thinking: None,
                 tool_calls: Vec::new(),
                 created_at: attempt.created_at.clone(),
-            }];
+            }]);
         }
     }
+    Some(Vec::new())
+}
 
-    Vec::new()
+/// Read a queued session without confusing a failed transcript read with no transcript.
+pub(crate) fn read_session_transcript_observation_from_snapshot(
+    session_id: &str,
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Option<Vec<TranscriptTurn>> {
+    let sessions = discover_sessions_impl(snap, home_override, false);
+    transcript_observation_from_sessions(
+        session_id,
+        &sessions,
+        snap,
+        home_override,
+        &mut TranscriptReads::default(),
+    )
 }
 
 /// A lower step rewinds. Step 0 or 1 also rewinds when it repeats.
@@ -4865,6 +4916,66 @@ pub fn scan_cargo_architecture_conformance(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unstable_read_is_unknown_but_missing_transcript_is_known_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let old = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n";
+        fs::write(&path, old).unwrap();
+        let session: DiscoveredSessionSummary = serde_json::from_value(serde_json::json!({
+            "id": "example", "source": "route", "adapter": "claude", "status": "active",
+            "transcript_path": path.to_str().unwrap()
+        }))
+        .unwrap();
+        let snapshot = DiscoveryStoreSnapshot::default();
+        let mut reads = TranscriptReads::default();
+        let change = path.clone();
+        AFTER_TRANSCRIPT_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            fs::write(change, format!("{old}{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":\"reply\"}}}}\n")).unwrap();
+        })));
+        assert!(
+            transcript_observation_from_sessions(
+                "example",
+                std::slice::from_ref(&session),
+                &snapshot,
+                Some(tmp.path()),
+                &mut reads,
+            )
+            .is_none()
+        );
+        let observed = transcript_observation_from_sessions(
+            "example",
+            std::slice::from_ref(&session),
+            &snapshot,
+            Some(tmp.path()),
+            &mut reads,
+        )
+        .unwrap();
+        assert_eq!(observed.len(), 2);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            transcript_observation_from_sessions(
+                "example",
+                &[session],
+                &snapshot,
+                Some(tmp.path()),
+                &mut reads,
+            ),
+            Some(Vec::new()),
+            "a genuinely absent route transcript is a known empty observation",
+        );
+        assert_eq!(
+            transcript_observation_from_sessions(
+                "not-found",
+                &[],
+                &snapshot,
+                Some(tmp.path()),
+                &mut reads,
+            ),
+            Some(Vec::new())
+        );
+    }
 
     #[test]
     fn transcript_reads_refreshes_after_file_changes_but_reuses_unchanged_data() {

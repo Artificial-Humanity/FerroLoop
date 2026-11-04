@@ -497,6 +497,31 @@ fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
 }
 
 #[test]
+fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let home = tmp.path().to_path_buf();
+    crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 4));
+    let (sent, _) = post_prompt(&state, true);
+    assert_eq!(sent.json_value().unwrap()["status"], "sent");
+    let (queued, _) = post_prompt(&state, false);
+    assert_eq!(queued.json_value().unwrap()["status"], "queued");
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(
+        state.session_queue("conv-ferris-1").len(),
+        1,
+        "old idle turns cannot complete the new prompt"
+    );
+    write_ferris_transcript(tmp.path(), 5);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(
+        state.session_queue("conv-ferris-1").is_empty(),
+        "a later assistant turn releases the queue"
+    );
+}
+
+#[test]
 fn known_prompt_skips_attempt_snapshot_and_reuses_unchanged_transcript() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
