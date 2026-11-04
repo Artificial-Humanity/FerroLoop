@@ -106,9 +106,11 @@ pub struct SliceBoundProof {
     pub adapter: String,
     pub mode: String,
     pub cli_version_range: String,
+    /// Canonical SHA-256 identity: `sha256:` followed by 64 lowercase hex digits.
     pub binary_hash: String,
     pub model: String,
     pub auth_billing_mode: String,
+    /// Canonical SHA-256 identity: `sha256:` followed by 64 lowercase hex digits.
     pub config_digest: String,
     pub kind: SliceBoundKind,
     pub accounting_unit: AccountingUnit,
@@ -138,6 +140,14 @@ pub enum SliceAdmissionRefusal {
 }
 fn valid_text(s: &str) -> bool {
     !s.trim().is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control)
+}
+fn valid_sha256(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 fn valid_version_range(s: &str) -> Option<VersionReq> {
     let range = VersionReq::parse(s).ok()?;
@@ -175,6 +185,9 @@ impl SliceBoundProof {
         .iter()
         .any(|s| !valid_text(s))
         {
+            return None;
+        }
+        if !valid_sha256(&self.binary_hash) || !valid_sha256(&self.config_digest) {
             return None;
         }
         let zero_allowed = match &self.accounting_unit {
@@ -303,6 +316,9 @@ pub fn evaluate_slice_bounds(
     {
         return Err(SliceAdmissionRefusal::Unproven);
     }
+    if !valid_sha256(input.binary_hash) || !valid_sha256(input.config_digest) {
+        return Err(SliceAdmissionRefusal::Unproven);
+    }
     let mut matched = proofs.iter().filter(|p| {
         p.adapter == input.adapter
             && p.mode == input.mode
@@ -337,10 +353,12 @@ mod tests {
             adapter: "claude".into(),
             mode: "print".into(),
             cli_version_range: ">=1.2.0, <2.0.0".into(),
-            binary_hash: "sha256:abc".into(),
+            binary_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .into(),
             model: "model".into(),
             auth_billing_mode: "api".into(),
-            config_digest: "sha256:config".into(),
+            config_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
             accounting_unit: AccountingUnit::ActualUsd {
                 billing_contract: "contract".into(),
             },
@@ -768,5 +786,49 @@ mod tests {
             epsilon_step: None,
         };
         assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
+    }
+    #[test]
+    fn malformed_or_missing_digest_pins_are_unproven() {
+        let valid = proof();
+        assert!(evaluate_slice_bounds(std::slice::from_ref(&valid), &installed(&valid)).is_ok());
+        let invalid = [
+            "".to_owned(),
+            "unknown".to_owned(),
+            "sha256:abc".to_owned(),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "a".repeat(65)),
+            format!("sha256:{}", "g".repeat(64)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("SHA256:{}", "a".repeat(64)),
+            "a".repeat(64),
+        ];
+        for bad in invalid {
+            let mut p = valid.clone();
+            p.binary_hash = bad.clone();
+            assert_eq!(
+                evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+                Err(SliceAdmissionRefusal::Unproven),
+                "binary {bad}"
+            );
+            p = valid.clone();
+            p.config_digest = bad.clone();
+            assert_eq!(
+                evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+                Err(SliceAdmissionRefusal::Unproven),
+                "config {bad}"
+            );
+        }
+        let mut input = installed(&valid);
+        input.binary_hash = "unknown";
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&valid), &input),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+        let mut input = installed(&valid);
+        input.config_digest = "unknown";
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&valid), &input),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
     }
 }

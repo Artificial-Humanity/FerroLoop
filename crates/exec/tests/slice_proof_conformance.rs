@@ -30,10 +30,12 @@ fn proof(kind: SliceBoundKind) -> SliceBoundProof {
         adapter: "fake".into(),
         mode: "print".into(),
         cli_version_range: ">=1.0.0, <2.0.0".into(),
-        binary_hash: "sha256:fixture".into(),
+        binary_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .into(),
         model: "fake-model".into(),
         auth_billing_mode: "api".into(),
-        config_digest: "sha256:fixture-config".into(),
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            .into(),
         kind,
         accounting_unit: AccountingUnit::ActualUsd {
             billing_contract: "test-only-contract".into(),
@@ -76,10 +78,10 @@ fn input() -> SliceProofInput<'static> {
         adapter: "fake",
         mode: "print",
         installed_cli_version: "1.0.0",
-        binary_hash: "sha256:fixture",
+        binary_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         model: "fake-model",
         auth_billing_mode: "api",
-        config_digest: "sha256:fixture-config",
+        config_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     }
 }
 
@@ -234,7 +236,7 @@ async fn missing_proof_and_every_pinned_drift_refuse_without_spawn_or_reservatio
             ..input()
         },
         SliceProofInput {
-            binary_hash: "drift",
+            binary_hash: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             ..input()
         },
         SliceProofInput {
@@ -246,7 +248,7 @@ async fn missing_proof_and_every_pinned_drift_refuse_without_spawn_or_reservatio
             ..input()
         },
         SliceProofInput {
-            config_digest: "drift",
+            config_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             ..input()
         },
     ];
