@@ -1714,18 +1714,48 @@ fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
     }
 }
 
-/// A stale saved route needs a positive liveness check before it can bypass a rescan.
-/// A process or pane check establishes only the endpoint's liveness, not delivery success.
-fn stale_route_verified_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
-    match route {
-        VendorRoute::Webhook { socket_path } => socket_path.exists(),
-        VendorRoute::Claude { pid, .. }
-            if *pid > 0
-                && home_override.is_none()
-                && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1") =>
-        {
-            Path::new(&format!("/proc/{pid}")).exists()
+/// Verify a Unix webhook listener without connecting to it. A probe connection would itself
+/// reach the receiver as a delivery. Linux exposes listening sockets in `/proc/net/unix`;
+/// elsewhere, or when the table cannot be read, rediscovery is required.
+#[cfg(target_os = "linux")]
+fn webhook_listener_is_live(socket_path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(path) = socket_path.to_str().filter(|p| !p.contains(['\n', '\r'])) else {
+        return false;
+    };
+    if !socket_path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_socket())
+    {
+        return false;
+    }
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return false;
+    };
+    table.lines().any(|line| {
+        let Some(prefix) = line.strip_suffix(path) else {
+            return false;
+        };
+        if !prefix.ends_with(' ') {
+            return false;
         }
+        let fields: Vec<_> = prefix.split_whitespace().collect();
+        fields.len() == 7
+            && u32::from_str_radix(fields[3], 16).is_ok_and(|flags| flags & 0x0001_0000 != 0)
+            && fields[4] == "0001"
+            && fields[5] == "01"
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn webhook_listener_is_live(_socket_path: &Path) -> bool {
+    false
+}
+
+/// A stale saved route needs a positive endpoint check. A PID alone is not a stable Claude
+/// session identity; stale Claude, Codex, and Antigravity routes require rediscovery.
+fn stale_route_verified_live(route: &VendorRoute, _home_override: Option<&Path>) -> bool {
+    match route {
+        VendorRoute::Webhook { socket_path } => webhook_listener_is_live(socket_path),
         VendorRoute::Muse {
             tmux_target,
             tmux_pane,
@@ -1741,7 +1771,6 @@ fn stale_route_verified_live(route: &VendorRoute, home_override: Option<&Path>) 
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .any(tmux_target_exists),
-        // These do not carry enough identity to validate the endpoint without rediscovery.
         _ => false,
     }
 }
@@ -1808,18 +1837,51 @@ pub(crate) fn lookup_route(
 ) -> Option<RouteLookup> {
     let fresh = crate::discovery::saved_routes_fresh(home_override, Instant::now());
     let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
-    if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
-        .filter(|route| {
-            query
-                .session_id
-                .is_none_or(|id| route_serves_session(route, id))
+    let candidate = route_in(&saved, query.persona, query.fallback_session_id).filter(|route| {
+        query.session_id.is_none_or(|id| {
+            route_serves_session(route, id)
+                || (fresh && freshly_scanned_muse_placeholder(route, query.persona, id))
         })
-        .filter(|route| route_looks_live(route, home_override))
-        .filter(|route| fresh || stale_route_verified_live(route, home_override))
-    {
-        return Some(RouteLookup::Saved(route));
+    });
+    // If a route had a tmux endpoint but it died, discovery can retain its vendor session id
+    // while clearing the target. Never let that turn into an accidental headless invocation.
+    let tmux_live = candidate.as_ref().and_then(|route| match route {
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        } if [tmux_target, tmux_pane]
+            .into_iter()
+            .flatten()
+            .any(|s| !s.trim().is_empty()) =>
+        {
+            Some(tmux_route_has_live_target(route))
+        }
+        _ => None,
+    });
+    let dead_tmux = tmux_live == Some(false);
+    if let Some(route) = candidate.as_ref().filter(|route| {
+        !dead_tmux
+            && route_looks_live(route, home_override)
+            && (fresh || tmux_live == Some(true) || stale_route_verified_live(route, home_override))
+    }) {
+        return Some(RouteLookup::Saved(route.clone()));
     }
-    rescan_route(home_override, query).map(RouteLookup::Scanned)
+    let scanned = rescan_route(home_override, query)?;
+    if dead_tmux
+        && candidate
+            .as_ref()
+            .is_some_and(|old| same_tmux_vendor_session(old, &scanned))
+        && !tmux_route_has_live_target(&scanned)
+    {
+        return None;
+    }
+    Some(RouteLookup::Scanned(scanned))
 }
 
 /// Scan the host for the session's route (never from the shared scan cache), save what the scan
@@ -1830,10 +1892,71 @@ pub(crate) fn rescan_route(
 ) -> Option<VendorRoute> {
     let scanned = crate::discovery::scan_and_save_route_table(home_override);
     route_in(&scanned, query.persona, query.fallback_session_id).filter(|route| {
-        query
-            .session_id
-            .is_none_or(|id| route_serves_session(route, id))
+        query.session_id.is_none_or(|id| {
+            route_serves_session(route, id)
+                || freshly_scanned_muse_placeholder(route, query.persona, id)
+        })
     })
+}
+
+/// Discovery names a live Muse window with no transcript `muse-<persona>`. This placeholder
+/// binds only the scanned persona and its exact live window; it is not a vendor session ID.
+fn freshly_scanned_muse_placeholder(
+    route: &VendorRoute,
+    persona: Option<&str>,
+    session_id: &str,
+) -> bool {
+    let Some(persona) = persona else {
+        return false;
+    };
+    if session_id != format!("muse-{persona}") {
+        return false;
+    }
+    match route {
+        VendorRoute::Muse {
+            session_id,
+            tmux_target: Some(target),
+            ..
+        } if session_id.is_empty() => {
+            let target_for_persona = target == &format!("muse:{persona}")
+                || target.split_once(':').is_some_and(|(session, window)| {
+                    session.eq_ignore_ascii_case(persona) && window == "muse"
+                });
+            target_for_persona && tmux_target_exists(target)
+        }
+        _ => false,
+    }
+}
+
+fn same_tmux_vendor_session(a: &VendorRoute, b: &VendorRoute) -> bool {
+    match (a, b) {
+        (VendorRoute::Muse { session_id: x, .. }, VendorRoute::Muse { session_id: y, .. })
+        | (VendorRoute::Grok { session_id: x, .. }, VendorRoute::Grok { session_id: y, .. }) => {
+            x == y
+        }
+        _ => false,
+    }
+}
+
+fn tmux_route_has_live_target(route: &VendorRoute) -> bool {
+    match route {
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => [tmux_target, tmux_pane]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .any(tmux_target_exists),
+        _ => false,
+    }
 }
 
 /// The live route for the query's session (see [`lookup_route`]).
@@ -1901,11 +2024,23 @@ pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
     }
 }
 
-/// `true` when tmux knows `target` (the binary fl-wire uses: `FL_WIRE_TMUX_BIN`, else `tmux`).
+/// Test an exact window with `list-panes`: display-message falls back to the current window.
 fn tmux_target_exists(target: &str) -> bool {
-    let mut cmd = Command::new(tmux_bin());
-    cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
-    command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
+    let exact = if !target.contains(':')
+        && !target.is_empty()
+        && !target.starts_with(['=', '@', '%', '$'])
+        && !target.bytes().all(|b| b.is_ascii_digit())
+    {
+        format!("={target}")
+    } else {
+        fl_wire::dispatcher::tmux_exact_target(target)
+    };
+    let output = if exact != target || target.contains(':') || target.starts_with('=') {
+        tmux_stdout(&["list-panes", "-t", &exact, "-F", "#{pane_id}"])
+    } else {
+        tmux_stdout(&["display-message", "-p", "-t", target, "#{pane_id}"])
+    };
+    output.is_some_and(|s| !s.trim().is_empty())
 }
 
 /// Send to the session's route; `None` when the session has no route.
@@ -1918,8 +2053,9 @@ fn tmux_target_exists(target: &str) -> bool {
 ///
 /// `send` runs a second time only when its first run on a saved route failed with
 /// [`PushError::NotConnected`] (the receiver was never reached, so nothing was delivered) and a
-/// scan then finds a different route. Every other failure of `send` is returned as it is, never
-/// retried: by then part of the delivery may have landed.
+/// scan then finds a different route. A gone tmux target never falls back to the same session's
+/// headless command. Every other failure of `send` is returned as it is, never retried: by then
+/// part of the delivery may have landed.
 pub(crate) fn dispatch_with_rediscovery<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
@@ -1927,7 +2063,15 @@ pub(crate) fn dispatch_with_rediscovery<T>(
 ) -> Option<Result<T, String>> {
     let (route, from_saved) = match lookup_route(home_override, query)? {
         RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
-            (rescan_route(home_override, query).unwrap_or(saved), false)
+            let refreshed = rescan_route(home_override, query);
+            if undeliverable(&saved) == Some(Undeliverable::PaneGone)
+                && refreshed.as_ref().is_none_or(|new| {
+                    same_tmux_vendor_session(&saved, new) && !tmux_route_has_live_target(new)
+                })
+            {
+                return Some(Err("the session's tmux target no longer exists".to_string()));
+            }
+            (refreshed.unwrap_or(saved), false)
         }
         RouteLookup::Saved(saved) => (saved, true),
         RouteLookup::Scanned(scanned) => (scanned, false),

@@ -767,11 +767,16 @@ impl FakeTmuxWindows {
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let list: String = windows.iter().map(|w| format!("  echo '{w}'\n")).collect();
+        let exact: String = windows
+            .iter()
+            .filter_map(|w| w.split_once(':'))
+            .map(|(session, window)| format!("  '={session}:={window}') echo '%5'; exit 0;;\n"))
+            .collect();
         let bin = dir.join("fake-tmux.sh");
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
+                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"list-panes\" ]; then\n case \"$3\" in\n{exact}  *) exit 1;;\n esac\nelif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
             ),
         )
         .unwrap();
@@ -838,7 +843,175 @@ fn a_spun_up_muse_resolves_to_its_tmux_window_before_it_has_a_transcript() {
         // Nothing to refuse the delivery before it is tried, and no session id to match.
         assert_eq!(undeliverable(&route), None);
         assert!(!crate::api::route_matches_session_id(&route, ""));
+        // Discovery exposes this route as a persona-specific placeholder before a transcript
+        // exists; prompt/reset route lookup must resolve it without matching another persona.
+        let placeholder = RouteQuery {
+            persona: Some("muselaunch"),
+            fallback_session_id: "muse-muselaunch",
+            session_id: Some("muse-muselaunch"),
+        };
+        assert_eq!(
+            lookup_route(Some(home.path()), placeholder).map(RouteLookup::into_route),
+            Some(route.clone())
+        );
+        let wrong = RouteQuery {
+            persona: Some("muselaunch"),
+            fallback_session_id: "muse-other",
+            session_id: Some("muse-other"),
+        };
+        assert_eq!(lookup_route(Some(home.path()), wrong), None);
     });
+}
+
+#[test]
+fn placeholder_muse_session_accepts_prompt_and_reset_before_transcript() {
+    crate::direct_quota::with_probe_lock(|| {
+        let home = TempDir::new().unwrap();
+        let state = crate::latency_tests::hub_with_ferris(&home, 2);
+        let _tmux = FakeTmuxWindows::install(home.path(), &["muse:muselaunch"]);
+        let request = crate::HttpRequest::new("POST", "/api/v1/sessions/muse-muselaunch/prompt")
+            .with_header("Authorization", "Bearer owner-tok-secret")
+            .with_json_body(&serde_json::json!({"prompt":"hello", "send_now":true}));
+        let reply = crate::handle_http_request(&state, &request);
+        assert_eq!(
+            reply.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body = reply.json_value().unwrap();
+        assert_eq!(body["session_id"], "muse-muselaunch");
+        assert_eq!(body["delivered"], true, "{body}");
+        let clear = crate::HttpRequest::new("POST", "/api/v1/sessions/muse-muselaunch/clear")
+            .with_header("Authorization", "Bearer owner-tok-secret")
+            .with_json_body(&serde_json::json!({"mode":"clear"}));
+        let reply = crate::handle_http_request(&state, &clear);
+        assert_eq!(
+            reply.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert_eq!(reply.json_value().unwrap()["ok"], true);
+    });
+}
+
+#[test]
+fn muse_placeholder_accepts_only_its_exact_persona_window() {
+    let home = TempDir::new().unwrap();
+    let _tmux = FakeTmuxWindows::install(home.path(), &["Ada:muse", "muse:other"]);
+    let route = VendorRoute::Muse {
+        session_id: String::new(),
+        cwd: None,
+        tmux_target: Some("Ada:muse".into()),
+        tmux_pane: None,
+    };
+    assert!(freshly_scanned_muse_placeholder(
+        &route,
+        Some("ada"),
+        "muse-ada"
+    ));
+    assert!(!freshly_scanned_muse_placeholder(
+        &route,
+        Some("other"),
+        "muse-other"
+    ));
+    assert!(!freshly_scanned_muse_placeholder(
+        &route,
+        Some("ada"),
+        "muse-other"
+    ));
+    assert!(!freshly_scanned_muse_placeholder(&route, None, "muse-ada"));
+}
+
+#[test]
+fn tmux_liveness_does_not_match_a_prefix_neighbor() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = crate::TMUX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().unwrap();
+    let bin = dir.path().join("prefix-tmux");
+    std::fs::write(&bin, "#!/bin/sh\ncase \"$1\" in\n  display-message) echo %5; exit 0;;\n  list-panes) exit 1;;\nesac\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_executable(&bin);
+    let prev = std::env::var_os("FL_WIRE_TMUX_BIN");
+    // SAFETY: all tests using the process-wide tmux override share this lock.
+    unsafe { std::env::set_var("FL_WIRE_TMUX_BIN", &bin) };
+    let alive = tmux_target_exists("muse:ada");
+    unsafe {
+        match prev {
+            Some(value) => std::env::set_var("FL_WIRE_TMUX_BIN", value),
+            None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+        }
+    };
+    assert!(
+        !alive,
+        "tmux display-message can fall back to a neighboring window"
+    );
+}
+
+#[test]
+fn a_gone_muse_window_does_not_fall_back_to_headless_via_a_neighbor() {
+    crate::direct_quota::with_probe_lock(|| {
+        let home = TempDir::new().unwrap();
+        let _tmux = FakeTmuxWindows::install(home.path(), &["muse:ada-2"]);
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Muse {
+                session_id: "old-session".into(),
+                cwd: None,
+                tmux_target: Some("muse:ada".into()),
+                tmux_pane: None,
+            },
+            At::from_unix_millis(1),
+        );
+        routes
+            .save(Some(&home.path().join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        let query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "old-session",
+            session_id: Some("old-session"),
+        };
+        let mut called = false;
+        let outcome = dispatch_with_rediscovery(Some(home.path()), query, |_| {
+            called = true;
+            Ok::<_, PushError>(())
+        });
+        assert!(
+            outcome.is_none() || matches!(outcome, Some(Err(_))),
+            "gone route must refuse: {outcome:?}"
+        );
+        assert!(
+            !called,
+            "a missing window must not cause a headless delivery"
+        );
+        let again = dispatch_with_rediscovery(Some(home.path()), query, |_| {
+            called = true;
+            Ok::<_, PushError>(())
+        });
+        assert!(
+            again.is_none() || matches!(again, Some(Err(_))),
+            "repeated lookup must remain refused: {again:?}"
+        );
+        assert!(
+            !called,
+            "rediscovery must not erase the reason to refuse headless delivery"
+        );
+    });
+}
+
+#[test]
+fn a_live_unrelated_pid_does_not_prove_a_stale_claude_route() {
+    let route = VendorRoute::Claude {
+        pid: std::process::id(),
+        session_id: "old-session".into(),
+        socket_path: "/tmp/nonexistent-claude.sock".into(),
+        key_path: None,
+    };
+    assert!(!stale_route_verified_live(&route, None));
 }
 
 #[test]

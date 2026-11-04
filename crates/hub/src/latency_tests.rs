@@ -939,8 +939,46 @@ mod route_lookup {
             .unwrap();
         note_route_file_scan(Some(home.path()), long_ago);
         let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        assert_eq!(found, Some(RouteLookup::Saved(route)));
-        assert_eq!(costs.route_scans, 0, "a live route does not need a scan");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(found, Some(RouteLookup::Saved(route)));
+            assert_eq!(
+                costs.route_scans, 0,
+                "a verified listener does not need a scan"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(found, Some(RouteLookup::Scanned(route)));
+            assert_eq!(costs.route_scans, 1, "without a listener verifier, rescan");
+        }
+    }
+
+    #[test]
+    fn a_stale_webhook_without_a_listener_rescans_the_live_route() {
+        let home = TempDir::new().unwrap();
+        let old = refusing_webhook(home.path(), "stale.sock");
+        save_route(home.path(), "ada", old);
+        host_runs_claude(home.path(), "ada", "new-sid");
+        let replacement = UnixListener::bind(home.path().join("new.sock")).unwrap();
+        let long_ago = Instant::now()
+            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
+            .unwrap();
+        note_route_file_scan(Some(home.path()), long_ago);
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
+        let Some(RouteLookup::Scanned(route)) = found else {
+            panic!("expected rescan: {found:?}");
+        };
+        assert_eq!(claude_session_id(&route), "new-sid");
+        assert_eq!(costs.route_scans, 1);
+        let chosen = dispatch_once(Some(home.path()), by_persona("ada"), |route| {
+            Ok::<_, String>(route.clone())
+        });
+        assert!(matches!(chosen, Some(Ok(ref route)) if claude_session_id(route) == "new-sid"));
+        assert!(
+            connections(&replacement).is_empty(),
+            "route verification must not connect"
+        );
     }
 
     #[test]
