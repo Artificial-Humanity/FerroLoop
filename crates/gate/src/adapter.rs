@@ -345,7 +345,8 @@ fn push_unique(entries: &mut Vec<Value>, entry: Value) {
 mod tests {
     use super::*;
     use crate::connector::{ConnectorManifest, ConnectorToolDef};
-    use crate::mcp::handle_mcp_jsonrpc_request_with_secret_provider;
+    use crate::governor::GateGovernor;
+    use crate::mcp::handle_mcp_jsonrpc_request_with_governor;
     use crate::proxy::{
         ProxyRequest, prepare_proxied_request, prepare_proxied_request_with_provider,
     };
@@ -905,12 +906,11 @@ mod tests {
     fn mcp_tool_call_denial_is_an_error_result_without_an_http_call() {
         let (_tmp, vault) = open_vault();
         let connector = connector_with_tool();
-        let provider = CountingProvider::with_secret(None);
-        *provider.decision.lock().unwrap() = IamDecision::Deny {
-            policy: "organizations/1/policy".into(),
-            reason: "no binding".into(),
-        };
-        let response = handle_mcp_jsonrpc_request_with_secret_provider(
+        // Governed entry with no governor store: connector dispatch is
+        // refused with admission_unavailable, without any HTTP call.
+        // (IAM denial itself is covered by the authorize_mcp_tool tests.)
+        let gov = GateGovernor::none();
+        let response = handle_mcp_jsonrpc_request_with_governor(
             &json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -921,16 +921,14 @@ mod tests {
             std::slice::from_ref(&connector),
             None,
             Some("felicia".into()),
-            Some(&provider),
+            Some(&gov),
+            &fl_core::governor::Principal::Owner,
+            "",
         )
         .unwrap();
         assert_eq!(response["result"]["isError"], true);
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
-        let expected = GateError::PolicyDenied {
-            secret: "organizations/1/policy".into(),
-            reason: "no binding".into(),
-        };
-        assert_eq!(text, expected.to_string());
+        assert_eq!(text, "admission_unavailable");
         assert!(!text.contains("upstream"));
     }
 

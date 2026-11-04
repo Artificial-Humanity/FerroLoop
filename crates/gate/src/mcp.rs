@@ -3,8 +3,13 @@
 
 use serde_json::{Value, json};
 
+use fl_core::governor::Principal;
+
 use crate::adapter::{SecretProviderAdapter, authorize_mcp_tool};
 use crate::connector::{ConnectorManifest, ToolOutcome};
+use crate::governor::{
+    ADMISSION_UNAVAILABLE, GateGovernor, GovernedOutcome, admission_refusal_text,
+};
 use crate::vault::Vault;
 
 /// Build the MCP `tools/list` array across all enabled `connectors` (plus built-in discovery tools).
@@ -57,6 +62,11 @@ pub fn build_mcp_tools_list(
 
 /// Handle a single MCP JSON-RPC 2.0 request object (`initialize`, `ping`, `tools/list`, `tools/call`).
 /// Returns `None` for JSON-RPC notifications (`notifications/initialized`).
+///
+/// Legacy entry point: built-in (non-connector) tools keep working, but
+/// CONNECTOR tool dispatch is refused with `admission_unavailable` —
+/// governed dispatch must go through
+/// [`handle_mcp_jsonrpc_request_with_governor`].
 pub fn handle_mcp_jsonrpc_request(
     req: &Value,
     vault: &Vault,
@@ -76,8 +86,10 @@ pub fn handle_mcp_jsonrpc_request(
 
 /// [`handle_mcp_jsonrpc_request`] with an optional IAM and secret provider.
 ///
-/// `None` keeps connector tools on [`ConnectorManifest::execute_tool`]. `Some` authorizes
-/// only connector-owned tools, then proxies with the provider. Built-in list tools are not authorized.
+/// Legacy entry point: like [`handle_mcp_jsonrpc_request`], CONNECTOR
+/// tool dispatch is refused with `admission_unavailable` (built-in tools
+/// keep working); use [`handle_mcp_jsonrpc_request_with_governor`] for
+/// governed connector dispatch.
 pub fn handle_mcp_jsonrpc_request_with_secret_provider(
     req: &Value,
     vault: &Vault,
@@ -85,6 +97,89 @@ pub fn handle_mcp_jsonrpc_request_with_secret_provider(
     connector_filter: Option<&str>,
     caller_agent: Option<String>,
     secret_provider: Option<&dyn SecretProviderAdapter>,
+) -> Option<Value> {
+    handle_mcp_inner(
+        req,
+        vault,
+        connectors,
+        connector_filter,
+        caller_agent,
+        secret_provider,
+        None,
+        &Principal::Owner,
+        "",
+    )
+}
+
+/// MCP handler with a [`GateGovernor`]: connector tools are governed
+/// (admit/reserve/settle); built-in list tools stay ungoverned.
+/// Project binding: `project` when non-empty, otherwise the connector id
+/// of the matched tool. Principal and project are supplied by the caller
+/// surface (hub: Owner authority maps to `Principal::Owner`).
+#[allow(clippy::too_many_arguments)]
+pub fn handle_mcp_jsonrpc_request_with_governor(
+    req: &Value,
+    vault: &Vault,
+    connectors: &[ConnectorManifest],
+    connector_filter: Option<&str>,
+    caller_agent: Option<String>,
+    governor: Option<&GateGovernor>,
+    principal: &Principal,
+    project: &str,
+) -> Option<Value> {
+    handle_mcp_jsonrpc_request_with_governor_and_secret_provider(
+        req,
+        vault,
+        connectors,
+        connector_filter,
+        caller_agent,
+        governor,
+        principal,
+        project,
+        None,
+    )
+}
+
+/// [`handle_mcp_jsonrpc_request_with_governor`] with an optional IAM and
+/// secret provider: the provider authorizes via `authorize_mcp_tool`
+/// before governed dispatch and resolves provider-backed secrets during
+/// request preparation.
+#[allow(clippy::too_many_arguments)]
+pub fn handle_mcp_jsonrpc_request_with_governor_and_secret_provider(
+    req: &Value,
+    vault: &Vault,
+    connectors: &[ConnectorManifest],
+    connector_filter: Option<&str>,
+    caller_agent: Option<String>,
+    governor: Option<&GateGovernor>,
+    principal: &Principal,
+    project: &str,
+    secret_provider: Option<&dyn SecretProviderAdapter>,
+) -> Option<Value> {
+    handle_mcp_inner(
+        req,
+        vault,
+        connectors,
+        connector_filter,
+        caller_agent,
+        secret_provider,
+        governor,
+        principal,
+        project,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_mcp_inner(
+    req: &Value,
+    vault: &Vault,
+    connectors: &[ConnectorManifest],
+    connector_filter: Option<&str>,
+    caller_agent: Option<String>,
+    secret_provider: Option<&dyn SecretProviderAdapter>,
+    governor: Option<&GateGovernor>,
+    principal: &Principal,
+    project: &str,
 ) -> Option<Value> {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let id = req.get("id").cloned();
@@ -179,39 +274,55 @@ pub fn handle_mcp_jsonrpc_request_with_secret_provider(
                     continue;
                 }
                 if conn.tools.iter().any(|t| t.name == tool_name) {
-                    if let Some(provider) = secret_provider {
-                        if let Err(err) = authorize_mcp_tool(
+                    // Legacy entries (no governor) never dispatch connector
+                    // tools: refuse with admission_unavailable. Built-in
+                    // tools above are unaffected.
+                    let Some(gov) = governor else {
+                        return Some(mcp_tool_text_response(id_val, ADMISSION_UNAVAILABLE, true));
+                    };
+                    // A secret provider, when supplied, still authorizes
+                    // before governed dispatch.
+                    if let Some(provider) = secret_provider
+                        && let Err(err) = authorize_mcp_tool(
                             provider,
                             caller_agent.as_deref(),
                             &conn.id,
                             tool_name,
-                        ) {
-                            return Some(mcp_tool_text_response(id_val, &err.to_string(), true));
-                        }
-                        return match conn.execute_tool_outcome_with_provider(
-                            vault,
-                            tool_name,
-                            &arguments,
-                            caller_agent,
-                            Some(provider),
-                        ) {
-                            Ok((resp, outcome)) => {
-                                Some(mcp_tool_outcome_response(id_val, &resp, outcome))
-                            }
-                            Err(err) => {
-                                Some(mcp_tool_text_response(id_val, &err.to_string(), true))
-                            }
-                        };
+                        )
+                    {
+                        return Some(mcp_tool_text_response(id_val, &err.to_string(), true));
                     }
-                    return match conn.invoke_tool_outcome(
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    // Project binding: explicit project, else connector id.
+                    let effective_project: &str = if project.is_empty() {
+                        conn.id.as_str()
+                    } else {
+                        project
+                    };
+                    return match gov.governed_invoke_with_provider(
+                        conn,
                         vault,
                         tool_name,
                         &arguments,
                         caller_agent,
+                        principal.clone(),
+                        effective_project,
+                        now_ms,
+                        // No real quota observation exists on this path.
+                        None,
+                        secret_provider,
                     ) {
-                        Ok((resp, outcome)) => {
-                            Some(mcp_tool_outcome_response(id_val, &resp, outcome))
-                        }
+                        Ok(GovernedOutcome::Completed {
+                            response, outcome, ..
+                        }) => Some(mcp_tool_outcome_response(id_val, &response, outcome)),
+                        Ok(GovernedOutcome::Refused(outcome)) => Some(mcp_tool_text_response(
+                            id_val,
+                            &admission_refusal_text(&outcome),
+                            true,
+                        )),
                         Err(err) => Some(mcp_tool_text_response(id_val, &err.to_string(), true)),
                     };
                 }
@@ -386,6 +497,48 @@ mod tests {
     }
 
     #[test]
+    fn legacy_entry_refuses_connector_but_serves_builtins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = crate::load_or_init_master_key(&tmp.path().join("k")).unwrap();
+        let vault = Vault::open(tmp.path().join("v.enc"), key).unwrap();
+        let m = manifest(false);
+        // Connector tool via the legacy entry: refused, never dispatched.
+        let resp = handle_mcp_jsonrpc_request(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
+            &vault,
+            std::slice::from_ref(&m),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert_eq!(
+            resp["result"]["content"][0]["text"],
+            json!("admission_unavailable")
+        );
+        // Built-in (non-connector) tool still works on the legacy entry.
+        let resp = handle_mcp_jsonrpc_request(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ferrogate_list_connectors","arguments":{}}}),
+            &vault,
+            std::slice::from_ref(&m),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(false));
+        // tools/list also keeps working.
+        let resp = handle_mcp_jsonrpc_request(
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+            &vault,
+            std::slice::from_ref(&m),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(resp["result"]["tools"].is_array());
+    }
+
+    #[test]
     fn mcp_connector_public_result_parity() {
         // Same fixture body via connector outcome (CLI cmd_call is raw proxy = Uncontracted,
         // Hub bridge/CLI MCP share this path) and via MCP rendering must agree.
@@ -425,5 +578,58 @@ mod tests {
                 other => panic!("unexpected {other:?} ok={ok}"),
             }
         }
+    }
+
+    #[test]
+    fn governed_mcp_provider_iam_denial_reaches_authorize() {
+        use crate::adapter::{ExternalSecret, IamDecision};
+        use crate::governor::GateGovernor;
+        use std::sync::Arc;
+        struct DenyProvider;
+        impl SecretProviderAdapter for DenyProvider {
+            fn provider_name(&self) -> &str {
+                "deny-test"
+            }
+            fn resolve_secret(
+                &self,
+                _name: &str,
+                _caller: Option<&str>,
+            ) -> Result<Option<ExternalSecret>, crate::GateError> {
+                Ok(None)
+            }
+            fn check_tool_authorization(
+                &self,
+                _caller: Option<&str>,
+                _connector: &str,
+                _tool: &str,
+            ) -> Result<IamDecision, crate::GateError> {
+                Ok(IamDecision::Deny {
+                    policy: "test-policy".into(),
+                    reason: "not allowed".into(),
+                })
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = crate::load_or_init_master_key(&tmp.path().join("k")).unwrap();
+        let vault = Vault::open(tmp.path().join("v.enc"), key).unwrap();
+        let m = manifest(false);
+        let gov = GateGovernor::new(Arc::new(fl_core::governor::MemGovernorStore::new(
+            fl_core::governor::GovernorPolicy::default(),
+        )));
+        let resp = handle_mcp_jsonrpc_request_with_governor_and_secret_provider(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
+            &vault,
+            std::slice::from_ref(&m),
+            None,
+            Some("felicia".into()),
+            Some(&gov),
+            &Principal::Owner,
+            "",
+            Some(&DenyProvider),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("test-policy"), "{text}");
     }
 }

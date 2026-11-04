@@ -19,6 +19,7 @@ pub mod code_knowledge;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod formats;
+pub mod governor_store;
 pub mod health;
 pub mod knowledge;
 pub mod manifest;
@@ -48,6 +49,7 @@ pub use ferrostore::{
     Transaction, VectorHit, VectorMetric, VectorStorage, ZoneMap, default_socket_path_for_store,
     migrate_redb_to_ferrostore,
 };
+pub use governor_store::{GOVERNOR_STATE_SLUG, PersistentGovernorStore};
 pub use knowledge::{
     DEFAULT_SYNC_BUDGET, IndexPolicy, MAX_SYNC_ROUNDS, RankMode, RankedHits, SearchMode,
     default_embedder, rank_bm25, rank_state_entries, rank_state_entries_mode,
