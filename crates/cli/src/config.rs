@@ -1096,6 +1096,7 @@ fn new_vendor_descriptor(id: &str, cfg: &VendorConfig) -> Result<VendorDescripto
         default_context_window: cfg.context_window.unwrap_or(0),
         default_rate_card: cfg.rate_card().unwrap_or_default(),
         mcp_config_rel_path: cfg.mcp_config_rel_path.clone(),
+        slice_bounds: Vec::new(),
     })
 }
 

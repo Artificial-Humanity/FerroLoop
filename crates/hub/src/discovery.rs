@@ -9024,6 +9024,7 @@ mod tests {
             default_context_window: context_window,
             default_rate_card: fl_core::telemetry::RateCard::default(),
             mcp_config_rel_path: None,
+            slice_bounds: Vec::new(),
         })
         .unwrap();
     }
