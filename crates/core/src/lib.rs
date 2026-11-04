@@ -40,6 +40,7 @@ pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
 pub mod routine;
+pub mod routine_authority;
 pub mod routing;
 pub mod session_protocol;
 pub mod slice_proof;
@@ -178,6 +179,12 @@ pub use routine::{
     FiringRecord, FiringState, RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork,
     Schedule, ScheduledInstant, Window, firing_key,
 };
+pub use routine_authority::{
+    AuthorityError, LifecycleAuthority, LifecycleTarget, LifecycleVerificationRequest,
+    LogicalWorkIdentity, ProofRegistryVerifier, ProofVerificationRequest, TerminalReceiptVerifier,
+    TerminalVerificationRequest, UnavailableAuthority, VerifiedLifecycle, VerifiedProof,
+    VerifiedTerminal, VerifiedTerminalOutcome,
+};
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use session_protocol::{
     AcpOperation, AcpProfileFingerprint, AcpProfileProofRecord, ConformanceState,
@@ -231,3 +238,14 @@ pub use workspace::{
 /// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the
 /// engine must recognise the file too: it never makes a gate stale.
 pub const MANIFEST_PATH: &str = ".fl/manifest.json";
+
+pub mod f1_memory;
+pub mod f1_records;
+pub use f1_records::{
+    AllocationEvidenceRecord, ControlRecordKey, F1PreparationStore, F1RecordError,
+    IntentDefinition, IntentEvidenceRecord, RoutineProposalRecord, SafetyBatch, SafetyChange,
+    SafetyState,
+};
+
+// A process-local, fail-closed preparation backend for tests and embedded callers.
+pub use f1_memory::MemoryF1PreparationStore;
