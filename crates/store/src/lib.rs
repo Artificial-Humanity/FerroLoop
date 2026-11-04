@@ -17,8 +17,6 @@ pub mod any;
 pub mod cli;
 pub mod code_knowledge;
 mod f1_preparation;
-mod f1_sqlite;
-pub use f1_sqlite::SqliteF1PreparationStore;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod formats;
