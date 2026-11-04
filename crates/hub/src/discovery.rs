@@ -2275,15 +2275,15 @@ fn is_antigravity_transcript(path: &Path) -> bool {
 /// Hydrate truncated `content` and `thinking` fields on Antigravity `transcript.jsonl` turns
 /// from the sibling `transcript_full.jsonl` when present, while keeping tool outputs (`GENERIC`,
 /// `TOOL_RESULT`, `CHECKPOINT`) and `tool_calls` compact.
-fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> Option<String> {
+fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> std::io::Result<Option<String>> {
     use std::io::{BufRead, BufReader, Read};
 
     if !is_antigravity_transcript(path) || !compact_raw.contains("\"truncated_fields\"") {
-        return None;
+        return Ok(None);
     }
     let full_path = path.with_file_name("transcript_full.jsonl");
     if !fs::metadata(&full_path).is_ok_and(|m| m.is_file()) {
-        return None;
+        return Ok(None);
     }
 
     struct PendingHydration {
@@ -2339,19 +2339,17 @@ fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> Option<String>
     }
 
     if pending.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    let file = fs::File::open(&full_path).ok()?;
+    let file = fs::File::open(&full_path)?;
     let mut reader = BufReader::new(file.take(TRANSCRIPT_READ_MAX_BYTES * 2));
     let mut buf = Vec::new();
     let mut full_idx = 0usize;
-    while reader
-        .read_until(b'\n', &mut buf)
-        .ok()
-        .filter(|&n| n > 0)
-        .is_some()
-    {
+    loop {
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
         let full_line = String::from_utf8_lossy(&buf);
         let trimmed = full_line.trim();
         if !trimmed.is_empty() {
@@ -2403,7 +2401,7 @@ fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> Option<String>
     }
 
     if !pending.iter().any(|p| p.hydrated) {
-        return None;
+        return Ok(None);
     }
 
     let mut out_lines: Vec<String> = compact_lines.iter().map(|&s| s.to_string()).collect();
@@ -2414,7 +2412,7 @@ fn hydrate_agy_truncated_turns(path: &Path, compact_raw: &str) -> Option<String>
             out_lines[p.compact_idx] = serialized;
         }
     }
-    Some(out_lines.join("\n"))
+    Ok(Some(out_lines.join("\n")))
 }
 
 fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage> {
@@ -2464,71 +2462,117 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
     latest
 }
 
-/// Transcript files one request has read. A second look at the same file (a busy check after
-/// the transcript, the context-window or quota scan) reuses the text and the parsed turns
-/// instead of reading and parsing a multi-MB file again. Keyed by path; a failed read is kept
-/// as `None`.
+/// Transcript files one request has read. Reuse a successful read and its parsed turns only
+/// when file identity and metadata remain stable. Failed reads are retried on the next access.
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptReads {
-    raw: BTreeMap<String, Option<String>>,
+    raw: BTreeMap<String, String>,
     turns: BTreeMap<String, Vec<TranscriptTurn>>,
     stamps: BTreeMap<String, TranscriptStamp>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct TranscriptStamp {
-    main: (std::time::SystemTime, u64),
-    agy_full: Option<(std::time::SystemTime, u64)>,
+    main: FileStamp,
+    agy_full: Option<FileStamp>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    device: u64,
+    inode: u64,
+    change_seconds: i64,
+    change_nanos: i64,
 }
 
 impl TranscriptReads {
+    #[cfg(unix)]
     fn stamp(path: &str) -> Option<TranscriptStamp> {
-        fn one(path: &Path) -> Option<(std::time::SystemTime, u64)> {
-            let meta = fs::metadata(path).ok()?;
-            Some((meta.modified().ok()?, meta.len()))
+        use std::os::unix::fs::MetadataExt;
+        fn one(path: &Path) -> std::io::Result<FileStamp> {
+            let meta = fs::metadata(path)?;
+            Ok(FileStamp {
+                modified: meta.modified()?,
+                len: meta.len(),
+                device: meta.dev(),
+                inode: meta.ino(),
+                change_seconds: meta.ctime(),
+                change_nanos: meta.ctime_nsec(),
+            })
         }
         let path = Path::new(path);
-        Some(TranscriptStamp {
-            main: one(path)?,
-            agy_full: is_antigravity_transcript(path)
-                .then(|| one(&path.with_file_name("transcript_full.jsonl")))
-                .flatten(),
-        })
+        let main = one(path).ok()?;
+        let agy_full = if is_antigravity_transcript(path) {
+            match one(&path.with_file_name("transcript_full.jsonl")) {
+                Ok(stamp) => Some(stamp),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return None,
+            }
+        } else {
+            None
+        };
+        Some(TranscriptStamp { main, agy_full })
+    }
+
+    // Without a reliable file identity, read again on every access.
+    #[cfg(not(unix))]
+    fn stamp(_path: &str) -> Option<TranscriptStamp> {
+        None
+    }
+
+    fn invalidate(&mut self, path: &str) {
+        self.raw.remove(path);
+        self.turns.remove(path);
+        self.stamps.remove(path);
     }
 
     fn refresh_if_changed(&mut self, path: &str) {
         let current = Self::stamp(path);
         if current.is_none() || current.as_ref() != self.stamps.get(path) {
-            self.raw.remove(path);
-            self.turns.remove(path);
-            self.stamps.remove(path);
+            self.invalidate(path);
         }
     }
 
-    /// Reuse a read only while the file's modification time and length are unchanged.
+    /// Reuse a read only while its file identity and metadata are unchanged.
     fn raw(&mut self, path: &str) -> Option<&str> {
         self.refresh_if_changed(path);
         if !self.raw.contains_key(path) {
             let before = Self::stamp(path);
-            let text = read_transcript(path).ok();
+            let text = read_transcript(path).ok()?;
             let after = Self::stamp(path);
-            if before == after
-                && let Some(stamp) = before
-            {
+            // A change or lost identity during the read cannot establish a safe baseline.
+            if before != after {
+                self.invalidate(path);
+                return None;
+            }
+            if let Some(stamp) = before {
                 self.stamps.insert(path.to_string(), stamp);
             }
             self.raw.insert(path.to_string(), text);
         }
-        self.raw.get(path).and_then(Option::as_deref)
+        self.raw.get(path).map(String::as_str)
     }
 
-    /// The file's turns, parsed on the first call for `path` only; `None` when it cannot be read.
+    /// Reuse parsed turns only if the compact and hydration files stayed stable.
     fn turns(&mut self, path: &str) -> Option<&[TranscriptTurn]> {
         self.refresh_if_changed(path);
         if !self.turns.contains_key(path) {
             let raw = self.raw(path)?;
-            let hydrated = hydrate_agy_truncated_turns(Path::new(path), raw);
+            let hydrated = match hydrate_agy_truncated_turns(Path::new(path), raw) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.invalidate(path);
+                    return None;
+                }
+            };
             let parsed = parse_jsonl_transcript(hydrated.as_deref().unwrap_or(raw));
+            let after = Self::stamp(path);
+            if after.as_ref() != self.stamps.get(path) {
+                self.invalidate(path);
+                return None;
+            }
             self.turns.insert(path.to_string(), parsed);
         }
         self.turns.get(path).map(Vec::as_slice)
@@ -4875,6 +4919,113 @@ mod tests {
         fs::write(&full, row("a longer changed full text", false)).unwrap();
         let turns = cache.turns(path).unwrap();
         assert!(turns[0].content.contains("a longer changed full text"));
+    }
+
+    #[cfg(unix)]
+    fn replace_preserving_mtime(path: &Path, contents: &str) {
+        use std::fs::FileTimes;
+        let old = fs::metadata(path).unwrap();
+        assert_eq!(old.len(), contents.len() as u64);
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, contents).unwrap();
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old.modified().unwrap()))
+            .unwrap();
+        fs::rename(&replacement, path).unwrap();
+        let new = fs::metadata(path).unwrap();
+        assert_eq!(new.modified().unwrap(), old.modified().unwrap());
+        assert_eq!(new.len(), old.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_cache_detects_same_size_replacement_with_preserved_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let row = |s: &str| {
+            format!("{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"{s}\"}}}}\n")
+        };
+        fs::write(&path, row("first")).unwrap();
+        let name = path.to_str().unwrap();
+        let mut reads = TranscriptReads::default();
+        assert!(reads.turns(name).unwrap()[0].content.contains("first"));
+        replace_preserving_mtime(&path, &row("other"));
+        let (turns, cost) = cost_counters::measure(|| reads.turns(name).unwrap().to_vec());
+        assert_eq!((cost.transcript_reads, cost.transcript_parses), (1, 1));
+        assert!(turns[0].content.contains("other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_cache_detects_same_size_companion_replacement_with_preserved_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let compact = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let row = |content: &str, truncated: bool| {
+            let mut row =
+                serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": content});
+            if truncated {
+                row["truncated_fields"] = serde_json::json!(["content"]);
+            }
+            format!("{row}\n")
+        };
+        fs::write(&compact, row("short", true)).unwrap();
+        fs::write(&full, row("first", false)).unwrap();
+        let mut reads = TranscriptReads::default();
+        let name = compact.to_str().unwrap();
+        assert!(reads.turns(name).unwrap()[0].content.contains("first"));
+        replace_preserving_mtime(&full, &row("other", false));
+        assert!(reads.turns(name).unwrap()[0].content.contains("other"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_transcript_read_is_not_cached_and_retries_after_permissions_recover() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+        let name = path.to_str().unwrap();
+        let mut reads = TranscriptReads::default();
+        assert!(reads.turns(name).is_none());
+        assert!(
+            !reads.raw.contains_key(name),
+            "failed read must not become a cached result"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(reads.turns(name).unwrap()[0].content.contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_companion_read_is_retried_after_access_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let compact = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        fs::write(&compact, "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"short\",\"truncated_fields\":[\"content\"]}\n").unwrap();
+        fs::write(
+            &full,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"complete\"}\n",
+        )
+        .unwrap();
+        fs::set_permissions(&full, fs::Permissions::from_mode(0o0)).unwrap();
+        let mut reads = TranscriptReads::default();
+        let name = compact.to_str().unwrap();
+        assert!(reads.turns(name).is_none());
+        assert!(!reads.raw.contains_key(name));
+        fs::set_permissions(&full, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(reads.turns(name).unwrap()[0].content.contains("complete"));
     }
 
     /// A workspace with `crates/a`, a nested `crates/a/submodules` package, a top-level
