@@ -451,6 +451,7 @@ mod tests {
                 response_fields: vec![],
                 input_schema: json!({"type":"object","properties":{}}),
                 response_contract: if contracted { Some(contract()) } else { None },
+                endpoint_set: None,
             }],
             bridges: vec![],
         }

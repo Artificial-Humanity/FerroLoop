@@ -32,6 +32,8 @@ use fl_core::{At, Permit};
 use crate::AnyStore;
 
 pub const GOVERNOR_STATE_SLUG: &str = "gate-governor-state";
+pub const FAILOVER_JOURNAL_SLUG: &str = "failover-journal";
+pub const FAILOVER_JOURNAL_CAP: usize = 200;
 
 /// [`GovernorStore`] persisted in an [`AnyStore`]'s Runtime state.
 /// See module docs for the single-process/lock limit.
@@ -111,6 +113,27 @@ impl PersistentGovernorStore {
     }
 }
 
+/// Evict oldest finished entries to fit the cap; never evict
+/// `Dispatching`. Err(Unavailable) when unfinished alone exceed the cap.
+fn cap_failover_journal(
+    entries: &[fl_core::failover::AttemptJournalEntry],
+) -> Result<Vec<fl_core::failover::AttemptJournalEntry>, GovernorError> {
+    use fl_core::failover::AttemptState;
+    let mut out = entries.to_vec();
+    while out.len() > FAILOVER_JOURNAL_CAP {
+        match out
+            .iter()
+            .position(|e| e.state != AttemptState::Dispatching)
+        {
+            Some(pos) => {
+                out.remove(pos);
+            }
+            None => return Err(GovernorError::Unavailable),
+        }
+    }
+    Ok(out)
+}
+
 impl GovernorStore for PersistentGovernorStore {
     fn reserve(
         &self,
@@ -137,6 +160,55 @@ impl GovernorStore for PersistentGovernorStore {
         self.load()
             .map(|m| m.unconfirmed_permits())
             .unwrap_or_default()
+    }
+    fn load_failover_journal(
+        &self,
+    ) -> Result<Vec<fl_core::failover::AttemptJournalEntry>, GovernorError> {
+        let entry = self
+            .store
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                FAILOVER_JOURNAL_SLUG,
+            )
+            .map_err(|_| GovernorError::Unavailable)?;
+        match entry {
+            Some(e) => match &e.payload {
+                StatePayload::Runtime(r) => {
+                    let json = r.value.as_str().ok_or(GovernorError::Unavailable)?;
+                    serde_json::from_str(json).map_err(|_| GovernorError::Unavailable)
+                }
+                _ => Err(GovernorError::Unavailable),
+            },
+            None => Ok(Vec::new()),
+        }
+    }
+    fn save_failover_journal(
+        &self,
+        entries: &[fl_core::failover::AttemptJournalEntry],
+    ) -> Result<(), GovernorError> {
+        // Never evict unfinished (`Dispatching`) entries; evict finished
+        // only. Full of unfinished -> Unavailable (JournalUnavailable).
+        let capped = cap_failover_journal(entries)?;
+        let json = serde_json::to_string(&capped).map_err(|_| GovernorError::Unavailable)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: FAILOVER_JOURNAL_SLUG.to_string(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: serde_json::Value::String(json),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: At::from_unix_millis(now_ms),
+                by: "gate-failover".to_string(),
+            })
+            .map(|_| ())
+            .map_err(|e| GovernorError::Invalid(e.to_string()))
     }
 }
 
@@ -177,6 +249,84 @@ mod tests {
             .unwrap();
         let gov = PersistentGovernorStore::with_policy(store, policy1000());
         assert_eq!(gov.reserve(&req(1), 1_000), Err(GovernorError::Unavailable));
+    }
+
+    #[test]
+    fn failover_journal_persists_and_corrupt_is_strict() {
+        use fl_core::failover::{AttemptJournalEntry, AttemptState};
+        use fl_core::governor::GovernorStore as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("fl.redb");
+        let entry = AttemptJournalEntry {
+            logical_operation_id: "op-crash".into(),
+            attempt_index: 0,
+            endpoint: "https://a.example/x".into(),
+            state: AttemptState::Dispatching,
+            at_ms: 100,
+        };
+        let s1 =
+            PersistentGovernorStore::with_policy(crate::open_store(&path).unwrap(), policy1000());
+        s1.save_failover_journal(std::slice::from_ref(&entry))
+            .unwrap();
+        // New instance over same store: Dispatching without finish is visible (uncertain).
+        let s2 =
+            PersistentGovernorStore::with_policy(crate::open_store(&path).unwrap(), policy1000());
+        let loaded = s2.load_failover_journal().unwrap();
+        assert_eq!(loaded, vec![entry]);
+        assert_eq!(loaded[0].state, AttemptState::Dispatching);
+        // Corrupt journal is strict Unavailable, never a silent reset.
+        s2.store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: FAILOVER_JOURNAL_SLUG.to_string(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: serde_json::Value::String("not-json{{{".into()),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: At::from_unix_millis(1_000),
+                by: "test".to_string(),
+            })
+            .unwrap();
+        assert_eq!(s2.load_failover_journal(), Err(GovernorError::Unavailable));
+    }
+
+    #[test]
+    fn dispatching_survives_journal_cap_pressure() {
+        use fl_core::failover::{AttemptJournalEntry, AttemptState};
+        let live = AttemptJournalEntry {
+            logical_operation_id: "op-live".into(),
+            attempt_index: 0,
+            endpoint: "https://a.example/x".into(),
+            state: AttemptState::Dispatching,
+            at_ms: 1,
+        };
+        let mut entries = vec![live.clone()];
+        for i in 0..(FAILOVER_JOURNAL_CAP + 10) {
+            entries.push(AttemptJournalEntry {
+                logical_operation_id: format!("op-{i}"),
+                attempt_index: 0,
+                endpoint: "https://a.example/x".into(),
+                state: AttemptState::Executed,
+                at_ms: 1,
+            });
+        }
+        let capped = cap_failover_journal(&entries).unwrap();
+        assert_eq!(capped.len(), FAILOVER_JOURNAL_CAP);
+        assert!(capped.contains(&live), "Dispatching must survive cap");
+        let unfinished: Vec<_> = (0..=FAILOVER_JOURNAL_CAP)
+            .map(|i| AttemptJournalEntry {
+                logical_operation_id: format!("op-u-{i}"),
+                attempt_index: 0,
+                endpoint: "https://a.example/x".into(),
+                state: AttemptState::Dispatching,
+                at_ms: 1,
+            })
+            .collect();
+        assert_eq!(
+            cap_failover_journal(&unfinished),
+            Err(GovernorError::Unavailable)
+        );
     }
 
     #[test]

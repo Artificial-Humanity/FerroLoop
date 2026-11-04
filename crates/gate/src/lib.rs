@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod bridge;
 pub mod connector;
 pub mod contract;
+pub mod failover;
 pub mod governor;
 pub mod mcp;
 pub mod proxy;
@@ -36,9 +37,17 @@ pub use contract::{
     ContractViolation, ResponseContract, ResponseSchema, bracket_depth, check_pre_parse_depth,
     count_tokens_bounded, count_unit_string, validate_value,
 };
+pub use failover::{
+    ClassifiedAttempt, DispatchOnlyOutcome, FailoverEngine, FailoverRun, PersistentFailoverJournal,
+    UNKNOWN_AFTER_SEND_TEXT, classify_transport,
+};
 pub use governor::{
-    ADMISSION_UNAVAILABLE, DispatchResult, GateGovernor, GovernedOrGateError, GovernedOutcome,
-    admission_refusal_text, connector_endpoint_aliases, join_url_paths, url_path,
+    ADMISSION_UNAVAILABLE, APPROVED_POLICY_DIGESTS_ENV, DispatchResult, GateGovernor,
+    GovernedOrGateError, GovernedOutcome, admission_refusal_text, approval_marker_digest,
+    approved_policy_digests_from_env, approved_policy_digests_from_value,
+    connector_endpoint_aliases, contract_digest, credential_scope_digest, is_live_approved,
+    is_live_approved_with_env, join_url_paths, policy_fingerprint, policy_fingerprint_for_tool,
+    policy_fingerprint_for_tool_live, policy_fingerprint_live, url_path,
 };
 pub use mcp::{
     build_mcp_tools_list, handle_mcp_jsonrpc_request, handle_mcp_jsonrpc_request_with_governor,
@@ -47,9 +56,11 @@ pub use mcp::{
 };
 pub use proxy::{
     DispatchPhaseError, LEGACY_MAX_RESPONSE_BYTES, MAX_HEADER_BYTES, MAX_HEADERS,
-    PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse,
-    execute_proxied_request, execute_proxied_request_with_contract,
-    execute_proxied_request_with_provider, execute_proxied_request_with_provider_and_contract,
+    PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyAttemptError,
+    ProxyAttemptWitness, ProxyRequest, ProxyResponse, execute_proxied_request,
+    execute_proxied_request_failover_attempt_with_provider_and_contract_phased_with_deadline,
+    execute_proxied_request_with_contract, execute_proxied_request_with_provider,
+    execute_proxied_request_with_provider_and_contract,
     execute_proxied_request_with_provider_and_contract_phased,
     execute_proxied_request_with_provider_and_contract_phased_with_deadline,
     extract_placeholder_keys, host_matches_pattern, is_private_or_loopback_ip,
