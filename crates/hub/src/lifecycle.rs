@@ -1893,11 +1893,11 @@ fn tmux_target_exists(target: &str) -> bool {
 /// [`PushError::NotConnected`] (the receiver was never reached, so nothing was delivered) and a
 /// scan then finds a different route. Every other failure of `send` is returned as it is, never
 /// retried: by then part of the delivery may have landed.
-pub(crate) fn dispatch_with_rediscovery<T>(
+pub(crate) fn dispatch_with_rediscovery_typed<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
     mut send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
-) -> Option<Result<T, String>> {
+) -> Option<Result<T, PushError>> {
     let (route, from_saved) = match lookup_route(home_override, query)? {
         RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
             (rescan_route(home_override, query).unwrap_or(saved), false)
@@ -1908,12 +1908,21 @@ pub(crate) fn dispatch_with_rediscovery<T>(
     Some(match send(&route) {
         Err(PushError::NotConnected(refused)) if from_saved => {
             match rescan_route(home_override, query).filter(|fresh| *fresh != route) {
-                Some(fresh) => send(&fresh).map_err(String::from),
-                None => Err(refused),
+                Some(fresh) => send(&fresh),
+                None => Err(PushError::NotConnected(refused)),
             }
         }
-        sent => sent.map_err(String::from),
+        sent => sent,
     })
+}
+
+pub(crate) fn dispatch_with_rediscovery<T>(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+    send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
+) -> Option<Result<T, String>> {
+    dispatch_with_rediscovery_typed(home_override, query, send)
+        .map(|result| result.map_err(String::from))
 }
 
 /// Run `send` once on the route [`lookup_route`] finds, with no pre-delivery check and no second

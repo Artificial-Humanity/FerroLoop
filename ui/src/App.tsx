@@ -146,6 +146,7 @@ export interface OptimisticPrompt {
   content: string;
   sentAt: number;
   agentKey?: string;
+  sessionId?: string;
 }
 
 export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
@@ -168,13 +169,15 @@ export function pruneOptimisticPrompts(
   turns: TranscriptTurn[],
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
+  currentSessionId?: string | null,
 ): OptimisticPrompt[] {
   const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
   return prompts.filter((p) => {
     if (!p || !p.content?.trim()) return false;
     if (nowMs - p.sentAt > OPTIMISTIC_PROMPT_TTL_MS) return false;
     const promptKey = (p.agentKey ?? "").trim().toLowerCase();
-    const matchesActive = !activeKey || !promptKey || promptKey === activeKey;
+    const matchesActive = (!activeKey || !promptKey || promptKey === activeKey) &&
+      (currentSessionId === undefined || (p.sessionId ?? null) === currentSessionId);
     if (matchesActive && isPromptOnDisk(turns, p.content)) {
       return false;
     }
@@ -193,6 +196,7 @@ export function preserveOptimisticTurn(
   optimistic: OptimisticPrompt | OptimisticPrompt[] | null | undefined,
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
+  currentSessionId?: string | null,
 ): TranscriptTurn[] {
   const rawList: OptimisticPrompt[] = Array.isArray(optimistic)
     ? optimistic
@@ -208,6 +212,7 @@ export function preserveOptimisticTurn(
     if (!item || !item.content?.trim()) continue;
     if (nowMs - item.sentAt > OPTIMISTIC_PROMPT_TTL_MS) continue;
     const itemKey = (item.agentKey ?? "").trim().toLowerCase();
+    if (currentSessionId !== undefined && (item.sessionId ?? null) !== currentSessionId) continue;
     if (activeKey && itemKey && itemKey !== activeKey) {
       continue;
     }
@@ -649,11 +654,13 @@ export const App: React.FC<AppProps> = ({
   const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
   const [sessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
   const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
+  const [unconfirmedBySession, setUnconfirmedBySession] = useState<Record<string, boolean>>({});
   const [sessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
   const [sessionQuotaUsage, setSessionQuotaUsage] =
     useState<SessionQuotaUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
+  const activeSessionIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
   const tornDownTargetsRef = useRef<Set<string>>(new Set());
   const loggedOutRef = useRef<boolean>(false);
@@ -711,7 +718,7 @@ export const App: React.FC<AppProps> = ({
   );
 
   const recordOptimisticPrompt = useCallback(
-    (content: string, agentKey?: string | null, sentAt: number = Date.now()) => {
+    (content: string, agentKey?: string | null, sentAt: number = Date.now(), sessionId?: string | null) => {
       const trimmed = (content || "").trim();
       if (!trimmed) return;
       const normalizedKey = (agentKey ?? "").trim().toLowerCase();
@@ -722,6 +729,7 @@ export const App: React.FC<AppProps> = ({
         (p) =>
           p.content.trim() === trimmed &&
           (p.agentKey ?? "").trim().toLowerCase() === normalizedKey &&
+          (p.sessionId ?? "") === (sessionId ?? "") &&
           Math.abs(sentAt - p.sentAt) < 3_000,
       );
       if (!duplicate) {
@@ -729,6 +737,7 @@ export const App: React.FC<AppProps> = ({
           content,
           sentAt,
           agentKey: normalizedKey || undefined,
+          sessionId: sessionId || undefined,
         });
       }
       optimisticPromptRef.current = current;
@@ -776,12 +785,14 @@ export const App: React.FC<AppProps> = ({
       optimisticPromptRef.current,
       nowMs,
       activeKey,
+      activeSessionIdRef.current,
     );
     optimisticPromptRef.current = pruneOptimisticPrompts(
       optimisticPromptRef.current,
       turns,
       nowMs,
       activeKey,
+      activeSessionIdRef.current,
     );
     setTranscriptTurns(merged);
   }, []);
@@ -953,6 +964,7 @@ export const App: React.FC<AppProps> = ({
         const requestedAgentName = selectedAgentNameRef.current;
         const requestedAgentKey = requestedAgentName.trim().toLowerCase();
         const requestedSessionId = selectedSessionIdRef.current;
+        const requestedActiveSessionId = activeSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
         if (loggedOutRef.current) {
           return;
@@ -970,7 +982,9 @@ export const App: React.FC<AppProps> = ({
         const rawTargetId =
           sessionOverride === null
             ? null
-            : (sessionOverride ?? requestedSessionId ?? requestedAgentName);
+            : (sessionOverride ?? requestedSessionId ?? requestedActiveSessionId ??
+              list.find((session) => (session.persona ?? "").toLowerCase() === requestedAgentKey)?.id ??
+              requestedAgentName);
         const targetId =
           rawTargetId &&
           !tornDownTargetsRef.current.has(rawTargetId.trim().toLowerCase()) &&
@@ -983,6 +997,16 @@ export const App: React.FC<AppProps> = ({
             return;
           }
           if (trRes) {
+            // A persona can have multiple sessions. Never publish or cache a
+            // response after the concrete session changed while awaiting it.
+            const activeNow = activeSessionIdRef.current;
+            const stillSameTarget =
+              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
+              selectedSessionIdRef.current === requestedSessionId &&
+              (requestedActiveSessionId
+                ? activeNow === requestedActiveSessionId && targetId === requestedActiveSessionId
+                : activeNow === null || activeNow === targetId);
+            if (!stillSameTarget) return;
             const targetPersona =
               list.find((session) => session.id === targetId)?.persona ??
               (list.some(
@@ -1004,14 +1028,11 @@ export const App: React.FC<AppProps> = ({
                 ? trRes.is_busy
                 : hasTrailingIncompleteWork(trRes.turns ?? []),
             );
-            const stillSameTarget =
-              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
-              selectedSessionIdRef.current === requestedSessionId &&
-              targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase();
-            if (stillSameTarget) {
+            if (targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase()) {
               if (trRes.turns) {
                 applyTranscriptTurns(trRes.turns);
               }
+              setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(trRes.in_flight_unconfirmed) }));
               setSessionContextUsage(trRes.context_usage ?? null);
               setSessionQuotaUsage(trRes.quota_usage ?? null);
               if (typeof trRes.is_busy === "boolean") {
@@ -1173,6 +1194,9 @@ export const App: React.FC<AppProps> = ({
         if (
           trRes &&
           !loggedOutRef.current &&
+          selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
+          selectedSessionIdRef.current === initialSessionId &&
+          (activeSessionIdRef.current === null || activeSessionIdRef.current === matchedSessionId) &&
           !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
           !tornDownTargetsRef.current.has(initialKey)
         ) {
@@ -1186,16 +1210,12 @@ export const App: React.FC<AppProps> = ({
               ? trRes.is_busy
               : hasTrailingIncompleteWork(trRes.turns ?? []),
           );
-          if (
-            selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
-            selectedSessionIdRef.current === initialSessionId
-          ) {
-            applyTranscriptTurns(trRes.turns ?? []);
-            setSessionQueue(trRes.queue ?? []);
-            setIsSessionBusy(Boolean(trRes.is_busy));
-            setSessionContextUsage(trRes.context_usage ?? null);
-            setSessionQuotaUsage(trRes.quota_usage ?? null);
-          }
+          applyTranscriptTurns(trRes.turns ?? []);
+          setSessionQueue(trRes.queue ?? []);
+          setUnconfirmedBySession((prev) => ({ ...prev, [matchedSessionId]: Boolean(trRes.in_flight_unconfirmed) }));
+          setIsSessionBusy(Boolean(trRes.is_busy));
+          setSessionContextUsage(trRes.context_usage ?? null);
+          setSessionQuotaUsage(trRes.quota_usage ?? null);
         }
       }
     } finally {
@@ -1322,31 +1342,21 @@ export const App: React.FC<AppProps> = ({
         const rawSessionId =
           typeof data.session_id === "string" ? data.session_id.trim() : "";
         const activeKey = selectedAgentNameRef.current.trim().toLowerCase();
-        const targetAgentKey =
-          rawPersona ||
-          (rawSessionId && rawSessionId === selectedSessionIdRef.current
-            ? activeKey
-            : "");
-        if (rawContent) {
-          recordOptimisticPrompt(rawContent, targetAgentKey || activeKey);
-          if (!targetAgentKey || targetAgentKey === activeKey) {
-            setTranscriptTurns((prev) =>
-              preserveOptimisticTurn(
-                prev,
-                optimisticPromptRef.current,
-                Date.now(),
-                activeKey,
-              ),
-            );
-          }
+        const activeSessionId = activeSessionIdRef.current;
+        // A persona is reusable; a session-scoped event must match the active session exactly.
+        // Legacy persona-only events cannot safely be assigned when a session is active.
+        const matchesActive = rawSessionId
+          ? rawSessionId === activeSessionId && (!rawPersona || rawPersona === activeKey)
+          : !activeSessionId && Boolean(rawPersona) && rawPersona === activeKey;
+        if (matchesActive && rawContent && data.delivered !== false) {
+          recordOptimisticPrompt(rawContent, activeKey, Date.now(), rawSessionId || null);
+          setTranscriptTurns((prev) =>
+            preserveOptimisticTurn(prev, optimisticPromptRef.current, Date.now(), activeKey, activeSessionId),
+          );
         }
-        if (!targetAgentKey || targetAgentKey === activeKey) {
-          if (Array.isArray(data.queue)) {
-            setSessionQueue(data.queue as QueuedOperatorPrompt[]);
-          }
-          if (typeof data.is_busy === "boolean") {
-            setIsSessionBusy(data.is_busy);
-          }
+        if (matchesActive) {
+          if (Array.isArray(data.queue)) setSessionQueue(data.queue as QueuedOperatorPrompt[]);
+          if (typeof data.is_busy === "boolean") setIsSessionBusy(data.is_busy);
         }
       }
       void refreshSessionsAndTranscript();
@@ -1433,6 +1443,8 @@ export const App: React.FC<AppProps> = ({
       null
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
+
+  activeSessionIdRef.current = activeSession?.id ?? null;
 
   const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
   const activeRoute = useMemo(
@@ -1537,6 +1549,7 @@ export const App: React.FC<AppProps> = ({
               : hasTrailingIncompleteWork(res.turns ?? []),
           );
           setSessionQueue(res.queue ?? []);
+          setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(res.in_flight_unconfirmed) }));
           setIsSessionBusy(Boolean(res.is_busy));
           setSessionContextUsage(res.context_usage ?? null);
           if (res.context_usage !== undefined) {
@@ -1689,6 +1702,7 @@ export const App: React.FC<AppProps> = ({
     setTranscriptTurns([]);
     setSessionQueue([]);
     setIsSessionBusy(false);
+    setUnconfirmedBySession({});
     setSessionContextUsage(null);
     setSessionQuotaUsage(null);
     setSessions([]);
@@ -1708,7 +1722,23 @@ export const App: React.FC<AppProps> = ({
   };
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
+    const submittedAgent = selectedAgentNameRef.current;
+    const submittedSession = selectedSessionIdRef.current;
+    const submittedActiveSession = activeSessionIdRef.current;
     const res = await apiClient.sendSessionPrompt(targetId, payload);
+    if (
+      (!res.queued && res.status !== "queued" && res.delivered === false) ||
+      selectedAgentNameRef.current !== submittedAgent ||
+      selectedSessionIdRef.current !== submittedSession ||
+      activeSessionIdRef.current !== submittedActiveSession ||
+      (submittedActiveSession !== null && submittedActiveSession !== targetId)
+    ) {
+      return res;
+    }
+    if (typeof res.in_flight_unconfirmed === "boolean") {
+      const unconfirmed = res.in_flight_unconfirmed;
+      setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: unconfirmed }));
+    }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
     }
@@ -1720,13 +1750,14 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey);
+      recordOptimisticPrompt(content, agentKey, Date.now(), submittedActiveSession);
       setTranscriptTurns((prev) =>
         preserveOptimisticTurn(
           prev,
           optimisticPromptRef.current,
           Date.now(),
           selectedAgentNameRef.current,
+          submittedActiveSession,
         ),
       );
     }
@@ -1737,25 +1768,35 @@ export const App: React.FC<AppProps> = ({
   const handleSendQueuedNow = async (promptId: string) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) return;
+    const submittedSession = activeSessionIdRef.current;
+    const submittedAgent = selectedAgentNameRef.current;
     const res = await apiClient.sendQueuedPromptNow(targetId, promptId);
+    if (activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
+      if (res.delivered === false) throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+      return;
+    }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
     }
     if (typeof res.is_busy === "boolean") {
       setIsSessionBusy(res.is_busy);
     }
+    if (res.delivered === false) {
+      throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+    }
     const content = res.effective_body || res.prompt;
     if (content) {
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey);
+      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
       setTranscriptTurns((prev) =>
         preserveOptimisticTurn(
           prev,
           optimisticPromptRef.current,
           Date.now(),
           selectedAgentNameRef.current,
+          activeSessionIdRef.current,
         ),
       );
     }
@@ -1995,6 +2036,7 @@ export const App: React.FC<AppProps> = ({
                     optimisticPromptRef.current,
                     Date.now(),
                     nextKey,
+                    null,
                   ),
                 );
                 setSessionQueue([]);
@@ -2009,6 +2051,7 @@ export const App: React.FC<AppProps> = ({
             onSelectSession={(sessionId) => {
               if (sessionId !== selectedSessionIdRef.current) {
                 selectedSessionIdRef.current = sessionId;
+                activeSessionIdRef.current = sessionId;
                 setTranscriptTurns([]);
                 setSessionQueue([]);
                 setIsSessionBusy(false);
@@ -2172,6 +2215,7 @@ export const App: React.FC<AppProps> = ({
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
             isBusy={isSessionBusy}
+            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
             queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}
@@ -2265,6 +2309,7 @@ export const App: React.FC<AppProps> = ({
               optimisticPromptRef.current,
               Date.now(),
               nextKey,
+              null,
             ),
           );
           setSessionQueue([]);
@@ -2378,6 +2423,7 @@ export const App: React.FC<AppProps> = ({
         onSelectSession={(sessionId) => {
           if (sessionId !== selectedSessionIdRef.current) {
             selectedSessionIdRef.current = sessionId;
+            activeSessionIdRef.current = sessionId;
             setTranscriptTurns([]);
             setSessionQueue([]);
             setIsSessionBusy(false);
@@ -2439,6 +2485,7 @@ export const App: React.FC<AppProps> = ({
                   optimisticPromptRef.current,
                   Date.now(),
                   nextKey,
+                  null,
                 ),
               );
               setSessionQueue([]);
@@ -2508,6 +2555,7 @@ export const App: React.FC<AppProps> = ({
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
             isBusy={isSessionBusy}
+            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
             queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}

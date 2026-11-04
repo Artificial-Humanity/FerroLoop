@@ -521,6 +521,12 @@ describe("optimistic prompt preservation", () => {
     expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
   });
 
+  it("does not carry an optimistic prompt between sessions of the same agent", () => {
+    const prompt = { content: "private to A", sentAt: 1_000, agentKey: "ferris", sessionId: "session-a" };
+    expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-b")).toBe(diskTurns);
+    expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-a")).toHaveLength(2);
+  });
+
   it("recognizes an on-disk user turn that wraps the prompt via substring match", () => {
     const wrappedOnDisk = [
       ...diskTurns,
@@ -1012,6 +1018,136 @@ describe("Agent switch transcript isolation", () => {
     unmount();
   });
 
+  it("refreshes the implicitly active session rather than its persona after a different session event", async () => {
+    let sessionListener: ((frame: unknown) => void) | null = null;
+    const transcriptTargets: string[] = [];
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
+      if (url.includes("/api/v1/auth/session")) return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return json({ sessions: [
+        { id: "session-b", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+        { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] });
+      if (url.includes("/transcript")) {
+        transcriptTargets.push(url);
+        const isB = url.includes("session-b");
+        return json({ session_id: isB ? "session-b" : "session-a", turns: [turn({ index: 0, content: isB ? "Correct session B" : "Wrong session A" })], queue: [] });
+      }
+      return json({});
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") sessionListener = cb; return () => {}; } } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await waitFor(() => expect(transcriptTargets.some((url) => url.includes("session-b"))).toBe(true));
+    await screen.findByText("Correct session B");
+    const before = transcriptTargets.length;
+    act(() => sessionListener?.({ type: "event", topic: "session", event: "prompt_sent", data: { session_id: "session-a", persona: "ferris", effective_body: "A message" } }));
+    await waitFor(() => expect(transcriptTargets.length).toBeGreaterThan(before));
+    await waitFor(() => expect(screen.getByText("Correct session B")).toBeInTheDocument());
+    expect(screen.queryByText("Wrong session A")).toBeNull();
+    expect(transcriptTargets.slice(before).some((url) => url.includes("/ferris/transcript"))).toBe(false);
+    unmount();
+  });
+
+  it("does not apply an implicit session's late send response to its successor", async () => {
+    let sessionListener: ((frame: unknown) => void) | null = null;
+    let firstId = "session-a";
+    let finishSend!: (response: Response) => void;
+    const sendResponse = new Promise<Response>((resolve) => { finishSend = resolve; });
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
+      if (url.includes("/api/v1/auth/session")) return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
+      if (url.includes("/prompt") && init?.method === "POST") return sendResponse;
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return json({ sessions: [
+        { id: firstId, source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+        { id: firstId === "session-a" ? "session-b" : "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] });
+      if (url.includes("/transcript")) return json({ session_id: firstId, turns: [turn({ index: 0, content: firstId === "session-a" ? "Session A ready" : "Session B ready" })], queue: [], is_busy: false });
+      return json({});
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") sessionListener = cb; return () => {}; } } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await screen.findByText("Session A ready");
+    fireEvent.change(screen.getByPlaceholderText(/Send a message/i), { target: { value: "A only" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Send Message$/i }));
+    await waitFor(() => expect(fetchImpl.mock.calls.some(([url, init]) => String(url).includes("/prompt") && init?.method === "POST")).toBe(true));
+    firstId = "session-b";
+    act(() => sessionListener?.({ type: "event", topic: "session", event: "updated", data: {} }));
+    await waitFor(() => expect((screen.getByTestId("session-selector") as HTMLSelectElement).value).toBe("session-b"));
+    await act(async () => { finishSend(new Response(JSON.stringify({ status: "sent", delivered: true, effective_body: "A only", queue: [{ id: "a-queue", prompt: "A queue" }], is_busy: true }), { status: 200, headers: { "Content-Type": "application/json" } })); await sendResponse; });
+    expect(screen.queryByText("A only")).toBeNull();
+    expect(screen.queryByText("A queue")).toBeNull();
+    unmount();
+  });
+
+  it("does not apply a late initial transcript after the implicit session changes", async () => {
+    let sessionListener: ((frame: unknown) => void) | null = null;
+    let current = "session-a";
+    let releaseInitial!: (response: Response) => void;
+    const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
+    let held = false;
+    const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) return Promise.resolve(response({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } }));
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return Promise.resolve(response({ sessions: [
+        { id: current, source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+        { id: current === "session-a" ? "session-b" : "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] }));
+      if (url.includes("/session-a/transcript") && !held) { held = true; return initialResponse; }
+      if (url.includes("/transcript")) {
+        const isB = url.includes("session-b");
+        return Promise.resolve(response({ session_id: isB ? "session-b" : "session-a", turns: [turn({ index: 0, content: isB ? "Session B initial" : "Session A interim" })], queue: [], is_busy: false }));
+      }
+      return Promise.resolve(response({}));
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") sessionListener = cb; return () => {}; } } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await waitFor(() => expect(held).toBe(true));
+    current = "session-b";
+    act(() => sessionListener?.({ type: "event", topic: "session", event: "updated", data: {} }));
+    await screen.findByText("Session B initial");
+    await act(async () => {
+      releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Stale initial A" })], queue: [{ id: "old", prompt: "Stale A queue" }], is_busy: true }));
+      await initialResponse;
+    });
+    expect(screen.getByText("Session B initial")).toBeInTheDocument();
+    expect(screen.queryByText("Stale initial A")).toBeNull();
+    expect(screen.queryByText("Stale A queue")).toBeNull();
+    unmount();
+  });
+
+  it("applies the initial transcript when its implicit session remains active", async () => {
+    let releaseInitial!: (response: Response) => void;
+    const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
+    let held = false;
+    const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) return Promise.resolve(response({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } }));
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return Promise.resolve(response({ sessions: [
+        { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] }));
+      if (url.includes("/session-a/transcript") && !held) { held = true; return initialResponse; }
+      if (url.includes("/transcript")) return Promise.resolve(response({ session_id: "session-a", turns: [], queue: [], is_busy: false }));
+      return Promise.resolve(response({}));
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: () => () => {} } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await waitFor(() => expect(held).toBe(true));
+    await act(async () => {
+      releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Legitimate initial A" })], queue: [], is_busy: false }));
+      await initialResponse;
+    });
+    expect(screen.getByText("Legitimate initial A")).toBeInTheDocument();
+    unmount();
+  });
+
   it("preserves multiple outbound prompts across polls and keeps prompt_sent WebSocket / queued prompts visible while in FerroWire transit", async () => {
     const now = Date.now();
     const baseTurns: TranscriptTurn[] = [
@@ -1137,6 +1273,32 @@ describe("Agent switch transcript isolation", () => {
     expect(
       await screen.findByText(/Waiting for operator instructions\./),
     ).toBeInTheDocument();
+
+    // Another session of the same persona must not affect the active session.
+    act(() => {
+      sessionListener?.({ type: "event", topic: "session", event: "prompt_sent", data: {
+        session_id: "sess-ferris-other", persona: "ferris", effective_body: "Other session secret", is_busy: true,
+        queue: [{ id: "other-session-queue", session_id: "sess-ferris-other", prompt: "Wrong queue", created_at: new Date().toISOString() }],
+      }});
+    });
+    expect(screen.queryByText("Other session secret")).toBeNull();
+    expect(screen.queryByText("Wrong queue")).toBeNull();
+
+    // A failed push is broadcast too; it must not become a sent transcript turn.
+    act(() => {
+      sessionListener?.({
+        type: "event",
+        topic: "session",
+        event: "prompt_sent",
+        data: {
+          session_id: "sess-ferris",
+          persona: "ferris",
+          effective_body: "Failed delivery must not appear as sent",
+          delivered: false,
+        },
+      });
+    });
+    expect(screen.queryByText("Failed delivery must not appear as sent")).toBeNull();
 
     // Emit a prompt_sent WebSocket event (e.g. auto-drained queued prompt)
     act(() => {

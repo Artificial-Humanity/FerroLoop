@@ -538,6 +538,7 @@ export interface SessionTranscriptResponse {
   session_id: string;
   turns: TranscriptTurn[];
   is_busy?: boolean;
+  in_flight_unconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
   /** Server-measured context usage when the hub reports it. */
   context_usage?: SessionContextUsage | null;
@@ -563,6 +564,8 @@ export interface SavedPromptAttachment {
 }
 
 export interface QueuedOperatorPrompt {
+  delivery_state?: "pending" | "sending" | "unconfirmed";
+  delivery_error?: string | null;
   id: string;
   session_id: string;
   persona?: string | null;
@@ -576,6 +579,7 @@ export interface QueuedOperatorPrompt {
 export interface SessionQueueResponse {
   session_id: string;
   is_busy: boolean;
+  in_flight_unconfirmed?: boolean;
   queue: QueuedOperatorPrompt[];
 }
 
@@ -731,11 +735,13 @@ export interface PromptRequest {
 
 export interface PromptResponse {
   session_id: string;
+  in_flight_unconfirmed?: boolean;
   persona?: string | null;
   status?: "sent" | "queued";
   queued?: boolean;
   is_busy?: boolean;
   delivered?: boolean;
+  delivery_error?: string | null;
   prompt_id?: string;
   prompt?: string;
   effective_body?: string;
