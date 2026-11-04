@@ -620,6 +620,10 @@ impl HubState {
                 } else {
                     true
                 }
+            } else if turns.is_empty() {
+                // Discovery may temporarily lose a previously observed file during rotation.
+                // Empty observations cannot establish a safe baseline for an unknown send.
+                true
             } else {
                 // The first reliable observation after an unstable read establishes a baseline;
                 // its existing idle turns do not prove completion of the just-sent prompt.
@@ -2065,6 +2069,7 @@ mod tests {
             .unwrap()
             .dispatched_at_ms = 0;
         assert!(state.is_session_busy_from_observation("test", None));
+        assert!(state.is_session_busy_from_turns("test", &[]));
         assert!(state.is_session_busy_from_turns("test", &old));
         state
             .prompt_queues

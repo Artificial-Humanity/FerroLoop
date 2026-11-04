@@ -3191,12 +3191,10 @@ pub(crate) fn transcript_observation_from_sessions(
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
         {
-            // A path already absent at observation time is different from a file that
-            // existed but could not be read consistently. The former is an empty baseline.
-            match fs::metadata(tpath) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-                Ok(_) => {}
+            // Discovery supplies a path only after finding a file. If it disappears,
+            // its previous contents are unknown; it is not a new empty transcript.
+            if fs::metadata(tpath).is_err() {
+                return None;
             }
             let turns = files.turns(tpath)?;
             if !turns.is_empty() {
@@ -4962,8 +4960,8 @@ mod tests {
                 Some(tmp.path()),
                 &mut reads,
             ),
-            Some(Vec::new()),
-            "a genuinely absent route transcript is a known empty observation",
+            None,
+            "a discovered transcript that disappears has an unknown observation",
         );
         assert_eq!(
             transcript_observation_from_sessions(

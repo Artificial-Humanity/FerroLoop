@@ -78,8 +78,7 @@ use crate::discovery::{
     DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
     discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
     list_git_worktrees, lookup_one_route_session, lookup_sessions,
-    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot,
-    read_session_transcript_observation_from_snapshot, read_worktree_diff,
+    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
     scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
     transcript_observation_from_sessions,
 };
@@ -5273,6 +5272,17 @@ fn dispatch_to_session_route<T>(
     .ok_or_else(|| no_route_error(persona, canonical_id))
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn after_next_prompt_dispatch(f: impl FnOnce() + 'static) {
+    AFTER_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
 fn dispatch_operator_prompt_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -5280,9 +5290,16 @@ fn dispatch_operator_prompt_for_session(
     sender_name: &str,
     effective_body: &str,
 ) -> Result<(), String> {
-    dispatch_to_session_route(state, persona, fallback_session_id, |route| {
+    let result = dispatch_to_session_route(state, persona, fallback_session_id, |route| {
         push_operator_prompt_to_route(route, sender_name, effective_body)
-    })?
+    })?;
+    #[cfg(test)]
+    AFTER_PROMPT_DISPATCH.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    result
 }
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
@@ -5300,7 +5317,12 @@ pub fn drain_ready_session_queues(state: &HubState) {
     };
     let home = state.config.home_override.as_deref();
     for session_id in keys {
-        let turns = read_session_transcript_observation_from_snapshot(&session_id, &snap, home);
+        // Keep the discovered path across the dispatch: if the file disappears before
+        // the post-send observation, it is unknown rather than a new empty transcript.
+        let sessions = lookup_sessions(&snap, home);
+        let mut files = TranscriptReads::default();
+        let turns =
+            transcript_observation_from_sessions(&session_id, &sessions, &snap, home, &mut files);
         if !state.is_session_busy_from_observation(&session_id, turns.as_deref())
             && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
         {
@@ -5311,7 +5333,13 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &item.by,
                 &item.effective_body,
             );
-            let after = read_session_transcript_observation_from_snapshot(&session_id, &snap, home);
+            let after = transcript_observation_from_sessions(
+                &session_id,
+                &sessions,
+                &snap,
+                home,
+                &mut files,
+            );
             state.mark_session_in_flight_from_observation(&session_id, after.as_deref());
             let sent_data = json!({
                 "session_id": item.session_id,

@@ -522,6 +522,81 @@ fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
 }
 
 #[test]
+fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
+    for send_now in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let path = tmp.path().join(
+            ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+        );
+        let old = fs::read(&path).unwrap();
+        let target = path.clone();
+        crate::api::after_next_prompt_dispatch(move || fs::remove_file(target).unwrap());
+        let (sent, _) = post_prompt(&state, send_now);
+        assert_eq!(sent.json_value().unwrap()["status"], "sent");
+        let (queued, _) = post_prompt(&state, false);
+        assert_eq!(queued.json_value().unwrap()["status"], "queued");
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(
+            state.session_queue("conv-ferris-1").len(),
+            1,
+            "absence cannot set an unknown baseline to zero"
+        );
+        fs::write(&path, &old).unwrap();
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(
+            state.session_queue("conv-ferris-1").len(),
+            1,
+            "restored old turns do not complete a new prompt"
+        );
+        write_ferris_transcript(tmp.path(), 4);
+        crate::api::drain_ready_session_queues(&state);
+        assert!(
+            state.session_queue("conv-ferris-1").is_empty(),
+            "new reply releases queue"
+        );
+    }
+}
+
+#[test]
+fn removed_queued_dispatch_transcript_keeps_following_prompt_fenced() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let path = tmp.path().join(
+        ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+    );
+    let old = fs::read(&path).unwrap();
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "first".into(),
+        "first".into(),
+        "owner".into(),
+        vec![],
+    );
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "second".into(),
+        "second".into(),
+        "owner".into(),
+        vec![],
+    );
+    let target = path.clone();
+    crate::api::after_next_prompt_dispatch(move || fs::remove_file(target).unwrap());
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    fs::write(&path, &old).unwrap();
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    write_ferris_transcript(tmp.path(), 4);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
 fn known_prompt_skips_attempt_snapshot_and_reuses_unchanged_transcript() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
