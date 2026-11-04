@@ -356,6 +356,14 @@ exit: 1
       "clean": true,
       "ferro_hash": "<HASH#5>",
       "ferro_rows": 0,
+      "name": "__f1_records",
+      "redb_hash": "<HASH#5>",
+      "redb_rows": 0
+    },
+    {
+      "clean": true,
+      "ferro_hash": "<HASH#5>",
+      "ferro_rows": 0,
       "name": "workflow_defs",
       "redb_hash": "<HASH#5>",
       "redb_rows": 0

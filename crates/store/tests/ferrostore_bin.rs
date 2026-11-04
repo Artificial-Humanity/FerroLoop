@@ -755,7 +755,7 @@ fn inspect_reports_the_superblocks_and_every_kind_of_collection() {
     }
     assert_eq!(v["error"], Value::Null);
     let c = &v["contents"];
-    assert_eq!(c["schema_version"], fl_store::FORMAT_WITH_WORKFLOW);
+    assert_eq!(c["schema_version"], fl_store::FORMAT_WITH_F1);
     assert_eq!(c["epoch"], sbk["epoch"]);
     let live_bytes = c["live_bytes"].as_u64().unwrap();
     let dead_bytes = c["dead_bytes"].as_u64().unwrap();

@@ -16,9 +16,9 @@ use super::{Arch, MANIFEST_SCHEMA_VERSION, Os, Product, Profile, Target};
 /// `fl_wire::peer::WIRE_PROTOCOL_VERSION`.
 const PROTOCOL_MAJOR: u32 = 2;
 /// The oldest and newest store format this tree opens (`fl_store::FORMAT_VERSION`
-/// and `FORMAT_WITH_WORKFLOW`; compared in the same test).
+/// and `FORMAT_WITH_F1`; compared in the same test).
 const STORE_FORMAT_MIN: u32 = 2;
-const STORE_FORMAT_MAX: u32 = 8;
+const STORE_FORMAT_MAX: u32 = 9;
 
 fn ids(ps: &[Product]) -> Vec<String> {
     ps.iter().map(|p| p.as_wire().to_string()).collect()

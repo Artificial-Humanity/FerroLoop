@@ -55,6 +55,7 @@ pub(super) const WIRE_INBOX: &str = "wire_inbox";
 pub(super) const WIRE_RCPT_LOG: &str = "wire_rcpt_log";
 pub(super) const WIRE_THREADS: &str = "wire_threads";
 pub(super) const WIRE_REPLIES: &str = "wire_replies";
+pub(super) const F1_RECORDS: &str = "__f1_records";
 pub(super) const WORKFLOW_DEFS: &str = "workflow_defs";
 pub(super) const WORKFLOW_SLUGS: &str = "workflow_slugs";
 pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";
@@ -85,7 +86,7 @@ pub(super) fn refuse_reserved(collection: &str, what: &str) -> Result<(), StoreE
     Ok(())
 }
 /// `(SCHEMA_COLLECTION, SCHEMA_KEY)` holds the schema version: the same ladder
-/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`).
+/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_F1`).
 pub(super) const SCHEMA_KEY: &str = "schema_version";
 /// redb's key for the schema version in `meta`. A FerroStore written before
 /// `__meta` existed may hold it in the `meta` collection.

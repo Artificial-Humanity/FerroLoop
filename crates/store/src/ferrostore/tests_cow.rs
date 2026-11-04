@@ -135,22 +135,22 @@ fn snapshot_and_wal_bytes_are_unchanged_by_the_state_shape() {
         populate_vectors(store);
     });
     let got = [v1, v2, v3];
-    // Recorded from origin/main 96577b8, before the state shape changed.
+    // Recorded for schema 9; the state-shape representation does not alter bytes.
     let want: [[&str; 3]; 3] = [
         [
-            "31d1e5be32fe754236359eb7c3fd5ffefbfdfe10a2179fa7725489608869d324",
-            "8dd7d0f96f7f251c7039e72aa8313dd173ab7ce21927fe4e32d8064f7d8e0807",
-            "fa0c5aa7979d0d709bd4c56a8fccd4fc74962690f845e387de7803bb794a9d48",
+            "fbf6dc083faa38576f6274b006923c77a143c633507d1067cbf68c8776949685",
+            "6a22813e65cc9b4e3b8601b8f2083e3fe921e5e7b3af49b1894d48bf53b73eed",
+            "3a0905a746622fce1e347ad4fe6e6c060a6336510f576ae29ce20dec804b97d5",
         ],
         [
-            "fdf430a5e8e47623f84db7657c88a37ed837dbcd82b638e381790e8bc0ee8b8f",
-            "9a65e03fbc32e605edd3cd4e51bfb062f191d30aec479e5667ddcf8a9fa02a4c",
-            "0f9c09fc2f7175aca5b5cde54396f07a2a3b9286f53387a82f780cbb205f0894",
+            "41b57f671f5110b28ba73470d461265d58106649b2e146724f959ec2cbccc902",
+            "9de5bdb8d40b2eb0c25aa779a5a7325e7be70dcbbe65bebf0938ee89307b2cc3",
+            "853cfeb3ed4aa0ac9d66ae7208ed2e3bc71264776b79adeb85f3baf298985f55",
         ],
         [
-            "de571b6a5130ed42844c7322d23dcaee3b7effc666bf5cc72379c011b3c11d79",
-            "74817dc09d9c8edbd1a9d19eb3b78123b0e68bb8d4b2637267b34d40420351b9",
-            "d2a48dbf58a5f51bbbf13200ec20c58f7bb03acd34a7aa1eb722f4e37cb3626d",
+            "347d1b2018ce0105aa36c7a175ce05b7cf10354fb519096b490409a834643652",
+            "55fbec5224b978e4d7a20ce0c4a4559cf4039d8ca274a40243f0b3e71b62aa3f",
+            "68500974c0a3306f5894c79e927aa8fda38bb787aeea9ff1b3d95a6d8698faf2",
         ],
     ];
     assert_eq!(

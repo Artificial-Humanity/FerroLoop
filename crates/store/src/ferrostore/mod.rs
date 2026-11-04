@@ -21,6 +21,7 @@ mod state;
 mod sync;
 mod tls;
 mod traits_catalog;
+mod traits_f1;
 mod traits_state;
 mod traits_wire;
 mod traits_workflow;
@@ -1606,7 +1607,7 @@ impl FerroStore {
     /// The schema version the store records, `None` for a store with no
     /// version document (a FerroStore written before schema versioning), the
     /// same meaning as [`crate::RedbStore::format_version`]. The value is on
-    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`.
+    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_F1`.
     pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
         self.with_read(doc::schema_version)
     }
@@ -3841,7 +3842,7 @@ fn new_store_docs() -> Docs {
     docs.insert(
         doc::SCHEMA_COLLECTION.to_string(),
         doc::SCHEMA_KEY.to_string(),
-        Arc::new(json!(crate::FORMAT_WITH_WORKFLOW)),
+        Arc::new(json!(crate::FORMAT_WITH_F1)),
     );
     docs
 }

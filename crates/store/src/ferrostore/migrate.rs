@@ -319,6 +319,11 @@ fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
         TableDefinition::<&str, &str>::new(doc::WORKFLOW_RUNS),
         |key, value| put_json_text(txn, doc::WORKFLOW_RUNS, key, value)
     );
+    copy_rows!(
+        tx,
+        TableDefinition::<&str, &str>::new(doc::F1_RECORDS),
+        |key, value| put_json_text(txn, doc::F1_RECORDS, key, value)
+    );
     Ok(())
 }
 

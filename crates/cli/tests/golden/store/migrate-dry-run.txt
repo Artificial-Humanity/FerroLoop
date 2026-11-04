@@ -45,6 +45,7 @@ wire_inbox                          0           0  ok
 wire_rcpt_log                       0           0  ok
 wire_threads                        0           0  ok
 wire_replies                        0           0  ok
+__f1_records                        0           0  ok
 workflow_defs                       0           0  ok
 workflow_slugs                      0           0  ok
 workflow_runs                       0           0  ok
