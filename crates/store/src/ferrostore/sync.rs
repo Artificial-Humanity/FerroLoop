@@ -2693,38 +2693,6 @@ mod tests {
     }
 
     #[test]
-    fn inbound_f1_records_refuse_the_batch_without_advancing_sequence() {
-        let store = FerroStore::in_memory();
-        let before = store.last_seq().unwrap();
-        for op in [
-            SyncOp::PutDoc {
-                collection: "__f1_records".into(),
-                id: "f1-a".into(),
-                doc: json!({"version": 1}),
-            },
-            SyncOp::DeleteDoc {
-                collection: "__f1_records".into(),
-                id: "f1-a".into(),
-            },
-        ] {
-            let result = store.apply_inbound(vec![SyncBatch {
-                seq: before + 1,
-                ops: vec![
-                    SyncOp::PutDoc {
-                        collection: "ordinary".into(),
-                        id: "a".into(),
-                        doc: json!(1),
-                    },
-                    op,
-                ],
-            }]);
-            assert!(result.is_err());
-            assert_eq!(store.last_seq().unwrap(), before);
-            assert_eq!(store.get_doc("ordinary", "a").unwrap(), None);
-        }
-    }
-
-    #[test]
     fn inbound_apply_and_cache_fill_refuse_while_a_notify_is_in_flight() {
         let (store, rig) = bounded_in_flight_rig();
         let writer = {

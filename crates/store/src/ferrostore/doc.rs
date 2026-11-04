@@ -55,7 +55,6 @@ pub(super) const WIRE_INBOX: &str = "wire_inbox";
 pub(super) const WIRE_RCPT_LOG: &str = "wire_rcpt_log";
 pub(super) const WIRE_THREADS: &str = "wire_threads";
 pub(super) const WIRE_REPLIES: &str = "wire_replies";
-pub(super) const F1_RECORDS: &str = "__f1_records";
 pub(super) const WORKFLOW_DEFS: &str = "workflow_defs";
 pub(super) const WORKFLOW_SLUGS: &str = "workflow_slugs";
 pub(super) const WORKFLOW_RUNS: &str = "workflow_runs";
@@ -67,8 +66,7 @@ pub(super) const SCHEMA_COLLECTION: &str = "__meta";
 /// A collection whose name starts with this belongs to the store: only its own
 /// transactions write it. Public `put_doc` / `delete_doc` refuse it. Outbound
 /// sync batches carry its ops like any other; an inbound sync batch applies
-/// one only as a schema raise (`admit_inbound` in `mod.rs`) and drops the rest,
-/// except F1 preparation ops, which refuse the inbound batch to prevent data loss.
+/// one only as a schema raise (`admit_inbound` in `mod.rs`) and drops the rest.
 pub(super) const RESERVED_PREFIX: &str = "__";
 
 /// `true` for a collection only the store itself writes ([`RESERVED_PREFIX`]).

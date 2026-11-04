@@ -49,14 +49,6 @@ pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Resul
 fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
     let tx = redb.db.begin_read().map_err(backend)?;
 
-    // A native F1 table belongs to an unsupported/future format. Refuse even an
-    // empty one so migration cannot silently drop schema or records.
-    if read_table(&tx, TableDefinition::<&str, &str>::new(doc::F1_RECORDS))?.is_some() {
-        return Err(backend(
-            "refusing redb-to-Ferro migration: an unsupported F1 preparation table is present",
-        ));
-    }
-
     let mut schema = None;
     copy_rows!(
         tx,

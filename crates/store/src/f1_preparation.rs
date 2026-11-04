@@ -258,23 +258,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn migration_refuses_unexpected_f1_table_even_when_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = RedbStore::open(&dir.path().join("source.redb")).unwrap();
-        let tx = source.db.begin_write().unwrap();
-        drop(
-            tx.open_table(redb::TableDefinition::<&str, &str>::new("__f1_records"))
-                .unwrap(),
-        );
-        tx.commit().unwrap();
-        let target_path = dir.path().join("target.fls");
-        let target = FerroStore::open(&target_path).unwrap();
-        let before = FerroStore::stats_at(&target_path).unwrap().last_seq;
-        assert!(crate::migrate_redb_to_ferrostore(&source, &target).is_err());
-        assert_eq!(FerroStore::stats_at(&target_path).unwrap().last_seq, before);
-    }
-
     #[cfg(unix)]
     #[test]
     fn remote_ferro_refuses_before_read_or_write() {
