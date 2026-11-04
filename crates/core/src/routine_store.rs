@@ -6,6 +6,7 @@
 //! Typed intent/member result records still require additional store operations.
 use crate::routine::{FiringRecord, FiringState, RoutineSpec, RoutineState, firing_key};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
@@ -233,6 +234,9 @@ pub enum RoutineTransaction {
 pub enum IntentTransaction {
     Carve {
         parent_id: String,
+        parent_outbox_id: String,
+        scheduler_epoch: u64,
+        now_utc: String,
         children: Vec<ChildRequest>,
         committee: bool,
     },
@@ -281,6 +285,20 @@ pub struct ControlLedger {
     pub reservations: BTreeMap<String, ExecutionReservation>,
     pub outbox: BTreeMap<String, OutboxRecord>,
     pub settlement_ids: BTreeSet<String>,
+}
+/// Digest the complete authority-bearing routine definition. State and approval are
+/// excluded because they change when a reviewed revision is approved or paused.
+/// Domain separation and a fixed JSON representation prevent confusion with other digests.
+pub fn routine_approval_digest(spec: &RoutineSpec) -> Result<String, ControlError> {
+    let mut canonical = spec.clone();
+    canonical.state = RoutineState::Proposed;
+    canonical.approval = None;
+    let bytes =
+        serde_json::to_vec(&canonical).map_err(|_| ControlError::Invalid("routine encoding"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"ferroloop:routine-approval:v1\0");
+    hash.update(bytes);
+    Ok(format!("sha256:{:x}", hash.finalize()))
 }
 fn id(s: &str) -> Result<(), ControlError> {
     if s.trim().is_empty() || s.len() > 1024 || s.chars().any(char::is_control) {
@@ -381,6 +399,15 @@ impl ControlLedger {
         for (key, spec) in &self.routines {
             if key != &spec.routine_id || id(key).is_err() || spec.revision == 0 {
                 return Err(ControlError::Invalid("corrupt routine"));
+            }
+            if matches!(spec.state, RoutineState::Approved)
+                && spec.approval.as_ref().is_none_or(|approval| {
+                    approval.revision != spec.revision
+                        || approval.approved_by.trim().is_empty()
+                        || routine_approval_digest(spec).ok().as_ref() != Some(&approval.digest)
+                })
+            {
+                return Err(ControlError::Invalid("corrupt routine approval"));
             }
         }
         for (key, window) in &self.windows {
@@ -570,7 +597,7 @@ impl ControlLedger {
                         .as_ref()
                         .ok_or(ControlError::Invalid("approval"))?;
                     if approval.revision != spec.revision
-                        || approval.digest.trim().is_empty()
+                        || approval.digest != routine_approval_digest(&spec)?
                         || approval.approved_by.trim().is_empty()
                         || spec.validate_for_approval(&approval.approved_at).is_err()
                     {
@@ -621,7 +648,7 @@ impl ControlLedger {
                     || spec.revision != expected_revision
                     || approval.revision != expected_revision
                     || approval.approved_by.trim().is_empty()
-                    || approval.digest.trim().is_empty()
+                    || approval.digest != routine_approval_digest(spec)?
                     || spec.validate_for_approval(&approval.approved_at).is_err()
                 {
                     return Err(ControlError::Conflict("approval"));
@@ -943,6 +970,7 @@ impl ControlLedger {
             || spec.revision != req.expected_revision
             || approval.revision != spec.revision
             || approval.digest != req.approval_digest
+            || approval.digest != routine_approval_digest(spec)?
             || approval.approved_by.trim().is_empty()
         {
             return Err(ControlError::Conflict("routine authority"));
@@ -975,16 +1003,31 @@ impl ControlLedger {
         {
             return Err(ControlError::Invalid("firing evidence"));
         }
+        // The deadline is capped at `max_firing_secs` (at most 24 hours).
+        // Searching beyond that ceiling cannot affect either the on-time or
+        // catch-up deadline, and valid annual schedules may have a next
+        // occurrence beyond the schedule iterator's 90-day safety bound.
+        let proposed_next = time(&req.next_instant_utc)?;
+        if proposed_next <= instant || !(60..=86_400).contains(&spec.max_firing_secs) {
+            return Err(ControlError::Invalid("next instant"));
+        }
+        let cap = instant
+            .checked_add_signed(chrono::Duration::seconds(spec.max_firing_secs as i64))
+            .ok_or(ControlError::Invalid("next instant"))?;
+        let search_end = proposed_next.min(cap);
         let next = spec
             .schedule
             .instants(
                 &req.firing.scheduled_instant_utc,
-                &req.next_instant_utc,
+                &search_end.to_rfc3339(),
                 None,
             )
             .map_err(|_| ControlError::Invalid("next instant"))?;
-        if next.len() != 1 || time(&next[0].scheduled_instant_utc)? != time(&req.next_instant_utc)?
-        {
+        if proposed_next <= cap {
+            if next.len() != 1 || time(&next[0].scheduled_instant_utc)? != proposed_next {
+                return Err(ControlError::Invalid("next instant"));
+            }
+        } else if !next.is_empty() {
             return Err(ControlError::Invalid("next instant"));
         }
         let computed_deadline = spec
@@ -1137,9 +1180,13 @@ impl ControlLedger {
         match tx {
             IntentTransaction::Carve {
                 parent_id,
+                parent_outbox_id,
+                scheduler_epoch,
+                now_utc,
                 children,
                 committee,
             } => {
+                self.check_epoch(scheduler_epoch)?;
                 if children.is_empty()
                     || (committee && !(2..=5).contains(&children.len()))
                     || (!committee && children.len() != 1)
@@ -1157,24 +1204,44 @@ impl ControlLedger {
                 if parent.settled {
                     return Err(ControlError::Conflict("parent settled"));
                 }
-                // A carve is created only by a turn whose owned effect has crossed the
-                // durable acceptance fence and whose reservation is still outstanding.
-                if !self.outbox.values().any(|out| {
-                    out.ticket == TicketState::Accepted
-                        && self.firings.get(&out.auth.firing_key).is_some_and(|f| {
-                            !matches!(
-                                f.state,
-                                FiringState::Ambiguous
-                                    | FiringState::Cancelled
-                                    | FiringState::Settled
-                                    | FiringState::Failed
-                            )
+                // New descendants require the exact still-active parent effect and
+                // the current authority, not merely a once-accepted old ticket.
+                let out = self
+                    .outbox
+                    .get(&parent_outbox_id)
+                    .ok_or(ControlError::Missing("parent outbox"))?;
+                let spec = self
+                    .routines
+                    .get(&out.auth.routine_id)
+                    .ok_or(ControlError::Missing("routine"))?;
+                let parent_effect_active = out.ticket == TicketState::Accepted
+                    && out.auth.scheduler_epoch == scheduler_epoch
+                    && spec.revision == out.auth.revision
+                    && matches!(spec.state, RoutineState::Approved)
+                    && self.overlap.get(&out.auth.routine_id) == Some(&out.auth.firing_key)
+                    && self.firings.get(&out.auth.firing_key).is_some_and(|f| {
+                        !matches!(
+                            f.state,
+                            FiringState::Ambiguous
+                                | FiringState::Cancelled
+                                | FiringState::Settled
+                                | FiringState::Failed
+                        )
+                    })
+                    && self
+                        .reservations
+                        .get(&out.reservation_id)
+                        .is_some_and(|r| r.allocation_id == parent_id && r.resolution.is_none())
+                    && out
+                        .auth
+                        .controller
+                        .as_ref()
+                        .is_none_or(|(controller, epoch)| {
+                            self.controllers.get(controller) == Some(epoch)
                         })
-                        && self
-                            .reservations
-                            .get(&out.reservation_id)
-                            .is_some_and(|r| r.allocation_id == parent_id && r.resolution.is_none())
-                }) {
+                    && before(&now_utc, &parent.deadline_utc)?
+                    && before(&now_utc, &out.deadline_utc)?;
+                if !parent_effect_active {
                     return Err(ControlError::Conflict("parent turn is not active"));
                 }
                 let mut total = Funds::default();

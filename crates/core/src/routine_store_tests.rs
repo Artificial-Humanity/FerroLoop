@@ -4,7 +4,7 @@ use crate::routine_store::*;
 use std::sync::{Arc, Barrier};
 
 fn spec() -> RoutineSpec {
-    RoutineSpec {
+    let mut spec = RoutineSpec {
         routine_id: "r".into(),
         revision: 1,
         project: "p".into(),
@@ -37,9 +37,11 @@ fn spec() -> RoutineSpec {
             approved_by: "owner".into(),
             approved_at: "2026-01-01T00:00:00Z".into(),
             revision: 1,
-            digest: "approved".into(),
+            digest: String::new(),
         }),
-    }
+    };
+    spec.approval.as_mut().unwrap().digest = routine_approval_digest(&spec).unwrap();
+    spec
 }
 fn setup<S: RoutineStore>(s: &S) {
     s.routine_transaction(RoutineTransaction::InsertRoutine(spec()))
@@ -62,7 +64,7 @@ fn request() -> AdmissionRequest {
     AdmissionRequest {
         routine_id: "r".into(),
         expected_revision: 1,
-        approval_digest: "approved".into(),
+        approval_digest: routine_approval_digest(&spec()).unwrap(),
         scheduler_epoch: 1,
         firing: FiringRecord {
             firing_key: firing_key("r", instant).unwrap(),
@@ -119,6 +121,9 @@ fn carve<S: RoutineStore + IntentStore>(s: &S, id: &str, n: u64) {
         activate(s);
     }
     s.intent_transaction(IntentTransaction::Carve {
+        parent_outbox_id: "outbox".into(),
+        scheduler_epoch: 1,
+        now_utc: "2026-01-01T01:01:00Z".into(),
         parent_id: "root".into(),
         children: vec![child(id, n)],
         committee: false,
@@ -217,6 +222,9 @@ pub fn concurrent_reservations_cannot_overspend_window<
         jobs.push(std::thread::spawn(move || {
             b.wait();
             s.intent_transaction(IntentTransaction::Carve {
+                parent_outbox_id: "outbox".into(),
+                scheduler_epoch: 1,
+                now_utc: "2026-01-01T01:01:00Z".into(),
                 parent_id: "root".into(),
                 children: vec![child(name, 50)],
                 committee: false,
@@ -316,6 +324,9 @@ pub fn carve_never_draws_on_in_flight_reservation<S: RoutineStore + IntentStore>
     let before = s.control_snapshot().unwrap();
     assert!(
         s.intent_transaction(IntentTransaction::Carve {
+            parent_outbox_id: "outbox".into(),
+            scheduler_epoch: 1,
+            now_utc: "2026-01-01T01:01:00Z".into(),
             parent_id: "root".into(),
             children: vec![child("a", 90)],
             committee: false
@@ -495,6 +506,9 @@ pub fn envelope_caps_parent_plus_children_plus_resumes<S: RoutineStore + IntentS
     let before = s.control_snapshot().unwrap();
     assert!(
         s.intent_transaction(IntentTransaction::Carve {
+            parent_outbox_id: "outbox".into(),
+            scheduler_epoch: 1,
+            now_utc: "2026-01-01T01:01:00Z".into(),
             parent_id: "root".into(),
             children: vec![child("b", 30)],
             committee: false
@@ -511,6 +525,9 @@ pub fn descendants_inherit_envelope_deadline_not_window<S: RoutineStore + Intent
     c.deadline_utc = "2026-01-01T02:01:00Z".into();
     assert!(
         s.intent_transaction(IntentTransaction::Carve {
+            parent_outbox_id: "outbox".into(),
+            scheduler_epoch: 1,
+            now_utc: "2026-01-01T01:01:00Z".into(),
             parent_id: "root".into(),
             children: vec![c],
             committee: false
@@ -526,6 +543,9 @@ pub fn committee_carving_is_atomic<S: RoutineStore + IntentStore>(s: S) {
     let before = s.control_snapshot().unwrap();
     assert!(
         s.intent_transaction(IntentTransaction::Carve {
+            parent_outbox_id: "outbox".into(),
+            scheduler_epoch: 1,
+            now_utc: "2026-01-01T01:01:00Z".into(),
             parent_id: "root".into(),
             children: vec![child("a", 50), child("b", 50)],
             committee: true
@@ -534,6 +554,9 @@ pub fn committee_carving_is_atomic<S: RoutineStore + IntentStore>(s: S) {
     );
     assert_eq!(s.control_snapshot().unwrap(), before);
     s.intent_transaction(IntentTransaction::Carve {
+        parent_outbox_id: "outbox".into(),
+        scheduler_epoch: 1,
+        now_utc: "2026-01-01T01:01:00Z".into(),
         parent_id: "root".into(),
         children: vec![child("a", 30), child("b", 30)],
         committee: true,
@@ -669,6 +692,194 @@ pub fn snapshot_corruption_fails_closed() {
 mod tests {
     use super::*;
     macro_rules! cases {($($name:ident),+ $(,)?) => {$ (#[test] fn $name(){super::$name(MemoryRoutineIntentStore::default());})+};}
+    #[test]
+    fn a_fenced_parent_cannot_create_a_child_allocation() {
+        let s = MemoryRoutineIntentStore::default();
+        setup(&s);
+        admit(&s);
+        activate(&s);
+        s.routine_transaction(RoutineTransaction::SetSchedulerEpoch {
+            expected: 1,
+            next: 2,
+        })
+        .unwrap();
+        let before = s.control_snapshot().unwrap();
+        assert!(
+            s.intent_transaction(IntentTransaction::Carve {
+                parent_outbox_id: "outbox".into(),
+                scheduler_epoch: 1,
+                now_utc: "2026-01-01T01:01:00Z".into(),
+                parent_id: "root".into(),
+                children: vec![child("after-fence", 10)],
+                committee: false,
+            })
+            .is_err()
+        );
+        assert_eq!(s.control_snapshot().unwrap(), before);
+    }
+    #[test]
+    fn an_edited_or_expired_parent_cannot_create_children() {
+        for change in ["edit", "cancel", "expiry"] {
+            let s = MemoryRoutineIntentStore::default();
+            setup(&s);
+            admit(&s);
+            activate(&s);
+            if change != "expiry" {
+                let mut changed = spec();
+                changed.revision = 2;
+                changed.state = if change == "edit" {
+                    RoutineState::Proposed
+                } else {
+                    RoutineState::Cancelled
+                };
+                changed.approval = None;
+                s.routine_transaction(RoutineTransaction::ReplaceRoutine {
+                    expected_revision: 1,
+                    spec: changed,
+                })
+                .unwrap();
+            }
+            let before = s.control_snapshot().unwrap();
+            assert!(
+                s.intent_transaction(IntentTransaction::Carve {
+                    parent_id: "root".into(),
+                    parent_outbox_id: "outbox".into(),
+                    scheduler_epoch: 1,
+                    now_utc: if change == "expiry" {
+                        "2026-01-01T02:00:00Z"
+                    } else {
+                        "2026-01-01T01:01:00Z"
+                    }
+                    .into(),
+                    children: vec![child("after-fence", 10)],
+                    committee: false,
+                })
+                .is_err(),
+                "{change}"
+            );
+            assert_eq!(s.control_snapshot().unwrap(), before, "{change}");
+        }
+    }
+    #[test]
+    fn long_period_firing_does_not_require_an_unbounded_scan() {
+        let s = MemoryRoutineIntentStore::default();
+        let mut long = spec();
+        long.schedule = Schedule::Interval {
+            every_secs: 100 * 86_400,
+            anchor_utc: "2026-01-01T01:00:00Z".into(),
+        };
+        long.approval.as_mut().unwrap().digest = routine_approval_digest(&long).unwrap();
+        s.routine_transaction(RoutineTransaction::InsertRoutine(long.clone()))
+            .unwrap();
+        s.routine_transaction(RoutineTransaction::SetSchedulerEpoch {
+            expected: 0,
+            next: 1,
+        })
+        .unwrap();
+        s.routine_transaction(RoutineTransaction::OpenWindow {
+            id: "window".into(),
+            routine_id: "r".into(),
+            at_utc: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2026-01-02T00:00:00Z".into(),
+        })
+        .unwrap();
+        let mut req = request();
+        req.approval_digest = routine_approval_digest(&long).unwrap();
+        req.next_instant_utc = "2026-04-11T01:00:00Z".into();
+        assert!(
+            s.routine_transaction(RoutineTransaction::CommitAdmission(req))
+                .is_ok()
+        );
+    }
+    #[test]
+    fn annual_cron_firing_does_not_require_an_unbounded_scan() {
+        let s = MemoryRoutineIntentStore::default();
+        let mut annual = spec();
+        annual.schedule = Schedule::Calendar {
+            cron: "0 1 1 1 *".into(),
+            tz: "UTC".into(),
+        };
+        annual.approval.as_mut().unwrap().digest = routine_approval_digest(&annual).unwrap();
+        s.routine_transaction(RoutineTransaction::InsertRoutine(annual.clone()))
+            .unwrap();
+        s.routine_transaction(RoutineTransaction::SetSchedulerEpoch {
+            expected: 0,
+            next: 1,
+        })
+        .unwrap();
+        s.routine_transaction(RoutineTransaction::OpenWindow {
+            id: "window".into(),
+            routine_id: "r".into(),
+            at_utc: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2026-01-02T00:00:00Z".into(),
+        })
+        .unwrap();
+        let mut req = request();
+        req.approval_digest = routine_approval_digest(&annual).unwrap();
+        req.firing.nominal_slots = vec!["2026-01-01T01:00:00".into()];
+        req.next_instant_utc = "2027-01-01T01:00:00Z".into();
+        assert!(
+            s.routine_transaction(RoutineTransaction::CommitAdmission(req))
+                .is_ok()
+        );
+    }
+    #[test]
+    fn false_late_next_instant_cannot_hide_an_earlier_deadline() {
+        let s = MemoryRoutineIntentStore::default();
+        setup(&s);
+        let before = s.control_snapshot().unwrap();
+        let mut req = request();
+        req.next_instant_utc = "2027-01-01T01:00:00Z".into();
+        assert!(
+            s.routine_transaction(RoutineTransaction::CommitAdmission(req))
+                .is_err()
+        );
+        assert_eq!(s.control_snapshot().unwrap(), before);
+    }
+    #[test]
+    fn approval_digest_binds_authority_fields_but_not_state_or_receipt() {
+        let original = spec();
+        let digest = routine_approval_digest(&original).unwrap();
+        let mut changed = original.clone();
+        changed.state = RoutineState::Paused {
+            reason: "pending".into(),
+        };
+        changed.approval = None;
+        assert_eq!(routine_approval_digest(&changed).unwrap(), digest);
+        changed.schedule = Schedule::Interval {
+            every_secs: 7200,
+            anchor_utc: "2026-01-01T00:00:00Z".into(),
+        };
+        assert_ne!(routine_approval_digest(&changed).unwrap(), digest);
+        let mut changed = original;
+        changed.revision += 1;
+        assert_ne!(routine_approval_digest(&changed).unwrap(), digest);
+    }
+    #[test]
+    fn tampered_approved_snapshot_fails_closed() {
+        let s = MemoryRoutineIntentStore::default();
+        setup(&s);
+        let mut snapshot = s.control_snapshot().unwrap();
+        snapshot
+            .routines
+            .get_mut("r")
+            .unwrap()
+            .allocation
+            .per_firing_tokens -= 1;
+        let encoded = snapshot.encode_snapshot().unwrap();
+        assert!(ControlLedger::decode_snapshot(&encoded).is_err());
+    }
+    #[test]
+    fn approved_routine_rejects_a_digest_that_does_not_match_the_spec() {
+        let s = MemoryRoutineIntentStore::default();
+        let mut changed = spec();
+        changed.allocation.per_firing_tokens -= 1;
+        assert!(
+            s.routine_transaction(RoutineTransaction::InsertRoutine(changed))
+                .is_err()
+        );
+        assert!(s.control_snapshot().unwrap().routines.is_empty());
+    }
     #[test]
     fn snapshot_corruption_fails_closed() {
         super::snapshot_corruption_fails_closed();
