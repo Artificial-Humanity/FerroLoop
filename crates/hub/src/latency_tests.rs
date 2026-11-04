@@ -805,7 +805,7 @@ fn fast_lookup_preserves_full_discoverys_deduplicated_route_order() {
 
 mod route_lookup {
     use std::cell::RefCell;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -839,12 +839,55 @@ mod route_lookup {
         note_route_file_scan(Some(home), Instant::now());
     }
 
+    /// Wait for a closed listener to stop accepting connections. A concurrently forked test
+    /// process can inherit the listener fd until exec, even after this test drops its copy.
+    /// Bound the number of probes; unexpected errors are not a refusal.
+    fn wait_for_connection_refusal(socket_path: &Path) {
+        for _ in 0..32 {
+            match UnixStream::connect(socket_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!(
+                    "{}: unexpected connect error: {error}",
+                    socket_path.display()
+                ),
+                Ok(stream) => drop(stream),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "{} remained connectable after listener close",
+            socket_path.display()
+        );
+    }
+
     /// A webhook route whose socket file exists (the cheap lookup check passes), with nothing
     /// listening on it: a connect is refused.
     fn refusing_webhook(home: &Path, name: &str) -> VendorRoute {
         let socket_path = home.join(name);
         drop(UnixListener::bind(&socket_path).unwrap());
+        wait_for_connection_refusal(&socket_path);
         VendorRoute::Webhook { socket_path }
+    }
+
+    #[test]
+    fn refusal_waits_for_a_retained_listener_copy_to_close() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("retained.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let retained = listener.try_clone().unwrap();
+        drop(listener);
+        // A copied listener models the fd held by a child between fork and exec.
+        assert!(UnixStream::connect(&path).is_ok());
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(retained);
+        });
+        wait_for_connection_refusal(&path);
+        closer.join().unwrap();
+        assert_eq!(
+            UnixStream::connect(&path).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
     }
 
     /// What each connection made to `listener` so far carried, in order. Every send under test
