@@ -135,6 +135,21 @@ impl RoutineProposalRecord {
         {
             return Err(F1RecordError::InvalidRecord);
         }
+        if matches!(self.spec.state, RoutineState::Proposed) {
+            if self.version == u64::MAX || self.spec.revision == u64::MAX {
+                return Err(F1RecordError::InvalidRecord);
+            }
+            // A pause may need a full-length reason and increment both revision counters.
+            // Quotes and backslashes have the largest JSON expansion of permitted reason
+            // characters (control characters are refused by SafetyBatch).
+            let mut paused = self.clone();
+            paused.version = u64::MAX;
+            paused.spec.revision = u64::MAX;
+            paused.spec.state = RoutineState::Paused {
+                reason: "\\".repeat(1024),
+            };
+            encode_record(&paused)?;
+        }
         encode_record(self)?;
         Ok(())
     }
@@ -170,12 +185,27 @@ pub struct IntentEvidenceRecord {
     pub safety: SafetyState,
 }
 impl IntentEvidenceRecord {
+    /// Only fresh inert evidence may enter the preparation store through insertion.
+    pub fn validate_for_insert(&self) -> Result<(), F1RecordError> {
+        if self.version != 1 || self.safety != SafetyState::Inert {
+            return Err(F1RecordError::InvalidRecord);
+        }
+        self.validate()
+    }
+
     pub fn validate(&self) -> Result<(), F1RecordError> {
         ControlRecordKey::intent(self.definition.id())?;
         if self.version == 0
+            || (self.safety == SafetyState::Inert && self.version == u64::MAX)
             || matches!(&self.definition, IntentDefinition::Committee(c) if c.validate().is_err())
         {
             return Err(F1RecordError::InvalidRecord);
+        }
+        if self.safety == SafetyState::Inert {
+            let mut quarantined = self.clone();
+            quarantined.version = u64::MAX;
+            quarantined.safety = SafetyState::Quarantined;
+            encode_record(&quarantined)?;
         }
         encode_record(self)?;
         Ok(())
@@ -197,9 +227,19 @@ pub struct AllocationEvidenceRecord {
     pub safety: SafetyState,
 }
 impl AllocationEvidenceRecord {
+    /// Only fresh inert evidence may enter the preparation store through insertion.
+    pub fn validate_for_insert(&self) -> Result<(), F1RecordError> {
+        if self.version != 1 || self.safety != SafetyState::Inert {
+            return Err(F1RecordError::InvalidRecord);
+        }
+        self.validate()
+    }
+
     pub fn validate(&self) -> Result<(), F1RecordError> {
         ControlRecordKey::allocation(&self.allocation_id)?;
         if self.version == 0
+            || (self.safety == SafetyState::Inert && self.version >= u64::MAX - 1)
+            || (self.safety == SafetyState::Quarantined && self.version == u64::MAX)
             || !valid_id(&self.root_id)
             || !valid_id(&self.source_window_id)
             || self
@@ -214,6 +254,12 @@ impl AllocationEvidenceRecord {
             || chrono::DateTime::parse_from_rfc3339(&self.deadline_utc).is_err()
         {
             return Err(F1RecordError::InvalidRecord);
+        }
+        if self.safety != SafetyState::StopRequested {
+            let mut stopped = self.clone();
+            stopped.version = u64::MAX;
+            stopped.safety = SafetyState::StopRequested;
+            encode_record(&stopped)?;
         }
         encode_record(self)?;
         Ok(())
@@ -261,6 +307,36 @@ pub fn decode_allocation_record(
 
 /// Compute one inert-record transition; a store must still compare and write it atomically.
 /// A stop request is evidence only and does not mean that a process was stopped.
+pub fn prepare_routine_pause(
+    current: &RoutineProposalRecord,
+    expected_version: u64,
+    reason: &str,
+) -> Result<RoutineProposalRecord, F1RecordError> {
+    current.validate()?;
+    if current.version != expected_version || !matches!(current.spec.state, RoutineState::Proposed)
+    {
+        return Err(F1RecordError::Conflict);
+    }
+    if reason.trim().is_empty() || reason.len() > 1024 || reason.chars().any(char::is_control) {
+        return Err(F1RecordError::InvalidRecord);
+    }
+    let mut next = current.clone();
+    next.version = current
+        .version
+        .checked_add(1)
+        .ok_or(F1RecordError::Conflict)?;
+    next.spec.revision = current
+        .spec
+        .revision
+        .checked_add(1)
+        .ok_or(F1RecordError::Conflict)?;
+    next.spec.state = RoutineState::Paused {
+        reason: reason.to_owned(),
+    };
+    next.validate()?;
+    Ok(next)
+}
+
 pub fn prepare_intent_quarantine(
     current: &IntentEvidenceRecord,
     expected_version: u64,
@@ -382,6 +458,14 @@ pub trait F1PreparationStore {
 
     /// Insert only an unapproved `Proposed` routine with a fresh identity.
     fn insert_proposal(&self, record: RoutineProposalRecord) -> Result<(), F1RecordError>;
+    /// Insert valid, version-1 inert intent evidence if its identity is absent.
+    /// Validate the full existing ID in the same transaction even when using a hashed slug;
+    /// an occupied key (duplicate or collision) is `Conflict` and never replaces the row.
+    fn insert_intent(&self, record: IntentEvidenceRecord) -> Result<(), F1RecordError>;
+    /// Insert valid, version-1 inert allocation evidence if its identity is absent.
+    /// Validate the full existing ID in the same transaction even when using a hashed slug;
+    /// an occupied key (duplicate or collision) is `Conflict` and never replaces the row.
+    fn insert_allocation(&self, record: AllocationEvidenceRecord) -> Result<(), F1RecordError>;
     /// Compare the row version, then pause the named routine; no unrelated row may change.
     fn pause_routine(
         &self,
@@ -428,6 +512,12 @@ mod tests {
             Err(F1RecordError::Missing)
         }
         fn insert_proposal(&self, _: RoutineProposalRecord) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn insert_intent(&self, _: IntentEvidenceRecord) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn insert_allocation(&self, _: AllocationEvidenceRecord) -> Result<(), F1RecordError> {
             Err(F1RecordError::Missing)
         }
         fn pause_routine(&self, _: &str, _: u64, _: &str) -> Result<(), F1RecordError> {
@@ -634,7 +724,272 @@ mod tests {
         overflow.version = u64::MAX;
         assert_eq!(
             prepare_intent_quarantine(&overflow, u64::MAX),
+            Err(F1RecordError::InvalidRecord)
+        );
+    }
+
+    #[test]
+    fn accepted_intent_reserves_quarantine_headroom_at_record_limit() {
+        let mut row = evidence("near-limit");
+        let base = serde_json::to_vec(&row).unwrap().len();
+        let IntentDefinition::Committee(ref mut committee) = row.definition else {
+            unreachable!()
+        };
+        committee
+            .delegator
+            .controller_lease_id
+            .push_str(&"x".repeat(MAX_RECORD_BYTES - base));
+        assert_eq!(serde_json::to_vec(&row).unwrap().len(), MAX_RECORD_BYTES);
+        assert_eq!(row.validate(), Err(F1RecordError::TooLarge));
+        while row.validate() == Err(F1RecordError::TooLarge) {
+            let IntentDefinition::Committee(ref mut committee) = row.definition else {
+                unreachable!()
+            };
+            committee.delegator.controller_lease_id.pop();
+        }
+        row.validate().unwrap();
+        let mut just_too_large = row.clone();
+        let IntentDefinition::Committee(ref mut committee) = just_too_large.definition else {
+            unreachable!()
+        };
+        committee.delegator.controller_lease_id.push('x');
+        assert_eq!(just_too_large.validate(), Err(F1RecordError::TooLarge));
+        let quarantined = prepare_intent_quarantine(&row, row.version).unwrap();
+        assert_eq!(quarantined.safety, SafetyState::Quarantined);
+    }
+
+    #[test]
+    fn active_evidence_rejects_versions_without_room_for_safety_transition() {
+        let mut intent = evidence("i");
+        intent.version = u64::MAX;
+        assert_eq!(intent.validate(), Err(F1RecordError::InvalidRecord));
+        let mut allocation = AllocationEvidenceRecord {
+            version: u64::MAX - 1,
+            allocation_id: "root".into(),
+            parent_id: None,
+            root_id: "root".into(),
+            source_window_id: "window".into(),
+            deadline_utc: "2030-01-01T00:00:00Z".into(),
+            tokens: 1,
+            cost_micros: 1,
+            safety: SafetyState::Inert,
+        };
+        assert_eq!(allocation.validate(), Err(F1RecordError::InvalidRecord));
+        allocation.version = u64::MAX - 2;
+        allocation.validate().unwrap();
+        allocation.safety = SafetyState::Quarantined;
+        allocation.version += 1;
+        let stopped = prepare_allocation_stop(&allocation, u64::MAX - 1).unwrap();
+        assert_eq!(stopped.version, u64::MAX);
+    }
+
+    #[test]
+    fn routine_proposals_reserve_space_for_long_escaped_pause_reason() {
+        use crate::routine::{Allocation, CatchUp, Concurrency, RoutineWork, Schedule, Window};
+        let mut row = RoutineProposalRecord {
+            version: 1,
+            spec: RoutineSpec {
+                routine_id: "routine".into(),
+                revision: 1,
+                project: "p".into(),
+                schedule: Schedule::Interval {
+                    every_secs: 300,
+                    anchor_utc: "2030-01-01T00:00:00Z".into(),
+                },
+                work: RoutineWork::ExecutableOnly {
+                    gate_or_hook_id: "gate".into(),
+                },
+                allocation: Allocation {
+                    per_firing_tokens: 1,
+                    per_firing_cost_micros: 1,
+                    window: Window::Day,
+                    window_tokens: 1,
+                    window_cost_micros: 1,
+                },
+                concurrency: Concurrency::Forbid,
+                catch_up: CatchUp::Skip,
+                misfire_grace_secs: 300,
+                max_firing_secs: 3600,
+                max_firings_per_day: 24,
+                expires_at: "2030-03-01T00:00:00Z".into(),
+                state: RoutineState::Proposed,
+                approval: None,
+            },
+        };
+        let base = serde_json::to_vec(&row).unwrap().len();
+        row.spec
+            .project
+            .push_str(&"x".repeat(MAX_RECORD_BYTES - base));
+        assert_eq!(row.validate(), Err(F1RecordError::TooLarge));
+        while row.validate() == Err(F1RecordError::TooLarge) {
+            row.spec.project.pop();
+        }
+        row.validate().unwrap();
+        let mut just_too_large = row.clone();
+        just_too_large.spec.project.push('x');
+        assert_eq!(just_too_large.validate(), Err(F1RecordError::TooLarge));
+        let paused = prepare_routine_pause(&row, row.version, &"\\".repeat(1024)).unwrap();
+        assert!(encode_record(&paused).is_ok());
+        row.version = u64::MAX;
+        assert_eq!(row.validate(), Err(F1RecordError::InvalidRecord));
+    }
+
+    #[test]
+    fn insert_contract_refuses_noninert_or_noninitial_evidence() {
+        let mut intent = evidence("intent-insert");
+        assert_eq!(intent.validate_for_insert(), Ok(()));
+        intent.version = 2;
+        assert_eq!(
+            intent.validate_for_insert(),
+            Err(F1RecordError::InvalidRecord)
+        );
+        intent.version = 1;
+        intent.safety = SafetyState::Quarantined;
+        assert_eq!(
+            intent.validate_for_insert(),
+            Err(F1RecordError::InvalidRecord)
+        );
+
+        let mut allocation = AllocationEvidenceRecord {
+            version: 1,
+            allocation_id: "root".into(),
+            parent_id: None,
+            root_id: "root".into(),
+            source_window_id: "window".into(),
+            deadline_utc: "2030-01-01T00:00:00Z".into(),
+            tokens: 1,
+            cost_micros: 1,
+            safety: SafetyState::Inert,
+        };
+        assert_eq!(allocation.validate_for_insert(), Ok(()));
+        allocation.version = 2;
+        assert_eq!(
+            allocation.validate_for_insert(),
+            Err(F1RecordError::InvalidRecord)
+        );
+        allocation.version = 1;
+        allocation.safety = SafetyState::StopRequested;
+        assert_eq!(
+            allocation.validate_for_insert(),
+            Err(F1RecordError::InvalidRecord)
+        );
+    }
+
+    // Test double for the insert-if-absent contract only. It is not a persistence backend.
+    #[derive(Default)]
+    struct InsertOnly(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+    impl InsertOnly {
+        fn insert(&self, key: ControlRecordKey, bytes: Vec<u8>) -> Result<(), F1RecordError> {
+            let mut rows = self.0.lock().unwrap();
+            if rows.contains_key(key.slug()) {
+                return Err(F1RecordError::Conflict);
+            }
+            rows.insert(key.slug().to_owned(), bytes);
+            Ok(())
+        }
+    }
+    impl F1PreparationStore for InsertOnly {
+        fn routine(&self, _: &str) -> Result<Option<RoutineProposalRecord>, F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn intent(&self, id: &str) -> Result<Option<IntentEvidenceRecord>, F1RecordError> {
+            let key = ControlRecordKey::intent(id)?;
+            self.0
+                .lock()
+                .unwrap()
+                .get(key.slug())
+                .map(|bytes| decode_intent_record(bytes, id))
+                .transpose()
+        }
+        fn allocation(&self, id: &str) -> Result<Option<AllocationEvidenceRecord>, F1RecordError> {
+            let key = ControlRecordKey::allocation(id)?;
+            self.0
+                .lock()
+                .unwrap()
+                .get(key.slug())
+                .map(|bytes| decode_allocation_record(bytes, id))
+                .transpose()
+        }
+        fn apply_safety_batch(&self, _: &SafetyBatch) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn insert_proposal(&self, _: RoutineProposalRecord) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn insert_intent(&self, record: IntentEvidenceRecord) -> Result<(), F1RecordError> {
+            record.validate_for_insert()?;
+            self.insert(
+                ControlRecordKey::intent(record.definition.id())?,
+                encode_record(&record)?,
+            )
+        }
+        fn insert_allocation(&self, record: AllocationEvidenceRecord) -> Result<(), F1RecordError> {
+            record.validate_for_insert()?;
+            self.insert(
+                ControlRecordKey::allocation(&record.allocation_id)?,
+                encode_record(&record)?,
+            )
+        }
+        fn pause_routine(&self, _: &str, _: u64, _: &str) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn quarantine_intent(&self, _: &str, _: u64) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+        fn request_allocation_stop(&self, _: &str, _: u64) -> Result<(), F1RecordError> {
+            Err(F1RecordError::Missing)
+        }
+    }
+
+    #[test]
+    fn insert_evidence_is_unique_and_detects_misplaced_row() {
+        let store = InsertOnly::default();
+        let intent = evidence("intent-original");
+        store.insert_intent(intent.clone()).unwrap();
+        assert_eq!(
+            store.insert_intent(intent.clone()),
             Err(F1RecordError::Conflict)
         );
+        assert_eq!(store.intent("intent-original"), Ok(Some(intent.clone())));
+        let other_key = ControlRecordKey::intent("intent-collision").unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert(other_key.slug().into(), encode_record(&intent).unwrap());
+        assert_eq!(
+            store.intent("intent-collision"),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(
+            store.insert_intent(evidence("intent-collision")),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(store.intent("intent-original"), Ok(Some(intent)));
+
+        let allocation = AllocationEvidenceRecord {
+            version: 1,
+            allocation_id: "root".into(),
+            parent_id: None,
+            root_id: "root".into(),
+            source_window_id: "window".into(),
+            deadline_utc: "2030-01-01T00:00:00Z".into(),
+            tokens: 1,
+            cost_micros: 1,
+            safety: SafetyState::Inert,
+        };
+        store.insert_allocation(allocation.clone()).unwrap();
+        assert_eq!(
+            store.insert_allocation(allocation.clone()),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(store.allocation("root"), Ok(Some(allocation.clone())));
+        let key = ControlRecordKey::allocation("other").unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .insert(key.slug().into(), encode_record(&allocation).unwrap());
+        assert_eq!(store.allocation("other"), Err(F1RecordError::Conflict));
     }
 }
