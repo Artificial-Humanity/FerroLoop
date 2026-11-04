@@ -389,7 +389,9 @@ impl Vault {
         // vault lock. `self.file` may be stale (another `fl vault set` process, or the hub, may
         // have saved since this `Vault` was opened), so the disk copy is the base and this one
         // secret is applied to it: a stale in-memory map is never written back over it.
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         let mut next = read_vault_file(&self.path)?;
         if only_if_absent && let Some(existing) = next.secrets.get(&name) {
             let metadata = existing.metadata.clone();
@@ -479,7 +481,9 @@ impl Vault {
     pub fn remove(&mut self, name: &str) -> Result<bool, GateError> {
         let key = normalize_secret_name(name)?;
         // Same lock and same disk-first rule as `set`: the disk copy is the base.
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         let mut next = read_vault_file(&self.path)?;
         let existed = next.secrets.remove(&key).is_some();
         if existed {
@@ -667,7 +671,9 @@ impl Vault {
     /// was opened is overwritten. Use [`Vault::set`] or [`Vault::remove`] to change a secret;
     /// they re-read the disk copy under the lock first.
     pub fn save(&self) -> Result<(), GateError> {
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         self.write_file(&self.file)
     }
 
@@ -676,7 +682,9 @@ impl Vault {
     /// a `set` that lands after [`Vault::open`] is never overwritten by an initialising `save`.
     /// An existing vault is left exactly as it is.
     pub fn save_if_absent(&self) -> Result<bool, GateError> {
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         // A symlink in the vault's place counts as present: it is never replaced here.
         if fs::symlink_metadata(&self.path).is_ok() {
             return Ok(false);
@@ -692,6 +700,55 @@ impl Vault {
             cause: e.to_string(),
         })?;
         write_atomic_0600(&self.path, format!("{encoded}\n").as_bytes())
+    }
+
+    /// Permanently require the broker for subsequent direct vault mutations.
+    ///
+    /// The caller must authorize this operation. The vault directory and its ancestors must
+    /// be trusted and fenced against concurrent replacement; the lock is advisory and cannot
+    /// protect files from same-user code that edits or removes them directly. There is no
+    /// bypass here: once configured, direct writes refuse until a future broker path exists.
+    #[cfg(unix)]
+    pub fn require_broker(&self) -> Result<(), GateError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        let marker = broker_marker_path(&self.path)?;
+        let error = |op, e: std::io::Error| GateError::Io {
+            op,
+            path: marker.clone(),
+            cause: e.to_string(),
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(&marker)
+            .map_err(|e| error("create broker marker", e))?;
+        // If any later operation fails, leave the marker in place so writes remain refused.
+        file.write_all(b"ferrogate-broker-required-v1\n")
+            .map_err(|e| error("write broker marker", e))?;
+        file.sync_all()
+            .map_err(|e| error("sync broker marker", e))?;
+        let parent = marker
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| error("sync broker marker directory", e))?;
+        Ok(())
+    }
+
+    /// Broker-required configuration is unavailable without a process-shared vault lock.
+    #[cfg(not(unix))]
+    pub fn require_broker(&self) -> Result<(), GateError> {
+        Err(GateError::DispatchAuthority(
+            "broker marker requires a process-shared lock",
+        ))
     }
 
     /// Compare `candidate` against the decrypted value of `secret_name` in constant time.
@@ -857,6 +914,32 @@ fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
 /// every save, so a lock on its inode would not exclude the next writer.
 pub(crate) const LOCK_FILE_NAME: &str = ".vault.lock";
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+fn broker_marker_path(vault_path: &Path) -> Result<PathBuf, GateError> {
+    let name = vault_path
+        .file_name()
+        .ok_or(GateError::DispatchAuthority("invalid vault path"))?;
+    let mut marker = name.to_os_string();
+    marker.push(".broker-required");
+    Ok(vault_path.with_file_name(marker))
+}
+
+/// A marker of any type or contents refuses direct writes. A corrupt marker must never
+/// turn broker enforcement off; access errors are also refusals, not absence.
+fn refuse_direct_write_if_broker_required(vault_path: &Path) -> Result<(), GateError> {
+    let path = broker_marker_path(vault_path)?;
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(GateError::DispatchAuthority(
+            "broker required for vault mutation",
+        )),
+    }
+}
+
 /// Lock directories held by this process. `flock` locks belong to an open file description, so
 /// two threads that each open the lock file would conflict anyway; this set makes the wait
 /// explicit and in-process, and keeps one thread from ever blocking on a description it holds
@@ -942,6 +1025,8 @@ mod flock {
 pub(crate) struct VaultLock {
     #[cfg_attr(not(unix), allow(dead_code))]
     file: fs::File,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    path: PathBuf,
     _slot: ProcessSlot,
 }
 
@@ -968,17 +1053,61 @@ impl VaultLock {
             .join(LOCK_FILE_NAME);
         let slot = ProcessSlot::acquire(key);
         reject_if_symlink(&lock_path)?;
+        #[cfg(test)]
+        BEFORE_LOCK_OPEN.with(|hook| {
+            if let Some(f) = hook.borrow_mut().take() {
+                f();
+            }
+        });
         let mut opts = fs::OpenOptions::new();
         opts.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
         let file = opts.open(&lock_path).map_err(|e| io_err("open", e))?;
+        if !file.metadata().map_err(|e| io_err("stat", e))?.is_file() {
+            return Err(io_err(
+                "open",
+                std::io::Error::other("vault lock is not a regular file"),
+            ));
+        }
         #[cfg(unix)]
         flock::lock_exclusive(&file).map_err(|e| io_err("lock", e))?;
-        Ok(Self { file, _slot: slot })
+        let lock = Self {
+            file,
+            path: lock_path,
+            _slot: slot,
+        };
+        lock.ensure_current()?;
+        Ok(lock)
+    }
+
+    /// Refuse a lock whose directory entry was replaced while this process waited.
+    /// Callers must also fence the directory against replacement during the operation.
+    #[cfg(unix)]
+    fn ensure_current(&self) -> Result<(), GateError> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = self.file.metadata();
+        let named = fs::symlink_metadata(&self.path);
+        match (opened, named) {
+            (Ok(a), Ok(b))
+                if b.file_type().is_file()
+                    && a.dev() == b.dev()
+                    && a.ino() == b.ino()
+                    && a.nlink() == 1 =>
+            {
+                Ok(())
+            }
+            _ => Err(GateError::DispatchAuthority("vault lock identity changed")),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_current(&self) -> Result<(), GateError> {
+        Ok(())
     }
 }
 
@@ -1588,6 +1717,119 @@ pub(crate) fn now_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn broker_marker_refuses_every_direct_vault_write() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        vault.set(args("EXISTING", "old")).unwrap();
+        let original = fs::read(vault.path()).unwrap();
+        fs::write(tmp.path().join("vault.enc.broker-required"), b"corrupt").unwrap();
+        assert!(matches!(
+            vault.set(args("NEW", "value")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(
+            vault.set_if_absent(args("NEW", "value")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(
+            vault.remove("EXISTING"),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(vault.save(), Err(GateError::DispatchAuthority(_))));
+        assert!(matches!(
+            vault.save_if_absent(),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert_eq!(fs::read(vault.path()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_marker_is_private_durable_and_scoped_to_one_vault() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut first = open_at(tmp.path());
+        first.set(args("EXISTING", "old")).unwrap();
+        let mut other = Vault::open(tmp.path().join("other.enc"), [9; 32]).unwrap();
+        first.require_broker().unwrap();
+        let marker = tmp.path().join("vault.enc.broker-required");
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut reopened = open_at(tmp.path());
+        assert!(matches!(
+            reopened.set(args("DENIED", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        other.set(args("OTHER", "allowed")).unwrap();
+        assert!(!fs::read_to_string(marker).unwrap().contains("old"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_symlink_and_unexpected_type_never_allow_writes() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        let marker = tmp.path().join("vault.enc.broker-required");
+        symlink(tmp.path().join("missing"), &marker).unwrap();
+        assert!(matches!(
+            vault.set(args("X", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(vault.require_broker().is_err());
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        assert!(matches!(vault.save(), Err(GateError::DispatchAuthority(_))));
+        assert!(vault.require_broker().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_marker_remains_enforced_when_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        vault.set(args("EXISTING", "old")).unwrap();
+        vault.require_broker().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = vault.set(args("NEXT", "secret"));
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(tmp.path().join("vault.enc.broker-required").exists());
+        assert!(matches!(
+            vault.set(args("NEXT", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_swap_and_replaced_inode_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let lock_path = tmp.path().join(LOCK_FILE_NAME);
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        let replacement = lock_path.clone();
+        let target = victim.clone();
+        BEFORE_LOCK_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                symlink(target, replacement).unwrap();
+            }))
+        });
+        assert!(VaultLock::acquire(&path).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+        fs::remove_file(&lock_path).unwrap();
+        let lock = VaultLock::acquire(&path).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        assert!(lock.ensure_current().is_err());
+    }
 
     fn args(name: &str, value: &str) -> SetSecretArgs {
         SetSecretArgs {
