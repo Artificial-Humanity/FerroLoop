@@ -186,7 +186,17 @@ fn run_inner(
             agent,
             timeout_secs,
             json,
-        } => cmd_call(url, method, headers, body, agent, timeout_secs, json, env),
+        } => cmd_call(
+            cwd,
+            url,
+            method,
+            headers,
+            body,
+            agent,
+            timeout_secs,
+            json,
+            env,
+        ),
         VaultCmd::Connectors { json } => cmd_connectors(cwd, json),
         VaultCmd::ImportOpenapi {
             spec_path,
@@ -342,6 +352,7 @@ fn cmd_remove(name: &str, as_json: bool) -> Result<i32, (i32, String)> {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_call(
+    cwd: &Path,
     url: String,
     method: String,
     raw_headers: Vec<String>,
@@ -374,10 +385,11 @@ fn cmd_call(
     };
     // Raw proxy only: no connector tool is named, so no response contract
     // applies — `fl vault call` is Uncontracted by definition (Record #96).
-    // It is still a governed dispatch: admit first with legacy-envelope
-    // reserved units (request body + URL bytes, at least 1). When the CLI
-    // store cannot open, the governor has no store and dispatch is refused
-    // with `admission_unavailable`, never a legacy fallback.
+    // It is still a governed dispatch: admit first, reserving the
+    // worst-case `LEGACY_MAX_RESPONSE_BYTES` (settlement is capped at the
+    // reserve). When the CLI store cannot open, the governor has no store
+    // and dispatch is refused with `admission_unavailable`, never a
+    // legacy fallback.
     let governor = cli_gate_governor(env);
     let (host, path) = match fl_gate::parse_url_scheme_host_port(&req.url) {
         Ok((_, h, _)) => {
@@ -396,8 +408,13 @@ fn cmd_call(
         }
         Err(_) => (String::new(), req.url.clone()),
     };
-    let endpoint = fl_core::governor::canonical_endpoint(None, None, &host, &path);
-    let reserved = (req.body.as_ref().map_or(0, |b| b.len()) + req.url.len()).max(1) as u64;
+    // Canonicalise against discovered connector aliases so a raw call to
+    // a connector endpoint shares that endpoint's budget scopes.
+    let connectors = discover_connectors(Some(cwd), None).unwrap_or_default();
+    let aliases = fl_gate::connector_endpoint_aliases(&connectors);
+    let endpoint =
+        fl_core::governor::resolve_canonical_endpoint(&aliases, None, None, &host, &path);
+    let reserved = fl_gate::LEGACY_MAX_RESPONSE_BYTES;
     let mut adm_req = AdmissionRequest::new(Principal::Owner, &host, &endpoint, reserved);
     adm_req.caller_agent = req.caller_agent.clone().unwrap_or_default();
     let now_ms = std::time::SystemTime::now()

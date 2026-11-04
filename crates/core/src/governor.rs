@@ -85,23 +85,31 @@ pub fn resolve_canonical_endpoint(
     if let (Some(c), Some(t)) = (connector, tool)
         && let Some(a) = aliases.iter().find(|a| a.connector_id == c && a.tool == t)
     {
-        let host = normalize_host(&a.host);
-        let p = if path.is_empty() {
+        return format!(
+            "{}{}",
+            normalize_host(&a.host),
             normalize_path(&a.path_prefix)
-        } else {
-            normalize_path(path)
-        };
-        return format!("{host}{p}");
+        );
     }
-    // raw path: if it matches an alias host+prefix, canonical is host/path (same as connector form)
+    // Raw path: an alias matches only on a segment boundary (the path is
+    // the prefix itself or extends it past a `/`), and the canonical form
+    // is the alias prefix, exactly as on the connector path.
     let host = normalize_host(url_host);
     if !host.is_empty() {
-        // verify alias match not needed to change form; host/path already canonical
-        let _ = aliases.iter().find(|a| {
-            normalize_host(&a.host) == host
-                && normalize_path(path).starts_with(&normalize_path(&a.path_prefix))
-        });
-        return format!("{}{}", host, normalize_path(path));
+        let norm_path = normalize_path(path);
+        for a in aliases {
+            if normalize_host(&a.host) != host {
+                continue;
+            }
+            let prefix = normalize_path(&a.path_prefix);
+            if prefix.is_empty() {
+                continue;
+            }
+            if norm_path == prefix || norm_path.starts_with(&format!("{prefix}/")) {
+                return format!("{host}{prefix}");
+            }
+        }
+        return format!("{host}{norm_path}");
     }
     canonical_endpoint(connector, tool, url_host, path)
 }
@@ -254,11 +262,18 @@ pub enum SideEffectClass {
     SideEffectful,
     IdempotentWithKey,
 }
+fn default_side_effect_class() -> SideEffectClass {
+    SideEffectClass::SideEffectful
+}
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplayRecord {
     pub operation: LogicalOperationId,
     pub outcome: Option<RecordedOutcome>,
     pub original_key: Option<String>,
+    /// Side-effect class recorded at dispatch time (trusted caller), never
+    /// re-derived from a retry's own claims.
+    #[serde(default = "default_side_effect_class")]
+    pub side_effect_class: SideEffectClass,
     pub endpoint: String,
     pub recorded_at_ms: u64,
     pub dispatching: bool,
@@ -296,6 +311,14 @@ pub fn replay_decision(
     if !uncertain && record.outcome.is_none() {
         return ReplayDecision::Allowed;
     }
+    // Same logical operation (same endpoint-set id) aimed at a different
+    // endpoint than the recorded dispatch is an endpoint switch, never a
+    // replay or reconciliation of that dispatch.
+    if attempt.endpoint != record.endpoint {
+        return ReplayDecision::Refused {
+            reason: "endpoint_switch_refused".into(),
+        };
+    }
     // Owner bypass only for an explicitly fresh action; otherwise an Owner
     // replay is refused like everyone else's. Principal mismatch is not a
     // replay of this record (lookup normally filters it out).
@@ -305,10 +328,14 @@ pub fn replay_decision(
     if record.operation.principal != attempt.operation.principal {
         return ReplayDecision::Allowed;
     }
-    if attempt.side_effect_class == SideEffectClass::IdempotentWithKey
+    // Reconciliation is only for a dispatch whose outcome is unknown after
+    // send, recorded (at dispatch time) as idempotent-with-key, retried
+    // with the original key. An `Executed` record never replays.
+    if record.outcome == Some(RecordedOutcome::UnknownAfterSend)
+        && record.side_effect_class == SideEffectClass::IdempotentWithKey
+        && attempt.side_effect_class == SideEffectClass::IdempotentWithKey
         && attempt.original_key.is_some()
         && attempt.original_key == record.original_key
-        && attempt.endpoint == record.endpoint
         && !uncertain
     {
         return ReplayDecision::AllowedReconciliation;
@@ -336,6 +363,10 @@ pub struct AdmissionRequest {
     pub owner_fresh_action: bool,
     /// Logical-operation digest for the replay guard; `None` skips the guard.
     pub operation_digest: Option<String>,
+    /// Explicit logical endpoint-set id for the replay guard. It is NOT
+    /// the per-attempt endpoint: attempts in one set share this id, and a
+    /// change of the concrete `endpoint` within the set is refused.
+    pub endpoint_set_digest: String,
     pub original_key: Option<String>,
     pub side_effect_class: SideEffectClass,
 }
@@ -352,6 +383,7 @@ impl AdmissionRequest {
             call_name: None,
             owner_fresh_action: false,
             operation_digest: None,
+            endpoint_set_digest: String::new(),
             original_key: None,
             side_effect_class: SideEffectClass::SideEffectful,
         }
@@ -363,7 +395,7 @@ impl AdmissionRequest {
                 digest: digest.clone(),
                 principal: self.principal.clone(),
                 project: self.project.clone(),
-                endpoint_set_digest: self.endpoint.clone(),
+                endpoint_set_digest: self.endpoint_set_digest.clone(),
             },
             endpoint: self.endpoint.clone(),
             original_key: self.original_key.clone(),
@@ -747,6 +779,7 @@ impl GovernorStore for MemGovernorStore {
                         operation: req.attempt.operation.clone(),
                         outcome: None,
                         original_key: req.attempt.original_key.clone(),
+                        side_effect_class: req.attempt.side_effect_class,
                         endpoint: req.attempt.endpoint.clone(),
                         recorded_at_ms: req.now_ms,
                         dispatching: true,
@@ -798,6 +831,7 @@ impl GovernorStore for MemGovernorStore {
                             operation: req.attempt.operation.clone(),
                             outcome: Some(*outcome),
                             original_key: req.attempt.original_key.clone(),
+                            side_effect_class: req.attempt.side_effect_class,
                             endpoint: req.attempt.endpoint.clone(),
                             recorded_at_ms: req.now_ms,
                             dispatching: true,
@@ -1121,6 +1155,97 @@ mod tests {
             store.check_replay(retry, 2000).unwrap(),
             ReplayDecision::Refused { .. }
         ));
+    }
+    #[test]
+    fn executed_never_reconciles_even_with_original_key() {
+        let store = MemGovernorStore::new(policy());
+        let attempt = attempt(
+            "d1",
+            Principal::Bundle("b1".into()),
+            "h/a",
+            Some("k1"),
+            SideEffectClass::IdempotentWithKey,
+        );
+        store.record_outcome(attempt.clone(), RecordedOutcome::Executed, 1000);
+        assert!(matches!(
+            store.check_replay(attempt, 2000).unwrap(),
+            ReplayDecision::Refused { .. }
+        ));
+    }
+    #[test]
+    fn recorded_side_effectful_unknown_never_reconciles() {
+        // Recorded class (SideEffectful at dispatch) governs, even if the
+        // retry claims IdempotentWithKey.
+        let store = MemGovernorStore::new(policy());
+        let attempt = attempt(
+            "d1",
+            Principal::Bundle("b1".into()),
+            "h/a",
+            Some("k1"),
+            SideEffectClass::SideEffectful,
+        );
+        store.record_outcome(attempt, RecordedOutcome::UnknownAfterSend, 1000);
+        let retry = mk_attempt(
+            "d1",
+            Principal::Bundle("b1".into()),
+            "h/a",
+            Some("k1"),
+            SideEffectClass::IdempotentWithKey,
+        );
+        assert!(matches!(
+            store.check_replay(retry, 2000).unwrap(),
+            ReplayDecision::Refused { .. }
+        ));
+    }
+    #[test]
+    fn admission_attempt_uses_explicit_endpoint_set_not_endpoint() {
+        let mut r = req(Principal::Bundle("b1".into()), "proj", "h/a", 1);
+        r.operation_digest = Some("op".into());
+        r.endpoint_set_digest = "set-logical".into();
+        let a = r.replay_attempt().unwrap();
+        assert_eq!(a.operation.endpoint_set_digest, "set-logical");
+        assert_eq!(a.endpoint, "h/a");
+        // Same digest+set, switched concrete endpoint: lookup finds the
+        // record (shared set) and replay_decision refuses the switch.
+        let store = MemGovernorStore::new(policy());
+        store.record_outcome(a, RecordedOutcome::Executed, 1000);
+        let mut r2 = req(Principal::Bundle("b1".into()), "proj", "h/b", 1);
+        r2.operation_digest = Some("op".into());
+        r2.endpoint_set_digest = "set-logical".into();
+        assert!(matches!(
+            store
+                .check_replay(r2.replay_attempt().unwrap(), 2000)
+                .unwrap(),
+            ReplayDecision::Refused { .. }
+        ));
+    }
+    #[test]
+    fn alias_raw_match_requires_segment_boundary() {
+        let aliases = vec![EndpointAlias {
+            connector_id: "c1".into(),
+            tool: "t1".into(),
+            host: "api.example.com".into(),
+            path_prefix: "/v1/chat".into(),
+        }];
+        assert_eq!(
+            resolve_canonical_endpoint(&aliases, None, None, "api.example.com", "/v1/chat/more"),
+            "api.example.com/v1/chat"
+        );
+        assert_eq!(
+            resolve_canonical_endpoint(&aliases, None, None, "api.example.com", "/v1/chatty"),
+            "api.example.com/v1/chatty"
+        );
+        // Connector form ignores the per-call path and uses the prefix.
+        assert_eq!(
+            resolve_canonical_endpoint(
+                &aliases,
+                Some("c1"),
+                Some("t1"),
+                "other.example.com",
+                "/elsewhere"
+            ),
+            "api.example.com/v1/chat"
+        );
     }
     #[test]
     fn crash_before_outcome_write_is_uncertain() {

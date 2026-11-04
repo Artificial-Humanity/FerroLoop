@@ -38,7 +38,7 @@ pub use contract::{
 };
 pub use governor::{
     ADMISSION_UNAVAILABLE, DispatchResult, GateGovernor, GovernedOrGateError, GovernedOutcome,
-    admission_refusal_text,
+    admission_refusal_text, connector_endpoint_aliases, join_url_paths, url_path,
 };
 pub use mcp::{
     build_mcp_tools_list, handle_mcp_jsonrpc_request, handle_mcp_jsonrpc_request_with_governor,

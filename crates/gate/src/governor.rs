@@ -19,8 +19,7 @@ use std::sync::Arc;
 use fl_core::governor::{
     AdmissionOutcome, AdmissionRequest, EndpointAlias, GOVERNANCE_CALLS, GovernorPolicy,
     GovernorStore, Permit, Principal, RecordedOutcome, ReplayAttempt, ReplayDecision,
-    ReplayRecordAction, ReplayRequest, SettleRequest, SettledOutcome, SideEffectClass,
-    resolve_canonical_endpoint,
+    ReplayRecordAction, ReplayRequest, SettleRequest, SettledOutcome, resolve_canonical_endpoint,
 };
 use serde_json::Value;
 
@@ -28,7 +27,7 @@ use crate::GateError;
 use crate::adapter::SecretProviderAdapter;
 use crate::connector::{ConnectorManifest, ToolOutcome};
 use crate::proxy::DispatchPhaseError;
-use crate::proxy::{ProxyResponse, parse_url_scheme_host_port};
+use crate::proxy::{LEGACY_MAX_RESPONSE_BYTES, ProxyResponse, parse_url_scheme_host_port};
 use crate::vault::Vault;
 
 pub const ADMISSION_UNAVAILABLE: &str = "admission_unavailable";
@@ -51,6 +50,61 @@ pub enum DispatchResult<T> {
     RefusedBeforeDispatch(GateError),
     /// Failed after a send was attempted; outcome unknown.
     FailedAfterSend(GateError),
+}
+
+/// Path component of a URL (after the authority, before `?`/`#`); empty if none.
+pub fn url_path(url: &str) -> String {
+    let Some((_, after)) = url.split_once("://") else {
+        return String::new();
+    };
+    match after.find('/') {
+        Some(i) => after[i..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        None => String::new(),
+    }
+}
+
+/// Join a base-url path prefix and a tool path into one `/`-rooted path.
+pub fn join_url_paths(prefix: &str, path: &str) -> String {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        }
+    } else if path.is_empty() {
+        p.to_string()
+    } else if path.starts_with('/') {
+        format!("{p}{path}")
+    } else {
+        format!("{p}/{path}")
+    }
+}
+
+/// Discovered connector aliases: one per manifest tool, with
+/// `path_prefix` = manifest `base_url` path prefix joined with the tool
+/// path, so raw and connector calls canonicalise identically.
+pub fn connector_endpoint_aliases(manifests: &[ConnectorManifest]) -> Vec<EndpointAlias> {
+    let mut out = Vec::new();
+    for m in manifests {
+        let Ok((_, host, _)) = parse_url_scheme_host_port(&m.base_url) else {
+            continue;
+        };
+        let base_path = url_path(&m.base_url);
+        for t in &m.tools {
+            out.push(EndpointAlias {
+                connector_id: m.id.clone(),
+                tool: t.name.clone(),
+                host: host.clone(),
+                path_prefix: join_url_paths(&base_path, &t.path),
+            });
+        }
+    }
+    out
 }
 
 pub struct GateGovernor {
@@ -213,7 +267,8 @@ impl GateGovernor {
     }
 
     /// Governed connector invoke: admit (reserve worst-case units =
-    /// contract `max_response_bytes`, else 1), dispatch, settle.
+    /// contract `max_response_bytes` when contracted, else
+    /// `LEGACY_MAX_RESPONSE_BYTES`), dispatch, settle capped at the reserve.
     #[allow(clippy::too_many_arguments)]
     pub fn governed_invoke(
         &self,
@@ -301,9 +356,14 @@ impl GateGovernor {
             .response_contract
             .as_ref()
             .map(|c| c.max_response_bytes)
-            .unwrap_or(1);
+            .unwrap_or(LEGACY_MAX_RESPONSE_BYTES);
+        // Connector path includes any path prefix in `manifest.base_url`
+        // (e.g. `https://host/v1` + tool `/chat` => `/v1/chat`).
         let (host, path) = match parse_url_scheme_host_port(&manifest.base_url) {
-            Ok((_, h, _)) => (h, tool_def.path.clone()),
+            Ok((_, h, _)) => (
+                h,
+                join_url_paths(&url_path(&manifest.base_url), &tool_def.path),
+            ),
             Err(_) => (String::new(), tool_def.path.clone()),
         };
         let endpoint =
@@ -321,20 +381,26 @@ impl GateGovernor {
             .or_else(|| args.get("original_key"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        if req.original_key.is_some() {
-            req.side_effect_class = SideEffectClass::IdempotentWithKey;
-        }
+        // Caller JSON must not self-declare the side-effect class: carrying
+        // an idempotency key does not promote this call to
+        // `IdempotentWithKey`. `req.side_effect_class` stays the default
+        // `SideEffectful` unless trusted (non-args) code sets it.
         // Replay identity is explicit: only a caller-supplied operation id
         // identifies a logical operation. Identical tool arguments alone
         // are legitimate repeated calls (for example repeated bridge
-        // events), so no digest is derived from them.
+        // events), so no digest is derived from them. The concrete target
+        // endpoint is NOT hashed into the digest; the logical endpoint-set
+        // id below is what groups attempts, and an endpoint switch within
+        // the set is refused by the replay guard.
         if let Some(op) = args
             .get("operation_id")
             .or_else(|| args.get("operation_digest"))
             .and_then(Value::as_str)
         {
-            let digest_input = format!("{}|{}|{}|{}", manifest.id, tool, endpoint, op);
+            let digest_input = format!("{}|{}|{}", manifest.id, tool, op);
             req.operation_digest = Some(sha256_hex(digest_input.as_bytes()));
+            req.endpoint_set_digest =
+                sha256_hex(format!("endpoint-set|{}|{}", manifest.id, tool).as_bytes());
         }
         match self.governed_dispatch(&req, now_ms, |permit| {
             // No stale timeout from `now_ms`: the shared phased helper
@@ -486,6 +552,40 @@ mod tests {
     }
 
     #[test]
+    fn governed_dispatch_refuses_endpoint_switch_in_same_set() {
+        use fl_core::governor::SideEffectClass;
+        let store = Arc::new(MemGovernorStore::new(GovernorPolicy::default()));
+        let gov = GateGovernor {
+            store: Some(store),
+            policy: GovernorPolicy::default(),
+            aliases: vec![],
+        };
+        let mut r = req(5);
+        r.operation_digest = Some("op-1".into());
+        r.endpoint_set_digest = "logical-set".into();
+        r.original_key = Some("k1".into());
+        r.side_effect_class = SideEffectClass::IdempotentWithKey;
+        gov.governed_dispatch(&r, 1_000, |_| DispatchResult::Executed((), 1))
+            .unwrap();
+        // Same digest and logical set, different concrete endpoint: refused
+        // without dispatching, even with the original key.
+        let mut switched = r.clone();
+        switched.endpoint = "h/b".into();
+        let called = std::cell::Cell::new(false);
+        let out = gov.governed_dispatch(&switched, 2_000, |_| {
+            called.set(true);
+            DispatchResult::Executed((), 1)
+        });
+        assert!(!called.get());
+        assert!(matches!(
+            out,
+            Err(GovernedOrGateError::Refused(
+                AdmissionOutcome::Denied { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn broker_refusal_releases_budget_fully() {
         // Budget 10 on all scopes; reserve 10, broker-refuse, then 10 again must succeed.
         let policy = GovernorPolicy {
@@ -577,7 +677,7 @@ mod tests {
             bridges: vec![],
         };
         let policy = GovernorPolicy {
-            budget_units_per_scope: 1,
+            budget_units_per_scope: LEGACY_MAX_RESPONSE_BYTES,
             ..Default::default()
         };
         let store = Arc::new(MemGovernorStore::new(policy));
@@ -651,7 +751,7 @@ mod tests {
             bridges: vec![],
         };
         let policy = GovernorPolicy {
-            budget_units_per_scope: 1,
+            budget_units_per_scope: LEGACY_MAX_RESPONSE_BYTES,
             ..Default::default()
         };
         let store = Arc::new(MemGovernorStore::new(policy));
@@ -713,7 +813,7 @@ mod tests {
             bridges: vec![],
         };
         let policy = GovernorPolicy {
-            budget_units_per_scope: 1,
+            budget_units_per_scope: LEGACY_MAX_RESPONSE_BYTES,
             ..Default::default()
         };
         let store = Arc::new(MemGovernorStore::new(policy));
@@ -779,7 +879,7 @@ mod tests {
         // Deadline 1500 ms after admission at 1000; injected fresh now
         // (read only after prepare) is past it, simulating slow prepare.
         let policy = GovernorPolicy {
-            budget_units_per_scope: 1,
+            budget_units_per_scope: LEGACY_MAX_RESPONSE_BYTES,
             deadline_window_ms: 1_500,
             ..Default::default()
         };
@@ -814,6 +914,119 @@ mod tests {
             gov.admit(&req(1), 2_000),
             AdmissionOutcome::Admitted(_)
         ));
+    }
+
+    #[test]
+    fn uncontracted_invoke_reserves_legacy_worst_case() {
+        use crate::connector::ConnectorToolDef;
+        use std::collections::BTreeMap;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = crate::load_or_init_master_key(&tmp.path().join("k")).unwrap();
+        let vault = Vault::open(tmp.path().join("v.enc"), key).unwrap();
+        let manifest = ConnectorManifest {
+            id: "demo".into(),
+            title: "Demo".into(),
+            version: "0.1.0".into(),
+            description: String::new(),
+            base_url: "http://127.0.0.1:1/".into(),
+            allowed_hosts: vec![],
+            default_headers: BTreeMap::new(),
+            enabled: true,
+            tools: vec![ConnectorToolDef {
+                name: "get_thing".into(),
+                description: "Get".into(),
+                method: "GET".into(),
+                path: "/thing".into(),
+                path_params: vec![],
+                query_params: vec![],
+                body_params: vec![],
+                headers: BTreeMap::new(),
+                response_fields: vec![],
+                input_schema: serde_json::json!({"type":"object"}),
+                response_contract: None,
+            }],
+            bridges: vec![],
+        };
+        // One byte under the legacy worst case: an uncontracted invoke
+        // reserving only 1 (old behaviour) would be admitted and reach
+        // dispatch; reserving LEGACY_MAX_RESPONSE_BYTES is denied here.
+        let policy = GovernorPolicy {
+            budget_units_per_scope: LEGACY_MAX_RESPONSE_BYTES - 1,
+            ..Default::default()
+        };
+        let store = Arc::new(MemGovernorStore::new(policy));
+        let gov = GateGovernor {
+            store: Some(store),
+            policy: GovernorPolicy::default(),
+            aliases: vec![],
+        };
+        let out = gov
+            .governed_invoke(
+                &manifest,
+                &vault,
+                "get_thing",
+                &serde_json::json!({"idempotency_key": "k1", "operation_id": "op1"}),
+                None,
+                Principal::Owner,
+                "proj",
+                1_000,
+                Some(1_000),
+            )
+            .expect("budget denial is a refusal, not a dispatch error");
+        assert!(
+            matches!(
+                out,
+                GovernedOutcome::Refused(AdmissionOutcome::Denied { .. })
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn connector_aliases_include_base_url_path_prefix() {
+        use crate::connector::ConnectorToolDef;
+        use std::collections::BTreeMap;
+        let manifest = ConnectorManifest {
+            id: "demo".into(),
+            title: "Demo".into(),
+            version: "0.1.0".into(),
+            description: String::new(),
+            base_url: "https://api.example.com:443/v1/".into(),
+            allowed_hosts: vec![],
+            default_headers: BTreeMap::new(),
+            enabled: true,
+            tools: vec![ConnectorToolDef {
+                name: "chat".into(),
+                description: "Chat".into(),
+                method: "POST".into(),
+                path: "/chat".into(),
+                path_params: vec![],
+                query_params: vec![],
+                body_params: vec![],
+                headers: BTreeMap::new(),
+                response_fields: vec![],
+                input_schema: serde_json::json!({"type":"object"}),
+                response_contract: None,
+            }],
+            bridges: vec![],
+        };
+        let aliases = connector_endpoint_aliases(std::slice::from_ref(&manifest));
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].path_prefix, "/v1/chat");
+        assert_eq!(
+            resolve_canonical_endpoint(&aliases, Some("demo"), Some("chat"), "", ""),
+            "api.example.com/v1/chat"
+        );
+        assert_eq!(
+            resolve_canonical_endpoint(
+                &aliases,
+                None,
+                None,
+                "api.example.com:443",
+                "/v1/chat/extra"
+            ),
+            "api.example.com/v1/chat"
+        );
     }
 
     #[test]

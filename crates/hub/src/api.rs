@@ -7250,8 +7250,9 @@ fn handle_post_gate_call(
 
     // Raw proxy: no connector tool is named, so no response contract
     // applies — Uncontracted by definition (Record #96). It is still a
-    // governed dispatch: admit first with legacy-envelope reserved units
-    // (request body + URL bytes, at least 1), settle on execution.
+    // governed dispatch: admit first, reserving the worst-case
+    // `LEGACY_MAX_RESPONSE_BYTES` (settlement is capped at the reserve),
+    // settle on execution.
     // Project binding: `project` is not a ProxyRequest field, so the raw
     // surface binds the endpoint host as its project scope label.
     let governor = match hub_gate_governor(state) {
@@ -7279,9 +7280,17 @@ fn handle_post_gate_call(
         }
         Err(_) => (String::new(), proxy_req.url.clone()),
     };
-    let endpoint = fl_core::governor::canonical_endpoint(None, None, &host, &path);
-    let reserved =
-        (proxy_req.body.as_ref().map_or(0, |b| b.len()) + proxy_req.url.len()).max(1) as u64;
+    // Canonicalise against discovered connector aliases so a raw call to
+    // a connector endpoint shares that endpoint's budget scopes.
+    let connectors = discover_connectors(
+        Some(&state.config.repo_root),
+        state.config.home_override.as_deref(),
+    )
+    .unwrap_or_default();
+    let aliases = fl_gate::connector_endpoint_aliases(&connectors);
+    let endpoint =
+        fl_core::governor::resolve_canonical_endpoint(&aliases, None, None, &host, &path);
+    let reserved = fl_gate::LEGACY_MAX_RESPONSE_BYTES;
     let mut adm_req = fl_core::governor::AdmissionRequest::new(
         hub_principal(authority),
         &host,
