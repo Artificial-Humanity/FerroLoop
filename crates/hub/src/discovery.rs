@@ -2301,6 +2301,44 @@ fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
     Some(normalize_codex_plan(plan))
 }
 
+/// Session discovery searches `<home>/.codex/sessions`; a route does not carry a
+/// credential-home identity. Only a rollout inside that sessions tree binds a
+/// session to the corresponding auth file. Never use the hub's CODEX_HOME for it.
+fn codex_session_auth_plan(home: &Path, transcript: Option<&str>) -> Option<String> {
+    let transcript = Path::new(transcript?);
+    if !home.is_absolute() {
+        return None;
+    }
+    let home = fs::canonicalize(home).ok()?;
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions");
+    if fs::symlink_metadata(&codex).ok()?.file_type().is_symlink()
+        || fs::symlink_metadata(&sessions)
+            .ok()?
+            .file_type()
+            .is_symlink()
+    {
+        return None;
+    }
+    let session_root = fs::canonicalize(sessions).ok()?;
+    let path = fs::canonicalize(transcript).ok()?;
+    if !session_root.starts_with(&home) || !path.starts_with(&session_root) {
+        return None;
+    }
+    codex_auth_plan(Some(&home))
+}
+
+/// An account-level probe is not attached to a session and uses the configured
+/// account home. It must not be merged into a session whose home is unknown.
+pub(crate) fn codex_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
+    Some(SessionQuotaUsage {
+        tier: Some(codex_auth_plan(home_override)?),
+        primary_window: None,
+        secondary_window: None,
+        exhausted_reason: None,
+    })
+}
+
 fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
     let mut latest = None;
     for line in raw.lines() {
@@ -2945,7 +2983,10 @@ fn quota_for_resolved_route_locked(
             let mut quota = transcript_path
                 .and_then(|path| files.raw(path))
                 .and_then(codex_quota_from_rollout);
-            if let Some(plan) = codex_auth_plan(home_override) {
+            if let Some(plan) = home
+                .as_deref()
+                .and_then(|h| codex_session_auth_plan(h, transcript_path))
+            {
                 quota
                     .get_or_insert(SessionQuotaUsage {
                         tier: None,
@@ -8965,6 +9006,108 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn codex_session_and_matrix_account_use_their_own_homes() {
+        use base64::Engine as _;
+        const CHILD: &str = "FL_TEST_CODEX_HOME_BINDING_CHILD";
+        if let Ok(rollout) = std::env::var(CHILD) {
+            let session = DiscoveredSessionSummary {
+                id: "bound".into(),
+                source: "route".into(),
+                adapter: "codex".into(),
+                persona: None,
+                status: "active".into(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: Some(rollout),
+                quota_usage: None,
+                model: None,
+                thinking_level: None,
+                available_models: vec![],
+                context_usage: None,
+                execution_mode: None,
+            };
+            let source = crate::runtime_matrix::QuotaSource::HOST;
+            let quota = (source.session)(&session, None).unwrap();
+            assert_eq!(quota.tier.as_deref(), Some("plus"));
+            assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+            assert_eq!(
+                (source.account)("codex", None).unwrap().tier.as_deref(),
+                Some("enterprise")
+            );
+            return;
+        }
+        let account_a = TempDir::new().unwrap();
+        let account_b = TempDir::new().unwrap();
+        for (home, plan) in [(account_a.path(), "plus"), (account_b.path(), "enterprise")] {
+            fs::create_dir_all(home.join(".codex")).unwrap();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            fs::write(
+                home.join(".codex/auth.json"),
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+        }
+        let rollout = write_codex_rollout(account_a.path(), "bound", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"free","primary":{"used_percent":7.0}}}}).to_string());
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::tests::codex_session_and_matrix_account_use_their_own_homes",
+            ])
+            .env(CHILD, rollout)
+            .env("HOME", account_a.path())
+            .env("CODEX_HOME", account_b.path().join(".codex"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_session_never_uses_auth_from_an_unrelated_home() {
+        use base64::Engine as _;
+        let account_a = TempDir::new().unwrap();
+        let account_b = TempDir::new().unwrap();
+        for (home, plan) in [(account_a.path(), "plus"), (account_b.path(), "pro")] {
+            fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            fs::write(
+                home.join(".codex/auth.json"),
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+        }
+        let id = "foreign-session";
+        let rollout = account_b
+            .path()
+            .join(".codex/sessions/foreign-session.jsonl");
+        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"pro","primary":{"used_percent":7.0}}}}).to_string()).unwrap();
+        let quota = quota_for_resolved_route("codex", rollout.to_str(), Some(account_a.path()), id)
+            .unwrap();
+        assert_eq!(
+            quota.tier.as_deref(),
+            Some("pro"),
+            "unrelated A auth must not override B rollout"
+        );
+        assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+        assert!(
+            quota_for_resolved_route("codex", None, Some(account_a.path()), id).is_none(),
+            "an unbound route must not inherit a plan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn codex_auth_plan_overrides_stale_rollout_without_changing_windows() {
         use base64::Engine;
         let home = TempDir::new().unwrap();
@@ -8974,8 +9117,7 @@ mod tests {
             serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}});
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
         fs::write(codex.join("auth.json"), serde_json::json!({"tokens": {"id_token": format!("e30.{payload}.signature"), "access_token": "secret-token"}}).to_string()).unwrap();
-        let rollout = home.path().join("rollout.jsonl");
-        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()).unwrap();
+        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()));
         let quota =
             quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s").unwrap();
         assert_eq!(quota.tier.as_deref(), Some("pro"));
@@ -8995,8 +9137,7 @@ mod tests {
         let dir = home.path().join(".codex");
         fs::create_dir_all(&dir).unwrap();
         let auth = dir.join("auth.json");
-        let rollout = home.path().join("rollout.jsonl");
-        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus"}}}).to_string()).unwrap();
+        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus"}}}).to_string()));
         let tier = || {
             quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s")
                 .unwrap()
@@ -9046,7 +9187,7 @@ mod tests {
         let quota = read_session_quota_usage_with_home(id, Some(home.path())).unwrap();
         assert_eq!(quota.tier.as_deref(), Some("pro"));
         assert_eq!(quota.primary_window.unwrap().used_percent, 3.0);
-        let account = quota_for_resolved_route("codex", None, Some(home.path()), id).unwrap();
+        let account = codex_account_quota(Some(home.path())).unwrap();
         assert_eq!(account.tier.as_deref(), Some("pro"));
         assert!(account.primary_window.is_none());
     }

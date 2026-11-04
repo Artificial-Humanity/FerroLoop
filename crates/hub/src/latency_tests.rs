@@ -450,7 +450,7 @@ fn transcript_response_reference(
 
 #[cfg(unix)]
 #[test]
-fn transcript_quota_uses_known_codex_route_without_a_rollout() {
+fn transcript_quota_does_not_assign_unbound_codex_account_to_route() {
     use base64::Engine as _;
     use fl_core::At;
     use fl_wire::identity::{RouteTable, VendorRoute};
@@ -490,7 +490,7 @@ fn transcript_quota_uses_known_codex_route_without_a_rollout() {
         .0
         .json_value()
         .unwrap();
-    assert_eq!(codex["quota_usage"]["tier"], "pro");
+    assert!(codex["quota_usage"].is_null());
     let unknown = get(&state, "/api/v1/sessions/unknown/transcript")
         .0
         .json_value()

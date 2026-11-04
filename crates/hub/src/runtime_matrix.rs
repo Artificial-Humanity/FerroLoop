@@ -44,8 +44,9 @@ use crate::api::{HttpRequest, HttpResponse};
 use crate::auth::HubAuthority;
 use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
-    DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
-    quota_for_resolved_route, quota_for_resolved_route_at, snapshot_discovery_store,
+    DiscoveredSessionSummary, SessionQuotaUsage, codex_account_quota,
+    discover_route_sessions_without_model_info, quota_for_resolved_route,
+    quota_for_resolved_route_at, snapshot_discovery_store,
 };
 use crate::runtime_update::update_command;
 
@@ -380,7 +381,11 @@ fn host_session_quota(
 /// The account probe `GET /api/v1/watch/balance` uses: no session, so no route, model or
 /// conversation id.
 fn host_account_quota(adapter: &str, home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
-    quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+    if adapter == "codex" {
+        codex_account_quota(home_override)
+    } else {
+        quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+    }
 }
 
 /// Route sessions per adapter whose allowance is read from disk, newest first. Bounds the cost

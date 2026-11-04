@@ -77,7 +77,7 @@ use crate::cloud_adapters;
 use crate::discovery::{
     DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
     discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
-    list_git_worktrees, lookup_one_route_session, lookup_sessions, quota_for_resolved_route,
+    list_git_worktrees, lookup_one_route_session, lookup_sessions,
     read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
     scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
     transcript_observation_from_sessions,
@@ -4858,34 +4858,15 @@ fn handle_dynamic_api_routes(
                 let context_usage =
                     context_usage_from_sessions(&session_id, &sessions, home, &mut files);
                 let quota_usage =
-                    read_session_quota_usage_with_reads(&canonical_id, home, &mut files)
-                        .or_else(|| {
+                    read_session_quota_usage_with_reads(&canonical_id, home, &mut files).or_else(
+                        || {
                             if canonical_id == session_id {
                                 None
                             } else {
                                 read_session_quota_usage_with_reads(&session_id, home, &mut files)
                             }
-                        })
-                        .or_else(|| {
-                            // Only a discovered Codex route establishes vendor identity without a
-                            // transcript; an arbitrary unknown session must not inherit its tier.
-                            sessions
-                                .iter()
-                                .find(|s| {
-                                    s.id == canonical_id
-                                        && s.source == "route"
-                                        && s.adapter == "codex"
-                                        && s.transcript_path.is_none()
-                                })
-                                .and_then(|s| {
-                                    quota_for_resolved_route(
-                                        "codex",
-                                        s.transcript_path.as_deref(),
-                                        home,
-                                        &s.id,
-                                    )
-                                })
-                        });
+                        },
+                    );
                 return HttpResponse::json(
                     200,
                     json!({
