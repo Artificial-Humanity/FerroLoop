@@ -518,7 +518,17 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
     <div style={{ display: "flex", flexDirection: "column", gap: "8px", flex: 1 }}>
       <div
         data-testid="artifact-zoom-toolbar"
-        style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "4px",
+          flexWrap: "nowrap",
+          overflowX: "auto",
+          WebkitOverflowScrolling: "touch",
+          scrollbarWidth: "none",
+          maxWidth: "100%",
+          paddingBottom: "2px",
+        }}
       >
         <button
           type="button"
@@ -527,7 +537,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
           className="fd-btn"
           disabled={scale <= ZOOM_MIN}
           onClick={() => zoomTo(nextZoomStep(scale, -1))}
-          style={{ fontSize: "11px", padding: "3px 8px" }}
+          style={{ fontSize: "11px", padding: "3px 8px", flexShrink: 0, whiteSpace: "nowrap" }}
         >
           Zoom Out
         </button>
@@ -538,7 +548,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
           className="fd-btn"
           disabled={scale >= ZOOM_MAX}
           onClick={() => zoomTo(nextZoomStep(scale, 1))}
-          style={{ fontSize: "11px", padding: "3px 8px" }}
+          style={{ fontSize: "11px", padding: "3px 8px", flexShrink: 0, whiteSpace: "nowrap" }}
         >
           Zoom In
         </button>
@@ -549,7 +559,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
             data-testid={`artifact-zoom-${preset}`}
             className={`fd-btn${scale === preset ? " fd-btn-active" : ""}`}
             onClick={() => zoomTo(preset)}
-            style={{ fontSize: "11px", padding: "3px 8px" }}
+            style={{ fontSize: "11px", padding: "3px 8px", flexShrink: 0, whiteSpace: "nowrap" }}
           >
             {preset}%
           </button>
@@ -562,7 +572,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
             setScale(100);
             setOffset({ x: 0, y: 0 });
           }}
-          style={{ fontSize: "11px", padding: "3px 8px" }}
+          style={{ fontSize: "11px", padding: "3px 8px", flexShrink: 0, whiteSpace: "nowrap" }}
         >
           Fit
         </button>
@@ -571,6 +581,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
           className="fd-badge fd-mono"
           aria-live="polite"
           title="Zoom level"
+          style={{ flexShrink: 0, whiteSpace: "nowrap" }}
         >
           {scale}%
         </span>
@@ -599,6 +610,28 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
           dragRef.current = null;
           setDragging(false);
         }}
+        onTouchStart={(e) => {
+          if (scale <= 100) return;
+          const t = e.touches[0];
+          if (!t) return;
+          dragRef.current = { x: t.clientX, y: t.clientY, ox: offset.x, oy: offset.y };
+          setDragging(true);
+        }}
+        onTouchMove={(e) => {
+          if (scale <= 100) return;
+          const d = dragRef.current;
+          const t = e.touches[0];
+          if (!d || !t) return;
+          setOffset({ x: d.ox + (t.clientX - d.x), y: d.oy + (t.clientY - d.y) });
+        }}
+        onTouchEnd={() => {
+          dragRef.current = null;
+          setDragging(false);
+        }}
+        onTouchCancel={() => {
+          dragRef.current = null;
+          setDragging(false);
+        }}
         onWheel={(e) => {
           if (e.ctrlKey || e.metaKey) {
             if (e.deltaY === 0) return;
@@ -610,10 +643,12 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          overflow: "hidden",
-          padding: "16px",
+          overflow: scale > 100 ? "hidden" : "visible",
+          padding: "12px",
           backgroundColor: "var(--bg-input)",
-          minHeight: "280px",
+          minHeight: "65dvh",
+          maxHeight: "none",
+          touchAction: scale > 100 ? "none" : "pan-y pinch-zoom",
           cursor: dragging ? "grabbing" : "grab",
           userSelect: "none",
         }}
@@ -1500,31 +1535,40 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   };
 
   return (
-    <section className="fd-pane" data-testid="artifact-preview-pane">
+    <section
+      className="fd-pane"
+      data-testid="artifact-preview-pane"
+      style={{
+        overflowY: "auto",
+        overflowX: "hidden",
+        WebkitOverflowScrolling: "touch",
+      }}
+    >
       {/* Top Bar: Path Input, Quick Switcher, Metadata & Download */}
       <div
         style={{
           display: "flex",
           flexDirection: "column",
-          gap: "8px",
-          padding: "10px 16px",
+          gap: "6px",
+          padding: "8px 12px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
+          flexShrink: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px", flexWrap: "wrap" }}>
           <strong
             data-testid="artifact-pane-title"
-            style={{ fontSize: "14px", color: "var(--text-primary)" }}
+            style={{ fontSize: "13px", color: "var(--text-primary)" }}
           >
             Artifacts &amp; Documents
           </strong>
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap" }}>
             <span
               data-testid="artifact-hierarchy-path-badge"
               className="fd-badge fd-mono"
               title="Canonical artifact hierarchy: system root [home]/artifacts and project subdirectory [home]/artifacts/[project-name]/[session-id]/"
-              style={{ fontSize: "10.5px", color: "var(--text-muted)" }}
+              style={{ fontSize: "10px", color: "var(--text-muted)" }}
             >
               [home]/artifacts → [home]/artifacts/[project-name]
             </span>
@@ -1532,7 +1576,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
               <span
                 data-testid="artifact-pane-storage-badge"
                 className="fd-badge fd-mono"
-                style={{ fontSize: "10.5px", color: "var(--text-secondary)" }}
+                style={{ fontSize: "10px", color: "var(--text-secondary)" }}
               >
                 Managed: {storageStats.managed_files ?? 0} ({formatByteSize(storageStats.managed_bytes ?? 0)}) · Versions: {storageStats.version_files ?? 0}
               </span>
@@ -1545,11 +1589,11 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             display: artifact ? "flex" : "none",
             alignItems: "center",
             justifyContent: "space-between",
-            gap: "8px",
+            gap: "6px",
             flexWrap: "wrap",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", minWidth: 0, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, flexWrap: "wrap" }}>
             <span
               data-testid="artifact-filename"
               style={{ fontWeight: 700, fontSize: "13px", color: "var(--text-primary)" }}
@@ -1578,7 +1622,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   title={artifact.path}
                   style={{
                     color: "var(--text-muted)",
-                    maxWidth: "min(300px, 100%)",
+                    maxWidth: "min(280px, 100%)",
                     minWidth: 0,
                     overflow: "hidden",
                     textOverflow: "ellipsis",
@@ -1591,7 +1635,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             )}
           </div>
 
-          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "auto" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "4px", flexWrap: "wrap", marginLeft: "auto" }}>
             {artifact && (
               <>
                 {versions !== null && (
@@ -1602,6 +1646,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                     aria-expanded={historyOpen}
                     onClick={toggleHistory}
                     title="Show the recorded revisions of this artifact"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
                   >
                     History ({versions.length})
                   </button>
@@ -1614,6 +1659,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                         data-testid="artifact-view-rendered"
                         className={`fd-btn${viewMode === "rendered" ? " fd-btn-active" : ""}`}
                         onClick={() => setViewMode("rendered")}
+                        style={{ fontSize: "11px", padding: "3px 8px" }}
                       >
                         Rendered
                       </button>
@@ -1622,6 +1668,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                         data-testid="artifact-view-source"
                         className={`fd-btn${viewMode === "source" ? " fd-btn-active" : ""}`}
                         onClick={() => setViewMode("source")}
+                        style={{ fontSize: "11px", padding: "3px 8px" }}
                       >
                         Source
                       </button>
@@ -1635,7 +1682,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   rel="noopener noreferrer"
                   data-testid="artifact-open-raw-btn"
                   className="fd-btn"
-                  style={{ textDecoration: "none" }}
+                  style={{ textDecoration: "none", fontSize: "11px", padding: "3px 8px" }}
                 >
                   Open Raw
                 </a>
@@ -1646,7 +1693,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   download={artifact.kind === "mermaid" && downloadUrl.startsWith("data:image/svg") ? "diagram.svg" : artifact.name}
                   data-testid="artifact-download-btn"
                   className="fd-btn fd-btn-primary"
-                  style={{ textDecoration: "none" }}
+                  style={{ textDecoration: "none", fontSize: "11px", padding: "3px 8px" }}
                 >
                   ↓ Download
                 </a>
@@ -1660,7 +1707,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           style={{
             display: "flex",
             alignItems: "center",
-            gap: "6px",
+            gap: "4px",
             flexWrap: "wrap",
             minWidth: 0,
             maxWidth: "100%",
@@ -1675,12 +1722,12 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             value={pathInput}
             onChange={(e) => setPathInput(e.target.value)}
             style={{
-              flex: "1 1 140px",
+              flex: "1 1 120px",
               minWidth: 0,
               maxWidth: "100%",
               boxSizing: "border-box",
               fontSize: "12px",
-              padding: "5px 9px",
+              padding: "4px 8px",
             }}
           />
           <button
@@ -1688,6 +1735,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             data-testid="artifact-load-btn"
             className="fd-btn"
             disabled={!pathInput.trim() || loading}
+            style={{ fontSize: "11px", padding: "4px 8px" }}
           >
             {loading ? "Loading..." : "Load"}
           </button>
@@ -1698,7 +1746,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             className="fd-select fd-mono"
             value={artifactFilter}
             onChange={(e) => setArtifactFilter(e.target.value as ArtifactFilterMode)}
-            style={{ fontSize: "11px", padding: "5px 8px", minWidth: 0, maxWidth: "100%" }}
+            style={{ fontSize: "11px", padding: "4px 6px", minWidth: 0, maxWidth: "100%" }}
           >
             <option value="user-docs">User Documents &amp; Media</option>
             <option value="all">All Files</option>
@@ -1714,6 +1762,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
               setCleanupModalOpen(true);
             }}
             title="Open artifact cleanup options by status, retention age, file kind, and revision count"
+            style={{ fontSize: "11px", padding: "4px 8px" }}
           >
             Clean Up
           </button>
@@ -1725,6 +1774,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             disabled={pruning}
             onClick={() => void handlePruneDeadPaths()}
             title="Prune dead worktree artifact references and archive surviving copies"
+            style={{ fontSize: "11px", padding: "4px 8px" }}
           >
             {pruning ? "Pruning..." : "Prune Dead Paths"}
           </button>
@@ -1757,11 +1807,11 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                 }
               }}
               style={{
-                flex: "1 1 160px",
+                flex: "1 1 140px",
                 minWidth: 0,
                 maxWidth: "100%",
                 fontSize: "11px",
-                padding: "5px 8px",
+                padding: "4px 6px",
               }}
             >
               <option value="" disabled>
@@ -1786,7 +1836,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             style={{
               display: "flex",
               alignItems: "center",
-              gap: "6px",
+              gap: "4px",
               flexWrap: "wrap",
             }}
           >
@@ -1828,7 +1878,9 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           display: "flex",
           flexDirection: "column",
           gap: "12px",
-          flex: 1,
+          flex: "1 0 auto",
+          overflowY: "visible",
+          minHeight: "65dvh",
         }}
       >
         {error && (
@@ -2098,7 +2150,9 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                     style={{
                       display: "block",
                       maxWidth: "100%",
-                      maxHeight: "72vh",
+                      maxHeight: "none",
+                      width: "auto",
+                      height: "auto",
                       objectFit: "contain",
                     }}
                   />
