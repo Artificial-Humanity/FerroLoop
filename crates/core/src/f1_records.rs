@@ -9,6 +9,7 @@
 use crate::intent::{CommitteeIntent, DelegateIntent};
 use crate::routine::{RoutineSpec, RoutineState};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::io::{self, Write};
 
 /// Each stored row is bounded independently; no aggregate snapshot limit is imposed here.
 pub const MAX_RECORD_BYTES: usize = 64 * 1024;
@@ -104,17 +105,54 @@ impl ControlRecordKey {
 
 /// JSON is bounded both before parsing untrusted stored bytes and after encoding.
 pub fn encode_record<T: Serialize>(value: &T) -> Result<Vec<u8>, F1RecordError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| F1RecordError::Codec)?;
-    if bytes.len() > MAX_RECORD_BYTES {
-        return Err(F1RecordError::TooLarge);
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        exceeded: bool,
     }
-    Ok(bytes)
+    impl Write for BoundedWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if data.len() > MAX_RECORD_BYTES - self.bytes.len() {
+                self.exceeded = true;
+                return Err(io::Error::other("record size limit"));
+            }
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        exceeded: false,
+    };
+    if serde_json::to_writer(&mut writer, value).is_err() {
+        return Err(if writer.exceeded {
+            F1RecordError::TooLarge
+        } else {
+            F1RecordError::Codec
+        });
+    }
+    Ok(writer.bytes)
 }
 pub fn decode_record<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, F1RecordError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(F1RecordError::TooLarge);
     }
     serde_json::from_slice(bytes).map_err(|_| F1RecordError::Codec)
+}
+
+// A typed read must not silently discard unknown nested data on a later safety update.
+// Compare JSON values rather than raw bytes so object order and whitespace are immaterial.
+fn decode_lossless<T: DeserializeOwned + Serialize>(bytes: &[u8]) -> Result<T, F1RecordError> {
+    let original: serde_json::Value = decode_record(bytes)?;
+    let row: T = decode_record(bytes)?;
+    let encoded = encode_record(&row)?;
+    let roundtrip: serde_json::Value = decode_record(&encoded)?;
+    if original != roundtrip {
+        return Err(F1RecordError::Codec);
+    }
+    Ok(row)
 }
 
 /// Data-only proposal. A stored record alone never creates an approval.
@@ -141,6 +179,8 @@ impl RoutineProposalRecord {
             if self.version == u64::MAX || self.spec.revision == u64::MAX {
                 return Err(F1RecordError::InvalidRecord);
             }
+            // Bound the input before cloning it to calculate safety-transition headroom.
+            encode_record(self)?;
             // A pause may need a full-length reason and increment both revision counters.
             // Quotes and backslashes have the largest JSON expansion of permitted reason
             // characters (control characters are refused by SafetyBatch).
@@ -204,6 +244,7 @@ impl IntentEvidenceRecord {
             return Err(F1RecordError::InvalidRecord);
         }
         if self.safety == SafetyState::Inert {
+            encode_record(self)?;
             let mut quarantined = self.clone();
             quarantined.version = u64::MAX;
             quarantined.safety = SafetyState::Quarantined;
@@ -258,6 +299,7 @@ impl AllocationEvidenceRecord {
             return Err(F1RecordError::InvalidRecord);
         }
         if self.safety != SafetyState::StopRequested {
+            encode_record(self)?;
             let mut stopped = self.clone();
             stopped.version = u64::MAX;
             stopped.safety = SafetyState::StopRequested;
@@ -275,7 +317,7 @@ pub fn decode_routine_record(
     expected_id: &str,
 ) -> Result<RoutineProposalRecord, F1RecordError> {
     ControlRecordKey::routine(expected_id)?;
-    let row: RoutineProposalRecord = decode_record(bytes)?;
+    let row: RoutineProposalRecord = decode_lossless(bytes)?;
     row.validate()?;
     if row.spec.routine_id != expected_id {
         return Err(F1RecordError::Conflict);
@@ -287,7 +329,7 @@ pub fn decode_intent_record(
     expected_id: &str,
 ) -> Result<IntentEvidenceRecord, F1RecordError> {
     ControlRecordKey::intent(expected_id)?;
-    let row: IntentEvidenceRecord = decode_record(bytes)?;
+    let row: IntentEvidenceRecord = decode_lossless(bytes)?;
     row.validate()?;
     if row.definition.id() != expected_id {
         return Err(F1RecordError::Conflict);
@@ -299,7 +341,7 @@ pub fn decode_allocation_record(
     expected_id: &str,
 ) -> Result<AllocationEvidenceRecord, F1RecordError> {
     ControlRecordKey::allocation(expected_id)?;
-    let row: AllocationEvidenceRecord = decode_record(bytes)?;
+    let row: AllocationEvidenceRecord = decode_lossless(bytes)?;
     row.validate()?;
     if row.allocation_id != expected_id {
         return Err(F1RecordError::Conflict);
@@ -585,6 +627,53 @@ mod tests {
             Err(F1RecordError::TooLarge)
         );
     }
+
+    #[test]
+    fn oversized_serialization_stops_before_processing_the_whole_value() {
+        use serde::ser::SerializeSeq;
+        use std::cell::Cell;
+        struct Many<'a>(&'a Cell<usize>);
+        impl Serialize for Many<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut seq = serializer.serialize_seq(None)?;
+                for _ in 0..1_000_000 {
+                    self.0.set(self.0.get() + 1);
+                    seq.serialize_element("0123456789")?;
+                }
+                seq.end()
+            }
+        }
+        let visited = Cell::new(0);
+        assert_eq!(encode_record(&Many(&visited)), Err(F1RecordError::TooLarge));
+        assert!(
+            visited.get() < 10_000,
+            "serialized {} elements",
+            visited.get()
+        );
+    }
+
+    #[test]
+    fn nested_unknown_fields_are_rejected_but_reordered_json_is_accepted() {
+        let intent = evidence("intent:strict");
+        let mut value = serde_json::to_value(&intent).unwrap();
+        value["definition"]["intent"]["delegator"]["future_field"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        assert_eq!(
+            decode_intent_record(&bytes, "intent:strict"),
+            Err(F1RecordError::Codec)
+        );
+
+        let reordered = format!(
+            "{{\n \"safety\": {}, \"definition\": {}, \"version\": {}\n}}",
+            serde_json::to_string(&intent.safety).unwrap(),
+            serde_json::to_string(&intent.definition).unwrap(),
+            intent.version,
+        );
+        assert_eq!(
+            decode_intent_record(reordered.as_bytes(), "intent:strict"),
+            Ok(intent)
+        );
+    }
     fn evidence(id: &str) -> IntentEvidenceRecord {
         IntentEvidenceRecord {
             version: 1,
@@ -818,6 +907,9 @@ mod tests {
                 approval: None,
             },
         };
+        let mut huge = row.clone();
+        huge.spec.project = "x".repeat(4 * 1024 * 1024);
+        assert_eq!(huge.validate(), Err(F1RecordError::TooLarge));
         let base = serde_json::to_vec(&row).unwrap().len();
         row.spec
             .project

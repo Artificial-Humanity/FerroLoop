@@ -715,6 +715,44 @@ mod tests {
     }
 
     #[test]
+    fn unknown_nested_row_refuses_redb_read_and_rolls_back_batch() {
+        use fl_core::f1_records::{ControlRecordKey, SafetyChange};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&tmp.path().join("unknown.redb")).unwrap();
+        store.insert_proposal(routine()).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        let mut json = serde_json::to_value(routine()).unwrap();
+        json["spec"]["future_field"] = serde_json::json!({"new": true});
+        let text = serde_json::to_string_pretty(&json).unwrap();
+        let key = ControlRecordKey::routine("routine").unwrap();
+        let tx = store.db.begin_write().unwrap();
+        {
+            let mut rows = tx.open_table(super::TABLE).unwrap();
+            rows.insert(key.native_key(), text.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(store.routine("routine"), Err(F1RecordError::Codec));
+        let batch = SafetyBatch {
+            changes: vec![
+                SafetyChange::RequestAllocationStop {
+                    id: "allocation".into(),
+                    expected_version: 1,
+                },
+                SafetyChange::PauseRoutine {
+                    id: "routine".into(),
+                    expected_version: 1,
+                    reason: "pause".into(),
+                },
+            ],
+        };
+        assert_eq!(store.apply_safety_batch(&batch), Err(F1RecordError::Codec));
+        assert_eq!(store.allocation("allocation"), Ok(Some(allocation())));
+        let read = store.db.begin_read().unwrap();
+        let rows = read.open_table(super::TABLE).unwrap();
+        assert_eq!(rows.get(key.native_key()).unwrap().unwrap().value(), text);
+    }
+
+    #[test]
     fn oversized_redb_and_ferro_rows_are_bounded_and_redb_batch_rolls_back() {
         use fl_core::f1_records::{ControlRecordKey, MAX_RECORD_BYTES, SafetyChange};
         let tmp = tempfile::tempdir().unwrap();

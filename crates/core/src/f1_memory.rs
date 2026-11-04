@@ -431,4 +431,70 @@ mod tests {
             Err(F1RecordError::Conflict)
         );
     }
+
+    #[test]
+    fn unknown_nested_intent_rolls_back_the_entire_memory_batch() {
+        use crate::f1_records::{IntentDefinition, IntentEvidenceRecord};
+        use crate::intent::{
+            AllocationAmount, Binding, CommitteeIntent, DelegateTarget, QuorumRule, ResultSchema,
+        };
+        let store = MemoryF1PreparationStore::default();
+        store.insert_allocation(allocation("root")).unwrap();
+        let intent = IntentEvidenceRecord {
+            version: 1,
+            safety: SafetyState::Inert,
+            definition: IntentDefinition::Committee(CommitteeIntent {
+                intent_id: "intent".into(),
+                delegator: Binding {
+                    incarnation_id: "inc".into(),
+                    thread_epoch: 1,
+                    controller_lease_id: "lease".into(),
+                },
+                members: vec![
+                    DelegateTarget::BoundIncarnation {
+                        incarnation_id: "a".into(),
+                    },
+                    DelegateTarget::BoundIncarnation {
+                        incarnation_id: "b".into(),
+                    },
+                ],
+                per_member: AllocationAmount {
+                    tokens: 1,
+                    cost_micros: 1,
+                },
+                quorum: QuorumRule::All,
+                deadline_utc: "2030-01-01T00:00:00Z".into(),
+                result_schema: ResultSchema::Verdict,
+            }),
+        };
+        store.insert_intent(intent.clone()).unwrap();
+        let mut value = serde_json::to_value(&intent).unwrap();
+        value["definition"]["intent"]["delegator"]["future"] = serde_json::json!(true);
+        let key = ControlRecordKey::intent("intent").unwrap();
+        let corrupt = serde_json::to_vec(&value).unwrap();
+        store
+            .rows
+            .lock()
+            .unwrap()
+            .insert(key.native_key().into(), corrupt.clone());
+        assert_eq!(store.intent("intent"), Err(F1RecordError::Codec));
+        let batch = SafetyBatch {
+            changes: vec![
+                SafetyChange::RequestAllocationStop {
+                    id: "root".into(),
+                    expected_version: 1,
+                },
+                SafetyChange::QuarantineIntent {
+                    id: "intent".into(),
+                    expected_version: 1,
+                },
+            ],
+        };
+        assert_eq!(store.apply_safety_batch(&batch), Err(F1RecordError::Codec));
+        assert_eq!(store.allocation("root"), Ok(Some(allocation("root"))));
+        assert_eq!(
+            store.rows.lock().unwrap().get(key.native_key()),
+            Some(&corrupt)
+        );
+    }
 }
