@@ -84,6 +84,12 @@ pub struct RouteEntry {
     pub persona: String,
     pub route: VendorRoute,
     pub updated_at: At,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explicit: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[cfg(test)]
@@ -311,6 +317,26 @@ impl RouteTable {
 
     pub fn merge_newer(&mut self, other: Self) {
         for (k, mut v) in other.entries {
+            if !v.explicit
+                && v.route.session_identity().is_some_and(|identity| {
+                    self.entries.iter().any(|(name, entry)| {
+                        name != &k
+                            && entry.explicit
+                            && entry.route.session_identity() == Some(identity)
+                    })
+                })
+            {
+                continue;
+            }
+            if let Some(existing) = self.entries.get(&k)
+                && existing.explicit
+                && !v.explicit
+            {
+                if std::mem::discriminant(&existing.route) != std::mem::discriminant(&v.route) {
+                    continue;
+                }
+                v.explicit = true;
+            }
             if let Some((target_kind, target_id)) = v
                 .route
                 .session_identity()
@@ -367,13 +393,46 @@ impl RouteTable {
     /// changed it meanwhile (a concurrent `RegisterRoute`), in which case the live entry wins.
     /// Everything else merges as in [`RouteTable::merge_newer`].
     pub fn merge_dispatch_result(&mut self, base: &Self, working: Self) {
-        // A scan made on the working copy counts for the live table too.
         self.last_discovery = self.last_discovery.max(working.last_discovery);
         for (key, base_entry) in &base.entries {
             if !working.entries.contains_key(key) && self.entries.get(key) == Some(base_entry) {
                 self.entries.remove(key);
             }
         }
+        self.merge_newer(working);
+    }
+
+    /// Merge a daemon dispatch snapshot without restoring a route concurrently unregistered
+    /// from the daemon. Hub scan reconciliation retains its existing merge semantics above.
+    pub fn merge_daemon_dispatch_result(&mut self, base: &Self, mut working: Self) {
+        // A scan made on the working copy counts for the live table too.
+        self.last_discovery = self.last_discovery.max(working.last_discovery);
+        // A concurrently changed persona can own either its old or new session. Protect both
+        // identities against stale aliases as well as the changed persona key itself.
+        let changed_sessions: BTreeSet<(&str, String)> = base
+            .entries
+            .iter()
+            .chain(self.entries.iter())
+            .filter(|(key, _)| base.entries.get(*key) != self.entries.get(*key))
+            .filter_map(|(_, entry)| {
+                entry
+                    .route
+                    .session_identity()
+                    .map(|(kind, id)| (kind, id.to_owned()))
+            })
+            .collect();
+        for (key, base_entry) in &base.entries {
+            if !working.entries.contains_key(key) && self.entries.get(key) == Some(base_entry) {
+                self.entries.remove(key);
+            }
+        }
+        working.entries.retain(|key, entry| {
+            self.entries.get(key) == base.entries.get(key)
+                && !entry
+                    .route
+                    .session_identity()
+                    .is_some_and(|(kind, id)| changed_sessions.contains(&(kind, id.to_owned())))
+        });
         self.merge_newer(working);
     }
 
@@ -409,6 +468,7 @@ impl RouteTable {
                             persona: norm,
                             route,
                             updated_at,
+                            explicit: false,
                         },
                     );
                 }
@@ -462,8 +522,49 @@ impl RouteTable {
         Ok(())
     }
 
-    pub fn upsert(&mut self, persona: &str, mut route: VendorRoute, at: At) {
+    pub fn upsert(&mut self, persona: &str, route: VendorRoute, at: At) {
+        self.upsert_inner(persona, route, at, false);
+    }
+
+    /// Register a route selected by the caller rather than discovered by a passive scan.
+    pub fn upsert_explicit(&mut self, persona: &str, route: VendorRoute, at: At) {
+        self.upsert_inner(persona, route, at, true);
+    }
+
+    fn upsert_passive(&mut self, persona: &str, route: VendorRoute, at: At) {
+        self.upsert_inner(persona, route, at, false);
+    }
+
+    fn upsert_inner(
+        &mut self,
+        persona: &str,
+        mut route: VendorRoute,
+        at: At,
+        requested_explicit: bool,
+    ) {
         if let Some(norm) = normalize_persona(persona) {
+            if !requested_explicit
+                && route.session_identity().is_some_and(|identity| {
+                    self.entries.iter().any(|(name, entry)| {
+                        name != &norm
+                            && entry.explicit
+                            && entry.route.session_identity() == Some(identity)
+                    })
+                })
+            {
+                return;
+            }
+            let explicit = if let Some(existing) = self.entries.get(&norm) {
+                if !requested_explicit
+                    && existing.explicit
+                    && std::mem::discriminant(&existing.route) != std::mem::discriminant(&route)
+                {
+                    return;
+                }
+                requested_explicit || existing.explicit
+            } else {
+                requested_explicit
+            };
             if let Some(existing) = self.entries.get(&norm) {
                 preserve_muse_tmux_fields(&mut route, &existing.route);
             }
@@ -487,6 +588,7 @@ impl RouteTable {
                     persona: norm,
                     route,
                     updated_at: at,
+                    explicit,
                 },
             );
         }
@@ -520,7 +622,7 @@ impl RouteTable {
         {
             return;
         }
-        self.upsert(&norm, route, file_at);
+        self.upsert_passive(&norm, route, file_at);
     }
 
     pub fn get(&self, persona: &str) -> Option<&RouteEntry> {
@@ -638,11 +740,14 @@ impl RouteTable {
 
     fn discover_claude_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
         if check_proc {
-            self.entries.retain(|_, entry| match &entry.route {
-                VendorRoute::Claude { pid, .. } if *pid > 0 => {
-                    Path::new(&format!("/proc/{pid}")).exists()
-                }
-                _ => true,
+            self.entries.retain(|_, entry| {
+                entry.explicit
+                    || match &entry.route {
+                        VendorRoute::Claude { pid, .. } if *pid > 0 => {
+                            Path::new(&format!("/proc/{pid}")).exists()
+                        }
+                        _ => true,
+                    }
             });
         }
         let sessions_dir = home.join(".claude").join("sessions");
@@ -674,10 +779,9 @@ impl RouteTable {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .and_then(normalize_persona)
-                && matches!(
-                    self.entries.get(&derived_key).map(|e| &e.route),
-                    Some(VendorRoute::Claude { .. })
-                )
+                && self.entries.get(&derived_key).is_some_and(|entry| {
+                    !entry.explicit && matches!(entry.route, VendorRoute::Claude { .. })
+                })
             {
                 self.entries.remove(&derived_key);
             }
@@ -695,7 +799,7 @@ impl RouteTable {
                 .unwrap_or("")
                 .to_string();
             let key_path = resolve_claude_key_path(&sessions_dir, pid, &socket_path);
-            self.upsert(
+            self.upsert_passive(
                 &persona,
                 VendorRoute::Claude {
                     pid,
@@ -881,7 +985,7 @@ impl RouteTable {
                     )
                 })
             {
-                self.upsert(
+                self.upsert_passive(
                     &persona,
                     VendorRoute::Agy {
                         conversation_id: conv_id.to_string(),
@@ -1071,26 +1175,37 @@ impl RouteTable {
                 };
                 // A transcript replaces the placeholder route a live tmux window made before
                 // the session had one, whatever the two timestamps say.
-                if matches!(
-                    self.entries.get(&persona),
-                    Some(RouteEntry {
-                        route: VendorRoute::Muse { session_id, .. },
-                        ..
-                    }) if session_id.is_empty()
-                ) {
+                let explicit_placeholder = self.entries.get(&persona).is_some_and(|entry| {
+                    entry.explicit && matches!(&entry.route, VendorRoute::Muse { session_id, .. } if session_id.is_empty())
+                });
+                if !explicit_placeholder
+                    && matches!(
+                        self.entries.get(&persona),
+                        Some(RouteEntry {
+                            route: VendorRoute::Muse { session_id, .. },
+                            ..
+                        }) if session_id.is_empty()
+                    )
+                {
                     self.entries.remove(&persona);
                 }
-                self.upsert_discovered(
-                    &persona,
-                    VendorRoute::Muse {
-                        session_id,
-                        cwd,
-                        tmux_target: existing_target,
-                        tmux_pane: existing_pane,
-                    },
-                    mtime_ms(path),
-                    at,
-                );
+                let route = VendorRoute::Muse {
+                    session_id,
+                    cwd,
+                    tmux_target: existing_target,
+                    tmux_pane: existing_pane,
+                };
+                if explicit_placeholder {
+                    let updated = mtime_ms(path);
+                    let file_at = if updated > 0 {
+                        At::from_unix_millis(updated)
+                    } else {
+                        at.clone()
+                    };
+                    self.upsert_passive(&persona, route, file_at);
+                } else {
+                    self.upsert_discovered(&persona, route, mtime_ms(path), at);
+                }
             }
         }
         if let Some(windows) = windows {
@@ -1157,7 +1272,7 @@ impl RouteTable {
             }
             match live.get(persona) {
                 Some(target) => *tmux_target = Some(target.clone()),
-                None if session_id.is_empty() => gone.push(persona.clone()),
+                None if session_id.is_empty() && !entry.explicit => gone.push(persona.clone()),
                 None => *tmux_target = None,
             }
         }
@@ -1166,7 +1281,7 @@ impl RouteTable {
         }
         for (persona, target) in live {
             if !self.entries.contains_key(&persona) {
-                self.upsert(
+                self.upsert_passive(
                     &persona,
                     VendorRoute::Muse {
                         session_id: String::new(),
@@ -1379,7 +1494,7 @@ impl RouteTable {
                 tmux_pane: cand.tmux_pane.or(existing_pane),
             };
             if cand.is_active {
-                self.upsert(&cand.persona, route, at.clone());
+                self.upsert_passive(&cand.persona, route, at.clone());
             } else {
                 self.upsert_discovered(&cand.persona, route, cand.updated_ms, at);
             }
@@ -3325,6 +3440,59 @@ mod tests {
     }
 
     #[test]
+    fn a_passive_claude_scan_does_not_replace_an_explicit_codex_binding() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("4242.json"), serde_json::json!({
+            "name":"ada", "sessionId":"old-claude", "messagingSocketPath":home.path().join("old.sock")
+        }).to_string()).unwrap();
+        let route = VendorRoute::Codex {
+            thread_id: "new-codex".into(),
+            cwd: None,
+        };
+        let mut table = RouteTable::default();
+        table.upsert_explicit("ada", route.clone(), At::from_unix_millis(1));
+        table.discover_routes(Some(home.path()), At::from_unix_millis(2));
+        assert_eq!(table.get("ada").map(|entry| &entry.route), Some(&route));
+    }
+
+    #[test]
+    fn same_vendor_discovery_refreshes_and_preserves_explicit_binding() {
+        let mut table = RouteTable::default();
+        table.upsert_explicit(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        table.upsert_discovered(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            2,
+            &At::from_unix_millis(2),
+        );
+        let entry = table.get("ada").unwrap();
+        assert!(entry.explicit);
+        assert!(matches!(&entry.route, VendorRoute::Codex { thread_id, .. } if thread_id == "new"));
+        let encoded = serde_json::to_string(&table).unwrap();
+        let restored: RouteTable = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.get("ada").unwrap().explicit);
+    }
+
+    #[test]
+    fn legacy_route_without_explicit_marker_still_loads() {
+        let raw = serde_json::json!({"entries":{"ada":{"persona":"ada","route":{"kind":"codex","thread_id":"old"},"updated_at":At::from_unix_millis(1)}}});
+        let table: RouteTable = serde_json::from_value(raw).unwrap();
+        assert!(!table.get("ada").unwrap().explicit);
+    }
+
+    #[test]
     fn discover_claude_routes_ignores_derived_name_and_resolves_from_project_transcript() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -4826,6 +4994,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatch_scan_does_not_restore_concurrently_unregistered_route() {
+        let mut base = RouteTable::default();
+        base.upsert_explicit(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let mut scanned = base.clone();
+        scanned.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(3),
+        );
+        let mut live = base.clone();
+        live.entries.remove("ada");
+        live.merge_daemon_dispatch_result(&base, scanned);
+        assert!(live.get("ada").is_none());
+    }
+
+    #[test]
+    fn hub_scan_can_merge_a_changed_route_after_its_prior_entry_was_removed() {
+        let mut base = RouteTable::default();
+        base.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let mut scanned = base.clone();
+        scanned.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(3),
+        );
+        let mut live = base.clone();
+        live.entries.remove("ada");
+        live.merge_dispatch_result(&base, scanned);
+        assert!(
+            matches!(&live.get("ada").unwrap().route, VendorRoute::Codex { thread_id, .. } if thread_id == "new")
+        );
+    }
+
+    #[test]
+    fn dispatch_scan_does_not_replace_concurrent_explicit_registration() {
+        let mut base = RouteTable::default();
+        base.upsert_explicit(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let mut scanned = base.clone();
+        scanned.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(3),
+        );
+        let mut live = base.clone();
+        live.upsert_explicit(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(2),
+        );
+        live.merge_daemon_dispatch_result(&base, scanned);
+        assert!(
+            matches!(&live.get("ada").unwrap().route, VendorRoute::Codex { thread_id, .. } if thread_id == "new")
+        );
+    }
+
+    #[test]
+    fn dispatch_scan_alias_cannot_evict_concurrent_registered_session() {
+        let base = RouteTable::default();
+        let mut scanned = base.clone();
+        scanned.upsert(
+            "old-alias",
+            VendorRoute::Codex {
+                thread_id: "same".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(3),
+        );
+        let mut live = base.clone();
+        live.upsert_explicit(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "same".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(2),
+        );
+        live.merge_daemon_dispatch_result(&base, scanned);
+        assert!(live.get("ada").is_some());
+        assert!(live.get("old-alias").is_none());
+    }
+
+    #[test]
+    fn dispatch_scan_alias_does_not_restore_a_concurrently_removed_session() {
+        let mut base = RouteTable::default();
+        base.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let mut scanned = base.clone();
+        scanned.upsert(
+            "old-alias",
+            VendorRoute::Codex {
+                thread_id: "old".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(3),
+        );
+        let mut live = base.clone();
+        live.entries.remove("ada");
+        live.merge_daemon_dispatch_result(&base, scanned);
+        assert!(live.get("ada").is_none());
+        assert!(live.get("old-alias").is_none());
+    }
+
     /// The daemon dispatches on a copy of its table: a scan made on that copy must reach the live
     /// table, or every dispatch would find the live table due and rescan.
     #[test]
@@ -5485,6 +5795,54 @@ mod tests {
         assert!(table.get("kacey").is_some());
     }
 
+    #[test]
+    fn explicit_muse_placeholder_remains_explicit_when_transcript_appears() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = vec![muse_sessions_dir(tmp.path())];
+        let at = At::from_unix_millis(5);
+        let mut table = RouteTable::default();
+        table.upsert_explicit(
+            "kacey",
+            VendorRoute::Muse {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Kacey:muse".into()),
+                tmux_pane: None,
+            },
+            at.clone(),
+        );
+        let transcript = write_muse_transcript(
+            &sessions[0].join("2026/10/27").join(MUSE_SESSION_A),
+            &muse_transcript_rows(&muse_hydration_prompt("Kacey")),
+        );
+        set_mtime(&transcript, 1);
+        table.discover_muse_routes_in(&sessions, Some(&windows(&[("Kacey", "muse")])), &at);
+        let entry = table.get("kacey").unwrap();
+        assert!(entry.explicit);
+        assert!(
+            matches!(&entry.route, VendorRoute::Muse { session_id, .. } if session_id == MUSE_SESSION_A)
+        );
+    }
+
+    #[test]
+    fn passive_alias_cannot_evict_an_explicit_session() {
+        let route = VendorRoute::Codex {
+            thread_id: "same".into(),
+            cwd: None,
+        };
+        let mut table = RouteTable::default();
+        table.upsert_explicit("ada", route.clone(), At::from_unix_millis(1));
+        table.upsert_discovered("old-alias", route.clone(), 2, &At::from_unix_millis(2));
+        assert_eq!(table.get("ada").map(|entry| &entry.route), Some(&route));
+        assert!(table.get("old-alias").is_none());
+
+        let mut observed = RouteTable::default();
+        observed.upsert("old-alias", route.clone(), At::from_unix_millis(3));
+        table.merge_newer(observed);
+        assert_eq!(table.get("ada").map(|entry| &entry.route), Some(&route));
+        assert!(table.get("old-alias").is_none());
+    }
+
     fn muse_route_with(session_id: &str, target: Option<&str>) -> VendorRoute {
         VendorRoute::Muse {
             session_id: session_id.into(),
@@ -5884,6 +6242,7 @@ mod tests {
                 persona: "highly".into(),
                 route: agy("conv-shared"),
                 updated_at: At::from_unix_millis(500),
+                explicit: false,
             },
         );
         raw_routes.entries.insert(
@@ -5892,6 +6251,7 @@ mod tests {
                 persona: "kayla".into(),
                 route: agy("conv-shared"),
                 updated_at: At::from_unix_millis(200),
+                explicit: false,
             },
         );
         let store = MemStore::default();
