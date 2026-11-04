@@ -911,4 +911,172 @@ mod tests {
             assert_eq!(store.settle(), Err(F1RecordError::UnverifiedAuthority));
         }
     }
+    #[test]
+    fn sqlite_preparation_rows_survive_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        assert_eq!(
+            store.insert_allocation(allocation()),
+            Err(F1RecordError::Conflict)
+        );
+        store.request_allocation_stop("allocation", 1).unwrap();
+        drop(store);
+        let reopened = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.allocation("allocation").unwrap().unwrap().safety,
+            SafetyState::StopRequested
+        );
+    }
+    #[test]
+    fn sqlite_independent_connections_allow_one_cas_winner() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let first = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        first.insert_allocation(allocation()).unwrap();
+        let other = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [first, other]
+            .into_iter()
+            .map(|s| {
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    s.request_allocation_stop("allocation", 1)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| **r == Err(F1RecordError::Conflict))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_batch_conflict_and_corrupt_row_roll_back() {
+        use fl_core::f1_records::{ControlRecordKey, SafetyBatch, SafetyChange};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        store.insert_intent(intent()).unwrap();
+        let batch = SafetyBatch {
+            changes: vec![
+                SafetyChange::request_allocation_stop("allocation", 1).unwrap(),
+                SafetyChange::quarantine_intent("intent", 2).unwrap(),
+            ],
+        };
+        assert_eq!(
+            store.apply_safety_batch(&batch),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(
+            store.allocation("allocation").unwrap().unwrap().safety,
+            SafetyState::Inert
+        );
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let key = ControlRecordKey::intent("intent").unwrap();
+        raw.execute(
+            "UPDATE f1_records SET value=?1 WHERE record_key=?2",
+            rusqlite::params![vec![b'x'; 65537], key.native_key()],
+        )
+        .unwrap();
+        let batch = SafetyBatch {
+            changes: vec![
+                SafetyChange::request_allocation_stop("allocation", 1).unwrap(),
+                SafetyChange::quarantine_intent("intent", 1).unwrap(),
+            ],
+        };
+        assert_eq!(
+            store.apply_safety_batch(&batch),
+            Err(F1RecordError::TooLarge)
+        );
+        assert_eq!(
+            store.allocation("allocation").unwrap().unwrap().safety,
+            SafetyState::Inert
+        );
+    }
+
+    #[test]
+    fn sqlite_refuses_lossy_nested_data_and_foreign_schema() {
+        use fl_core::f1_records::ControlRecordKey;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        store.insert_proposal(routine()).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let key = ControlRecordKey::routine("routine").unwrap();
+        let mut row = serde_json::to_value(routine()).unwrap();
+        row["spec"]["unknown_future_field"] = serde_json::json!(true);
+        raw.execute(
+            "UPDATE f1_records SET value=?1 WHERE record_key=?2",
+            rusqlite::params![serde_json::to_vec(&row).unwrap(), key.native_key()],
+        )
+        .unwrap();
+        assert_eq!(
+            store.pause_routine("routine", 1, "pause"),
+            Err(F1RecordError::Codec)
+        );
+        let foreign = tmp.path().join("foreign.sqlite");
+        let db = rusqlite::Connection::open(&foreign).unwrap();
+        db.execute_batch("CREATE TABLE other (x TEXT);").unwrap();
+        drop(db);
+        assert!(crate::SqliteF1PreparationStore::open(&foreign).is_err());
+    }
+
+    #[test]
+    fn sqlite_many_independent_rows_do_not_block_safety() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        for n in 0..150 {
+            let mut row = routine();
+            row.spec.routine_id = format!("row-{n}");
+            row.spec.project = "x".repeat(32 * 1024);
+            store.insert_proposal(row).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() > 4 * 1024 * 1024);
+        store.pause_routine("row-0", 1, "stop").unwrap();
+        assert!(matches!(
+            store.routine("row-0").unwrap().unwrap().spec.state,
+            fl_core::routine::RoutineState::Paused { .. }
+        ));
+        assert_eq!(store.admit(), Err(F1RecordError::UnverifiedAuthority));
+        assert_eq!(
+            store.accept_effect(),
+            Err(F1RecordError::UnverifiedAuthority)
+        );
+        assert_eq!(store.settle(), Err(F1RecordError::UnverifiedAuthority));
+    }
+    #[test]
+    fn sqlite_refuses_extra_triggers_even_after_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f1.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "CREATE TRIGGER extra AFTER UPDATE ON f1_records BEGIN DELETE FROM f1_records; END;",
+        )
+        .unwrap();
+        assert!(store.request_allocation_stop("allocation", 1).is_err());
+        let count: i64 = raw
+            .query_row("SELECT count(*) FROM f1_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(store);
+        assert!(crate::SqliteF1PreparationStore::open(&path).is_err());
+    }
+    #[test]
+    fn sqlite_preparation_refuses_memory_pseudopath() {
+        assert!(crate::SqliteF1PreparationStore::open(std::path::Path::new(":memory:")).is_err());
+    }
 }
