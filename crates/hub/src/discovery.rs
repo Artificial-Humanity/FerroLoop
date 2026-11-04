@@ -2304,7 +2304,7 @@ fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
 /// Session discovery searches `<home>/.codex/sessions`; a route does not carry a
 /// credential-home identity. Only a rollout inside that sessions tree binds a
 /// session to the corresponding auth file. Never use the hub's CODEX_HOME for it.
-fn codex_session_auth_plan(home: &Path, transcript: Option<&str>) -> Option<String> {
+fn codex_bound_session_home(home: &Path, transcript: Option<&str>) -> Option<PathBuf> {
     let transcript = Path::new(transcript?);
     if !home.is_absolute() {
         return None;
@@ -2325,7 +2325,44 @@ fn codex_session_auth_plan(home: &Path, transcript: Option<&str>) -> Option<Stri
     if !session_root.starts_with(&home) || !path.starts_with(&session_root) {
         return None;
     }
-    codex_auth_plan(Some(&home))
+    Some(home)
+}
+
+fn codex_session_auth_plan(home: &Path, transcript: Option<&str>) -> Option<String> {
+    codex_auth_plan(Some(&codex_bound_session_home(home, transcript)?))
+}
+
+/// A matrix account probe and a session's usage describe the same credential home only when
+/// the session has a rollout in discovery's sessions tree and the configured account home
+/// resolves to that tree's `.codex` directory. Missing paths and unbound sessions fail closed.
+pub(crate) fn codex_session_matches_account(
+    session: &DiscoveredSessionSummary,
+    home_override: Option<&Path>,
+) -> bool {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let Some(bound_home) = home
+        .as_deref()
+        .and_then(|h| codex_bound_session_home(h, session.transcript_path.as_deref()))
+    else {
+        return false;
+    };
+    let account_path = codex_auth_path(
+        home_override,
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    );
+    let Some(account_dir) = account_path.as_deref().and_then(Path::parent) else {
+        return false;
+    };
+    match (
+        fs::canonicalize(bound_home.join(".codex")),
+        fs::canonicalize(account_dir),
+    ) {
+        (Ok(session_dir), Ok(account_dir)) => session_dir == account_dir,
+        _ => false,
+    }
 }
 
 /// An account-level probe is not attached to a session and uses the configured

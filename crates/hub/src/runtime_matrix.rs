@@ -45,8 +45,8 @@ use crate::auth::HubAuthority;
 use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
     DiscoveredSessionSummary, SessionQuotaUsage, codex_account_quota,
-    discover_route_sessions_without_model_info, quota_for_resolved_route,
-    quota_for_resolved_route_at, snapshot_discovery_store,
+    codex_session_matches_account, discover_route_sessions_without_model_info,
+    quota_for_resolved_route, quota_for_resolved_route_at, snapshot_discovery_store,
 };
 use crate::runtime_update::update_command;
 
@@ -351,6 +351,8 @@ pub struct QuotaSource {
     pub session: fn(&DiscoveredSessionSummary, Option<&Path>) -> Option<SessionQuotaUsage>,
     /// The account allowance of an adapter that no session reports.
     pub account: fn(&str, Option<&Path>) -> Option<SessionQuotaUsage>,
+    /// Whether a Codex session's quota belongs to the configured account. Unknown is false.
+    pub codex_session_matches_account: fn(&DiscoveredSessionSummary, Option<&Path>) -> bool,
 }
 
 impl QuotaSource {
@@ -358,11 +360,13 @@ impl QuotaSource {
     pub const HOST: Self = Self {
         session: host_session_quota,
         account: host_account_quota,
+        codex_session_matches_account,
     };
     /// Reads nothing.
     pub const NONE: Self = Self {
         session: |_, _| None,
         account: |_, _| None,
+        codex_session_matches_account: |_, _| false,
     };
 }
 
@@ -417,10 +421,24 @@ fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
 fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
     let home = inputs.home_override.as_deref();
     let now_ms = inputs.now_ms;
+    // A session's quota must never be presented as the configured Codex account's quota
+    // unless both a live account reading and an explicit credential-home binding exist.
+    let codex_account = if adapter == "codex" {
+        Some(
+            (inputs.quota_source.account)(adapter, home)
+                .filter(|q| quota_richness(q, now_ms) > 0)?,
+        )
+    } else {
+        None
+    };
     let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
         .sessions
         .iter()
-        .filter(|s| s.adapter == adapter)
+        .filter(|s| {
+            s.adapter == adapter
+                && (adapter != "codex"
+                    || (inputs.quota_source.codex_session_matches_account)(s, home))
+        })
         .collect();
     // Newest first, and the sort is stable: among equally rich readings the first (newest) stays.
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -440,6 +458,15 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
         if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
             best = Some((richness, reading));
         }
+    }
+    if let Some(account) = codex_account {
+        return Some(match best {
+            Some((_, mut session)) => {
+                session.tier = account.tier;
+                session
+            }
+            None => account,
+        });
     }
     best.map(|(_, q)| q).or_else(|| {
         (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q, now_ms) > 0)
@@ -2118,6 +2145,7 @@ mod tests {
         static ACCOUNT_CALLS: AtomicUsize = AtomicUsize::new(0);
         let mut inp = inputs("", None);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| None,
             account: |_, _| {
                 ACCOUNT_CALLS.fetch_add(1, Ordering::SeqCst);
@@ -2160,21 +2188,21 @@ mod tests {
         let mut inp = inputs("", None);
         inp.sessions = vec![
             quota_session(
-                "codex",
+                "claude",
                 "older",
                 "2026-11-01T10:00:00Z",
                 Some(quota(None, Some(90.0), None)),
             ),
             quota_session(
-                "codex",
+                "claude",
                 "newer",
                 "2026-11-02T10:00:00Z",
                 Some(quota(None, Some(12.0), None)),
             ),
         ];
-        let m = only_cli(&inp, "codex");
+        let m = only_cli(&inp, "claude");
         assert_eq!(
-            m.vendor_quotas["codex"]
+            m.vendor_quotas["claude"]
                 .primary_window
                 .as_ref()
                 .unwrap()
@@ -2188,6 +2216,7 @@ mod tests {
         static READS: AtomicUsize = AtomicUsize::new(0);
         let mut inp = inputs("", None);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |s, _| {
                 READS.fetch_add(1, Ordering::SeqCst);
                 (s.id == "route-3").then(|| quota(Some("pro"), Some(7.0), Some(1.0)))
@@ -2228,6 +2257,7 @@ mod tests {
         let mut inp = inputs("", None);
         inp.home_override = Some(PathBuf::from("/sandbox/home"));
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| None,
             account: |adapter, home| {
                 ADAPTERS.lock().unwrap().push(adapter.to_string());
@@ -2259,6 +2289,7 @@ mod tests {
         static ACCOUNT: AtomicUsize = AtomicUsize::new(0);
         let mut inp = inputs("", None);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| None,
             account: |_, _| {
                 ACCOUNT.fetch_add(1, Ordering::SeqCst);
@@ -2293,6 +2324,7 @@ mod tests {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         let mut inp = inputs("", None);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| {
                 CALLS.fetch_add(1, Ordering::SeqCst);
                 None
@@ -2366,22 +2398,27 @@ mod tests {
             exhausted_reason: None,
         };
         inp.sessions = vec![
-            quota_session("codex", "old", "2026-10-01T10:00:00Z", Some(stale_but_rich)),
             quota_session(
-                "codex",
+                "claude",
+                "old",
+                "2026-10-01T10:00:00Z",
+                Some(stale_but_rich),
+            ),
+            quota_session(
+                "claude",
                 "new",
                 "2026-11-02T10:00:00Z",
                 Some(quota(None, Some(12.0), None)),
             ),
         ];
-        let m = only_cli(&inp, "codex");
-        let codex = &m.vendor_quotas["codex"];
-        assert_eq!(codex.primary_window.as_ref().unwrap().used_percent, 12.0);
+        let m = only_cli(&inp, "claude");
+        let claude = &m.vendor_quotas["claude"];
+        assert_eq!(claude.primary_window.as_ref().unwrap().used_percent, 12.0);
 
         // A reading that is stale all through is not a quota: the account probe is asked instead.
         inp.sessions.truncate(1);
         inp.quota_cache = Arc::default();
-        let m = only_cli(&inp, "codex");
+        let m = only_cli(&inp, "claude");
         assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
     }
 
@@ -2390,6 +2427,7 @@ mod tests {
         let mut inp = inputs("", None);
         inp.quota_budget = Duration::from_millis(300);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| None,
             account: |adapter, _| {
                 if adapter == "codex" {
@@ -2429,6 +2467,7 @@ mod tests {
         static READS: AtomicUsize = AtomicUsize::new(0);
         let mut inp = inputs("", None);
         inp.quota_source = QuotaSource {
+            codex_session_matches_account: |_, _| false,
             session: |_, _| None,
             account: |_, _| {
                 READS.fetch_add(1, Ordering::SeqCst);
