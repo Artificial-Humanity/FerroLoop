@@ -904,6 +904,22 @@ interface PendingPrompt {
 
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
+export const sessionSendErrors = new Map<string, string>();
+const pendingAttachmentReads = new Map<string, number>();
+const draftListeners = new Set<
+  (target: string, draft: SessionDraft | null, error?: string) => void
+>();
+function notifyDraft(target: string, draft: SessionDraft | null, error?: string) {
+  for (const listener of draftListeners) listener(target, draft, error);
+}
+function saveSessionDraft(target: string, draft: SessionDraft) {
+  sessionDraftMemory.set(target, draft);
+  try {
+    window.localStorage.setItem(DRAFT_STORAGE_PREFIX + target, draft.promptText);
+  } catch {
+    // Storage is optional; the in-memory draft still survives target switches.
+  }
+}
 
 export const DRAFT_STORAGE_PREFIX = "ferrodeck.draft.";
 
@@ -1208,7 +1224,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     });
   }, []);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
-  const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>({});
+  const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
+    () => Object.fromEntries(sessionSendErrors),
+  );
   const [pendingByTarget, setPendingByTarget] = React.useState<Record<string, PendingPrompt>>({});
   const activeSendsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(false);
@@ -1220,6 +1238,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   }, []);
   const draftRef = React.useRef({ promptText, attachments });
   draftRef.current = { promptText, attachments };
+
+  React.useEffect(() => {
+    const listener = (target: string, draft: SessionDraft | null, error?: string) => {
+      if (error) setSendErrorsByTarget((prev) => ({ ...prev, [target]: error }));
+      if (draft && currentTargetRef.current === target) {
+        draftRef.current = draft;
+        setPromptText(draft.promptText);
+        setAttachments(draft.attachments);
+      }
+    };
+    draftListeners.add(listener);
+    return () => { draftListeners.delete(listener); };
+  }, []);
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -2016,12 +2047,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const readFilesAsAttachments = React.useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
-    if (fileArray.length === 0) return;
+    const target = currentTargetRef.current;
+    if (fileArray.length === 0 || !target) return;
+    pendingAttachmentReads.set(target, (pendingAttachmentReads.get(target) ?? 0) + 1);
     try {
       const loaded = await Promise.all(fileArray.map((f) => fileToPromptAttachment(f)));
-      setAttachments((prev) => [...prev, ...loaded]);
+      const previous = mountedRef.current && currentTargetRef.current === target
+        ? draftRef.current : loadSessionDraft(target);
+      const draft = { ...previous, attachments: [...previous.attachments, ...loaded] };
+      saveSessionDraft(target, draft);
+      notifyDraft(target, draft);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to read attachment");
+      const message = err instanceof Error ? err.message : "Failed to read attachment";
+      sessionSendErrors.set(target, message);
+      notifyDraft(target, null, message);
+    } finally {
+      const remaining = (pendingAttachmentReads.get(target) ?? 1) - 1;
+      if (remaining > 0) pendingAttachmentReads.set(target, remaining);
+      else pendingAttachmentReads.delete(target);
     }
   }, []);
 
@@ -2202,6 +2245,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     activeSendsRef.current.add(submittedTarget);
     beginTargetSubmitting(submittedTarget);
     setSubmitError(null);
+    sessionSendErrors.delete(submittedTarget);
     setSendErrorsByTarget((prev) => {
       const next = { ...prev };
       delete next[submittedTarget];
@@ -2264,25 +2308,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to send message";
-      if (mountedRef.current) {
-        setSendErrorsByTarget((prev) => ({ ...prev, [submittedTarget]: message }));
-      }
+      sessionSendErrors.set(submittedTarget, message);
       const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget
-        ? draftRef.current
-        : loadSessionDraft(submittedTarget);
-      if (currentDraft.promptText.length === 0 && currentDraft.attachments.length === 0) {
-        sessionDraftMemory.set(submittedTarget, submittedDraft);
-        try {
-          window.localStorage.setItem(DRAFT_STORAGE_PREFIX + submittedTarget, submittedDraft.promptText);
-        } catch {
-          // Ignore storage errors.
-        }
-        if (mountedRef.current && currentTargetRef.current === submittedTarget) {
-          draftRef.current = submittedDraft;
-          setPromptText(submittedDraft.promptText);
-          setAttachments(submittedDraft.attachments);
-        }
+        ? draftRef.current : loadSessionDraft(submittedTarget);
+      let restored: SessionDraft | null = null;
+      if (currentDraft.promptText.length === 0 && currentDraft.attachments.length === 0 &&
+          !pendingAttachmentReads.has(submittedTarget)) {
+        restored = submittedDraft;
+        saveSessionDraft(submittedTarget, restored);
       }
+      notifyDraft(submittedTarget, restored, message);
+
     } finally {
       activeSendsRef.current.delete(submittedTarget);
       if (mountedRef.current) {

@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatPane, sessionDraftMemory } from "../components/ChatPane";
+import { ChatPane, sessionDraftMemory, sessionSendErrors } from "../components/ChatPane";
 import type { TranscriptTurn } from "../types/api";
 
 function deferred<T>() {
@@ -15,7 +15,7 @@ const input = () => screen.getByPlaceholderText(/Send a message/i) as HTMLTextAr
 const send = () => fireEvent.click(screen.getByRole("button", { name: /^Send Message$/i }));
 const props = (handler: () => Promise<unknown>) => ({ agentName: "alpha", sessionId: "a", turns: [] as TranscriptTurn[], onSendPrompt: handler });
 
-beforeEach(() => { sessionDraftMemory.clear(); window.localStorage.clear(); });
+beforeEach(() => { sessionDraftMemory.clear(); sessionSendErrors.clear(); window.localStorage.clear(); });
 describe("optimistic prompt submission", () => {
   it("clears immediately and displays the sending turn, then reconciles a real-time transcript without duplication", async () => {
     const pending = deferred<unknown>();
@@ -86,6 +86,70 @@ describe("optimistic prompt submission", () => {
     await act(async () => { pending.reject(new Error("old send failed")); await pending.promise.catch(() => {}); });
     expect(input().value).toBe("new");
     expect(sessionDraftMemory.get("a")?.promptText).toBe("new");
+  });
+  it("restores a failed send to an already remounted empty composer", async () => {
+    const pending = deferred<unknown>();
+    sessionDraftMemory.set("a", { promptText: "old", attachments: [{ name: "old.txt", media_type: "text/plain", data_base64: "eA==" }] });
+    const first = render(<ChatPane {...props(() => pending.promise)} />);
+    send(); first.unmount();
+    render(<ChatPane {...props(vi.fn(async () => {}))} />);
+    await act(async () => { pending.reject(new Error("old send failed")); await pending.promise.catch(() => {}); });
+    expect(input().value).toBe("old");
+    expect(screen.getByText("old.txt")).toBeInTheDocument();
+    expect(screen.getByText("old send failed")).toBeInTheDocument();
+  });
+  it("does not restore an old draft while a newer selected file is still loading", async () => {
+    const pending = deferred<unknown>();
+    const readers: FileReader[] = [];
+    const OriginalReader = globalThis.FileReader;
+    class DelayedReader {
+      onload: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      onerror: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      result: string | null = null;
+      readAsDataURL() { readers.push(this as unknown as FileReader); }
+    }
+    vi.stubGlobal("FileReader", DelayedReader);
+    try {
+      sessionDraftMemory.set("a", { promptText: "old", attachments: [{ name: "old.txt", media_type: "text/plain", data_base64: "eA==" }] });
+      render(<ChatPane {...props(() => pending.promise)} />);
+      send();
+      fireEvent.change(screen.getByTestId("prompt-file-input"), { target: { files: [new File(["new"], "new.txt", { type: "text/plain" })] } });
+      await act(async () => { pending.reject(new Error("failed")); await pending.promise.catch(() => {}); });
+      expect(input().value).toBe("");
+      expect(screen.queryByText("old.txt")).toBeNull();
+      await act(async () => {
+        const reader = readers[0];
+        Object.defineProperty(reader, "result", { value: "data:text/plain;base64,bmV3" });
+        reader.onload?.call(reader, new ProgressEvent("load") as ProgressEvent<FileReader>);
+      });
+      expect(screen.getByText("new.txt")).toBeInTheDocument();
+      expect(screen.queryByText("old.txt")).toBeNull();
+    } finally { vi.stubGlobal("FileReader", OriginalReader); }
+  });
+  it("keeps a delayed attachment with its original session when the target changes", async () => {
+    const readers: FileReader[] = [];
+    const OriginalReader = globalThis.FileReader;
+    class DelayedReader {
+      onload: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      onerror: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      result: string | null = null;
+      readAsDataURL() { readers.push(this as unknown as FileReader); }
+    }
+    vi.stubGlobal("FileReader", DelayedReader);
+    try {
+      const handler = vi.fn(async () => {});
+      const { rerender } = render(<ChatPane {...props(handler)} />);
+      fireEvent.change(screen.getByTestId("prompt-file-input"), { target: { files: [new File(["x"], "alpha.txt", { type: "text/plain" })] } });
+      rerender(<ChatPane agentName="beta" sessionId="b" turns={[]} onSendPrompt={handler} />);
+      await act(async () => {
+        const reader = readers[0];
+        Object.defineProperty(reader, "result", { value: "data:text/plain;base64,eA==" });
+        reader.onload?.call(reader, new ProgressEvent("load") as ProgressEvent<FileReader>);
+      });
+      expect(screen.queryByText("alpha.txt")).toBeNull();
+      rerender(<ChatPane {...props(handler)} />);
+      expect(screen.getByText("alpha.txt")).toBeInTheDocument();
+    } finally { vi.stubGlobal("FileReader", OriginalReader); }
   });
   it("does not hide an identical earlier transcript turn while sending", async () => {
     const pending = deferred<unknown>();

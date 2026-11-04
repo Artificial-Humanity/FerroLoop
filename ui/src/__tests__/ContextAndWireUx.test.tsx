@@ -521,6 +521,12 @@ describe("optimistic prompt preservation", () => {
     expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
   });
 
+  it("does not carry an optimistic prompt between sessions of the same agent", () => {
+    const prompt = { content: "private to A", sentAt: 1_000, agentKey: "ferris", sessionId: "session-a" };
+    expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-b")).toBe(diskTurns);
+    expect(preserveOptimisticTurn(diskTurns, prompt, 3_000, "ferris", "session-a")).toHaveLength(2);
+  });
+
   it("recognizes an on-disk user turn that wraps the prompt via substring match", () => {
     const wrappedOnDisk = [
       ...diskTurns,
@@ -1137,6 +1143,16 @@ describe("Agent switch transcript isolation", () => {
     expect(
       await screen.findByText(/Waiting for operator instructions\./),
     ).toBeInTheDocument();
+
+    // Another session of the same persona must not affect the active session.
+    act(() => {
+      sessionListener?.({ type: "event", topic: "session", event: "prompt_sent", data: {
+        session_id: "sess-ferris-other", persona: "ferris", effective_body: "Other session secret", is_busy: true,
+        queue: [{ id: "other-session-queue", session_id: "sess-ferris-other", prompt: "Wrong queue", created_at: new Date().toISOString() }],
+      }});
+    });
+    expect(screen.queryByText("Other session secret")).toBeNull();
+    expect(screen.queryByText("Wrong queue")).toBeNull();
 
     // A failed push is broadcast too; it must not become a sent transcript turn.
     act(() => {

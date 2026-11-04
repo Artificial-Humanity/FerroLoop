@@ -146,6 +146,7 @@ export interface OptimisticPrompt {
   content: string;
   sentAt: number;
   agentKey?: string;
+  sessionId?: string;
 }
 
 export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
@@ -168,13 +169,15 @@ export function pruneOptimisticPrompts(
   turns: TranscriptTurn[],
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
+  currentSessionId?: string | null,
 ): OptimisticPrompt[] {
   const activeKey = (currentAgentKey ?? "").trim().toLowerCase();
   return prompts.filter((p) => {
     if (!p || !p.content?.trim()) return false;
     if (nowMs - p.sentAt > OPTIMISTIC_PROMPT_TTL_MS) return false;
     const promptKey = (p.agentKey ?? "").trim().toLowerCase();
-    const matchesActive = !activeKey || !promptKey || promptKey === activeKey;
+    const matchesActive = (!activeKey || !promptKey || promptKey === activeKey) &&
+      (currentSessionId === undefined || (p.sessionId ?? null) === currentSessionId);
     if (matchesActive && isPromptOnDisk(turns, p.content)) {
       return false;
     }
@@ -193,6 +196,7 @@ export function preserveOptimisticTurn(
   optimistic: OptimisticPrompt | OptimisticPrompt[] | null | undefined,
   nowMs: number = Date.now(),
   currentAgentKey?: string | null,
+  currentSessionId?: string | null,
 ): TranscriptTurn[] {
   const rawList: OptimisticPrompt[] = Array.isArray(optimistic)
     ? optimistic
@@ -208,6 +212,7 @@ export function preserveOptimisticTurn(
     if (!item || !item.content?.trim()) continue;
     if (nowMs - item.sentAt > OPTIMISTIC_PROMPT_TTL_MS) continue;
     const itemKey = (item.agentKey ?? "").trim().toLowerCase();
+    if (currentSessionId !== undefined && (item.sessionId ?? null) !== currentSessionId) continue;
     if (activeKey && itemKey && itemKey !== activeKey) {
       continue;
     }
@@ -654,6 +659,7 @@ export const App: React.FC<AppProps> = ({
   const [sessionQuotaUsage, setSessionQuotaUsage] =
     useState<SessionQuotaUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt[]>([]);
+  const activeSessionIdRef = useRef<string | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
   const tornDownTargetsRef = useRef<Set<string>>(new Set());
   const loggedOutRef = useRef<boolean>(false);
@@ -711,7 +717,7 @@ export const App: React.FC<AppProps> = ({
   );
 
   const recordOptimisticPrompt = useCallback(
-    (content: string, agentKey?: string | null, sentAt: number = Date.now()) => {
+    (content: string, agentKey?: string | null, sentAt: number = Date.now(), sessionId?: string | null) => {
       const trimmed = (content || "").trim();
       if (!trimmed) return;
       const normalizedKey = (agentKey ?? "").trim().toLowerCase();
@@ -722,6 +728,7 @@ export const App: React.FC<AppProps> = ({
         (p) =>
           p.content.trim() === trimmed &&
           (p.agentKey ?? "").trim().toLowerCase() === normalizedKey &&
+          (p.sessionId ?? "") === (sessionId ?? "") &&
           Math.abs(sentAt - p.sentAt) < 3_000,
       );
       if (!duplicate) {
@@ -729,6 +736,7 @@ export const App: React.FC<AppProps> = ({
           content,
           sentAt,
           agentKey: normalizedKey || undefined,
+          sessionId: sessionId || undefined,
         });
       }
       optimisticPromptRef.current = current;
@@ -776,12 +784,14 @@ export const App: React.FC<AppProps> = ({
       optimisticPromptRef.current,
       nowMs,
       activeKey,
+      activeSessionIdRef.current,
     );
     optimisticPromptRef.current = pruneOptimisticPrompts(
       optimisticPromptRef.current,
       turns,
       nowMs,
       activeKey,
+      activeSessionIdRef.current,
     );
     setTranscriptTurns(merged);
   }, []);
@@ -1322,31 +1332,21 @@ export const App: React.FC<AppProps> = ({
         const rawSessionId =
           typeof data.session_id === "string" ? data.session_id.trim() : "";
         const activeKey = selectedAgentNameRef.current.trim().toLowerCase();
-        const targetAgentKey =
-          rawPersona ||
-          (rawSessionId && rawSessionId === selectedSessionIdRef.current
-            ? activeKey
-            : "");
-        if (rawContent && data.delivered !== false) {
-          recordOptimisticPrompt(rawContent, targetAgentKey || activeKey);
-          if (!targetAgentKey || targetAgentKey === activeKey) {
-            setTranscriptTurns((prev) =>
-              preserveOptimisticTurn(
-                prev,
-                optimisticPromptRef.current,
-                Date.now(),
-                activeKey,
-              ),
-            );
-          }
+        const activeSessionId = activeSessionIdRef.current;
+        // A persona is reusable; a session-scoped event must match the active session exactly.
+        // Legacy persona-only events cannot safely be assigned when a session is active.
+        const matchesActive = rawSessionId
+          ? rawSessionId === activeSessionId && (!rawPersona || rawPersona === activeKey)
+          : !activeSessionId && Boolean(rawPersona) && rawPersona === activeKey;
+        if (matchesActive && rawContent && data.delivered !== false) {
+          recordOptimisticPrompt(rawContent, activeKey, Date.now(), rawSessionId || null);
+          setTranscriptTurns((prev) =>
+            preserveOptimisticTurn(prev, optimisticPromptRef.current, Date.now(), activeKey, activeSessionId),
+          );
         }
-        if (!targetAgentKey || targetAgentKey === activeKey) {
-          if (Array.isArray(data.queue)) {
-            setSessionQueue(data.queue as QueuedOperatorPrompt[]);
-          }
-          if (typeof data.is_busy === "boolean") {
-            setIsSessionBusy(data.is_busy);
-          }
+        if (matchesActive) {
+          if (Array.isArray(data.queue)) setSessionQueue(data.queue as QueuedOperatorPrompt[]);
+          if (typeof data.is_busy === "boolean") setIsSessionBusy(data.is_busy);
         }
       }
       void refreshSessionsAndTranscript();
@@ -1433,6 +1433,8 @@ export const App: React.FC<AppProps> = ({
       null
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
+
+  activeSessionIdRef.current = activeSession?.id ?? null;
 
   const activeAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
   const activeRoute = useMemo(
@@ -1729,13 +1731,14 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey);
+      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
       setTranscriptTurns((prev) =>
         preserveOptimisticTurn(
           prev,
           optimisticPromptRef.current,
           Date.now(),
           selectedAgentNameRef.current,
+          activeSessionIdRef.current,
         ),
       );
     }
@@ -1758,13 +1761,14 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey);
+      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
       setTranscriptTurns((prev) =>
         preserveOptimisticTurn(
           prev,
           optimisticPromptRef.current,
           Date.now(),
           selectedAgentNameRef.current,
+          activeSessionIdRef.current,
         ),
       );
     }
@@ -2004,6 +2008,7 @@ export const App: React.FC<AppProps> = ({
                     optimisticPromptRef.current,
                     Date.now(),
                     nextKey,
+                    null,
                   ),
                 );
                 setSessionQueue([]);
@@ -2018,6 +2023,7 @@ export const App: React.FC<AppProps> = ({
             onSelectSession={(sessionId) => {
               if (sessionId !== selectedSessionIdRef.current) {
                 selectedSessionIdRef.current = sessionId;
+                activeSessionIdRef.current = sessionId;
                 setTranscriptTurns([]);
                 setSessionQueue([]);
                 setIsSessionBusy(false);
@@ -2274,6 +2280,7 @@ export const App: React.FC<AppProps> = ({
               optimisticPromptRef.current,
               Date.now(),
               nextKey,
+              null,
             ),
           );
           setSessionQueue([]);
@@ -2387,6 +2394,7 @@ export const App: React.FC<AppProps> = ({
         onSelectSession={(sessionId) => {
           if (sessionId !== selectedSessionIdRef.current) {
             selectedSessionIdRef.current = sessionId;
+            activeSessionIdRef.current = sessionId;
             setTranscriptTurns([]);
             setSessionQueue([]);
             setIsSessionBusy(false);
@@ -2448,6 +2456,7 @@ export const App: React.FC<AppProps> = ({
                   optimisticPromptRef.current,
                   Date.now(),
                   nextKey,
+                  null,
                 ),
               );
               setSessionQueue([]);
