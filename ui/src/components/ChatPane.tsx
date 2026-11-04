@@ -2419,7 +2419,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       className="fd-pane"
       data-testid="chat-pane"
       style={{
-        minWidth: "360px",
+        minWidth: 0,
         width: "100%",
         maxWidth: "100%",
         overflowX: "hidden",

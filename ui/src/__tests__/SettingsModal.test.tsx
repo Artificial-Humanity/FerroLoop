@@ -1230,4 +1230,53 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       });
     }
   });
+
+  it("Record #114: renders iOS safe-area margins overlay by default on <720px (including 320px zoomed iOS viewport), allows closing via HUD [×], and toggles from Appearance settings", () => {
+    const originalInnerWidth = window.innerWidth;
+    try {
+      window.localStorage.removeItem("fd_show_safe_margins");
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 320,
+      });
+
+      const apiClient = makeStubApiClient();
+      const wsClient = makeStubWsClient();
+      const { unmount } = render(<App apiClient={apiClient} wsClient={wsClient} />);
+
+      const chatPane = screen.getByTestId("chat-pane");
+      expect(chatPane.style.minWidth).toBe("0");
+
+      const overlay = screen.getByTestId("ios-safe-area-overlay");
+      const hud = screen.getByTestId("ios-safe-area-hud");
+      expect(overlay).toBeInTheDocument();
+      expect(hud).toHaveTextContent(/Safe Margins: T:\d+px B:\d+px L:\d+px R:\d+px/i);
+      expect(hud).toHaveTextContent(/Viewport: 320×/i);
+
+      // Dismiss via HUD [×] button
+      fireEvent.click(screen.getByTestId("ios-safe-area-close-btn"));
+      expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
+      expect(window.localStorage.getItem("fd_show_safe_margins")).toBe("false");
+
+      // Re-enable via Settings -> Appearance -> Show iOS Safe-Area Margins
+      fireEvent.click(screen.getByTestId("settings-modal-btn"));
+      fireEvent.click(screen.getByTestId("settings-tab-appearance"));
+      const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
+      expect(toggle.checked).toBe(false);
+      fireEvent.click(toggle);
+      expect(toggle.checked).toBe(true);
+      expect(window.localStorage.getItem("fd_show_safe_margins")).toBe("true");
+      expect(screen.getByTestId("ios-safe-area-overlay")).toBeInTheDocument();
+
+      unmount();
+    } finally {
+      window.localStorage.removeItem("fd_show_safe_margins");
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
 });

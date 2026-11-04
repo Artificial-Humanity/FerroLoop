@@ -141,18 +141,19 @@ body,
 /* Cockpit Layout */
 .fd-cockpit {
   position: fixed;
-  inset: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  height: 100dvh;
   width: 100%;
-  max-width: 100vw;
+  height: 100%;
+  max-width: 100%;
   overflow-x: hidden;
   overflow-y: hidden;
   background-color: var(--bg-canvas);
-  padding-top: env(safe-area-inset-top, 0px);
-  padding-bottom: 0;
+  padding: 0;
 }
 
 .fd-cockpit-body {
@@ -727,7 +728,7 @@ button.fd-badge:hover:not(:disabled) {
     bottom: 0;
     left: 0;
     width: 100% !important;
-    min-width: 360px !important;
+    min-width: 0 !important;
     max-width: 100% !important;
     overflow-y: auto !important;
     transform: translateX(-100%);
@@ -752,7 +753,7 @@ button.fd-badge:hover:not(:disabled) {
   .fd-workspace,
   .fd-pane {
     width: 100% !important;
-    max-width: 100vw !important;
+    max-width: 100% !important;
     min-width: 0 !important;
     overflow-x: hidden !important;
   }
@@ -830,7 +831,8 @@ button.fd-badge:hover:not(:disabled) {
   .fd-workspace.is-split > .fd-pane:first-child {
     display: flex !important;
     width: 100% !important;
-    min-width: 360px !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
   }
 
   .fd-right-split-backdrop {
@@ -848,7 +850,7 @@ button.fd-badge:hover:not(:disabled) {
     bottom: 0;
     left: 0;
     width: 100% !important;
-    min-width: 360px !important;
+    min-width: 0 !important;
     max-width: 100% !important;
     overflow-y: auto !important;
     flex: none !important;
@@ -870,9 +872,9 @@ button.fd-badge:hover:not(:disabled) {
   }
 
   .fd-modal {
-    width: max(360px, calc(100vw - 20px)) !important;
-    min-width: 360px !important;
-    max-width: max(360px, calc(100vw - 20px)) !important;
+    width: calc(100vw - 20px) !important;
+    min-width: min(360px, calc(100vw - 20px)) !important;
+    max-width: calc(100vw - 20px) !important;
     max-height: calc(100dvh - 20px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)) !important;
     overflow-y: auto;
     padding: 14px !important;
@@ -911,11 +913,17 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 @media (max-width: 480px) {
-  .fd-modal,
   .fd-sidebar,
   .fd-pane,
   .fd-right-split-pane {
-    min-width: 360px !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    overflow-y: auto;
+  }
+
+  .fd-modal {
+    min-width: min(360px, calc(100vw - 20px)) !important;
+    max-width: calc(100vw - 20px) !important;
     overflow-y: auto;
   }
 

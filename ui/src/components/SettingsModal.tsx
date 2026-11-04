@@ -792,6 +792,8 @@ export interface SettingsModalProps {
   onChangeThemeMode?: (mode: ThemeMode) => void;
   fontScalePct?: number;
   onChangeFontScalePct?: (pct: number) => void;
+  showSafeAreaMargins?: boolean;
+  onChangeShowSafeAreaMargins?: (enabled: boolean) => void;
   onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
   postureInputsByAgent?: Record<string, Partial<AgentMcpPostureInput>>;
@@ -1275,6 +1277,44 @@ export async function executeScopedBulkSessionAction(
   };
 }
 
+export const SAFE_AREA_MARGINS_STORAGE_KEY = "fd_show_safe_margins";
+export const SAFE_AREA_MARGINS_EVENT = "fd:safe-area-margins-changed";
+
+export function readInitialShowSafeAreaMargins(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    const raw = window.localStorage?.getItem(SAFE_AREA_MARGINS_STORAGE_KEY);
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+  } catch {
+    // Ignore storage read errors
+  }
+  return window.innerWidth < 720;
+}
+
+export function persistShowSafeAreaMargins(enabled: boolean): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage?.setItem(
+      SAFE_AREA_MARGINS_STORAGE_KEY,
+      enabled ? "true" : "false",
+    );
+  } catch {
+    // Ignore storage write errors
+  }
+  try {
+    window.dispatchEvent(
+      new CustomEvent(SAFE_AREA_MARGINS_EVENT, { detail: { enabled } }),
+    );
+  } catch {
+    // Ignore event dispatch errors
+  }
+}
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
@@ -1300,6 +1340,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onChangeThemeMode,
   fontScalePct: propFontScalePct,
   onChangeFontScalePct,
+  showSafeAreaMargins: propShowSafeAreaMargins,
+  onChangeShowSafeAreaMargins,
   onSettingsUpdated,
   apiClient,
   postureInputsByAgent,
@@ -1824,6 +1866,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [consoleLayoutBanner, setConsoleLayoutBanner] = useState<string | null>(
     null,
   );
+  const [localShowSafeAreaMargins, setLocalShowSafeAreaMargins] =
+    useState<boolean>(
+      () => propShowSafeAreaMargins ?? readInitialShowSafeAreaMargins(),
+    );
+
+  useEffect(() => {
+    if (propShowSafeAreaMargins !== undefined) {
+      setLocalShowSafeAreaMargins(propShowSafeAreaMargins);
+    }
+  }, [propShowSafeAreaMargins]);
 
   if (!isOpen) {
     return null;
@@ -9205,6 +9257,63 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   ).panesSummary
                 }
               </div>
+            </div>
+
+            {/* Record #114: iOS Safe-Area Margins Diagnostic Overlay Toggle */}
+            <div
+              className="fd-card"
+              data-testid="ios-safe-margins-settings-card"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h3
+                  style={{
+                    margin: 0,
+                    fontSize: "12.5px",
+                    fontWeight: 700,
+                    textTransform: "uppercase",
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  Show iOS Safe-Area Margins (#114)
+                </h3>
+                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                  Display dashed guide lines, tinted inset bands, and a live viewport/DPR HUD for{" "}
+                  <code className="fd-mono">env(safe-area-inset-*)</code> margins.
+                </span>
+              </div>
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  flexShrink: 0,
+                }}
+              >
+                <span className="fd-badge fd-mono">
+                  {localShowSafeAreaMargins ? "Visible" : "Hidden"}
+                </span>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-ios-safe-margins"
+                  aria-label="Show iOS Safe-Area Margins"
+                  checked={localShowSafeAreaMargins}
+                  onChange={(e) => {
+                    const next = e.target.checked;
+                    setLocalShowSafeAreaMargins(next);
+                    persistShowSafeAreaMargins(next);
+                    onChangeShowSafeAreaMargins?.(next);
+                  }}
+                />
+              </label>
             </div>
           </div>
         )}
