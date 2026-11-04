@@ -129,6 +129,14 @@ impl Vault {
             deny(reason, err)
         })?;
         let meta = &snapshot.metadata;
+        if meta.usage != crate::vault::SecretUsage::SignJwtRs256 {
+            return Err(deny(
+                "usage",
+                GateError::UsageMismatch {
+                    secret: name.clone(),
+                },
+            ));
+        }
         if meta.bundle_required || meta.app_binding.is_some() {
             return Err(deny(
                 "authority_unavailable",
@@ -167,7 +175,7 @@ impl Vault {
             std::slice::from_ref(&name),
             SIGN_AUDIT_METHOD,
             &audit_host,
-            "allowed",
+            "allowed:binding-absent",
         )?;
         Ok(jwt)
     }
@@ -329,6 +337,32 @@ fn decode_der(b64: &str) -> Result<Zeroizing<Vec<u8>>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_usage_cannot_sign_and_is_audited_as_usage_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(
+            dir.path().join("vault.enc"),
+            [5; crate::vault::MASTER_KEY_LEN],
+        )
+        .unwrap();
+        vault
+            .set(crate::vault::SetSecretArgs {
+                name: "KEY".into(),
+                value: "not a signing key".into(),
+                allowed_hosts: vec!["api.github.com".into()],
+                usage: crate::vault::SecretUsage::Proxy,
+                ..Default::default()
+            })
+            .unwrap();
+        let key: VaultRef = "vault://KEY".parse().unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let audit = std::fs::read_to_string(dir.path().join("gate-audit.jsonl")).unwrap();
+        assert!(audit.contains("denied:usage"));
+    }
 
     #[test]
     fn host_labels_must_be_non_empty_and_hostname_shaped() {
