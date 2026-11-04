@@ -52,9 +52,26 @@ pub enum LifecycleTarget {
     },
 }
 
+/// The exact logical work whose scoped session and spawn token are being verified.
+/// Values are identifiers, not authority; a trusted verifier must authenticate them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalWorkIdentity {
+    Routine {
+        routine_id: String,
+        revision: u64,
+        firing_key: String,
+    },
+    Intent {
+        intent_id: String,
+        revision: u64,
+        member_slot: u32,
+    },
+}
+
 /// The approval, resolved identity, and immutable host/readings revisions to recheck.
 #[derive(Debug, Clone)]
 pub struct LifecycleVerificationRequest<'a> {
+    pub work: &'a LogicalWorkIdentity,
     pub approved_target: &'a RoutineTarget,
     pub resolved_target: &'a LifecycleTarget,
     pub lifecycle_revision: u64,
@@ -64,13 +81,16 @@ pub struct LifecycleVerificationRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedLifecycle {
+    pub work: LogicalWorkIdentity,
     pub target: LifecycleTarget,
     pub lifecycle_revision: u64,
     pub reading_revision: u64,
 }
 
 /// The verifier is responsible for authenticated issuer provenance, ownership, live
-/// telemetry, reading freshness and the exact approved incarnation or template.
+/// telemetry, reading freshness and the exact approved incarnation or template. For a fresh
+/// session it must bind the scoped session and spawn token to the authenticated work identity
+/// and approved template; matching a template alone is insufficient.
 pub trait LifecycleAuthority {
     fn verify_lifecycle(
         &self,
@@ -152,6 +172,7 @@ mod tests {
     struct TestAuthority {
         proof: crate::slice_proof::SliceBoundProof,
         lifecycle: LifecycleTarget,
+        work: LogicalWorkIdentity,
         terminal: VerifiedTerminal,
     }
     impl ProofRegistryVerifier for TestAuthority {
@@ -195,7 +216,8 @@ mod tests {
                 ) => approved == template_id,
                 _ => false,
             };
-            if !approved_matches
+            if request.work != &self.work
+                || !approved_matches
                 || request.resolved_target != &self.lifecycle
                 || request.lifecycle_revision != 4
                 || request.reading_revision != 5
@@ -204,6 +226,7 @@ mod tests {
                 return Err(AuthorityError::UnverifiedAuthority);
             }
             Ok(VerifiedLifecycle {
+                work: self.work.clone(),
                 target: self.lifecycle.clone(),
                 lifecycle_revision: 4,
                 reading_revision: 5,
@@ -250,6 +273,11 @@ mod tests {
                     zero_cost_proven: true,
                 },
                 transcript_ref: "reviewed-transcript".into(),
+            },
+            work: LogicalWorkIdentity::Routine {
+                routine_id: "routine".into(),
+                revision: 1,
+                firing_key: "firing".into(),
             },
             lifecycle: LifecycleTarget::BoundIncarnation {
                 incarnation_id: "inc-1".into(),
@@ -315,6 +343,7 @@ mod tests {
             incarnation_id: "inc-1".into(),
         };
         let mut req = LifecycleVerificationRequest {
+            work: &auth.work,
             approved_target: &approved,
             resolved_target: &target,
             lifecycle_revision: 4,
@@ -412,7 +441,13 @@ mod tests {
             controller_lease_id: "lease".into(),
             controller_lease_epoch: 3,
         };
+        let work = LogicalWorkIdentity::Routine {
+            routine_id: "routine".into(),
+            revision: 1,
+            firing_key: "firing".into(),
+        };
         let lifecycle = LifecycleVerificationRequest {
+            work: &work,
             approved_target: &approved,
             resolved_target: &target,
             lifecycle_revision: 4,
@@ -438,6 +473,92 @@ mod tests {
         assert_eq!(
             unavailable.verify_terminal(&terminal).unwrap_err(),
             AuthorityError::UnverifiedAuthority
+        );
+    }
+    #[test]
+    fn fresh_session_verification_rejects_cross_work_reuse() {
+        let mut auth = fixture();
+        let routine = LogicalWorkIdentity::Routine {
+            routine_id: "routine-a".into(),
+            revision: 3,
+            firing_key: "firing-a".into(),
+        };
+        let other_firing = LogicalWorkIdentity::Routine {
+            routine_id: "routine-a".into(),
+            revision: 3,
+            firing_key: "firing-b".into(),
+        };
+        let intent = LogicalWorkIdentity::Intent {
+            intent_id: "intent-a".into(),
+            revision: 2,
+            member_slot: 1,
+        };
+        let other_slot = LogicalWorkIdentity::Intent {
+            intent_id: "intent-a".into(),
+            revision: 2,
+            member_slot: 2,
+        };
+        let approved = RoutineTarget::FreshSession {
+            template_id: "template".into(),
+        };
+        auth.lifecycle = LifecycleTarget::FreshSession {
+            template_id: "template".into(),
+            scoped_session_id: "scoped-a".into(),
+            host_spawn_token: "token-a".into(),
+        };
+        auth.work = routine.clone();
+        let mut req = LifecycleVerificationRequest {
+            work: &routine,
+            approved_target: &approved,
+            resolved_target: &auth.lifecycle,
+            lifecycle_revision: 4,
+            now_utc: "2026-01-01T00:00:00Z",
+            reading_revision: 5,
+        };
+        assert_eq!(auth.verify_lifecycle(&req).unwrap().work, routine);
+        req.work = &other_firing;
+        assert_eq!(
+            auth.verify_lifecycle(&req),
+            Err(AuthorityError::UnverifiedAuthority)
+        );
+        let other_revision = LogicalWorkIdentity::Routine {
+            routine_id: "routine-a".into(),
+            revision: 4,
+            firing_key: "firing-a".into(),
+        };
+        req.work = &other_revision;
+        assert_eq!(
+            auth.verify_lifecycle(&req),
+            Err(AuthorityError::UnverifiedAuthority)
+        );
+        req.work = &routine;
+        let bad_token = LifecycleTarget::FreshSession {
+            template_id: "template".into(),
+            scoped_session_id: "scoped-a".into(),
+            host_spawn_token: "other-token".into(),
+        };
+        req.resolved_target = &bad_token;
+        assert_eq!(
+            auth.verify_lifecycle(&req),
+            Err(AuthorityError::UnverifiedAuthority)
+        );
+        req.resolved_target = &auth.lifecycle;
+        let bad_template = RoutineTarget::FreshSession {
+            template_id: "other-template".into(),
+        };
+        req.approved_target = &bad_template;
+        assert_eq!(
+            auth.verify_lifecycle(&req),
+            Err(AuthorityError::UnverifiedAuthority)
+        );
+        req.approved_target = &approved;
+        auth.work = intent.clone();
+        req.work = &intent;
+        assert_eq!(auth.verify_lifecycle(&req).unwrap().work, intent);
+        req.work = &other_slot;
+        assert_eq!(
+            auth.verify_lifecycle(&req),
+            Err(AuthorityError::UnverifiedAuthority)
         );
     }
 }

@@ -181,7 +181,7 @@ pub use routine::{
 };
 pub use routine_authority::{
     AuthorityError, LifecycleAuthority, LifecycleTarget, LifecycleVerificationRequest,
-    ProofRegistryVerifier, ProofVerificationRequest, TerminalReceiptVerifier,
+    LogicalWorkIdentity, ProofRegistryVerifier, ProofVerificationRequest, TerminalReceiptVerifier,
     TerminalVerificationRequest, UnavailableAuthority, VerifiedLifecycle, VerifiedProof,
     VerifiedTerminal, VerifiedTerminalOutcome,
 };
