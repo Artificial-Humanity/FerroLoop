@@ -59,6 +59,16 @@ pub enum AccountingUnit {
         billing_contract: String,
     },
 }
+/// Enforced maxima and billing rates for one in-flight model step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpsilonStepBound {
+    pub input_knob: String,
+    pub max_input_tokens: u64,
+    pub output_knob: String,
+    pub max_output_tokens: u64,
+    pub price_per_input_token: Usd,
+    pub price_per_output_token: Usd,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SliceBoundKind {
@@ -70,6 +80,9 @@ pub enum SliceBoundKind {
         epsilon_usd: Usd,
         token_bound_knob: String,
         max_total_tokens: Option<u64>,
+        /// Required evidence for the maximal in-flight step; old records fail closed.
+        #[serde(default)]
+        epsilon_step: Option<EpsilonStepBound>,
     },
     Arithmetic {
         steps_knob: String,
@@ -180,17 +193,33 @@ impl SliceBoundProof {
                 epsilon_usd,
                 token_bound_knob,
                 max_total_tokens,
+                epsilon_step,
             } => {
                 let t = (*max_total_tokens)?;
+                let step = epsilon_step.as_ref()?;
                 if !valid_text(knob)
                     || !valid_text(token_bound_knob)
+                    || !valid_text(&step.input_knob)
+                    || !valid_text(&step.output_knob)
                     || t == 0
                     || *epsilon_tokens == 0
+                    || step.max_input_tokens == 0
+                    || step.max_output_tokens == 0
                 {
                     return None;
                 }
                 let epsilon = epsilon_usd.picos()?;
-                if epsilon == 0 && !zero_allowed {
+                let step_tokens = step.max_input_tokens.checked_add(step.max_output_tokens)?;
+                let step_picos = u128::from(step.max_input_tokens)
+                    .checked_mul(step.price_per_input_token.picos()?)?
+                    .checked_add(
+                        u128::from(step.max_output_tokens)
+                            .checked_mul(step.price_per_output_token.picos()?)?,
+                    )?;
+                if *epsilon_tokens < step_tokens
+                    || epsilon < step_picos
+                    || (epsilon == 0 && !zero_allowed)
+                {
                     return None;
                 }
                 (
@@ -328,6 +357,16 @@ mod tests {
             },
         }
     }
+    fn step() -> EpsilonStepBound {
+        EpsilonStepBound {
+            input_knob: "context".into(),
+            max_input_tokens: 1,
+            output_knob: "output".into(),
+            max_output_tokens: 1,
+            price_per_input_token: money("0.000000000001"),
+            price_per_output_token: money("0"),
+        }
+    }
     fn installed<'a>(p: &'a SliceBoundProof) -> SliceProofInput<'a> {
         SliceProofInput {
             adapter: &p.adapter,
@@ -370,6 +409,7 @@ mod tests {
             epsilon_usd: money("0.1"),
             token_bound_knob: String::new(),
             max_total_tokens: None,
+            epsilon_step: None,
         };
         assert_eq!(
             evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
@@ -386,11 +426,197 @@ mod tests {
             epsilon_usd: money("0.000000000001"),
             token_bound_knob: "turns".into(),
             max_total_tokens: Some(100),
+            epsilon_step: Some(step()),
         };
         let result = evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).unwrap();
         assert_eq!(result.max_tokens, 107);
         assert_eq!(result.max_cost_micros, 1_000_001);
         assert_eq!(result.max_cost_usd.as_str(), "1.000001");
+    }
+    #[test]
+    fn vendor_cap_without_epsilon_derivation_is_unproven() {
+        let mut p = proof();
+        p.kind = SliceBoundKind::VendorCap {
+            knob: "budget".into(),
+            cap_usd: money("1"),
+            epsilon_tokens: 1,
+            epsilon_usd: money("0.000001"),
+            token_bound_knob: "whole-slice".into(),
+            max_total_tokens: Some(100),
+            epsilon_step: None,
+        };
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+    }
+    #[test]
+    fn vendor_cap_checks_enforced_step_epsilon_and_serialization() {
+        let mut p = proof();
+        p.kind = SliceBoundKind::VendorCap {
+            knob: "budget".into(),
+            cap_usd: money("1"),
+            epsilon_tokens: 2,
+            epsilon_usd: money("0.000000000001"),
+            token_bound_knob: "whole-slice".into(),
+            max_total_tokens: Some(100),
+            epsilon_step: Some(step()),
+        };
+        let roundtrip: SliceBoundProof =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(roundtrip, p);
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p))
+                .unwrap()
+                .max_tokens,
+            102
+        );
+        if let SliceBoundKind::VendorCap { epsilon_tokens, .. } = &mut p.kind {
+            *epsilon_tokens = 1;
+        }
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+        if let SliceBoundKind::VendorCap {
+            epsilon_tokens,
+            epsilon_usd,
+            ..
+        } = &mut p.kind
+        {
+            *epsilon_tokens = 3;
+            *epsilon_usd = money("0");
+        }
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+        if let SliceBoundKind::VendorCap {
+            epsilon_usd,
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            *epsilon_usd = money("0.000000000001");
+            s.price_per_input_token = money("0.000000000002");
+        }
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+        if let SliceBoundKind::VendorCap { epsilon_usd, .. } = &mut p.kind {
+            *epsilon_usd = money("0.000000000003");
+        }
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p))
+                .unwrap()
+                .max_tokens,
+            103
+        );
+        let mut old = serde_json::to_value(&p).unwrap();
+        old["kind"].as_object_mut().unwrap().remove("epsilon_step");
+        let old: SliceBoundProof = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&old), &installed(&old)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+    }
+
+    #[test]
+    fn vendor_cap_rejects_unenforced_or_overflowing_step() {
+        let mut p = proof();
+        p.kind = SliceBoundKind::VendorCap {
+            knob: "budget".into(),
+            cap_usd: money("1"),
+            epsilon_tokens: u64::MAX,
+            epsilon_usd: money("1"),
+            token_bound_knob: "whole-slice".into(),
+            max_total_tokens: Some(1),
+            epsilon_step: Some(step()),
+        };
+        assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
+        if let SliceBoundKind::VendorCap {
+            epsilon_tokens,
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            *epsilon_tokens = 2;
+            s.input_knob.clear();
+        }
+        assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
+        if let SliceBoundKind::VendorCap {
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            s.input_knob = "input".into();
+            s.max_input_tokens = u64::MAX;
+        }
+        assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
+        if let SliceBoundKind::VendorCap {
+            epsilon_tokens,
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            *epsilon_tokens = u64::MAX;
+            s.max_input_tokens = u64::MAX - 1;
+            s.price_per_input_token = money("999999999999999999.999999999999");
+        }
+        assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
+    }
+    #[test]
+    fn vendor_cap_zero_epsilon_requires_proven_subscription_and_zero_step_rates() {
+        let mut p = proof();
+        p.auth_billing_mode = "subscription".into();
+        p.accounting_unit = AccountingUnit::SubscriptionIncrementalUsd {
+            billing_contract: "plan".into(),
+            zero_cost_proven: true,
+        };
+        let mut zero_step = step();
+        zero_step.price_per_input_token = money("0");
+        p.kind = SliceBoundKind::VendorCap {
+            knob: "budget".into(),
+            cap_usd: money("0"),
+            epsilon_tokens: 2,
+            epsilon_usd: money("0"),
+            token_bound_knob: "total".into(),
+            max_total_tokens: Some(100),
+            epsilon_step: Some(zero_step),
+        };
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p))
+                .unwrap()
+                .max_cost_micros,
+            0
+        );
+        if let SliceBoundKind::VendorCap {
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            s.price_per_output_token = money("0.000000000001");
+        }
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
+        if let SliceBoundKind::VendorCap {
+            epsilon_step: Some(s),
+            ..
+        } = &mut p.kind
+        {
+            s.price_per_output_token = money("0");
+        }
+        p.accounting_unit = AccountingUnit::SubscriptionIncrementalUsd {
+            billing_contract: "plan".into(),
+            zero_cost_proven: false,
+        };
+        assert_eq!(
+            evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)),
+            Err(SliceAdmissionRefusal::Unproven)
+        );
     }
     #[test]
     fn per_request_checked_and_rounded_up() {
@@ -539,6 +765,7 @@ mod tests {
             epsilon_usd: money("0"),
             token_bound_knob: "turns".into(),
             max_total_tokens: Some(1),
+            epsilon_step: None,
         };
         assert!(evaluate_slice_bounds(std::slice::from_ref(&p), &installed(&p)).is_err());
     }

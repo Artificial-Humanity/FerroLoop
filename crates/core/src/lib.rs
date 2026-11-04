@@ -176,8 +176,8 @@ pub use session_protocol::{
     OperationEvidence, SessionProtocolKind,
 };
 pub use slice_proof::{
-    AccountingUnit, AdmittedSliceBound, SliceAdmissionRefusal, SliceBoundKind, SliceBoundProof,
-    SliceProofInput, Usd, evaluate_slice_bounds,
+    AccountingUnit, AdmittedSliceBound, EpsilonStepBound, SliceAdmissionRefusal, SliceBoundKind,
+    SliceBoundProof, SliceProofInput, Usd, evaluate_slice_bounds,
 };
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
