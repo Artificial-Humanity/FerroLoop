@@ -83,7 +83,6 @@ pub enum Product {
     Ferrotrack,
     Ferrowatch,
     Ferrodeck,
-    Ferrostep,
 }
 
 crate::wire::wire_names!(Product as product_wire {
@@ -95,7 +94,6 @@ crate::wire::wire_names!(Product as product_wire {
     Ferrotrack => "ferrotrack",
     Ferrowatch => "ferrowatch",
     Ferrodeck => "ferrodeck",
-    Ferrostep => "ferrostep",
 });
 crate::wire::wire_parse!(Product as product_parse);
 
@@ -111,7 +109,6 @@ impl Product {
             Product::Ferrotrack => "FerroTrack",
             Product::Ferrowatch => "FerroWatch",
             Product::Ferrodeck => "FerroDeck",
-            Product::Ferrostep => "FerroStep",
         }
     }
 
@@ -127,7 +124,7 @@ impl Product {
 
     /// The ids of the `.fl/architecture.toml` components that implement this
     /// product. Empty where the spec names no component of its own (FerroState
-    /// spans `fl-core`, `fl-cli` and `fl-store`; FerroStep has no crate).
+    /// spans `fl-core`, `fl-cli` and `fl-store`).
     pub fn arch_components(self) -> &'static [&'static str] {
         match self {
             Product::Ferroloop => &["fl_core", "fl_exec"],
@@ -138,9 +135,23 @@ impl Product {
             Product::Ferrotrack => &["fl_github"],
             Product::Ferrowatch => &["fl_watch"],
             Product::Ferrodeck => &["fl_hub", "ferrodeck_ui"],
-            Product::Ferrostep => &[],
         }
     }
+}
+
+/// Read pre-retirement install state without exposing the retired product as selectable.
+fn deserialize_installed_products<'de, D>(deserializer: D) -> Result<Vec<Product>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ids = Vec::<String>::deserialize(deserializer)?;
+    ids.into_iter()
+        .filter(|id| id != "ferrostep")
+        .map(|id| {
+            Product::from_wire(&id)
+                .ok_or_else(|| serde::de::Error::custom(format!("unknown product `{id}`")))
+        })
+        .collect()
 }
 
 impl fmt::Display for Product {
@@ -369,8 +380,7 @@ mod tests {
                 "ferrogate",
                 "ferrotrack",
                 "ferrowatch",
-                "ferrodeck",
-                "ferrostep"
+                "ferrodeck"
             ]
         );
         assert_eq!(Product::ALL.iter().filter(|p| p.is_required()).count(), 1);

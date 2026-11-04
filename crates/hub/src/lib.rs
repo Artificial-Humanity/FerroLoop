@@ -5364,7 +5364,7 @@ mod tests {
                 "ferrowire",
                 "ferrostate",
                 "ferrogate",
-                "ferrostep",
+                "ferroloop",
                 "ferrodeck"
             ])
         );
@@ -8967,7 +8967,7 @@ default_target = "connector:parity:get_thing"
             "subsystems": {
                 "ferrogate_enabled": true,
                 "ferrostate_enabled": true,
-                "ferrostep_enabled": true,
+                "fl_flow_enabled": true,
             },
             "notifications": {
                 "notify_on_pr_review": true,
@@ -9048,10 +9048,10 @@ default_target = "connector:parity:get_thing"
             "PUT",
             url,
             OWNER,
-            &json!({ "subsystems": { "ferrostep_enabled": false } }),
+            &json!({ "subsystems": { "fl_flow_enabled": false } }),
         );
         assert_eq!(resp.status, 200);
-        expected["subsystems"]["ferrostep_enabled"] = json!(false);
+        expected["subsystems"]["fl_flow_enabled"] = json!(false);
         assert_eq!(resp.json_value().unwrap(), expected);
 
         // Persisted: a fresh hub over the same home reads them back.

@@ -38,7 +38,7 @@ pub const FEDERATED_SUBSYSTEMS: [&str; 5] = [
     "ferrowire",
     "ferrostate",
     "ferrogate",
-    "ferrostep",
+    "ferroloop",
     "ferrodeck",
 ];
 /// Worker-reported activity, separate from the liveness `status` the hub computes.
@@ -1851,7 +1851,7 @@ mod tests {
                 reported_status: Some("Busy".to_string()),
                 active_tasks: Some(4),
                 load_avg: Some(2.25),
-                federated_subsystems: Some(vec!["ferrostep".to_string()]),
+                federated_subsystems: Some(vec!["ferroloop".to_string()]),
                 now_ms: 9_000,
                 ..Default::default()
             },
@@ -1859,7 +1859,7 @@ mod tests {
         .unwrap();
         assert_eq!(view.reported_status.as_deref(), Some("busy"));
         assert_eq!((view.active_tasks, view.load_avg), (4, Some(2.25)));
-        assert_eq!(view.federated_subsystems, ["ferrostep"]);
+        assert_eq!(view.federated_subsystems, ["ferroloop"]);
 
         for bad in [
             HeartbeatUpdate {

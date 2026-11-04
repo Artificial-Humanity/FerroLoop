@@ -22,7 +22,7 @@ const HUB: EnrolledNode = {
   enrolled_at_ms: 1,
   last_seen_at_ms: 2,
   environment_kind: "ai-lab",
-  federated_subsystems: ["ferrowire", "ferrostate", "ferrogate", "ferrostep", "ferrodeck"],
+  federated_subsystems: ["ferrowire", "ferrostate", "ferrogate", "ferroloop", "ferrodeck"],
 };
 
 const MAC: EnrolledNode = {
@@ -108,7 +108,7 @@ describe("Track F: environment profiles and federation controls", () => {
     expect(screen.getByTestId("env-badge-ai-lab-0")).toHaveTextContent("ai-lab");
     expect(screen.getByTestId("env-badge-mac-studio")).toHaveTextContent("macos-xcode");
     expect(screen.getByTestId("env-badge-cloud-1")).toHaveTextContent("cloud-worker");
-    for (const sub of ["ferrowire", "ferrostate", "ferrogate", "ferrostep", "ferrodeck"]) {
+    for (const sub of ["ferrowire", "ferrostate", "ferrogate", "ferroloop", "ferrodeck"]) {
       expect(screen.getByTestId(`subsystem-pill-ai-lab-0-${sub}`)).toHaveTextContent(sub);
     }
     expect(screen.queryByTestId("subsystem-pill-cloud-1-ferrowire")).toBeNull();

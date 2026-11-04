@@ -343,7 +343,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
           poll_interval_secs: 5,
           enable_ferrogate: true,
           enable_ferrostate: true,
-          enable_ferrostep: false,
+          enable_fl_flow: false,
           notifications: {
             notify_urgent_wire: true,
             notify_gate_approvals: true,
@@ -597,7 +597,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
             subsystems: {
               ferrogate_enabled: true,
               ferrostate_enabled: true,
-              ferrostep_enabled: true,
+              fl_flow_enabled: true,
             },
             notifications: {
               notify_on_pr_review: true,

@@ -203,7 +203,7 @@ describe("Wave A UI — Records 10, 4 & 29", () => {
       fireEvent.change(screen.getByTestId("settings-theme-select"), {
         target: { value: "light" },
       });
-      fireEvent.click(screen.getByTestId("toggle-ferrostep"));
+      fireEvent.click(screen.getByTestId("toggle-fl-flow"));
       fireEvent.click(screen.getByTestId("toggle-notify-sound"));
       fireEvent.change(screen.getByTestId("input-poll-interval"), {
         target: { value: "10" },
@@ -224,7 +224,7 @@ describe("Wave A UI — Records 10, 4 & 29", () => {
         subsystems: {
           ferrogate_enabled: true,
           ferrostate_enabled: true,
-          ferrostep_enabled: false,
+          fl_flow_enabled: false,
         },
         notifications: {
           notify_on_pr_review: true,

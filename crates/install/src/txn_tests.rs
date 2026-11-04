@@ -757,13 +757,20 @@ fn a_crash_during_the_rollback_itself_is_finished_by_the_next_rollback() {
 
 #[test]
 fn a_receipt_only_change_is_a_short_transaction_that_also_recovers() {
-    // `--add ferrostep` has no files of its own: only the receipt changes.
+    // A selected product with no files or actions changes only the receipt.
     let run = |faults: Faults| {
         let w = World::new(Kind::Explicit);
-        let m = w.release("0.1.0", "a");
+        let mut m = w.release("0.1.0", "a");
+        let deck = m
+            .products
+            .iter_mut()
+            .find(|p| p.id == Product::Ferrodeck.as_wire())
+            .unwrap();
+        deck.files.clear();
+        deck.actions.clear();
         w.install(&m);
         let mut req = w.request(None);
-        req.add = vec![Product::Ferrostep];
+        req.add = vec![Product::Ferrodeck];
         let host = HostInfo::from_consts(std::env::consts::OS, std::env::consts::ARCH).unwrap();
         let mut env = w.env();
         env.faults = faults;
@@ -783,7 +790,7 @@ fn a_receipt_only_change_is_a_short_transaction_that_also_recovers() {
     let r = r.unwrap();
     assert_eq!(r.steps, [Step::Begin, Step::WriteReceipt, Step::Commit]);
     let post = clean.snap();
-    assert!(clean.receipt().products.contains(&Product::Ferrostep));
+    assert!(clean.receipt().products.contains(&Product::Ferrodeck));
     assert_eq!(clean.receipt().journal.len(), 2);
 
     for point in FaultPoint::all(&r.steps) {

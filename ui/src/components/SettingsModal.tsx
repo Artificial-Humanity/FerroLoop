@@ -1077,7 +1077,7 @@ export interface ProductDependencyClosureResult {
 
 function normalizeSubProductId(raw: string): SubProductId | null {
   const clean = raw.trim().toLowerCase();
-  if (clean === "ferrostep" || clean === "fl-flow" || clean === "flow") {
+  if (clean === "fl-flow" || clean === "flow") {
     return "fl-flow";
   }
   if (clean in SUBPRODUCT_DEPENDENCY_GRAPH) {
@@ -1152,7 +1152,7 @@ export function resolveProfileSubsystems(
     return {
       ferrogate_enabled: false,
       ferrostate_enabled: false,
-      ferrostep_enabled: false,
+      fl_flow_enabled: false,
       ferrodeck_enabled: false,
       ferrowire_enabled: false,
       ferrotrack_enabled: false,
@@ -1163,7 +1163,7 @@ export function resolveProfileSubsystems(
     return {
       ferrogate_enabled: true,
       ferrostate_enabled: true,
-      ferrostep_enabled: true,
+      fl_flow_enabled: true,
       ferrodeck_enabled: false,
       ferrowire_enabled: true,
       ferrotrack_enabled: true,
@@ -1173,7 +1173,7 @@ export function resolveProfileSubsystems(
   return {
     ferrogate_enabled: true,
     ferrostate_enabled: true,
-    ferrostep_enabled: true,
+    fl_flow_enabled: true,
     ferrodeck_enabled: true,
     ferrowire_enabled: true,
     ferrotrack_enabled: true,
@@ -1191,7 +1191,7 @@ export function inferInstallProfilePreset(
   const gate = subsystems.ferrogate_enabled;
   const track = subsystems.ferrotrack_enabled ?? true;
   const watch = subsystems.ferrowatch_enabled ?? true;
-  const flow = subsystems.ferrostep_enabled;
+  const flow = subsystems.fl_flow_enabled;
 
   if (!deck && !wire && !state && !gate && !track && !watch && !flow) {
     return "minimal";
@@ -6584,7 +6584,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             if (settings.subsystems.ferrowatch_enabled ?? true) {
               selectedIds.push("ferrowatch");
             }
-            if (settings.subsystems.ferrostep_enabled) {
+            if (settings.subsystems.fl_flow_enabled) {
               selectedIds.push("fl-flow");
             }
             const closure = computeProductDependencyClosure(
@@ -6908,15 +6908,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   <input
                     type="checkbox"
-                    data-testid="toggle-ferrostep"
-                    checked={settings.subsystems.ferrostep_enabled}
+                    data-testid="toggle-fl-flow"
+                    checked={settings.subsystems.fl_flow_enabled}
                     onChange={(e) => {
                       setSettingsSaved(false);
                       setSettings((prev) => ({
                         ...prev,
                         subsystems: {
                           ...prev.subsystems,
-                          ferrostep_enabled: e.target.checked,
+                          fl_flow_enabled: e.target.checked,
                         },
                       }));
                     }}

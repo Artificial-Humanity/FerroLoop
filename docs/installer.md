@@ -24,7 +24,6 @@ the path guard, the tree reader), `crates/cli/src/cmd/install.rs` (the command).
 | `ferrotrack` | `ferrostore` | none |
 | `ferrowatch` | `ferrostore` | none |
 | `ferrodeck` | `ferrostore`, `ferrowire` | `ferrogate`, `ferrowatch`, `ferrotrack` |
-| `ferrostep` | `ferroloop` | none |
 
 | Profile | Products |
 |---|---|

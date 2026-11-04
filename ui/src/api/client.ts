@@ -137,6 +137,7 @@ export function normalizeHubSettings(
     obj.subsystems && typeof obj.subsystems === "object"
       ? (obj.subsystems as Record<string, unknown>)
       : {};
+  const flowEnabled = subRaw.fl_flow_enabled ?? subRaw.ferrostep_enabled;
   const notifRaw =
     obj.notifications && typeof obj.notifications === "object"
       ? (obj.notifications as Record<string, unknown>)
@@ -209,10 +210,10 @@ export function normalizeHubSettings(
         typeof subRaw.ferrostate_enabled === "boolean"
           ? subRaw.ferrostate_enabled
           : fallback.subsystems.ferrostate_enabled,
-      ferrostep_enabled:
-        typeof subRaw.ferrostep_enabled === "boolean"
-          ? subRaw.ferrostep_enabled
-          : fallback.subsystems.ferrostep_enabled,
+      fl_flow_enabled:
+        typeof flowEnabled === "boolean"
+          ? flowEnabled
+          : fallback.subsystems.fl_flow_enabled,
       ...(typeof subRaw.ferrodeck_enabled === "boolean"
         ? { ferrodeck_enabled: subRaw.ferrodeck_enabled }
         : {}),
