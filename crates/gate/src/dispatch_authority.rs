@@ -183,6 +183,23 @@ pub trait AuthoritySource: Send + Sync {
             "durable fence verification unavailable",
         ))
     }
+    /// Authenticate the complete generation history in `(from, to]` and prove
+    /// that every change is a monotonic durable revocation of one of `pending`.
+    /// The implementation must bound work and fail closed on an oversized or
+    /// incomplete history. A matching current generation or the continued presence of one fence is
+    /// not enough: an intervening policy change or grant must cause refusal.
+    /// This may perform I/O and is called without the broker mutex. The caller
+    /// must subsequently acquire a whole-source guard and recheck `to`.
+    fn verify_revocation_transition(
+        &self,
+        _from: u64,
+        _to: u64,
+        _pending: &[BTreeSet<ScopeKey>],
+    ) -> Result<(), GateError> {
+        Err(GateError::DispatchAuthority(
+            "revocation transition verification unavailable",
+        ))
+    }
     fn worker_terminated(
         &self,
         worker: &WorkerIdentity,
@@ -310,6 +327,12 @@ struct State {
     fences: BTreeMap<u64, Fence>,
     next_fence_id: u64,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshResult {
+    Published,
+    Retry,
+    Unverified,
+}
 /// A pure in-process kernel; singleton hosting, authenticated transport, and durable
 /// source are deliberately not implemented here. Starts sealed after every restart.
 pub struct BrokerState {
@@ -400,6 +423,41 @@ impl BrokerState {
             let Ok(generation) = self.source.verify_persisted_fence(scope) else {
                 return Ok(false);
             };
+            let (from, pending): (_, Vec<_>) = {
+                let state = self.state()?;
+                let Some(current) = state.generation.filter(|_| !state.revocation_failed) else {
+                    return Ok(false);
+                };
+                let pending = state
+                    .fences
+                    .values()
+                    .filter(|f| f.phase == FencePhase::Persisting)
+                    .map(|f| f.scope.clone())
+                    .collect();
+                (current, pending)
+            };
+            if generation < from {
+                continue;
+            }
+            if generation > from
+                && self
+                    .source
+                    .verify_revocation_transition(from, generation, &pending)
+                    .is_err()
+            {
+                // A concurrent authenticated publication or source mutation can
+                // invalidate the snapshot while it is being checked. Retry rather
+                // than treating that transient mismatch as a verified failure.
+                if self.state()?.generation != Some(from) {
+                    continue;
+                }
+                if let Ok(guard) = self.source.guard_admission(&BTreeSet::new())
+                    && guard.generation() > generation
+                {
+                    continue;
+                }
+                return Ok(false);
+            }
             let Ok(guard) = self.source.guard_admission(&BTreeSet::new()) else {
                 return Ok(false);
             };
@@ -407,12 +465,11 @@ impl BrokerState {
                 continue;
             }
             let mut state = self.state()?;
-            if state.revocation_failed
-                || !state
-                    .generation
-                    .is_some_and(|current| generation >= current)
-            {
+            if state.revocation_failed || state.generation.is_none() {
                 return Ok(false);
+            }
+            if state.generation != Some(from) {
+                continue;
             }
             state.generation = Some(generation);
             let Some(fence) = state.fences.get_mut(&id) else {
@@ -426,6 +483,106 @@ impl BrokerState {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Publish an authenticated source generation while another fence's durable write
+    /// is being verified. The existing in-memory fence stays in place: verifying it here
+    /// is evidence for the source snapshot, not permission to retire that fence.
+    ///
+    /// Source I/O is outside the broker mutex. A whole-source guard then makes the
+    /// generation recheck and publication atomic with respect to sanctioned writers.
+    fn refresh_during_persistence(&self, expected: u64) -> Result<RefreshResult, GateError> {
+        let (from, witnesses): (_, Vec<_>) = {
+            let state = self.state()?;
+            if state.generation == Some(expected) && !state.revocation_failed {
+                return Ok(RefreshResult::Published);
+            }
+            if state.generation.is_some_and(|current| current > expected)
+                && !state.revocation_failed
+            {
+                return Ok(RefreshResult::Retry);
+            }
+            let Some(from) = state.generation.filter(|_| !state.revocation_failed) else {
+                return Ok(RefreshResult::Unverified);
+            };
+            let witnesses = state
+                .fences
+                .iter()
+                .filter(|(_, fence)| fence.phase == FencePhase::Persisting)
+                .take(4096)
+                .map(|(id, fence)| (*id, fence.scope.clone()))
+                .collect();
+            (from, witnesses)
+        };
+        if expected <= from || witnesses.is_empty() {
+            return Ok(RefreshResult::Unverified);
+        }
+        let pending = witnesses
+            .iter()
+            .map(|(_, scope)| scope.clone())
+            .collect::<Vec<_>>();
+        if self
+            .source
+            .verify_revocation_transition(from, expected, &pending)
+            .is_err()
+        {
+            // The authenticated source can advance during verification. Re-resolve
+            // the request instead of sealing solely on that transient race; a
+            // subsequent attempt still has to prove the entire new transition.
+            if let Ok(guard) = self.source.guard_admission(&BTreeSet::new())
+                && guard.generation() > expected
+            {
+                return Ok(RefreshResult::Retry);
+            }
+            let state = self.state()?;
+            if state.generation == Some(expected) && !state.revocation_failed {
+                return Ok(RefreshResult::Published);
+            }
+            return Ok(RefreshResult::Unverified);
+        }
+        for (id, scope) in witnesses {
+            match self.source.verify_persisted_fence(&scope) {
+                Ok(generation) if generation == expected => {}
+                Ok(generation) if generation > expected => return Ok(RefreshResult::Retry),
+                _ => continue,
+            };
+            let Ok(guard) = self.source.guard_admission(&BTreeSet::new()) else {
+                continue;
+            };
+            if guard.generation() != expected {
+                return Ok(RefreshResult::Retry);
+            }
+            let mut state = self.state()?;
+            if state.revocation_failed || state.generation.is_none() {
+                return Ok(RefreshResult::Unverified);
+            }
+            if state.generation == Some(expected) {
+                return Ok(RefreshResult::Published);
+            }
+            if state.generation != Some(from) {
+                return Ok(RefreshResult::Retry);
+            }
+            if !state
+                .fences
+                .get(&id)
+                .is_some_and(|fence| fence.phase == FencePhase::Persisting && fence.scope == scope)
+            {
+                continue;
+            }
+            state.generation = Some(expected);
+            self.changed.notify_all();
+            return Ok(RefreshResult::Published);
+        }
+        let state = self.state()?;
+        if state.generation == Some(expected) && !state.revocation_failed {
+            Ok(RefreshResult::Published)
+        } else if state.generation.is_some_and(|current| current > expected)
+            && !state.revocation_failed
+        {
+            Ok(RefreshResult::Retry)
+        } else {
+            Ok(RefreshResult::Unverified)
+        }
     }
     /// Request cancellation of expired workers without treating expiry or a successful
     /// cancellation request as confirmation of quiescence. A host should call this on its
@@ -617,76 +774,116 @@ impl DispatchAuthority for BrokerState {
         {
             return Err(GateError::DispatchAuthority("invalid revocation"));
         }
-        let resolved = self.source.resolve_revocation(scope);
-        let (generation, expanded) = match resolved {
-            Ok(pair) => pair,
-            Err(error) => {
-                // If aliases cannot be authenticated, do not leave an equivalent scope open.
-                let mut state = self.state()?;
-                state.generation = None;
-                state.revocation_failed = true;
-                return Err(error);
-            }
-        };
-        if expanded.is_empty()
-            || expanded.len() > 128
-            || !scope.is_subset(&expanded)
-            || expanded.iter().any(|s| !s.valid())
-        {
-            let mut state = self.state()?;
-            state.generation = None;
-            state.revocation_failed = true;
-            return Err(GateError::DispatchAuthority("invalid revocation aliases"));
-        }
-        // The resolved alias set is authenticated outside the broker mutex. Fence the
-        // source before publishing the revocation so it cannot change between those steps.
-        let generation_guard = match self.source.guard_admission(&expanded) {
-            Ok(guard) if guard.generation() == generation => guard,
-            Ok(_) | Err(_) => {
-                let mut state = self.state()?;
-                state.generation = None;
-                state.revocation_failed = true;
-                return Err(GateError::DispatchAuthority(
-                    "stale or uncoordinated revocation",
-                ));
-            }
-        };
-        let (index, ready) = {
-            let mut s = self.state()?;
-            if s.generation != Some(generation) {
-                s.generation = None;
-                s.revocation_failed = true;
-                return Err(GateError::DispatchAuthority("sealed or stale authority"));
-            }
-            // Capacity exhaustion seals all new work; it never allows a revocation to fail open.
-            if s.fences.len() >= 4096 {
-                s.generation = None;
-                s.revocation_failed = true;
-                return Err(GateError::DispatchAuthority("revocation capacity reached"));
-            }
-            // This insertion is the revocation linearization point.
-            let index = s.next_fence_id;
-            let Some(next) = index.checked_add(1) else {
-                // A revocation we cannot represent must never leave authority open.
-                s.generation = None;
-                s.revocation_failed = true;
-                return Err(GateError::DispatchAuthority("revocation id exhausted"));
+        let mut refresh_attempts = 0;
+        let (index, ready) = loop {
+            let resolved = self.source.resolve_revocation(scope);
+            let (generation, expanded) = match resolved {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // If aliases cannot be authenticated, do not leave an equivalent scope open.
+                    let mut state = self.state()?;
+                    state.generation = None;
+                    state.revocation_failed = true;
+                    return Err(error);
+                }
             };
-            s.next_fence_id = next;
-            s.fences.insert(
-                index,
-                Fence {
-                    scope: expanded,
-                    reason: reason.into(),
-                    phase: FencePhase::Pending,
-                    waiting: true,
-                },
-            );
-            let ready = Self::ready_to_persist(&mut s);
-            (index, ready)
+            if expanded.is_empty()
+                || expanded.len() > 128
+                || !scope.is_subset(&expanded)
+                || expanded.iter().any(|s| !s.valid())
+            {
+                let mut state = self.state()?;
+                state.generation = None;
+                state.revocation_failed = true;
+                return Err(GateError::DispatchAuthority("invalid revocation aliases"));
+            }
+            // The resolved alias set is authenticated outside the broker mutex. Fence the
+            // source before publishing the revocation so it cannot change between those steps.
+            let generation_guard = match self.source.guard_admission(&expanded) {
+                Ok(guard) if guard.generation() == generation => guard,
+                Ok(guard) => {
+                    let current = guard.generation();
+                    drop(guard);
+                    if current > generation && refresh_attempts < 8 {
+                        refresh_attempts += 1;
+                        match self.refresh_during_persistence(current)? {
+                            RefreshResult::Published | RefreshResult::Retry => continue,
+                            RefreshResult::Unverified => {}
+                        }
+                    }
+                    let mut state = self.state()?;
+                    state.generation = None;
+                    state.revocation_failed = true;
+                    return Err(GateError::DispatchAuthority(
+                        "stale or uncoordinated revocation",
+                    ));
+                }
+                Err(_) => {
+                    let mut state = self.state()?;
+                    state.generation = None;
+                    state.revocation_failed = true;
+                    return Err(GateError::DispatchAuthority(
+                        "stale or uncoordinated revocation",
+                    ));
+                }
+            };
+            let (index, ready) = {
+                let mut s = self.state()?;
+                if s.generation != Some(generation) {
+                    let may_refresh = s.generation.is_some_and(|current| generation > current)
+                        && !s.revocation_failed
+                        && s.fences.values().any(|f| f.phase == FencePhase::Persisting)
+                        && refresh_attempts < 8;
+                    if may_refresh {
+                        drop(s);
+                        drop(generation_guard);
+                        refresh_attempts += 1;
+                        match self.refresh_during_persistence(generation)? {
+                            RefreshResult::Published | RefreshResult::Retry => continue,
+                            RefreshResult::Unverified => {}
+                        }
+                        let mut state = self.state()?;
+                        state.generation = None;
+                        state.revocation_failed = true;
+                        return Err(GateError::DispatchAuthority(
+                            "unverified authority generation",
+                        ));
+                    }
+                    s.generation = None;
+                    s.revocation_failed = true;
+                    return Err(GateError::DispatchAuthority("sealed or stale authority"));
+                }
+                // Capacity exhaustion seals all new work; it never allows a revocation to fail open.
+                if s.fences.len() >= 4096 {
+                    s.generation = None;
+                    s.revocation_failed = true;
+                    return Err(GateError::DispatchAuthority("revocation capacity reached"));
+                }
+                // This insertion is the revocation linearization point.
+                let index = s.next_fence_id;
+                let Some(next) = index.checked_add(1) else {
+                    // A revocation we cannot represent must never leave authority open.
+                    s.generation = None;
+                    s.revocation_failed = true;
+                    return Err(GateError::DispatchAuthority("revocation id exhausted"));
+                };
+                s.next_fence_id = next;
+                s.fences.insert(
+                    index,
+                    Fence {
+                        scope: expanded,
+                        reason: reason.into(),
+                        phase: FencePhase::Pending,
+                        waiting: true,
+                    },
+                );
+                let ready = Self::ready_to_persist(&mut s);
+                (index, ready)
+            };
+            // Persistence may need the source's write side. Never hold its read fence over I/O.
+            drop(generation_guard);
+            break (index, ready);
         };
-        // Persistence may need the source's write side. Never hold its read fence over I/O.
-        drop(generation_guard);
         if let Err(error) = self.persist_ready(ready) {
             // This caller is no longer waiting. A separately persisted fence may
             // have succeeded in the same batch; retire it if authenticated, while
@@ -791,6 +988,7 @@ mod tests {
         stopped: AtomicBool,
         cancellations: AtomicU64,
         persisted: Mutex<Vec<BTreeSet<ScopeKey>>>,
+        revocation_history: Mutex<BTreeMap<u64, BTreeSet<ScopeKey>>>,
     }
     impl Default for TestSource {
         fn default() -> Self {
@@ -803,6 +1001,7 @@ mod tests {
                 stopped: AtomicBool::new(false),
                 cancellations: AtomicU64::new(0),
                 persisted: Mutex::new(vec![]),
+                revocation_history: Mutex::new(BTreeMap::new()),
             }
         }
     }
@@ -946,6 +1145,16 @@ mod tests {
         assert_eq!(
             PermitId::from_wire("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
             None
+        );
+    }
+
+    #[test]
+    fn source_without_transition_history_cannot_authorize_generation_refresh() {
+        let source = TestSource::default();
+        assert!(
+            source
+                .verify_revocation_transition(1, 2, &[scope("A")])
+                .is_err()
         );
     }
 
@@ -1445,11 +1654,40 @@ mod tests {
         fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, _: &str) -> Result<(), GateError> {
             let _guard = self.0.generation_gate.write().unwrap();
             self.0.persisted.lock().unwrap().push(scope.clone());
-            self.0.generation.fetch_add(1, Ordering::SeqCst);
+            let generation = self.0.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0
+                .revocation_history
+                .lock()
+                .unwrap()
+                .insert(generation, scope.clone());
             Ok(())
         }
         fn verify_persisted_fence(&self, scope: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
             self.0.verify_persisted_fence(scope)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            let _guard = self.0.generation_gate.read().unwrap();
+            let history = self.0.revocation_history.lock().unwrap();
+            let start = from
+                .checked_add(1)
+                .ok_or(GateError::DispatchAuthority("generation overflow"))?;
+            if to != self.0.generation.load(Ordering::SeqCst)
+                || start > to
+                || to.saturating_sub(from) > 4096
+                || (start..=to).any(|generation| {
+                    history
+                        .get(&generation)
+                        .is_none_or(|scope| !pending.contains(scope))
+                })
+            {
+                return Err(GateError::DispatchAuthority("unverified transition"));
+            }
+            Ok(())
         }
         fn worker_terminated(
             &self,
@@ -1483,6 +1721,365 @@ mod tests {
         );
         assert!(broker.admit(&AdmitRequest::secret("KEY")).is_err());
         assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
+    }
+
+    /// Pause one revocation after its durable write advanced the source generation.
+    struct PausedFenceVerification {
+        source: AdvancingSource,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        paused: AtomicBool,
+    }
+    impl AuthoritySource for PausedFenceVerification {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.source.reconcile()
+        }
+        fn verify_admission(&self, req: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.source.verify_admission(req)
+        }
+        fn guard_admission<'a>(
+            &'a self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(scope)
+        }
+        fn resolve_revocation(
+            &self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            self.source.resolve_revocation(scope)
+        }
+        fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            self.source.persist_fence(scope, reason)
+        }
+        fn verify_persisted_fence(&self, scope: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
+            if scope.contains(&ScopeKey::Secret("A".into()))
+                && !self.paused.swap(true, Ordering::SeqCst)
+            {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+            }
+            self.source.verify_persisted_fence(scope)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            self.source.verify_revocation_transition(from, to, pending)
+        }
+        fn worker_terminated(
+            &self,
+            worker: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(worker)
+        }
+        fn request_cancellation(
+            &self,
+            id: &PermitId,
+            worker: &WorkerIdentity,
+        ) -> Result<(), GateError> {
+            self.source.request_cancellation(id, worker)
+        }
+    }
+
+    #[test]
+    fn unrelated_revoke_during_generation_publication_keeps_both_fences() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(PausedFenceVerification {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            paused: AtomicBool::new(false),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source,
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("A"), "owner", Duration::from_secs(2)))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let b = broker.revoke(&scope("B"), "owner", Duration::from_secs(2));
+        assert_eq!(b.unwrap(), RevokeAck::Complete);
+        // A's first verifier is still paused. Its in-memory fence must continue to
+        // deny A while the now-authenticated generation permits unrelated work.
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
+        resume_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), RevokeAck::Complete);
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
+    }
+
+    struct PausedAliasResolution {
+        source: AdvancingSource,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        paused: AtomicBool,
+    }
+    impl AuthoritySource for PausedAliasResolution {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.source.reconcile()
+        }
+        fn verify_admission(&self, req: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.source.verify_admission(req)
+        }
+        fn guard_admission<'a>(
+            &'a self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(scope)
+        }
+        fn resolve_revocation(
+            &self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            let resolved = self.source.resolve_revocation(scope)?;
+            if scope.contains(&ScopeKey::Secret("B".into()))
+                && !self.paused.swap(true, Ordering::SeqCst)
+            {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+            }
+            Ok(resolved)
+        }
+        fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            self.source.persist_fence(scope, reason)
+        }
+        fn verify_persisted_fence(&self, scope: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
+            self.source.verify_persisted_fence(scope)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            self.source.verify_revocation_transition(from, to, pending)
+        }
+        fn worker_terminated(
+            &self,
+            worker: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(worker)
+        }
+        fn request_cancellation(
+            &self,
+            id: &PermitId,
+            worker: &WorkerIdentity,
+        ) -> Result<(), GateError> {
+            self.source.request_cancellation(id, worker)
+        }
+    }
+
+    #[test]
+    fn revoke_re_resolves_aliases_when_another_fence_publishes_first() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(PausedAliasResolution {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            paused: AtomicBool::new(false),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source,
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let b = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("B"), "owner", Duration::from_secs(2)))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            broker
+                .revoke(&scope("A"), "owner", Duration::from_secs(2))
+                .unwrap(),
+            RevokeAck::Complete
+        );
+        resume_tx.send(()).unwrap();
+        assert_eq!(b.join().unwrap().unwrap(), RevokeAck::Complete);
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
+    }
+
+    #[test]
+    fn unrelated_mutation_after_persisted_fence_never_publishes_generation() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(PausedFenceVerification {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            paused: AtomicBool::new(false),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source.clone(),
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("A"), "owner", Duration::from_secs(2)))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // A is durable at generation 2. This separate mutation advances to 3,
+        // without a revocation-transition record that can authorize publication.
+        source.source.0.rotate(3);
+        assert!(
+            broker
+                .revoke(&scope("B"), "owner", Duration::from_secs(2))
+                .is_err()
+        );
+        assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_err());
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn persisted_fence_alone_cannot_publish_unrelated_authority_mutation() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(PausedFenceVerification {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            paused: AtomicBool::new(false),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source.clone(),
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("A"), "owner", Duration::from_secs(2)))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        source.source.0.rotate(3);
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_ne!(broker.state().unwrap().generation, Some(3));
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_err());
+    }
+
+    /// A generation advance is not evidence of a fence that has not been persisted.
+    struct PausedBeforePersistence {
+        source: AdvancingSource,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl AuthoritySource for PausedBeforePersistence {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.source.reconcile()
+        }
+        fn verify_admission(&self, req: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.source.verify_admission(req)
+        }
+        fn guard_admission<'a>(
+            &'a self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(scope)
+        }
+        fn resolve_revocation(
+            &self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            self.source.resolve_revocation(scope)
+        }
+        fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            if scope.contains(&ScopeKey::Secret("A".into())) {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+            }
+            self.source.persist_fence(scope, reason)
+        }
+        fn verify_persisted_fence(&self, scope: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
+            self.source.verify_persisted_fence(scope)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            self.source.verify_revocation_transition(from, to, pending)
+        }
+        fn worker_terminated(
+            &self,
+            worker: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(worker)
+        }
+        fn request_cancellation(
+            &self,
+            id: &PermitId,
+            worker: &WorkerIdentity,
+        ) -> Result<(), GateError> {
+            self.source.request_cancellation(id, worker)
+        }
+    }
+
+    #[test]
+    fn unrelated_generation_advance_without_durable_witness_seals() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(PausedBeforePersistence {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source.clone(),
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("A"), "owner", Duration::from_secs(2)))
+        };
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        source.source.0.rotate(2);
+        assert!(
+            broker
+                .revoke(&scope("B"), "owner", Duration::from_secs(2))
+                .is_err()
+        );
+        assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_err());
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
     }
     #[test]
     fn durable_fences_do_not_exhaust_pending_fence_capacity() {
@@ -1667,6 +2264,14 @@ mod tests {
                 self.resume.lock().unwrap().recv().unwrap();
             }
             Ok(generation)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            self.source.verify_revocation_transition(from, to, pending)
         }
         fn worker_terminated(
             &self,
