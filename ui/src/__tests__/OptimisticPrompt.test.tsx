@@ -17,6 +17,20 @@ const props = (handler: () => Promise<unknown>) => ({ agentName: "alpha", sessio
 
 beforeEach(() => { sessionDraftMemory.clear(); sessionSendErrors.clear(); window.localStorage.clear(); });
 describe("optimistic prompt submission", () => {
+  it("keeps an in-flight turn and prevents a duplicate after remount", async () => {
+    const pending = deferred<unknown>();
+    const handler = vi.fn(() => pending.promise);
+    const first = render(<ChatPane {...props(handler)} />);
+    fireEvent.change(input(), { target: { value: "first" } });
+    send();
+    first.unmount();
+    render(<ChatPane {...props(handler)} />);
+    expect(within(screen.getByTestId("optimistic-user-turn")).getByText("Sending...")).toBeInTheDocument();
+    fireEvent.change(input(), { target: { value: "second" } });
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(handler).toHaveBeenCalledTimes(1);
+    await act(async () => { pending.resolve({ status: "sent", delivered: true }); await pending.promise; });
+  });
   it("clears immediately and displays the sending turn, then reconciles a real-time transcript without duplication", async () => {
     const pending = deferred<unknown>();
     const onSendPrompt = vi.fn(() => pending.promise);

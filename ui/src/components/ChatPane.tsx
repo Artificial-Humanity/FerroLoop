@@ -902,6 +902,14 @@ interface PendingPrompt {
   matchingBefore: number;
 }
 
+// A send can outlive the pane that started it. Keep its identity shared so a
+// remount displays the same pending turn and cannot start a duplicate send.
+const pendingPrompts = new Map<string, PendingPrompt>();
+const pendingPromptListeners = new Set<() => void>();
+function notifyPendingPrompts() {
+  for (const listener of pendingPromptListeners) listener();
+}
+
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
 export const sessionSendErrors = new Map<string, string>();
@@ -1199,36 +1207,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // still belongs to the agent/session they were started for.
   const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
   currentTargetRef.current = targetSessionOrAgent;
-  const [submittingByTarget, setSubmittingByTarget] = React.useState<
-    Record<string, number>
-  >({});
-  const submitting = Boolean(
-    targetSessionOrAgent && (submittingByTarget[targetSessionOrAgent] ?? 0) > 0,
-  );
-  const beginTargetSubmitting = React.useCallback((targetKey: string) => {
-    if (!targetKey) return;
-    setSubmittingByTarget((prev) => ({
-      ...prev,
-      [targetKey]: (prev[targetKey] ?? 0) + 1,
-    }));
+  const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    pendingPromptListeners.add(refreshPendingPrompts);
+    // A send could have begun between render and subscription.
+    refreshPendingPrompts();
+    return () => { pendingPromptListeners.delete(refreshPendingPrompts); };
   }, []);
-  const endTargetSubmitting = React.useCallback((targetKey: string) => {
-    if (!targetKey) return;
-    setSubmittingByTarget((prev) => {
-      const nextCount = (prev[targetKey] ?? 0) - 1;
-      if (nextCount <= 0) {
-        const { [targetKey]: _removed, ...rest } = prev;
-        return rest;
-      }
-      return { ...prev, [targetKey]: nextCount };
-    });
-  }, []);
+  const submitting = Boolean(targetSessionOrAgent && pendingPrompts.has(targetSessionOrAgent));
   const [submitError, setSubmitError] = React.useState<string | null>(null);
   const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
     () => Object.fromEntries(sessionSendErrors),
   );
-  const [pendingByTarget, setPendingByTarget] = React.useState<Record<string, PendingPrompt>>({});
-  const activeSendsRef = React.useRef(new Set<string>());
   const mountedRef = React.useRef(false);
   React.useEffect(() => {
     mountedRef.current = true;
@@ -1896,7 +1886,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     void fetchTranscript();
   }, [fetchTranscript]);
 
-  const pendingPrompt = pendingByTarget[targetSessionOrAgent];
+  const pendingPrompt = pendingPrompts.get(targetSessionOrAgent);
   const filteredTurns = React.useMemo(() => {
     let visible = effectiveTurns;
     if (pendingPrompt) {
@@ -2220,7 +2210,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       (!trimmedPrompt && attachments.length === 0) ||
       submitting ||
       !targetSessionOrAgent ||
-      activeSendsRef.current.has(targetSessionOrAgent)
+      pendingPrompts.has(targetSessionOrAgent)
     ) {
       return;
     }
@@ -2242,8 +2232,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
-    activeSendsRef.current.add(submittedTarget);
-    beginTargetSubmitting(submittedTarget);
+    const pending: PendingPrompt = { content, attachments: submittedDraft.attachments, matchingBefore };
+    pendingPrompts.set(submittedTarget, pending);
+    notifyPendingPrompts();
     setSubmitError(null);
     sessionSendErrors.delete(submittedTarget);
     setSendErrorsByTarget((prev) => {
@@ -2251,10 +2242,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       delete next[submittedTarget];
       return next;
     });
-    setPendingByTarget((prev) => ({
-      ...prev,
-      [submittedTarget]: { content, attachments: submittedDraft.attachments, matchingBefore },
-    }));
     clearSessionDraft(submittedTarget);
     draftRef.current = { promptText: "", attachments: [] };
     setPromptText("");
@@ -2320,14 +2307,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       notifyDraft(submittedTarget, restored, message);
 
     } finally {
-      activeSendsRef.current.delete(submittedTarget);
-      if (mountedRef.current) {
-        setPendingByTarget((prev) => {
-          const next = { ...prev };
-          delete next[submittedTarget];
-          return next;
-        });
-        endTargetSubmitting(submittedTarget);
+      if (pendingPrompts.get(submittedTarget) === pending) {
+        pendingPrompts.delete(submittedTarget);
+        notifyPendingPrompts();
       }
     }
   };

@@ -963,6 +963,7 @@ export const App: React.FC<AppProps> = ({
         const requestedAgentName = selectedAgentNameRef.current;
         const requestedAgentKey = requestedAgentName.trim().toLowerCase();
         const requestedSessionId = selectedSessionIdRef.current;
+        const requestedActiveSessionId = activeSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
         if (loggedOutRef.current) {
           return;
@@ -980,7 +981,9 @@ export const App: React.FC<AppProps> = ({
         const rawTargetId =
           sessionOverride === null
             ? null
-            : (sessionOverride ?? requestedSessionId ?? requestedAgentName);
+            : (sessionOverride ?? requestedSessionId ?? requestedActiveSessionId ??
+              list.find((session) => (session.persona ?? "").toLowerCase() === requestedAgentKey)?.id ??
+              requestedAgentName);
         const targetId =
           rawTargetId &&
           !tornDownTargetsRef.current.has(rawTargetId.trim().toLowerCase()) &&
@@ -993,6 +996,16 @@ export const App: React.FC<AppProps> = ({
             return;
           }
           if (trRes) {
+            // A persona can have multiple sessions. Never publish or cache a
+            // response after the concrete session changed while awaiting it.
+            const activeNow = activeSessionIdRef.current;
+            const stillSameTarget =
+              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
+              selectedSessionIdRef.current === requestedSessionId &&
+              (requestedActiveSessionId
+                ? activeNow === requestedActiveSessionId && targetId === requestedActiveSessionId
+                : activeNow === null || activeNow === targetId);
+            if (!stillSameTarget) return;
             const targetPersona =
               list.find((session) => session.id === targetId)?.persona ??
               (list.some(
@@ -1014,11 +1027,7 @@ export const App: React.FC<AppProps> = ({
                 ? trRes.is_busy
                 : hasTrailingIncompleteWork(trRes.turns ?? []),
             );
-            const stillSameTarget =
-              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
-              selectedSessionIdRef.current === requestedSessionId &&
-              targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase();
-            if (stillSameTarget) {
+            if (targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase()) {
               if (trRes.turns) {
                 applyTranscriptTurns(trRes.turns);
               }
@@ -1712,11 +1721,14 @@ export const App: React.FC<AppProps> = ({
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
     const submittedAgent = selectedAgentNameRef.current;
     const submittedSession = selectedSessionIdRef.current;
+    const submittedActiveSession = activeSessionIdRef.current;
     const res = await apiClient.sendSessionPrompt(targetId, payload);
     if (
       (!res.queued && res.status !== "queued" && res.delivered === false) ||
       selectedAgentNameRef.current !== submittedAgent ||
-      selectedSessionIdRef.current !== submittedSession
+      selectedSessionIdRef.current !== submittedSession ||
+      activeSessionIdRef.current !== submittedActiveSession ||
+      (submittedActiveSession !== null && submittedActiveSession !== targetId)
     ) {
       return res;
     }
@@ -1731,14 +1743,14 @@ export const App: React.FC<AppProps> = ({
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
-      recordOptimisticPrompt(content, agentKey, Date.now(), activeSessionIdRef.current);
+      recordOptimisticPrompt(content, agentKey, Date.now(), submittedActiveSession);
       setTranscriptTurns((prev) =>
         preserveOptimisticTurn(
           prev,
           optimisticPromptRef.current,
           Date.now(),
           selectedAgentNameRef.current,
-          activeSessionIdRef.current,
+          submittedActiveSession,
         ),
       );
     }
