@@ -361,17 +361,33 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
       "agent",
     );
 
-    // Open Right Panel and drag right-panel-resize-handle to widen from 460px to 520px
+    // Open Right Panel and drag right-panel-resize-handle to widen from 460px to 520px (mouse) and 500px (touch)
     fireEvent.click(splitToggleBtn);
     const rightSplitPanel = screen.getByTestId("right-split-panel");
     expect(rightSplitPanel.style.width).toBe("460px");
     const rightResizeHandle = within(rightSplitPanel).getByTestId(
       "right-panel-resize-handle",
     );
+    expect(rightResizeHandle.style.touchAction).toBe("none");
     fireEvent.mouseDown(rightResizeHandle, { clientX: 800 });
     fireEvent.mouseMove(window, { clientX: 740 });
     fireEvent.mouseUp(window);
     expect(rightSplitPanel.style.width).toBe("520px");
+    fireEvent.touchStart(rightResizeHandle, { touches: [{ clientX: 740 }] });
+    fireEvent.touchMove(window, { touches: [{ clientX: 760 }] });
+    fireEvent.touchEnd(window);
+    expect(rightSplitPanel.style.width).toBe("500px");
+
+    // Touch drag left-panel-resize-handle to 380px and back to 360px
+    expect(leftResizeHandle.style.touchAction).toBe("none");
+    fireEvent.touchStart(leftResizeHandle, { touches: [{ clientX: 360 }] });
+    fireEvent.touchMove(window, { touches: [{ clientX: 380 }] });
+    fireEvent.touchEnd(window);
+    expect(sidebar.style.width).toBe("380px");
+    fireEvent.touchStart(leftResizeHandle, { touches: [{ clientX: 380 }] });
+    fireEvent.touchMove(window, { touches: [{ clientX: 300 }] });
+    fireEvent.touchEnd(window);
+    expect(sidebar.style.width).toBe("360px");
     expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
 
     unmount();

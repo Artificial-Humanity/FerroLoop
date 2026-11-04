@@ -1348,8 +1348,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
   });
 });
 
-describe("Resizable chat composer (Record 57)", () => {
-  it("renders composer-resize-handle and resizes the textarea height within 72px..420px on mouse drag", () => {
+describe("Resizable chat composer (Record 57 & Record 112)", () => {
+  it("renders composer-resize-handle and resizes the textarea height within 36px..420px on mouse and touch drag", () => {
     render(
       <ChatPane
         agentName="ferris"
@@ -1362,9 +1362,13 @@ describe("Resizable chat composer (Record 57)", () => {
 
     const handle = screen.getByTestId("composer-resize-handle");
     const textarea = screen.getByLabelText("Message") as HTMLTextAreaElement;
+    const composer = screen.getByTestId("prompt-composer");
 
     expect(handle).toBeInTheDocument();
+    expect(handle.style.touchAction).toBe("none");
     expect(textarea.style.height).toBe("80px");
+    expect(textarea.style.minHeight).toBe("36px");
+    expect(composer.style.padding).toBe("8px clamp(8px, 1.4vw, 14px)");
 
     // Drag upward by 60px (clientY: 400 -> 340 => 80 + 60 = 140px)
     fireEvent.mouseDown(handle, { clientY: 400 });
@@ -1378,11 +1382,23 @@ describe("Resizable chat composer (Record 57)", () => {
     fireEvent.mouseUp(window);
     expect(textarea.style.height).toBe("420px");
 
-    // Drag downward beyond min (clientY: 100 -> 600 => clamped at 72px)
+    // Drag downward beyond min (clientY: 100 -> 600 => clamped at 36px)
     fireEvent.mouseDown(handle, { clientY: 100 });
     fireEvent.mouseMove(window, { clientY: 600 });
     fireEvent.mouseUp(window);
-    expect(textarea.style.height).toBe("72px");
+    expect(textarea.style.height).toBe("36px");
+
+    // Touch drag upward on iPad/iPhone (clientY: 500 -> 410 => 36 + 90 = 126px)
+    fireEvent.touchStart(handle, { touches: [{ clientY: 500 }] });
+    fireEvent.touchMove(window, { touches: [{ clientY: 410 }] });
+    fireEvent.touchEnd(window);
+    expect(textarea.style.height).toBe("126px");
+
+    // Touch drag downward to minimum 36px
+    fireEvent.touchStart(handle, { touches: [{ clientY: 300 }] });
+    fireEvent.touchMove(window, { touches: [{ clientY: 600 }] });
+    fireEvent.touchEnd(window);
+    expect(textarea.style.height).toBe("36px");
   });
 
   it("resets selectedModel to opts[0] when switching from a Claude agent to an Antigravity agent with model={null}", () => {
