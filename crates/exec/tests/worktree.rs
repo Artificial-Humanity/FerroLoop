@@ -214,3 +214,80 @@ fn refuses_conditional_config_that_could_enable_filters_in_new_gitdir() {
     assert!(create_worktree(&request).is_err());
     assert!(!request.path.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn refuses_partial_clone_without_running_remote_for_missing_commit_or_blob() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for missing_blob in [false, true] {
+        let (temp, root, parent, oid) = fixture();
+        let blob = git(&root, &["rev-parse", "HEAD:file"]);
+        let marker = temp.path().join("remote-executed");
+        let upload = temp.path().join("upload-pack");
+        std::fs::write(
+            &upload,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&upload, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&root, &["config", "remote.origin.url", "/missing-remote"]);
+        git(
+            &root,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                upload.to_str().unwrap(),
+            ],
+        );
+        git(&root, &["config", "remote.origin.promisor", "true"]);
+        git(&root, &["config", "extensions.partialClone", "origin"]);
+        if missing_blob {
+            let object = root.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+            std::fs::remove_file(object).unwrap();
+        }
+        let request = WorktreeRequest {
+            git_common_dir: root.join(".git").canonicalize().unwrap(),
+            project_root: root,
+            approved_parent: parent.clone(),
+            path: parent.join("child"),
+            branch_ref: "refs/heads/safe".into(),
+            base_oid: if missing_blob { oid } else { "1".repeat(40) },
+        };
+        assert!(create_worktree(&request).is_err());
+        assert!(
+            !marker.exists(),
+            "missing_blob={missing_blob}: remote command ran"
+        );
+        assert!(
+            !request.path.exists(),
+            "missing_blob={missing_blob}: worktree created"
+        );
+    }
+}
+
+#[test]
+fn refuses_each_partial_clone_configuration_even_with_all_objects_present() {
+    for (name, value) in [
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "false"),
+        ("remote.origin.partialCloneFilter", "blob:none"),
+    ] {
+        let (_temp, root, parent, oid) = fixture();
+        git(&root, &["config", name, value]);
+        let request = WorktreeRequest {
+            git_common_dir: root.join(".git").canonicalize().unwrap(),
+            project_root: root,
+            approved_parent: parent.clone(),
+            path: parent.join("child"),
+            branch_ref: "refs/heads/safe".into(),
+            base_oid: oid,
+        };
+        let error = create_worktree(&request).unwrap_err();
+        assert!(
+            error.to_string().contains("partial-clone or promisor"),
+            "{name}: {error}"
+        );
+        assert!(!request.path.exists());
+    }
+}

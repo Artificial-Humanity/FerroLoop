@@ -152,6 +152,9 @@ fn run_git(root: &Path, args: &[OsString]) -> Result<GitOutput, WorktreeError> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Newer Git versions honour this; the explicit configuration refusal below is required
+        // too, because older versions may silently ignore this variable.
+        .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args([
             "-c",
@@ -339,6 +342,32 @@ pub fn create_worktree(request: &WorktreeRequest) -> Result<WorktreeRegistration
         _ => {
             return Err(WorktreeError::Git(
                 String::from_utf8_lossy(&conditional.stderr).into_owned(),
+            ));
+        }
+    }
+    // Looking up a missing object in a partial clone can start a promisor remote and execute
+    // its configured upload-pack. Refuse even a disabled-looking setting: older Git releases
+    // differ in how partial-clone extensions and remotes are interpreted. The caller fences
+    // repository configuration against concurrent changes until this operation is reconciled.
+    let promisor = run_git(
+        &request.project_root,
+        &[
+            "config".into(),
+            "--null".into(),
+            "--get-regexp".into(),
+            r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$".into(),
+        ],
+    )?;
+    match promisor.status.code() {
+        Some(1) => {}
+        Some(0) => {
+            return Err(WorktreeError::Invalid(
+                "partial-clone or promisor Git configuration is configured",
+            ));
+        }
+        _ => {
+            return Err(WorktreeError::Git(
+                String::from_utf8_lossy(&promisor.stderr).into_owned(),
             ));
         }
     }
