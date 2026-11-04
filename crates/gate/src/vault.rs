@@ -241,6 +241,7 @@ impl Vault {
         master_key: [u8; MASTER_KEY_LEN],
     ) -> Result<Self, GateError> {
         let path = vault_path.into();
+        validate_vault_path(&path)?;
         let raw = read_bounded_regular(&path, MAX_INSPECT_VAULT_BYTES)?;
         let file: VaultFile =
             serde_json::from_slice(&raw).map_err(|e| GateError::VaultCorrupt {
@@ -267,6 +268,7 @@ impl Vault {
         master_key: [u8; MASTER_KEY_LEN],
     ) -> Result<Self, GateError> {
         let path = vault_path.into();
+        validate_vault_path(&path)?;
         let file = read_vault_file(&path)?;
         Ok(Self {
             path,
@@ -280,6 +282,7 @@ impl Vault {
     pub fn open_default(home_override: Option<&Path>) -> Result<Self, GateError> {
         let vault_path = resolve_vault_path(home_override);
         let key_path = resolve_master_key_path(home_override);
+        validate_vault_path(&vault_path)?;
         let master_key = load_or_init_master_key(&key_path)?;
         Self::open(vault_path, master_key)
     }
@@ -887,6 +890,7 @@ fn read_bounded_regular(path: &Path, _limit: usize) -> Result<Vec<u8>, GateError
 
 /// Read and validate `vault.enc` at `path`; a missing file is an empty vault.
 fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
+    validate_vault_path(path)?;
     let file = if path.exists() {
         reject_if_symlink(path)?;
         let raw = fs::read_to_string(path).map_err(|e| GateError::Io {
@@ -913,6 +917,64 @@ fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
 /// The lock file beside the vault. Not `vault.enc` itself: that file is replaced by a rename on
 /// every save, so a lock on its inode would not exclude the next writer.
 pub(crate) const LOCK_FILE_NAME: &str = ".vault.lock";
+
+/// A vault must not replace the lock or any broker marker belonging to a vault in
+/// the same directory. The directory and its ancestors remain caller-fenced.
+fn validate_vault_path(path: &Path) -> Result<(), GateError> {
+    let invalid = || GateError::Io {
+        op: "open",
+        path: path.to_path_buf(),
+        cause: "vault path aliases a reserved internal file".into(),
+    };
+    let name = path.file_name().ok_or_else(invalid)?.to_string_lossy();
+    let lower = name.to_ascii_lowercase();
+    if lower == LOCK_FILE_NAME || lower == "gate-audit.jsonl" || lower.ends_with(".broker-required")
+    {
+        return Err(invalid());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(invalid()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(GateError::Io {
+                op: "stat",
+                path: path.to_path_buf(),
+                cause: error.to_string(),
+            });
+        }
+    }
+    // An existing hardlink to the lock must not be treated as a vault, even if
+    // it has a different name. `VaultLock::acquire` repeats this after locking.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let existing = fs::metadata(path).map_err(|e| GateError::Io {
+            op: "stat",
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        })?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match fs::symlink_metadata(parent.join(LOCK_FILE_NAME)) {
+            Ok(lock) if existing.dev() == lock.dev() && existing.ino() == lock.ino() => {
+                return Err(invalid());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(GateError::Io {
+                    op: "stat",
+                    path: parent.join(LOCK_FILE_NAME),
+                    cause: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1032,6 +1094,7 @@ pub(crate) struct VaultLock {
 
 impl VaultLock {
     pub(crate) fn acquire(vault_path: &Path) -> Result<Self, GateError> {
+        validate_vault_path(vault_path)?;
         let parent = match vault_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
@@ -1082,6 +1145,7 @@ impl VaultLock {
             _slot: slot,
         };
         lock.ensure_current()?;
+        validate_vault_path(vault_path)?;
         Ok(lock)
     }
 
@@ -1717,6 +1781,51 @@ pub(crate) fn now_unix_millis() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn reserved_lock_and_marker_paths_are_not_vault_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        for path in [
+            tmp.path().join(LOCK_FILE_NAME),
+            tmp.path().join(".").join(LOCK_FILE_NAME),
+            tmp.path().join("sub").join("..").join(LOCK_FILE_NAME),
+            tmp.path().join("vault.enc.broker-required"),
+            tmp.path().join("gate-audit.jsonl"),
+        ] {
+            assert!(Vault::open(&path, [9; 32]).is_err(), "{}", path.display());
+            assert!(!path.exists());
+        }
+        let path = tmp.path().join("a-vault.enc");
+        let vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.save().unwrap();
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_path_rejects_symlinks_and_hardlinks_to_lock_before_writing() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("alias.enc");
+        let alias = Vault::open(&path, [9; 32]).unwrap();
+        let other = Vault::open(tmp.path().join("other.enc"), [9; 32]).unwrap();
+        other.save().unwrap();
+        let lock_path = tmp.path().join(LOCK_FILE_NAME);
+        let before = fs::metadata(&lock_path).unwrap().ino();
+        fs::hard_link(&lock_path, &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+        assert!(alias.save().is_err());
+        assert!(alias.require_broker().is_err());
+        assert_eq!(fs::metadata(&lock_path).unwrap().ino(), before);
+        fs::remove_file(&path).unwrap();
+        symlink(&lock_path, &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+        assert!(alias.save().is_err());
+        fs::remove_file(&path).unwrap();
+        symlink(tmp.path().join("missing"), &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+    }
 
     #[test]
     fn broker_marker_refuses_every_direct_vault_write() {

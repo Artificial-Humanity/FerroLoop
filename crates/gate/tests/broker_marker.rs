@@ -28,7 +28,10 @@ fn marker_race_child() {
         assert!(Instant::now() < deadline, "start signal missing");
         std::thread::yield_now();
     }
-    let outcome = if role == "marker" {
+    let outcome = if role == "reserved" {
+        assert!(Vault::open(dir.join(".vault.lock"), [9; 32]).is_err());
+        "refused"
+    } else if role == "marker" {
         vault.require_broker().unwrap();
         "configured"
     } else {
@@ -57,8 +60,12 @@ fn marker_creation_and_vault_write_are_serialized_across_processes() {
                 ..Default::default()
             })
             .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let lock_inode = std::fs::metadata(dir.path().join(".vault.lock"))
+            .unwrap()
+            .ino();
         let mut children = Vec::new();
-        for role in ["marker", "writer"] {
+        for role in ["marker", "writer", "reserved"] {
             children.push(
                 Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "marker_race_child", "--nocapture"])
@@ -73,7 +80,8 @@ fn marker_creation_and_vault_write_are_serialized_across_processes() {
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         while !(dir.path().join("ready-marker").exists()
-            && dir.path().join("ready-writer").exists())
+            && dir.path().join("ready-writer").exists()
+            && dir.path().join("ready-reserved").exists())
         {
             assert!(Instant::now() < deadline, "workers did not become ready");
             std::thread::yield_now();
@@ -90,6 +98,16 @@ fn marker_creation_and_vault_write_are_serialized_across_processes() {
             }
             assert!(child.wait().unwrap().success());
         }
+        assert_eq!(
+            std::fs::metadata(dir.path().join(".vault.lock"))
+                .unwrap()
+                .ino(),
+            lock_inode
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("result-reserved")).unwrap(),
+            "refused"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("result-marker")).unwrap(),
             "configured"
