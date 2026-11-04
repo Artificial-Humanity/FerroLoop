@@ -201,6 +201,11 @@ pub enum LocalRequest {
     RegisterRoute {
         persona: String,
         route: VendorRoute,
+        #[serde(default)]
+        explicit: bool,
+    },
+    UnregisterRoute {
+        persona: String,
     },
     Subscribe {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +231,7 @@ pub enum LocalResponse {
         receipts: Vec<DeliveryReceipt>,
     },
     RouteRegistered,
+    RouteUnregistered,
     Subscribed,
     Status(DaemonStatus),
     ShuttingDown,
@@ -448,7 +454,7 @@ where
         // carry both back, and persist them so a restart starts from the refreshed table.
         let changed = !working.same_routes(&base);
         let mut live = lock(&self.routes);
-        live.merge_dispatch_result(&base, working);
+        live.merge_daemon_dispatch_result(&base, working);
         if changed {
             let _ = live.save(self.config.routes_path.as_deref());
         }
@@ -580,14 +586,85 @@ where
                 }
                 (LocalResponse::Acked { receipts: out }, None)
             }
-            LocalRequest::RegisterRoute { persona, route } => {
+            LocalRequest::RegisterRoute {
+                persona,
+                route,
+                explicit,
+            } => {
                 {
                     let mut routes = lock(&self.routes);
-                    routes.upsert(&persona, route, now.clone());
-                    let _ = routes.save(self.config.routes_path.as_deref());
+                    let Some(norm) = normalize_persona(&persona) else {
+                        return (
+                            LocalResponse::Error {
+                                message: "invalid persona".into(),
+                            },
+                            None,
+                        );
+                    };
+                    if !explicit {
+                        let conflicts_with_binding = routes.get(&norm).is_some_and(|entry| {
+                            entry.explicit
+                                && std::mem::discriminant(&entry.route)
+                                    != std::mem::discriminant(&route)
+                        });
+                        let claims_bound_alias = route.session_identity().is_some_and(|identity| {
+                            routes.entries.iter().any(|(name, entry)| {
+                                name != &norm
+                                    && entry.explicit
+                                    && entry.route.session_identity() == Some(identity)
+                            })
+                        });
+                        if conflicts_with_binding || claims_bound_alias {
+                            return (
+                                LocalResponse::Error {
+                                    message: "observed route conflicts with an explicit binding"
+                                        .into(),
+                                },
+                                None,
+                            );
+                        }
+                    }
+                    let before = routes.clone();
+                    if explicit {
+                        routes.upsert_explicit(&persona, route, now.clone());
+                    } else {
+                        routes.upsert(&persona, route, now.clone());
+                    }
+                    if let Err(error) = routes.save(self.config.routes_path.as_deref()) {
+                        *routes = before;
+                        return (
+                            LocalResponse::Error {
+                                message: format!("cannot save route: {error}"),
+                            },
+                            None,
+                        );
+                    }
                 }
                 self.dispatch_pending_for_persona(&persona, now);
                 (LocalResponse::RouteRegistered, None)
+            }
+            LocalRequest::UnregisterRoute { persona } => {
+                let Some(persona) = normalize_persona(&persona) else {
+                    return (
+                        LocalResponse::Error {
+                            message: "invalid persona".into(),
+                        },
+                        None,
+                    );
+                };
+                let mut routes = lock(&self.routes);
+                let before = routes.clone();
+                routes.entries.remove(&persona);
+                if let Err(error) = routes.save(self.config.routes_path.as_deref()) {
+                    *routes = before;
+                    return (
+                        LocalResponse::Error {
+                            message: format!("cannot save route removal: {error}"),
+                        },
+                        None,
+                    );
+                }
+                (LocalResponse::RouteUnregistered, None)
             }
             LocalRequest::Subscribe {
                 recipient,
@@ -1216,6 +1293,7 @@ mod tests {
         assert!(!path.exists());
         let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
             persona: "synthetic-route-owner".into(),
+            explicit: false,
             route: VendorRoute::Webhook {
                 socket_path: rig._tmp.path().join("hook.sock"),
             },
@@ -1228,6 +1306,115 @@ mod tests {
                 .get("synthetic-route-owner")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn explicit_registration_and_unregister_update_the_live_and_saved_table() {
+        let rig = rig();
+        let path = rig._tmp.path().join("routes-b.json");
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "ada".into(),
+            route: VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            explicit: true,
+        });
+        assert!(matches!(reply, LocalResponse::RouteRegistered));
+        assert!(lock(&rig.inner.routes).get("ada").unwrap().explicit);
+        assert!(RouteTable::load(Some(&path)).get("ada").unwrap().explicit);
+        let (reply, _) = rig
+            .inner
+            .handle_local_request(LocalRequest::UnregisterRoute {
+                persona: "ada".into(),
+            });
+        assert!(matches!(reply, LocalResponse::RouteUnregistered));
+        assert!(lock(&rig.inner.routes).get("ada").is_none());
+        assert!(RouteTable::load(Some(&path)).get("ada").is_none());
+    }
+
+    #[test]
+    fn a_passive_cross_harness_observation_is_refused_by_the_daemon() {
+        let rig = rig();
+        let route = VendorRoute::Codex {
+            thread_id: "current".into(),
+            cwd: None,
+        };
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "ada".into(),
+            route: route.clone(),
+            explicit: true,
+        });
+        assert!(matches!(reply, LocalResponse::RouteRegistered));
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "ada".into(),
+            route: VendorRoute::Muse {
+                session_id: "old".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            },
+            explicit: false,
+        });
+        assert!(matches!(reply, LocalResponse::Error { .. }));
+        assert_eq!(lock(&rig.inner.routes).get("ada").unwrap().route, route);
+    }
+
+    #[test]
+    fn a_passive_alias_cannot_claim_an_explicit_session_but_same_vendor_refresh_works() {
+        let rig = rig();
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "ada".into(),
+            route: VendorRoute::Codex {
+                thread_id: "current".into(),
+                cwd: None,
+            },
+            explicit: true,
+        });
+        assert!(matches!(reply, LocalResponse::RouteRegistered));
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "old-alias".into(),
+            route: VendorRoute::Codex {
+                thread_id: "current".into(),
+                cwd: None,
+            },
+            explicit: false,
+        });
+        assert!(matches!(reply, LocalResponse::Error { .. }));
+        let (reply, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "ada".into(),
+            route: VendorRoute::Codex {
+                thread_id: "refreshed".into(),
+                cwd: None,
+            },
+            explicit: false,
+        });
+        assert!(matches!(reply, LocalResponse::RouteRegistered));
+        let routes = lock(&rig.inner.routes);
+        let entry = routes.get("ada").unwrap();
+        assert!(entry.explicit);
+        assert!(
+            matches!(&entry.route, VendorRoute::Codex { thread_id, .. } if thread_id == "refreshed")
+        );
+        assert!(routes.get("old-alias").is_none());
+    }
+
+    #[test]
+    fn register_route_wire_format_defaults_to_passive_and_accepts_explicit() {
+        let old =
+            r#"{"op":"register_route","persona":"ada","route":{"kind":"codex","thread_id":"t"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<LocalRequest>(old).unwrap(),
+            LocalRequest::RegisterRoute {
+                explicit: false,
+                ..
+            }
+        ));
+        let new = r#"{"op":"register_route","persona":"ada","route":{"kind":"codex","thread_id":"t"},"explicit":true}"#;
+        assert!(matches!(
+            serde_json::from_str::<LocalRequest>(new).unwrap(),
+            LocalRequest::RegisterRoute { explicit: true, .. }
+        ));
     }
 
     #[test]
@@ -1502,6 +1689,7 @@ mod tests {
         client_b
             .request(&LocalRequest::RegisterRoute {
                 persona: "synthetic-recipient".into(),
+                explicit: false,
                 route: VendorRoute::Webhook {
                     socket_path: webhook_sock,
                 },
@@ -1672,6 +1860,7 @@ mod tests {
         };
         request(LocalRequest::RegisterRoute {
             persona: "lmcfarlin-e6".into(),
+            explicit: false,
             route: VendorRoute::Claude {
                 pid: 4242,
                 session_id: "s-derived".into(),
@@ -1694,6 +1883,7 @@ mod tests {
         // The next RegisterRoute saves the live table; the pruned route must not come back.
         request(LocalRequest::RegisterRoute {
             persona: "other".into(),
+            explicit: false,
             route: VendorRoute::Codex {
                 thread_id: "t".into(),
                 cwd: None,
@@ -1728,6 +1918,7 @@ mod tests {
         let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         reg.request(&LocalRequest::RegisterRoute {
             persona: "synthetic-recipient".into(),
+            explicit: false,
             route: VendorRoute::Codex {
                 thread_id: "t1".into(),
                 cwd: None,
@@ -1753,6 +1944,7 @@ mod tests {
         probe
             .request(&LocalRequest::RegisterRoute {
                 persona: "other".into(),
+                explicit: false,
                 route: VendorRoute::Codex {
                     thread_id: "t2".into(),
                     cwd: None,

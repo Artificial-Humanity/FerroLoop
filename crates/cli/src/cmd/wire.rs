@@ -340,19 +340,105 @@ pub fn resolve_caller_with_source(
     (persona, source)
 }
 
-pub fn record_caller_route(env: &StateEnv<'_>, persona: &str, route: VendorRoute) {
+fn record_caller_route_with_provenance(
+    env: &StateEnv<'_>,
+    persona: &str,
+    route: VendorRoute,
+    explicit: bool,
+) -> Result<(), String> {
+    let prune_roster = explicit && !matches!(route, VendorRoute::Muse { .. });
     let sock = resolve_socket_path(env, None);
     if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        let _ = client.request(&LocalRequest::RegisterRoute {
+        let response = client.request(&LocalRequest::RegisterRoute {
             persona: persona.to_string(),
             route,
-        });
-        return;
+            explicit,
+        })?;
+        if !matches!(response, LocalResponse::RouteRegistered) {
+            return Err(format!("unexpected daemon response: {response:?}"));
+        }
+    } else {
+        let rpath = resolve_routes_path_for(env);
+        let mut table = RouteTable::load(rpath.as_deref());
+        if explicit {
+            table.upsert_explicit(persona, route, now_at());
+        } else {
+            table.upsert(persona, route, now_at());
+        }
+        table
+            .save(rpath.as_deref())
+            .map_err(|error| error.to_string())?;
     }
-    let rpath = resolve_routes_path_for(env);
-    let mut table = RouteTable::load(rpath.as_deref());
-    table.upsert(persona, route, now_at());
-    let _ = table.save(rpath.as_deref());
+    if prune_roster {
+        prune_muse_roster(persona).map_err(|error| {
+            format!("route registered but Muse boot roster could not be updated: {error}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Remove just this persona from the external Muse restore list, preserving other entries.
+fn prune_muse_roster(persona: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(home).join(".config/muse/active-sessions.json");
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut value: Value = serde_json::from_slice(&raw).map_err(std::io::Error::other)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Muse roster must be a JSON object",
+        )
+    })?;
+    let before = object.len();
+    object.retain(|name, _| !name.eq_ignore_ascii_case(persona.trim()));
+    if object.len() == before {
+        return Ok(());
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(path.parent().expect("roster has parent"))?;
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        temp.as_file().set_permissions(metadata.permissions())?;
+    }
+    serde_json::to_writer_pretty(&mut temp, &value).map_err(std::io::Error::other)?;
+    writeln!(temp)?;
+    temp.persist(&path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
+    let sock = resolve_socket_path(env, None);
+    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+        match client.request(&LocalRequest::UnregisterRoute {
+            persona: persona.into(),
+        })? {
+            LocalResponse::RouteUnregistered => {}
+            other => return Err(format!("unexpected daemon response: {other:?}")),
+        }
+    }
+    let paths: Vec<PathBuf> = match resolve_routes_path_for(env) {
+        Some(path) => vec![path],
+        None => std::iter::once(fl_wire::identity::default_routes_path())
+            .chain(fl_wire::identity::legacy_routes_path())
+            .collect(),
+    };
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let mut routes = RouteTable::load(Some(&path));
+        if routes.entries.remove(persona).is_some() {
+            routes
+                .save(Some(&path))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// May `new` replace `existing` as the route of a persona resolved from `source`?
@@ -465,7 +551,15 @@ pub fn record_caller_route_checked(
             return false;
         }
     }
-    record_caller_route(env, persona, route);
+    if let Err(error) = record_caller_route_with_provenance(
+        env,
+        persona,
+        route,
+        matches!(source, PersonaSource::Explicit | PersonaSource::Env),
+    ) {
+        eprintln!("fl wire: could not register route: {error}");
+        return false;
+    }
     true
 }
 
@@ -1450,7 +1544,13 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             }) {
                 Ok(rec) => {
                     if let Some(route) = capture_current_env_route() {
-                        record_caller_route(env, &rec.name_key, route);
+                        record_caller_route_with_provenance(env, &rec.name_key, route, true)
+                            .map_err(|error| {
+                                (
+                                    1,
+                                    format!("agent registered but route update failed: {error}"),
+                                )
+                            })?;
                     }
                     sync_registry_markdown(&store, env.cwd);
                     let all_active = store.list_agents(None, false).unwrap_or_default();
@@ -1480,6 +1580,14 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             let retired = store
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
+            remove_caller_route(env, &by)
+                .map_err(|e| (1, format!("agent retired but route removal failed: {e}")))?;
+            prune_muse_roster(&by).map_err(|e| {
+                (
+                    1,
+                    format!("agent retired but Muse roster removal failed: {e}"),
+                )
+            })?;
             sync_registry_markdown(&store, env.cwd);
             println!("Retired {} ({})", retired.display_name, retired.id);
             Ok(0)
@@ -1615,6 +1723,125 @@ pub fn inbox_item_to_json(item: &WireInboxItem) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rejected_daemon_registration_keeps_the_muse_roster_entry() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let rig = HookRig::new(Some("ada"));
+        let path = rig.home().join(".config/muse/active-sessions.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"ada":{"session_id":"keep"}}"#).unwrap();
+        let listener = UnixListener::bind(rig.dir.path().join("none.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream
+                .write_all(b"{\"status\":\"error\",\"message\":\"registration refused\"}\n")
+                .unwrap();
+        });
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let result = record_caller_route_with_provenance(
+            &env,
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            true,
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        let roster: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(roster["ada"]["session_id"], "keep");
+    }
+    #[test]
+    fn registering_a_non_muse_route_prunes_only_that_personas_muse_roster_entry() {
+        let rig = HookRig::new(Some("ada"));
+        let path = rig.home().join(".config/muse/active-sessions.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"ada":{"session_id":"old"},"bob":{"session_id":"keep"}}"#,
+        )
+        .unwrap();
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        record_caller_route_with_provenance(
+            &env,
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "new".into(),
+                cwd: None,
+            },
+            true,
+        )
+        .unwrap();
+        let roster: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(roster.get("ada").is_none());
+        assert_eq!(roster["bob"]["session_id"], "keep");
+        assert!(
+            RouteTable::load(Some(&rig.routes_path()))
+                .get("ada")
+                .unwrap()
+                .explicit
+        );
+    }
+
+    #[test]
+    fn unregister_removes_the_route_and_muse_roster_entry() {
+        let rig = HookRig::new(Some("ada"));
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: now_at(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        drop(store);
+        let path = rig.home().join(".config/muse/active-sessions.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"ada":{"session_id":"old"},"bob":{"session_id":"keep"}}"#,
+        )
+        .unwrap();
+        rig.seed("ada", grok_route("old"));
+        let cli = AgentMsgCli::parse_from(["agent-msg", "unregister", "Ada"]);
+        assert_eq!(run_agent_msg(&env, cli).unwrap(), 0);
+        assert!(
+            RouteTable::load(Some(&rig.routes_path()))
+                .get("ada")
+                .is_none()
+        );
+        let roster: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(roster.get("ada").is_none());
+        assert_eq!(roster["bob"]["session_id"], "keep");
+    }
     #[test]
     fn retention_cutoff_saturates_instead_of_wrapping() {
         assert_eq!(super::retention_cutoff_ms(1_000, u64::MAX), 0);
