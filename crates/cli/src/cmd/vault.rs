@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use fl_core::governor::{AdmissionRequest, Principal};
 use fl_gate::{
-    DispatchPhaseError, DispatchResult, GateGovernor, GovernedOrGateError, ProxyRequest,
-    SetSecretArgs, Vault, admission_refusal_text, approved_policy_digests_from_env,
-    discover_connectors, execute_proxied_request_with_provider_and_contract_phased_with_deadline,
+    AppBinding, DispatchPhaseError, DispatchResult, GateGovernor, GovernedOrGateError,
+    ProxyRequest, SecretUsage, SetSecretArgs, Vault, admission_refusal_text,
+    approved_policy_digests_from_env, discover_connectors,
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
     handle_mcp_jsonrpc_request_with_governor_and_secret_provider, import_openapi_to_connector,
     load_or_init_master_key, resolve_master_key_path, resolve_vault_path,
 };
@@ -55,6 +56,18 @@ pub enum VaultCmd {
         /// Optional lease time-to-live in seconds.
         #[arg(long)]
         ttl_secs: Option<u64>,
+        /// Secret usage: proxy (default) or sign-jwt-rs256.
+        #[arg(long, default_value = "proxy")]
+        usage: String,
+        /// Bound App issuer for signing records.
+        #[arg(long)]
+        issuer: Option<String>,
+        /// Bound HTTPS origin for signing records.
+        #[arg(long)]
+        origin: Option<String>,
+        /// Require live bundle authority for use.
+        #[arg(long)]
+        bundle_required: bool,
         /// Output JSON summary.
         #[arg(long)]
         json: bool,
@@ -163,6 +176,10 @@ fn run_inner(
             allowed_agents,
             allow_private_network,
             ttl_secs,
+            usage,
+            issuer,
+            origin,
+            bundle_required,
             json,
         } => cmd_set(
             name,
@@ -174,6 +191,10 @@ fn run_inner(
             allowed_agents,
             allow_private_network,
             ttl_secs,
+            usage,
+            issuer,
+            origin,
+            bundle_required,
             json,
         ),
         VaultCmd::List { json } => cmd_list(json),
@@ -257,8 +278,36 @@ fn cmd_set(
     allowed_agents: Vec<String>,
     allow_private_network: bool,
     ttl_secs: Option<u64>,
+    usage: String,
+    issuer: Option<String>,
+    origin: Option<String>,
+    bundle_required: bool,
     as_json: bool,
 ) -> Result<i32, (i32, String)> {
+    let usage = match usage.as_str() {
+        "proxy" => SecretUsage::Proxy,
+        "sign-jwt-rs256" => SecretUsage::SignJwtRs256,
+        _ => return Err((2, "usage must be proxy or sign-jwt-rs256".into())),
+    };
+    if usage == SecretUsage::SignJwtRs256 && (!from_stdin || value.is_some()) {
+        return Err((
+            2,
+            "signing secrets require --stdin; --value is not permitted".into(),
+        ));
+    }
+    let app_binding = match (usage, issuer, origin) {
+        (SecretUsage::SignJwtRs256, Some(issuer), Some(origin)) => {
+            Some(AppBinding { issuer, origin })
+        }
+        (SecretUsage::Proxy, None, None) => None,
+        _ => {
+            return Err((
+                2,
+                "signing secrets require --issuer and --origin; proxy secrets cannot set them"
+                    .into(),
+            ));
+        }
+    };
     let secret_val = match (value, from_stdin) {
         (Some(v), false) => v,
         (None, true) => {
@@ -290,6 +339,9 @@ fn cmd_set(
             allowed_agents,
             allow_private_network,
             lease_ttl_secs: ttl_secs,
+            usage,
+            bundle_required,
+            app_binding,
         })
         .map_err(|e| (1, e.to_string()))?;
 
@@ -822,4 +874,33 @@ fn upsert_toml_mcp_server(
     fs::write(path, formatted)
         .map_err(|e| (1, format!("failed to write {}: {e}", path.display())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signing_secret_rejects_value_before_opening_vault() {
+        let err = cmd_set(
+            "KEY".into(),
+            Some("do-not-echo".into()),
+            false,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            false,
+            None,
+            "sign-jwt-rs256".into(),
+            Some("123".into()),
+            Some("https://api.github.com".into()),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 2);
+        assert!(err.1.contains("--stdin"));
+        assert!(!err.1.contains("do-not-echo"));
+    }
 }

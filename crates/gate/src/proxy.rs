@@ -409,6 +409,7 @@ fn audit_method(method: &str) -> String {
 fn denial_reason(trace: &DenialTrace, err: &GateError) -> String {
     let reason = trace.reason.unwrap_or(match err {
         GateError::NoSuchSecret { .. } => "no_such_secret",
+        GateError::UsageMismatch { .. } => "usage_mismatch",
         GateError::InvalidSecret { .. } => "invalid_secret_name",
         GateError::PolicyDenied { reason, .. }
             if reason.starts_with(crate::vault::LEASE_EXPIRED_REASON) =>

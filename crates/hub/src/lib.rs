@@ -7600,6 +7600,7 @@ default_target = "wire:felicity"
                 allowed_agents: vec![],
                 allow_private_network: true,
                 lease_ttl_secs: None,
+                ..Default::default()
             })
             .unwrap();
         drop(vault);

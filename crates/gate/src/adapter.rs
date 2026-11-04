@@ -195,19 +195,44 @@ pub fn resolve_vault_secret(
     name: &str,
     caller_agent: Option<&str>,
 ) -> Result<(VaultSecretMetadata, String), GateError> {
-    match vault.decrypt_raw(name) {
-        Ok(pair) => Ok(pair),
+    let checked = |metadata: &VaultSecretMetadata| -> Result<(), GateError> {
+        if metadata.usage != crate::vault::SecretUsage::Proxy {
+            return Err(GateError::UsageMismatch {
+                secret: metadata.name.clone(),
+            });
+        }
+        if metadata.bundle_required {
+            return Err(GateError::PolicyDenied {
+                secret: metadata.name.clone(),
+                reason: "bundle authority unavailable".into(),
+            });
+        }
+        Ok(())
+    };
+    let (metadata, value) = match vault.decrypt_bytes(name) {
+        Ok((metadata, bytes)) => {
+            checked(&metadata)?;
+            let value = String::from_utf8(bytes.to_vec()).map_err(|_| GateError::VaultCorrupt {
+                path: vault.path().to_path_buf(),
+                cause: format!("decrypted secret `{}` is not valid UTF-8", metadata.name),
+            })?;
+            (metadata, value)
+        }
         Err(GateError::NoSuchSecret { name }) => {
             let Some(provider) = provider else {
                 return Err(GateError::NoSuchSecret { name });
             };
             match provider.resolve_secret(&name, caller_agent)? {
-                Some(secret) => Ok((secret.metadata, secret.value)),
-                None => Err(GateError::NoSuchSecret { name }),
+                Some(secret) => {
+                    checked(&secret.metadata)?;
+                    (secret.metadata, secret.value)
+                }
+                None => return Err(GateError::NoSuchSecret { name }),
             }
         }
-        Err(err) => Err(err),
-    }
+        Err(err) => return Err(err),
+    };
+    Ok((metadata, value))
 }
 
 /// `Allow` is success. `Deny` is [`GateError::PolicyDenied`] with `secret` set to `policy`.
@@ -663,6 +688,9 @@ mod tests {
             updated_at: "2026-10-30T00:00:00Z".into(),
             lease_ttl_secs: None,
             expires_at: None,
+            usage: crate::vault::SecretUsage::Proxy,
+            bundle_required: false,
+            app_binding: None,
         }
     }
 

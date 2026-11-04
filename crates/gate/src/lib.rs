@@ -70,9 +70,10 @@ pub use proxy::{
 pub use registry::{connector_to_registry_entry, handle_registry_v01_get};
 pub use sign::SIGN_AUDIT_METHOD;
 pub use vault::{
-    EncryptedSecretRecord, MASTER_KEY_LEN, NONCE_LEN, SetSecretArgs, VAULT_SCHEMA_VERSION, Vault,
-    VaultSecretMetadata, canonical_aad, load_existing_master_key, load_or_init_master_key,
-    normalize_secret_name, resolve_master_key_path, resolve_vault_path,
+    AppBinding, EncryptedSecretRecord, MASTER_KEY_LEN, NONCE_LEN, SecretUsage, SetSecretArgs,
+    VAULT_SCHEMA_VERSION, Vault, VaultSecretMetadata, VerifiedSecretSnapshot, canonical_aad,
+    load_existing_master_key, load_or_init_master_key, normalize_secret_name,
+    normalize_signing_origin, resolve_master_key_path, resolve_vault_path,
 };
 
 pub use vaultref::{VaultField, VaultRef, VaultRefError, parse_vault_ref};
@@ -107,6 +108,8 @@ pub enum GateError {
     NoSuchSecret { name: String },
     #[error("FerroGate policy denied secret `{secret}`: {reason}")]
     PolicyDenied { secret: String, reason: String },
+    #[error("secret `{secret}` cannot be used for this operation")]
+    UsageMismatch { secret: String },
     #[error("invalid placeholder: {reason}")]
     InvalidPlaceholder { reason: String },
     #[error("invalid URL `{url}`: {reason}")]
@@ -211,6 +214,7 @@ mod tests {
                 allowed_agents: vec!["ferris".into(), "felicia".into()],
                 allow_private_network: false,
                 lease_ttl_secs: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -264,6 +268,7 @@ mod tests {
                 allowed_agents: vec!["ferris".into()],
                 allow_private_network: false,
                 lease_ttl_secs: None,
+                ..Default::default()
             })
             .unwrap();
 
@@ -428,6 +433,7 @@ mod tests {
                 allowed_agents: vec![],
                 allow_private_network: true,
                 lease_ttl_secs: None,
+                ..Default::default()
             })
             .unwrap();
 

@@ -117,19 +117,33 @@ impl Vault {
             }
         };
 
-        // Policy, from the redacted metadata, before any decryption.
-        let Some(meta) = self.get_metadata(&name) else {
+        // Authenticate the actual current record before trusting any policy fields.
+        let fresh = self.fresh().map_err(|err| deny("vault_error", err))?;
+        let snapshot = fresh.verified_snapshot_current(&name).map_err(|err| {
+            let reason = match &err {
+                GateError::NoSuchSecret { .. } => "no_such_secret",
+                GateError::PolicyDenied { .. } => policy_reason(&err),
+                GateError::VaultTampered { .. } => "tamper",
+                _ => "vault_error",
+            };
+            deny(reason, err)
+        })?;
+        let meta = &snapshot.metadata;
+        if meta.bundle_required || meta.app_binding.is_some() {
             return Err(deny(
-                "no_such_secret",
-                GateError::NoSuchSecret { name: name.clone() },
+                "authority_unavailable",
+                GateError::PolicyDenied {
+                    secret: name.clone(),
+                    reason: "bound signing requires the upgraded live authority path".into(),
+                },
             ));
-        };
+        }
         if let Err(err) = check_signing_policy(meta, caller, host) {
             let reason = policy_reason(&err);
             return Err(deny(reason, err));
         }
 
-        let (_meta, pem) = match self.decrypt_bytes(&name) {
+        let (_meta, pem) = match fresh.decrypt_bytes(&name) {
             Ok(pair) => pair,
             Err(err) => {
                 let reason = match &err {
@@ -359,6 +373,9 @@ mod tests {
             updated_at: String::new(),
             lease_ttl_secs: None,
             expires_at: None,
+            usage: crate::vault::SecretUsage::Proxy,
+            bundle_required: false,
+            app_binding: None,
         };
         assert!(check_signing_policy(&meta, "x", "api.github.com").is_ok());
         for bad in [".github.com", "github.com.", "a..b", "..x", ""] {

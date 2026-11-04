@@ -22,6 +22,68 @@ pub const VAULT_SCHEMA_VERSION: u32 = 1;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 
+/// Authorized use of a vault record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretUsage {
+    #[default]
+    Proxy,
+    SignJwtRs256,
+}
+fn is_proxy(usage: &SecretUsage) -> bool {
+    *usage == SecretUsage::Proxy
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// App identity and exact network origin authenticated with the record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppBinding {
+    pub issuer: String,
+    pub origin: String,
+}
+
+/// Verified metadata and record identity; this contains no plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSecretSnapshot {
+    pub metadata: VaultSecretMetadata,
+    pub record_epoch: String,
+}
+
+/// Normalize an exact HTTPS origin; paths, query, fragment and credentials are forbidden.
+pub fn normalize_signing_origin(raw: &str) -> Result<String, GateError> {
+    if raw.trim() != raw || raw.chars().any(char::is_control) {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "origin has whitespace or controls".into(),
+        });
+    }
+    let (_, authority) = raw.split_once("://").ok_or_else(|| GateError::InvalidUrl {
+        url: raw.into(),
+        reason: "origin needs a scheme".into(),
+    })?;
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "origin must not contain credentials, path, query or fragment".into(),
+        });
+    }
+    let (scheme, host, port) = crate::proxy::parse_url_scheme_host_port(raw)?;
+    if scheme != "https" || port == 0 {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "signing origin requires HTTPS and a valid port".into(),
+        });
+    }
+    let formatted_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("https://{formatted_host}:{port}"))
+}
+
 /// Public, redacted metadata for a secret stored in [`Vault`] (spec §2.2).
 /// Never holds plaintext secret values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +105,12 @@ pub struct VaultSecretMetadata {
     pub lease_ttl_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_proxy")]
+    pub usage: SecretUsage,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bundle_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_binding: Option<AppBinding>,
 }
 
 /// Parameters for inserting or updating a secret in [`Vault`].
@@ -59,6 +127,9 @@ pub struct SetSecretArgs {
     pub allowed_agents: Vec<String>,
     pub allow_private_network: bool,
     pub lease_ttl_secs: Option<u64>,
+    pub usage: SecretUsage,
+    pub bundle_required: bool,
+    pub app_binding: Option<AppBinding>,
 }
 
 impl std::fmt::Debug for SetSecretArgs {
@@ -72,6 +143,9 @@ impl std::fmt::Debug for SetSecretArgs {
             .field("allowed_agents", &self.allowed_agents)
             .field("allow_private_network", &self.allow_private_network)
             .field("lease_ttl_secs", &self.lease_ttl_secs)
+            .field("usage", &self.usage)
+            .field("bundle_required", &self.bundle_required)
+            .field("app_binding", &self.app_binding)
             .finish()
     }
 }
@@ -101,6 +175,8 @@ impl Default for VaultFile {
     }
 }
 
+type VerifiedSnapshotCache = std::sync::Arc<Mutex<BTreeMap<String, ([u8; 32], String)>>>;
+
 /// Zero-knowledge AES-256-GCM encrypted secrets vault (`crates/gate/src/vault.rs`).
 ///
 /// `Debug` prints the path and the number of secrets, never the master key: a `{:?}` of a
@@ -110,6 +186,7 @@ pub struct Vault {
     path: PathBuf,
     master_key: [u8; MASTER_KEY_LEN],
     file: VaultFile,
+    verified: VerifiedSnapshotCache,
 }
 
 impl std::fmt::Debug for Vault {
@@ -133,6 +210,7 @@ impl Vault {
             path,
             master_key,
             file,
+            verified: Default::default(),
         })
     }
 
@@ -146,6 +224,14 @@ impl Vault {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    pub(crate) fn fresh(&self) -> Result<Self, GateError> {
+        Ok(Self {
+            path: self.path.clone(),
+            master_key: self.master_key,
+            file: read_vault_file(&self.path)?,
+            verified: self.verified.clone(),
+        })
     }
 
     /// List redacted metadata for all secrets in deterministic key order.
@@ -188,6 +274,33 @@ impl Vault {
             });
         }
 
+        if args.usage == SecretUsage::Proxy && args.app_binding.is_some() {
+            return Err(GateError::InvalidSecret {
+                name,
+                reason: "app binding requires signing usage".into(),
+            });
+        }
+        let app_binding = args
+            .app_binding
+            .map(|binding| {
+                if binding.issuer.is_empty()
+                    || binding.issuer.len() > 64
+                    || !binding
+                        .issuer
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                {
+                    return Err(GateError::InvalidSecret {
+                        name: name.clone(),
+                        reason: "invalid app issuer".into(),
+                    });
+                }
+                Ok(AppBinding {
+                    issuer: binding.issuer,
+                    origin: normalize_signing_origin(&binding.origin)?,
+                })
+            })
+            .transpose()?;
         let allowed_hosts = normalize_string_list(&args.allowed_hosts, true);
         let allowed_methods = normalize_string_list(&args.allowed_methods, false)
             .into_iter()
@@ -248,6 +361,9 @@ impl Vault {
             updated_at: now_str,
             lease_ttl_secs: args.lease_ttl_secs,
             expires_at,
+            usage: args.usage,
+            bundle_required: args.bundle_required,
+            app_binding,
         };
 
         let rng = SystemRandom::new();
@@ -262,11 +378,25 @@ impl Vault {
                 reason: "invalid AES-256-GCM master key".to_string(),
             })?;
         let key = LessSafeKey::new(unbound);
-        let mut in_out = args.value.into_bytes();
+        let value = Zeroizing::new(args.value);
+        let capacity = value
+            .len()
+            .checked_add(AES_256_GCM.tag_len())
+            .ok_or_else(|| GateError::Crypto {
+                reason: "secret is too large".into(),
+            })?;
+        let mut in_out = Zeroizing::new(Vec::new());
+        in_out
+            .try_reserve_exact(capacity)
+            .map_err(|_| GateError::Crypto {
+                reason: "secret is too large".into(),
+            })?;
+        in_out.extend_from_slice(value.as_bytes());
+        drop(value);
         key.seal_in_place_append_tag(
             Nonce::assume_unique_for_key(nonce_bytes),
             Aad::from(aad_str.as_bytes()),
-            &mut in_out,
+            &mut *in_out,
         )
         .map_err(|_| GateError::Crypto {
             reason: "AES-256-GCM encryption failed".to_string(),
@@ -275,7 +405,7 @@ impl Vault {
         let record = EncryptedSecretRecord {
             metadata: metadata.clone(),
             nonce_b64: BASE64.encode(nonce_bytes),
-            ciphertext_b64: BASE64.encode(in_out),
+            ciphertext_b64: BASE64.encode(&*in_out),
         };
         next.secrets.insert(name, record);
         self.write_file(&next)?;
@@ -295,6 +425,79 @@ impl Vault {
         }
         self.file = next;
         Ok(existed)
+    }
+
+    /// Verify AEAD before trusting policy and retain only an authenticated epoch and key fingerprint.
+    pub fn verified_snapshot(&self, name: &str) -> Result<VerifiedSecretSnapshot, GateError> {
+        let name = normalize_secret_name(name)?;
+        self.fresh()?.verified_snapshot_current(&name)
+    }
+
+    pub(crate) fn verified_snapshot_current(
+        &self,
+        name: &str,
+    ) -> Result<VerifiedSecretSnapshot, GateError> {
+        let name = normalize_secret_name(name)?;
+        let record = self
+            .file
+            .secrets
+            .get(&name)
+            .ok_or_else(|| GateError::NoSuchSecret { name: name.clone() })?;
+        if record.metadata.name != name {
+            return Err(GateError::VaultTampered { secret: name });
+        }
+        let nonce = BASE64
+            .decode(&record.nonce_b64)
+            .map_err(|e| GateError::VaultCorrupt {
+                path: self.path.clone(),
+                cause: format!("invalid nonce: {e}"),
+            })?;
+        let cipher =
+            BASE64
+                .decode(&record.ciphertext_b64)
+                .map_err(|e| GateError::VaultCorrupt {
+                    path: self.path.clone(),
+                    cause: format!("invalid ciphertext: {e}"),
+                })?;
+        let aad = canonical_aad(&record.metadata);
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        for part in [aad.as_bytes(), nonce.as_slice(), cipher.as_slice()] {
+            digest.update(&(part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        let epoch: String = digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let fingerprint: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &self.master_key)
+            .as_ref()
+            .try_into()
+            .expect("sha256 width");
+        let cached = self
+            .verified
+            .lock()
+            .map_err(|_| GateError::Crypto {
+                reason: "verified snapshot lock poisoned".into(),
+            })?
+            .get(&name)
+            .is_some_and(|entry| entry.0 == fingerprint && entry.1 == epoch);
+        if !cached {
+            let (_, plaintext) = self.decrypt_bytes(&name)?;
+            drop(plaintext);
+            self.verified
+                .lock()
+                .map_err(|_| GateError::Crypto {
+                    reason: "verified snapshot lock poisoned".into(),
+                })?
+                .insert(name, (fingerprint, epoch.clone()));
+        }
+        check_lease(&record.metadata)?;
+        Ok(VerifiedSecretSnapshot {
+            metadata: record.metadata.clone(),
+            record_epoch: epoch,
+        })
     }
 
     /// Decrypt a secret for internal proxy substitution, verifying its AAD policy and expiration.
@@ -325,8 +528,6 @@ impl Vault {
         if record.metadata.name != key_name {
             return Err(GateError::VaultTampered { secret: key_name });
         }
-
-        check_lease(&record.metadata)?;
 
         let nonce_vec = BASE64
             .decode(&record.nonce_b64)
@@ -364,6 +565,7 @@ impl Vault {
             })?
             .len();
         in_out.truncate(plaintext_len);
+        check_lease(&record.metadata)?;
         Ok((record.metadata.clone(), in_out))
     }
 
@@ -739,9 +941,37 @@ pub fn canonical_aad(meta: &VaultSecretMetadata) -> String {
     let methods = meta.allowed_methods.join(",");
     let agents = meta.allowed_agents.join(",");
     let exp = meta.expires_at.as_deref().unwrap_or("none");
-    format!(
+    let v1 = format!(
         "ferrogate:v1|{}|{}|{}|{}|{}|{}",
         meta.name, hosts, methods, agents, meta.allow_private_network, exp
+    );
+    if meta.usage == SecretUsage::Proxy && !meta.bundle_required && meta.app_binding.is_none() {
+        return v1;
+    }
+    let usage = match meta.usage {
+        SecretUsage::Proxy => "proxy",
+        SecretUsage::SignJwtRs256 => "sign-jwt-rs256",
+    };
+    let issuer = meta
+        .app_binding
+        .as_ref()
+        .map_or("none", |b| b.issuer.as_str());
+    let origin = meta
+        .app_binding
+        .as_ref()
+        .map_or("none", |b| b.origin.as_str());
+    format!(
+        "ferrogate:v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        meta.name,
+        hosts,
+        methods,
+        agents,
+        meta.allow_private_network,
+        exp,
+        usage,
+        meta.bundle_required,
+        issuer,
+        origin
     )
 }
 
@@ -1141,6 +1371,211 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp."))
             .collect()
+    }
+
+    #[test]
+    fn proxy_aad_is_legacy_and_v2_fields_are_authenticated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let meta = vault.set(args("PLAIN", "token")).unwrap();
+        assert_eq!(
+            canonical_aad(&meta),
+            "ferrogate:v1|PLAIN|example.com|||false|none"
+        );
+        let mut bundled = args("BUNDLED", "token");
+        bundled.bundle_required = true;
+        vault.set(bundled).unwrap();
+        let mut signing = args("SIGNING", "token");
+        signing.usage = SecretUsage::SignJwtRs256;
+        signing.app_binding = Some(AppBinding {
+            issuer: "123".into(),
+            origin: "https://EXAMPLE.com".into(),
+        });
+        vault.set(signing).unwrap();
+        let original = fs::read(&path).unwrap();
+        for (name, field, changed) in [
+            ("BUNDLED", "bundle_required", serde_json::json!(false)),
+            ("SIGNING", "usage", serde_json::json!("proxy")),
+            (
+                "SIGNING",
+                "app_binding",
+                serde_json::json!({"issuer":"456", "origin":"https://example.com:443"}),
+            ),
+            (
+                "SIGNING",
+                "app_binding",
+                serde_json::json!({"issuer":"123", "origin":"https://example.com:444"}),
+            ),
+        ] {
+            let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            altered["secrets"][name]["metadata"][field] = changed;
+            fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    vault.verified_snapshot(name),
+                    Err(GateError::VaultTampered { .. })
+                ),
+                "{name} {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_changes_for_key_policy_and_ciphertext_and_wrong_key_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.set(args("A", "first")).unwrap();
+        let first = vault.verified_snapshot("A").unwrap().record_epoch;
+        assert_eq!(first, vault.verified_snapshot("A").unwrap().record_epoch);
+        vault.set(args("A", "second")).unwrap();
+        let second = vault.verified_snapshot("A").unwrap().record_epoch;
+        assert_ne!(first, second);
+        let mut changed = args("A", "second");
+        changed.allowed_hosts.push("other.example".into());
+        vault.set(changed).unwrap();
+        assert_ne!(second, vault.verified_snapshot("A").unwrap().record_epoch);
+        assert!(matches!(
+            Vault::open(&path, [8; 32]).unwrap().verified_snapshot("A"),
+            Err(GateError::VaultTampered { .. })
+        ));
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let ciphertext = disk["secrets"]["A"]["ciphertext_b64"].as_str().unwrap();
+        let mut bytes = BASE64.decode(ciphertext).unwrap();
+        bytes[0] ^= 1;
+        disk["secrets"]["A"]["ciphertext_b64"] = BASE64.encode(bytes).into();
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("A"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_expiry_is_authenticated_before_refusal() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.set(args("KEY", "secret")).unwrap();
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["KEY"]["metadata"]["expires_at"] = "1970-01-01T00:00:00.000Z".into();
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn signing_origin_is_exact_https_authority() {
+        assert_eq!(
+            normalize_signing_origin("HTTPS://EXAMPLE.COM").unwrap(),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            normalize_signing_origin("https://example.com:8443").unwrap(),
+            "https://example.com:8443"
+        );
+        assert_eq!(
+            normalize_signing_origin("https://[::1]").unwrap(),
+            "https://[::1]:443"
+        );
+        for invalid in [
+            "http://example.com",
+            "https://user@example.com",
+            "https://example.com/",
+            "https://example.com?q=1",
+            "https://example.com#x",
+            "https://example.com:0",
+            " https://example.com",
+        ] {
+            assert!(normalize_signing_origin(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn proxy_resolution_refuses_sign_usage_and_bundle_without_authority() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = Vault::open(tmp.path().join("vault.enc"), [7; 32]).unwrap();
+        let mut input = args("SIGNING", "key");
+        input.usage = SecretUsage::SignJwtRs256;
+        vault.set(input).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&vault, None, "SIGNING", None),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let mut input = args("BUNDLE", "key");
+        input.bundle_required = true;
+        vault.set(input).unwrap();
+        assert!(crate::adapter::resolve_vault_secret(&vault, None, "BUNDLE", None).is_err());
+    }
+
+    #[test]
+    fn signing_usage_is_refused_and_audited_in_every_proxy_position() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = Vault::open(tmp.path().join("vault.enc"), [7; 32]).unwrap();
+        let mut input = args("SIGNING", "private-key-marker");
+        input.allowed_hosts = vec!["8.8.8.8".into()];
+        input.usage = SecretUsage::SignJwtRs256;
+        vault.set(input).unwrap();
+        for position in ["header", "query", "body"] {
+            let mut req = crate::ProxyRequest {
+                method: "POST".into(),
+                url: "https://8.8.8.8/".into(),
+                headers: BTreeMap::new(),
+                body: None,
+                caller_agent: None,
+                timeout_secs: None,
+            };
+            match position {
+                "header" => {
+                    req.headers
+                        .insert("authorization".into(), "{{FERROGATE:SIGNING}}".into());
+                }
+                "query" => req.url.push_str("?key={{FERROGATE:SIGNING}}"),
+                _ => req.body = Some("{{FERROGATE:SIGNING}}".into()),
+            }
+            assert!(
+                matches!(
+                    crate::prepare_proxied_request(&vault, &req),
+                    Err(GateError::UsageMismatch { .. })
+                ),
+                "{position}"
+            );
+        }
+        let audit = fs::read_to_string(tmp.path().join("gate-audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("denied:usage_mismatch").count(), 3);
+        assert!(!audit.contains("private-key-marker"));
+    }
+
+    #[test]
+    fn signing_usage_and_binding_are_authenticated_and_epoch_rotates() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [7; 32]).unwrap();
+        let mut input = args("SIGNING", "first-key");
+        input.usage = SecretUsage::SignJwtRs256;
+        input.app_binding = Some(AppBinding {
+            issuer: "123".into(),
+            origin: "https://api.github.com:443".into(),
+        });
+        vault.set(input.clone()).unwrap();
+        let first = vault.verified_snapshot("SIGNING").unwrap();
+        vault.set(input).unwrap();
+        let second = vault.verified_snapshot("SIGNING").unwrap();
+        assert_ne!(first.record_epoch, second.record_epoch);
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["SIGNING"]["metadata"]["usage"] = serde_json::json!("proxy");
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let reopened = Vault::open(&path, [7; 32]).unwrap();
+        assert!(matches!(
+            reopened.verified_snapshot("SIGNING"),
+            Err(GateError::VaultTampered { .. })
+        ));
     }
 
     #[test]

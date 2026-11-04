@@ -175,6 +175,28 @@ mod tests {
     }
 
     #[test]
+    fn vendor_key_read_refuses_sign_usage_secret() {
+        let f = fixture("VK_KEY", "initial", "api.example.com", &[], false);
+        let master = load_or_init_master_key(&f.key).unwrap();
+        let mut vault = Vault::open(&f.vault, master).unwrap();
+        vault
+            .set(SetSecretArgs {
+                name: "VK_KEY".into(),
+                value: "sign-only".into(),
+                allowed_hosts: vec!["api.example.com".into()],
+                usage: fl_gate::SecretUsage::SignJwtRs256,
+                ..SetSecretArgs::default()
+            })
+            .unwrap();
+        let d = vendor(None, Some("VK_KEY"), "https://api.example.com/v1");
+        assert_eq!(resolve_key(&d, None, &no_env, &f.vault, &f.key), None);
+        let audit =
+            std::fs::read_to_string(f.vault.parent().unwrap().join("gate-audit.jsonl")).unwrap();
+        assert!(audit.contains("denied:usage_mismatch"));
+        assert!(!audit.contains("sign-only"));
+    }
+
+    #[test]
     fn the_environment_wins_when_it_is_set() {
         let f = fixture("VK_KEY", "from-vault", "api.example.com", &[], false);
         let d = vendor(Some("VK_ENV"), Some("VK_KEY"), "https://api.example.com/v1");
