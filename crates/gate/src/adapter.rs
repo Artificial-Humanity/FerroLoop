@@ -195,6 +195,34 @@ pub fn resolve_vault_secret(
     name: &str,
     caller_agent: Option<&str>,
 ) -> Result<(VaultSecretMetadata, String), GateError> {
+    let fresh = vault.fresh()?;
+    reject_disappeared_local(vault, &fresh, name)?;
+    resolve_vault_secret_current(&fresh, provider, name, caller_agent)
+}
+
+/// Do not turn disappearance of a known local secret into provider fallback.
+pub(crate) fn reject_disappeared_local(
+    previous: &Vault,
+    current: &Vault,
+    name: &str,
+) -> Result<(), GateError> {
+    if previous.get_metadata(name).is_some() && current.get_metadata(name).is_none() {
+        return Err(GateError::PolicyDenied {
+            secret: name.to_owned(),
+            reason: "local secret disappeared since the vault was opened".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve from one already-refreshed vault snapshot; the caller keeps it for the
+/// entire operation so values and policy cannot come from different snapshots.
+pub(crate) fn resolve_vault_secret_current(
+    vault: &Vault,
+    provider: Option<&dyn SecretProviderAdapter>,
+    name: &str,
+    caller_agent: Option<&str>,
+) -> Result<(VaultSecretMetadata, String), GateError> {
     let checked = |metadata: &VaultSecretMetadata| -> Result<(), GateError> {
         if metadata.usage != crate::vault::SecretUsage::Proxy {
             return Err(GateError::UsageMismatch {
@@ -779,6 +807,105 @@ mod tests {
             caller_agent: Some("felicia".into()),
             timeout_secs: None,
         }
+    }
+
+    #[test]
+    fn stale_proxy_policy_is_refreshed_and_tamper_never_falls_back() {
+        let (tmp, mut writer) = open_vault();
+        writer
+            .set(SetSecretArgs {
+                name: "LOCAL_KEY".into(),
+                value: "old".into(),
+                allowed_hosts: vec!["example.com".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let stale = writer.clone();
+        writer
+            .set(SetSecretArgs {
+                name: "LOCAL_KEY".into(),
+                value: "new".into(),
+                allowed_hosts: vec!["other.example".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let provider = CountingProvider::with_secret(Some(ExternalSecret {
+            metadata: external_meta("LOCAL_KEY", &["example.com"], false),
+            value: "provider".into(),
+        }));
+        let req = proxy_req("https://example.com/?token={{FERROGATE:LOCAL_KEY}}");
+        assert!(matches!(
+            prepare_proxied_request_with_provider(&stale, &req, Some(&provider)),
+            Err(GateError::PolicyDenied { .. })
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let path = tmp.path().join("vault.enc");
+        let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["LOCAL_KEY"]["metadata"]["allowed_hosts"] = json!(["example.com"]);
+        std::fs::write(path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            resolve_vault_secret(&stale, Some(&provider), "LOCAL_KEY", None),
+            Err(GateError::VaultTampered { .. })
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        // Removing a previously observed local record is not an excuse to silently
+        // substitute another provider's secret through a stale handle.
+        writer.remove("LOCAL_KEY").unwrap();
+        assert!(matches!(
+            resolve_vault_secret(&stale, Some(&provider), "LOCAL_KEY", None),
+            Err(GateError::PolicyDenied { .. })
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn proxy_resolves_all_local_records_from_one_current_snapshot() {
+        struct RotatingProvider(Mutex<Vault>);
+        impl SecretProviderAdapter for RotatingProvider {
+            fn provider_name(&self) -> &str {
+                "rotate"
+            }
+            fn resolve_secret(
+                &self,
+                name: &str,
+                _: Option<&str>,
+            ) -> Result<Option<ExternalSecret>, GateError> {
+                assert_eq!(name, "A_TRIGGER");
+                self.0.lock().unwrap().set(SetSecretArgs {
+                    name: "Z_LOCAL".into(),
+                    value: "new".into(),
+                    allowed_hosts: vec!["other.example".into()],
+                    ..Default::default()
+                })?;
+                Ok(Some(ExternalSecret {
+                    metadata: external_meta("A_TRIGGER", &["example.com"], false),
+                    value: "external".into(),
+                }))
+            }
+        }
+        let (_tmp, mut vault) = open_vault();
+        vault
+            .set(SetSecretArgs {
+                name: "Z_LOCAL".into(),
+                value: "old".into(),
+                allowed_hosts: vec!["example.com".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let provider = RotatingProvider(Mutex::new(vault.clone()));
+        let req =
+            proxy_req("https://example.com/?a={{FERROGATE:A_TRIGGER}}&z={{FERROGATE:Z_LOCAL}}");
+        let prepared =
+            prepare_proxied_request_with_provider(&vault, &req, Some(&provider)).unwrap();
+        assert!(prepared.url.contains("a=external"));
+        assert!(prepared.url.contains("z=old"));
+        assert!(matches!(
+            prepare_proxied_request(
+                &vault,
+                &proxy_req("https://example.com/?z={{FERROGATE:Z_LOCAL}}")
+            ),
+            Err(GateError::PolicyDenied { .. })
+        ));
     }
 
     #[test]

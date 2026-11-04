@@ -10,7 +10,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::GateError;
-use crate::adapter::{SecretProviderAdapter, resolve_vault_secret};
+use crate::adapter::{
+    SecretProviderAdapter, reject_disappeared_local, resolve_vault_secret_current,
+};
 use crate::vault::{Vault, normalize_secret_name};
 
 pub const PLACEHOLDER_PREFIX: &str = "{{FERROGATE:";
@@ -510,13 +512,24 @@ fn prepare_checked(
     let (scheme, host, port) = parse_url_scheme_host_port(&req.url)?;
     trace.host = Some(host.clone());
 
+    // Resolve all local values and policies from one current disk snapshot.
+    let fresh = vault.fresh()?;
+    for name in &referenced {
+        reject_disappeared_local(vault, &fresh, name)?;
+    }
+    let vault = &fresh;
+
     let mut decrypted_map = BTreeMap::new();
     let mut external_plaintexts = Vec::new();
     let mut allow_private = false;
 
     for secret_name in &referenced {
-        let (meta, secret_val) =
-            resolve_vault_secret(vault, provider, secret_name, req.caller_agent.as_deref())?;
+        let (meta, secret_val) = resolve_vault_secret_current(
+            vault,
+            provider,
+            secret_name,
+            req.caller_agent.as_deref(),
+        )?;
         if vault.get_metadata(secret_name).is_none() {
             external_plaintexts.push((secret_name.clone(), secret_val.clone()));
         }

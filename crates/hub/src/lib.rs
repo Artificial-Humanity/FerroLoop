@@ -1643,6 +1643,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gate_secret_request_refuses_unknown_policy_fields() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for field in ["usage", "bundle_required", "app_binding"] {
+            let mut payload = serde_json::json!({"name":"SECRET", "value":"secret", "allowed_hosts":["example.com"]});
+            payload[field] = serde_json::json!(true);
+            let response = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/gate/secrets")
+                    .with_header("Authorization", "Bearer owner-tok-secret")
+                    .with_json_body(&payload),
+            );
+            assert_eq!(response.status, 400, "{field}");
+        }
+    }
+
     fn test_hub_state(tmp: &TempDir) -> HubState {
         test_hub_state_at(tmp, tmp.path(), tmp.path())
     }

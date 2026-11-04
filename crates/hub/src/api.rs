@@ -7316,6 +7316,7 @@ fn handle_post_gate_secret(
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct SetSecretPayload {
         name: String,
         value: String,

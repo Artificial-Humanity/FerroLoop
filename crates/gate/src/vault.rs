@@ -443,7 +443,7 @@ impl Vault {
             .secrets
             .get(&name)
             .ok_or_else(|| GateError::NoSuchSecret { name: name.clone() })?;
-        if record.metadata.name != name {
+        if record.metadata.name != name || !valid_authenticated_metadata(&record.metadata) {
             return Err(GateError::VaultTampered { secret: name });
         }
         let nonce = BASE64
@@ -525,7 +525,7 @@ impl Vault {
         };
         // The AAD binds `metadata.name`, not the map key. A record copied under another key
         // would otherwise decrypt as that other secret, with its own value and policy.
-        if record.metadata.name != key_name {
+        if record.metadata.name != key_name || !valid_authenticated_metadata(&record.metadata) {
             return Err(GateError::VaultTampered { secret: key_name });
         }
 
@@ -933,6 +933,38 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     // `abc\0`.
     let len_diff = std::hint::black_box(a.len() ^ b.len());
     std::hint::black_box(diff) == 0 && len_diff == 0
+}
+
+/// Reject metadata that the vault writer would not produce and that could alias an AAD.
+/// Legacy records retain the original v1 AAD bytes.
+fn valid_authenticated_metadata(meta: &VaultSecretMetadata) -> bool {
+    if meta
+        .allowed_hosts
+        .iter()
+        .chain(&meta.allowed_methods)
+        .chain(&meta.allowed_agents)
+        .any(|item| item.trim().is_empty() || item.contains(['|', ',']))
+        || meta
+            .expires_at
+            .as_deref()
+            .is_some_and(|value| At::parse(value).is_err())
+    {
+        return false;
+    }
+    match &meta.app_binding {
+        None => true,
+        Some(binding) => {
+            meta.usage == SecretUsage::SignJwtRs256
+                && !binding.issuer.is_empty()
+                && binding.issuer.len() <= 64
+                && binding
+                    .issuer
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && normalize_signing_origin(&binding.origin)
+                    .is_ok_and(|origin| origin == binding.origin)
+        }
+    }
 }
 
 /// Build the canonical AEAD Additional Authenticated Data (AAD) string for `meta`.
@@ -1419,6 +1451,76 @@ mod tests {
                 "{name} {field}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_binding_cannot_alias_unbound_aad_even_when_snapshot_cached() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let mut signing = args("SIGNING", "secret");
+        signing.usage = SecretUsage::SignJwtRs256;
+        vault.set(signing).unwrap();
+        vault.verified_snapshot("SIGNING").unwrap();
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["SIGNING"]["metadata"]["app_binding"] =
+            serde_json::json!({"issuer":"none", "origin":"none"});
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("SIGNING"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn delimiter_alias_in_policy_is_rejected_without_changing_v1_aad() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let mut input = args("KEY", "secret");
+        input.allowed_hosts = vec!["a.example".into(), "b.example".into()];
+        let meta = vault.set(input).unwrap();
+        assert!(canonical_aad(&meta).starts_with("ferrogate:v1|"));
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["KEY"]["metadata"]["allowed_hosts"] =
+            serde_json::json!(["a.example,b.example"]);
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_handle_observes_current_usage_bundle_policy_and_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut writer = Vault::open(&path, [9; 32]).unwrap();
+        writer.set(args("KEY", "old")).unwrap();
+        let stale = Vault::open(&path, [9; 32]).unwrap();
+        let mut sign = args("KEY", "new");
+        sign.usage = SecretUsage::SignJwtRs256;
+        writer.set(sign).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let mut bundle = args("KEY", "new");
+        bundle.bundle_required = true;
+        writer.set(bundle).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None),
+            Err(GateError::PolicyDenied { .. })
+        ));
+        let mut restricted = args("KEY", "latest");
+        restricted.allowed_hosts = vec!["other.example".into()];
+        writer.set(restricted).unwrap();
+        let (meta, value) =
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None).unwrap();
+        assert_eq!(value, "latest");
+        assert_eq!(meta.allowed_hosts, ["other.example"]);
     }
 
     #[test]
