@@ -352,6 +352,7 @@ export interface RosterSidebarProps {
   consoleContent?: React.ReactNode;
   width?: number;
   onResizeStart?: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onTouchResizeStart?: (e: React.TouchEvent<HTMLDivElement>) => void;
 }
 
 export type LeftPanelTab =
@@ -577,6 +578,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   consoleContent,
   width,
   onResizeStart,
+  onTouchResizeStart,
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState<LeftPanelTab>("roster");
   const effectiveLeftTab: LeftPanelTab = leftPanelTab ?? internalLeftTab;
@@ -1571,15 +1573,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           aria-label="Resize left panel"
           title="Drag left or right to resize left panel"
           onMouseDown={onResizeStart}
+          onTouchStart={onTouchResizeStart}
           style={{
             position: "absolute",
             top: 0,
-            right: "-3px",
+            right: "-6px",
             bottom: 0,
-            width: "6px",
+            width: "12px",
             cursor: "col-resize",
             zIndex: 25,
             userSelect: "none",
+            touchAction: "none",
           }}
         />
       </aside>

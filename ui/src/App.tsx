@@ -503,6 +503,36 @@ export const App: React.FC<AppProps> = ({
     leftPanelTab === "roster" ? leftRosterWidth : leftConsoleWidth,
   );
 
+  const applyLeftResizeDelta = useCallback(
+    (startWidth: number, delta: number, isRoster: boolean) => {
+      const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+      const mode = resolveViewportPanelMode(vw);
+      const maxAllowed =
+        mode === "three-panel"
+          ? Math.max(
+              PANEL_MIN_WIDTH_PX,
+              Math.min(
+                720,
+                vw - PANEL_MIN_WIDTH_PX - (splitView ? rightPanelWidth : 0),
+              ),
+            )
+          : mode === "two-panel"
+            ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(720, vw - PANEL_MIN_WIDTH_PX))
+            : 720;
+      const nextWidth = Math.round(
+        Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
+      );
+      if (isRoster) {
+        setLeftRosterWidth(nextWidth);
+        persistPanelWidth("fd_left_roster_width", nextWidth);
+      } else {
+        setLeftConsoleWidth(nextWidth);
+        persistPanelWidth("fd_left_console_width", nextWidth);
+      }
+    },
+    [splitView, rightPanelWidth],
+  );
+
   const handleLeftResizeStart = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       e.preventDefault();
@@ -511,31 +541,7 @@ export const App: React.FC<AppProps> = ({
       const isRoster = leftPanelTab === "roster";
       const startWidth = isRoster ? leftRosterWidth : leftConsoleWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
-        const delta = moveEvent.clientX - startX;
-        const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
-        const mode = resolveViewportPanelMode(vw);
-        const maxAllowed =
-          mode === "three-panel"
-            ? Math.max(
-                PANEL_MIN_WIDTH_PX,
-                Math.min(
-                  720,
-                  vw - PANEL_MIN_WIDTH_PX - (splitView ? rightPanelWidth : 0),
-                ),
-              )
-            : mode === "two-panel"
-              ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(720, vw - PANEL_MIN_WIDTH_PX))
-              : 720;
-        const nextWidth = Math.round(
-          Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
-        );
-        if (isRoster) {
-          setLeftRosterWidth(nextWidth);
-          persistPanelWidth("fd_left_roster_width", nextWidth);
-        } else {
-          setLeftConsoleWidth(nextWidth);
-          persistPanelWidth("fd_left_console_width", nextWidth);
-        }
+        applyLeftResizeDelta(startWidth, moveEvent.clientX - startX, isRoster);
       };
       const handleMouseUp = () => {
         window.removeEventListener("mousemove", handleMouseMove);
@@ -546,7 +552,67 @@ export const App: React.FC<AppProps> = ({
       window.addEventListener("mouseup", handleMouseUp);
       panelResizeCleanupRef.current = handleMouseUp;
     },
-    [leftPanelTab, leftRosterWidth, leftConsoleWidth, splitView, rightPanelWidth],
+    [leftPanelTab, leftRosterWidth, leftConsoleWidth, applyLeftResizeDelta],
+  );
+
+  const handleLeftTouchResizeStart = useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      if (!e.touches || e.touches.length === 0) return;
+      e.preventDefault();
+      panelResizeCleanupRef.current?.();
+      const startX = e.touches[0].clientX;
+      const isRoster = leftPanelTab === "roster";
+      const startWidth = isRoster ? leftRosterWidth : leftConsoleWidth;
+      const handleTouchMove = (moveEvent: TouchEvent) => {
+        if (!moveEvent.touches || moveEvent.touches.length === 0) return;
+        if (moveEvent.cancelable) {
+          moveEvent.preventDefault();
+        }
+        applyLeftResizeDelta(
+          startWidth,
+          moveEvent.touches[0].clientX - startX,
+          isRoster,
+        );
+      };
+      const handleTouchEnd = () => {
+        window.removeEventListener("touchmove", handleTouchMove);
+        window.removeEventListener("touchend", handleTouchEnd);
+        window.removeEventListener("touchcancel", handleTouchEnd);
+        panelResizeCleanupRef.current = null;
+      };
+      window.addEventListener("touchmove", handleTouchMove, { passive: false });
+      window.addEventListener("touchend", handleTouchEnd);
+      window.addEventListener("touchcancel", handleTouchEnd);
+      panelResizeCleanupRef.current = handleTouchEnd;
+    },
+    [leftPanelTab, leftRosterWidth, leftConsoleWidth, applyLeftResizeDelta],
+  );
+
+  const applyRightResizeDelta = useCallback(
+    (startWidth: number, delta: number) => {
+      const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+      const mode = resolveViewportPanelMode(vw);
+      const maxAllowed =
+        mode === "three-panel"
+          ? Math.max(
+              PANEL_MIN_WIDTH_PX,
+              Math.min(
+                800,
+                vw -
+                  PANEL_MIN_WIDTH_PX -
+                  (desktopSidebarCollapsed ? 0 : effectiveLeftWidth),
+              ),
+            )
+          : mode === "two-panel"
+            ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(800, vw - PANEL_MIN_WIDTH_PX))
+            : 800;
+      const nextWidth = Math.round(
+        Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
+      );
+      setRightPanelWidth(nextWidth);
+      persistPanelWidth("fd_right_panel_width", nextWidth);
+    },
+    [desktopSidebarCollapsed, effectiveLeftWidth],
   );
 
   const handleRightResizeStart = useCallback(
@@ -556,28 +622,7 @@ export const App: React.FC<AppProps> = ({
       const startX = e.clientX;
       const startWidth = rightPanelWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
-        const delta = startX - moveEvent.clientX;
-        const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
-        const mode = resolveViewportPanelMode(vw);
-        const maxAllowed =
-          mode === "three-panel"
-            ? Math.max(
-                PANEL_MIN_WIDTH_PX,
-                Math.min(
-                  800,
-                  vw -
-                    PANEL_MIN_WIDTH_PX -
-                    (desktopSidebarCollapsed ? 0 : effectiveLeftWidth),
-                ),
-              )
-            : mode === "two-panel"
-              ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(800, vw - PANEL_MIN_WIDTH_PX))
-              : 800;
-        const nextWidth = Math.round(
-          Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
-        );
-        setRightPanelWidth(nextWidth);
-        persistPanelWidth("fd_right_panel_width", nextWidth);
+        applyRightResizeDelta(startWidth, startX - moveEvent.clientX);
       };
       const handleMouseUp = () => {
         window.removeEventListener("mousemove", handleMouseMove);
@@ -588,7 +633,35 @@ export const App: React.FC<AppProps> = ({
       window.addEventListener("mouseup", handleMouseUp);
       panelResizeCleanupRef.current = handleMouseUp;
     },
-    [rightPanelWidth, desktopSidebarCollapsed, effectiveLeftWidth],
+    [rightPanelWidth, applyRightResizeDelta],
+  );
+
+  const handleRightTouchResizeStart = useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      if (!e.touches || e.touches.length === 0) return;
+      e.preventDefault();
+      panelResizeCleanupRef.current?.();
+      const startX = e.touches[0].clientX;
+      const startWidth = rightPanelWidth;
+      const handleTouchMove = (moveEvent: TouchEvent) => {
+        if (!moveEvent.touches || moveEvent.touches.length === 0) return;
+        if (moveEvent.cancelable) {
+          moveEvent.preventDefault();
+        }
+        applyRightResizeDelta(startWidth, startX - moveEvent.touches[0].clientX);
+      };
+      const handleTouchEnd = () => {
+        window.removeEventListener("touchmove", handleTouchMove);
+        window.removeEventListener("touchend", handleTouchEnd);
+        window.removeEventListener("touchcancel", handleTouchEnd);
+        panelResizeCleanupRef.current = null;
+      };
+      window.addEventListener("touchmove", handleTouchMove, { passive: false });
+      window.addEventListener("touchend", handleTouchEnd);
+      window.addEventListener("touchcancel", handleTouchEnd);
+      panelResizeCleanupRef.current = handleTouchEnd;
+    },
+    [rightPanelWidth, applyRightResizeDelta],
   );
 
   const handleOpenArtifact = useCallback((rawPathOrUrl: string) => {
@@ -2701,6 +2774,7 @@ export const App: React.FC<AppProps> = ({
           }
           width={isMobileViewport ? undefined : effectiveLeftWidth}
           onResizeStart={handleLeftResizeStart}
+          onTouchResizeStart={handleLeftTouchResizeStart}
         />
 
         <div className="fd-main">
@@ -2784,15 +2858,17 @@ export const App: React.FC<AppProps> = ({
                 aria-label="Resize right panel"
                 title="Drag left or right to resize right panel"
                 onMouseDown={handleRightResizeStart}
+                onTouchStart={handleRightTouchResizeStart}
                 style={{
                   position: "absolute",
                   top: 0,
-                  left: "-3px",
+                  left: "-6px",
                   bottom: 0,
-                  width: "6px",
+                  width: "12px",
                   cursor: "col-resize",
                   zIndex: 25,
                   userSelect: "none",
+                  touchAction: "none",
                 }}
               />
               <RightPanelHeader

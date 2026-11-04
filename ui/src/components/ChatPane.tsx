@@ -1096,6 +1096,9 @@ function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
   });
 }
 
+export const COMPOSER_MIN_HEIGHT_PX = 36;
+export const COMPOSER_MAX_HEIGHT_PX = 420;
+
 export const ChatPane: React.FC<ChatPaneProps> = ({
   agentName,
   agentDisplayName,
@@ -1170,7 +1173,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [interrupting, setInterrupting] = React.useState<boolean>(false);
   const interruptTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchingModel, setSwitchingModel] = React.useState<boolean>(false);
-  const [composerHeight, setComposerHeight] = React.useState<number>(80);
+  const [composerHeight, setComposerHeight] = React.useState<number>(() =>
+    typeof window !== "undefined" && window.innerWidth < 720 ? 48 : 80,
+  );
   const resizeCleanupRef = React.useRef<(() => void) | null>(null);
   const [internalSlashCommands, setInternalSlashCommands] =
     React.useState<SlashCommandEntry[]>(DEFAULT_SLASH_COMMANDS);
@@ -1445,7 +1450,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       const startHeight = textareaRef.current?.offsetHeight || composerHeight;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = startY - moveEvent.clientY;
-        const nextHeight = Math.max(72, Math.min(420, startHeight + delta));
+        const nextHeight = Math.max(
+          COMPOSER_MIN_HEIGHT_PX,
+          Math.min(COMPOSER_MAX_HEIGHT_PX, startHeight + delta),
+        );
         setComposerHeight(nextHeight);
       };
       const handleMouseUp = () => {
@@ -1456,6 +1464,39 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       window.addEventListener("mousemove", handleMouseMove);
       window.addEventListener("mouseup", handleMouseUp);
       resizeCleanupRef.current = handleMouseUp;
+    },
+    [composerHeight],
+  );
+
+  const handleComposerTouchResizeStart = React.useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      if (!e.touches || e.touches.length === 0) return;
+      e.preventDefault();
+      resizeCleanupRef.current?.();
+      const startY = e.touches[0].clientY;
+      const startHeight = textareaRef.current?.offsetHeight || composerHeight;
+      const handleTouchMove = (moveEvent: TouchEvent) => {
+        if (!moveEvent.touches || moveEvent.touches.length === 0) return;
+        if (moveEvent.cancelable) {
+          moveEvent.preventDefault();
+        }
+        const delta = startY - moveEvent.touches[0].clientY;
+        const nextHeight = Math.max(
+          COMPOSER_MIN_HEIGHT_PX,
+          Math.min(COMPOSER_MAX_HEIGHT_PX, startHeight + delta),
+        );
+        setComposerHeight(nextHeight);
+      };
+      const handleTouchEnd = () => {
+        window.removeEventListener("touchmove", handleTouchMove);
+        window.removeEventListener("touchend", handleTouchEnd);
+        window.removeEventListener("touchcancel", handleTouchEnd);
+        resizeCleanupRef.current = null;
+      };
+      window.addEventListener("touchmove", handleTouchMove, { passive: false });
+      window.addEventListener("touchend", handleTouchEnd);
+      window.addEventListener("touchcancel", handleTouchEnd);
+      resizeCleanupRef.current = handleTouchEnd;
     },
     [composerHeight],
   );
@@ -2377,7 +2418,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     <section
       className="fd-pane"
       data-testid="chat-pane"
-      style={{ minWidth: "360px" }}
+      style={{
+        minWidth: "360px",
+        width: "100%",
+        maxWidth: "100%",
+        overflowX: "hidden",
+      }}
     >
       {/* Toolbar */}
       <div
@@ -2391,6 +2437,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
           flexWrap: "wrap",
+          width: "100%",
+          maxWidth: "100%",
+          boxSizing: "border-box",
         }}
       >
         <div
@@ -2558,6 +2607,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             padding: "6px clamp(8px, 1.4vw, 14px)",
             gap: "6px",
             flexShrink: 0,
+            width: "100%",
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            overflowX: "hidden",
             zIndex: 2,
           }}
         >
@@ -2566,8 +2619,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
-              gap: "10px",
+              gap: "8px",
               flexWrap: "wrap",
+              minWidth: 0,
             }}
           >
             <div
@@ -2575,7 +2629,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 display: "flex",
                 alignItems: "center",
                 gap: "8px",
-                flex: 1,
+                flex: "1 1 180px",
                 minWidth: 0,
               }}
             >
@@ -2661,7 +2715,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 alignItems: "center",
                 gap: "6px",
                 flexWrap: "wrap",
-                flexShrink: 0,
+                minWidth: 0,
               }}
             >
               <button
@@ -3406,7 +3460,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          padding: "10px clamp(8px, 1.4vw, 14px) calc(18px + env(safe-area-inset-bottom, 0px))",
+          padding: "8px clamp(8px, 1.4vw, 14px)",
           display: "flex",
           flexDirection: "column",
           gap: "8px",
@@ -3419,14 +3473,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           aria-label="Resize message composer"
           title="Drag up or down to resize prompt composer"
           onMouseDown={handleComposerResizeStart}
+          onTouchStart={handleComposerTouchResizeStart}
           style={{
-            height: "8px",
-            margin: "-6px 0 2px 0",
+            height: "16px",
+            margin: "-8px 0 0 0",
             cursor: "ns-resize",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             userSelect: "none",
+            touchAction: "none",
           }}
         >
           <div
@@ -3765,7 +3821,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
           <textarea
             ref={textareaRef}
-            rows={2}
+            rows={1}
             role="searchbox"
             name="fd-dispatch-command"
             autoComplete="one-time-code"
@@ -3789,8 +3845,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               width: "100%",
               resize: "vertical",
               height: `${composerHeight}px`,
-              minHeight: "72px",
-              maxHeight: "420px",
+              minHeight: `${COMPOSER_MIN_HEIGHT_PX}px`,
+              maxHeight: `${COMPOSER_MAX_HEIGHT_PX}px`,
               border: "none",
               outline: "none",
               backgroundColor: "transparent",
