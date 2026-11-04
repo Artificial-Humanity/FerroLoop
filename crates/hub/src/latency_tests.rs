@@ -439,6 +439,7 @@ fn transcript_response_reference(
             "turns": turns,
             "total_turns": total_turns,
             "is_busy": is_busy,
+            "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
             "queue": queue,
             "context_usage": context_usage,
             "quota_usage": quota_usage,
@@ -497,14 +498,180 @@ fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
 }
 
 #[test]
-fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
+fn normal_prompt_queues_while_finished_queue_send_has_not_marked_inflight() {
+    use std::sync::{Arc, Mutex};
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = Arc::new(hub_with_ferris(&tmp, 3));
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "first".into(),
+        "first".into(),
+        "owner".into(),
+        vec![],
+    );
+    let observed = Arc::new(Mutex::new(None));
+    let (state_for_hook, observed_for_hook) = (state.clone(), observed.clone());
+    crate::api::after_next_queue_finish(move || {
+        let (response, _) = post_prompt(&state_for_hook, false);
+        *observed_for_hook.lock().unwrap() = Some(response.json_value().unwrap());
+    });
+    crate::api::drain_ready_session_queues(&state);
+    let response = observed.lock().unwrap().take().unwrap();
+    assert_eq!(response["status"], "queued");
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+}
+
+#[test]
+fn direct_dispatch_fences_queue_drain_and_other_direct_prompts() {
+    use std::sync::{Arc, Mutex};
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = Arc::new(hub_with_ferris(&tmp, 3));
+    let observed = Arc::new(Mutex::new(None));
+    let (state_for_hook, observed_for_hook) = (state.clone(), observed.clone());
+    crate::api::after_next_prompt_dispatch(move || {
+        let (response, _) = post_prompt(&state_for_hook, false);
+        let status = response.json_value().unwrap()["status"].clone();
+        let (forced, _) = post_prompt(&state_for_hook, true);
+        assert_eq!(
+            forced.status, 409,
+            "send-now cannot overlap an active delivery"
+        );
+        crate::api::drain_ready_session_queues(&state_for_hook);
+        *observed_for_hook.lock().unwrap() =
+            Some((status, state_for_hook.session_queue("conv-ferris-1").len()));
+    });
+    let (response, _) = post_prompt(&state, false);
+    assert_eq!(response.json_value().unwrap()["status"], "sent");
+    let (status, remaining) = observed.lock().unwrap().take().unwrap();
+    assert_eq!(status, "queued");
+    assert_eq!(
+        remaining, 1,
+        "queue drain must not dispatch during direct delivery"
+    );
+}
+
+#[test]
+fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let home = tmp.path().to_path_buf();
+    crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 4));
+    let (sent, _) = post_prompt(&state, true);
+    assert_eq!(sent.json_value().unwrap()["status"], "sent");
+    let (queued, _) = post_prompt(&state, false);
+    assert_eq!(queued.json_value().unwrap()["status"], "queued");
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(
+        state.session_queue("conv-ferris-1").len(),
+        1,
+        "old idle turns cannot complete the new prompt"
+    );
+    write_ferris_transcript(tmp.path(), 5);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(
+        state.session_queue("conv-ferris-1").is_empty(),
+        "a later assistant turn releases the queue"
+    );
+}
+
+#[test]
+fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
+    for send_now in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let path = tmp.path().join(
+            ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+        );
+        let old = fs::read(&path).unwrap();
+        let target = path.clone();
+        crate::api::after_next_prompt_dispatch(move || fs::remove_file(target).unwrap());
+        let (sent, _) = post_prompt(&state, send_now);
+        assert_eq!(sent.json_value().unwrap()["status"], "sent");
+        assert_eq!(sent.json_value().unwrap()["in_flight_unconfirmed"], true);
+        let (queued, _) = post_prompt(&state, false);
+        assert_eq!(queued.json_value().unwrap()["status"], "queued");
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(
+            state.session_queue("conv-ferris-1").len(),
+            1,
+            "absence cannot set an unknown baseline to zero"
+        );
+        fs::write(&path, &old).unwrap();
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(
+            state.session_queue("conv-ferris-1").len(),
+            1,
+            "restored old turns do not complete a new prompt"
+        );
+        let request = HttpRequest::new("GET", "/api/v1/sessions/conv-ferris-1/transcript")
+            .with_header("Authorization", OWNER);
+        let observed = handle_http_request(&state, &request).json_value().unwrap();
+        assert_eq!(observed["in_flight_unconfirmed"], true);
+        assert_eq!(observed["queue"].as_array().unwrap().len(), 1);
+
+        write_ferris_transcript(tmp.path(), 4);
+        crate::api::drain_ready_session_queues(&state);
+        assert!(
+            state.session_queue("conv-ferris-1").is_empty(),
+            "new reply releases queue"
+        );
+    }
+}
+
+#[test]
+fn removed_queued_dispatch_transcript_keeps_following_prompt_fenced() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let path = tmp.path().join(
+        ".gemini/antigravity-cli/brain/conv-ferris-1/.system_generated/logs/transcript.jsonl",
+    );
+    let old = fs::read(&path).unwrap();
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "first".into(),
+        "first".into(),
+        "owner".into(),
+        vec![],
+    );
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "second".into(),
+        "second".into(),
+        "owner".into(),
+        vec![],
+    );
+    let target = path.clone();
+    crate::api::after_next_prompt_dispatch(move || fs::remove_file(target).unwrap());
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    fs::write(&path, &old).unwrap();
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+    write_ferris_transcript(tmp.path(), 4);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
+fn known_prompt_skips_attempt_snapshot_and_reuses_unchanged_transcript() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let (queued_check, checked) = post_prompt(&state, false);
     assert_eq!(queued_check.json_value().unwrap()["status"], "sent");
-    // Busy check, then the in-flight mark after the dispatch.
-    assert_eq!(checked.transcript_parses, 2);
-    assert_eq!(checked.store_snapshots, 1);
+    // Busy check and in-flight mark share the unchanged transcript.
+    assert_eq!(checked.transcript_parses, 1);
+    assert_eq!(checked.store_snapshots, 0);
 
     let (sent, skipped) = post_prompt(&state, true);
     let body = sent.json_value().unwrap();
@@ -514,18 +681,131 @@ fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
         skipped.transcript_parses, 1,
         "only the in-flight mark parses"
     );
-    assert_eq!(skipped.store_snapshots, 1);
+    assert_eq!(skipped.store_snapshots, 0);
 
     // The in-flight mark still took: a prompt without send_now now queues.
     let (queued, _) = post_prompt(&state, false);
     assert_eq!(queued.json_value().unwrap()["status"], "queued");
 }
 
+#[test]
+fn unknown_prompt_uses_full_attempt_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (response, costs) = measure(|| {
+        handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/not-a-route/prompt")
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+        )
+    });
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        costs.store_snapshots, 1,
+        "unknown targets retain attempt fallback"
+    );
+}
+
+#[test]
+fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
+    let attempt = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["source"] == "attempt")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let (response, costs) = measure(|| {
+        handle_http_request(
+            &state,
+            &HttpRequest::new("POST", format!("/api/v1/sessions/{attempt}/prompt"))
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+        )
+    });
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json_value().unwrap()["session_id"], attempt);
+    assert_eq!(costs.store_snapshots, 1);
+}
+
+#[test]
+fn single_route_lookup_does_not_search_unrelated_transcripts() {
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    let tmp = TempDir::new().unwrap();
+    let path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    let mut routes = RouteTable::default();
+    for i in 0..25 {
+        routes.upsert(
+            &format!("agent{i}"),
+            VendorRoute::Codex {
+                thread_id: format!("thread-{i}"),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+    }
+    routes.save(Some(&path)).unwrap();
+    let snapshot = crate::discovery::DiscoveryStoreSnapshot::default();
+    let (found, costs) = measure(|| {
+        crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), "thread-12")
+    });
+    assert_eq!(found.unwrap().persona.as_deref(), Some("agent12"));
+    assert_eq!(
+        costs.transcript_finds, 1,
+        "only the selected route is searched"
+    );
+    let full = crate::discovery::lookup_sessions(&snapshot, Some(tmp.path()));
+    for requested in ["thread-12", "agent12", "missing"] {
+        let fast =
+            crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), requested);
+        let full_match = full
+            .iter()
+            .find(|s| s.id == requested || s.persona.as_deref() == Some(requested));
+        assert_eq!(fast.as_ref(), full_match, "{requested}");
+    }
+}
+
+#[test]
+fn fast_lookup_preserves_full_discoverys_deduplicated_route_order() {
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    let tmp = TempDir::new().unwrap();
+    let path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    let mut routes = RouteTable::default();
+    for persona in ["alice", "bob"] {
+        routes.upsert(
+            persona,
+            VendorRoute::Codex {
+                thread_id: "shared-thread".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+    }
+    routes.save(Some(&path)).unwrap();
+    let snapshot = crate::discovery::DiscoveryStoreSnapshot::default();
+    let full = crate::discovery::lookup_sessions(&snapshot, Some(tmp.path()));
+    for requested in ["alice", "bob", "shared-thread"] {
+        let fast =
+            crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), requested);
+        let full_match = full
+            .iter()
+            .find(|s| s.id == requested || s.persona.as_deref() == Some(requested));
+        assert_eq!(fast.as_ref(), full_match, "{requested}");
+    }
+}
+
 // ---- item 3: lazy route lookup ----
 
 mod route_lookup {
     use std::cell::RefCell;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -559,12 +839,55 @@ mod route_lookup {
         note_route_file_scan(Some(home), Instant::now());
     }
 
+    /// Wait for a closed listener to stop accepting connections. A concurrently forked test
+    /// process can inherit the listener fd until exec, even after this test drops its copy.
+    /// Bound the number of probes; unexpected errors are not a refusal.
+    fn wait_for_connection_refusal(socket_path: &Path) {
+        for _ in 0..32 {
+            match UnixStream::connect(socket_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!(
+                    "{}: unexpected connect error: {error}",
+                    socket_path.display()
+                ),
+                Ok(stream) => drop(stream),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "{} remained connectable after listener close",
+            socket_path.display()
+        );
+    }
+
     /// A webhook route whose socket file exists (the cheap lookup check passes), with nothing
     /// listening on it: a connect is refused.
     fn refusing_webhook(home: &Path, name: &str) -> VendorRoute {
         let socket_path = home.join(name);
         drop(UnixListener::bind(&socket_path).unwrap());
+        wait_for_connection_refusal(&socket_path);
         VendorRoute::Webhook { socket_path }
+    }
+
+    #[test]
+    fn refusal_waits_for_a_retained_listener_copy_to_close() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("retained.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let retained = listener.try_clone().unwrap();
+        drop(listener);
+        // A copied listener models the fd held by a child between fork and exec.
+        assert!(UnixStream::connect(&path).is_ok());
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(retained);
+        });
+        wait_for_connection_refusal(&path);
+        closer.join().unwrap();
+        assert_eq!(
+            UnixStream::connect(&path).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
     }
 
     /// What each connection made to `listener` so far carried, in order. Every send under test

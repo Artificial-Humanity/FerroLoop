@@ -896,8 +896,38 @@ export interface SessionDraft {
   attachments: PromptAttachment[];
 }
 
+interface PendingPrompt {
+  content: string;
+  attachments: PromptAttachment[];
+  matchingBefore: number;
+}
+
+// A send can outlive the pane that started it. Keep its identity shared so a
+// remount displays the same pending turn and cannot start a duplicate send.
+const pendingPrompts = new Map<string, PendingPrompt>();
+const pendingPromptListeners = new Set<() => void>();
+function notifyPendingPrompts() {
+  for (const listener of pendingPromptListeners) listener();
+}
+
 /** In-progress composer drafts survive tab switches and agent switches. */
 export const sessionDraftMemory = new Map<string, SessionDraft>();
+export const sessionSendErrors = new Map<string, string>();
+const pendingAttachmentReads = new Map<string, number>();
+const draftListeners = new Set<
+  (target: string, draft: SessionDraft | null, error?: string) => void
+>();
+function notifyDraft(target: string, draft: SessionDraft | null, error?: string) {
+  for (const listener of draftListeners) listener(target, draft, error);
+}
+function saveSessionDraft(target: string, draft: SessionDraft) {
+  sessionDraftMemory.set(target, draft);
+  try {
+    window.localStorage.setItem(DRAFT_STORAGE_PREFIX + target, draft.promptText);
+  } catch {
+    // Storage is optional; the in-memory draft still survives target switches.
+  }
+}
 
 export const DRAFT_STORAGE_PREFIX = "ferrodeck.draft.";
 
@@ -949,6 +979,7 @@ export interface ChatPaneProps {
   /** Vendor account quota/allowance usage when reported by the adapter/hub. */
   quotaUsage?: SessionQuotaUsage | null;
   isBusy?: boolean;
+  inFlightUnconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
   loading?: boolean;
   error?: string | null;
@@ -1078,6 +1109,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   contextUsage = null,
   quotaUsage = null,
   isBusy,
+  inFlightUnconfirmed,
   queue,
   loading = false,
   error = null,
@@ -1108,6 +1140,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     string | null
   >(null);
   const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
+  const [internalInFlightUnconfirmed, setInternalInFlightUnconfirmed] = React.useState(false);
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
   const [editingQueueId, setEditingQueueId] = React.useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = React.useState<string>("");
@@ -1177,31 +1210,40 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // still belongs to the agent/session they were started for.
   const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
   currentTargetRef.current = targetSessionOrAgent;
-  const [submittingByTarget, setSubmittingByTarget] = React.useState<
-    Record<string, number>
-  >({});
-  const submitting = Boolean(
-    targetSessionOrAgent && (submittingByTarget[targetSessionOrAgent] ?? 0) > 0,
-  );
-  const beginTargetSubmitting = React.useCallback((targetKey: string) => {
-    if (!targetKey) return;
-    setSubmittingByTarget((prev) => ({
-      ...prev,
-      [targetKey]: (prev[targetKey] ?? 0) + 1,
-    }));
+  const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
+  React.useEffect(() => {
+    pendingPromptListeners.add(refreshPendingPrompts);
+    // A send could have begun between render and subscription.
+    refreshPendingPrompts();
+    return () => { pendingPromptListeners.delete(refreshPendingPrompts); };
   }, []);
-  const endTargetSubmitting = React.useCallback((targetKey: string) => {
-    if (!targetKey) return;
-    setSubmittingByTarget((prev) => {
-      const nextCount = (prev[targetKey] ?? 0) - 1;
-      if (nextCount <= 0) {
-        const { [targetKey]: _removed, ...rest } = prev;
-        return rest;
-      }
-      return { ...prev, [targetKey]: nextCount };
-    });
-  }, []);
+  const submitting = Boolean(targetSessionOrAgent && pendingPrompts.has(targetSessionOrAgent));
   const [submitError, setSubmitError] = React.useState<string | null>(null);
+  const [sendErrorsByTarget, setSendErrorsByTarget] = React.useState<Record<string, string>>(
+    () => Object.fromEntries(sessionSendErrors),
+  );
+  const mountedRef = React.useRef(false);
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const draftRef = React.useRef({ promptText, attachments });
+  draftRef.current = { promptText, attachments };
+
+  React.useEffect(() => {
+    const listener = (target: string, draft: SessionDraft | null, error?: string) => {
+      if (error) setSendErrorsByTarget((prev) => ({ ...prev, [target]: error }));
+      if (draft && currentTargetRef.current === target) {
+        draftRef.current = draft;
+        setPromptText(draft.promptText);
+        setAttachments(draft.attachments);
+      }
+    };
+    draftListeners.add(listener);
+    return () => { draftListeners.delete(listener); };
+  }, []);
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
@@ -1826,6 +1868,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (currentTargetRef.current === targetId) {
         setInternalTurns(response.turns ?? []);
         setInternalIsBusy(Boolean(response.is_busy));
+        setInternalInFlightUnconfirmed(Boolean(response.in_flight_unconfirmed));
         setInternalQueue(response.queue ?? []);
         setInternalContextUsage(response.context_usage ?? null);
         setInternalQuotaUsage(response.quota_usage ?? null);
@@ -1847,12 +1890,29 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     void fetchTranscript();
   }, [fetchTranscript]);
 
+  const pendingPrompt = pendingPrompts.get(targetSessionOrAgent);
   const filteredTurns = React.useMemo(() => {
+    let visible = effectiveTurns;
+    if (pendingPrompt) {
+      const matches = effectiveTurns.reduce<number[]>((indices, turn, index) => {
+        const body = extractTurnAttachments(turn.content || "", {
+          stripAgyWrapper: true,
+        }).cleanedContent.trim();
+        if (turn.role.toLowerCase() === "user" && body === pendingPrompt.content) {
+          indices.push(index);
+        }
+        return indices;
+      }, []);
+      if (matches.length > pendingPrompt.matchingBefore) {
+        const duplicate = matches[matches.length - 1];
+        visible = effectiveTurns.filter((_, index) => index !== duplicate);
+      }
+    }
     const q = filterQuery.trim().toLowerCase();
     if (!q) {
-      return effectiveTurns;
+      return visible;
     }
-    return effectiveTurns.filter((t) => {
+    return visible.filter((t) => {
       if (t.content.toLowerCase().includes(q)) return true;
       if (t.thinking && t.thinking.toLowerCase().includes(q)) return true;
       if (t.role.toLowerCase().includes(q)) return true;
@@ -1862,7 +1922,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           JSON.stringify(tc.arguments ?? "").toLowerCase().includes(q),
       );
     });
-  }, [effectiveTurns, filterQuery]);
+  }, [effectiveTurns, filterQuery, pendingPrompt]);
 
   const { displayedTurns, hiddenTurnCount } = React.useMemo(() => {
     if (filterQuery.trim() || filteredTurns.length <= visibleTurnLimit) {
@@ -1981,12 +2041,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const readFilesAsAttachments = React.useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
-    if (fileArray.length === 0) return;
+    const target = currentTargetRef.current;
+    if (fileArray.length === 0 || !target) return;
+    pendingAttachmentReads.set(target, (pendingAttachmentReads.get(target) ?? 0) + 1);
     try {
       const loaded = await Promise.all(fileArray.map((f) => fileToPromptAttachment(f)));
-      setAttachments((prev) => [...prev, ...loaded]);
+      const previous = mountedRef.current && currentTargetRef.current === target
+        ? draftRef.current : loadSessionDraft(target);
+      const draft = { ...previous, attachments: [...previous.attachments, ...loaded] };
+      saveSessionDraft(target, draft);
+      notifyDraft(target, draft);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to read attachment");
+      const message = err instanceof Error ? err.message : "Failed to read attachment";
+      sessionSendErrors.set(target, message);
+      notifyDraft(target, null, message);
+    } finally {
+      const remaining = (pendingAttachmentReads.get(target) ?? 1) - 1;
+      if (remaining > 0) pendingAttachmentReads.set(target, remaining);
+      else pendingAttachmentReads.delete(target);
     }
   }, []);
 
@@ -2019,8 +2091,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent) return;
     const submittedTarget = targetSessionOrAgent;
     try {
+      setSubmitError(null);
       if (onSendQueuedNow) {
-        await onSendQueuedNow(promptId);
+        const res = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
+        if (res?.delivered === false) {
+          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        }
       } else if (apiClient) {
         const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         if (currentTargetRef.current === submittedTarget) {
@@ -2029,6 +2105,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
+          }
+          if (res.delivered === false) {
+            throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
           }
           const content = res.effective_body || res.prompt;
           if (content) {
@@ -2060,6 +2139,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    const item = effectiveQueue.find((queued) => queued.id === promptId);
+    if (item?.delivery_state === "unconfirmed" && !window.confirm(
+      "Delivery may have succeeded. Check the session before removing this record. Remove it anyway?",
+    )) return;
     const submittedTarget = targetSessionOrAgent;
     if (editingQueueId === promptId) {
       setEditingQueueId(null);
@@ -2138,78 +2221,111 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const submitPrompt = async () => {
     const trimmedPrompt = promptText.trim();
-    if ((!trimmedPrompt && attachments.length === 0) || submitting || !targetSessionOrAgent) {
+    if (
+      (!trimmedPrompt && attachments.length === 0) ||
+      submitting ||
+      !targetSessionOrAgent ||
+      pendingPrompts.has(targetSessionOrAgent)
+    ) {
       return;
     }
-
+    const submittedTarget = targetSessionOrAgent;
+    const submittedDraft = { promptText, attachments: [...attachments] };
+    const content = trimmedPrompt || "Attached file(s).";
+    const matchingBefore = effectiveTurns.filter((turn) =>
+      turn.role.toLowerCase() === "user" &&
+      extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
+        .cleanedContent.trim() === content,
+    ).length;
     const payload: PromptRequest = {
-      prompt: trimmedPrompt || "Attached file(s).",
+      prompt: content,
       urgency: "normal",
       subject: undefined,
-      ...(attachments.length > 0 ? { attachments } : {}),
+      ...(submittedDraft.attachments.length > 0
+        ? { attachments: submittedDraft.attachments }
+        : {}),
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
-    const submittedTarget = targetSessionOrAgent;
-    beginTargetSubmitting(submittedTarget);
+    const pending: PendingPrompt = { content, attachments: submittedDraft.attachments, matchingBefore };
+    pendingPrompts.set(submittedTarget, pending);
+    notifyPendingPrompts();
     setSubmitError(null);
+    sessionSendErrors.delete(submittedTarget);
+    setSendErrorsByTarget((prev) => {
+      const next = { ...prev };
+      delete next[submittedTarget];
+      return next;
+    });
+    clearSessionDraft(submittedTarget);
+    draftRef.current = { promptText: "", attachments: [] };
+    setPromptText("");
+    setAttachments([]);
+    scrollToBottom("smooth");
     try {
-      let wasQueued = false;
+      let res: PromptResponse | undefined;
       if (onSendPrompt) {
-        const res = (await onSendPrompt(submittedTarget, payload)) as
+        res = (await onSendPrompt(submittedTarget, payload)) as
           | PromptResponse
           | undefined;
-        if (res && (res.queued || res.status === "queued")) {
-          wasQueued = true;
-        }
       } else if (apiClient) {
-        const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
-        if (res.queued || res.status === "queued") {
-          wasQueued = true;
-        }
-        if (currentTargetRef.current === submittedTarget) {
-          if (Array.isArray(res.queue)) {
-            setInternalQueue(res.queue);
-          }
-          if (typeof res.is_busy === "boolean") {
-            setInternalIsBusy(res.is_busy);
-          }
-          if (!wasQueued) {
-            const content = res.effective_body || payload.prompt;
-            setInternalTurns((prev) => [
-              ...prev,
-              {
-                index: prev.length,
-                role: "user",
-                content,
-                thinking: null,
-                tool_calls: [],
-                created_at: new Date().toISOString(),
-              },
-            ]);
-          }
-          await fetchTranscript();
-        }
+        res = await apiClient.sendSessionPrompt(submittedTarget, payload);
+      } else {
+        throw new Error("No prompt connection is available");
       }
-      clearSessionDraft(submittedTarget);
-      // The operator may have switched agents while the request was in
-      // flight: the composer now holds another target's draft, which must
-      // not be wiped (or scrolled) on behalf of the finished send.
-      if (currentTargetRef.current === submittedTarget) {
-        setPromptText("");
-        setAttachments([]);
+      const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
+      if (!wasQueued && res?.delivered === false) {
+        throw new Error(res.delivery_error || "Message delivery failed");
+      }
+      if (
+        mountedRef.current && !onSendPrompt && apiClient && res &&
+        currentTargetRef.current === submittedTarget
+      ) {
+        if (Array.isArray(res.queue)) setInternalQueue(res.queue);
+        if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
         if (!wasQueued) {
-          scrollToBottom("smooth");
-          // Run again after the optimistic turn and live indicator render.
-          requestAnimationFrame(() => scrollToBottom("smooth"));
+          const body = res.effective_body || payload.prompt;
+          setInternalTurns((prev) => {
+            const matches = prev.filter((turn) =>
+              turn.role.toLowerCase() === "user" &&
+              extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
+                .cleanedContent.trim() === content,
+            ).length;
+            if (matches > matchingBefore) return prev;
+            return [...prev, {
+              index: prev.length,
+              role: "user",
+              content: body,
+              thinking: null,
+              tool_calls: [],
+              created_at: new Date().toISOString(),
+            }];
+          });
         }
+        void fetchTranscript();
+      }
+      if (mountedRef.current && currentTargetRef.current === submittedTarget && !wasQueued) {
+        scrollToBottom("smooth");
+        requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
-      if (currentTargetRef.current === submittedTarget) {
-        setSubmitError(err instanceof Error ? err.message : "Failed to send message");
+      const message = err instanceof Error ? err.message : "Failed to send message";
+      sessionSendErrors.set(submittedTarget, message);
+      const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget
+        ? draftRef.current : loadSessionDraft(submittedTarget);
+      let restored: SessionDraft | null = null;
+      if (currentDraft.promptText.length === 0 && currentDraft.attachments.length === 0 &&
+          !pendingAttachmentReads.has(submittedTarget)) {
+        restored = submittedDraft;
+        saveSessionDraft(submittedTarget, restored);
       }
+      notifyDraft(submittedTarget, restored, message);
+
     } finally {
-      endTargetSubmitting(submittedTarget);
+      if (pendingPrompts.get(submittedTarget) === pending) {
+        pendingPrompts.delete(submittedTarget);
+        notifyPendingPrompts();
+      }
     }
   };
 
@@ -3158,7 +3274,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
-        {filteredTurns.length === 0 ? (
+        {filteredTurns.length === 0 && !pendingPrompt ? (
           <div
             className="fd-card"
             data-testid="chat-empty-state"
@@ -3238,6 +3354,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </>
         )}
 
+        {pendingPrompt && (
+          <div data-testid="optimistic-user-turn" aria-live="polite">
+            <TurnCard turn={{
+              index: -1,
+              role: "user",
+              content: pendingPrompt.content,
+              thinking: null,
+              tool_calls: [],
+              created_at: null,
+            }} />
+            {pendingPrompt.attachments.map((attachment, index) => (
+              <span key={`${attachment.name}-${index}`}>{attachment.name}</span>
+            ))}
+            <span>Sending...</span>
+          </div>
+        )}
+
         {effectiveIsBusy &&
           !displayedTurns[displayedTurns.length - 1]?.thinking?.trim() && (
             <div data-testid="live-thinking-indicator">
@@ -3297,7 +3430,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             }}
           />
         </div>
-        {submitError && (
+        {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
             style={{
@@ -3305,8 +3438,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               color: "#FCA5A5",
             }}
           >
-            {submitError}
+            {submitError || sendErrorsByTarget[targetSessionOrAgent]}
           </div>
+        )}
+
+        {(inFlightUnconfirmed ?? internalInFlightUnconfirmed) && (
+          <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.some((item) => !item.delivery_state || item.delivery_state === "pending") && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
         )}
 
         {effectiveQueue.length > 0 && (
@@ -3424,6 +3561,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         >
                           {item.prompt}
                         </span>
+                        {item.delivery_state === "unconfirmed" && (
+                          <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
+                        )}
+                        {item.delivery_error && <span role="status">{item.delivery_error}</span>}
                         {item.attachments && item.attachments.length > 0 && (
                           <span className="fd-badge" style={{ fontSize: "10px" }}>
                             {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
@@ -3433,6 +3574,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           type="button"
                           className="fd-btn"
                           data-testid={`queued-edit-${item.id}`}
+                          disabled={Boolean(item.delivery_state && item.delivery_state !== "pending")}
                           onClick={() => {
                             setEditingQueueId(item.id);
                             setEditingQueueText(item.prompt);
@@ -3446,6 +3588,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           type="button"
                           className="fd-btn fd-btn-primary"
                           data-testid={`queued-send-now-${item.id}`}
+                          disabled={Boolean(item.delivery_state && item.delivery_state !== "pending")}
                           onClick={() => void handleSendQueuedNow(item.id)}
                           style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
                         >
@@ -3456,6 +3599,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           className="fd-btn"
                           aria-label="Remove"
                           data-testid={`queued-cancel-${item.id}`}
+                          disabled={item.delivery_state === "sending"}
                           onClick={() => void handleCancelQueued(item.id)}
                           style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
                           title="Remove from queue"

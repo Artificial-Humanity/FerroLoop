@@ -77,9 +77,10 @@ use crate::cloud_adapters;
 use crate::discovery::{
     DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
     discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
-    list_git_worktrees, lookup_sessions, read_session_quota_usage_with_reads,
-    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
-    snapshot_discovery_store, transcript_from_sessions,
+    list_git_worktrees, lookup_one_route_session, lookup_sessions,
+    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
+    scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
+    transcript_observation_from_sessions,
 };
 use crate::github_pr;
 use crate::lifecycle::{
@@ -4820,15 +4821,29 @@ fn handle_dynamic_api_routes(
                 let sessions = lookup_sessions(&snap, home);
                 let mut files = TranscriptReads::default();
                 let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
-                let all_turns =
-                    transcript_from_sessions(&session_id, &sessions, &snap, home, &mut files);
-                // The busy check reads the canonical id's transcript. It is the same read
-                // unless the persona resolved to another id; a file both reach is parsed once.
-                let canonical_turns = (canonical_id != session_id.trim()).then(|| {
-                    transcript_from_sessions(&canonical_id, &sessions, &snap, home, &mut files)
-                });
-                let busy_turns = canonical_turns.as_deref().unwrap_or(&all_turns);
-                let is_busy = state.is_session_busy_from_turns(&canonical_id, busy_turns);
+                let all_observation = transcript_observation_from_sessions(
+                    &session_id,
+                    &sessions,
+                    &snap,
+                    home,
+                    &mut files,
+                );
+                let canonical_observation = if canonical_id != session_id.trim() {
+                    transcript_observation_from_sessions(
+                        &canonical_id,
+                        &sessions,
+                        &snap,
+                        home,
+                        &mut files,
+                    )
+                } else {
+                    all_observation.clone()
+                };
+                let is_busy = state.is_session_busy_from_observation(
+                    &canonical_id,
+                    canonical_observation.as_deref(),
+                );
+                let all_turns = all_observation.unwrap_or_default();
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -4859,6 +4874,7 @@ fn handle_dynamic_api_routes(
                         "turns": turns,
                         "total_turns": total_turns,
                         "is_busy": is_busy,
+                        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                         "queue": queue,
                         "context_usage": context_usage,
                         "quota_usage": quota_usage,
@@ -4875,6 +4891,7 @@ fn handle_dynamic_api_routes(
                     json!({
                         "session_id": canonical_id,
                         "is_busy": is_busy,
+                        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                         "queue": queue,
                     }),
                 );
@@ -5257,6 +5274,73 @@ fn dispatch_to_session_route<T>(
     .ok_or_else(|| no_route_error(persona, canonical_id))
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_QUEUE_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn after_next_queue_finish(f: impl FnOnce() + 'static) {
+    AFTER_QUEUE_FINISH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+thread_local! {
+    static QUEUED_TEST_DELIVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+pub(crate) struct StubQueuedDelivery;
+#[cfg(test)]
+impl Drop for StubQueuedDelivery {
+    fn drop(&mut self) {
+        QUEUED_TEST_DELIVERY.with(|flag| flag.set(false));
+    }
+}
+#[cfg(test)]
+pub(crate) fn stub_queued_delivery_success() -> StubQueuedDelivery {
+    QUEUED_TEST_DELIVERY.with(|flag| flag.set(true));
+    StubQueuedDelivery
+}
+
+#[cfg(test)]
+pub(crate) fn after_next_prompt_dispatch(f: impl FnOnce() + 'static) {
+    AFTER_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+fn dispatch_operator_prompt_for_session_typed(
+    state: &HubState,
+    persona: Option<&str>,
+    session_id: &str,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), PushError> {
+    #[cfg(test)]
+    if QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+        AFTER_PROMPT_DISPATCH.with(|hook| {
+            if let Some(f) = hook.borrow_mut().take() {
+                f();
+            }
+        });
+        return Ok(());
+    }
+    let result = crate::lifecycle::dispatch_with_rediscovery_typed(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, session_id),
+        |route| push_operator_prompt_to_route(route, sender_name, body),
+    )
+    .unwrap_or_else(|| Err(PushError::NotConnected(no_route_error(persona, session_id))));
+    #[cfg(test)]
+    AFTER_PROMPT_DISPATCH.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    result
+}
+
 fn dispatch_operator_prompt_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -5264,9 +5348,16 @@ fn dispatch_operator_prompt_for_session(
     sender_name: &str,
     effective_body: &str,
 ) -> Result<(), String> {
-    dispatch_to_session_route(state, persona, fallback_session_id, |route| {
+    let result = dispatch_to_session_route(state, persona, fallback_session_id, |route| {
         push_operator_prompt_to_route(route, sender_name, effective_body)
-    })?
+    })?;
+    #[cfg(test)]
+    AFTER_PROMPT_DISPATCH.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    result
 }
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
@@ -5284,27 +5375,58 @@ pub fn drain_ready_session_queues(state: &HubState) {
     };
     let home = state.config.home_override.as_deref();
     for session_id in keys {
-        let turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
-        if !state.is_session_busy_from_turns(&session_id, &turns)
-            && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
+        // Keep the discovered path across the dispatch: if the file disappears before
+        // the post-send observation, it is unknown rather than a new empty transcript.
+        let sessions = lookup_sessions(&snap, home);
+        let (canonical_id, _) = resolve_session_target_in(&sessions, &session_id);
+        let mut files = TranscriptReads::default();
+        let turns =
+            transcript_observation_from_sessions(&canonical_id, &sessions, &snap, home, &mut files);
+        let next = state
+            .session_queue(&session_id)
+            .first()
+            .map(|item| item.id.clone());
+        if !state.is_session_busy_from_observation(&canonical_id, turns.as_deref())
+            && let Some(prompt_id) = next
+            && let Some((item, claim)) =
+                state.claim_queued_for_dispatch(&canonical_id, &session_id, &prompt_id, true)
         {
-            let delivery_res = dispatch_operator_prompt_for_session(
+            let delivery_res = dispatch_operator_prompt_for_session_typed(
                 state,
                 item.persona.as_deref(),
-                &item.session_id,
+                &canonical_id,
                 &item.by,
                 &item.effective_body,
             );
-            let after = read_session_transcript_from_snapshot(&session_id, &snap, home);
-            state.mark_session_in_flight_from_turns(&session_id, &after);
+            let queue = state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone());
+            #[cfg(test)]
+            AFTER_QUEUE_FINISH.with(|hook| {
+                if let Some(f) = hook.borrow_mut().take() {
+                    f();
+                }
+            });
+            if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
+                let after = transcript_observation_from_sessions(
+                    &canonical_id,
+                    &sessions,
+                    &snap,
+                    home,
+                    &mut files,
+                );
+                state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
+                if matches!(delivery_res, Err(PushError::Failed(_))) {
+                    state.associate_unconfirmed_queue(&canonical_id, &session_id, &item.id);
+                }
+            }
+            claim.finish();
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
-                "status": "sent",
-                "queued": false,
+                "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
+                "queued": delivery_res.is_err(),
                 "is_busy": true,
                 "delivered": delivery_res.is_ok(),
-                "delivery_error": delivery_res.as_ref().err(),
+                "delivery_error": delivery_res.as_ref().err().map(ToString::to_string),
                 "prompt_id": item.id,
                 "prompt": item.prompt,
                 "effective_body": item.effective_body,
@@ -5333,30 +5455,46 @@ fn handle_post_queued_prompt_send_now(
     prompt_id: &str,
 ) -> HttpResponse {
     let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
-    let removed = state
-        .remove_queued_prompt(&canonical_id, prompt_id)
-        .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
-    let Some((item, queue)) = removed else {
-        return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
+    let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
+    let Some((item, claim)) = claimed else {
+        let exists = state
+            .session_queue(&canonical_id)
+            .iter()
+            .any(|q| q.id == prompt_id)
+            || state
+                .session_queue(raw_session_id)
+                .iter()
+                .any(|q| q.id == prompt_id);
+        return HttpResponse::json(
+            if exists { 409 } else { 404 },
+            json!({ "error": "queued prompt is missing, already sending, or has unconfirmed delivery" }),
+        );
     };
-
-    let delivery_res = dispatch_operator_prompt_for_session(
+    let queue_key = item.session_id.clone();
+    let delivery_res = dispatch_operator_prompt_for_session_typed(
         state,
         item.persona.as_deref().or(target_persona.as_deref()),
         &canonical_id,
         &item.by,
         &item.effective_body,
     );
-    state.mark_session_in_flight_released(&canonical_id);
+    let queue = state.finish_queued_prompt(&queue_key, prompt_id, delivery_res.clone());
+    if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
+        state.mark_session_in_flight_released(&canonical_id);
+        if matches!(delivery_res, Err(PushError::Failed(_))) {
+            state.associate_unconfirmed_queue(&canonical_id, &queue_key, prompt_id);
+        }
+    }
+    claim.finish();
 
     let data = json!({
         "session_id": canonical_id,
         "persona": item.persona.clone().or(target_persona.clone()),
-        "status": "sent",
-        "queued": false,
+        "status": if delivery_res.is_ok() { "sent" } else { "delivery_failed" },
+        "queued": delivery_res.is_err(),
         "is_busy": true,
         "delivered": delivery_res.is_ok(),
-        "delivery_error": delivery_res.as_ref().err(),
+        "delivery_error": delivery_res.as_ref().err().map(ToString::to_string),
         "prompt_id": prompt_id,
         "prompt": item.prompt,
         "effective_body": item.effective_body,
@@ -5609,60 +5747,82 @@ fn handle_post_session_prompt(
 
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
-    drain_ready_session_queues(state);
-    // One store snapshot and one route lookup serve the resolve, the busy check and the
-    // in-flight mark below.
-    let snap = load_discovery_snapshot(state);
     let home = state.config.home_override.as_deref();
-    let sessions = lookup_sessions(&snap, home);
+    // Most prompts target a live route. Its identity needs agent ordering but not the
+    // project's entire attempt history. Preserve the full lookup for unknown targets.
+    let names = state
+        .open_store()
+        .map(|store| snapshot_discovery_names(&store))
+        .unwrap_or_default();
+    let fast = lookup_one_route_session(&names, home, session_id);
+    let (snap, sessions) = if let Some(session) = fast {
+        (names, vec![session])
+    } else {
+        let snap = load_discovery_snapshot(state);
+        let sessions = lookup_sessions(&snap, home);
+        (snap, sessions)
+    };
     let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
-    let has_queued = !state.session_queue(&canonical_session_id).is_empty();
+    let mut files = TranscriptReads::default();
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
     let busy = !payload.send_now && {
-        let turns = transcript_from_sessions(
+        let turns = transcript_observation_from_sessions(
             &canonical_session_id,
             &sessions,
             &snap,
             home,
-            &mut TranscriptReads::default(),
+            &mut files,
         );
-        state.is_session_busy_from_turns(&canonical_session_id, &turns)
+        state.is_session_busy_from_observation(&canonical_session_id, turns.as_deref())
     };
 
-    if !payload.send_now && (busy || has_queued) {
-        let (item, queue) = state.enqueue_session_prompt(
-            &canonical_session_id,
-            target_persona.clone(),
-            prompt_text,
-            effective_body,
-            sender_name,
-            saved_attachments.clone(),
-        );
-        state.broadcast(
-            "session",
-            "queue_updated",
-            json!({
-                "session_id": canonical_session_id,
-                "persona": target_persona,
-                "is_busy": true,
-                "queue": queue,
-            }),
-        );
-        return HttpResponse::json(
-            200,
-            json!({
-                "session_id": canonical_session_id,
-                "persona": target_persona,
-                "status": "queued",
-                "queued": true,
-                "is_busy": true,
-                "queued_prompt": item,
-                "queue": queue,
-                "attachments": saved_attachments,
-            }),
-        );
-    }
+    let claim = match state.admit_direct_prompt(
+        &canonical_session_id,
+        session_id,
+        payload.send_now,
+        busy,
+        crate::DirectPromptInput {
+            persona: target_persona.clone(),
+            prompt: prompt_text.clone(),
+            effective_body: effective_body.clone(),
+            by: sender_name.clone(),
+            attachments: saved_attachments.clone(),
+        },
+    ) {
+        crate::DirectPromptDecision::Dispatch(claim) => claim,
+        crate::DirectPromptDecision::DispatchBusy => {
+            return HttpResponse::json(
+                409,
+                json!({ "error": "another prompt is being dispatched to this session" }),
+            );
+        }
+        crate::DirectPromptDecision::Queued(item, queue) => {
+            state.broadcast(
+                "session",
+                "queue_updated",
+                json!({
+                    "session_id": canonical_session_id,
+                    "persona": target_persona,
+                    "is_busy": true,
+                    "queue": queue,
+                }),
+            );
+            return HttpResponse::json(
+                200,
+                json!({
+                    "session_id": canonical_session_id,
+                    "persona": target_persona,
+                    "status": "queued",
+                    "queued": true,
+                    "is_busy": true,
+                    "queued_prompt": item,
+                    "queue": queue,
+                    "attachments": saved_attachments,
+                }),
+            );
+        }
+    };
 
     let delivery_res = dispatch_operator_prompt_for_session(
         state,
@@ -5671,15 +5831,16 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    // The transcript as the dispatch left it: read again, not taken from the busy check.
-    let after = transcript_from_sessions(
+    // A changed transcript is refreshed; an unchanged one reuses the busy check's parse.
+    let after = transcript_observation_from_sessions(
         &canonical_session_id,
         &sessions,
         &snap,
         home,
-        &mut TranscriptReads::default(),
+        &mut files,
     );
-    state.mark_session_in_flight_from_turns(&canonical_session_id, &after);
+    state.mark_session_in_flight_from_observation(&canonical_session_id, after.as_deref());
+    claim.finish();
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({
@@ -5688,6 +5849,7 @@ fn handle_post_session_prompt(
         "status": "sent",
         "queued": false,
         "is_busy": true,
+        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
         "delivered": delivery_res.is_ok(),
         "delivery_error": delivery_res.as_ref().err(),
         "prompt": prompt_text,
@@ -7364,7 +7526,11 @@ fn hub_gate_governor(state: &HubState) -> Result<std::sync::Arc<GateGovernor>, (
             ),
         ))
     })?;
-    Ok(std::sync::Arc::new(GateGovernor::new(persistent)))
+    // Owner policy channel: FL_GATE_APPROVED_POLICY_DIGESTS (empty = no failover).
+    Ok(std::sync::Arc::new(
+        GateGovernor::new(persistent)
+            .with_approved_policy_digests(fl_gate::approved_policy_digests_from_env()),
+    ))
 }
 
 fn hub_admission_unavailable() -> HttpResponse {

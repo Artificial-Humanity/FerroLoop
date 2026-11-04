@@ -107,12 +107,29 @@ pub struct QueuedOperatorPrompt {
     #[serde(default)]
     pub attachments: Vec<SavedPromptAttachment>,
     pub created_at: String,
+    #[serde(default)]
+    pub delivery_state: QueuedDeliveryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
+}
+
+/// Sending and unconfirmed items stay visible and cannot be drained automatically.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedDeliveryState {
+    #[default]
+    Pending,
+    Sending,
+    Unconfirmed,
 }
 
 #[derive(Debug, Clone)]
 struct InFlightPrompt {
-    baseline_turn_count: usize,
+    baseline_turn_count: Option<usize>,
     baseline_busy: bool,
+    require_observed_completion: bool,
+    /// Queue aliases associated with this specific unwound dispatch, if any.
+    unwind_queue_keys: Option<(String, String)>,
     dispatched_at_ms: i64,
 }
 
@@ -120,7 +137,105 @@ struct InFlightPrompt {
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
     in_flight: BTreeMap<String, InFlightPrompt>,
+    active_queue_sends: std::collections::BTreeSet<String>,
     next_seq: u64,
+}
+
+/// A logical dispatch claim, held across I/O without holding the queue mutex.
+/// Drop releases it even if the dispatch path unwinds.
+pub(crate) struct SessionDispatchGuard<'a> {
+    state: &'a HubState,
+    canonical: String,
+    raw: String,
+    prompt_id: Option<String>,
+    completed: bool,
+}
+
+impl SessionDispatchGuard<'_> {
+    /// The caller has recorded an in-flight observation or proved no delivery occurred.
+    pub(crate) fn finish(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionDispatchGuard<'_> {
+    fn drop(&mut self) {
+        let mut queues = self
+            .state
+            .prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.completed {
+            let mut has_queue_evidence = false;
+            if let Some(prompt_id) = &self.prompt_id {
+                for key in [&self.canonical, &self.raw] {
+                    if let Some(queue) = queues.queues.get_mut(key) {
+                        for item in queue.iter_mut().filter(|item| {
+                            item.id == *prompt_id
+                                && item.delivery_state == QueuedDeliveryState::Sending
+                        }) {
+                            item.delivery_state = QueuedDeliveryState::Unconfirmed;
+                            has_queue_evidence = true;
+                            item.delivery_error = Some("Delivery is unconfirmed after dispatch was interrupted; inspect the session before taking action".into());
+                        }
+                    }
+                }
+            }
+            queues.in_flight.insert(
+                self.canonical.clone(),
+                InFlightPrompt {
+                    baseline_turn_count: None,
+                    baseline_busy: false,
+                    require_observed_completion: true,
+                    unwind_queue_keys: has_queue_evidence
+                        .then(|| (self.canonical.clone(), self.raw.clone())),
+                    dispatched_at_ms: stamp::now().unix_millis() as i64,
+                },
+            );
+        }
+        queues.active_queue_sends.remove(&self.canonical);
+        queues.active_queue_sends.remove(&self.raw);
+    }
+}
+
+pub(crate) struct DirectPromptInput {
+    pub persona: Option<String>,
+    pub prompt: String,
+    pub effective_body: String,
+    pub by: String,
+    pub attachments: Vec<SavedPromptAttachment>,
+}
+
+pub(crate) enum DirectPromptDecision<'a> {
+    Dispatch(SessionDispatchGuard<'a>),
+    Queued(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>),
+    DispatchBusy,
+}
+
+impl PromptQueueState {
+    fn enqueue(
+        &mut self,
+        session_key: &str,
+        input: DirectPromptInput,
+    ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let now = stamp::now();
+        self.next_seq += 1;
+        let item = QueuedOperatorPrompt {
+            id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
+            session_id: session_key.to_string(),
+            persona: input.persona,
+            prompt: input.prompt,
+            effective_body: input.effective_body,
+            by: input.by,
+            attachments: input.attachments,
+            created_at: now.to_string(),
+            delivery_state: QueuedDeliveryState::Pending,
+            delivery_error: None,
+        };
+        let queue = self.queues.entry(session_key.to_string()).or_default();
+        queue.push(item.clone());
+        (item, queue.clone())
+    }
 }
 
 /// Multiplexed WebSocket frame envelope on `/ws/v1` and `/api/v1/stream` (spec §4.1).
@@ -500,46 +615,178 @@ impl HubState {
         by: String,
         attachments: Vec<SavedPromptAttachment>,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
-        let now = stamp::now();
-        let now_ms = now.unix_millis();
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        guard.next_seq += 1;
-        let seq = guard.next_seq;
-        let item = QueuedOperatorPrompt {
-            id: format!("qp-{now_ms}-{seq}"),
-            session_id: session_key.to_string(),
-            persona,
-            prompt,
-            effective_body,
-            by,
-            attachments,
-            created_at: now.to_string(),
-        };
-        let queue = guard.queues.entry(session_key.to_string()).or_default();
-        queue.push(item.clone());
-        let snapshot = queue.clone();
-        (item, snapshot)
+        guard.enqueue(
+            session_key,
+            DirectPromptInput {
+                persona,
+                prompt,
+                effective_body,
+                by,
+                attachments,
+            },
+        )
     }
 
-    pub fn pop_next_queued_prompt(
+    /// Claim against both names under one lock so an alias cannot bypass the send fence.
+    #[cfg(test)]
+    fn claim_queued_prompt_aliases(
         &self,
-        session_key: &str,
-    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
+        canonical: &str,
+        raw: &str,
+        prompt_id: &str,
+    ) -> Option<QueuedOperatorPrompt> {
+        self.claim_queued_prompt_aliases_inner(canonical, raw, prompt_id, false)
+    }
+
+    fn claim_queued_prompt_aliases_inner(
+        &self,
+        canonical: &str,
+        raw: &str,
+        prompt_id: &str,
+        require_idle: bool,
+    ) -> Option<QueuedOperatorPrompt> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        let queue = guard.queues.get_mut(session_key)?;
-        if queue.is_empty() {
+        if guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw) {
             return None;
         }
-        let item = queue.remove(0);
-        let snapshot = queue.clone();
-        Some((item, snapshot))
+        if require_idle
+            && (guard.in_flight.contains_key(canonical) || guard.in_flight.contains_key(raw))
+        {
+            return None;
+        }
+        let item = {
+            let queue_key = if guard
+                .queues
+                .get(canonical)
+                .is_some_and(|q| q.iter().any(|item| item.id == prompt_id))
+            {
+                canonical
+            } else {
+                raw
+            };
+            let item = guard
+                .queues
+                .get_mut(queue_key)?
+                .iter_mut()
+                .find(|item| item.id == prompt_id)?;
+            if item.delivery_state != QueuedDeliveryState::Pending {
+                return None;
+            }
+            item.delivery_state = QueuedDeliveryState::Sending;
+            item.delivery_error = None;
+            item.clone()
+        };
+        guard.active_queue_sends.insert(canonical.to_string());
+        guard.active_queue_sends.insert(raw.to_string());
+        Some(item)
     }
 
-    /// Drop queued operator prompts and the in-flight marker for `session_key`.
-    /// A clear or reforge must not drain prompts that were waiting on the old context.
+    /// Claim a queued item and keep its session fenced until the returned guard drops.
+    pub(crate) fn claim_queued_for_dispatch<'a>(
+        &'a self,
+        canonical: &str,
+        raw: &str,
+        prompt_id: &str,
+        require_idle: bool,
+    ) -> Option<(QueuedOperatorPrompt, SessionDispatchGuard<'a>)> {
+        let item =
+            self.claim_queued_prompt_aliases_inner(canonical, raw, prompt_id, require_idle)?;
+        Some((
+            item,
+            SessionDispatchGuard {
+                state: self,
+                canonical: canonical.into(),
+                raw: raw.into(),
+                prompt_id: Some(prompt_id.to_owned()),
+                completed: false,
+            },
+        ))
+    }
+
+    /// Atomically check queue/flight state and claim the same gate used by queued sends.
+    /// An explicit send-now may bypass an existing queue/flight, but never another dispatch.
+    pub(crate) fn admit_direct_prompt<'a>(
+        &'a self,
+        canonical: &str,
+        raw: &str,
+        force: bool,
+        observed_busy: bool,
+        input: DirectPromptInput,
+    ) -> DirectPromptDecision<'a> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let active =
+            guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw);
+        if force && active {
+            return DirectPromptDecision::DispatchBusy;
+        }
+        if !force
+            && (active
+                || observed_busy
+                || guard.in_flight.contains_key(canonical)
+                || guard.in_flight.contains_key(raw)
+                || guard.queues.get(canonical).is_some_and(|q| !q.is_empty())
+                || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
+        {
+            let (item, queue) = guard.enqueue(canonical, input);
+            return DirectPromptDecision::Queued(item, queue);
+        }
+        guard.active_queue_sends.insert(canonical.into());
+        guard.active_queue_sends.insert(raw.into());
+        DirectPromptDecision::Dispatch(SessionDispatchGuard {
+            state: self,
+            canonical: canonical.into(),
+            raw: raw.into(),
+            prompt_id: None,
+            completed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn release_queued_send_aliases(&self, canonical: &str, raw: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.active_queue_sends.remove(canonical);
+        guard.active_queue_sends.remove(raw);
+    }
+
+    /// Complete the exact claim. Failed unknown deliveries are retained as evidence and fenced.
+    pub fn finish_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        result: Result<(), fl_wire::dispatcher::PushError>,
+    ) -> Vec<QueuedOperatorPrompt> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return Vec::new();
+        };
+        if let Some(pos) = queue
+            .iter()
+            .position(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
+        {
+            match result {
+                Ok(()) => {
+                    queue.remove(pos);
+                }
+                Err(fl_wire::dispatcher::PushError::NotConnected(error)) => {
+                    queue[pos].delivery_state = QueuedDeliveryState::Pending;
+                    queue[pos].delivery_error = Some(error);
+                }
+                Err(fl_wire::dispatcher::PushError::Failed(error)) => {
+                    queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
+                    queue[pos].delivery_error = Some(error);
+                }
+            }
+        }
+        queue.clone()
+    }
+
+    /// Clearing a session cannot erase an in-progress or uncertain delivery.
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        guard.queues.remove(session_key);
+        if let Some(queue) = guard.queues.get_mut(session_key) {
+            queue.retain(|q| q.delivery_state != QueuedDeliveryState::Pending);
+        }
         guard.in_flight.remove(session_key);
     }
 
@@ -549,11 +796,47 @@ impl HubState {
         prompt_id: &str,
     ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        // A dispatch remains in progress until its in-flight marker is recorded.
+        if guard.active_queue_sends.contains(session_key) {
+            return None;
+        }
         let queue = guard.queues.get_mut(session_key)?;
-        let pos = queue.iter().position(|item| item.id == prompt_id)?;
+        let pos = queue.iter().position(|item| {
+            item.id == prompt_id && item.delivery_state != QueuedDeliveryState::Sending
+        })?;
         let item = queue.remove(pos);
-        let snapshot = queue.clone();
-        Some((item, snapshot))
+        let remaining = queue.clone();
+        if item.delivery_state == QueuedDeliveryState::Unconfirmed {
+            // Only unwind-owned fences carry queue aliases. Do not clear a later direct
+            // dispatch's unrelated unknown fence, or another alias's unresolved item.
+            let clear: Vec<String> = guard
+                .in_flight
+                .iter()
+                .filter_map(|(key, flight)| {
+                    let (canonical, raw) = flight.unwind_queue_keys.as_ref()?;
+                    if !flight.require_observed_completion
+                        || (session_key != canonical && session_key != raw)
+                    {
+                        return None;
+                    }
+                    let unresolved = [canonical, raw].into_iter().any(|alias| {
+                        guard.queues.get(alias).is_some_and(|q| {
+                            q.iter().any(|item| {
+                                matches!(
+                                    item.delivery_state,
+                                    QueuedDeliveryState::Sending | QueuedDeliveryState::Unconfirmed
+                                )
+                            })
+                        })
+                    });
+                    (!unresolved).then(|| key.clone())
+                })
+                .collect();
+            for key in clear {
+                guard.in_flight.remove(&key);
+            }
+        }
+        Some((item, remaining))
     }
 
     pub fn update_queued_prompt(
@@ -564,7 +847,9 @@ impl HubState {
     ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         let queue = guard.queues.get_mut(session_key)?;
-        let item = queue.iter_mut().find(|item| item.id == prompt_id)?;
+        let item = queue.iter_mut().find(|item| {
+            item.id == prompt_id && item.delivery_state == QueuedDeliveryState::Pending
+        })?;
         let mut effective_body = new_prompt.clone();
         for saved in &item.attachments {
             effective_body.push_str(&format!(
@@ -580,30 +865,65 @@ impl HubState {
     }
 
     pub fn is_session_busy(&self, store: &AnyStore, session_id: &str) -> bool {
-        let turns = read_session_transcript_with_home(
+        let snap = discovery::snapshot_discovery_store(store);
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_id,
-            store,
+            &snap,
             self.config.home_override.as_deref(),
         );
-        self.is_session_busy_from_turns(session_id, &turns)
+        self.is_session_busy_from_observation(session_id, turns.as_deref())
+    }
+
+    /// Whether a send's completion cannot yet be established from a reliable baseline.
+    pub(crate) fn session_in_flight_unconfirmed(&self, session_id: &str) -> bool {
+        self.prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .get(session_id)
+            .is_some_and(|flight| flight.require_observed_completion)
     }
 
     /// Busy check from turns already read. Does not open the store or the transcript file.
     pub fn is_session_busy_from_turns(&self, session_id: &str, turns: &[TranscriptTurn]) -> bool {
+        self.is_session_busy_from_observation(session_id, Some(turns))
+    }
+
+    /// An unreadable or changing transcript is not evidence that a session is idle.
+    pub(crate) fn is_session_busy_from_observation(
+        &self,
+        session_id: &str,
+        observation: Option<&[TranscriptTurn]>,
+    ) -> bool {
+        let Some(turns) = observation else {
+            return true;
+        };
         let transcript_busy = is_transcript_busy(turns);
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        let in_flight_active = if let Some(in_flight) = guard.in_flight.get(session_id) {
-            let expired = now_ms - in_flight.dispatched_at_ms > 300_000;
-            // An empty slice is not a transcript observation. Do not clear in-flight
-            // just because the caller has no turns yet.
-            let completed = !turns.is_empty()
-                && (turns.len() > in_flight.baseline_turn_count || in_flight.baseline_busy)
-                && !transcript_busy;
-            if expired || completed {
-                guard.in_flight.remove(session_id);
-                false
+        let in_flight_active = if let Some(in_flight) = guard.in_flight.get_mut(session_id) {
+            if let Some(baseline) = in_flight.baseline_turn_count {
+                let expired = !in_flight.require_observed_completion
+                    && now_ms - in_flight.dispatched_at_ms > 300_000;
+                let completed = !turns.is_empty()
+                    && (turns.len() > baseline || in_flight.baseline_busy)
+                    && !transcript_busy;
+                if expired || completed {
+                    guard.in_flight.remove(session_id);
+                    false
+                } else {
+                    true
+                }
+            } else if turns.is_empty() {
+                // Discovery may temporarily lose a previously observed file during rotation.
+                // Empty observations cannot establish a safe baseline for an unknown send.
+                true
             } else {
+                // The first reliable observation after an unstable read establishes a baseline;
+                // its existing idle turns do not prove completion of the just-sent prompt.
+                in_flight.baseline_turn_count = Some(turns.len());
+                in_flight.baseline_busy = transcript_busy;
+                in_flight.dispatched_at_ms = now_ms;
                 true
             }
         } else {
@@ -619,36 +939,64 @@ impl HubState {
             Ok(store) => discovery::snapshot_discovery_store(&store),
             Err(_) => discovery::DiscoveryStoreSnapshot::default(),
         };
-        let turns = discovery::read_session_transcript_from_snapshot(
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_id,
             &snap,
             self.config.home_override.as_deref(),
         );
-        self.is_session_busy_from_turns(session_id, &turns)
+        self.is_session_busy_from_observation(session_id, turns.as_deref())
     }
 
     pub fn mark_session_in_flight(&self, store: &AnyStore, session_key: &str) {
-        let turns = read_session_transcript_with_home(
+        let snap = discovery::snapshot_discovery_store(store);
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_key,
-            store,
+            &snap,
             self.config.home_override.as_deref(),
         );
-        self.mark_session_in_flight_from_turns(session_key, &turns);
+        self.mark_session_in_flight_from_observation(session_key, turns.as_deref());
     }
 
     /// Record an in-flight prompt from turns already read. Does not touch the store.
     pub fn mark_session_in_flight_from_turns(&self, session_key: &str, turns: &[TranscriptTurn]) {
-        let baseline_busy = is_transcript_busy(turns);
+        self.mark_session_in_flight_from_observation(session_key, Some(turns));
+    }
+
+    pub(crate) fn mark_session_in_flight_from_observation(
+        &self,
+        session_key: &str,
+        observation: Option<&[TranscriptTurn]>,
+    ) {
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.in_flight.insert(
             session_key.to_string(),
             InFlightPrompt {
-                baseline_turn_count: turns.len(),
-                baseline_busy,
+                baseline_turn_count: observation.map(<[TranscriptTurn]>::len),
+                baseline_busy: observation.is_some_and(is_transcript_busy),
+                require_observed_completion: observation.is_none(),
+                unwind_queue_keys: None,
                 dispatched_at_ms: now_ms,
             },
         );
+    }
+
+    /// Bind a queued failure's unknown fence to the queue aliases that own its evidence.
+    pub(crate) fn associate_unconfirmed_queue(&self, canonical: &str, raw: &str, prompt_id: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let has_evidence = [canonical, raw].into_iter().any(|key| {
+            guard.queues.get(key).is_some_and(|q| {
+                q.iter().any(|item| {
+                    item.id == prompt_id && item.delivery_state == QueuedDeliveryState::Unconfirmed
+                })
+            })
+        });
+        if has_evidence
+            && let Some(flight) = guard.in_flight.get_mut(canonical)
+            && flight.require_observed_completion
+        {
+            flight.unwind_queue_keys = Some((canonical.to_string(), raw.to_string()));
+        }
     }
 
     /// Open the store, snapshot, drop the guard, then read the transcript and mark in-flight.
@@ -658,12 +1006,12 @@ impl HubState {
             Ok(store) => discovery::snapshot_discovery_store(&store),
             Err(_) => discovery::DiscoveryStoreSnapshot::default(),
         };
-        let turns = discovery::read_session_transcript_from_snapshot(
+        let turns = discovery::read_session_transcript_observation_from_snapshot(
             session_key,
             &snap,
             self.config.home_override.as_deref(),
         );
-        self.mark_session_in_flight_from_turns(session_key, &turns);
+        self.mark_session_in_flight_from_observation(session_key, turns.as_deref());
     }
 
     /// Open the workspace `AnyStore` for the duration of a single operation, retrying
@@ -826,6 +1174,474 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn failed_queued_send_retains_prompt_in_original_order() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "absent",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "absent",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        state.mark_session_in_flight_from_observation("absent", None);
+        let response = handle_http_request(
+            &state,
+            &HttpRequest::new(
+                "POST",
+                format!("/api/v1/sessions/absent/queue/{}/send-now", first.id),
+            )
+            .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        let body = response.json_value().unwrap();
+        assert_eq!(body["delivered"], false);
+        let queue = state.session_queue("absent");
+        assert_eq!(
+            queue.iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
+            [first.id.as_str(), second.id.as_str()]
+        );
+        assert!(state.session_in_flight_unconfirmed("absent"));
+    }
+
+    #[test]
+    fn interrupted_dispatch_claim_fences_session_as_unconfirmed() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let decision = state.admit_direct_prompt(
+                "canonical",
+                "raw",
+                false,
+                false,
+                DirectPromptInput {
+                    persona: None,
+                    prompt: "one".into(),
+                    effective_body: "one".into(),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            let DirectPromptDecision::Dispatch(_claim) = decision else {
+                panic!("expected claim")
+            };
+            panic!("simulated dispatch unwind");
+        }));
+        assert!(result.is_err());
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        let decision = state.admit_direct_prompt(
+            "canonical",
+            "raw",
+            false,
+            false,
+            DirectPromptInput {
+                persona: None,
+                prompt: "two".into(),
+                effective_body: "two".into(),
+                by: "owner".into(),
+                attachments: vec![],
+            },
+        );
+        assert!(matches!(decision, DirectPromptDecision::Queued(_, _)));
+    }
+
+    #[test]
+    fn queued_unwind_is_inspectable_and_cancellation_recovers_alias_queue() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_item, _claim) = state
+                .claim_queued_for_dispatch("canonical", "raw", &first.id, false)
+                .unwrap();
+            panic!("simulated queued dispatch unwind");
+        }));
+        assert!(result.is_err());
+        let queue = state.session_queue("raw");
+        assert_eq!(queue[0].delivery_state, QueuedDeliveryState::Unconfirmed);
+        assert!(
+            queue[0]
+                .delivery_error
+                .as_ref()
+                .is_some_and(|s| s.contains("unconfirmed"))
+        );
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        let (_, remaining) = state.remove_queued_prompt("raw", &first.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second.id);
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn cancelling_unconfirmed_never_clears_other_uncertain_or_known_flights() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (other, _) = state.enqueue_session_prompt(
+            "canonical",
+            None,
+            "other".into(),
+            "other".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("canonical").unwrap()[0].delivery_state =
+                QueuedDeliveryState::Unconfirmed;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_item, _claim) = state
+                .claim_queued_for_dispatch("canonical", "raw", &first.id, false)
+                .unwrap();
+            panic!("queued unwind");
+        }));
+        state.remove_queued_prompt("raw", &first.id).unwrap();
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        state.remove_queued_prompt("canonical", &other.id).unwrap();
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+
+        let (item, _) = state.enqueue_session_prompt(
+            "canonical",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("canonical").unwrap()[0].delivery_state =
+                QueuedDeliveryState::Unconfirmed;
+        }
+        state.mark_session_in_flight_from_observation("canonical", Some(&[]));
+        state.remove_queued_prompt("canonical", &item.id).unwrap();
+        assert!(state.is_session_busy_from_observation("canonical", Some(&[])));
+    }
+
+    #[test]
+    fn cancelling_ambiguous_queue_failure_recovers_only_its_own_unknown_fence() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_claimed, claim) = state
+            .claim_queued_for_dispatch("canonical", "raw", &item.id, false)
+            .unwrap();
+        state.finish_queued_prompt(
+            "raw",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed("unknown".into())),
+        );
+        state.mark_session_in_flight_from_observation("canonical", None);
+        state.associate_unconfirmed_queue("canonical", "raw", &item.id);
+        claim.finish();
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        state.remove_queued_prompt("raw", &item.id).unwrap();
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn cancelling_unconfirmed_item_does_not_clear_unrelated_unknown_direct_send() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("ada").unwrap()[0].delivery_state = QueuedDeliveryState::Unconfirmed;
+        }
+        state.mark_session_in_flight_from_observation("ada", None);
+        state.remove_queued_prompt("ada", &item.id).unwrap();
+        assert!(state.session_in_flight_unconfirmed("ada"));
+    }
+
+    #[test]
+    fn queued_claim_blocks_concurrent_cancel_drain_and_preserves_uncertain_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        assert_eq!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &first.id)
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &second.id)
+                .is_none()
+        );
+        assert!(state.remove_queued_prompt("ada", &first.id).is_none());
+        state.clear_session_prompt_queue("ada");
+        let kept = state.finish_queued_prompt(
+            "ada",
+            &first.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "partial write".into(),
+            )),
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].delivery_state, QueuedDeliveryState::Unconfirmed);
+        assert!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &first.id)
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &first.id)
+                .is_none()
+        );
+        assert!(state.remove_queued_prompt("ada", &first.id).is_none());
+        state.release_queued_send_aliases("ada", "ada");
+        assert_eq!(
+            state.remove_queued_prompt("ada", &first.id).unwrap().0.id,
+            first.id
+        );
+    }
+
+    #[test]
+    fn successful_queue_claim_remains_exclusive_until_inflight_is_marked() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        state
+            .claim_queued_prompt_aliases("ada", "ada", &first.id)
+            .unwrap();
+        state.finish_queued_prompt("ada", &first.id, Ok(()));
+        assert!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &second.id)
+                .is_none()
+        );
+        state.mark_session_in_flight_from_observation("ada", None);
+        state.release_queued_send_aliases("ada", "ada");
+        assert!(state.session_in_flight_unconfirmed("ada"));
+    }
+
+    #[test]
+    fn queued_send_claim_fences_raw_and_canonical_session_aliases() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "canonical",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("canonical", "raw", &first.id)
+                .is_some()
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("canonical", "canonical", &second.id)
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("raw", "raw", &first.id)
+                .is_none()
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("canonical", "raw", &second.id)
+                .is_none()
+        );
+        state.finish_queued_prompt(
+            "raw",
+            &first.id,
+            Err(fl_wire::dispatcher::PushError::NotConnected(
+                "offline".into(),
+            )),
+        );
+        state.release_queued_send_aliases("canonical", "raw");
+        assert!(
+            state
+                .claim_queued_prompt_aliases("canonical", "canonical", &second.id)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn concurrent_queue_claims_cannot_send_or_cancel_the_same_item() {
+        use std::sync::{Arc, Barrier};
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(test_hub_state(&tmp));
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "one".into(),
+            "one".into(),
+            "owner".into(),
+            vec![],
+        );
+        let barrier = Arc::new(Barrier::new(3));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (state, barrier, id) = (state.clone(), barrier.clone(), item.id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    state
+                        .claim_queued_prompt_aliases("ada", "ada", &id)
+                        .is_some()
+                })
+            })
+            .collect();
+        barrier.wait();
+        let wins = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(wins, 1);
+        assert!(state.remove_queued_prompt("ada", &item.id).is_none());
+        assert_eq!(
+            state.session_queue("ada")[0].delivery_state,
+            QueuedDeliveryState::Sending
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_queued_webhook_send_is_unconfirmed_and_never_auto_retried() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let path = tmp.path().join("ada.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        install_webhook_route(tmp.path(), "ada", &path);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            drop(stream);
+        });
+        let payload = "x".repeat(4 * 1024 * 1024);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            Some("ada".into()),
+            "message".into(),
+            payload,
+            "owner".into(),
+            vec![],
+        );
+        state.mark_session_in_flight_from_observation("ada", None);
+        let response = handle_http_request(
+            &state,
+            &HttpRequest::new(
+                "POST",
+                format!("/api/v1/sessions/ada/queue/{}/send-now", item.id),
+            )
+            .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        server.join().unwrap();
+        let body = response.json_value().unwrap();
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["queue"][0]["delivery_state"], "unconfirmed");
+        assert_eq!(
+            state.session_queue("ada")[0].delivery_state,
+            QueuedDeliveryState::Unconfirmed
+        );
+        api::drain_ready_session_queues(&state);
+        assert_eq!(
+            state.session_queue("ada")[0].delivery_state,
+            QueuedDeliveryState::Unconfirmed
+        );
+        assert!(
+            state
+                .claim_queued_prompt_aliases("ada", "ada", &item.id)
+                .is_none()
+        );
+    }
 
     fn test_hub_state(tmp: &TempDir) -> HubState {
         test_hub_state_at(tmp, tmp.path(), tmp.path())
@@ -2012,7 +2828,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unreliable_post_dispatch_read_does_not_release_on_old_idle_turns() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let old = discovery::parse_jsonl_transcript(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"old\"}}\n",
+        );
+        let new = discovery::parse_jsonl_transcript(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"old\"}}\n",
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"new prompt\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"new reply\"}}\n",
+        ));
+        state.mark_session_in_flight_from_observation("test", None);
+        assert!(state.session_in_flight_unconfirmed("test"));
+        // Unreliable observations cannot time out a fence before any reliable baseline.
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .in_flight
+            .get_mut("test")
+            .unwrap()
+            .dispatched_at_ms = 0;
+        assert!(state.is_session_busy_from_observation("test", None));
+        assert!(state.is_session_busy_from_turns("test", &[]));
+        assert!(state.is_session_busy_from_turns("test", &old));
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .in_flight
+            .get_mut("test")
+            .unwrap()
+            .dispatched_at_ms = 0;
+        assert!(state.is_session_busy_from_turns("test", &old));
+        assert!(!state.is_session_busy_from_turns("test", &new));
+        assert!(!state.session_in_flight_unconfirmed("test"));
+    }
+
+    #[test]
+    fn a_genuinely_missing_transcript_allows_first_reply_to_finish() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        state.mark_session_in_flight_from_observation("test", Some(&[]));
+        let reply = discovery::parse_jsonl_transcript(
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"reply\"}}\n",
+        );
+        assert!(!state.is_session_busy_from_turns("test", &reply));
+    }
+
+    #[test]
     fn operator_prompt_queue_send_now_cancel_and_auto_drain_lifecycle() {
+        let _queued_delivery = crate::api::stub_queued_delivery_success();
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
 

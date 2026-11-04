@@ -794,12 +794,70 @@ fn scrub_with_external(
 /// injected secret and all, to whatever process the environment names. No redirects either: a
 /// credential must not follow one to another origin. An error status is an answer, not an error.
 fn agent_config(timeout: Duration) -> ureq::config::Config {
-    ureq::Agent::config_builder()
+    agent_config_pooled(timeout, true)
+}
+
+fn agent_config_pooled(timeout: Duration, pooled: bool) -> ureq::config::Config {
+    let mut b = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .max_redirects(0)
         .http_status_as_error(false)
-        .proxy(None)
-        .build()
+        .proxy(None);
+    if !pooled {
+        // Failover attempts must not reuse a keep-alive connection: a fresh
+        // connection per attempt is what makes a zero-byte witness meaningful.
+        // ureq 3.x names this `max_idle_connections_per_host` (the pool cap);
+        // 0 keeps no idle connection for reuse.
+        b = b.max_idle_connections(0).max_idle_connections_per_host(0);
+    }
+    b.build()
+}
+
+/// Witness facts for one failover attempt. Honest mapping: ureq does not
+/// report connection reuse or bytes written. With pooling disabled and a
+/// fresh `Agent` per attempt, every connection is fresh by construction.
+/// Only DNS failure (`HostNotFound`) and TCP `ConnectionRefused` are known
+/// to occur before any request byte is written; every other transport
+/// error (timeout, reset, protocol, body-read) is classified unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyAttemptWitness {
+    pub fresh_connection: bool,
+    pub bytes_written: u64,
+    pub failed_after_connect: bool,
+}
+
+/// Error from a failover proxy attempt, classified by execution certainty.
+#[derive(Debug)]
+pub enum ProxyAttemptError {
+    BeforeSend(GateError),
+    NoExecutionProven(GateError),
+    UnknownAfterSend(GateError),
+}
+impl ProxyAttemptError {
+    pub fn into_gate_error(self) -> GateError {
+        match self {
+            Self::BeforeSend(e) | Self::NoExecutionProven(e) | Self::UnknownAfterSend(e) => e,
+        }
+    }
+}
+impl std::fmt::Display for ProxyAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeSend(e) | Self::NoExecutionProven(e) | Self::UnknownAfterSend(e) => {
+                write!(f, "{e}")
+            }
+        }
+    }
+}
+impl std::error::Error for ProxyAttemptError {}
+
+fn classify_ureq_attempt_error(e: &ureq::Error) -> bool {
+    // Returns true when zero bytes are proven (pre-write connect/DNS failure).
+    match e {
+        ureq::Error::HostNotFound => true,
+        ureq::Error::Io(io) => io.kind() == std::io::ErrorKind::ConnectionRefused,
+        _ => false,
+    }
 }
 
 /// Execute `req` through the zero-knowledge credential proxy (`prepare_proxied_request`),
@@ -962,6 +1020,43 @@ pub fn execute_proxied_request_with_provider_and_contract_phased_with_deadline(
     send_prepared_proxied_request(vault, req, prepared_secrets, cap, strict)
 }
 
+/// Failover attempt: like the phased deadline dispatch, but with a
+/// non-pooled fresh agent and errors classified as `NoExecutionProven`
+/// only for DNS/connect-refused failures before any byte was written.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_proxied_request_failover_attempt_with_provider_and_contract_phased_with_deadline(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    contract: Option<&crate::contract::ResponseContract>,
+    deadline_mono_ms: Option<u64>,
+    now_fn: &dyn Fn() -> u64,
+) -> Result<ProxyResponse, ProxyAttemptError> {
+    let (cap, strict) = match contract {
+        Some(c) => (c.max_response_bytes, true),
+        None => (LEGACY_MAX_RESPONSE_BYTES, false),
+    };
+    let prepared_secrets = prepare_proxied_request_inner(vault, req, provider)
+        .map_err(ProxyAttemptError::BeforeSend)?;
+    let mut effective;
+    let req = match deadline_mono_ms {
+        Some(deadline) => {
+            let fresh_now = now_fn();
+            let Some(secs) = remaining_deadline_timeout_secs(deadline, fresh_now) else {
+                return Err(ProxyAttemptError::BeforeSend(GateError::InvalidUrl {
+                    url: req.url.clone(),
+                    reason: "permit_deadline_exceeded".into(),
+                }));
+            };
+            effective = req.clone();
+            effective.timeout_secs = Some(effective.timeout_secs.unwrap_or(30).min(secs).max(1));
+            &effective
+        }
+        None => req,
+    };
+    send_prepared_failover_attempt(vault, req, prepared_secrets, cap, strict)
+}
+
 fn execute_proxied_request_inner(
     vault: &Vault,
     req: &ProxyRequest,
@@ -974,6 +1069,12 @@ fn execute_proxied_request_inner(
         .map_err(DispatchPhaseError::into_gate_error)
 }
 
+enum SendPhaseError {
+    BeforeSend(GateError),
+    AfterSend(GateError),
+    NoExecutionProven(GateError),
+}
+
 fn send_prepared_proxied_request(
     vault: &Vault,
     req: &ProxyRequest,
@@ -981,7 +1082,40 @@ fn send_prepared_proxied_request(
     cap: u64,
     strict_utf8: bool,
 ) -> Result<ProxyResponse, DispatchPhaseError> {
-    use DispatchPhaseError::{AfterSend as After, BeforeSend as Before};
+    match send_prepared_inner(vault, req, prepared_secrets, cap, strict_utf8, true) {
+        Ok(r) => Ok(r),
+        Err(SendPhaseError::BeforeSend(e)) => Err(DispatchPhaseError::BeforeSend(e)),
+        Err(SendPhaseError::AfterSend(e)) | Err(SendPhaseError::NoExecutionProven(e)) => {
+            Err(DispatchPhaseError::AfterSend(e))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_prepared_failover_attempt(
+    vault: &Vault,
+    req: &ProxyRequest,
+    prepared_secrets: PreparedSecrets,
+    cap: u64,
+    strict_utf8: bool,
+) -> Result<ProxyResponse, ProxyAttemptError> {
+    match send_prepared_inner(vault, req, prepared_secrets, cap, strict_utf8, false) {
+        Ok(r) => Ok(r),
+        Err(SendPhaseError::BeforeSend(e)) => Err(ProxyAttemptError::BeforeSend(e)),
+        Err(SendPhaseError::NoExecutionProven(e)) => Err(ProxyAttemptError::NoExecutionProven(e)),
+        Err(SendPhaseError::AfterSend(e)) => Err(ProxyAttemptError::UnknownAfterSend(e)),
+    }
+}
+
+fn send_prepared_inner(
+    vault: &Vault,
+    req: &ProxyRequest,
+    prepared_secrets: PreparedSecrets,
+    cap: u64,
+    strict_utf8: bool,
+    pooled: bool,
+) -> Result<ProxyResponse, SendPhaseError> {
+    use SendPhaseError::{AfterSend as After, BeforeSend as Before};
     let prepared = prepared_secrets.request;
     let external = prepared_secrets.external_plaintexts;
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(1, 300));
@@ -998,7 +1132,12 @@ fn send_prepared_proxied_request(
         }
     };
 
-    let agent: ureq::Agent = agent_config(timeout).into();
+    let agent: ureq::Agent = if pooled {
+        agent_config(timeout)
+    } else {
+        agent_config_pooled(timeout, false)
+    }
+    .into();
 
     let send_result = match prepared.method.as_str() {
         "GET" => {
@@ -1053,13 +1192,22 @@ fn send_prepared_proxied_request(
         }
     };
 
-    let mut resp = send_result.map_err(|e| {
-        audit_after_send("error:upstream");
-        let (scrubbed_err, _) = scrub_with_external(vault, &e.to_string(), &external);
-        After(GateError::UpstreamHttp {
-            cause: scrubbed_err,
-        })
-    })?;
+    let mut resp = match send_result {
+        Ok(r) => r,
+        Err(e) => {
+            audit_after_send("error:upstream");
+            let proven_zero = !pooled && classify_ureq_attempt_error(&e);
+            let (scrubbed_err, _) = scrub_with_external(vault, &e.to_string(), &external);
+            let ge = GateError::UpstreamHttp {
+                cause: scrubbed_err,
+            };
+            return Err(if proven_zero {
+                SendPhaseError::NoExecutionProven(ge)
+            } else {
+                After(ge)
+            });
+        }
+    };
 
     let status = resp.status().as_u16();
     if (300..400).contains(&status) {

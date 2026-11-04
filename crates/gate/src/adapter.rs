@@ -897,6 +897,7 @@ mod tests {
                 response_fields: Vec::new(),
                 input_schema: json!({"type": "object", "properties": {}}),
                 response_contract: None,
+                endpoint_set: None,
             }],
             bridges: Vec::new(),
         }

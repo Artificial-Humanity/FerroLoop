@@ -12,8 +12,8 @@ use clap::Subcommand;
 use fl_core::governor::{AdmissionRequest, Principal};
 use fl_gate::{
     DispatchPhaseError, DispatchResult, GateGovernor, GovernedOrGateError, ProxyRequest,
-    SetSecretArgs, Vault, admission_refusal_text, discover_connectors,
-    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
+    SetSecretArgs, Vault, admission_refusal_text, approved_policy_digests_from_env,
+    discover_connectors, execute_proxied_request_with_provider_and_contract_phased_with_deadline,
     handle_mcp_jsonrpc_request_with_governor_and_secret_provider, import_openapi_to_connector,
     load_or_init_master_key, resolve_master_key_path, resolve_vault_path,
 };
@@ -535,14 +535,17 @@ fn cli_gate_governor(env: Option<&crate::cmd::state::StateEnv<'_>>) -> GateGover
     // (`StateEnv::open_for_scope(None)` — the default `fl state` store).
     // Failure yields a governor with no store, which refuses governed
     // dispatch with `admission_unavailable`, never a legacy fallback.
+    // Owner policy channel: FL_GATE_APPROVED_POLICY_DIGESTS (empty = no failover).
+    let approved = approved_policy_digests_from_env();
     let Some(env) = env else {
-        return GateGovernor::none();
+        return GateGovernor::none().with_approved_policy_digests(approved);
     };
     match env.open_for_scope(None) {
         Ok(store) => GateGovernor::new(std::sync::Arc::new(
             fl_store::PersistentGovernorStore::new(store),
-        )),
-        Err(_) => GateGovernor::none(),
+        ))
+        .with_approved_policy_digests(approved),
+        Err(_) => GateGovernor::none().with_approved_policy_digests(approved),
     }
 }
 
