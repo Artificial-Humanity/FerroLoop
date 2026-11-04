@@ -1259,8 +1259,15 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
       expect(window.localStorage.getItem("fd_show_safe_margins")).toBe("false");
 
+      // Header settings button is rendered in ContextHeader when left sidebar is collapsed
+      expect(screen.getByTestId("header-settings-btn")).toBeInTheDocument();
+
+      // Chat toolbar also exposes left and right panel show/hide toggles
+      expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
+      expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
+
       // Re-enable via Settings -> Appearance -> Show iOS Safe-Area Margins
-      fireEvent.click(screen.getByTestId("settings-modal-btn"));
+      fireEvent.click(screen.getByTestId("header-settings-btn"));
       fireEvent.click(screen.getByTestId("settings-tab-appearance"));
       const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
       expect(toggle.checked).toBe(false);

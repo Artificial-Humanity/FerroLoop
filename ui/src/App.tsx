@@ -2896,6 +2896,10 @@ export const App: React.FC<AppProps> = ({
             onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
             returnToSettingsLabel={returnToSettingsLabel}
             onReturnToSettings={handleReturnToOriginSettings}
+            splitView={splitView}
+            onToggleSplitView={handleToggleSplitView}
+            onOpenMobileRoster={handleToggleLeftSidebar}
+            mobileSidebarOpen={leftSidebarOpen}
             onRefresh={() => {
               void refreshSessionsAndTranscript();
               void refreshWireAndRoster();
