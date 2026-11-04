@@ -864,7 +864,9 @@ fn redact_pairs(
     if text
         .len()
         .checked_mul(external.len())
-        .and_then(|n| n.checked_mul(6))
+        // Raw and percent-decoded scans of the secret and each of four
+        // padded/unpadded standard/URL-safe Base64 spellings.
+        .and_then(|n| n.checked_mul(10))
         .is_none_or(|n| n > MAX_SECRET_SCAN_BYTES)
     {
         return fail_closed();
@@ -897,13 +899,17 @@ fn redact_pairs(
             .chain(b64.as_ref().into_iter().flat_map(|value| {
                 [
                     (value.as_bytes(), false),
+                    (value.as_bytes(), true),
                     (value.trim_end_matches('=').as_bytes(), false),
+                    (value.trim_end_matches('=').as_bytes(), true),
                 ]
             }))
             .chain(b64_url.as_ref().into_iter().flat_map(|value| {
                 [
                     (value.as_bytes(), false),
+                    (value.as_bytes(), true),
                     (value.trim_end_matches('=').as_bytes(), false),
+                    (value.trim_end_matches('=').as_bytes(), true),
                 ]
             }));
         for (pattern, decode) in patterns {
@@ -1888,6 +1894,63 @@ mod tests {
         let (clean, _) = redact_external_plaintexts("Pj8/Pw== Pj8/Pw Pj8_Pw== Pj8_Pw", &values);
         assert_eq!(clean.matches("REDACTED").count(), 4, "{clean}");
         assert!(!clean.contains("Pj8"), "{clean}");
+    }
+
+    #[test]
+    fn percent_encoded_base64_variants_are_scrubbed_with_utf8_and_overlaps() {
+        let values = vec![
+            ("SHORT".into(), zeroize::Zeroizing::new(">???".into())),
+            ("LONG".into(), zeroize::Zeroizing::new(">???x".into())),
+        ];
+        // Standard and URL-safe forms, padded/unpadded, with mixed-case hex and
+        // encoded unreserved bytes; the literal prefix tests source UTF-8 offsets.
+        let input = "é %50j8%2fPw%3d%3D Pj8%2FPw Pj8%5fPw%3d%3d Pj8%5FPw >???x";
+        let (clean, names) = redact_external_plaintexts(input, &values);
+        assert_eq!(clean.matches("REDACTED").count(), 5, "{clean}");
+        assert!(clean.starts_with("é "));
+        assert!(
+            !clean.contains("Pj8") && !clean.contains("%50j8"),
+            "{clean}"
+        );
+        assert!(names.contains(&"SHORT".to_string()));
+        assert!(names.contains(&"LONG".to_string()));
+    }
+
+    #[test]
+    fn encoded_base64_scan_work_limit_fails_closed() {
+        let values = vec![("KEY".into(), zeroize::Zeroizing::new(">???".into()))];
+        let input = "x".repeat(MAX_SECRET_SCAN_BYTES / 10 + 1);
+        let (clean, names) = redact_external_plaintexts(&input, &values);
+        assert_eq!(clean, "[REDACTED:FERROGATE]");
+        assert_eq!(names, ["KEY"]);
+    }
+
+    #[test]
+    fn real_response_scrubs_percent_encoded_base64_in_body_headers_and_errors() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let response = tiny_http::Response::from_string("é Pj8%2FPw%3D%3D Pj8%5fPw")
+                .with_header(tiny_http::Header::from_bytes("x-echo", "Pj8%2fPw%3d%3d").unwrap())
+                .with_header(tiny_http::Header::from_bytes("x-Pj8%5fPw", "ok").unwrap());
+            req.respond(response).unwrap();
+        });
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", ">???", &["127.0.0.1"]);
+        let req = request(
+            "GET",
+            &format!("http://127.0.0.1:{port}/"),
+            &[("X-Key", "{{FERROGATE:API_KEY}}")],
+        );
+        let result = execute_proxied_request(&vault, &req).unwrap();
+        worker.join().unwrap();
+        assert!(!result.body.contains("Pj8"), "{}", result.body);
+        assert!(!result.headers["x-echo"].contains("Pj8"));
+        assert!(!result.headers.keys().any(|key| key.contains("pj8")));
+        let exact = vec![("API_KEY".into(), zeroize::Zeroizing::new(">???".into()))];
+        let (error, _) = scrub_with_external(&vault, "error Pj8%2fPw%3d%3d", &exact);
+        assert!(!error.contains("Pj8"), "{error}");
     }
 
     #[test]
