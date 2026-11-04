@@ -1888,6 +1888,8 @@ mod tests {
         ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
             self.source.guard_admission(s)
         }
+        // `try_update` is unavailable on older supported Rust toolchains.
+        #[allow(deprecated)]
         fn resolve_revocation(
             &self,
             s: &BTreeSet<ScopeKey>,
