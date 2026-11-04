@@ -785,6 +785,9 @@ fn meta(name: &str, generation: u64) -> VaultSecretMetadata {
         updated_at: "2026-10-30T00:00:00Z".into(),
         lease_ttl_secs: Some(60),
         expires_at: None,
+        usage: fl_gate::SecretUsage::Proxy,
+        bundle_required: false,
+        app_binding: None,
     }
 }
 

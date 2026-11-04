@@ -117,19 +117,41 @@ impl Vault {
             }
         };
 
-        // Policy, from the redacted metadata, before any decryption.
-        let Some(meta) = self.get_metadata(&name) else {
+        // Authenticate the actual current record before trusting any policy fields.
+        let fresh = self.fresh().map_err(|err| deny("vault_error", err))?;
+        let snapshot = fresh.authenticated_snapshot_current(&name).map_err(|err| {
+            let reason = match &err {
+                GateError::NoSuchSecret { .. } => "no_such_secret",
+                GateError::PolicyDenied { .. } => policy_reason(&err),
+                GateError::VaultTampered { .. } => "tamper",
+                _ => "vault_error",
+            };
+            deny(reason, err)
+        })?;
+        let meta = &snapshot.metadata;
+        if meta.usage != crate::vault::SecretUsage::SignJwtRs256 {
             return Err(deny(
-                "no_such_secret",
-                GateError::NoSuchSecret { name: name.clone() },
+                "usage",
+                GateError::UsageMismatch {
+                    secret: name.clone(),
+                },
             ));
-        };
+        }
+        if meta.bundle_required || meta.app_binding.is_some() {
+            return Err(deny(
+                "authority_unavailable",
+                GateError::PolicyDenied {
+                    secret: name.clone(),
+                    reason: "bound signing requires the upgraded live authority path".into(),
+                },
+            ));
+        }
         if let Err(err) = check_signing_policy(meta, caller, host) {
             let reason = policy_reason(&err);
             return Err(deny(reason, err));
         }
 
-        let (_meta, pem) = match self.decrypt_bytes(&name) {
+        let (_meta, pem) = match fresh.decrypt_bytes(&name) {
             Ok(pair) => pair,
             Err(err) => {
                 let reason = match &err {
@@ -153,7 +175,7 @@ impl Vault {
             std::slice::from_ref(&name),
             SIGN_AUDIT_METHOD,
             &audit_host,
-            "allowed",
+            "allowed:binding-absent",
         )?;
         Ok(jwt)
     }
@@ -317,6 +339,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proxy_usage_cannot_sign_and_is_audited_as_usage_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(
+            dir.path().join("vault.enc"),
+            [5; crate::vault::MASTER_KEY_LEN],
+        )
+        .unwrap();
+        vault
+            .set(crate::vault::SetSecretArgs {
+                name: "KEY".into(),
+                value: "not a signing key".into(),
+                allowed_hosts: vec!["api.github.com".into()],
+                usage: crate::vault::SecretUsage::Proxy,
+                ..Default::default()
+            })
+            .unwrap();
+        let key: VaultRef = "vault://KEY".parse().unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let audit = std::fs::read_to_string(dir.path().join("gate-audit.jsonl")).unwrap();
+        assert!(audit.contains("denied:usage"));
+    }
+
+    #[test]
+    fn expired_proxy_usage_is_authenticated_then_denied_as_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().join("vault.enc"), [7; 32]).unwrap();
+        vault
+            .set(crate::vault::SetSecretArgs {
+                name: "KEY".into(),
+                value: "secret".into(),
+                allowed_hosts: vec!["api.github.com".into()],
+                lease_ttl_secs: Some(0),
+                usage: crate::vault::SecretUsage::Proxy,
+                ..Default::default()
+            })
+            .unwrap();
+        let key: VaultRef = "vault://KEY".parse().unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        assert!(
+            std::fs::read_to_string(dir.path().join("gate-audit.jsonl"))
+                .unwrap()
+                .contains("denied:usage")
+        );
+        let path = dir.path().join("vault.enc");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["secrets"]["KEY"]["metadata"]["usage"] = serde_json::json!("sign-jwt-rs256");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
     fn host_labels_must_be_non_empty_and_hostname_shaped() {
         for ok in [
             "api.github.com",
@@ -359,6 +442,9 @@ mod tests {
             updated_at: String::new(),
             lease_ttl_secs: None,
             expires_at: None,
+            usage: crate::vault::SecretUsage::Proxy,
+            bundle_required: false,
+            app_binding: None,
         };
         assert!(check_signing_policy(&meta, "x", "api.github.com").is_ok());
         for bad in [".github.com", "github.com.", "a..b", "..x", ""] {

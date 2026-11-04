@@ -343,6 +343,7 @@ mod tests {
             vault
                 .set(SetSecretArgs {
                     name: name.into(),
+                    usage: fl_gate::SecretUsage::SignJwtRs256,
                     value: value.into(),
                     allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
                     allowed_agents: agents.iter().map(|a| a.to_string()).collect(),
@@ -390,7 +391,7 @@ mod tests {
         );
         let log = f.audit();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0]["outcome"], "allowed");
+        assert_eq!(log[0]["outcome"], "allowed:binding-absent");
         assert_eq!(log[0]["method"], fl_gate::SIGN_AUDIT_METHOD);
         assert_eq!(log[0]["host"], GITHUB_API_HOST);
         assert_eq!(log[0]["caller"], "ferris");

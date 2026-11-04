@@ -129,6 +129,7 @@ impl G {
         vault
             .set(SetSecretArgs {
                 name: SECRET.into(),
+                usage: fl_gate::SecretUsage::SignJwtRs256,
                 value: pem.into(),
                 allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
                 allowed_agents: agents.iter().map(|a| a.to_string()).collect(),
@@ -209,7 +210,7 @@ fn the_vault_signs_the_apps_jwt_and_the_audit_log_holds_the_name_only() {
         "one audit entry per JWT the Vault signed"
     );
     for entry in &log {
-        assert_eq!(entry["outcome"], "allowed");
+        assert_eq!(entry["outcome"], "allowed:binding-absent");
         assert_eq!(entry["method"], "SIGN_RS256_JWT");
         // The host of the API URL the JWT is sent to (the stub), not a fixed label.
         assert_eq!(entry["host"], "127.0.0.1");
@@ -274,7 +275,7 @@ fn the_host_the_vault_is_asked_about_is_the_apis_own_and_a_port_is_not_part_of_i
     assert!(!log.is_empty());
     assert!(
         log.iter()
-            .all(|e| e["host"] == "localhost" && e["outcome"] == "allowed")
+            .all(|e| e["host"] == "localhost" && e["outcome"] == "allowed:binding-absent")
     );
     assert!(g.fake.state().jwts.iter().all(|j| verifies(&pem, j)));
 

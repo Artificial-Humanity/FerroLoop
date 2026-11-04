@@ -17,8 +17,8 @@ pub mod state_sync;
 pub mod workflow;
 pub mod worktree;
 pub use adapters::{
-    AdapterBuild, AntigravityAdapter, AnyAdapter, ApiKeyResolver, ClaudeAdapter, CodexAdapter,
-    ExecVendorAdapter, GrokAdapter, HttpApiAdapter, LivenessSink, MuseAdapter,
+    AdapterBuild, AntigravityAdapter, AnyAdapter, ApiKeyError, ApiKeyResolver, ClaudeAdapter,
+    CodexAdapter, ExecVendorAdapter, GrokAdapter, HttpApiAdapter, LivenessSink, MuseAdapter,
     RegisterAdapterError, env_key_resolver, register_exec_adapter,
 };
 pub use command::{GateOutcome, run_command_gate};

@@ -1312,6 +1312,9 @@ mod tests {
             updated_at: "2026-01-01T00:00:00.000Z".into(),
             lease_ttl_secs: None,
             expires_at: expires_at.map(str::to_string),
+            usage: fl_gate::SecretUsage::Proxy,
+            bundle_required: false,
+            app_binding: None,
         }
     }
 

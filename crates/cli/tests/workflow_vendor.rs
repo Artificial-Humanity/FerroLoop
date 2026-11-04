@@ -232,7 +232,7 @@ fn priced(key: Option<&'static str>) -> impl Fn(&str) -> AdapterBuild + Send + S
             output_usd_micros_per_mtok: 10_000_000,
         }),
         api_key: key.map(|k| -> fl_exec::adapters::ApiKeyResolver {
-            Arc::new(move |_| Some(k.to_string()))
+            Arc::new(move |_| Ok(Some(k.to_string())))
         }),
         ..AdapterBuild::default()
     }
@@ -311,7 +311,7 @@ fn a_step_with_no_key_or_no_rate_card_is_refused_and_the_step_fails() {
     // (it does not here) and the vendor's own card is zero. The attempt is refused either way.
     let run = one_step_run(&fx);
     let no_card = |_: &str| AdapterBuild {
-        api_key: Some(Arc::new(|_| Some("k".to_string()))),
+        api_key: Some(Arc::new(|_| Ok(Some("k".to_string())))),
         ..AdapterBuild::default()
     };
     let report = execute_workflow_step_with(

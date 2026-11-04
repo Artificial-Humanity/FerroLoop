@@ -1649,6 +1649,7 @@ body_params = ["content"]
                 allowed_agents: vec![],
                 allow_private_network: true,
                 lease_ttl_secs: None,
+                ..Default::default()
             })
             .unwrap();
         let toml = format!(
