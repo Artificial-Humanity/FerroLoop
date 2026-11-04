@@ -222,10 +222,6 @@ const WRITE_SITES_FLOOR: usize = 50;
 /// sites, though a line in them matches [`starts_a_write`], and why.
 const NOT_SCANNED: &[(&str, &str)] = &[
     (
-        "traits_f1.rs",
-        "F1 preparation refuses remote handles before any transaction",
-    ),
-    (
         "compat.rs",
         "its one write call is in its own #[cfg(test)] module, on an in-memory store",
     ),

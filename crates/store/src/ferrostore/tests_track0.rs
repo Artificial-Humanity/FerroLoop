@@ -3,7 +3,7 @@
 
 use super::layout::{self, FORMAT_V1, FORMAT_V2, SLOT_LEN, SlotRead, Superblock};
 use super::{FerroStore, FerroStoreServer, latest_superblock};
-use crate::{FORMAT_VERSION, FORMAT_WITH_F1, FORMAT_WITH_ROUTING};
+use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
 use fl_core::StoreError;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
@@ -348,18 +348,18 @@ fn two_valid_slots_with_one_epoch_are_corrupt_across_formats() {
 fn a_new_store_starts_at_the_newest_schema_and_keeps_it() {
     assert_eq!(
         FerroStore::in_memory().format_version().unwrap(),
-        Some(FORMAT_WITH_F1)
+        Some(FORMAT_WITH_WORKFLOW)
     );
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("store.fls");
     {
         let store = FerroStore::open(&path).unwrap();
-        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
         store.put_doc("c", "a", &json!(1)).unwrap();
         store.checkpoint().unwrap();
     }
     let store = FerroStore::open(&path).unwrap();
-    assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+    assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
     // The version document is not a WAL frame: a new store is at sequence 0.
     assert_eq!(
         super::read_consistent(&File::open(&path).unwrap())
@@ -381,7 +381,7 @@ fn a_schema_newer_than_this_build_is_refused() {
             .put_doc_unchecked(
                 "__meta",
                 "schema_version",
-                &json!(FORMAT_WITH_F1 + 1),
+                &json!(FORMAT_WITH_WORKFLOW + 1),
                 false,
             )
             .unwrap();
@@ -393,8 +393,8 @@ fn a_schema_newer_than_this_build_is_refused() {
     assert!(
         matches!(
             err,
-            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_F1 }
-                if v == FORMAT_WITH_F1 + 1
+            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_WORKFLOW }
+                if v == FORMAT_WITH_WORKFLOW + 1
         ),
         "{err:?}"
     );
@@ -459,7 +459,7 @@ fn a_migration_copies_the_sources_schema_version() {
     let redb = crate::RedbStore::open(&tmp.path().join("src.redb")).unwrap();
     assert_eq!(redb.format_version().unwrap(), Some(FORMAT_VERSION));
     let ferro = FerroStore::open(tmp.path().join("dst.fls")).unwrap();
-    assert_eq!(ferro.format_version().unwrap(), Some(FORMAT_WITH_F1));
+    assert_eq!(ferro.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
     crate::migrate_redb_to_ferrostore(&redb, &ferro).unwrap();
     assert_eq!(ferro.format_version().unwrap(), Some(FORMAT_VERSION));
     assert_eq!(ferro.get_doc("meta", "format_version").unwrap(), None);
@@ -472,14 +472,18 @@ fn the_schema_document_is_in_no_trait_listing() {
     // Not vacuous: the document is there to leak.
     assert_eq!(
         store.get_doc("__meta", "schema_version").unwrap(),
-        Some(json!(FORMAT_WITH_F1))
+        Some(json!(FORMAT_WITH_WORKFLOW))
     );
     assert!(store.list_projects().unwrap().is_empty());
     assert!(store.list_state(None, None).unwrap().is_empty());
     assert!(store.list_workflow_defs(None).unwrap().is_empty());
     assert!(
         store
-            .query_by_field("__meta", "schema_version", &FORMAT_WITH_F1.to_string())
+            .query_by_field(
+                "__meta",
+                "schema_version",
+                &FORMAT_WITH_WORKFLOW.to_string()
+            )
             .unwrap()
             .is_empty()
     );
@@ -516,7 +520,7 @@ fn a_first_open_cut_short_after_its_snapshot_reopens_as_a_new_store() {
         let store = FerroStore::open(&path).unwrap_or_else(|err| panic!("{name}: {err}"));
         assert_eq!(
             store.format_version().unwrap(),
-            Some(FORMAT_WITH_F1),
+            Some(FORMAT_WITH_WORKFLOW),
             "{name}"
         );
         store.put_doc("c", "a", &json!(1)).unwrap();
@@ -584,7 +588,7 @@ fn ensure_superblock_says_when_it_initialized_the_file() {
 
 mod reserved {
     use super::super::{DocState, FerroStore, Inner, Op, SyncAdapter, SyncBatch, SyncMode, SyncOp};
-    use crate::{FORMAT_VERSION, FORMAT_WITH_F1, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE};
+    use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE, FORMAT_WITH_WORKFLOW};
     use fl_core::StoreError;
     use fl_core::routing::RoutingMap;
     use fl_core::store::Catalog;
@@ -691,7 +695,7 @@ mod reserved {
         );
         assert_reserved(store.delete_doc("__meta", "schema_version").unwrap_err());
         assert_reserved(store.put_doc("__other", "x", &json!(1)).unwrap_err());
-        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
         assert_eq!(store.read_state().unwrap().last_seq, 0, "nothing committed");
         // One underscore is an ordinary collection.
         store.put_doc("_meta", "x", &json!(1)).unwrap();
@@ -722,7 +726,7 @@ mod reserved {
         }
         let remote = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
         assert_reserved(remote.put_doc("__meta", "x", &json!(1)).unwrap_err());
-        assert_eq!(remote.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(remote.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
         drop(remote);
         drop(client);
         drop(server);
@@ -839,7 +843,10 @@ mod reserved {
         *inbound.pull.lock().unwrap() = sent;
         assert_eq!(replica.sync_pull().unwrap(), 2);
         // An older version never lowers the replica's.
-        assert_eq!(replica.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(
+            replica.format_version().unwrap(),
+            Some(FORMAT_WITH_WORKFLOW)
+        );
         assert!(has(&replica, "docs", "a"));
     }
 
@@ -887,7 +894,7 @@ mod reserved {
     #[test]
     fn an_inbound_schema_newer_than_this_build_is_refused() {
         let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
-        let newer = FORMAT_WITH_F1 + 1;
+        let newer = FORMAT_WITH_WORKFLOW + 1;
         pulled(
             &recorder,
             vec![
@@ -902,14 +909,14 @@ mod reserved {
             assert!(
                 matches!(
                     err,
-                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_F1 }
+                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_WORKFLOW }
                         if v == newer
                 ),
                 "{err:?}"
             );
         }
         assert_eq!(store.read_state().unwrap().last_seq, 0, "nothing applied");
-        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
         assert!(!has(&store, "docs", "a") && !has(&store, "docs", "b"));
     }
 
@@ -947,7 +954,7 @@ mod reserved {
         }] {
             let state = store.read_state().unwrap();
             assert_eq!(state.last_seq, 4);
-            assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+            assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
             let reserved: Vec<_> = state
                 .docs
                 .iter()
@@ -974,7 +981,7 @@ mod reserved {
         ];
         assert_eq!(store.apply_sync_batches(batches.clone(), false).unwrap(), 2);
         assert_eq!(*recorder.commits.lock().unwrap(), batches);
-        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_F1));
+        assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
     }
 
     #[test]

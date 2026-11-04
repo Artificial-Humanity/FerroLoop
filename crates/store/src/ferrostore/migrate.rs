@@ -49,20 +49,11 @@ pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Resul
 fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
     let tx = redb.db.begin_read().map_err(backend)?;
 
-    // F1 control rows cannot safely migrate to the Ferro engine until its
-    // reserved-record replication and write fencing are implemented. Refuse
-    // before staging anything, preserving the authoritative redb source.
-    if let Some(table) = read_table(&tx, TableDefinition::<&str, &str>::new(doc::F1_RECORDS))?
-        && table
-            .iter()
-            .map_err(backend)?
-            .next()
-            .transpose()
-            .map_err(backend)?
-            .is_some()
-    {
+    // A native F1 table belongs to an unsupported/future format. Refuse even an
+    // empty one so migration cannot silently drop schema or records.
+    if read_table(&tx, TableDefinition::<&str, &str>::new(doc::F1_RECORDS))?.is_some() {
         return Err(backend(
-            "refusing redb-to-Ferro migration: F1 preparation records require the redb backend; set FL_STORE_BACKEND=redb",
+            "refusing redb-to-Ferro migration: an unsupported F1 preparation table is present",
         ));
     }
 
@@ -335,11 +326,6 @@ fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
         tx,
         TableDefinition::<&str, &str>::new(doc::WORKFLOW_RUNS),
         |key, value| put_json_text(txn, doc::WORKFLOW_RUNS, key, value)
-    );
-    copy_rows!(
-        tx,
-        TableDefinition::<&str, &str>::new(doc::F1_RECORDS),
-        |key, value| put_json_text(txn, doc::F1_RECORDS, key, value)
     );
     Ok(())
 }

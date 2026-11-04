@@ -161,13 +161,10 @@ pub const FORMAT_WITH_WIRE: u64 = 7;
 /// workflow tables. This build opens 2 to 8.
 pub const FORMAT_WITH_WORKFLOW: u64 = 8;
 
-/// First F1 preparation write; older builds must not ignore these records.
-pub const FORMAT_WITH_F1: u64 = 9;
-
 /// Every schema version this build opens, oldest first. Both `RedbStore` and
 /// `FerroStore` use this one ladder, so `format_version()` means the same on
 /// both; a new schema step adds a constant here and an upgrade for both.
-pub(crate) const FORMAT_LADDER: [u64; 8] = [
+pub(crate) const FORMAT_LADDER: [u64; 7] = [
     FORMAT_VERSION,
     FORMAT_WITH_IMPORTS,
     FORMAT_WITH_LEDGER_ROOT,
@@ -175,7 +172,6 @@ pub(crate) const FORMAT_LADDER: [u64; 8] = [
     FORMAT_WITH_STATE,
     FORMAT_WITH_WIRE,
     FORMAT_WITH_WORKFLOW,
-    FORMAT_WITH_F1,
 ];
 
 /// `FormatVersion` unless `found` is on [`FORMAT_LADDER`].
@@ -185,7 +181,7 @@ pub(crate) fn check_format(found: Option<u64>) -> Result<(), StoreError> {
         _ => Err(StoreError::FormatVersion {
             found,
             oldest: FORMAT_VERSION,
-            newest: FORMAT_WITH_F1,
+            newest: FORMAT_WITH_WORKFLOW,
         }),
     }
 }
@@ -2273,7 +2269,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_F1
+                    newest: FORMAT_WITH_WORKFLOW
                 }
             ),
             "{err:?}"
@@ -3014,7 +3010,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_F1 + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_WORKFLOW + 1)
                 .unwrap();
             tx.commit().unwrap();
         }

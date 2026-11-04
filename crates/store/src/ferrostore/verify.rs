@@ -808,7 +808,6 @@ fn redb_table(tx: &redb::ReadTransaction, name: &str) -> Result<Option<Rows>, St
         | doc::AGENTS
         | doc::AREAS
         | doc::WIRE_MESSAGES
-        | doc::F1_RECORDS
         | doc::WORKFLOW_DEFS
         | doc::WORKFLOW_RUNS => {
             redb_rows!(tx, name, &str, &str, |k, v| Ok((
@@ -874,7 +873,7 @@ fn redb_table(tx: &redb::ReadTransaction, name: &str) -> Result<Option<Rows>, St
 }
 
 /// Every redb table `migrate.rs` copies, in its order.
-const COPIED: [&str; 46] = [
+const COPIED: [&str; 45] = [
     doc::META,
     doc::IDS,
     doc::ALIASES,
@@ -917,7 +916,6 @@ const COPIED: [&str; 46] = [
     doc::WIRE_RCPT_LOG,
     doc::WIRE_THREADS,
     doc::WIRE_REPLIES,
-    doc::F1_RECORDS,
     doc::WORKFLOW_DEFS,
     doc::WORKFLOW_SLUGS,
     doc::WORKFLOW_RUNS,
