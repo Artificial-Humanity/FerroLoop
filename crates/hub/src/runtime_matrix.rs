@@ -46,8 +46,9 @@ use crate::auth::HubAuthority;
 use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
     DiscoveredSessionSummary, SessionQuotaUsage, codex_account_quota,
-    discover_route_sessions_without_model_info, quota_for_resolved_route,
-    quota_for_resolved_route_at, snapshot_discovery_store,
+    codex_session_matches_account, discover_route_sessions_without_model_info,
+    normalize_codex_plan, quota_for_resolved_route, quota_for_resolved_route_at,
+    snapshot_discovery_store,
 };
 use crate::runtime_update::update_command;
 
@@ -418,12 +419,10 @@ fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
 fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
     let home = inputs.home_override.as_deref();
     let now_ms = inputs.now_ms;
-    // Codex rollouts do not carry an account identity that can bind them to
-    // the current auth file, even when both happen to use the same directory.
-    if adapter == "codex" {
-        return (inputs.quota_source.account)(adapter, home)
-            .filter(|q| quota_richness(q, now_ms) > 0);
-    }
+    let codex_account = (adapter == "codex")
+        .then(|| (inputs.quota_source.account)(adapter, home))
+        .flatten()
+        .filter(|q| quota_richness(q, now_ms) > 0);
     let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
         .sessions
         .iter()
@@ -434,6 +433,9 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
     let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
     let mut best: Option<(usize, SessionQuotaUsage)> = None;
     for session in sessions {
+        if codex_account.is_some() && !codex_session_matches_account(session, home) {
+            continue;
+        }
         let reading = match &session.quota_usage {
             Some(q) => Some(q.clone()),
             None if session.source == "route" && reads_left > 0 => {
@@ -443,13 +445,27 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
             None => None,
         };
         let Some(reading) = reading else { continue };
+        if let Some(account) = &codex_account {
+            let matching_tier = account
+                .tier
+                .as_deref()
+                .zip(reading.tier.as_deref())
+                .is_some_and(|(a, b)| normalize_codex_plan(a) == normalize_codex_plan(b));
+            if !matching_tier {
+                continue;
+            }
+        }
         let richness = quota_richness(&reading, now_ms);
         if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
             best = Some((richness, reading));
         }
     }
-    best.map(|(_, q)| q).or_else(|| {
-        (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q, now_ms) > 0)
+    // Without an auth reading this is session evidence, not proof of the current account.
+    best.map(|(_, q)| q).or(codex_account).or_else(|| {
+        (adapter != "codex")
+            .then(|| (inputs.quota_source.account)(adapter, home))
+            .flatten()
+            .filter(|q| quota_richness(q, now_ms) > 0)
     })
 }
 

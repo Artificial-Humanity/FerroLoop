@@ -1,7 +1,7 @@
 #![cfg(unix)]
 use base64::Engine as _;
 use fl_hub::{
-    discovery::{DiscoveredSessionSummary, QuotaWindowUsage, SessionQuotaUsage},
+    discovery::DiscoveredSessionSummary,
     runtime_matrix::{ProbeInputs, QuotaSource, build_matrix},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -13,6 +13,20 @@ fn codex_matrix_account_is_bound_to_credential_home() {
     const EXPECTED: &str = "FL_TEST_CODEX_MATRIX_EXPECTED";
     if let Ok(rollout) = std::env::var(CHILD) {
         let mode = std::env::var(EXPECTED).unwrap();
+        let plan = match mode.as_str() {
+            "mismatch" => serde_json::json!("plus"),
+            "unknown" => serde_json::Value::Null,
+            _ => serde_json::json!("prolite"),
+        };
+        std::fs::write(&rollout, format!("{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":plan,"primary":{"used_percent":26.0,"window_minutes":10080},"secondary":null}}}))).unwrap();
+        if matches!(mode.as_str(), "mismatch" | "unknown") {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"enterprise"}}).to_string());
+            std::fs::write(
+                PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("auth.json"),
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+        }
         let session = DiscoveredSessionSummary {
             id: "session-a".into(),
             source: "route".into(),
@@ -23,16 +37,7 @@ fn codex_matrix_account_is_bound_to_credential_home() {
             cwd: None,
             record_id: None,
             transcript_path: Some(rollout),
-            quota_usage: Some(SessionQuotaUsage {
-                tier: Some("plus".into()),
-                primary_window: Some(QuotaWindowUsage {
-                    used_percent: 7.0,
-                    window_minutes: Some(300),
-                    resets_at_ms: None,
-                }),
-                secondary_window: None,
-                exhausted_reason: None,
-            }),
+            quota_usage: None,
             model: None,
             thinking_level: None,
             available_models: vec![],
@@ -69,20 +74,31 @@ fn codex_matrix_account_is_bound_to_credential_home() {
             let current = &updated.vendor_quotas["codex"];
             assert_eq!(current.tier.as_deref(), Some("enterprise"));
             assert!(current.primary_window.is_none());
+            assert!(current.secondary_window.is_none());
             return;
         }
         match mode.as_str() {
-            "same" | "override" => {
+            "same" | "override" | "missing" | "malformed" => {
                 let reading = &matrix.vendor_quotas["codex"];
                 assert_eq!(reading.tier.as_deref(), Some("pro"));
-                assert!(reading.primary_window.is_none());
+                assert_eq!(
+                    reading.secondary_window.as_ref().unwrap().window_minutes,
+                    Some(10_080)
+                );
             }
-            "other" => {
+            "other" | "different_same_tier" | "mismatch" | "unknown" => {
                 let reading = &matrix.vendor_quotas["codex"];
-                assert_eq!(reading.tier.as_deref(), Some("enterprise"));
+                assert_eq!(
+                    reading.tier.as_deref(),
+                    Some(if mode == "different_same_tier" {
+                        "pro"
+                    } else {
+                        "enterprise"
+                    })
+                );
                 assert!(reading.primary_window.is_none());
+                assert!(reading.secondary_window.is_none());
             }
-            "missing" => assert!(!matrix.vendor_quotas.contains_key("codex")),
             _ => panic!("unexpected test mode"),
         }
         return;
@@ -104,12 +120,24 @@ fn codex_matrix_account_is_bound_to_credential_home() {
         )
         .unwrap();
     }
+    std::fs::create_dir_all(account_b.path().join("same")).unwrap();
+    std::fs::copy(
+        account_a.path().join(".codex/auth.json"),
+        account_b.path().join("same/auth.json"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(account_b.path().join("malformed")).unwrap();
+    std::fs::write(account_b.path().join("malformed/auth.json"), "{").unwrap();
     for (mode, configured) in [
         ("same", account_a.path().join(".codex")),
         ("other", account_b.path().join(".codex")),
         ("override", account_b.path().join(".codex")),
         ("missing", account_b.path().join("missing")),
         ("switch", account_a.path().join(".codex")),
+        ("different_same_tier", account_b.path().join("same")),
+        ("malformed", account_b.path().join("malformed")),
+        ("mismatch", account_a.path().join(".codex")),
+        ("unknown", account_a.path().join(".codex")),
     ] {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([

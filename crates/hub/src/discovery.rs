@@ -2111,7 +2111,7 @@ fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindo
 }
 
 /// Normalize Codex's legacy plan spelling for display.
-fn normalize_codex_plan(plan: &str) -> String {
+pub(crate) fn normalize_codex_plan(plan: &str) -> String {
     let key = plan.trim().to_ascii_lowercase();
     if matches!(key.as_str(), "prolite" | "pro_lite" | "pro-lite") {
         "pro".to_owned()
@@ -2304,6 +2304,55 @@ fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
         return None;
     }
     Some(normalize_codex_plan(plan))
+}
+
+/// Home binding prevents mixing different credential directories. It cannot prove that
+/// a rollout belongs to the current account after a same-tier account switch in place.
+pub(crate) fn codex_session_matches_account(
+    session: &DiscoveredSessionSummary,
+    home_override: Option<&Path>,
+) -> bool {
+    let home = match home_override {
+        Some(home) => home.to_path_buf(),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => return false,
+        },
+    };
+    if !home.is_absolute() {
+        return false;
+    }
+    let Ok(home) = fs::canonicalize(home) else {
+        return false;
+    };
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions");
+    if fs::symlink_metadata(&codex)
+        .ok()
+        .is_none_or(|m| m.file_type().is_symlink())
+        || fs::symlink_metadata(&sessions)
+            .ok()
+            .is_none_or(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    let Some(transcript) = session.transcript_path.as_deref() else {
+        return false;
+    };
+    let (Ok(root), Ok(path)) = (fs::canonicalize(&sessions), fs::canonicalize(transcript)) else {
+        return false;
+    };
+    if !root.starts_with(&home) || !path.starts_with(&root) {
+        return false;
+    }
+    let account_dir = match home_override {
+        Some(_) => codex.clone(),
+        None => std::env::var_os("CODEX_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| codex.clone()),
+    };
+    matches!((fs::canonicalize(codex), fs::canonicalize(account_dir)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// An account-level probe is not attached to a session and uses the configured
