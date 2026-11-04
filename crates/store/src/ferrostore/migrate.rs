@@ -49,6 +49,23 @@ pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Resul
 fn copy_tables(redb: &RedbStore, txn: &mut Txn) -> Result<(), StoreError> {
     let tx = redb.db.begin_read().map_err(backend)?;
 
+    // F1 control rows cannot safely migrate to the Ferro engine until its
+    // reserved-record replication and write fencing are implemented. Refuse
+    // before staging anything, preserving the authoritative redb source.
+    if let Some(table) = read_table(&tx, TableDefinition::<&str, &str>::new(doc::F1_RECORDS))?
+        && table
+            .iter()
+            .map_err(backend)?
+            .next()
+            .transpose()
+            .map_err(backend)?
+            .is_some()
+    {
+        return Err(backend(
+            "refusing redb-to-Ferro migration: F1 preparation records require the redb backend; set FL_STORE_BACKEND=redb",
+        ));
+    }
+
     let mut schema = None;
     copy_rows!(
         tx,

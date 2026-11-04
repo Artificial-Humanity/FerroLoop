@@ -67,7 +67,8 @@ pub(super) const SCHEMA_COLLECTION: &str = "__meta";
 /// A collection whose name starts with this belongs to the store: only its own
 /// transactions write it. Public `put_doc` / `delete_doc` refuse it. Outbound
 /// sync batches carry its ops like any other; an inbound sync batch applies
-/// one only as a schema raise (`admit_inbound` in `mod.rs`) and drops the rest.
+/// one only as a schema raise (`admit_inbound` in `mod.rs`) and drops the rest,
+/// except F1 preparation ops, which refuse the inbound batch to prevent data loss.
 pub(super) const RESERVED_PREFIX: &str = "__";
 
 /// `true` for a collection only the store itself writes ([`RESERVED_PREFIX`]).

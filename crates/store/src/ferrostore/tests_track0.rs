@@ -619,6 +619,46 @@ mod reserved {
         }
     }
 
+    #[test]
+    fn sync_attachment_refuses_a_store_already_holding_f1_rows() {
+        let store = FerroStore::in_memory();
+        store
+            .with_write(|tx| {
+                tx.put("__f1_records", "f1-existing", json!({"version": 1}));
+                Ok(())
+            })
+            .unwrap();
+        let before = store.last_seq().unwrap();
+        let err = store
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Recorder::default()))
+            .unwrap_err();
+        assert!(err.to_string().contains("F1"), "{err}");
+        assert_eq!(store.sync_mode(), None);
+        assert_eq!(store.last_seq().unwrap(), before);
+    }
+
+    #[test]
+    fn remote_sync_attachment_refuses_server_holding_f1_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("remote.sock");
+        let server_store = FerroStore::in_memory();
+        server_store
+            .with_write(|tx| {
+                tx.put("__f1_records", "f1-existing", json!({"version": 1}));
+                Ok(())
+            })
+            .unwrap();
+        let server = super::super::FerroStoreServer::bind_unix(&socket, server_store).unwrap();
+        let remote = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        let err = remote
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Recorder::default()))
+            .unwrap_err();
+        assert!(err.to_string().contains("F1"), "{err}");
+        assert_eq!(remote.sync_mode(), None);
+        drop(remote);
+        drop(server);
+    }
+
     fn attached(store: FerroStore, mode: SyncMode) -> (FerroStore, Arc<Recorder>) {
         let recorder = Arc::new(Recorder::default());
         let store = store

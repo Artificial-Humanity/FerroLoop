@@ -2264,6 +2264,14 @@ impl FerroStore {
         adapter: Arc<dyn SyncAdapter>,
     ) -> Result<(), StoreError> {
         self.refuse_reentry()?;
+        // F1 rows are local-only until their authenticated replication contract is
+        // implemented. F1 mutations and redb→Ferro migration are refused, so no
+        // supported writer can introduce such a row after this check.
+        if self.with_read(|tx| Ok(tx.collections().iter().any(|name| name == doc::F1_RECORDS)))? {
+            return Err(backend(
+                "cannot attach sync: this store holds local-only F1 preparation records",
+            ));
+        }
         let mut slot = lock_mutex(&self.sync);
         if !slot.is_idle() {
             return Err(backend(
@@ -3460,7 +3468,8 @@ fn prepare_sync_batches(
 /// [`StoreError::FormatVersion`], the same refusal `open` gives, so the batch
 /// is refused whole; any other reserved op (an older, equal or off-ladder
 /// version, another `__meta` id, a delete, another reserved collection) is
-/// dropped.
+/// dropped. F1 preparation rows are the exception: their authenticated sync
+/// contract is not implemented, so an inbound F1 op refuses the entire batch.
 fn admit_inbound<'a>(
     op: &'a SyncOp,
     version: &mut Option<u64>,
@@ -3479,6 +3488,11 @@ fn admit_inbound<'a>(
         SyncOp::DeleteDoc { collection, .. } => (collection, None),
         _ => return Ok(Some(op)),
     };
+    // F1 preparation records are local-only until their authenticated sync
+    // contract exists. Never advance the sequence while discarding them.
+    if collection == doc::F1_RECORDS {
+        return Err(backend("inbound F1 preparation records are unsupported"));
+    }
     if !doc::is_reserved(collection) {
         return Ok(Some(op));
     }

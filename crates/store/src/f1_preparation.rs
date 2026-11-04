@@ -1,10 +1,13 @@
-//! Per-record, fail-closed F1 preparation on local native backends.
-//! Remote Ferro never performs these operations. Records are inert evidence, not authority.
+//! Per-record, fail-closed F1 preparation on redb.
+//! Ferro F1 mutations and redb-to-Ferro migration with F1 rows are refused until
+//! reserved-record sync and cross-handle fencing are implemented. Existing local
+//! Ferro F1 rows remain readable; remote Ferro refuses all F1 operations.
+//! Records are inert evidence, not authority.
 
 use crate::{AnyStore, FORMAT_WITH_F1, RedbStore};
 use fl_core::f1_records::{
     AllocationEvidenceRecord, ControlRecordKey, F1PreparationStore, F1RecordError,
-    IntentEvidenceRecord, RoutineProposalRecord, SafetyBatch, SafetyChange,
+    IntentEvidenceRecord, MAX_RECORD_BYTES, RoutineProposalRecord, SafetyBatch, SafetyChange,
     decode_allocation_record, decode_intent_record, decode_routine_record, encode_record,
     prepare_allocation_stop, prepare_intent_quarantine, prepare_routine_pause,
 };
@@ -13,6 +16,14 @@ use redb::{ReadableTable, TableDefinition};
 pub(crate) const TABLE: TableDefinition<&str, &str> = TableDefinition::new("__f1_records");
 fn backend_error(e: impl std::fmt::Display) -> F1RecordError {
     F1RecordError::Backend(e.to_string())
+}
+
+/// Check the borrowed redb value before allocating a copy.
+fn bounded_redb_bytes(value: &str) -> Result<Vec<u8>, F1RecordError> {
+    if value.len() > MAX_RECORD_BYTES {
+        return Err(F1RecordError::TooLarge);
+    }
+    Ok(value.as_bytes().to_vec())
 }
 
 /// Stage only after every row is present, valid and at its expected version.
@@ -75,11 +86,11 @@ impl RedbStore {
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
             Err(e) => return Err(backend_error(e)),
         };
-        let value = table
+        table
             .get(key.native_key())
             .map_err(backend_error)?
-            .map(|v| v.value().as_bytes().to_vec());
-        Ok(value)
+            .map(|v| bounded_redb_bytes(v.value()))
+            .transpose()
     }
     fn f1_insert(&self, key: ControlRecordKey, bytes: Vec<u8>) -> Result<(), F1RecordError> {
         let text = std::str::from_utf8(&bytes).map_err(|_| F1RecordError::Codec)?;
@@ -147,10 +158,11 @@ impl F1PreparationStore for RedbStore {
         {
             let mut table = tx.open_table(TABLE).map_err(backend_error)?;
             let changes = stage_batch(batch, |key| {
-                Ok(table
+                table
                     .get(key)
                     .map_err(backend_error)?
-                    .map(|v| v.value().as_bytes().to_vec()))
+                    .map(|v| bounded_redb_bytes(v.value()))
+                    .transpose()
             })?;
             for (key, bytes) in changes {
                 let text = std::str::from_utf8(&bytes).map_err(|_| F1RecordError::Codec)?;
@@ -418,236 +430,236 @@ mod tests {
     }
 
     #[test]
-    fn local_engines_persist_independent_records_and_atomic_safety() {
-        let tmp = tempfile::tempdir().unwrap();
-        for store in [
-            AnyStore::from(RedbStore::open(&tmp.path().join("f1.redb")).unwrap()),
-            AnyStore::from(FerroStore::open(tmp.path().join("f1.fls")).unwrap()),
-        ] {
-            store.insert_proposal(routine()).unwrap();
-            store.insert_allocation(allocation()).unwrap();
-            assert_eq!(store.routine("routine").unwrap(), Some(routine()));
-            let batch = SafetyBatch {
-                changes: vec![
-                    fl_core::f1_records::SafetyChange::PauseRoutine {
-                        id: "routine".into(),
-                        expected_version: 1,
-                        reason: "pause".into(),
-                    },
-                    fl_core::f1_records::SafetyChange::RequestAllocationStop {
-                        id: "allocation".into(),
-                        expected_version: 2,
-                    },
-                ],
-            };
-            assert_eq!(
-                store.apply_safety_batch(&batch),
-                Err(F1RecordError::Conflict)
-            );
-            assert_eq!(store.routine("routine").unwrap(), Some(routine()));
-            store.request_allocation_stop("allocation", 1).unwrap();
-            assert_eq!(
-                store.allocation("allocation").unwrap().unwrap().safety,
-                SafetyState::StopRequested
-            );
-        }
-    }
-
-    #[test]
-    fn both_local_backends_survive_reopen_and_reject_duplicate_identity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let redb_path = tmp.path().join("rows.redb");
-        let ferro_path = tmp.path().join("rows.fls");
-        {
-            let redb = RedbStore::open(&redb_path).unwrap();
-            let ferro = FerroStore::open(&ferro_path).unwrap();
-            for store in [
-                &redb as &dyn F1PreparationStore,
-                &ferro as &dyn F1PreparationStore,
-            ] {
-                store.insert_proposal(routine()).unwrap();
-                store.insert_intent(intent()).unwrap();
-                store.insert_allocation(allocation()).unwrap();
-                assert_eq!(
-                    store.insert_allocation(allocation()),
-                    Err(F1RecordError::Conflict)
-                );
-                store.quarantine_intent("intent", 1).unwrap();
+    fn ferro_mutations_refuse_before_committing_even_with_write_through_adapter() {
+        use crate::ferrostore::{SyncAdapter, SyncBatch, SyncMode};
+        use std::sync::Arc;
+        struct Rejecting;
+        impl SyncAdapter for Rejecting {
+            fn name(&self) -> &str {
+                "rejecting"
             }
-            assert_eq!(redb.format_version().unwrap(), Some(crate::FORMAT_WITH_F1));
-            assert_eq!(ferro.format_version().unwrap(), Some(crate::FORMAT_WITH_F1));
-            assert!(
-                ferro
-                    .put_doc("__f1_records", "x", &serde_json::json!(1))
-                    .is_err()
-            );
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), fl_core::StoreError> {
+                Err(fl_core::StoreError::Backend(
+                    "injected delivery failure".into(),
+                ))
+            }
         }
-        let redb = RedbStore::open(&redb_path).unwrap();
-        let ferro = FerroStore::open(&ferro_path).unwrap();
-        for store in [
-            &redb as &dyn F1PreparationStore,
-            &ferro as &dyn F1PreparationStore,
-        ] {
-            assert_eq!(store.routine("routine").unwrap(), Some(routine()));
-            assert_eq!(
-                store.intent("intent").unwrap().unwrap().safety,
-                SafetyState::Quarantined
-            );
-            assert_eq!(store.allocation("allocation").unwrap(), Some(allocation()));
-        }
-    }
-
-    #[test]
-    fn migration_copies_and_verifies_f1_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        let redb = RedbStore::open(&tmp.path().join("source.redb")).unwrap();
-        let ferro = FerroStore::open(tmp.path().join("destination.fls")).unwrap();
-        redb.insert_proposal(routine()).unwrap();
-        redb.insert_intent(intent()).unwrap();
-        redb.insert_allocation(allocation()).unwrap();
-        redb.quarantine_intent("intent", 1).unwrap();
-        crate::migrate_redb_to_ferrostore(&redb, &ferro).unwrap();
-        let report = crate::migrate::verify_redb_vs_ferrostore(&redb, &ferro).unwrap();
-        assert!(report.is_clean(), "{:?}", report.mismatches());
-        assert_eq!(ferro.routine("routine").unwrap(), Some(routine()));
+        let path = tmp.path().join("local.fls");
+        let first = FerroStore::open(&path).unwrap();
+        let second = FerroStore::open(&path).unwrap();
+        first
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Rejecting))
+            .unwrap();
+        let before = FerroStore::stats_at(&path).unwrap().last_seq;
         assert_eq!(
-            ferro.intent("intent").unwrap().unwrap().safety,
-            SafetyState::Quarantined
+            first.insert_allocation(allocation()),
+            Err(F1RecordError::UnsupportedLocal)
         );
-        assert_eq!(ferro.allocation("allocation").unwrap(), Some(allocation()));
+        assert_eq!(
+            second.insert_allocation(allocation()),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+        assert_eq!(
+            first.request_allocation_stop("allocation", 1),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+        assert_eq!(
+            first.apply_safety_batch(&SafetyBatch { changes: vec![] }),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+        let mut invalid = allocation();
+        invalid.allocation_id.clear();
+        assert_eq!(
+            first.insert_allocation(invalid),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+        assert_eq!(FerroStore::stats_at(&path).unwrap().last_seq, before);
+        assert_eq!(first.allocation("allocation").unwrap(), None);
     }
 
     #[test]
-    fn concurrent_f1_cas_has_exactly_one_winner_on_both_engines() {
+    fn ferro_sync_attach_and_another_handle_f1_write_can_race_without_committing_f1() {
+        use crate::ferrostore::{SyncAdapter, SyncBatch, SyncMode};
         use std::sync::{Arc, Barrier};
-        let tmp = tempfile::tempdir().unwrap();
-        for store in [
-            Arc::new(AnyStore::from(
-                RedbStore::open(&tmp.path().join("race.redb")).unwrap(),
-            )),
-            Arc::new(AnyStore::from(
-                FerroStore::open(tmp.path().join("race.fls")).unwrap(),
-            )),
-        ] {
-            store.insert_allocation(allocation()).unwrap();
-            let barrier = Arc::new(Barrier::new(3));
-            let mut threads = Vec::new();
-            for _ in 0..2 {
-                let store = Arc::clone(&store);
-                let barrier = Arc::clone(&barrier);
-                threads.push(std::thread::spawn(move || {
-                    barrier.wait();
-                    store.request_allocation_stop("allocation", 1)
-                }));
+        struct Rejecting;
+        impl SyncAdapter for Rejecting {
+            fn name(&self) -> &str {
+                "rejecting"
             }
-            barrier.wait();
-            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-            assert_eq!(
-                results.iter().filter(|r| r.is_ok()).count(),
-                1,
-                "{results:?}"
-            );
-            assert_eq!(
-                results
-                    .iter()
-                    .filter(|r| matches!(r, Err(F1RecordError::Conflict)))
-                    .count(),
-                1,
-                "{results:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn misplaced_or_corrupt_row_fails_closed_without_batch_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let redb = RedbStore::open(&tmp.path().join("corrupt.redb")).unwrap();
-        let ferro = FerroStore::open(tmp.path().join("corrupt.fls")).unwrap();
-        redb.insert_proposal(routine()).unwrap();
-        redb.insert_allocation(allocation()).unwrap();
-        {
-            let tx = redb.db.begin_write().unwrap();
-            {
-                let mut rows = tx.open_table(super::TABLE).unwrap();
-                let key = fl_core::f1_records::ControlRecordKey::allocation("other").unwrap();
-                let bytes = fl_core::f1_records::encode_record(&allocation()).unwrap();
-                rows.insert(key.native_key(), std::str::from_utf8(&bytes).unwrap())
-                    .unwrap();
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), fl_core::StoreError> {
+                Err(fl_core::StoreError::Backend("injected failure".into()))
             }
-            tx.commit().unwrap();
         }
-        crate::migrate_redb_to_ferrostore(&redb, &ferro).unwrap();
-        for store in [
-            &redb as &dyn F1PreparationStore,
-            &ferro as &dyn F1PreparationStore,
-        ] {
-            assert_eq!(store.allocation("other"), Err(F1RecordError::Conflict));
-            let changes = SafetyBatch {
-                changes: vec![
-                    fl_core::f1_records::SafetyChange::PauseRoutine {
-                        id: "routine".into(),
-                        expected_version: 1,
-                        reason: "pause".into(),
-                    },
-                    fl_core::f1_records::SafetyChange::RequestAllocationStop {
-                        id: "other".into(),
-                        expected_version: 1,
-                    },
-                ],
-            };
-            assert_eq!(
-                store.apply_safety_batch(&changes),
-                Err(F1RecordError::Conflict)
-            );
-            assert_eq!(store.routine("routine").unwrap(), Some(routine()));
-            assert_eq!(store.allocation("allocation").unwrap(), Some(allocation()));
-        }
-    }
-
-    #[test]
-    fn safety_transition_survives_more_than_four_mib_of_other_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        for store in [
-            AnyStore::from(RedbStore::open(&tmp.path().join("large.redb")).unwrap()),
-            AnyStore::from(FerroStore::open(tmp.path().join("large.fls")).unwrap()),
-        ] {
-            store.insert_allocation(allocation()).unwrap();
-            let mut total = 0;
-            for i in 0..75 {
-                let mut row = routine();
-                row.spec.routine_id = format!("routine-{i}");
-                row.spec.project = "x".repeat(60_000);
-                total += fl_core::f1_records::encode_record(&row).unwrap().len();
-                store.insert_proposal(row).unwrap();
-            }
-            assert!(total > 4 * 1024 * 1024);
-            store.request_allocation_stop("allocation", 1).unwrap();
-            assert_eq!(
-                store.allocation("allocation").unwrap().unwrap().safety,
-                SafetyState::StopRequested
-            );
-        }
-    }
-
-    #[test]
-    fn ferro_independent_handles_race_one_cas() {
-        use std::sync::{Arc, Barrier};
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("independent.fls");
+        let path = tmp.path().join("race.fls");
         let first = Arc::new(FerroStore::open(&path).unwrap());
         let second = Arc::new(FerroStore::open(&path).unwrap());
-        first.insert_allocation(allocation()).unwrap();
+        let before = FerroStore::stats_at(&path).unwrap().last_seq;
         let barrier = Arc::new(Barrier::new(3));
-        let threads: Vec<_> = [first, second]
-            .into_iter()
-            .map(|store| {
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    store.request_allocation_stop("allocation", 1)
-                })
+        let attach = {
+            let first = Arc::clone(&first);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                first.attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Rejecting))
             })
-            .collect();
+        };
+        let write = {
+            let second = Arc::clone(&second);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                second.insert_allocation(allocation())
+            })
+        };
+        barrier.wait();
+        assert!(attach.join().unwrap().is_ok());
+        assert_eq!(write.join().unwrap(), Err(F1RecordError::UnsupportedLocal));
+        assert_eq!(FerroStore::stats_at(&path).unwrap().last_seq, before);
+        assert_eq!(second.allocation("allocation").unwrap(), None);
+    }
+
+    #[test]
+    fn migration_of_f1_rows_is_refused_without_changing_source_or_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let redb = RedbStore::open(&tmp.path().join("source.redb")).unwrap();
+        let path = tmp.path().join("destination.fls");
+        let ferro = FerroStore::open(&path).unwrap();
+        redb.insert_proposal(routine()).unwrap();
+        let before = FerroStore::stats_at(&path).unwrap().last_seq;
+        let err = crate::migrate_redb_to_ferrostore(&redb, &ferro).unwrap_err();
+        assert!(err.to_string().contains("F1"), "{err}");
+        assert_eq!(redb.routine("routine").unwrap(), Some(routine()));
+        assert_eq!(FerroStore::stats_at(&path).unwrap().last_seq, before);
+        assert_eq!(ferro.routine("routine").unwrap(), None);
+    }
+
+    #[test]
+    fn auto_migration_refusal_keeps_f1_redb_available_with_explicit_backend() {
+        use crate::any::{BackendKind, StoreOptions, Unmigrated, open_store_with};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("source.redb");
+        {
+            let store = RedbStore::open(&path).unwrap();
+            store.insert_allocation(allocation()).unwrap();
+        }
+        let options = StoreOptions {
+            backend: Some(BackendKind::Ferro),
+            unmigrated: Unmigrated::Migrate,
+            ..StoreOptions::default()
+        };
+        let err = match open_store_with(&path, &options) {
+            Ok(_) => panic!("F1 auto-migration must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("FL_STORE_BACKEND=redb"), "{err}");
+        assert!(!path.with_extension("fls").exists());
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(store.allocation("allocation").unwrap(), Some(allocation()));
+        store.request_allocation_stop("allocation", 1).unwrap();
+    }
+
+    #[test]
+    fn redb_persists_independent_records_and_atomic_safety() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&tmp.path().join("f1.redb")).unwrap();
+        store.insert_proposal(routine()).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        let batch = SafetyBatch {
+            changes: vec![
+                fl_core::f1_records::SafetyChange::PauseRoutine {
+                    id: "routine".into(),
+                    expected_version: 1,
+                    reason: "pause".into(),
+                },
+                fl_core::f1_records::SafetyChange::RequestAllocationStop {
+                    id: "allocation".into(),
+                    expected_version: 2,
+                },
+            ],
+        };
+        assert_eq!(
+            store.apply_safety_batch(&batch),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(store.routine("routine").unwrap(), Some(routine()));
+        store.request_allocation_stop("allocation", 1).unwrap();
+        assert_eq!(
+            store.allocation("allocation").unwrap().unwrap().safety,
+            SafetyState::StopRequested
+        );
+    }
+
+    #[test]
+    fn redb_survives_reopen_and_rejects_duplicate_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rows.redb");
+        {
+            let store = RedbStore::open(&path).unwrap();
+            store.insert_proposal(routine()).unwrap();
+            store.insert_intent(intent()).unwrap();
+            store.insert_allocation(allocation()).unwrap();
+            assert_eq!(
+                store.insert_allocation(allocation()),
+                Err(F1RecordError::Conflict)
+            );
+            store.quarantine_intent("intent", 1).unwrap();
+            assert_eq!(store.format_version().unwrap(), Some(crate::FORMAT_WITH_F1));
+        }
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(store.routine("routine").unwrap(), Some(routine()));
+        assert_eq!(
+            store.intent("intent").unwrap().unwrap().safety,
+            SafetyState::Quarantined
+        );
+        assert_eq!(store.allocation("allocation").unwrap(), Some(allocation()));
+    }
+
+    #[test]
+    fn preexisting_ferro_f1_rows_are_read_only() {
+        use fl_core::f1_records::ControlRecordKey;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.fls");
+        let ferro = FerroStore::open(&path).unwrap();
+        let key = ControlRecordKey::allocation("allocation").unwrap();
+        ferro.seed_f1_test_document(
+            key.native_key(),
+            serde_json::to_value(allocation()).unwrap(),
+        );
+        assert_eq!(ferro.allocation("allocation").unwrap(), Some(allocation()));
+        let before = FerroStore::stats_at(&path).unwrap().last_seq;
+        assert_eq!(
+            ferro.request_allocation_stop("allocation", 1),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+        assert_eq!(FerroStore::stats_at(&path).unwrap().last_seq, before);
+        drop(ferro);
+        let reopened = FerroStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.allocation("allocation").unwrap(),
+            Some(allocation())
+        );
+    }
+
+    #[test]
+    fn concurrent_redb_f1_cas_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(AnyStore::from(
+            RedbStore::open(&tmp.path().join("race.redb")).unwrap(),
+        ));
+        store.insert_allocation(allocation()).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.request_allocation_stop("allocation", 1)
+            }));
+        }
         barrier.wait();
         let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
         assert_eq!(
@@ -663,6 +675,135 @@ mod tests {
             1,
             "{results:?}"
         );
+    }
+
+    #[test]
+    fn misplaced_or_corrupt_row_fails_closed_without_batch_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let redb = RedbStore::open(&tmp.path().join("corrupt.redb")).unwrap();
+        redb.insert_proposal(routine()).unwrap();
+        redb.insert_allocation(allocation()).unwrap();
+        let tx = redb.db.begin_write().unwrap();
+        {
+            let mut rows = tx.open_table(super::TABLE).unwrap();
+            let key = fl_core::f1_records::ControlRecordKey::allocation("other").unwrap();
+            let bytes = fl_core::f1_records::encode_record(&allocation()).unwrap();
+            rows.insert(key.native_key(), std::str::from_utf8(&bytes).unwrap())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(redb.allocation("other"), Err(F1RecordError::Conflict));
+        let changes = SafetyBatch {
+            changes: vec![
+                fl_core::f1_records::SafetyChange::PauseRoutine {
+                    id: "routine".into(),
+                    expected_version: 1,
+                    reason: "pause".into(),
+                },
+                fl_core::f1_records::SafetyChange::RequestAllocationStop {
+                    id: "other".into(),
+                    expected_version: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            redb.apply_safety_batch(&changes),
+            Err(F1RecordError::Conflict)
+        );
+        assert_eq!(redb.routine("routine").unwrap(), Some(routine()));
+        assert_eq!(redb.allocation("allocation").unwrap(), Some(allocation()));
+    }
+
+    #[test]
+    fn oversized_redb_and_ferro_rows_are_bounded_and_redb_batch_rolls_back() {
+        use fl_core::f1_records::{ControlRecordKey, MAX_RECORD_BYTES, SafetyChange};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&tmp.path().join("oversized.redb")).unwrap();
+        store.insert_proposal(routine()).unwrap();
+        let key = ControlRecordKey::allocation("oversized").unwrap();
+        let data = "x".repeat(MAX_RECORD_BYTES + 1);
+        let value = serde_json::to_string(&data).unwrap();
+        let tx = store.db.begin_write().unwrap();
+        {
+            let mut rows = tx.open_table(super::TABLE).unwrap();
+            rows.insert(key.native_key(), value.as_str()).unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(store.allocation("oversized"), Err(F1RecordError::TooLarge));
+        let batch = SafetyBatch {
+            changes: vec![
+                SafetyChange::PauseRoutine {
+                    id: "routine".into(),
+                    expected_version: 1,
+                    reason: "pause".into(),
+                },
+                SafetyChange::RequestAllocationStop {
+                    id: "oversized".into(),
+                    expected_version: 1,
+                },
+            ],
+        };
+        assert_eq!(
+            store.apply_safety_batch(&batch),
+            Err(F1RecordError::TooLarge)
+        );
+        assert_eq!(store.routine("routine").unwrap(), Some(routine()));
+        let ferro = FerroStore::open(tmp.path().join("oversized.fls")).unwrap();
+        ferro.seed_f1_test_document(key.native_key(), serde_json::Value::String(data));
+        assert_eq!(ferro.allocation("oversized"), Err(F1RecordError::TooLarge));
+        assert_eq!(
+            ferro.apply_safety_batch(&batch),
+            Err(F1RecordError::UnsupportedLocal)
+        );
+    }
+
+    #[test]
+    fn safety_transition_survives_more_than_four_mib_of_other_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&tmp.path().join("large.redb")).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        let mut total = 0;
+        for i in 0..75 {
+            let mut row = routine();
+            row.spec.routine_id = format!("routine-{i}");
+            row.spec.project = "x".repeat(60_000);
+            total += fl_core::f1_records::encode_record(&row).unwrap().len();
+            store.insert_proposal(row).unwrap();
+        }
+        assert!(total > 4 * 1024 * 1024);
+        store.request_allocation_stop("allocation", 1).unwrap();
+        assert_eq!(
+            store.allocation("allocation").unwrap().unwrap().safety,
+            SafetyState::StopRequested
+        );
+    }
+
+    #[test]
+    fn ferro_independent_handles_refuse_writes_even_when_they_race() {
+        use std::sync::{Arc, Barrier};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("independent.fls");
+        let handles = [
+            Arc::new(FerroStore::open(&path).unwrap()),
+            Arc::new(FerroStore::open(&path).unwrap()),
+        ];
+        let barrier = Arc::new(Barrier::new(3));
+        let threads: Vec<_> = handles
+            .into_iter()
+            .map(|store| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.insert_allocation(allocation())
+                })
+            })
+            .collect();
+        barrier.wait();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), Err(F1RecordError::UnsupportedLocal));
+        }
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(store.allocation("allocation").unwrap(), None);
     }
 
     #[test]
