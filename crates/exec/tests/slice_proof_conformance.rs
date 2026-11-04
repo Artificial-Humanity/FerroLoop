@@ -2,6 +2,10 @@
 //! The in-memory ledger below is a test double, not a production admission path.
 #![cfg(unix)]
 
+use fl_core::governor::{
+    AdmissionOutcome, AdmissionRequest, GovernorPolicy, GovernorStore, MemGovernorStore, Principal,
+    SettleRequest, SettledOutcome,
+};
 use fl_core::ids::{RecordId, seq_iri};
 use fl_core::log::AttemptStatus;
 use fl_core::slice_proof::{
@@ -286,31 +290,83 @@ fn competing_test_reservations_cannot_spend_the_same_remainder() {
     assert_eq!(ledger.lock().unwrap().reservations.len(), 1);
 }
 
+/// Exercise the real single-unit governor with micro-USD units. This demonstrates its
+/// unknown-outcome accounting, not a production Track C dual token/cost reservation.
 #[tokio::test]
-async fn unknown_interrupted_slice_keeps_full_reservation_and_reported_usage() {
+async fn unknown_interrupted_slice_keeps_full_cost_charge_and_live_permit() {
     let dir = TempDir::new().unwrap();
     let bin = fake(
         dir.path(),
         r#"test -s "$FAKE_RECEIPT" || exit 9
-touch "$FAKE_MARKER"
-printf '%s\n' '{"text":"partial","usage":{"input_tokens":40,"output_tokens":10}}'
-kill -INT $$"#,
+ touch "$FAKE_MARKER"
+ printf '%s\n' '{"text":"partial","usage":{"input_tokens":40,"output_tokens":10}}'
+ kill -INT $$"#,
     );
-    let ledger = Arc::new(Mutex::new(TestLedger {
-        tokens: 240,
-        micros: 280,
-        reservations: vec![],
-    }));
-    let out = admit_then_run(&[arithmetic()], &input(), &ledger, &dir, &bin)
-        .await
-        .unwrap();
+    let bound = evaluate_slice_bounds(&[arithmetic()], &input()).unwrap();
+    assert_eq!((bound.max_tokens, bound.max_cost_micros), (240, 280));
+    let store = MemGovernorStore::new(GovernorPolicy {
+        budget_units_per_scope: bound.max_cost_micros,
+        concurrency_per_scope: 1,
+        ..GovernorPolicy::default()
+    });
+    let request = AdmissionRequest::new(Principal::Owner, "project", "fake", bound.max_cost_micros);
+    let permit = match store.reserve(&request, 1).unwrap() {
+        AdmissionOutcome::Admitted(permit) => permit,
+        other => panic!("expected a cost reservation: {other:?}"),
+    };
+    let before = store.snapshot();
+    let principal = &before.scopes["principal:owner"];
+    assert_eq!(
+        (
+            principal.budget_used,
+            principal.budget_reserved,
+            principal.concurrency_live
+        ),
+        (0, 280, 1)
+    );
+    let receipt = dir.path().join("reserved");
+    std::fs::write(&receipt, permit.reserved_units.to_string()).unwrap();
+    let marker = dir.path().join("spawned");
+    let out = harness(&bin, &marker, &receipt)
+        .run(attempt(dir.path(), bound.max_cost_micros))
+        .await;
     assert_eq!(out.status, AttemptStatus::Crashed);
     assert_eq!(
         (out.tokens_in, out.tokens_out, out.cost_usd_micros),
         (40, 10, 60)
     );
-    assert!(dir.path().join("spawned").exists());
-    assert_eq!(ledger.lock().unwrap().reservations, vec![(240, 280)]);
+    assert!(marker.exists());
+
+    // The interrupted process may have spent more than its last observed usage. An unknown
+    // outcome charges the full cost reservation and keeps the permit live for reconciliation.
+    let settlement = SettleRequest {
+        permit_id: permit.id.clone(),
+        actual_units: out.cost_usd_micros,
+        outcome: SettledOutcome::UnknownAfterSend,
+        complete: true,
+    };
+    store.settle(&settlement).unwrap();
+    store.settle(&settlement).unwrap(); // settlement is idempotent
+    let after = store.snapshot();
+    let principal = &after.scopes["principal:owner"];
+    assert_eq!(
+        (
+            principal.budget_used,
+            principal.budget_reserved,
+            principal.concurrency_live
+        ),
+        (280, 0, 1)
+    );
+    assert!(
+        store
+            .unconfirmed_permits()
+            .iter()
+            .any(|p| p.id == permit.id)
+    );
+    assert!(matches!(
+        store.reserve(&request, 2).unwrap(),
+        AdmissionOutcome::Deferred { .. }
+    ));
 }
 
 #[tokio::test]
