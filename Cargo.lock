@@ -435,6 +435,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tiktoken-rs",
+ "toml",
 ]
 
 [[package]]
@@ -443,6 +444,7 @@ version = "0.1.0"
 dependencies = [
  "fl-core",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
