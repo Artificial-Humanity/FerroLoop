@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod bridge;
 pub mod connector;
 pub mod contract;
+pub mod dispatch_authority;
 pub mod failover;
 pub mod governor;
 pub mod mcp;
@@ -110,6 +111,8 @@ pub enum GateError {
     PolicyDenied { secret: String, reason: String },
     #[error("secret `{secret}` cannot be used for this operation")]
     UsageMismatch { secret: String },
+    #[error("dispatch authority refused: {0}")]
+    DispatchAuthority(&'static str),
     #[error("invalid placeholder: {reason}")]
     InvalidPlaceholder { reason: String },
     #[error("invalid URL `{url}`: {reason}")]
