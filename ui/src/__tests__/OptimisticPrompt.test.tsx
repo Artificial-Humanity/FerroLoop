@@ -31,6 +31,19 @@ describe("optimistic prompt submission", () => {
     expect(handler).toHaveBeenCalledTimes(1);
     await act(async () => { pending.resolve({ status: "sent", delivered: true }); await pending.promise; });
   });
+  it("explains an unconfirmed send and offers queued work for deliberate send", () => {
+    const onSendQueuedNow = vi.fn();
+    render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now" }]} onSendQueuedNow={onSendQueuedNow} />);
+    expect(screen.getByText(/Previous send could not be confirmed/)).toBeInTheDocument();
+    expect(screen.getByText(/Check the session before sending queued messages/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("queued-send-now-q1"));
+    expect(onSendQueuedNow).toHaveBeenCalledWith("q1");
+  });
+  it("does not suggest Send Now when no queued action exists", () => {
+    render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[]} />);
+    expect(screen.getByText(/Previous send could not be confirmed/)).toBeInTheDocument();
+    expect(screen.queryByText(/Send Now sends that item/)).toBeNull();
+  });
   it("clears immediately and displays the sending turn, then reconciles a real-time transcript without duplication", async () => {
     const pending = deferred<unknown>();
     const onSendPrompt = vi.fn(() => pending.promise);

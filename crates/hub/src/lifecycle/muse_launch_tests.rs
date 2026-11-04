@@ -1004,7 +1004,7 @@ fn a_gone_muse_window_does_not_fall_back_to_headless_via_a_neighbor() {
 }
 
 #[test]
-fn a_stale_exact_live_muse_route_is_used_without_a_rescan() {
+fn a_stale_exact_live_muse_route_is_rechecked_before_use() {
     crate::direct_quota::with_probe_lock(|| {
         let home = TempDir::new().unwrap();
         let _tmux = FakeTmuxWindows::install(home.path(), &["muse:ada"]);
@@ -1031,20 +1031,109 @@ fn a_stale_exact_live_muse_route_is_used_without_a_rescan() {
         };
         let (found, costs) =
             crate::discovery::cost_counters::measure(|| lookup_route(Some(home.path()), query));
-        assert_eq!(found, Some(RouteLookup::Saved(route)));
-        assert_eq!(costs.route_scans, 0);
+        assert!(!matches!(found, Some(RouteLookup::Saved(_))));
+        assert_eq!(costs.route_scans, 1);
     });
 }
 
 #[test]
-fn a_live_unrelated_pid_does_not_prove_a_stale_claude_route() {
-    let route = VendorRoute::Claude {
-        pid: std::process::id(),
-        session_id: "old-session".into(),
-        socket_path: "/tmp/nonexistent-claude.sock".into(),
-        key_path: None,
-    };
-    assert!(!stale_route_verified_live(&route, None));
+fn stale_muse_route_does_not_send_old_session_to_reused_window() {
+    crate::direct_quota::with_probe_lock(|| {
+        let home = TempDir::new().unwrap();
+        let _tmux = FakeTmuxWindows::install(home.path(), &["muse:ada"]);
+        let path = crate::discovery::route_table_path(Some(home.path())).unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Muse {
+                session_id: "old-session".into(),
+                cwd: None,
+                tmux_target: Some("muse:ada".into()),
+                tmux_pane: None,
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        let sessions = home.path().join(".local/share/muse/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("new-session.jsonl"),
+            "{\"persona\":\"ada\",\"session_id\":\"new-session\"}\n",
+        )
+        .unwrap();
+        let old = std::time::Instant::now()
+            .checked_sub(
+                fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        crate::discovery::note_route_file_scan(Some(home.path()), old);
+        let old_query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "old-session",
+            session_id: Some("old-session"),
+        };
+        let mut delivered = false;
+        let result = dispatch_with_rediscovery(Some(home.path()), old_query, |_| {
+            delivered = true;
+            Ok::<_, PushError>(())
+        });
+        assert!(!matches!(result, Some(Ok(()))), "{result:?}");
+        assert!(
+            !delivered,
+            "old-session prompt must not enter the reused window"
+        );
+        let query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "new-session",
+            session_id: Some("new-session"),
+        };
+        assert!(
+            matches!(lookup_route(Some(home.path()), query), Some(RouteLookup::Saved(VendorRoute::Muse { session_id, .. })) if session_id == "new-session")
+        );
+    });
+}
+
+#[test]
+#[ignore = "saved route and reused tmux window lack a verified session binding"]
+fn stale_muse_route_without_live_session_evidence_must_not_dispatch() {
+    crate::direct_quota::with_probe_lock(|| {
+        let home = TempDir::new().unwrap();
+        let _tmux = FakeTmuxWindows::install(home.path(), &["muse:ada"]);
+        let path = crate::discovery::route_table_path(Some(home.path())).unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Muse {
+                session_id: "old-session".into(),
+                cwd: None,
+                tmux_target: Some("muse:ada".into()),
+                tmux_pane: None,
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        let old = std::time::Instant::now()
+            .checked_sub(
+                fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        crate::discovery::note_route_file_scan(Some(home.path()), old);
+        let query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "old-session",
+            session_id: Some("old-session"),
+        };
+        let mut called = false;
+        let result = dispatch_with_rediscovery(Some(home.path()), query, |_| {
+            called = true;
+            Ok::<_, PushError>(())
+        });
+        assert!(!matches!(result, Some(Ok(()))), "{result:?}");
+        assert!(
+            !called,
+            "retained stale S1 cannot identify the session running in the reused window"
+        );
+    });
 }
 
 #[test]

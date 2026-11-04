@@ -979,6 +979,7 @@ export interface ChatPaneProps {
   /** Vendor account quota/allowance usage when reported by the adapter/hub. */
   quotaUsage?: SessionQuotaUsage | null;
   isBusy?: boolean;
+  inFlightUnconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
   loading?: boolean;
   error?: string | null;
@@ -1108,6 +1109,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   contextUsage = null,
   quotaUsage = null,
   isBusy,
+  inFlightUnconfirmed,
   queue,
   loading = false,
   error = null,
@@ -1138,6 +1140,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     string | null
   >(null);
   const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
+  const [internalInFlightUnconfirmed, setInternalInFlightUnconfirmed] = React.useState(false);
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
   const [editingQueueId, setEditingQueueId] = React.useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = React.useState<string>("");
@@ -1865,6 +1868,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (currentTargetRef.current === targetId) {
         setInternalTurns(response.turns ?? []);
         setInternalIsBusy(Boolean(response.is_busy));
+        setInternalInFlightUnconfirmed(Boolean(response.in_flight_unconfirmed));
         setInternalQueue(response.queue ?? []);
         setInternalContextUsage(response.context_usage ?? null);
         setInternalQuotaUsage(response.quota_usage ?? null);
@@ -3425,6 +3429,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             {submitError || sendErrorsByTarget[targetSessionOrAgent]}
           </div>
+        )}
+
+        {(inFlightUnconfirmed ?? internalInFlightUnconfirmed) && (
+          <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.length > 0 && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
         )}
 
         {effectiveQueue.length > 0 && (

@@ -4874,6 +4874,7 @@ fn handle_dynamic_api_routes(
                         "turns": turns,
                         "total_turns": total_turns,
                         "is_busy": is_busy,
+                        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                         "queue": queue,
                         "context_usage": context_usage,
                         "quota_usage": quota_usage,
@@ -4890,6 +4891,7 @@ fn handle_dynamic_api_routes(
                     json!({
                         "session_id": canonical_id,
                         "is_busy": is_busy,
+                        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                         "queue": queue,
                     }),
                 );
@@ -5742,6 +5744,7 @@ fn handle_post_session_prompt(
         "status": "sent",
         "queued": false,
         "is_busy": true,
+        "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_session_id),
         "delivered": delivery_res.is_ok(),
         "delivery_error": delivery_res.as_ref().err(),
         "prompt": prompt_text,

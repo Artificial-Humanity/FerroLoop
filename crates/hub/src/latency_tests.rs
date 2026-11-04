@@ -439,6 +439,7 @@ fn transcript_response_reference(
             "turns": turns,
             "total_turns": total_turns,
             "is_busy": is_busy,
+            "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
             "queue": queue,
             "context_usage": context_usage,
             "quota_usage": quota_usage,
@@ -534,6 +535,7 @@ fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
         crate::api::after_next_prompt_dispatch(move || fs::remove_file(target).unwrap());
         let (sent, _) = post_prompt(&state, send_now);
         assert_eq!(sent.json_value().unwrap()["status"], "sent");
+        assert_eq!(sent.json_value().unwrap()["in_flight_unconfirmed"], true);
         let (queued, _) = post_prompt(&state, false);
         assert_eq!(queued.json_value().unwrap()["status"], "queued");
         crate::api::drain_ready_session_queues(&state);
@@ -549,6 +551,12 @@ fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
             1,
             "restored old turns do not complete a new prompt"
         );
+        let request = HttpRequest::new("GET", "/api/v1/sessions/conv-ferris-1/transcript")
+            .with_header("Authorization", OWNER);
+        let observed = handle_http_request(&state, &request).json_value().unwrap();
+        assert_eq!(observed["in_flight_unconfirmed"], true);
+        assert_eq!(observed["queue"].as_array().unwrap().len(), 1);
+
         write_ferris_transcript(tmp.path(), 4);
         crate::api::drain_ready_session_queues(&state);
         assert!(

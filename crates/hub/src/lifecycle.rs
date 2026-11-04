@@ -1714,30 +1714,6 @@ fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
     }
 }
 
-/// A stale saved route needs a positive endpoint check. A PID alone is not a stable Claude
-/// session identity, and a socket pathname cannot prove which listener owns it. Unverifiable
-/// stale routes require rediscovery.
-fn stale_route_verified_live(route: &VendorRoute, _home_override: Option<&Path>) -> bool {
-    match route {
-        VendorRoute::Muse {
-            tmux_target,
-            tmux_pane,
-            ..
-        }
-        | VendorRoute::Grok {
-            tmux_target,
-            tmux_pane,
-            ..
-        } => [tmux_target, tmux_pane]
-            .into_iter()
-            .flatten()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .any(tmux_target_exists),
-        _ => false,
-    }
-}
-
 /// Where [`lookup_route`] found a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteLookup {
@@ -1791,9 +1767,9 @@ fn route_serves_session(route: &VendorRoute, session_id: &str) -> bool {
     }
 }
 
-/// Return a saved matching route when its liveness is verified; otherwise rescan.
-/// A recently scanned route may use discovery's existing cheap liveness check. An older route
-/// must have a positive endpoint check; unverifiable routes are rediscovered.
+/// A saved endpoint can be reused only while its discovery scan is fresh. A live tmux
+/// window alone does not prove that it still hosts the saved vendor session; older routes
+/// require rediscovery even when their endpoint still exists.
 pub(crate) fn lookup_route(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
@@ -1828,11 +1804,10 @@ pub(crate) fn lookup_route(
         _ => None,
     });
     let dead_tmux = tmux_live == Some(false);
-    if let Some(route) = candidate.as_ref().filter(|route| {
-        !dead_tmux
-            && route_looks_live(route, home_override)
-            && (fresh || tmux_live == Some(true) || stale_route_verified_live(route, home_override))
-    }) {
+    if let Some(route) = candidate
+        .as_ref()
+        .filter(|route| !dead_tmux && route_looks_live(route, home_override) && fresh)
+    {
         return Some(RouteLookup::Saved(route.clone()));
     }
     let scanned = rescan_route(home_override, query)?;

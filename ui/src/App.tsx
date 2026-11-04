@@ -654,6 +654,7 @@ export const App: React.FC<AppProps> = ({
   const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
   const [sessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
   const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
+  const [unconfirmedBySession, setUnconfirmedBySession] = useState<Record<string, boolean>>({});
   const [sessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
   const [sessionQuotaUsage, setSessionQuotaUsage] =
@@ -1031,6 +1032,7 @@ export const App: React.FC<AppProps> = ({
               if (trRes.turns) {
                 applyTranscriptTurns(trRes.turns);
               }
+              setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(trRes.in_flight_unconfirmed) }));
               setSessionContextUsage(trRes.context_usage ?? null);
               setSessionQuotaUsage(trRes.quota_usage ?? null);
               if (typeof trRes.is_busy === "boolean") {
@@ -1210,6 +1212,7 @@ export const App: React.FC<AppProps> = ({
           );
           applyTranscriptTurns(trRes.turns ?? []);
           setSessionQueue(trRes.queue ?? []);
+          setUnconfirmedBySession((prev) => ({ ...prev, [matchedSessionId]: Boolean(trRes.in_flight_unconfirmed) }));
           setIsSessionBusy(Boolean(trRes.is_busy));
           setSessionContextUsage(trRes.context_usage ?? null);
           setSessionQuotaUsage(trRes.quota_usage ?? null);
@@ -1546,6 +1549,7 @@ export const App: React.FC<AppProps> = ({
               : hasTrailingIncompleteWork(res.turns ?? []),
           );
           setSessionQueue(res.queue ?? []);
+          setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: Boolean(res.in_flight_unconfirmed) }));
           setIsSessionBusy(Boolean(res.is_busy));
           setSessionContextUsage(res.context_usage ?? null);
           if (res.context_usage !== undefined) {
@@ -1698,6 +1702,7 @@ export const App: React.FC<AppProps> = ({
     setTranscriptTurns([]);
     setSessionQueue([]);
     setIsSessionBusy(false);
+    setUnconfirmedBySession({});
     setSessionContextUsage(null);
     setSessionQuotaUsage(null);
     setSessions([]);
@@ -1729,6 +1734,10 @@ export const App: React.FC<AppProps> = ({
       (submittedActiveSession !== null && submittedActiveSession !== targetId)
     ) {
       return res;
+    }
+    if (typeof res.in_flight_unconfirmed === "boolean") {
+      const unconfirmed = res.in_flight_unconfirmed;
+      setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: unconfirmed }));
     }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
@@ -2197,6 +2206,7 @@ export const App: React.FC<AppProps> = ({
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
             isBusy={isSessionBusy}
+            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
             queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}
@@ -2536,6 +2546,7 @@ export const App: React.FC<AppProps> = ({
             contextUsage={sessionContextUsage}
             quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
             isBusy={isSessionBusy}
+            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
             queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}

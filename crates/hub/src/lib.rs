@@ -590,6 +590,16 @@ impl HubState {
         self.is_session_busy_from_observation(session_id, turns.as_deref())
     }
 
+    /// Whether a send's completion cannot yet be established from a reliable baseline.
+    pub(crate) fn session_in_flight_unconfirmed(&self, session_id: &str) -> bool {
+        self.prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .get(session_id)
+            .is_some_and(|flight| flight.require_observed_completion)
+    }
+
     /// Busy check from turns already read. Does not open the store or the transcript file.
     pub fn is_session_busy_from_turns(&self, session_id: &str, turns: &[TranscriptTurn]) -> bool {
         self.is_session_busy_from_observation(session_id, Some(turns))
@@ -2059,6 +2069,7 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"new reply\"}}\n",
         ));
         state.mark_session_in_flight_from_observation("test", None);
+        assert!(state.session_in_flight_unconfirmed("test"));
         // Unreliable observations cannot time out a fence before any reliable baseline.
         state
             .prompt_queues
@@ -2081,6 +2092,7 @@ mod tests {
             .dispatched_at_ms = 0;
         assert!(state.is_session_busy_from_turns("test", &old));
         assert!(!state.is_session_busy_from_turns("test", &new));
+        assert!(!state.session_in_flight_unconfirmed("test"));
     }
 
     #[test]
