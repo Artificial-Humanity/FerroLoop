@@ -304,6 +304,9 @@ struct LivePermit {
 enum FencePhase {
     Pending,
     Persisting,
+    /// The source confirmed the durable write, but post-write authentication failed.
+    /// Keep the scope fenced and retry verification without repeating that write.
+    DurableUnverified,
     Persisted,
     Failed,
 }
@@ -323,6 +326,11 @@ struct State {
     /// A revocation whose scope could not be established must never be erased by
     /// an in-progress initial reconciliation.
     revocation_failed: bool,
+    /// Alias resolution exhausted a bounded retry. The requested scopes remain
+    /// here until a later `revoke` authenticates and installs their full alias
+    /// fence. Because aliases are not yet known, admission is temporarily sealed
+    /// globally; this is recoverable and distinct from a permanent failure.
+    unresolved_revocations: BTreeMap<BTreeSet<ScopeKey>, String>,
     live: BTreeMap<PermitId, LivePermit>,
     fences: BTreeMap<u64, Fence>,
     next_fence_id: u64,
@@ -373,6 +381,28 @@ impl BrokerState {
             .lock()
             .map_err(|_| GateError::DispatchAuthority("authority poisoned"))
     }
+    fn record_unresolved_revocation(
+        state: &mut State,
+        scope: &BTreeSet<ScopeKey>,
+        reason: &str,
+    ) -> Result<RevokeAck, GateError> {
+        if !state.unresolved_revocations.contains_key(scope)
+            && state.unresolved_revocations.len() >= 4096
+        {
+            // If the request cannot be retained, only a sticky seal can avoid
+            // forgetting an owner revocation that was not durably installed.
+            state.generation = None;
+            state.revocation_failed = true;
+            return Err(GateError::DispatchAuthority(
+                "unresolved revocation capacity reached",
+            ));
+        }
+        state
+            .unresolved_revocations
+            .entry(scope.clone())
+            .or_insert_with(|| reason.to_owned());
+        Ok(RevokeAck::PendingUnconfirmed)
+    }
     fn ready_to_persist(s: &mut State) -> Vec<(u64, BTreeSet<ScopeKey>, String)> {
         let mut ready = Vec::new();
         for (id, fence) in &mut s.fences {
@@ -402,7 +432,11 @@ impl BrokerState {
                 return Err(GateError::DispatchAuthority("revocation fence missing"));
             };
             failed = true;
-            fence.phase = FencePhase::Failed;
+            fence.phase = if persisted {
+                FencePhase::DurableUnverified
+            } else {
+                FencePhase::Failed
+            };
             self.changed.notify_all();
         }
         if failed {
@@ -431,7 +465,12 @@ impl BrokerState {
                 let pending = state
                     .fences
                     .values()
-                    .filter(|f| f.phase == FencePhase::Persisting)
+                    .filter(|f| {
+                        matches!(
+                            f.phase,
+                            FencePhase::Persisting | FencePhase::DurableUnverified
+                        )
+                    })
                     .map(|f| f.scope.clone())
                     .collect();
                 (current, pending)
@@ -508,7 +547,12 @@ impl BrokerState {
             let witnesses = state
                 .fences
                 .iter()
-                .filter(|(_, fence)| fence.phase == FencePhase::Persisting)
+                .filter(|(_, fence)| {
+                    matches!(
+                        fence.phase,
+                        FencePhase::Persisting | FencePhase::DurableUnverified
+                    )
+                })
                 .take(4096)
                 .map(|(id, fence)| (*id, fence.scope.clone()))
                 .collect();
@@ -562,11 +606,12 @@ impl BrokerState {
             if state.generation != Some(from) {
                 return Ok(RefreshResult::Retry);
             }
-            if !state
-                .fences
-                .get(&id)
-                .is_some_and(|fence| fence.phase == FencePhase::Persisting && fence.scope == scope)
-            {
+            if !state.fences.get(&id).is_some_and(|fence| {
+                matches!(
+                    fence.phase,
+                    FencePhase::Persisting | FencePhase::DurableUnverified
+                ) && fence.scope == scope
+            }) {
                 continue;
             }
             state.generation = Some(expected);
@@ -622,16 +667,36 @@ impl BrokerState {
     }
     /// Retry failed durable fences; failed scopes remain denied throughout.
     pub fn retry_failed(&self) -> Result<(), GateError> {
-        let ready = {
+        let (ready, verify) = {
             let mut s = self.state()?;
-            for f in s.fences.values_mut() {
+            let mut verify = Vec::new();
+            for (id, f) in &mut s.fences {
                 if f.phase == FencePhase::Failed {
                     f.phase = FencePhase::Pending;
+                } else if f.phase == FencePhase::DurableUnverified {
+                    f.phase = FencePhase::Persisting;
+                    verify.push((*id, f.scope.clone()));
                 }
             }
-            Self::ready_to_persist(&mut s)
+            (Self::ready_to_persist(&mut s), verify)
         };
-        self.persist_ready(ready)
+        let mut failed = self.persist_ready(ready).is_err();
+        for (id, scope) in verify {
+            if !self.verify_and_retire(id, &scope)? {
+                let mut s = self.state()?;
+                if let Some(fence) = s.fences.get_mut(&id) {
+                    fence.phase = FencePhase::DurableUnverified;
+                }
+                failed = true;
+            }
+        }
+        if failed {
+            Err(GateError::DispatchAuthority(
+                "revocation persistence failed",
+            ))
+        } else {
+            Ok(())
+        }
     }
     /// Ask the trusted host to confirm termination of the exact recorded process instance.
     /// The verifier must compare both PID and start identity, not PID alone.
@@ -669,9 +734,11 @@ impl DispatchAuthority for BrokerState {
             .required_scopes()
             .ok_or(GateError::DispatchAuthority("invalid scope"))?;
         // Refuse a sealed broker without consulting a possibly unavailable source.
-        if self.state()?.generation.is_none() {
+        let state = self.state()?;
+        if state.generation.is_none() || !state.unresolved_revocations.is_empty() {
             return Err(GateError::DispatchAuthority("authority sealed"));
         }
+        drop(state);
         // Authentication and I/O are deliberately outside the broker mutex.
         let verified = self.source.verify_admission(req)?;
         if verified.generation == 0
@@ -711,7 +778,7 @@ impl DispatchAuthority for BrokerState {
             return Err(GateError::DispatchAuthority("stale source authority"));
         }
         let mut s = self.state()?;
-        if s.generation != Some(verified.generation) {
+        if s.generation != Some(verified.generation) || !s.unresolved_revocations.is_empty() {
             return Err(GateError::DispatchAuthority("sealed or stale authority"));
         }
         if s.fences
@@ -774,6 +841,16 @@ impl DispatchAuthority for BrokerState {
         {
             return Err(GateError::DispatchAuthority("invalid revocation"));
         }
+        if self
+            .state()?
+            .unresolved_revocations
+            .get(scope)
+            .is_some_and(|stored| stored != reason)
+        {
+            return Err(GateError::DispatchAuthority(
+                "unresolved revocation reason differs",
+            ));
+        }
         let mut refresh_attempts = 0;
         let (index, ready) = loop {
             let resolved = self.source.resolve_revocation(scope);
@@ -811,6 +888,10 @@ impl DispatchAuthority for BrokerState {
                             RefreshResult::Unverified => {}
                         }
                     }
+                    if current > generation && refresh_attempts >= 8 {
+                        let mut state = self.state()?;
+                        return Self::record_unresolved_revocation(&mut state, scope, reason);
+                    }
                     let mut state = self.state()?;
                     state.generation = None;
                     state.revocation_failed = true;
@@ -829,10 +910,31 @@ impl DispatchAuthority for BrokerState {
             };
             let (index, ready) = {
                 let mut s = self.state()?;
+                // An unresolved request may have appeared after the early check.
+                // Do not let a differently attributed retry erase its reason.
+                if s.unresolved_revocations
+                    .get(scope)
+                    .is_some_and(|stored| stored != reason)
+                {
+                    return Err(GateError::DispatchAuthority(
+                        "unresolved revocation reason differs",
+                    ));
+                }
                 if s.generation != Some(generation) {
+                    if s.generation.is_some_and(|current| generation > current)
+                        && !s.revocation_failed
+                        && refresh_attempts >= 8
+                    {
+                        return Self::record_unresolved_revocation(&mut s, scope, reason);
+                    }
                     let may_refresh = s.generation.is_some_and(|current| generation > current)
                         && !s.revocation_failed
-                        && s.fences.values().any(|f| f.phase == FencePhase::Persisting)
+                        && s.fences.values().any(|f| {
+                            matches!(
+                                f.phase,
+                                FencePhase::Persisting | FencePhase::DurableUnverified
+                            )
+                        })
                         && refresh_attempts < 8;
                     if may_refresh {
                         drop(s);
@@ -877,6 +979,9 @@ impl DispatchAuthority for BrokerState {
                         waiting: true,
                     },
                 );
+                // Install the authenticated alias fence before releasing the
+                // conservative unresolved gate; there is no admission gap.
+                s.unresolved_revocations.remove(scope);
                 let ready = Self::ready_to_persist(&mut s);
                 (index, ready)
             };
@@ -910,7 +1015,7 @@ impl DispatchAuthority for BrokerState {
                     s.fences.remove(&index);
                     return Ok(RevokeAck::Complete);
                 }
-                FencePhase::Failed => {
+                FencePhase::Failed | FencePhase::DurableUnverified => {
                     s.fences.get_mut(&index).expect("fence exists").waiting = false;
                     return Err(GateError::DispatchAuthority(
                         "revocation persistence failed",
@@ -931,11 +1036,14 @@ impl DispatchAuthority for BrokerState {
         }
     }
     fn health(&self) -> Result<AuthorityHealth, GateError> {
-        Ok(if self.state()?.generation.is_some() {
-            AuthorityHealth::Ready
-        } else {
-            AuthorityHealth::Sealed
-        })
+        let state = self.state()?;
+        Ok(
+            if state.generation.is_some() && state.unresolved_revocations.is_empty() {
+                AuthorityHealth::Ready
+            } else {
+                AuthorityHealth::Sealed
+            },
+        )
     }
     fn reconcile(&self) -> Result<(), GateError> {
         // Source must authenticate ledger/health outside this lock and ensure no pre-crash grant reopens.
@@ -956,6 +1064,7 @@ impl DispatchAuthority for BrokerState {
             || s.revocation_failed
             || !s.live.is_empty()
             || !s.fences.is_empty()
+            || !s.unresolved_revocations.is_empty()
             || s.generation.is_some()
         {
             return Err(GateError::DispatchAuthority("authority cannot be reopened"));
@@ -983,6 +1092,7 @@ mod tests {
         generation: AtomicU64,
         generation_gate: std::sync::RwLock<()>,
         failed: AtomicBool,
+        verification_failed: AtomicBool,
         aliases_failed: AtomicBool,
         cancellation_failed: AtomicBool,
         stopped: AtomicBool,
@@ -996,6 +1106,7 @@ mod tests {
                 generation: AtomicU64::new(1),
                 generation_gate: std::sync::RwLock::new(()),
                 failed: AtomicBool::new(false),
+                verification_failed: AtomicBool::new(false),
                 aliases_failed: AtomicBool::new(false),
                 cancellation_failed: AtomicBool::new(false),
                 stopped: AtomicBool::new(false),
@@ -1088,6 +1199,9 @@ mod tests {
             Ok(())
         }
         fn verify_persisted_fence(&self, scope: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
+            if self.verification_failed.load(Ordering::SeqCst) {
+                return Err(GateError::DispatchAuthority("test verification failure"));
+            }
             if !self
                 .persisted
                 .lock()
@@ -1723,6 +1837,154 @@ mod tests {
         assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
     }
 
+    #[test]
+    fn durable_unverified_fence_can_refresh_unrelated_revocation_after_recovery() {
+        let source = Arc::new(AdvancingSource(TestSource::default()));
+        let broker = BrokerState::new(
+            source.clone(),
+            Arc::new(TestClock::default()),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        broker.reconcile().unwrap();
+        source.0.verification_failed.store(true, Ordering::SeqCst);
+        assert!(broker.revoke(&scope("A"), "owner", Duration::ZERO).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        source.0.verification_failed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            broker.revoke(&scope("B"), "owner", Duration::ZERO).unwrap(),
+            RevokeAck::Complete
+        );
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
+        broker.retry_failed().unwrap();
+        assert!(broker.admit(&AdmitRequest::secret("A")).is_err());
+        assert_eq!(
+            source.0.persisted.lock().unwrap().len(),
+            2,
+            "retry verifies A without duplicating its durable write"
+        );
+    }
+
+    /// Pause B after every authenticated alias resolution so the test can commit an
+    /// unrelated revocation before B attempts its source guard.
+    struct RepeatedAliasRaces {
+        source: AdvancingSource,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        remaining: AtomicU64,
+    }
+    impl AuthoritySource for RepeatedAliasRaces {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.source.reconcile()
+        }
+        fn verify_admission(&self, req: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.source.verify_admission(req)
+        }
+        fn guard_admission<'a>(
+            &'a self,
+            s: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(s)
+        }
+        fn resolve_revocation(
+            &self,
+            s: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            let result = self.source.resolve_revocation(s)?;
+            if s == &scope("B")
+                && self
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.entered.send(()).unwrap();
+                self.resume.lock().unwrap().recv().unwrap();
+            }
+            Ok(result)
+        }
+        fn persist_fence(&self, s: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            self.source.persist_fence(s, reason)
+        }
+        fn verify_persisted_fence(&self, s: &BTreeSet<ScopeKey>) -> Result<u64, GateError> {
+            self.source.verify_persisted_fence(s)
+        }
+        fn verify_revocation_transition(
+            &self,
+            from: u64,
+            to: u64,
+            pending: &[BTreeSet<ScopeKey>],
+        ) -> Result<(), GateError> {
+            self.source.verify_revocation_transition(from, to, pending)
+        }
+        fn worker_terminated(
+            &self,
+            w: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(w)
+        }
+        fn request_cancellation(&self, id: &PermitId, w: &WorkerIdentity) -> Result<(), GateError> {
+            self.source.request_cancellation(id, w)
+        }
+    }
+
+    #[test]
+    fn repeated_alias_generation_races_remain_retryable_without_reopening_scope() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(RepeatedAliasRaces {
+            source: AdvancingSource(TestSource::default()),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            remaining: AtomicU64::new(9),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source,
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.revoke(&scope("B"), "owner", Duration::ZERO))
+        };
+        for i in 0..9 {
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                broker
+                    .revoke(&scope(&format!("other-{i}")), "owner", Duration::ZERO)
+                    .unwrap(),
+                RevokeAck::Complete
+            );
+            resume_tx.send(()).unwrap();
+        }
+        assert_eq!(
+            worker.join().unwrap().unwrap(),
+            RevokeAck::PendingUnconfirmed
+        );
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(
+            broker.admit(&AdmitRequest::secret("unrelated")).is_err(),
+            "unverified aliases temporarily seal all admission"
+        );
+        assert!(
+            broker
+                .revoke(&scope("B"), "different reason", Duration::ZERO)
+                .is_err()
+        );
+        assert!(broker.admit(&AdmitRequest::secret("unrelated")).is_err());
+        assert_eq!(
+            broker.revoke(&scope("B"), "owner", Duration::ZERO).unwrap(),
+            RevokeAck::Complete
+        );
+        assert!(broker.admit(&AdmitRequest::secret("B")).is_err());
+        assert!(broker.admit(&AdmitRequest::secret("unrelated")).is_ok());
+    }
+
     /// Pause one revocation after its durable write advanced the source generation.
     struct PausedFenceVerification {
         source: AdvancingSource,
@@ -2157,7 +2419,10 @@ mod tests {
         );
         let s = broker.state().unwrap();
         assert_eq!(s.fences.len(), 1);
-        assert_eq!(s.fences.values().next().unwrap().phase, FencePhase::Failed);
+        assert_eq!(
+            s.fences.values().next().unwrap().phase,
+            FencePhase::DurableUnverified
+        );
         drop(s);
         assert!(broker.admit(&AdmitRequest::secret("KEY")).is_err());
         assert!(broker.admit(&AdmitRequest::secret("OTHER")).is_ok());
