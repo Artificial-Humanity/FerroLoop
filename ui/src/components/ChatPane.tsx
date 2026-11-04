@@ -1125,6 +1125,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onCloseAgentSettings,
   returnToSettingsLabel = null,
   onReturnToSettings,
+  splitView = false,
+  onToggleSplitView,
+  onOpenMobileRoster,
+  mobileSidebarOpen = false,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -2455,6 +2459,47 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             minWidth: 0,
           }}
         >
+          {onOpenMobileRoster && (
+            <button
+              type="button"
+              data-testid="chat-toolbar-left-panel-toggle"
+              className={`fd-btn${mobileSidebarOpen ? " fd-btn-active" : ""}`}
+              onClick={onOpenMobileRoster}
+              title={mobileSidebarOpen ? "Hide Agent Roster panel" : "Show Agent Roster panel"}
+              aria-label={mobileSidebarOpen ? "Hide Agent Roster panel" : "Show Agent Roster panel"}
+              aria-pressed={Boolean(mobileSidebarOpen)}
+              style={{ flexShrink: 0, padding: "4px 7px", lineHeight: 1 }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect
+                  x="1.5"
+                  y="2.5"
+                  width="13"
+                  height="11"
+                  rx="2"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <line
+                  x1="6.5"
+                  y1="2.5"
+                  x2="6.5"
+                  y2="13.5"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <rect
+                  x="2.2"
+                  y="3.2"
+                  width="3.6"
+                  height="9.6"
+                  rx="0.8"
+                  fill="currentColor"
+                  fillOpacity={mobileSidebarOpen ? 0.45 : 0.12}
+                />
+              </svg>
+            </button>
+          )}
           <input
             type="search"
             name="fd-transcript-filter"
@@ -2596,6 +2641,47 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             ↓ Latest
           </button>
+          {onToggleSplitView && (
+            <button
+              type="button"
+              data-testid="chat-toolbar-right-panel-toggle"
+              className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+              onClick={onToggleSplitView}
+              title={splitView ? "Hide Secondary Panel" : "Show Secondary Panel"}
+              aria-label={splitView ? "Hide Secondary Panel" : "Show Secondary Panel"}
+              aria-pressed={Boolean(splitView)}
+              style={{ flexShrink: 0, padding: "4px 7px", lineHeight: 1 }}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect
+                  x="1.5"
+                  y="2.5"
+                  width="13"
+                  height="11"
+                  rx="2"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <line
+                  x1="9.5"
+                  y1="2.5"
+                  x2="9.5"
+                  y2="13.5"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                />
+                <rect
+                  x="10.2"
+                  y="3.2"
+                  width="3.6"
+                  height="9.6"
+                  rx="0.8"
+                  fill="currentColor"
+                  fillOpacity={splitView ? 0.45 : 0.12}
+                />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
 

@@ -725,45 +725,74 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           )}
         </div>
 
-        <button
-          type="button"
-          data-testid="split-view-toggle"
-          className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
-          onClick={() => onToggleSplitView?.()}
-          title="Toggle Desktop Split-View (Chat + Secondary Pane)"
-          aria-label={splitView ? "Close right split panel" : "Open right split panel"}
-          aria-pressed={splitView}
-          style={{ marginLeft: "auto", flexShrink: 0 }}
+        <div
+          style={{
+            marginLeft: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            flexShrink: 0,
+          }}
         >
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect
-              x="1.5"
-              y="2.5"
-              width="13"
-              height="11"
-              rx="2"
-              stroke="currentColor"
-              strokeWidth="1.4"
-            />
-            <line
-              x1="9.5"
-              y1="2.5"
-              x2="9.5"
-              y2="13.5"
-              stroke="currentColor"
-              strokeWidth="1.4"
-            />
-            <rect
-              x="10.2"
-              y="3.2"
-              width="3.6"
-              height="9.6"
-              rx="0.8"
-              fill="currentColor"
-              fillOpacity={splitView ? 0.45 : 0.12}
-            />
-          </svg>
-        </button>
+          {!mobileSidebarOpen && onOpenSettingsModal && (
+            <button
+              type="button"
+              data-testid="header-settings-btn"
+              className="fd-btn"
+              onClick={onOpenSettingsModal}
+              title="Open Settings (Agents, System, Products, Appearance, Accessibility, Auth)"
+              aria-label="Open Settings"
+              style={{ flexShrink: 0, padding: "5px 8px" }}
+            >
+              <span
+                className="fd-gear-icon"
+                aria-hidden="true"
+                style={{ fontSize: "16px", lineHeight: 1 }}
+              >
+                ⚙
+              </span>
+            </button>
+          )}
+          <button
+            type="button"
+            data-testid="split-view-toggle"
+            className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+            onClick={() => onToggleSplitView?.()}
+            title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+            aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+            aria-pressed={splitView}
+            style={{ flexShrink: 0 }}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect
+                x="1.5"
+                y="2.5"
+                width="13"
+                height="11"
+                rx="2"
+                stroke="currentColor"
+                strokeWidth="1.4"
+              />
+              <line
+                x1="9.5"
+                y1="2.5"
+                x2="9.5"
+                y2="13.5"
+                stroke="currentColor"
+                strokeWidth="1.4"
+              />
+              <rect
+                x="10.2"
+                y="3.2"
+                width="3.6"
+                height="9.6"
+                rx="0.8"
+                fill="currentColor"
+                fillOpacity={splitView ? 0.45 : 0.12}
+              />
+            </svg>
+          </button>
+        </div>
       </div>
     </header>
   );

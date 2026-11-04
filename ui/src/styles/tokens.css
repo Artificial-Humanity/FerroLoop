@@ -153,7 +153,20 @@ body,
   overflow-x: hidden;
   overflow-y: hidden;
   background-color: var(--bg-canvas);
-  padding: 0;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) 0 env(safe-area-inset-left, 0px);
+  box-sizing: border-box;
+}
+
+@media (pointer: coarse) and (min-width: 720px) {
+  .fd-cockpit {
+    padding-top: max(env(safe-area-inset-top, 0px), 32px);
+  }
+}
+
+@media (display-mode: standalone) {
+  .fd-cockpit {
+    padding-top: max(env(safe-area-inset-top, 0px), 32px);
+  }
 }
 
 .fd-cockpit-body {
