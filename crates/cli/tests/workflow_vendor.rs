@@ -121,6 +121,7 @@ fn vendor(id: &str, base: &str, key: Option<&str>) {
         default_context_window: 0,
         default_rate_card: Default::default(),
         mcp_config_rel_path: None,
+        slice_bounds: Vec::new(),
     })
     .unwrap();
 }

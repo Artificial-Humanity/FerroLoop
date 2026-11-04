@@ -41,6 +41,7 @@ pub mod ref_index;
 pub mod routine;
 pub mod routing;
 pub mod session_protocol;
+pub mod slice_proof;
 pub mod split;
 pub mod stale;
 pub mod state;
@@ -173,6 +174,10 @@ pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, Ro
 pub use session_protocol::{
     AcpOperation, AcpProfileFingerprint, AcpProfileProofRecord, ConformanceState,
     OperationEvidence, SessionProtocolKind,
+};
+pub use slice_proof::{
+    AccountingUnit, AdmittedSliceBound, EpsilonStepBound, SliceAdmissionRefusal, SliceBoundKind,
+    SliceBoundProof, SliceProofInput, Usd, evaluate_slice_bounds,
 };
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,

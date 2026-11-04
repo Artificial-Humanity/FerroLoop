@@ -24,6 +24,7 @@ fn custom_http(id: &str, env_key: Option<&str>, vault_secret: Option<&str>) -> S
         default_context_window: 12_345,
         default_rate_card: RateCard::default(),
         mcp_config_rel_path: None,
+        slice_bounds: Vec::new(),
     })
     .unwrap();
     id.to_string()
@@ -40,6 +41,7 @@ pub(super) fn custom_cli(id: &str) -> String {
         default_context_window: 0,
         default_rate_card: RateCard::default(),
         mcp_config_rel_path: None,
+        slice_bounds: Vec::new(),
     })
     .unwrap();
     id.to_string()

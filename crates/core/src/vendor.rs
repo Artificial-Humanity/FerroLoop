@@ -82,6 +82,9 @@ pub struct VendorDescriptor {
     pub default_rate_card: RateCard,
     /// The vendor's project MCP file, relative to the project root. `None`: it has none.
     pub mcp_config_rel_path: Option<String>,
+    /// Reviewed whole-slice proofs; empty means manual-only.
+    #[serde(default)]
+    pub slice_bounds: Vec<crate::slice_proof::SliceBoundProof>,
 }
 
 /// Why a descriptor was refused.
@@ -133,6 +136,7 @@ impl VendorRegistry {
     /// [`validate_api_base_url`]).
     pub fn register(&self, descriptor: VendorDescriptor) -> Result<(), VendorError> {
         validate(&descriptor)?;
+        refuse_runtime_proofs(&descriptor)?;
         let mut vendors = self.vendors.write().unwrap_or_else(|e| e.into_inner());
         if vendors.contains_key(&descriptor.id) {
             return Err(VendorError::Duplicate(descriptor.id));
@@ -146,6 +150,7 @@ impl VendorRegistry {
     /// descriptor under a registered id is still [`VendorError::Duplicate`].
     pub fn ensure_registered(&self, descriptor: VendorDescriptor) -> Result<(), VendorError> {
         validate(&descriptor)?;
+        refuse_runtime_proofs(&descriptor)?;
         // The comparison and the insert share one write lock: two threads loading the same
         // descriptor must not see "absent" together and have the second fail as a duplicate.
         let mut vendors = self.vendors.write().unwrap_or_else(|e| e.into_inner());
@@ -176,6 +181,18 @@ impl VendorRegistry {
         let id = id.trim().to_ascii_lowercase();
         builtin_vendors().iter().any(|v| v.id == id)
     }
+}
+
+/// Runtime registration is configuration, not a reviewed proof record. Reviewed built-in
+/// proofs must be compiled into the registry, never enabled by configuration or a caller.
+fn refuse_runtime_proofs(descriptor: &VendorDescriptor) -> Result<(), VendorError> {
+    if descriptor.slice_bounds.is_empty() {
+        return Ok(());
+    }
+    Err(VendorError::Invalid {
+        id: descriptor.id.clone(),
+        problem: "runtime registration cannot supply slice proofs".into(),
+    })
 }
 
 /// Adds a vendor to the process-wide registry: one call, and `fl-exec` can run attempts through
@@ -319,6 +336,7 @@ fn cli(id: &str, display: &str, binary: &str, mcp: Option<&str>) -> VendorDescri
         default_context_window: 0,
         default_rate_card: RateCard::default(),
         mcp_config_rel_path: mcp.map(str::to_string),
+        slice_bounds: Vec::new(),
     }
 }
 
@@ -344,6 +362,7 @@ fn api(
         default_context_window: context,
         default_rate_card: RateCard::default(),
         mcp_config_rel_path: None,
+        slice_bounds: Vec::new(),
     }
 }
 
