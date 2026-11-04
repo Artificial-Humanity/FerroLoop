@@ -238,3 +238,10 @@ pub use workspace::{
 /// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the
 /// engine must recognise the file too: it never makes a gate stale.
 pub const MANIFEST_PATH: &str = ".fl/manifest.json";
+
+pub mod f1_records;
+pub use f1_records::{
+    AllocationEvidenceRecord, ControlRecordKey, F1PreparationStore, F1RecordError,
+    IntentDefinition, IntentEvidenceRecord, RoutineProposalRecord, SafetyBatch, SafetyChange,
+    SafetyState,
+};
