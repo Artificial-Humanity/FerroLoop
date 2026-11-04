@@ -2091,6 +2091,11 @@ fn parse_reset_instant_from_reason(reason: &str) -> Option<u64> {
 fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindowUsage> {
     let value = value?;
     let used_percent = json_f64(value.get("used_percent"))?;
+    let window_minutes = value
+        .get("window_minutes")
+        .and_then(Value::as_u64)
+        .filter(|minutes| *minutes > 0)
+        .unwrap_or(window_minutes);
     let resets_at_ms = value.get("resets_at").and_then(|raw| {
         raw.as_i64()
             .or_else(|| raw.as_u64().map(|n| n as i64))
@@ -2346,8 +2351,16 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let primary_window = codex_window(limits.get("primary"), 300);
-        let secondary_window = codex_window(limits.get("secondary"), 10_080);
+        let mut primary_window = codex_window(limits.get("primary"), 300);
+        let mut secondary_window = codex_window(limits.get("secondary"), 10_080);
+        if secondary_window.is_none()
+            && primary_window
+                .as_ref()
+                .and_then(|window| window.window_minutes)
+                .is_some_and(|minutes| minutes >= 1440)
+        {
+            secondary_window = primary_window.take();
+        }
         if tier.is_none()
             && exhausted_reason.is_none()
             && primary_window.is_none()
@@ -2371,7 +2384,7 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         QUOTA_LOG_TAIL_BYTES,
     )
     .ok()?;
-    let mut latest = None;
+    let mut latest: Option<SessionQuotaUsage> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if !trimmed.contains("billing: fetched credits config") {
@@ -2408,12 +2421,18 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         if tier.is_none() && secondary_window.is_none() {
             continue;
         }
-        latest = Some(SessionQuotaUsage {
-            tier,
+        let quota = latest.get_or_insert(SessionQuotaUsage {
+            tier: None,
             primary_window: None,
-            secondary_window,
+            secondary_window: None,
             exhausted_reason: None,
         });
+        if tier.is_some() {
+            quota.tier = tier;
+        }
+        if secondary_window.is_some() {
+            quota.secondary_window = secondary_window;
+        }
     }
     latest
 }
@@ -8904,6 +8923,53 @@ mod tests {
     }
 
     #[test]
+    fn codex_reported_window_durations_and_weekly_primary() {
+        let rollout = |primary: Value, secondary: Value| {
+            serde_json::json!({"type":"event_msg", "payload": {"type":"token_count", "rate_limits": {
+                "plan_type":"prolite", "primary":primary, "secondary":secondary
+            }}}).to_string()
+        };
+        let weekly =
+            serde_json::json!({"used_percent":26.0,"window_minutes":10080,"resets_at":1700000000});
+        let quota = codex_quota_from_rollout(&rollout(weekly.clone(), Value::Null)).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert!(quota.primary_window.is_none());
+        let window = quota.secondary_window.unwrap();
+        assert_eq!(window.used_percent, 26.0);
+        assert_eq!(window.window_minutes, Some(10080));
+        assert_eq!(window.resets_at_ms, Some(1700000000000));
+
+        let quota = codex_quota_from_rollout(&rollout(
+            serde_json::json!({"used_percent":3.0,"window_minutes":1440}),
+            weekly,
+        ))
+        .unwrap();
+        assert_eq!(quota.primary_window.unwrap().window_minutes, Some(1440));
+        assert_eq!(quota.secondary_window.unwrap().window_minutes, Some(10080));
+
+        for invalid in [
+            Value::Null,
+            serde_json::json!(0),
+            serde_json::json!("10080"),
+            serde_json::json!(-1),
+        ] {
+            let quota = codex_quota_from_rollout(&rollout(
+                serde_json::json!({"used_percent":4.0,"window_minutes":invalid}),
+                Value::Null,
+            ))
+            .unwrap();
+            assert_eq!(quota.primary_window.unwrap().window_minutes, Some(300));
+            assert!(quota.secondary_window.is_none());
+        }
+        let quota = codex_quota_from_rollout(&rollout(
+            serde_json::json!({"used_percent":4.0}),
+            Value::Null,
+        ))
+        .unwrap();
+        assert_eq!(quota.primary_window.unwrap().window_minutes, Some(300));
+    }
+
+    #[test]
     fn codex_prolite_plan_is_shown_as_pro() {
         for raw in ["prolite", "ProLite", "pro_lite", "PRO-LITE"] {
             assert_eq!(normalize_codex_plan(raw), "pro", "{raw}");
@@ -9232,6 +9298,40 @@ mod tests {
         )
         .unwrap();
         assert!(codex_auth_plan(Some(home.path())).is_none());
+    }
+
+    #[test]
+    fn grok_retains_latest_weekly_usage_across_partial_billing_entries() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join(".grok/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("unified.jsonl");
+        let first = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "subscriptionTier":"SUPERGROK", "config":{"creditUsagePercent":100.0,
+            "billingPeriodEnd":"2026-12-01T00:00:00Z"}}});
+        let unrelated = serde_json::json!({"msg":"other billing: fetched credits config", "ctx":{
+            "config":{"creditUsagePercent":0.0}}});
+        let partial = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "subscriptionTier":"SUPERGROK", "config":{"onDemandCap":10}}});
+        fs::write(&path, format!("{first}\n{unrelated}\n{partial}\n")).unwrap();
+        let quota = grok_quota_from_home(tmp.path()).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("SUPERGROK"));
+        assert_eq!(quota.secondary_window.unwrap().used_percent, 100.0);
+
+        let newer = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "config":{"creditUsagePercent":34.0}}});
+        fs::write(&path, format!("{first}\n{unrelated}\n{partial}\n{newer}\n")).unwrap();
+        let quota = grok_quota_from_home(tmp.path()).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("SUPERGROK"));
+        assert_eq!(quota.secondary_window.unwrap().used_percent, 34.0);
+
+        fs::write(&path, format!("{partial}\n")).unwrap();
+        assert!(
+            grok_quota_from_home(tmp.path())
+                .unwrap()
+                .secondary_window
+                .is_none()
+        );
     }
 
     #[test]
