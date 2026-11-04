@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE as BASE64_URL};
 use serde::{Deserialize, Serialize};
 
 use crate::GateError;
@@ -687,35 +687,21 @@ fn substitute_placeholders(
 /// Scrub any known secret values from `vault` (plain, URL-encoded, and base64-encoded)
 /// and common credential prefixes from `text`.
 pub fn scrub_secrets(vault: &Vault, text: &str) -> (String, Vec<String>) {
-    let mut scrubbed = text.to_string();
-    let mut matched = Vec::new();
+    let values: Vec<_> = vault
+        .all_decrypted_for_scrubbing()
+        .into_iter()
+        .filter(|(_, secret)| secret.len() >= 4)
+        .map(|(name, secret)| (name, zeroize::Zeroizing::new(secret)))
+        .collect();
+    let refs: Vec<_> = values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (scrubbed, matched) = redact_pairs(text, &refs, false);
+    scrub_known_prefixes(scrubbed, matched)
+}
 
-    for (name, secret) in vault.all_decrypted_for_scrubbing() {
-        if secret.len() < 4 {
-            continue;
-        }
-        let replacement = format!("[REDACTED:FERROGATE:{name}]");
-        let b64 = BASE64.encode(secret.as_bytes());
-        let url_enc = simple_percent_encode(&secret);
-
-        let mut hit = false;
-        if scrubbed.contains(&secret) {
-            scrubbed = scrubbed.replace(&secret, &replacement);
-            hit = true;
-        }
-        if b64.len() >= 8 && scrubbed.contains(&b64) {
-            scrubbed = scrubbed.replace(&b64, &replacement);
-            hit = true;
-        }
-        if url_enc != secret && scrubbed.contains(&url_enc) {
-            scrubbed = scrubbed.replace(&url_enc, &replacement);
-            hit = true;
-        }
-        if hit {
-            matched.push(name);
-        }
-    }
-
+fn scrub_known_prefixes(mut scrubbed: String, mut matched: Vec<String>) -> (String, Vec<String>) {
     for (prefix, label) in [
         ("sk-ant-", "ANTHROPIC_TOKEN"),
         ("sk-proj-", "OPENAI_TOKEN"),
@@ -761,6 +747,7 @@ fn redact_prefixed_tokens(text: &str, prefix: &str, label: &str) -> (String, boo
     (out, any_redacted)
 }
 
+#[cfg(test)]
 fn simple_percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -774,32 +761,219 @@ fn simple_percent_encode(s: &str) -> String {
     out
 }
 
-/// Redact exact injected values and their encoded representations.
+/// A fixed work/space bound; exceeding either limit redacts the entire input.
+const MAX_SECRET_SCAN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SECRET_MATCHES: usize = 65_536;
+const MAX_SECRET_PATTERN_BYTES: usize = 64 * 1024;
+
+/// Find overlapping matches in one pass. For percent decoding, `starts` maps each decoded
+/// byte back to its original input offset, without generating exponentially many spellings.
+fn find_secret_spans(
+    text: &str,
+    pattern: &[u8],
+    percent_decode: bool,
+    ascii_case_insensitive: bool,
+    owner: usize,
+    spans: &mut Vec<(usize, usize, usize)>,
+) -> Result<bool, ()> {
+    if pattern.is_empty() || pattern.len() > text.len() {
+        return Ok(false);
+    }
+    let fold = |b: u8| {
+        if ascii_case_insensitive {
+            b.to_ascii_lowercase()
+        } else {
+            b
+        }
+    };
+    let mut prefix = vec![0usize; pattern.len()];
+    let mut matched = 0usize;
+    for i in 1..pattern.len() {
+        while matched > 0 && fold(pattern[i]) != fold(pattern[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if fold(pattern[i]) == fold(pattern[matched]) {
+            matched += 1;
+        }
+        prefix[i] = matched;
+    }
+    let bytes = text.as_bytes();
+    let mut starts = vec![0usize; pattern.len()];
+    let mut index = 0usize;
+    let mut position = 0usize;
+    let mut hit = false;
+    matched = 0;
+    while position < bytes.len() {
+        let begin = position;
+        let mut value = bytes[position];
+        if percent_decode
+            && value == b'%'
+            && position + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                char::from(bytes[position + 1]).to_digit(16),
+                char::from(bytes[position + 2]).to_digit(16),
+            )
+        {
+            value = ((hi << 4) | lo) as u8;
+            position += 3;
+        } else {
+            position += 1;
+        }
+        starts[index % pattern.len()] = begin;
+        index += 1;
+        while matched > 0 && fold(value) != fold(pattern[matched]) {
+            matched = prefix[matched - 1];
+        }
+        if fold(value) == fold(pattern[matched]) {
+            matched += 1;
+        }
+        if matched == pattern.len() {
+            let start = starts[(index - pattern.len()) % pattern.len()];
+            if !text.is_char_boundary(start)
+                || !text.is_char_boundary(position)
+                || spans.len() >= MAX_SECRET_MATCHES
+            {
+                return Err(());
+            }
+            spans.push((start, position, owner));
+            hit = true;
+            matched = prefix[matched - 1];
+        }
+    }
+    Ok(hit)
+}
+
+/// Redact the union of every matching span in the original input. Sequential replacement can
+/// expose suffixes when one secret overlaps another, so the original is never modified while
+/// searching. Header names use ASCII-insensitive matching because HTTP normalizes their case.
+fn redact_pairs(
+    text: &str,
+    external: &[(&str, &str)],
+    ascii_case_insensitive: bool,
+) -> (String, Vec<String>) {
+    let all_names = || {
+        external
+            .iter()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(n, _)| (*n).to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    let fail_closed = || ("[REDACTED:FERROGATE]".to_string(), all_names());
+    if text
+        .len()
+        .checked_mul(external.len())
+        .and_then(|n| n.checked_mul(6))
+        .is_none_or(|n| n > MAX_SECRET_SCAN_BYTES)
+    {
+        return fail_closed();
+    }
+    let mut spans = Vec::new();
+    let mut names = BTreeSet::new();
+    for (index, (name, secret)) in external.iter().enumerate() {
+        if secret.is_empty() {
+            continue;
+        }
+        // The KMP tables are proportional to the pattern. Keep their allocation bounded;
+        // unusually large secret values cause complete redaction rather than a partial scan.
+        if secret.len() > MAX_SECRET_PATTERN_BYTES {
+            return fail_closed();
+        }
+        // Do not allocate a base64 copy when it cannot fit anywhere in this input.
+        let b64_unpadded_len = secret
+            .len()
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(2))
+            .map(|n| n / 3);
+        let b64 = b64_unpadded_len
+            .filter(|len| *len <= text.len())
+            .map(|_| zeroize::Zeroizing::new(BASE64.encode(secret.as_bytes())));
+        let b64_url = b64
+            .as_ref()
+            .map(|_| zeroize::Zeroizing::new(BASE64_URL.encode(secret.as_bytes())));
+        let patterns = [(secret.as_bytes(), false), (secret.as_bytes(), true)]
+            .into_iter()
+            .chain(b64.as_ref().into_iter().flat_map(|value| {
+                [
+                    (value.as_bytes(), false),
+                    (value.trim_end_matches('=').as_bytes(), false),
+                ]
+            }))
+            .chain(b64_url.as_ref().into_iter().flat_map(|value| {
+                [
+                    (value.as_bytes(), false),
+                    (value.trim_end_matches('=').as_bytes(), false),
+                ]
+            }));
+        for (pattern, decode) in patterns {
+            match find_secret_spans(
+                text,
+                pattern,
+                decode,
+                ascii_case_insensitive,
+                index,
+                &mut spans,
+            ) {
+                Ok(true) => {
+                    names.insert((*name).to_string());
+                }
+                Ok(false) => {}
+                Err(()) => return fail_closed(),
+            }
+        }
+    }
+    spans.sort_unstable_by_key(|&(start, end, owner)| (start, std::cmp::Reverse(end), owner));
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut i = 0;
+    while i < spans.len() {
+        let (start, mut end, owner) = spans[i];
+        output.push_str(&text[cursor..start]);
+        i += 1;
+        while i < spans.len() && spans[i].0 < end {
+            end = end.max(spans[i].1);
+            i += 1;
+        }
+        output.push_str(&format!("[REDACTED:FERROGATE:{}]", external[owner].0));
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    (output, names.into_iter().collect())
+}
+
+#[cfg(test)]
 fn redact_external_plaintexts(
     text: &str,
     external: &[(String, zeroize::Zeroizing<String>)],
 ) -> (String, Vec<String>) {
-    let mut scrubbed = text.to_string();
-    let mut matched = Vec::new();
-    for (name, secret) in external {
-        if secret.is_empty() {
-            continue;
-        }
-        let replacement = format!("[REDACTED:FERROGATE:{name}]");
-        let b64 = zeroize::Zeroizing::new(BASE64.encode(secret.as_bytes()));
-        let encoded = zeroize::Zeroizing::new(simple_percent_encode(secret));
-        let mut hit = false;
-        for value in [secret.as_str(), b64.as_str(), encoded.as_str()] {
-            if !value.is_empty() && scrubbed.contains(value) {
-                scrubbed = scrubbed.replace(value, &replacement);
-                hit = true;
-            }
-        }
-        if hit && !matched.iter().any(|existing: &String| existing == name) {
-            matched.push(name.clone());
-        }
-    }
-    (scrubbed, matched)
+    let refs: Vec<_> = external
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    redact_pairs(text, &refs, false)
+}
+
+fn redact_with_vault(
+    vault: &Vault,
+    text: &str,
+    external: &[(String, zeroize::Zeroizing<String>)],
+    ascii_case_insensitive: bool,
+) -> (String, Vec<String>) {
+    // Match injected values and the vault's other secrets against the same original text.
+    let values: Vec<_> = vault
+        .all_decrypted_for_scrubbing()
+        .into_iter()
+        .filter(|(_, value)| value.len() >= 4)
+        .map(|(name, value)| (name, zeroize::Zeroizing::new(value)))
+        .collect();
+    let refs: Vec<_> = external
+        .iter()
+        .chain(values.iter())
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (scrubbed, names) = redact_pairs(text, &refs, ascii_case_insensitive);
+    scrub_known_prefixes(scrubbed, names)
 }
 
 fn scrub_with_external(
@@ -807,12 +981,8 @@ fn scrub_with_external(
     text: &str,
     external: &[(String, zeroize::Zeroizing<String>)],
 ) -> (String, BTreeSet<String>) {
-    // Exact injected values take priority over an older vault value that may be a substring.
-    let (scrubbed, extra) = redact_external_plaintexts(text, external);
-    let (scrubbed, hits) = scrub_secrets(vault, &scrubbed);
-    let mut names: BTreeSet<String> = extra.into_iter().collect();
-    names.extend(hits);
-    (scrubbed, names)
+    let (scrubbed, names) = redact_with_vault(vault, text, external, false);
+    (scrubbed, names.into_iter().collect())
 }
 
 /// The outbound client's settings. No proxy: `ureq` reads `HTTP_PROXY`, `HTTPS_PROXY` and
@@ -1262,6 +1432,13 @@ fn send_prepared_inner(
     let mut resp_headers = BTreeMap::new();
     let mut scrubbed_names = BTreeSet::new();
     for (hk, hv) in resp.headers() {
+        // Header names are case-insensitive and cannot contain our redaction marker. Drop the
+        // whole header when its name contains an injected secret instead of returning the key.
+        let (_, name_hits) = redact_with_vault(vault, hk.as_str(), &external, true);
+        if !name_hits.is_empty() {
+            scrubbed_names.extend(name_hits);
+            continue;
+        }
         if let Ok(val_str) = hv.to_str() {
             let (clean_v, hits) = scrub_with_external(vault, val_str, &external);
             scrubbed_names.extend(hits);
@@ -1657,6 +1834,173 @@ mod tests {
             redact_external_plaintexts("xy eHk=", &short).0,
             "[REDACTED:FERROGATE:SHORT] [REDACTED:FERROGATE:SHORT]"
         );
+    }
+
+    #[test]
+    fn injected_overlapping_secrets_and_equivalent_percent_encodings_are_fully_scrubbed() {
+        for values in [
+            vec![
+                ("A".into(), zeroize::Zeroizing::new("foob".into())),
+                ("B".into(), zeroize::Zeroizing::new("foobarbaz".into())),
+                ("C".into(), zeroize::Zeroizing::new("a/b+z".into())),
+            ],
+            vec![
+                ("B".into(), zeroize::Zeroizing::new("foobarbaz".into())),
+                ("A".into(), zeroize::Zeroizing::new("foob".into())),
+                ("C".into(), zeroize::Zeroizing::new("a/b+z".into())),
+            ],
+        ] {
+            let (clean, names) =
+                redact_external_plaintexts("foobarbaz foobarbaz a%2fb%2bz %61%2Fb%2B%7a", &values);
+            assert!(!clean.contains("arbaz"), "{clean}");
+            assert!(!clean.contains("%2f") && !clean.contains("%2F"), "{clean}");
+            assert!(names.contains(&"A".to_string()));
+            assert!(names.contains(&"B".to_string()));
+            assert!(names.contains(&"C".to_string()));
+        }
+    }
+
+    #[test]
+    fn overlapping_matches_cover_the_entire_union_and_utf8_offsets() {
+        let values = vec![
+            ("ONE".into(), zeroize::Zeroizing::new("aba".into())),
+            ("TWO".into(), zeroize::Zeroizing::new("bab".into())),
+            ("UTF8".into(), zeroize::Zeroizing::new("café".into())),
+        ];
+        let (clean, names) = redact_external_plaintexts("ababa / café / c%61f%c3%a9", &values);
+        assert_eq!(clean.matches("REDACTED").count(), 3, "{clean}");
+        assert!(!clean.contains("ababa") && !clean.contains("café") && !clean.contains("%c3"));
+        assert_eq!(names, ["ONE", "TWO", "UTF8"]);
+    }
+
+    #[test]
+    fn matching_budget_exhaustion_redacts_the_whole_input() {
+        let values = vec![("ONE".into(), zeroize::Zeroizing::new("x".into()))];
+        let input = "x".repeat(MAX_SECRET_MATCHES + 1);
+        let (clean, names) = redact_external_plaintexts(&input, &values);
+        assert_eq!(clean, "[REDACTED:FERROGATE]");
+        assert_eq!(names, ["ONE"]);
+    }
+
+    #[test]
+    fn standard_and_url_safe_base64_with_or_without_padding_are_scrubbed() {
+        let values = vec![("KEY".into(), zeroize::Zeroizing::new(">???".into()))];
+        let (clean, _) = redact_external_plaintexts("Pj8/Pw== Pj8/Pw Pj8_Pw== Pj8_Pw", &values);
+        assert_eq!(clean.matches("REDACTED").count(), 4, "{clean}");
+        assert!(!clean.contains("Pj8"), "{clean}");
+    }
+
+    #[test]
+    fn vault_and_injected_values_are_matched_against_the_same_original_text() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "LONG", "foobarbaz", &["127.0.0.1"]);
+        let injected = vec![("SHORT".into(), zeroize::Zeroizing::new("foob".into()))];
+        let (clean, names) = scrub_with_external(&vault, "foobarbaz", &injected);
+        assert!(!clean.contains("arbaz"), "{clean}");
+        assert!(names.contains("LONG") && names.contains("SHORT"));
+    }
+
+    #[test]
+    fn response_header_names_containing_injected_secret_are_dropped() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let response = tiny_http::Response::from_string("ok")
+                .with_header(tiny_http::Header::from_bytes("X-Hunter2", "ok").unwrap());
+            req.respond(response).unwrap();
+        });
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", "Hunter2", &["127.0.0.1"]);
+        let req = request(
+            "GET",
+            &format!("http://127.0.0.1:{port}/"),
+            &[("X-Key", "{{FERROGATE:API_KEY}}")],
+        );
+        let result = execute_proxied_request(&vault, &req).unwrap();
+        worker.join().unwrap();
+        assert!(
+            !result.headers.keys().any(|key| key.contains("hunter2")),
+            "{:?}",
+            result.headers
+        );
+        assert!(result.scrubbed_secrets.contains(&"API_KEY".to_string()));
+    }
+
+    #[test]
+    fn header_name_checks_include_other_vault_secrets_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "OTHER", "SecretValue", &["127.0.0.1"]);
+        let (_, hits) = redact_with_vault(&vault, "x-secretvalue", &[], true);
+        assert_eq!(hits, ["OTHER"]);
+    }
+
+    #[test]
+    fn real_response_scrubs_overlapping_local_and_provider_values_everywhere() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let response =
+                tiny_http::Response::from_string("foobarbaz foobarbaz a%2fb%2bz %61%2Fb%2B%7a")
+                    .with_header(tiny_http::Header::from_bytes("x-foobarbaz", "ok").unwrap())
+                    .with_header(
+                        tiny_http::Header::from_bytes("x-echo", "foobarbaz a%2fb%2bz").unwrap(),
+                    );
+            req.respond(response).unwrap();
+        });
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "A_LOCAL", "foob", &["127.0.0.1"]);
+        let req = request("GET", &format!("http://127.0.0.1:{port}/"), &[]);
+        // Exercise the real transport/response boundary with prevalidated local and provider
+        // values: the loopback SSRF gate requires placeholder metadata to be local.
+        let prepared = PreparedSecrets {
+            request: PreparedProxyRequest {
+                method: "GET".into(),
+                url: req.url.clone(),
+                host: "127.0.0.1".into(),
+                headers: BTreeMap::new(),
+                body: None,
+                injected_secrets: vec!["A_LOCAL".into(), "B_REMOTE".into(), "C_REMOTE".into()],
+            },
+            injected_plaintexts: vec![
+                ("A_LOCAL".into(), zeroize::Zeroizing::new("foob".into())),
+                (
+                    "B_REMOTE".into(),
+                    zeroize::Zeroizing::new("foobarbaz".into()),
+                ),
+                ("C_REMOTE".into(), zeroize::Zeroizing::new("a/b+z".into())),
+            ],
+        };
+        let result =
+            send_prepared_proxied_request(&vault, &req, prepared, LEGACY_MAX_RESPONSE_BYTES, false)
+                .unwrap();
+        worker.join().unwrap();
+        assert!(
+            !result.body.contains("arbaz")
+                && !result.body.contains("%2f")
+                && !result.body.contains("%2F"),
+            "{:?}",
+            result.body
+        );
+        assert!(!result.headers.keys().any(|key| key.contains("foob")));
+        assert!(
+            !result.headers["x-echo"].contains("arbaz")
+                && !result.headers["x-echo"].contains("%2f")
+        );
+        for name in ["A_LOCAL", "B_REMOTE", "C_REMOTE"] {
+            assert!(result.scrubbed_secrets.contains(&name.into()));
+        }
+        let exact = vec![
+            ("A_LOCAL".into(), zeroize::Zeroizing::new("foob".into())),
+            (
+                "B_REMOTE".into(),
+                zeroize::Zeroizing::new("foobarbaz".into()),
+            ),
+            ("C_REMOTE".into(), zeroize::Zeroizing::new("a/b+z".into())),
+        ];
+        let (error, _) = scrub_with_external(&vault, "upstream foobarbaz at a%2fb%2bz", &exact);
+        assert!(!error.contains("arbaz") && !error.contains("%2f"));
     }
 
     #[test]
