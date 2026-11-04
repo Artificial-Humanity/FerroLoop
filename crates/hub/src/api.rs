@@ -5278,6 +5278,13 @@ fn dispatch_to_session_route<T>(
 thread_local! {
     static AFTER_PROMPT_DISPATCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_QUEUE_FINISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn after_next_queue_finish(f: impl FnOnce() + 'static) {
+    AFTER_QUEUE_FINISH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
 }
 
 #[cfg(test)]
@@ -5381,8 +5388,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
             .map(|item| item.id.clone());
         if !state.is_session_busy_from_observation(&canonical_id, turns.as_deref())
             && let Some(prompt_id) = next
-            && let Some(item) =
-                state.claim_queued_prompt_aliases(&canonical_id, &session_id, &prompt_id)
+            && let Some((item, claim)) =
+                state.claim_queued_for_dispatch(&canonical_id, &session_id, &prompt_id, true)
         {
             let delivery_res = dispatch_operator_prompt_for_session_typed(
                 state,
@@ -5392,6 +5399,12 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &item.effective_body,
             );
             let queue = state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone());
+            #[cfg(test)]
+            AFTER_QUEUE_FINISH.with(|hook| {
+                if let Some(f) = hook.borrow_mut().take() {
+                    f();
+                }
+            });
             if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
                 let after = transcript_observation_from_sessions(
                     &canonical_id,
@@ -5402,7 +5415,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 );
                 state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
             }
-            state.release_queued_send_aliases(&canonical_id, &session_id);
+            claim.finish();
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
@@ -5439,8 +5452,8 @@ fn handle_post_queued_prompt_send_now(
     prompt_id: &str,
 ) -> HttpResponse {
     let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
-    let claimed = state.claim_queued_prompt_aliases(&canonical_id, raw_session_id, prompt_id);
-    let Some(item) = claimed else {
+    let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
+    let Some((item, claim)) = claimed else {
         let exists = state
             .session_queue(&canonical_id)
             .iter()
@@ -5466,7 +5479,7 @@ fn handle_post_queued_prompt_send_now(
     if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
         state.mark_session_in_flight_released(&canonical_id);
     }
-    state.release_queued_send_aliases(&canonical_id, raw_session_id);
+    claim.finish();
 
     let data = json!({
         "session_id": canonical_id,
@@ -5744,7 +5757,6 @@ fn handle_post_session_prompt(
         (snap, sessions)
     };
     let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
-    let has_queued = !state.session_queue(&canonical_session_id).is_empty();
     let mut files = TranscriptReads::default();
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
@@ -5759,39 +5771,52 @@ fn handle_post_session_prompt(
         state.is_session_busy_from_observation(&canonical_session_id, turns.as_deref())
     };
 
-    if !payload.send_now && (busy || has_queued) {
-        let (item, queue) = state.enqueue_session_prompt(
-            &canonical_session_id,
-            target_persona.clone(),
-            prompt_text,
-            effective_body,
-            sender_name,
-            saved_attachments.clone(),
-        );
-        state.broadcast(
-            "session",
-            "queue_updated",
-            json!({
-                "session_id": canonical_session_id,
-                "persona": target_persona,
-                "is_busy": true,
-                "queue": queue,
-            }),
-        );
-        return HttpResponse::json(
-            200,
-            json!({
-                "session_id": canonical_session_id,
-                "persona": target_persona,
-                "status": "queued",
-                "queued": true,
-                "is_busy": true,
-                "queued_prompt": item,
-                "queue": queue,
-                "attachments": saved_attachments,
-            }),
-        );
-    }
+    let claim = match state.admit_direct_prompt(
+        &canonical_session_id,
+        session_id,
+        payload.send_now,
+        busy,
+        crate::DirectPromptInput {
+            persona: target_persona.clone(),
+            prompt: prompt_text.clone(),
+            effective_body: effective_body.clone(),
+            by: sender_name.clone(),
+            attachments: saved_attachments.clone(),
+        },
+    ) {
+        crate::DirectPromptDecision::Dispatch(claim) => claim,
+        crate::DirectPromptDecision::DispatchBusy => {
+            return HttpResponse::json(
+                409,
+                json!({ "error": "another prompt is being dispatched to this session" }),
+            );
+        }
+        crate::DirectPromptDecision::Queued(item, queue) => {
+            state.broadcast(
+                "session",
+                "queue_updated",
+                json!({
+                    "session_id": canonical_session_id,
+                    "persona": target_persona,
+                    "is_busy": true,
+                    "queue": queue,
+                }),
+            );
+            return HttpResponse::json(
+                200,
+                json!({
+                    "session_id": canonical_session_id,
+                    "persona": target_persona,
+                    "status": "queued",
+                    "queued": true,
+                    "is_busy": true,
+                    "queued_prompt": item,
+                    "queue": queue,
+                    "attachments": saved_attachments,
+                }),
+            );
+        }
+    };
 
     let delivery_res = dispatch_operator_prompt_for_session(
         state,
@@ -5809,6 +5834,7 @@ fn handle_post_session_prompt(
         &mut files,
     );
     state.mark_session_in_flight_from_observation(&canonical_session_id, after.as_deref());
+    claim.finish();
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({

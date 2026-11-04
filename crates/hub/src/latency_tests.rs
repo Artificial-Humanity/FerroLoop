@@ -498,6 +498,62 @@ fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
 }
 
 #[test]
+fn normal_prompt_queues_while_finished_queue_send_has_not_marked_inflight() {
+    use std::sync::{Arc, Mutex};
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = Arc::new(hub_with_ferris(&tmp, 3));
+    state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "first".into(),
+        "first".into(),
+        "owner".into(),
+        vec![],
+    );
+    let observed = Arc::new(Mutex::new(None));
+    let (state_for_hook, observed_for_hook) = (state.clone(), observed.clone());
+    crate::api::after_next_queue_finish(move || {
+        let (response, _) = post_prompt(&state_for_hook, false);
+        *observed_for_hook.lock().unwrap() = Some(response.json_value().unwrap());
+    });
+    crate::api::drain_ready_session_queues(&state);
+    let response = observed.lock().unwrap().take().unwrap();
+    assert_eq!(response["status"], "queued");
+    assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+}
+
+#[test]
+fn direct_dispatch_fences_queue_drain_and_other_direct_prompts() {
+    use std::sync::{Arc, Mutex};
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let tmp = TempDir::new().unwrap();
+    let state = Arc::new(hub_with_ferris(&tmp, 3));
+    let observed = Arc::new(Mutex::new(None));
+    let (state_for_hook, observed_for_hook) = (state.clone(), observed.clone());
+    crate::api::after_next_prompt_dispatch(move || {
+        let (response, _) = post_prompt(&state_for_hook, false);
+        let status = response.json_value().unwrap()["status"].clone();
+        let (forced, _) = post_prompt(&state_for_hook, true);
+        assert_eq!(
+            forced.status, 409,
+            "send-now cannot overlap an active delivery"
+        );
+        crate::api::drain_ready_session_queues(&state_for_hook);
+        *observed_for_hook.lock().unwrap() =
+            Some((status, state_for_hook.session_queue("conv-ferris-1").len()));
+    });
+    let (response, _) = post_prompt(&state, false);
+    assert_eq!(response.json_value().unwrap()["status"], "sent");
+    let (status, remaining) = observed.lock().unwrap().take().unwrap();
+    assert_eq!(status, "queued");
+    assert_eq!(
+        remaining, 1,
+        "queue drain must not dispatch during direct delivery"
+    );
+}
+
+#[test]
 fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
     let _queued_delivery = crate::api::stub_queued_delivery_success();
     let tmp = TempDir::new().unwrap();

@@ -139,6 +139,85 @@ struct PromptQueueState {
     next_seq: u64,
 }
 
+/// A logical dispatch claim, held across I/O without holding the queue mutex.
+/// Drop releases it even if the dispatch path unwinds.
+pub(crate) struct SessionDispatchGuard<'a> {
+    state: &'a HubState,
+    canonical: String,
+    raw: String,
+    completed: bool,
+}
+
+impl SessionDispatchGuard<'_> {
+    /// The caller has recorded an in-flight observation or proved no delivery occurred.
+    pub(crate) fn finish(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SessionDispatchGuard<'_> {
+    fn drop(&mut self) {
+        let mut queues = self
+            .state
+            .prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.completed {
+            queues.in_flight.insert(
+                self.canonical.clone(),
+                InFlightPrompt {
+                    baseline_turn_count: None,
+                    baseline_busy: false,
+                    require_observed_completion: true,
+                    dispatched_at_ms: stamp::now().unix_millis() as i64,
+                },
+            );
+        }
+        queues.active_queue_sends.remove(&self.canonical);
+        queues.active_queue_sends.remove(&self.raw);
+    }
+}
+
+pub(crate) struct DirectPromptInput {
+    pub persona: Option<String>,
+    pub prompt: String,
+    pub effective_body: String,
+    pub by: String,
+    pub attachments: Vec<SavedPromptAttachment>,
+}
+
+pub(crate) enum DirectPromptDecision<'a> {
+    Dispatch(SessionDispatchGuard<'a>),
+    Queued(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>),
+    DispatchBusy,
+}
+
+impl PromptQueueState {
+    fn enqueue(
+        &mut self,
+        session_key: &str,
+        input: DirectPromptInput,
+    ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let now = stamp::now();
+        self.next_seq += 1;
+        let item = QueuedOperatorPrompt {
+            id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
+            session_id: session_key.to_string(),
+            persona: input.persona,
+            prompt: input.prompt,
+            effective_body: input.effective_body,
+            by: input.by,
+            attachments: input.attachments,
+            created_at: now.to_string(),
+            delivery_state: QueuedDeliveryState::Pending,
+            delivery_error: None,
+        };
+        let queue = self.queues.entry(session_key.to_string()).or_default();
+        queue.push(item.clone());
+        (item, queue.clone())
+    }
+}
+
 /// Multiplexed WebSocket frame envelope on `/ws/v1` and `/api/v1/stream` (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubWsFrame {
@@ -516,38 +595,44 @@ impl HubState {
         by: String,
         attachments: Vec<SavedPromptAttachment>,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
-        let now = stamp::now();
-        let now_ms = now.unix_millis();
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        guard.next_seq += 1;
-        let seq = guard.next_seq;
-        let item = QueuedOperatorPrompt {
-            id: format!("qp-{now_ms}-{seq}"),
-            session_id: session_key.to_string(),
-            persona,
-            prompt,
-            effective_body,
-            by,
-            attachments,
-            created_at: now.to_string(),
-            delivery_state: QueuedDeliveryState::Pending,
-            delivery_error: None,
-        };
-        let queue = guard.queues.entry(session_key.to_string()).or_default();
-        queue.push(item.clone());
-        let snapshot = queue.clone();
-        (item, snapshot)
+        guard.enqueue(
+            session_key,
+            DirectPromptInput {
+                persona,
+                prompt,
+                effective_body,
+                by,
+                attachments,
+            },
+        )
     }
 
     /// Claim against both names under one lock so an alias cannot bypass the send fence.
-    pub fn claim_queued_prompt_aliases(
+    #[cfg(test)]
+    fn claim_queued_prompt_aliases(
         &self,
         canonical: &str,
         raw: &str,
         prompt_id: &str,
     ) -> Option<QueuedOperatorPrompt> {
+        self.claim_queued_prompt_aliases_inner(canonical, raw, prompt_id, false)
+    }
+
+    fn claim_queued_prompt_aliases_inner(
+        &self,
+        canonical: &str,
+        raw: &str,
+        prompt_id: &str,
+        require_idle: bool,
+    ) -> Option<QueuedOperatorPrompt> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         if guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw) {
+            return None;
+        }
+        if require_idle
+            && (guard.in_flight.contains_key(canonical) || guard.in_flight.contains_key(raw))
+        {
             return None;
         }
         let item = {
@@ -577,7 +662,66 @@ impl HubState {
         Some(item)
     }
 
-    pub fn release_queued_send_aliases(&self, canonical: &str, raw: &str) {
+    /// Claim a queued item and keep its session fenced until the returned guard drops.
+    pub(crate) fn claim_queued_for_dispatch<'a>(
+        &'a self,
+        canonical: &str,
+        raw: &str,
+        prompt_id: &str,
+        require_idle: bool,
+    ) -> Option<(QueuedOperatorPrompt, SessionDispatchGuard<'a>)> {
+        let item =
+            self.claim_queued_prompt_aliases_inner(canonical, raw, prompt_id, require_idle)?;
+        Some((
+            item,
+            SessionDispatchGuard {
+                state: self,
+                canonical: canonical.into(),
+                raw: raw.into(),
+                completed: false,
+            },
+        ))
+    }
+
+    /// Atomically check queue/flight state and claim the same gate used by queued sends.
+    /// An explicit send-now may bypass an existing queue/flight, but never another dispatch.
+    pub(crate) fn admit_direct_prompt<'a>(
+        &'a self,
+        canonical: &str,
+        raw: &str,
+        force: bool,
+        observed_busy: bool,
+        input: DirectPromptInput,
+    ) -> DirectPromptDecision<'a> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let active =
+            guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw);
+        if force && active {
+            return DirectPromptDecision::DispatchBusy;
+        }
+        if !force
+            && (active
+                || observed_busy
+                || guard.in_flight.contains_key(canonical)
+                || guard.in_flight.contains_key(raw)
+                || guard.queues.get(canonical).is_some_and(|q| !q.is_empty())
+                || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
+        {
+            let (item, queue) = guard.enqueue(canonical, input);
+            return DirectPromptDecision::Queued(item, queue);
+        }
+        guard.active_queue_sends.insert(canonical.into());
+        guard.active_queue_sends.insert(raw.into());
+        DirectPromptDecision::Dispatch(SessionDispatchGuard {
+            state: self,
+            canonical: canonical.into(),
+            raw: raw.into(),
+            completed: false,
+        })
+    }
+
+    #[cfg(test)]
+    fn release_queued_send_aliases(&self, canonical: &str, raw: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.active_queue_sends.remove(canonical);
         guard.active_queue_sends.remove(raw);
@@ -992,6 +1136,47 @@ mod tests {
             [first.id.as_str(), second.id.as_str()]
         );
         assert!(state.session_in_flight_unconfirmed("absent"));
+    }
+
+    #[test]
+    fn interrupted_dispatch_claim_fences_session_as_unconfirmed() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let decision = state.admit_direct_prompt(
+                "canonical",
+                "raw",
+                false,
+                false,
+                DirectPromptInput {
+                    persona: None,
+                    prompt: "one".into(),
+                    effective_body: "one".into(),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            let DirectPromptDecision::Dispatch(_claim) = decision else {
+                panic!("expected claim")
+            };
+            panic!("simulated dispatch unwind");
+        }));
+        assert!(result.is_err());
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        let decision = state.admit_direct_prompt(
+            "canonical",
+            "raw",
+            false,
+            false,
+            DirectPromptInput {
+                persona: None,
+                prompt: "two".into(),
+                effective_body: "two".into(),
+                by: "owner".into(),
+                attachments: vec![],
+            },
+        );
+        assert!(matches!(decision, DirectPromptDecision::Queued(_, _)));
     }
 
     #[test]
