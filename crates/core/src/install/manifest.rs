@@ -1323,7 +1323,11 @@ pub(crate) mod tests {
         let full = m.profile_products(Profile::Full).unwrap();
         let lab = m.profile_products(Profile::Lab).unwrap();
         assert!(full.is_subset(&lab));
-        assert_eq!(full.len(), 8, "full is every product the user can pick");
+        assert_eq!(
+            full.len(),
+            Product::ALL.iter().filter(|p| !p.is_hidden()).count(),
+            "full is every product the user can pick"
+        );
         assert!(m.profile_products(Profile::Minimal).unwrap().len() == 1);
     }
 

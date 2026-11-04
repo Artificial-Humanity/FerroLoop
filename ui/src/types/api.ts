@@ -252,7 +252,7 @@ export interface HubSettings {
   subsystems: {
     ferrogate_enabled: boolean;
     ferrostate_enabled: boolean;
-    ferrostep_enabled: boolean;
+    fl_flow_enabled: boolean;
     ferrodeck_enabled?: boolean;
     ferrowire_enabled?: boolean;
     ferrotrack_enabled?: boolean;
@@ -291,7 +291,7 @@ export const DEFAULT_HUB_SETTINGS: HubSettings = {
   subsystems: {
     ferrogate_enabled: true,
     ferrostate_enabled: true,
-    ferrostep_enabled: true,
+    fl_flow_enabled: true,
   },
   notifications: {
     notify_on_pr_review: true,

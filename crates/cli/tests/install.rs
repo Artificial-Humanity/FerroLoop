@@ -151,7 +151,7 @@ fn json_output_carries_the_schema_version_and_the_whole_plan() {
     assert_eq!(v["profile"], "full");
     assert_eq!(v["management"], "unmanaged");
     assert_eq!(v["status"], "ready");
-    assert_eq!(v["products"].as_array().unwrap().len(), 9);
+    assert_eq!(v["products"].as_array().unwrap().len(), 8);
     assert_eq!(v["products"][1]["id"], "ferrostore");
     assert_eq!(v["products"][1]["hidden"], true);
     assert!(v["actions"].as_array().unwrap().iter().all(|a| {
@@ -173,7 +173,7 @@ fn the_same_inputs_give_the_same_bytes_whatever_the_cwd_and_environment() {
         "--profile",
         "lab",
         "--add",
-        "ferrostep",
+        "ferrowatch",
     ];
     let first_text = stdout(w.fl().args(args));
     let first_json = stdout(w.fl().args(args).arg("--json"));

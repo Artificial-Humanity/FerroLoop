@@ -204,9 +204,6 @@ pub fn default_manifest() -> ReleaseManifest {
         .planned_in(FULL_UP),
     ];
 
-    let mut step = entry(Product::Ferrostep);
-    step.requires = ids(&[Product::Ferroloop]);
-
     let all = [
         Product::Ferroloop,
         Product::Ferrowire,
@@ -215,7 +212,6 @@ pub fn default_manifest() -> ReleaseManifest {
         Product::Ferrotrack,
         Product::Ferrowatch,
         Product::Ferrodeck,
-        Product::Ferrostep,
     ];
     let headless = [
         Product::Ferroloop,
@@ -241,7 +237,7 @@ pub fn default_manifest() -> ReleaseManifest {
             store_format_max: STORE_FORMAT_MAX,
         },
         artifacts: Vec::new(),
-        products: vec![loop_, store, wire, state, gate, track, watch, deck, step],
+        products: vec![loop_, store, wire, state, gate, track, watch, deck],
         profiles: vec![
             ProfileEntry {
                 id: Profile::Minimal,

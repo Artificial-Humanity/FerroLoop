@@ -40,7 +40,7 @@ pub(crate) enum Theme {
 pub(crate) struct Subsystems {
     pub ferrogate_enabled: bool,
     pub ferrostate_enabled: bool,
-    pub ferrostep_enabled: bool,
+    pub fl_flow_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -88,7 +88,7 @@ impl Default for Settings {
             subsystems: Subsystems {
                 ferrogate_enabled: true,
                 ferrostate_enabled: true,
-                ferrostep_enabled: true,
+                fl_flow_enabled: true,
             },
             notifications: Notifications {
                 notify_on_pr_review: true,
@@ -136,7 +136,8 @@ pub(crate) struct SettingsPatch {
 pub(crate) struct SubsystemsPatch {
     pub ferrogate_enabled: Option<bool>,
     pub ferrostate_enabled: Option<bool>,
-    pub ferrostep_enabled: Option<bool>,
+    #[serde(alias = "ferrostep_enabled")]
+    pub fl_flow_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -204,7 +205,7 @@ impl Settings {
             let s = &mut next.subsystems;
             set(&mut s.ferrogate_enabled, p.ferrogate_enabled);
             set(&mut s.ferrostate_enabled, p.ferrostate_enabled);
-            set(&mut s.ferrostep_enabled, p.ferrostep_enabled);
+            set(&mut s.fl_flow_enabled, p.fl_flow_enabled);
         }
         if let Some(p) = patch.notifications {
             let n = &mut next.notifications;
@@ -278,11 +279,13 @@ impl Settings {
             "ferrostate_enabled",
             &mut s.subsystems.ferrostate_enabled,
         );
-        flag(
-            "subsystems",
-            "ferrostep_enabled",
-            &mut s.subsystems.ferrostep_enabled,
-        );
+        if let Some(flow) = root.get("subsystems").and_then(|sub| {
+            sub.get("fl_flow_enabled")
+                .and_then(Value::as_bool)
+                .or_else(|| sub.get("ferrostep_enabled").and_then(Value::as_bool))
+        }) {
+            s.subsystems.fl_flow_enabled = flow;
+        }
         flag(
             "notifications",
             "notify_on_pr_review",
@@ -474,7 +477,7 @@ mod tests {
                 "subsystems": {
                     "ferrogate_enabled": true,
                     "ferrostate_enabled": true,
-                    "ferrostep_enabled": true,
+                    "fl_flow_enabled": true,
                 },
                 "notifications": {
                     "notify_on_pr_review": true,
@@ -785,6 +788,32 @@ mod tests {
     }
 
     #[test]
+    fn legacy_flow_setting_is_read_and_only_new_name_is_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"subsystems":{"ferrostep_enabled":false}}"#).unwrap();
+        let saved = serde_json::to_value(load(tmp.path())).unwrap();
+        assert_eq!(saved["subsystems"]["fl_flow_enabled"], false);
+        assert!(saved["subsystems"].get("ferrostep_enabled").is_none());
+        std::fs::write(
+            &path,
+            r#"{"subsystems":{"fl_flow_enabled":true,"ferrostep_enabled":false}}"#,
+        )
+        .unwrap();
+        assert!(load(tmp.path()).subsystems.fl_flow_enabled);
+        let patch: SettingsPatch =
+            serde_json::from_value(json!({"subsystems":{"ferrostep_enabled":false}})).unwrap();
+        assert!(
+            !Settings::default()
+                .merged(patch)
+                .unwrap()
+                .subsystems
+                .fl_flow_enabled
+        );
+    }
+
+    #[test]
     fn partial_and_corrupt_files_fall_back_field_by_field() {
         let tmp = TempDir::new().unwrap();
         let path = settings_path(tmp.path());
@@ -804,7 +833,7 @@ mod tests {
         std::fs::write(&path, doc.to_string()).unwrap();
         let loaded = load(tmp.path());
         assert_eq!(loaded.theme_preference, Theme::Light);
-        assert!(!loaded.subsystems.ferrostep_enabled);
+        assert!(!loaded.subsystems.fl_flow_enabled);
         assert!(loaded.subsystems.ferrogate_enabled);
         assert_eq!(loaded.notifications, Settings::default().notifications);
         assert_eq!(loaded.hub_connection.poll_interval_secs, 10);

@@ -4,7 +4,8 @@ import App, {
   FONT_SCALE_STORAGE_KEY,
   THEME_STORAGE_KEY,
 } from "../App";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, normalizeHubSettings } from "../api/client";
+import { DEFAULT_HUB_SETTINGS } from "../types/api";
 import type { HubWsClient } from "../api/ws";
 import { ArtifactPreviewPane } from "../components/ArtifactPreviewPane";
 import { ChatPane } from "../components/ChatPane";
@@ -41,6 +42,10 @@ function makeStubWsClient(): HubWsClient {
 }
 
 describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
+  it("reads the legacy flow setting while preferring the current key", () => {
+    expect(normalizeHubSettings({ subsystems: { ferrostep_enabled: false } }, DEFAULT_HUB_SETTINGS).subsystems.fl_flow_enabled).toBe(false);
+    expect(normalizeHubSettings({ subsystems: { fl_flow_enabled: true, ferrostep_enabled: false } }, DEFAULT_HUB_SETTINGS).subsystems.fl_flow_enabled).toBe(true);
+  });
   const originalMatchMedia = window.matchMedia;
 
   beforeEach(() => {
@@ -503,7 +508,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
             subsystems: {
               ferrogate_enabled: true,
               ferrostate_enabled: true,
-              ferrostep_enabled: true,
+              fl_flow_enabled: true,
             },
             notifications: {
               notify_on_pr_review: true,
@@ -830,7 +835,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       subsystems: {
         ferrogate_enabled: false,
         ferrostate_enabled: true,
-        ferrostep_enabled: true,
+        fl_flow_enabled: true,
         ferrowire_enabled: false,
       },
     });

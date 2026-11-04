@@ -50,8 +50,8 @@ fn each_profile_selects_its_products() {
         ]
     );
     let full = plan_with(&req(Some(Profile::Full), &[], &[]));
-    assert_eq!(full.products.len(), 9);
-    assert!(ids(&full).contains(&"ferrodeck") && ids(&full).contains(&"ferrostep"));
+    assert_eq!(full.products.len(), 8);
+    assert!(ids(&full).contains(&"ferrodeck"));
     let lab = plan_with(&req(Some(Profile::Lab), &[], &[]));
     assert_eq!(ids(&lab), ids(&full));
     assert!(
@@ -271,7 +271,7 @@ fn an_unsupported_platform_is_refused_before_the_host_is_touched() {
     match &e {
         PlanError::UnsupportedPlatform { host, products } => {
             assert_eq!(host.to_string(), "windows/x86_64");
-            assert_eq!(products.len(), 9);
+            assert_eq!(products.len(), 8);
         }
         other => panic!("{other:?}"),
     }

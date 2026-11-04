@@ -150,6 +150,7 @@ pub struct InstallReceipt {
     pub release: ReceiptRelease,
     pub profile: Profile,
     /// The explicit selection (profile products, plus adds, minus removes).
+    #[serde(deserialize_with = "super::deserialize_installed_products")]
     pub products: Vec<Product>,
     pub layout: ReceiptLayout,
     #[serde(default)]
@@ -495,6 +496,18 @@ pub(crate) mod tests {
                 at_ms: 1,
             }],
         }
+    }
+
+    #[test]
+    fn legacy_ferrostep_receipt_is_read_without_retaining_a_retired_product() {
+        let mut value = serde_json::to_value(full_receipt()).unwrap();
+        value["products"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("ferrostep"));
+        let parsed = InstallReceipt::parse(&value.to_string()).unwrap();
+        assert!(!parsed.to_json().contains("ferrostep"));
+        assert!(parsed.products.contains(&Product::Ferroloop));
     }
 
     #[test]

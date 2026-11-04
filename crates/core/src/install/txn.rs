@@ -116,6 +116,7 @@ pub struct BackupSpec {
 pub struct TxnIntent {
     pub release: ReceiptRelease,
     pub profile: Profile,
+    #[serde(deserialize_with = "super::deserialize_installed_products")]
     pub products: Vec<Product>,
     pub layout: ReceiptLayout,
     pub artifacts: Vec<OwnedArtifact>,
@@ -507,6 +508,20 @@ mod tests {
 
     fn sha(c: char) -> String {
         c.to_string().repeat(64)
+    }
+
+    #[test]
+    fn old_transaction_intent_with_retired_product_remains_readable() {
+        let mut value = serde_json::to_value(intent("0.1.0+aaaaaaaaaaaa")).unwrap();
+        value["products"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("ferrostep"));
+        let restored: TxnIntent = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.products,
+            vec![Product::Ferroloop, Product::Ferrostore]
+        );
     }
 
     fn intent(name: &str) -> TxnIntent {
