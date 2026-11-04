@@ -1648,6 +1648,10 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
     deliver_via_tmux_paste_opts(target, text, false)
 }
 
+/// Pause around the Enter key so the terminal can receive the paste and show its state.
+const TMUX_PASTE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const TMUX_ENTER_SETTLE_DELAY: Duration = Duration::from_millis(50);
+
 /// Paste `text` into `target` and press Enter. With `bracketed`, the paste is a tmux bracketed
 /// paste (`paste-buffer -p`), so the pane's application receives the newlines as pasted text
 /// rather than as Enter presses, and a failed Enter clears the prompt line (`C-u`) so a retry
@@ -1707,7 +1711,7 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
 
     let skip_sleep = std::env::var_os("FL_WIRE_TMUX_BIN").is_some();
     if !skip_sleep {
-        std::thread::sleep(Duration::from_millis(350));
+        std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
     }
 
     let enter_status = Command::new(&tmux)
@@ -1728,7 +1732,7 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
     }
 
     if !skip_sleep {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(TMUX_ENTER_SETTLE_DELAY);
     }
     if let Ok(cap) = Command::new(&tmux)
         .args(["capture-pane", "-p", "-t", target, "-S", "-8"])
@@ -2045,6 +2049,12 @@ mod tests {
     /// for the whole test so a mock binary cannot hide a live revert, and a live
     /// revert cannot run against the host language server.
     static AGY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn tmux_paste_settle_delays_are_short() {
+        assert_eq!(TMUX_PASTE_SETTLE_DELAY, Duration::from_millis(50));
+        assert_eq!(TMUX_ENTER_SETTLE_DELAY, Duration::from_millis(50));
+    }
 
     #[test]
     fn validate_agy_conversation_id_rejects_dot_and_nul() {

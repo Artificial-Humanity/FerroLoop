@@ -930,27 +930,44 @@ mod route_lookup {
     }
 
     #[test]
-    fn a_saved_table_older_than_the_rediscovery_interval_rescans() {
+    fn a_live_saved_route_is_used_even_when_the_table_is_old() {
         let home = TempDir::new().unwrap();
-        save_route(home.path(), "ada", agy("conv-ada"));
-        // Never scanned in this process: the saved table may be any age.
-        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        assert_eq!(conversation(&found), Some((true, "conv-ada".into())));
-        assert_eq!(costs.route_scans, 1);
-
-        let other = TempDir::new().unwrap();
-        save_route(other.path(), "ada", agy("conv-ada"));
+        let (route, _listener) = listening_webhook(home.path(), "live.sock");
+        save_route(home.path(), "ada", route.clone());
         let long_ago = Instant::now()
             .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
             .unwrap();
-        note_route_file_scan(Some(other.path()), long_ago);
-        let (found, costs) = measure(|| lookup_route(Some(other.path()), by_persona("ada")));
-        assert_eq!(conversation(&found), Some((true, "conv-ada".into())));
-        assert_eq!(costs.route_scans, 1, "older than the interval: scanned");
-        // That scan made the table fresh again.
-        let (found, costs) = measure(|| lookup_route(Some(other.path()), by_persona("ada")));
-        assert_eq!(conversation(&found), Some((false, "conv-ada".into())));
-        assert_eq!(costs.route_scans, 0);
+        note_route_file_scan(Some(home.path()), long_ago);
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
+        assert_eq!(found, Some(RouteLookup::Saved(route)));
+        assert_eq!(costs.route_scans, 0, "a live route does not need a scan");
+    }
+
+    #[test]
+    fn an_old_unverifiable_route_is_rescanned() {
+        let home = TempDir::new().unwrap();
+        save_route(home.path(), "ada", agy("conv-ada"));
+        let long_ago = Instant::now()
+            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
+            .unwrap();
+        note_route_file_scan(Some(home.path()), long_ago);
+        let (_, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
+        assert_eq!(costs.route_scans, 1);
+    }
+
+    #[test]
+    fn a_rescan_cannot_return_a_different_session() {
+        let home = TempDir::new().unwrap();
+        save_route(home.path(), "ada", claude("old-sid", 0));
+        host_runs_claude(home.path(), "ada", "old-sid");
+        let query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "new-sid",
+            session_id: Some("new-sid"),
+        };
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), query));
+        assert_eq!(found, None);
+        assert_eq!(costs.route_scans, 1);
     }
 
     #[test]

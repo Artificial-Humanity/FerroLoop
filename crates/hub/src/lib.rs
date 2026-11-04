@@ -5558,7 +5558,12 @@ mod tests {
         );
         assert_eq!(ok.status, 200, "{}", error_text(&ok));
         assert!(!state.is_session_busy_from_turns("ms-ada", &[]));
-        assert_eq!(tmux.log(), "", "an interrupt types nothing into the pane");
+        let log = tmux.log();
+        assert!(
+            !log.lines()
+                .any(|line| line.starts_with("send-keys ") || line.starts_with("paste-buffer ")),
+            "an interrupt types nothing into the pane: {log}"
+        );
         let ok = call(
             &state,
             "POST",

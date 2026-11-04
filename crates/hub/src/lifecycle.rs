@@ -1714,6 +1714,38 @@ fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
     }
 }
 
+/// A stale saved route needs a positive liveness check before it can bypass a rescan.
+/// A process or pane check establishes only the endpoint's liveness, not delivery success.
+fn stale_route_verified_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
+    match route {
+        VendorRoute::Webhook { socket_path } => socket_path.exists(),
+        VendorRoute::Claude { pid, .. }
+            if *pid > 0
+                && home_override.is_none()
+                && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1") =>
+        {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => [tmux_target, tmux_pane]
+            .into_iter()
+            .flatten()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .any(tmux_target_exists),
+        // These do not carry enough identity to validate the endpoint without rediscovery.
+        _ => false,
+    }
+}
+
 /// Where [`lookup_route`] found a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RouteLookup {
@@ -1767,34 +1799,25 @@ fn route_serves_session(route: &VendorRoute, session_id: &str) -> bool {
     }
 }
 
-/// The route for the query's persona, else any route that matches its fallback id. A route in
-/// the saved table is used without a host scan only when all of these hold:
-///
-/// - the hub scanned the host and saved the scan to this route file within fl-wire's
-///   [`ROUTE_REDISCOVERY_INTERVAL`] (the bound the daemon's dispatch uses), so a saved route is
-///   never older than that;
-/// - when the query names a vendor session, the route serves it ([`route_serves_session`]);
-/// - the route passes the cheap liveness check ([`route_looks_live`]).
-///
-/// Otherwise the host is scanned, the scan saved, and the route taken from the scan.
-///
-/// [`ROUTE_REDISCOVERY_INTERVAL`]: fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
+/// Return a saved matching route when its liveness is verified; otherwise rescan.
+/// A recently scanned route may use discovery's existing cheap liveness check. An older route
+/// must have a positive endpoint check; unverifiable routes are rediscovered.
 pub(crate) fn lookup_route(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
 ) -> Option<RouteLookup> {
-    if crate::discovery::saved_routes_fresh(home_override, Instant::now()) {
-        let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
-        if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
-            .filter(|route| {
-                query
-                    .session_id
-                    .is_none_or(|id| route_serves_session(route, id))
-            })
-            .filter(|route| route_looks_live(route, home_override))
-        {
-            return Some(RouteLookup::Saved(route));
-        }
+    let fresh = crate::discovery::saved_routes_fresh(home_override, Instant::now());
+    let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
+    if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
+        .filter(|route| {
+            query
+                .session_id
+                .is_none_or(|id| route_serves_session(route, id))
+        })
+        .filter(|route| route_looks_live(route, home_override))
+        .filter(|route| fresh || stale_route_verified_live(route, home_override))
+    {
+        return Some(RouteLookup::Saved(route));
     }
     rescan_route(home_override, query).map(RouteLookup::Scanned)
 }
@@ -1806,7 +1829,11 @@ pub(crate) fn rescan_route(
     query: RouteQuery<'_>,
 ) -> Option<VendorRoute> {
     let scanned = crate::discovery::scan_and_save_route_table(home_override);
-    route_in(&scanned, query.persona, query.fallback_session_id)
+    route_in(&scanned, query.persona, query.fallback_session_id).filter(|route| {
+        query
+            .session_id
+            .is_none_or(|id| route_serves_session(route, id))
+    })
 }
 
 /// The live route for the query's session (see [`lookup_route`]).
@@ -1841,7 +1868,7 @@ pub(crate) enum Undeliverable {
 ///   [`dispatch_with_rediscovery`]).
 /// - Muse, Grok: the route names tmux targets and none of them exists. fl-wire would then run
 ///   the vendor's headless CLI on the old session id instead.
-/// - Antigravity, Codex: no check; a stale route is bounded by [`lookup_route`] instead.
+/// - Antigravity, Codex: no cheap check; an older saved route is rescanned by [`lookup_route`].
 pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
     match route {
         VendorRoute::Claude { pid, .. } if *pid != 0 => (!Path::new(&format!("/proc/{pid}"))
