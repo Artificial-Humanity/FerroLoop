@@ -128,6 +128,8 @@ struct InFlightPrompt {
     baseline_turn_count: Option<usize>,
     baseline_busy: bool,
     require_observed_completion: bool,
+    /// Queue aliases associated with this specific unwound dispatch, if any.
+    unwind_queue_keys: Option<(String, String)>,
     dispatched_at_ms: i64,
 }
 
@@ -145,6 +147,7 @@ pub(crate) struct SessionDispatchGuard<'a> {
     state: &'a HubState,
     canonical: String,
     raw: String,
+    prompt_id: Option<String>,
     completed: bool,
 }
 
@@ -163,12 +166,29 @@ impl Drop for SessionDispatchGuard<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !self.completed {
+            let mut has_queue_evidence = false;
+            if let Some(prompt_id) = &self.prompt_id {
+                for key in [&self.canonical, &self.raw] {
+                    if let Some(queue) = queues.queues.get_mut(key) {
+                        for item in queue.iter_mut().filter(|item| {
+                            item.id == *prompt_id
+                                && item.delivery_state == QueuedDeliveryState::Sending
+                        }) {
+                            item.delivery_state = QueuedDeliveryState::Unconfirmed;
+                            has_queue_evidence = true;
+                            item.delivery_error = Some("Delivery is unconfirmed after dispatch was interrupted; inspect the session before taking action".into());
+                        }
+                    }
+                }
+            }
             queues.in_flight.insert(
                 self.canonical.clone(),
                 InFlightPrompt {
                     baseline_turn_count: None,
                     baseline_busy: false,
                     require_observed_completion: true,
+                    unwind_queue_keys: has_queue_evidence
+                        .then(|| (self.canonical.clone(), self.raw.clone())),
                     dispatched_at_ms: stamp::now().unix_millis() as i64,
                 },
             );
@@ -678,6 +698,7 @@ impl HubState {
                 state: self,
                 canonical: canonical.into(),
                 raw: raw.into(),
+                prompt_id: Some(prompt_id.to_owned()),
                 completed: false,
             },
         ))
@@ -716,6 +737,7 @@ impl HubState {
             state: self,
             canonical: canonical.into(),
             raw: raw.into(),
+            prompt_id: None,
             completed: false,
         })
     }
@@ -774,12 +796,47 @@ impl HubState {
         prompt_id: &str,
     ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        // A dispatch remains in progress until its in-flight marker is recorded.
+        if guard.active_queue_sends.contains(session_key) {
+            return None;
+        }
         let queue = guard.queues.get_mut(session_key)?;
         let pos = queue.iter().position(|item| {
             item.id == prompt_id && item.delivery_state != QueuedDeliveryState::Sending
         })?;
         let item = queue.remove(pos);
-        Some((item, queue.clone()))
+        let remaining = queue.clone();
+        if item.delivery_state == QueuedDeliveryState::Unconfirmed {
+            // Only unwind-owned fences carry queue aliases. Do not clear a later direct
+            // dispatch's unrelated unknown fence, or another alias's unresolved item.
+            let clear: Vec<String> = guard
+                .in_flight
+                .iter()
+                .filter_map(|(key, flight)| {
+                    let (canonical, raw) = flight.unwind_queue_keys.as_ref()?;
+                    if !flight.require_observed_completion
+                        || (session_key != canonical && session_key != raw)
+                    {
+                        return None;
+                    }
+                    let unresolved = [canonical, raw].into_iter().any(|alias| {
+                        guard.queues.get(alias).is_some_and(|q| {
+                            q.iter().any(|item| {
+                                matches!(
+                                    item.delivery_state,
+                                    QueuedDeliveryState::Sending | QueuedDeliveryState::Unconfirmed
+                                )
+                            })
+                        })
+                    });
+                    (!unresolved).then(|| key.clone())
+                })
+                .collect();
+            for key in clear {
+                guard.in_flight.remove(&key);
+            }
+        }
+        Some((item, remaining))
     }
 
     pub fn update_queued_prompt(
@@ -918,9 +975,28 @@ impl HubState {
                 baseline_turn_count: observation.map(<[TranscriptTurn]>::len),
                 baseline_busy: observation.is_some_and(is_transcript_busy),
                 require_observed_completion: observation.is_none(),
+                unwind_queue_keys: None,
                 dispatched_at_ms: now_ms,
             },
         );
+    }
+
+    /// Bind a queued failure's unknown fence to the queue aliases that own its evidence.
+    pub(crate) fn associate_unconfirmed_queue(&self, canonical: &str, raw: &str, prompt_id: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let has_evidence = [canonical, raw].into_iter().any(|key| {
+            guard.queues.get(key).is_some_and(|q| {
+                q.iter().any(|item| {
+                    item.id == prompt_id && item.delivery_state == QueuedDeliveryState::Unconfirmed
+                })
+            })
+        });
+        if has_evidence
+            && let Some(flight) = guard.in_flight.get_mut(canonical)
+            && flight.require_observed_completion
+        {
+            flight.unwind_queue_keys = Some((canonical.to_string(), raw.to_string()));
+        }
     }
 
     /// Open the store, snapshot, drop the guard, then read the transcript and mark in-flight.
@@ -1180,6 +1256,151 @@ mod tests {
     }
 
     #[test]
+    fn queued_unwind_is_inspectable_and_cancellation_recovers_alias_queue() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (second, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "second".into(),
+            "second".into(),
+            "owner".into(),
+            vec![],
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_item, _claim) = state
+                .claim_queued_for_dispatch("canonical", "raw", &first.id, false)
+                .unwrap();
+            panic!("simulated queued dispatch unwind");
+        }));
+        assert!(result.is_err());
+        let queue = state.session_queue("raw");
+        assert_eq!(queue[0].delivery_state, QueuedDeliveryState::Unconfirmed);
+        assert!(
+            queue[0]
+                .delivery_error
+                .as_ref()
+                .is_some_and(|s| s.contains("unconfirmed"))
+        );
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        let (_, remaining) = state.remove_queued_prompt("raw", &first.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, second.id);
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn cancelling_unconfirmed_never_clears_other_uncertain_or_known_flights() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (first, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "first".into(),
+            "first".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (other, _) = state.enqueue_session_prompt(
+            "canonical",
+            None,
+            "other".into(),
+            "other".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("canonical").unwrap()[0].delivery_state =
+                QueuedDeliveryState::Unconfirmed;
+        }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (_item, _claim) = state
+                .claim_queued_for_dispatch("canonical", "raw", &first.id, false)
+                .unwrap();
+            panic!("queued unwind");
+        }));
+        state.remove_queued_prompt("raw", &first.id).unwrap();
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        state.remove_queued_prompt("canonical", &other.id).unwrap();
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+
+        let (item, _) = state.enqueue_session_prompt(
+            "canonical",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("canonical").unwrap()[0].delivery_state =
+                QueuedDeliveryState::Unconfirmed;
+        }
+        state.mark_session_in_flight_from_observation("canonical", Some(&[]));
+        state.remove_queued_prompt("canonical", &item.id).unwrap();
+        assert!(state.is_session_busy_from_observation("canonical", Some(&[])));
+    }
+
+    #[test]
+    fn cancelling_ambiguous_queue_failure_recovers_only_its_own_unknown_fence() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "raw",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_claimed, claim) = state
+            .claim_queued_for_dispatch("canonical", "raw", &item.id, false)
+            .unwrap();
+        state.finish_queued_prompt(
+            "raw",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed("unknown".into())),
+        );
+        state.mark_session_in_flight_from_observation("canonical", None);
+        state.associate_unconfirmed_queue("canonical", "raw", &item.id);
+        claim.finish();
+        assert!(state.session_in_flight_unconfirmed("canonical"));
+        state.remove_queued_prompt("raw", &item.id).unwrap();
+        assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn cancelling_unconfirmed_item_does_not_clear_unrelated_unknown_direct_send() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "x".into(),
+            "x".into(),
+            "owner".into(),
+            vec![],
+        );
+        {
+            let mut g = state.prompt_queues.lock().unwrap();
+            g.queues.get_mut("ada").unwrap()[0].delivery_state = QueuedDeliveryState::Unconfirmed;
+        }
+        state.mark_session_in_flight_from_observation("ada", None);
+        state.remove_queued_prompt("ada", &item.id).unwrap();
+        assert!(state.session_in_flight_unconfirmed("ada"));
+    }
+
+    #[test]
     fn queued_claim_blocks_concurrent_cancel_drain_and_preserves_uncertain_evidence() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
@@ -1232,6 +1453,8 @@ mod tests {
                 .claim_queued_prompt_aliases("ada", "ada", &first.id)
                 .is_none()
         );
+        assert!(state.remove_queued_prompt("ada", &first.id).is_none());
+        state.release_queued_send_aliases("ada", "ada");
         assert_eq!(
             state.remove_queued_prompt("ada", &first.id).unwrap().0.id,
             first.id

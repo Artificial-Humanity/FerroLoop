@@ -5414,6 +5414,9 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     &mut files,
                 );
                 state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
+                if matches!(delivery_res, Err(PushError::Failed(_))) {
+                    state.associate_unconfirmed_queue(&canonical_id, &session_id, &item.id);
+                }
             }
             claim.finish();
             let sent_data = json!({
@@ -5478,6 +5481,9 @@ fn handle_post_queued_prompt_send_now(
     let queue = state.finish_queued_prompt(&queue_key, prompt_id, delivery_res.clone());
     if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
         state.mark_session_in_flight_released(&canonical_id);
+        if matches!(delivery_res, Err(PushError::Failed(_))) {
+            state.associate_unconfirmed_queue(&canonical_id, &queue_key, prompt_id);
+        }
     }
     claim.finish();
 
