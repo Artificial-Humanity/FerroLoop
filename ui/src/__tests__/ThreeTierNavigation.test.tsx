@@ -281,7 +281,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     // Bottom text mobile-bottom-nav is removed
     expect(screen.queryByTestId("mobile-bottom-nav")).toBeNull();
 
-    // Left panel header defaults to Agent Roster (326px minimum width), stepped down inside cockpit-body below ContextHeader
+    // Left panel header defaults to Agent Roster (360px minimum width), stepped down inside cockpit-body below ContextHeader
     expect(screen.getByTestId("ferrodeck-brand")).toBeInTheDocument();
     const brandIcon = screen.getByTestId("ferrodeck-brand-icon");
     expect(brandIcon).toBeInTheDocument();
@@ -303,11 +303,11 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     expect(within(sidebar).getByTestId("left-panel-pane-title")).toHaveTextContent(
       "Agent Roster",
     );
-    expect(sidebar.style.width).toBe("326px");
+    expect(sidebar.style.width).toBe("360px");
 
     // Drag left-panel-resize-handle to 360px on roster
     const leftResizeHandle = within(sidebar).getByTestId("left-panel-resize-handle");
-    fireEvent.mouseDown(leftResizeHandle, { clientX: 326 });
+    fireEvent.mouseDown(leftResizeHandle, { clientX: 360 });
     fireEvent.mouseMove(window, { clientX: 360 });
     fireEvent.mouseUp(window);
     expect(sidebar.style.width).toBe("360px");

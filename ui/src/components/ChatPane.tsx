@@ -988,6 +988,8 @@ export interface ChatPaneProps {
   agentSettingsOpen?: boolean;
   onOpenAgentSettings?: () => void;
   onCloseAgentSettings?: () => void;
+  returnToSettingsLabel?: string | null;
+  onReturnToSettings?: () => void;
   splitView?: boolean;
   onToggleSplitView?: () => void;
   onOpenMobileRoster?: () => void;
@@ -1118,6 +1120,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   agentSettingsOpen,
   onOpenAgentSettings,
   onCloseAgentSettings,
+  returnToSettingsLabel = null,
+  onReturnToSettings,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -2370,7 +2374,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   return (
-    <section className="fd-pane" data-testid="chat-pane">
+    <section
+      className="fd-pane"
+      data-testid="chat-pane"
+      style={{ minWidth: "360px" }}
+    >
       {/* Toolbar */}
       <div
         className="fd-chat-toolbar"
@@ -4211,6 +4219,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         onOpenDecommissionModal={handleOpenDecommissionModal}
         apiClient={apiClient}
         onAgentsUpdated={onRefresh}
+        returnToSettingsLabel={returnToSettingsLabel}
+        onReturnToSettings={onReturnToSettings}
       />
     </section>
   );

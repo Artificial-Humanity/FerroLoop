@@ -724,6 +724,7 @@ export type SettingsTabId =
   | "system"
   | "products"
   | "runtimes"
+  | "appearance"
   | "accessibility"
   | "auth";
 
@@ -731,19 +732,39 @@ export type ProjectSettingsSubTabId =
   | "overview"
   | "agents"
   | "roles"
+  | "cloud-sessions"
+  | "local-runtimes"
   | "runtimes";
 
-export type AgentsSubTabId = "roster" | "roles" | "runtimes";
+export type AgentsSubTabId =
+  | "roster"
+  | "roles"
+  | "cloud-sessions"
+  | "local-runtimes"
+  | "runtimes";
 
 export type SystemSubTabId = "general" | "storage" | "notifications";
 
 export type ProductsSubTabId = "catalog" | "installer";
+
+export interface SettingsOriginMemento {
+  initialProject: string | null;
+  projectFilter: string;
+  activeTab: SettingsTabId;
+  projectSubTab: ProjectSettingsSubTabId;
+  agentsSubTab: AgentsSubTabId;
+  systemSubTab?: SystemSubTabId;
+  productsSubTab?: ProductsSubTabId;
+}
 
 export interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialTab?: SettingsTabId;
   initialProject?: string | null;
+  initialProjectFilter?: string | null;
+  initialProjectSubTab?: ProjectSettingsSubTabId;
+  initialAgentsSubTab?: AgentsSubTabId;
   agents?: AgentRecord[];
   authority?: HubAuthority | null;
   wsConnected?: boolean;
@@ -753,7 +774,10 @@ export interface SettingsModalProps {
   onOpenNodesModal?: () => void;
   onOpenSpinUpModal?: (initialProject?: string | null) => void;
   onOpenPairingModal?: () => void;
-  onOpenAgentSettings?: (nameKey: string) => void;
+  onOpenAgentSettings?: (
+    nameKey: string,
+    originMemento?: SettingsOriginMemento,
+  ) => void;
   onLogout?: () => void;
   onAgentsUpdated?: () => void;
   onDecommissionAgent?: (
@@ -1182,9 +1206,16 @@ export function inferInstallProfilePreset(
 export function getBulkActionLabel(
   action: BulkSessionAction,
   selectedCount: number,
+  scopedProject?: string | null,
+  scopedAgentCount?: number,
 ): string {
   if (selectedCount > 0) {
     return `${ACTION_VERBS[action]} Selected (${selectedCount})`;
+  }
+  if (scopedProject && scopedProject !== "all") {
+    const countSuffix =
+      typeof scopedAgentCount === "number" ? ` (${scopedAgentCount})` : "";
+    return `${ACTION_VERBS[action]} ${scopedProject}${countSuffix}`;
   }
   return ACTION_LABELS[action];
 }
@@ -1195,11 +1226,15 @@ export async function executeScopedBulkSessionAction(
   selectedAgentKeys?: string[],
   fallbackAgentKeys?: string[],
 ): Promise<BulkSessionActionResponse> {
-  if (
-    (!selectedAgentKeys || selectedAgentKeys.length === 0) &&
-    action !== "prepare" &&
-    action !== "teardown"
-  ) {
+  if (Array.isArray(selectedAgentKeys) && selectedAgentKeys.length === 0) {
+    return {
+      action,
+      total: 0,
+      succeeded: 0,
+      results: [],
+    };
+  }
+  if (!selectedAgentKeys && action !== "prepare" && action !== "teardown") {
     return client.bulkSessionAction(action);
   }
   const targetKeys =
@@ -1245,6 +1280,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClose,
   initialTab = "agents",
   initialProject = null,
+  initialProjectFilter,
+  initialProjectSubTab,
+  initialAgentsSubTab,
   agents: propAgents,
   authority,
   wsConnected = false,
@@ -1301,8 +1339,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
   const [projectSubTab, setProjectSubTab] =
-    useState<ProjectSettingsSubTabId>("overview");
-  const [agentsSubTab, setAgentsSubTab] = useState<AgentsSubTabId>("roster");
+    useState<ProjectSettingsSubTabId>(initialProjectSubTab ?? "overview");
+  const [agentsSubTab, setAgentsSubTab] = useState<AgentsSubTabId>(
+    initialAgentsSubTab ?? "roster",
+  );
   const [systemSubTab, setSystemSubTab] = useState<SystemSubTabId>("general");
   const [productsSubTab, setProductsSubTab] =
     useState<ProductsSubTabId>("catalog");
@@ -1317,7 +1357,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
   const { pinnedProjects } = usePinnedState();
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
-    () => resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
+    () =>
+      resolveProjectFilterValue(
+        initialProjectFilter ?? initialProject,
+        CANONICAL_PROJECTS,
+      ),
   );
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<Set<string>>(
     () => new Set(),
@@ -1502,13 +1546,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   useEffect(() => {
     setSelectedProjectFilter(
-      resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
+      resolveProjectFilterValue(
+        initialProjectFilter ?? initialProject,
+        CANONICAL_PROJECTS,
+      ),
     );
     if (initialProject) {
       setActiveTab("agents");
-      setProjectSubTab("overview");
+      setProjectSubTab(initialProjectSubTab ?? "overview");
     }
-  }, [initialProject]);
+  }, [initialProject, initialProjectFilter, initialProjectSubTab]);
 
   useEffect(() => {
     setArmedAction(null);
@@ -1529,11 +1576,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setRecastModalAgentKey(null);
     setSelectedAgentKeys(new Set());
     setSelectedProjectFilter(
-      resolveProjectFilterValue(initialProject, CANONICAL_PROJECTS),
+      resolveProjectFilterValue(
+        initialProjectFilter ?? initialProject,
+        CANONICAL_PROJECTS,
+      ),
     );
     setActiveTab(initialProject ? "agents" : initialTab);
-    setProjectSubTab("overview");
-    setAgentsSubTab("roster");
+    setProjectSubTab(initialProjectSubTab ?? "overview");
+    setAgentsSubTab(initialAgentsSubTab ?? "roster");
     setSystemSubTab("general");
     setProductsSubTab("catalog");
     setTotpEnrollment(null);
@@ -2299,12 +2349,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const isProjectScoped =
+    Boolean(initialProject) || resolvedProjectFilter !== "all";
+  const scopedProjectName =
+    resolvedProjectFilter !== "all"
+      ? resolvedProjectFilter
+      : initialProject || null;
+
   const handleConfirmBulkAction = async () => {
     if (!armedAction || submitting) return;
     setSubmitting(true);
     setError(null);
     const selectedKeys =
-      selectedAgentKeys.size > 0 ? Array.from(selectedAgentKeys) : undefined;
+      selectedAgentKeys.size > 0
+        ? Array.from(selectedAgentKeys)
+        : isProjectScoped
+          ? filteredAgents.map((a) => a.name_key.toLowerCase())
+          : undefined;
     try {
       let res: BulkSessionActionResponse;
       if (onBulkSessionAction) {
@@ -2603,13 +2664,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
         style={{
-          maxWidth: "740px",
-          width: "95vw",
-          maxHeight: "88vh",
+          width: "920px",
+          maxWidth: "calc(100vw - 32px)",
+          minWidth: "360px",
+          height: "780px",
+          maxHeight: "calc(100vh - 48px)",
+          minHeight: "560px",
           overflow: "hidden",
           display: "flex",
           flexDirection: "column",
           gap: "12px",
+          boxSizing: "border-box",
         }}
       >
         <div
@@ -2623,8 +2688,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             flexShrink: 0,
           }}
         >
-          <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}>
-            Settings &amp; Fleet Operations
+          <h2
+            data-testid="settings-modal-title"
+            style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}
+          >
+            {initialProject
+              ? `Project Settings — ${initialProject}`
+              : "Settings & Fleet Operations"}
           </h2>
           <button
             type="button"
@@ -2638,7 +2708,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </button>
         </div>
 
-        {/* 3-Tab Navigation Header (System & Auth omitted when opened from a Project cog) */}
+        {/* Top-Level Tab Navigation Header (System & Auth omitted when opened from a Project cog) */}
         <div
           role="tablist"
           aria-label="Settings Categories"
@@ -2697,6 +2767,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   Runtimes &amp; Quotas
                 </button>
               )}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "appearance"}
+                data-testid="settings-tab-appearance"
+                className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("appearance")}
+              >
+                Appearance
+              </button>
               <button
                 type="button"
                 role="tab"
@@ -2856,7 +2936,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               data-testid="project-settings-subtab-bar"
               style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+                gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
                 gap: "4px",
                 padding: "3px",
                 borderRadius: "6px",
@@ -2872,7 +2952,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   { id: "overview", label: "Overview & Storage" },
                   { id: "agents", label: "Agents & Bulk Ops" },
                   { id: "roles", label: "Roles" },
-                  { id: "runtimes", label: "Cloud & Local Runtimes" },
+                  { id: "cloud-sessions", label: "Cloud Sessions" },
+                  { id: "local-runtimes", label: "Local & API Runtimes" },
                 ] as const
               ).map((sub) => {
                 const isSelected = projectSubTab === sub.id;
@@ -2908,7 +2989,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               data-testid="agents-subtab-bar"
               style={{
                 display: "grid",
-                gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
                 gap: "4px",
                 padding: "3px",
                 borderRadius: "6px",
@@ -2923,7 +3004,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 [
                   { id: "roster", label: "Roster & Bulk Ops" },
                   { id: "roles", label: "Role Registry" },
-                  { id: "runtimes", label: "Cloud & Local Runtimes" },
+                  { id: "cloud-sessions", label: "Cloud Sessions" },
+                  { id: "local-runtimes", label: "Local & API Runtimes" },
                 ] as const
               ).map((sub) => {
                 const isSelected = agentsSubTab === sub.id;
@@ -3312,7 +3394,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             fontSize: "16px",
                             lineHeight: 1,
                           }}
-                          onClick={() => onOpenAgentSettings?.(ag.name_key)}
+                          onClick={() => {
+                            const originMemento: SettingsOriginMemento = {
+                              initialProject: initialProject ?? null,
+                              projectFilter: resolvedProjectFilter,
+                              activeTab,
+                              projectSubTab,
+                              agentsSubTab,
+                              systemSubTab,
+                              productsSubTab,
+                            };
+                            onOpenAgentSettings?.(ag.name_key, originMemento);
+                          }}
                         >
                           ⚙
                         </button>
@@ -3324,9 +3417,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          {/* Fleet Bulk Session Operations */}
+          {/* Scoped Project or Fleet Bulk Session Operations */}
           <div
             className="fd-card"
+            data-testid="bulk-session-ops-card"
+            data-scope={isProjectScoped ? "project" : "fleet"}
             style={{
               display: "flex",
               flexDirection: "column",
@@ -3336,6 +3431,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           >
             <div>
               <h3
+                data-testid="bulk-session-ops-heading"
                 style={{
                   margin: "0 0 4px 0",
                   fontSize: "13px",
@@ -3344,18 +3440,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   letterSpacing: "0.04em",
                 }}
               >
-                Fleet Bulk Session Operations
+                {isProjectScoped
+                  ? `Project Bulk Session Operations — ${scopedProjectName} (${filteredAgents.length} ${filteredAgents.length === 1 ? "Agent" : "Agents"})`
+                  : "Fleet Bulk Session Operations"}
               </h3>
               <p
+                data-testid="bulk-session-ops-description"
                 style={{
                   margin: 0,
                   fontSize: "12px",
                   color: "var(--text-secondary)",
                 }}
               >
-                Fleet-wide session context operations are isolated here and require
-                explicit two-step confirmation before executing across all active
-                agent sessions.
+                {isProjectScoped
+                  ? `Project-scoped session context operations apply only to active agents in ${scopedProjectName} (${filteredAgents.length} ${filteredAgents.length === 1 ? "agent" : "agents"}) and require explicit two-step confirmation.`
+                  : "Fleet-wide session context operations are isolated here and require explicit two-step confirmation before executing across all active agent sessions."}
               </p>
             </div>
 
@@ -3364,76 +3463,116 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 type="button"
                 className={`fd-btn${armedAction === "compact" ? " fd-btn-active" : ""}`}
                 data-testid="bulk-compact-btn"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (isProjectScoped &&
+                    filteredAgents.length === 0 &&
+                    selectedAgentKeys.size === 0)
+                }
                 onClick={() => {
                   setLastResult(null);
                   setError(null);
                   setArmedAction("compact");
                 }}
               >
-                {selectedAgentKeys.size > 0
-                  ? `Compact Selected (${selectedAgentKeys.size})`
-                  : "Compact All"}
+                {getBulkActionLabel(
+                  "compact",
+                  selectedAgentKeys.size,
+                  isProjectScoped ? scopedProjectName : null,
+                  filteredAgents.length,
+                )}
               </button>
               <button
                 type="button"
                 className="fd-btn fd-btn-danger"
                 data-testid="bulk-clear-btn"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (isProjectScoped &&
+                    filteredAgents.length === 0 &&
+                    selectedAgentKeys.size === 0)
+                }
                 onClick={() => {
                   setLastResult(null);
                   setError(null);
                   setArmedAction("clear");
                 }}
               >
-                {selectedAgentKeys.size > 0
-                  ? `Clear Selected (${selectedAgentKeys.size})`
-                  : "Clear All"}
+                {getBulkActionLabel(
+                  "clear",
+                  selectedAgentKeys.size,
+                  isProjectScoped ? scopedProjectName : null,
+                  filteredAgents.length,
+                )}
               </button>
               <button
                 type="button"
                 className={`fd-btn fd-btn-primary${armedAction === "reforge" ? " fd-btn-active" : ""}`}
                 data-testid="bulk-reforge-btn"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (isProjectScoped &&
+                    filteredAgents.length === 0 &&
+                    selectedAgentKeys.size === 0)
+                }
                 onClick={() => {
                   setLastResult(null);
                   setError(null);
                   setArmedAction("reforge");
                 }}
               >
-                {selectedAgentKeys.size > 0
-                  ? `Reforge Selected (${selectedAgentKeys.size})`
-                  : "Reforge All"}
+                {getBulkActionLabel(
+                  "reforge",
+                  selectedAgentKeys.size,
+                  isProjectScoped ? scopedProjectName : null,
+                  filteredAgents.length,
+                )}
               </button>
               <button
                 type="button"
                 className={`fd-btn${armedAction === "prepare" ? " fd-btn-active" : ""}`}
                 data-testid="bulk-action-prepare-btn"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (isProjectScoped &&
+                    filteredAgents.length === 0 &&
+                    selectedAgentKeys.size === 0)
+                }
                 onClick={() => {
                   setLastResult(null);
                   setError(null);
                   setArmedAction("prepare");
                 }}
               >
-                {selectedAgentKeys.size > 0
-                  ? `Prepare Selected (${selectedAgentKeys.size})`
-                  : "Prepare All"}
+                {getBulkActionLabel(
+                  "prepare",
+                  selectedAgentKeys.size,
+                  isProjectScoped ? scopedProjectName : null,
+                  filteredAgents.length,
+                )}
               </button>
               <button
                 type="button"
                 className={`fd-btn fd-btn-danger${armedAction === "teardown" ? " fd-btn-active" : ""}`}
                 data-testid="bulk-action-teardown-btn"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (isProjectScoped &&
+                    filteredAgents.length === 0 &&
+                    selectedAgentKeys.size === 0)
+                }
                 onClick={() => {
                   setLastResult(null);
                   setError(null);
                   setArmedAction("teardown");
                 }}
               >
-                {selectedAgentKeys.size > 0
-                  ? `Tear Down Selected (${selectedAgentKeys.size})`
-                  : "Tear Down All"}
+                {getBulkActionLabel(
+                  "teardown",
+                  selectedAgentKeys.size,
+                  isProjectScoped ? scopedProjectName : null,
+                  filteredAgents.length,
+                )}
               </button>
             </div>
 
@@ -3452,11 +3591,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
                   <strong>
                     Confirm{" "}
-                    {getBulkActionLabel(armedAction, selectedAgentKeys.size)}:
+                    {getBulkActionLabel(
+                      armedAction,
+                      selectedAgentKeys.size,
+                      isProjectScoped ? scopedProjectName : null,
+                      filteredAgents.length,
+                    )}
+                    :
                   </strong>{" "}
                   {selectedAgentKeys.size > 0
                     ? `Execute ${armedAction} across the ${selectedAgentKeys.size} selected agent session${selectedAgentKeys.size === 1 ? "" : "s"} (${Array.from(selectedAgentKeys).join(", ")}).`
-                    : ACTION_DESCRIPTIONS[armedAction]}
+                    : isProjectScoped
+                      ? `Execute ${armedAction} across the ${filteredAgents.length} ${scopedProjectName} project agent session${filteredAgents.length === 1 ? "" : "s"} (${filteredAgents.map((a) => a.name_key.toLowerCase()).join(", ")}).`
+                      : ACTION_DESCRIPTIONS[armedAction]}
                 </div>
                 <div
                   style={{
@@ -3488,7 +3635,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {submitting
                       ? "Running..."
-                      : `Confirm ${getBulkActionLabel(armedAction, selectedAgentKeys.size)}`}
+                      : `Confirm ${getBulkActionLabel(
+                          armedAction,
+                          selectedAgentKeys.size,
+                          isProjectScoped ? scopedProjectName : null,
+                          filteredAgents.length,
+                        )}`}
                   </button>
                 </div>
               </div>
@@ -3804,19 +3956,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div
             data-testid={
               initialProject
-                ? "project-subpanel-runtimes"
-                : "agents-subpanel-runtimes"
+                ? "project-subpanel-cloud-sessions"
+                : "agents-subpanel-cloud-sessions"
             }
             style={{
               display: (
                 initialProject
-                  ? projectSubTab === "runtimes"
-                  : agentsSubTab === "runtimes"
+                  ? projectSubTab === "cloud-sessions" || projectSubTab === "runtimes"
+                  : agentsSubTab === "cloud-sessions" || agentsSubTab === "runtimes"
               )
                 ? "flex"
                 : "none",
               flexDirection: "column",
               gap: "12px",
+              overflowY: "auto",
+              minHeight: 0,
+              maxHeight: "100%",
             }}
           >
           {/* Record #71: Manage Vendor Cloud Sessions in FerroDeck */}
@@ -3827,6 +3982,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               display: "flex",
               flexDirection: "column",
               gap: "10px",
+              overflowY: "auto",
+              minHeight: 0,
             }}
           >
             <div
@@ -4057,7 +4214,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               ))}
             </div>
           </div>
+          </div>
 
+          <div
+            data-testid={
+              initialProject
+                ? "project-subpanel-local-runtimes"
+                : "agents-subpanel-local-runtimes"
+            }
+            style={{
+              display: (
+                initialProject
+                  ? projectSubTab === "local-runtimes" || projectSubTab === "runtimes"
+                  : agentsSubTab === "local-runtimes" || agentsSubTab === "runtimes"
+              )
+                ? "flex"
+                : "none",
+              flexDirection: "column",
+              gap: "12px",
+              overflowY: "auto",
+              minHeight: 0,
+              maxHeight: "100%",
+            }}
+          >
           {/* Record #72: Local Model & API-Key Agent Lifecycle (Ollama, Lemonade, OpenAI-Compatible) */}
           <div
             className="fd-card"
@@ -4066,6 +4245,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               display: "flex",
               flexDirection: "column",
               gap: "10px",
+              overflowY: "auto",
+              minHeight: 0,
             }}
           >
             <div
@@ -4463,53 +4644,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               gap: "12px",
             }}
           >
-            {/* Appearance & Theme */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "12px",
-                flexWrap: "wrap",
-              }}
-            >
-              <div>
-                <h3
-                  style={{
-                    margin: 0,
-                    fontSize: "12.5px",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                    letterSpacing: "0.04em",
-                  }}
-                >
-                  Appearance &amp; Theme
-                </h3>
-                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
-                  Choose the default color scheme for FerroDeck.
-                </span>
-              </div>
-              <select
-                aria-label="Theme Preference"
-                data-testid="settings-theme-select"
-                className="fd-select fd-mono"
-                value={settings.theme_preference}
-                onChange={(e) => {
-                  setSettingsSaved(false);
-                  setSettings((prev) => ({
-                    ...prev,
-                    theme_preference:
-                      e.target.value as HubSettings["theme_preference"],
-                  }));
-                }}
-                style={{ fontSize: "12px", padding: "5px 10px" }}
-              >
-                <option value="dark">Dark</option>
-                <option value="light">Light</option>
-                <option value="system">System</option>
-              </select>
-            </div>
-
             {/* Time Zone */}
             <div
               style={{
@@ -8792,40 +8926,74 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         )}
 
-        {/* Re-Cast Modal Dialog */}
-        {activeTab === "accessibility" && !initialProject && (
+        {/* Dedicated Top-Level Appearance Tab (Record #109) */}
+        {!initialProject && (
           <div
-            data-testid="settings-accessibility-panel"
+            role="tabpanel"
+            aria-label="Appearance Settings Panel"
+            data-testid="settings-panel-appearance"
             style={{
-              display: "flex",
+              display: activeTab === "appearance" ? "flex" : "none",
               flexDirection: "column",
               gap: "12px",
             }}
           >
-            {/* Section a: Color Theme / Appearance */}
+            {/* Section a: Appearance & Theme */}
             <div
               className="fd-card"
+              data-testid="settings-appearance-theme-card"
               style={{
                 display: "flex",
                 flexDirection: "column",
                 gap: "10px",
               }}
             >
-              <div>
-                <h3
-                  style={{
-                    margin: 0,
-                    fontSize: "12.5px",
-                    fontWeight: 700,
-                    textTransform: "uppercase",
-                    letterSpacing: "0.04em",
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    Appearance &amp; Theme
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Choose the default color scheme for FerroDeck (Dark, Light, or System).
+                  </span>
+                </div>
+                <select
+                  aria-label="Theme Preference"
+                  data-testid="settings-theme-select"
+                  className="fd-select fd-mono"
+                  value={settings.theme_preference}
+                  onChange={(e) => {
+                    const nextMode =
+                      e.target.value as HubSettings["theme_preference"];
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      theme_preference: nextMode,
+                    }));
+                    handleSelectThemeMode(nextMode);
                   }}
+                  style={{ fontSize: "12px", padding: "5px 10px" }}
                 >
-                  Color Theme &amp; Appearance
-                </h3>
-                <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
-                  Select Dark, Light, or System color scheme across FerroDeck.
-                </span>
+                  <option value="dark">Dark</option>
+                  <option value="light">Light</option>
+                  <option value="system">System</option>
+                </select>
               </div>
 
               <div
@@ -8871,106 +9039,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <strong>{resolvedOsTheme}</strong>)
                 </div>
               )}
-            </div>
-
-            {/* Section b: System-Wide Font Size Increase */}
-            <div
-              className="fd-card"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div>
-                  <h3
-                    style={{
-                      margin: 0,
-                      fontSize: "12.5px",
-                      fontWeight: 700,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.04em",
-                    }}
-                  >
-                    System-Wide Font Size Scale
-                  </h3>
-                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
-                    Scale typography from {FONT_SCALE_MIN_PCT}% to {FONT_SCALE_MAX_PCT}% while preserving panel layout integrity.
-                  </span>
-                </div>
-                <span
-                  data-testid="font-scale-current-badge"
-                  className="fd-badge fd-mono"
-                >
-                  {localFontScalePct}%
-                </span>
-              </div>
-
-              <div
-                role="group"
-                aria-label="Font Size Presets"
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  flexWrap: "wrap",
-                }}
-              >
-                {FONT_SCALE_PRESETS.map((pct) => {
-                  const isSelected = localFontScalePct === pct;
-                  return (
-                    <button
-                      key={pct}
-                      type="button"
-                      data-testid={`font-scale-preset-${pct}`}
-                      aria-pressed={isSelected}
-                      className={`fd-btn fd-mono${isSelected ? " fd-btn-active" : ""}`}
-                      onClick={() => handleSelectFontScalePct(pct)}
-                    >
-                      {pct}%
-                    </button>
-                  );
-                })}
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "10px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <input
-                  type="range"
-                  aria-label="Font Size Scale Percentage"
-                  data-testid="font-scale-slider"
-                  min={FONT_SCALE_MIN_PCT}
-                  max={FONT_SCALE_MAX_PCT}
-                  step={FONT_SCALE_STEP_PCT}
-                  value={localFontScalePct}
-                  onChange={(e) => handleSelectFontScalePct(Number(e.target.value))}
-                  style={{ flex: "1 1 180px", minWidth: 0 }}
-                />
-                <button
-                  type="button"
-                  data-testid="font-scale-reset"
-                  className="fd-btn"
-                  disabled={localFontScalePct === 100}
-                  onClick={() => handleSelectFontScalePct(100)}
-                >
-                  Reset (100%)
-                </button>
-              </div>
             </div>
 
             {/* Record #68: System Console Layout Mode Selector */}
@@ -9136,6 +9204,120 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     ) ?? SYSTEM_CONSOLE_LAYOUT_OPTIONS[0]
                   ).panesSummary
                 }
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Accessibility Tab */}
+        {!initialProject && (
+          <div
+            role="tabpanel"
+            aria-label="Accessibility Settings Panel"
+            data-testid="settings-accessibility-panel"
+            style={{
+              display: activeTab === "accessibility" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            {/* System-Wide Font Size Increase */}
+            <div
+              className="fd-card"
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "10px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "8px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "12.5px",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    System-Wide Font Size Scale
+                  </h3>
+                  <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                    Scale typography from {FONT_SCALE_MIN_PCT}% to {FONT_SCALE_MAX_PCT}% while preserving panel layout integrity.
+                  </span>
+                </div>
+                <span
+                  data-testid="font-scale-current-badge"
+                  className="fd-badge fd-mono"
+                >
+                  {localFontScalePct}%
+                </span>
+              </div>
+
+              <div
+                role="group"
+                aria-label="Font Size Presets"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  flexWrap: "wrap",
+                }}
+              >
+                {FONT_SCALE_PRESETS.map((pct) => {
+                  const isSelected = localFontScalePct === pct;
+                  return (
+                    <button
+                      key={pct}
+                      type="button"
+                      data-testid={`font-scale-preset-${pct}`}
+                      aria-pressed={isSelected}
+                      className={`fd-btn fd-mono${isSelected ? " fd-btn-active" : ""}`}
+                      onClick={() => handleSelectFontScalePct(pct)}
+                    >
+                      {pct}%
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  flexWrap: "wrap",
+                }}
+              >
+                <input
+                  type="range"
+                  aria-label="Font Size Scale Percentage"
+                  data-testid="font-scale-slider"
+                  min={FONT_SCALE_MIN_PCT}
+                  max={FONT_SCALE_MAX_PCT}
+                  step={FONT_SCALE_STEP_PCT}
+                  value={localFontScalePct}
+                  onChange={(e) => handleSelectFontScalePct(Number(e.target.value))}
+                  style={{ flex: "1 1 180px", minWidth: 0 }}
+                />
+                <button
+                  type="button"
+                  data-testid="font-scale-reset"
+                  className="fd-btn"
+                  disabled={localFontScalePct === 100}
+                  onClick={() => handleSelectFontScalePct(100)}
+                >
+                  Reset (100%)
+                </button>
               </div>
             </div>
           </div>

@@ -826,8 +826,11 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         data-left-panel-tab={effectiveLeftTab}
         style={
           width
-            ? { width: `${width}px`, minWidth: `${width}px`, position: "relative" }
-            : { position: "relative" }
+            ? {
+                width: `${Math.max(360, width)}px`,
+                minWidth: `${Math.max(360, width)}px`,
+              }
+            : undefined
         }
       >
         <div
