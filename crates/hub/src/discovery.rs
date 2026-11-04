@@ -2139,6 +2139,95 @@ fn codex_auth_path(
     }
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_CODEX_AUTH_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+/// Open the sandbox's Codex credentials without following a replaced path component.
+#[cfg(unix)]
+fn open_sandboxed_codex_auth(home: &Path) -> Option<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let canonical_home = fs::canonicalize(home).ok()?;
+    let root_name = CString::new("/").ok()?;
+    // SAFETY: root_name is a valid C string; ownership of a successful fd is transferred to File.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return None;
+    }
+    // SAFETY: root_fd is a fresh successful descriptor.
+    let mut dir = unsafe { fs::File::from_raw_fd(root_fd) };
+    for component in canonical_home.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => CString::new(name.as_bytes()).ok()?,
+            _ => return None,
+        };
+        // SAFETY: dir owns a live directory fd and name is NUL terminated.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: fd is fresh and ownership is transferred once.
+        dir = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    let codex = CString::new(".codex").ok()?;
+    // SAFETY: dir owns a live directory fd and codex is a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            codex.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is fresh and ownership is transferred once.
+    let codex_dir = unsafe { fs::File::from_raw_fd(fd) };
+    #[cfg(test)]
+    BEFORE_CODEX_AUTH_OPEN.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    let auth = CString::new("auth.json").ok()?;
+    // SAFETY: codex_dir is a live directory fd and auth is a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            codex_dir.as_raw_fd(),
+            auth.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is fresh and ownership is transferred once.
+    Some(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_sandboxed_codex_auth(_home: &Path) -> Option<fs::File> {
+    // Without descriptor-anchored traversal, an override cannot be safely confined.
+    None
+}
+
 /// Read only the plan claim from Codex's current account file. The token is never returned
 /// or included in an error. A home override is hermetic and ignores ambient CODEX_HOME.
 fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
@@ -2146,30 +2235,33 @@ fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
     use std::io::Read as _;
 
     const MAX_AUTH_BYTES: u64 = 256 * 1024;
-    let path = codex_auth_path(
-        home_override,
-        std::env::var_os("CODEX_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    )?;
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Open the reparse point itself rather than following a replaced auth.json link.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    #[cfg(not(any(unix, windows)))]
-    if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
-        return None;
-    }
-    let file = options.open(path).ok()?;
+    let file = if let Some(home) = home_override {
+        open_sandboxed_codex_auth(home)?
+    } else {
+        let path = codex_auth_path(
+            None,
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        #[cfg(not(any(unix, windows)))]
+        if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+            return None;
+        }
+        options.open(path).ok()?
+    };
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_AUTH_BYTES {
         return None;
@@ -8838,6 +8930,40 @@ mod tests {
         assert_eq!(quota.tier.as_deref(), Some("pro"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_override_directory_swap_never_reads_outside_home() {
+        use base64::Engine as _;
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dir = home.path().join(".codex");
+        fs::create_dir(&dir).unwrap();
+        let make_auth = |plan: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string()
+        };
+        fs::write(dir.join("auth.json"), make_auth("plus")).unwrap();
+        fs::write(outside.path().join("auth.json"), make_auth("enterprise")).unwrap();
+        let original = dir.clone();
+        let parked = home.path().join("old-codex");
+        let target = outside.path().to_owned();
+        BEFORE_CODEX_AUTH_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&original, &parked).unwrap();
+                symlink(&target, &original).unwrap();
+            }))
+        });
+        assert_ne!(
+            codex_auth_plan(Some(home.path())).as_deref(),
+            Some("enterprise")
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn codex_auth_plan_overrides_stale_rollout_without_changing_windows() {
         use base64::Engine;
@@ -8861,6 +8987,7 @@ mod tests {
         assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_auth_invalid_or_missing_falls_back_and_rotation_is_live() {
         use base64::Engine;
@@ -8901,6 +9028,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn codex_auth_plan_reaches_by_id_and_account_quota() {
         use base64::Engine;
@@ -8921,6 +9049,15 @@ mod tests {
         let account = quota_for_resolved_route("codex", None, Some(home.path()), id).unwrap();
         assert_eq!(account.tier.as_deref(), Some("pro"));
         assert!(account.primary_window.is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn sandboxed_auth_without_anchored_open_fails_closed() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
     }
 
     #[cfg(unix)]
