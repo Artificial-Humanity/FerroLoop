@@ -1767,59 +1767,36 @@ fn route_serves_session(route: &VendorRoute, session_id: &str) -> bool {
     }
 }
 
-/// A saved endpoint can be reused only while its discovery scan is fresh. A live tmux
-/// window alone does not prove that it still hosts the saved vendor session; older routes
-/// require rediscovery even when their endpoint still exists.
+/// The route for the query's persona, else any route that matches its fallback id. A route in
+/// the saved table is used without a host scan only when all of these hold:
+///
+/// - the hub scanned the host and saved the scan to this route file within fl-wire's
+///   [`ROUTE_REDISCOVERY_INTERVAL`] (the bound the daemon's dispatch uses), so a saved route is
+///   never older than that;
+/// - when the query names a vendor session, the route serves it ([`route_serves_session`]);
+/// - the route passes the cheap liveness check ([`route_looks_live`]).
+///
+/// Otherwise the host is scanned, the scan saved, and the route taken from the scan.
+///
+/// [`ROUTE_REDISCOVERY_INTERVAL`]: fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL
 pub(crate) fn lookup_route(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
 ) -> Option<RouteLookup> {
-    let fresh = crate::discovery::saved_routes_fresh(home_override, Instant::now());
-    let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
-    let candidate = route_in(&saved, query.persona, query.fallback_session_id).filter(|route| {
-        query.session_id.is_none_or(|id| {
-            route_serves_session(route, id)
-                || (fresh && freshly_scanned_muse_placeholder(route, query.persona, id))
-        })
-    });
-    // If a route had a tmux endpoint but it died, discovery can retain its vendor session id
-    // while clearing the target. Never let that turn into an accidental headless invocation.
-    let tmux_live = candidate.as_ref().and_then(|route| match route {
-        VendorRoute::Muse {
-            tmux_target,
-            tmux_pane,
-            ..
-        }
-        | VendorRoute::Grok {
-            tmux_target,
-            tmux_pane,
-            ..
-        } if [tmux_target, tmux_pane]
-            .into_iter()
-            .flatten()
-            .any(|s| !s.trim().is_empty()) =>
+    if crate::discovery::saved_routes_fresh(home_override, Instant::now()) {
+        let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
+        if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
+            .filter(|route| {
+                query
+                    .session_id
+                    .is_none_or(|id| route_serves_session(route, id))
+            })
+            .filter(|route| route_looks_live(route, home_override))
         {
-            Some(tmux_route_has_live_target(route))
+            return Some(RouteLookup::Saved(route));
         }
-        _ => None,
-    });
-    let dead_tmux = tmux_live == Some(false);
-    if let Some(route) = candidate
-        .as_ref()
-        .filter(|route| !dead_tmux && route_looks_live(route, home_override) && fresh)
-    {
-        return Some(RouteLookup::Saved(route.clone()));
     }
-    let scanned = rescan_route(home_override, query)?;
-    if dead_tmux
-        && candidate
-            .as_ref()
-            .is_some_and(|old| same_tmux_vendor_session(old, &scanned))
-        && !tmux_route_has_live_target(&scanned)
-    {
-        return None;
-    }
-    Some(RouteLookup::Scanned(scanned))
+    rescan_route(home_override, query).map(RouteLookup::Scanned)
 }
 
 /// Scan the host for the session's route (never from the shared scan cache), save what the scan
@@ -1829,72 +1806,7 @@ pub(crate) fn rescan_route(
     query: RouteQuery<'_>,
 ) -> Option<VendorRoute> {
     let scanned = crate::discovery::scan_and_save_route_table(home_override);
-    route_in(&scanned, query.persona, query.fallback_session_id).filter(|route| {
-        query.session_id.is_none_or(|id| {
-            route_serves_session(route, id)
-                || freshly_scanned_muse_placeholder(route, query.persona, id)
-        })
-    })
-}
-
-/// Discovery names a live Muse window with no transcript `muse-<persona>`. This placeholder
-/// binds only the scanned persona and its exact live window; it is not a vendor session ID.
-fn freshly_scanned_muse_placeholder(
-    route: &VendorRoute,
-    persona: Option<&str>,
-    session_id: &str,
-) -> bool {
-    let Some(persona) = persona else {
-        return false;
-    };
-    if session_id != format!("muse-{persona}") {
-        return false;
-    }
-    match route {
-        VendorRoute::Muse {
-            session_id,
-            tmux_target: Some(target),
-            ..
-        } if session_id.is_empty() => {
-            let target_for_persona = target == &format!("muse:{persona}")
-                || target.split_once(':').is_some_and(|(session, window)| {
-                    session.eq_ignore_ascii_case(persona) && window == "muse"
-                });
-            target_for_persona && tmux_target_exists(target)
-        }
-        _ => false,
-    }
-}
-
-fn same_tmux_vendor_session(a: &VendorRoute, b: &VendorRoute) -> bool {
-    match (a, b) {
-        (VendorRoute::Muse { session_id: x, .. }, VendorRoute::Muse { session_id: y, .. })
-        | (VendorRoute::Grok { session_id: x, .. }, VendorRoute::Grok { session_id: y, .. }) => {
-            x == y
-        }
-        _ => false,
-    }
-}
-
-fn tmux_route_has_live_target(route: &VendorRoute) -> bool {
-    match route {
-        VendorRoute::Muse {
-            tmux_target,
-            tmux_pane,
-            ..
-        }
-        | VendorRoute::Grok {
-            tmux_target,
-            tmux_pane,
-            ..
-        } => [tmux_target, tmux_pane]
-            .into_iter()
-            .flatten()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .any(tmux_target_exists),
-        _ => false,
-    }
+    route_in(&scanned, query.persona, query.fallback_session_id)
 }
 
 /// The live route for the query's session (see [`lookup_route`]).
@@ -1929,7 +1841,7 @@ pub(crate) enum Undeliverable {
 ///   [`dispatch_with_rediscovery`]).
 /// - Muse, Grok: the route names tmux targets and none of them exists. fl-wire would then run
 ///   the vendor's headless CLI on the old session id instead.
-/// - Antigravity, Codex: no cheap check; an older saved route is rescanned by [`lookup_route`].
+/// - Antigravity, Codex: no check; a stale route is bounded by [`lookup_route`] instead.
 pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
     match route {
         VendorRoute::Claude { pid, .. } if *pid != 0 => (!Path::new(&format!("/proc/{pid}"))
@@ -1962,23 +1874,11 @@ pub(crate) fn undeliverable(route: &VendorRoute) -> Option<Undeliverable> {
     }
 }
 
-/// Test an exact window with `list-panes`: display-message falls back to the current window.
+/// `true` when tmux knows `target` (the binary fl-wire uses: `FL_WIRE_TMUX_BIN`, else `tmux`).
 fn tmux_target_exists(target: &str) -> bool {
-    let exact = if !target.contains(':')
-        && !target.is_empty()
-        && !target.starts_with(['=', '@', '%', '$'])
-        && !target.bytes().all(|b| b.is_ascii_digit())
-    {
-        format!("={target}")
-    } else {
-        fl_wire::dispatcher::tmux_exact_target(target)
-    };
-    let output = if exact != target || target.contains(':') || target.starts_with('=') {
-        tmux_stdout(&["list-panes", "-t", &exact, "-F", "#{pane_id}"])
-    } else {
-        tmux_stdout(&["display-message", "-p", "-t", target, "#{pane_id}"])
-    };
-    output.is_some_and(|s| !s.trim().is_empty())
+    let mut cmd = Command::new(tmux_bin());
+    cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
+    command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
 }
 
 /// Send to the session's route; `None` when the session has no route.
@@ -1991,9 +1891,8 @@ fn tmux_target_exists(target: &str) -> bool {
 ///
 /// `send` runs a second time only when its first run on a saved route failed with
 /// [`PushError::NotConnected`] (the receiver was never reached, so nothing was delivered) and a
-/// scan then finds a different route. A gone tmux target never falls back to the same session's
-/// headless command. Every other failure of `send` is returned as it is, never retried: by then
-/// part of the delivery may have landed.
+/// scan then finds a different route. Every other failure of `send` is returned as it is, never
+/// retried: by then part of the delivery may have landed.
 pub(crate) fn dispatch_with_rediscovery_typed<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
@@ -2001,17 +1900,7 @@ pub(crate) fn dispatch_with_rediscovery_typed<T>(
 ) -> Option<Result<T, PushError>> {
     let (route, from_saved) = match lookup_route(home_override, query)? {
         RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
-            let refreshed = rescan_route(home_override, query);
-            if undeliverable(&saved) == Some(Undeliverable::PaneGone)
-                && refreshed.as_ref().is_none_or(|new| {
-                    same_tmux_vendor_session(&saved, new) && !tmux_route_has_live_target(new)
-                })
-            {
-                return Some(Err(PushError::NotConnected(
-                    "the session's tmux target no longer exists".to_string(),
-                )));
-            }
-            (refreshed.unwrap_or(saved), false)
+            (rescan_route(home_override, query).unwrap_or(saved), false)
         }
         RouteLookup::Saved(saved) => (saved, true),
         RouteLookup::Scanned(scanned) => (scanned, false),

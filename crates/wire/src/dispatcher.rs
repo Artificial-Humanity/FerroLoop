@@ -1592,7 +1592,7 @@ pub(crate) fn tmux_bin() -> PathBuf {
 /// `=session:=window` (a trailing `.pane` index or `.%id` is kept), which resolves only to a
 /// window of exactly that name or not at all. A pane id (`%3`), a window id (`@2`), a numeric
 /// window index, a bare session name and a target that already carries `=` are returned as given.
-pub fn tmux_exact_target(target: &str) -> String {
+pub(crate) fn tmux_exact_target(target: &str) -> String {
     let Some((session, rest)) = target.split_once(':') else {
         return target.to_string();
     };

@@ -997,130 +997,27 @@ mod route_lookup {
     }
 
     #[test]
-    fn a_stale_live_webhook_is_rescanned_without_connecting() {
-        let home = TempDir::new().unwrap();
-        let (route, _listener) = listening_webhook(home.path(), "live.sock");
-        save_route(home.path(), "ada", route.clone());
-        let long_ago = Instant::now()
-            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
-            .unwrap();
-        note_route_file_scan(Some(home.path()), long_ago);
-        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        assert_eq!(found, Some(RouteLookup::Scanned(route)));
-        assert_eq!(
-            costs.route_scans, 1,
-            "a pathname cannot verify listener identity"
-        );
-        assert!(
-            connections(&_listener).is_empty(),
-            "lookup must not connect"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_rebound_non_listening_webhook_does_not_reuse_the_old_listener() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
-
-        let home = TempDir::new().unwrap();
-        let socket_path = home.path().join("rebound.sock");
-        let old_listener = UnixListener::bind(&socket_path).unwrap();
-        std::fs::remove_file(&socket_path).unwrap();
-        // Bind another stream socket at the same pathname, but deliberately do not listen.
-        // SAFETY: socket returns an owned descriptor; sockaddr_un is initialized before bind.
-        let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-        assert!(raw_fd >= 0, "{}", std::io::Error::last_os_error());
-        // SAFETY: socket returned a valid, uniquely owned descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        let path_bytes = socket_path.as_os_str().as_bytes();
-        // SAFETY: zero is a valid initial representation for sockaddr_un.
-        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        assert!(path_bytes.len() < addr.sun_path.len());
-        for (dest, src) in addr.sun_path.iter_mut().zip(path_bytes) {
-            *dest = *src as libc::c_char;
-        }
-        // SAFETY: addr is a fully initialized sockaddr_un and remains alive for the call.
-        let ret = unsafe {
-            libc::bind(
-                std::os::fd::AsRawFd::as_raw_fd(&fd),
-                (&raw const addr).cast(),
-                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
-        assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
-        save_route(home.path(), "ada", VendorRoute::Webhook { socket_path });
-        host_runs_claude(home.path(), "ada", "new-sid");
-        let long_ago = Instant::now()
-            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
-            .unwrap();
-        note_route_file_scan(Some(home.path()), long_ago);
-        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        assert!(
-            matches!(found, Some(RouteLookup::Scanned(ref route)) if claude_session_id(route) == "new-sid"),
-            "{found:?}"
-        );
-        assert_eq!(costs.route_scans, 1);
-        assert!(
-            connections(&old_listener).is_empty(),
-            "liveness must not send a probe"
-        );
-    }
-
-    #[test]
-    fn a_stale_webhook_without_a_listener_rescans_the_live_route() {
-        let home = TempDir::new().unwrap();
-        let old = refusing_webhook(home.path(), "stale.sock");
-        save_route(home.path(), "ada", old);
-        host_runs_claude(home.path(), "ada", "new-sid");
-        let replacement = UnixListener::bind(home.path().join("new.sock")).unwrap();
-        let long_ago = Instant::now()
-            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
-            .unwrap();
-        note_route_file_scan(Some(home.path()), long_ago);
-        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        let Some(RouteLookup::Scanned(route)) = found else {
-            panic!("expected rescan: {found:?}");
-        };
-        assert_eq!(claude_session_id(&route), "new-sid");
-        assert_eq!(costs.route_scans, 1);
-        let chosen = dispatch_once(Some(home.path()), by_persona("ada"), |route| {
-            Ok::<_, String>(route.clone())
-        });
-        assert!(matches!(chosen, Some(Ok(ref route)) if claude_session_id(route) == "new-sid"));
-        assert!(
-            connections(&replacement).is_empty(),
-            "route verification must not connect"
-        );
-    }
-
-    #[test]
-    fn an_old_unverifiable_route_is_rescanned() {
+    fn a_saved_table_older_than_the_rediscovery_interval_rescans() {
         let home = TempDir::new().unwrap();
         save_route(home.path(), "ada", agy("conv-ada"));
+        // Never scanned in this process: the saved table may be any age.
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
+        assert_eq!(conversation(&found), Some((true, "conv-ada".into())));
+        assert_eq!(costs.route_scans, 1);
+
+        let other = TempDir::new().unwrap();
+        save_route(other.path(), "ada", agy("conv-ada"));
         let long_ago = Instant::now()
             .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
             .unwrap();
-        note_route_file_scan(Some(home.path()), long_ago);
-        let (_, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        assert_eq!(costs.route_scans, 1);
-    }
-
-    #[test]
-    fn a_rescan_cannot_return_a_different_session() {
-        let home = TempDir::new().unwrap();
-        save_route(home.path(), "ada", claude("old-sid", 0));
-        host_runs_claude(home.path(), "ada", "old-sid");
-        let query = RouteQuery {
-            persona: Some("ada"),
-            fallback_session_id: "new-sid",
-            session_id: Some("new-sid"),
-        };
-        let (found, costs) = measure(|| lookup_route(Some(home.path()), query));
-        assert_eq!(found, None);
-        assert_eq!(costs.route_scans, 1);
+        note_route_file_scan(Some(other.path()), long_ago);
+        let (found, costs) = measure(|| lookup_route(Some(other.path()), by_persona("ada")));
+        assert_eq!(conversation(&found), Some((true, "conv-ada".into())));
+        assert_eq!(costs.route_scans, 1, "older than the interval: scanned");
+        // That scan made the table fresh again.
+        let (found, costs) = measure(|| lookup_route(Some(other.path()), by_persona("ada")));
+        assert_eq!(conversation(&found), Some((false, "conv-ada".into())));
+        assert_eq!(costs.route_scans, 0);
     }
 
     #[test]
