@@ -62,6 +62,40 @@ impl AdmitRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PermitId([u8; 16]);
+impl PermitId {
+    /// Canonical transport encoding; possession of this identifier is not authorization.
+    pub fn to_wire(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(32);
+        for b in self.0 {
+            write!(out, "{b:02x}").expect("writing to String cannot fail");
+        }
+        out
+    }
+    /// Parse exactly 32 lowercase hexadecimal digits.
+    pub fn from_wire(input: &str) -> Option<Self> {
+        let bytes = input.as_bytes();
+        if bytes.len() != 32
+            || !bytes
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        {
+            return None;
+        }
+        let mut out = [0; 16];
+        for (dst, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            let hex = |b: u8| {
+                if b.is_ascii_digit() {
+                    b - b'0'
+                } else {
+                    b - b'a' + 10
+                }
+            };
+            *dst = (hex(pair[0]) << 4) | hex(pair[1]);
+        }
+        Some(Self(out))
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerIdentity {
     pub pid: u32,
@@ -229,6 +263,9 @@ struct Fence {
 struct State {
     generation: Option<u64>,
     reconciled: bool,
+    /// A revocation whose scope could not be established must never be erased by
+    /// an in-progress initial reconciliation.
+    revocation_failed: bool,
     live: BTreeMap<PermitId, LivePermit>,
     fences: Vec<Fence>,
 }
@@ -497,7 +534,9 @@ impl DispatchAuthority for BrokerState {
             Ok(pair) => pair,
             Err(error) => {
                 // If aliases cannot be authenticated, do not leave an equivalent scope open.
-                self.state()?.generation = None;
+                let mut state = self.state()?;
+                state.generation = None;
+                state.revocation_failed = true;
                 return Err(error);
             }
         };
@@ -506,7 +545,9 @@ impl DispatchAuthority for BrokerState {
             || !scope.is_subset(&expanded)
             || expanded.iter().any(|s| !s.valid())
         {
-            self.state()?.generation = None;
+            let mut state = self.state()?;
+            state.generation = None;
+            state.revocation_failed = true;
             return Err(GateError::DispatchAuthority("invalid revocation aliases"));
         }
         let (index, ready) = {
@@ -568,7 +609,12 @@ impl DispatchAuthority for BrokerState {
             return Err(GateError::DispatchAuthority("invalid authority generation"));
         }
         let mut s = self.state()?;
-        if s.reconciled || !s.live.is_empty() || !s.fences.is_empty() || s.generation.is_some() {
+        if s.reconciled
+            || s.revocation_failed
+            || !s.live.is_empty()
+            || !s.fences.is_empty()
+            || s.generation.is_some()
+        {
             return Err(GateError::DispatchAuthority("authority cannot be reopened"));
         }
         s.generation = Some(generation);
@@ -688,6 +734,91 @@ mod tests {
     }
     fn scope(secret: &str) -> BTreeSet<ScopeKey> {
         BTreeSet::from([ScopeKey::Secret(secret.into())])
+    }
+
+    #[test]
+    fn permit_id_wire_encoding_is_canonical_and_bounded() {
+        let id = PermitId([0xab; 16]);
+        assert_eq!(id.to_wire(), "abababababababababababababababab");
+        assert_eq!(PermitId::from_wire(&id.to_wire()), Some(id));
+        assert_eq!(
+            PermitId::from_wire("ABABABABABABABABABABABABABABABAB"),
+            None
+        );
+        assert_eq!(PermitId::from_wire("abab"), None);
+        assert_eq!(
+            PermitId::from_wire("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            None
+        );
+    }
+
+    struct BlockingReconcile {
+        source: TestSource,
+        entered: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl AuthoritySource for BlockingReconcile {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            let generation = self.source.reconcile()?;
+            self.entered.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            Ok(generation)
+        }
+        fn verify_admission(&self, r: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.source.verify_admission(r)
+        }
+        fn resolve_revocation(
+            &self,
+            s: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            self.source.resolve_revocation(s)
+        }
+        fn persist_fence(&self, s: &BTreeSet<ScopeKey>, r: &str) -> Result<(), GateError> {
+            self.source.persist_fence(s, r)
+        }
+        fn worker_terminated(
+            &self,
+            w: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(w)
+        }
+        fn request_cancellation(&self, id: &PermitId, w: &WorkerIdentity) -> Result<(), GateError> {
+            self.source.request_cancellation(id, w)
+        }
+    }
+
+    #[test]
+    fn failed_revoke_during_initial_reconcile_never_unseals() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(BlockingReconcile {
+            source: TestSource::default(),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        source.source.aliases_failed.store(true, Ordering::SeqCst);
+        let broker = Arc::new(
+            BrokerState::new(
+                source,
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.reconcile())
+        };
+        entered_rx.recv().unwrap();
+        assert!(
+            broker
+                .revoke(&scope("KEY"), "owner", Duration::ZERO)
+                .is_err()
+        );
+        resume_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
+        assert!(broker.admit(&AdmitRequest::secret("KEY")).is_err());
     }
 
     #[test]
