@@ -41,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 pub struct MemStore {
     inner: RefCell<Inner>,
+    pub(crate) control_ledger: std::sync::Mutex<crate::routine_store::ControlLedger>,
 }
 
 const LABEL: &str = "memory";
