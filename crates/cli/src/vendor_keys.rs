@@ -9,12 +9,12 @@
 //! is written to the Vault's audit log. Nothing here widens that policy: a secret the owner has
 //! not opened to `fl-exec` for the vendor's host stays closed, and the attempt is refused.
 //!
-//! ⚠ Every failure is `None` and says nothing: no Vault, no master key, a missing, expired or
-//! tampered secret, a policy denial. The key is never printed, logged or put in an error, and
-//! nothing here creates a Vault or a master key as a side effect of a read.
+//! ⚠ An incompatible usage class is returned as a typed refusal. Other unavailable or denied
+//! keys return `None`; the key is never printed, logged or put in an error, and nothing here
+//! creates a Vault or a master key as a side effect of a read.
 
 use fl_core::vendor::{VendorDescriptor, VendorTransport};
-use fl_exec::adapters::ApiKeyResolver;
+use fl_exec::adapters::{ApiKeyError, ApiKeyResolver};
 use fl_gate::{
     ProxyRequest, Vault, load_or_init_master_key, normalize_secret_name, prepare_proxied_request,
     resolve_master_key_path, resolve_vault_path,
@@ -38,7 +38,7 @@ const KEY_HEADER: &str = "x-fl-key";
 /// else `$XDG_DATA_HOME` / `$XDG_CONFIG_HOME` / `$HOME`.
 pub fn vault_key_resolver(base_url: Option<String>) -> ApiKeyResolver {
     Arc::new(move |d: &VendorDescriptor| {
-        resolve_key(
+        resolve_key_checked(
             d,
             base_url.as_deref(),
             &|name| std::env::var(name).ok(),
@@ -49,13 +49,13 @@ pub fn vault_key_resolver(base_url: Option<String>) -> ApiKeyResolver {
 }
 
 /// [`vault_key_resolver`] with the environment and the Vault files named by the caller.
-fn resolve_key(
+fn resolve_key_checked(
     d: &VendorDescriptor,
     base_url: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
     vault_path: &Path,
     key_path: &Path,
-) -> Option<String> {
+) -> Result<Option<String>, ApiKeyError> {
     let VendorTransport::HttpApi {
         default_base_url,
         vault_secret_name,
@@ -63,15 +63,20 @@ fn resolve_key(
         ..
     } = &d.transport
     else {
-        return None;
+        return Ok(None);
     };
     if let Some(name) = env_key_name
         && let Some(value) = env(name).map(|v| v.trim().to_string())
         && !value.is_empty()
     {
-        return Some(value);
+        return Ok(Some(value));
     }
-    let secret = normalize_secret_name(vault_secret_name.as_deref()?).ok()?;
+    let Some(secret) = vault_secret_name
+        .as_deref()
+        .and_then(|name| normalize_secret_name(name).ok())
+    else {
+        return Ok(None);
+    };
     let url = base_url.unwrap_or(default_base_url);
     let env_master = env(MASTER_KEY_ENV);
     from_vault(&secret, url, env_master.as_deref(), vault_path, key_path)
@@ -95,13 +100,17 @@ fn from_vault(
     env_master: Option<&str>,
     vault_path: &Path,
     key_path: &Path,
-) -> Option<String> {
+) -> Result<Option<String>, ApiKeyError> {
     // `load_or_init_master_key` would create a master key; a read must not.
     if !vault_path.is_file() || !master_key_exists(env_master, key_path) {
-        return None;
+        return Ok(None);
     }
-    let master_key = load_or_init_master_key(key_path).ok()?;
-    let vault = Vault::open(vault_path, master_key).ok()?;
+    let Some(master_key) = load_or_init_master_key(key_path).ok() else {
+        return Ok(None);
+    };
+    let Some(vault) = Vault::open(vault_path, master_key).ok() else {
+        return Ok(None);
+    };
     let request = ProxyRequest {
         method: "POST".into(),
         url: url.to_string(),
@@ -117,9 +126,29 @@ fn from_vault(
         caller_agent: Some(CALLER.to_string()),
         timeout_secs: None,
     };
-    let prepared = prepare_proxied_request(&vault, &request).ok()?;
-    let key = prepared.headers.get(KEY_HEADER)?.trim().to_string();
-    (!key.is_empty()).then_some(key)
+    let prepared = match prepare_proxied_request(&vault, &request) {
+        Ok(value) => value,
+        Err(fl_gate::GateError::UsageMismatch { .. }) => return Err(ApiKeyError::UsageMismatch),
+        Err(_) => return Ok(None),
+    };
+    let Some(key) = prepared.headers.get(KEY_HEADER) else {
+        return Ok(None);
+    };
+    let key = key.trim().to_string();
+    Ok((!key.is_empty()).then_some(key))
+}
+
+#[cfg(test)]
+fn resolve_key(
+    d: &VendorDescriptor,
+    base_url: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+    vault_path: &Path,
+    key_path: &Path,
+) -> Option<String> {
+    resolve_key_checked(d, base_url, env, vault_path, key_path)
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -189,7 +218,10 @@ mod tests {
             })
             .unwrap();
         let d = vendor(None, Some("VK_KEY"), "https://api.example.com/v1");
-        assert_eq!(resolve_key(&d, None, &no_env, &f.vault, &f.key), None);
+        assert_eq!(
+            resolve_key_checked(&d, None, &no_env, &f.vault, &f.key),
+            Err(ApiKeyError::UsageMismatch)
+        );
         let audit =
             std::fs::read_to_string(f.vault.parent().unwrap().join("gate-audit.jsonl")).unwrap();
         assert!(audit.contains("denied:usage_mismatch"));

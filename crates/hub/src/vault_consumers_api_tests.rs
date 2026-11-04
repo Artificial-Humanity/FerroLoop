@@ -817,6 +817,56 @@ fn only_the_owner_may_read_the_report() {
     }
 }
 
+#[test]
+fn binding_absent_requires_an_authenticated_signing_snapshot() {
+    let _env = clean_env();
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let vault_path = home.join(".local/share/fl/vault.enc");
+    let key_path = home.join(".config/fl/vault.key");
+    fs::create_dir_all(vault_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+    let key = fl_gate::load_or_init_master_key(&key_path).unwrap();
+    let mut vault = fl_gate::Vault::open(&vault_path, key).unwrap();
+    vault
+        .set(fl_gate::SetSecretArgs {
+            name: "GITHUB_APP_KEY".into(),
+            value: CANARY_VAULT.into(),
+            usage: fl_gate::SecretUsage::SignJwtRs256,
+            ..Default::default()
+        })
+        .unwrap();
+    let state = hub(&tmp);
+    state.set_vault_consumer_config(github(None, Some("GITHUB_APP_KEY")));
+    let (status, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(status, 200);
+    assert_eq!(consumer(&body, KEY)["binding_absent"], true);
+    assert!(!body.to_string().contains(CANARY_VAULT));
+    vault
+        .set(fl_gate::SetSecretArgs {
+            name: "GITHUB_APP_KEY".into(),
+            value: CANARY_VAULT.into(),
+            usage: fl_gate::SecretUsage::SignJwtRs256,
+            app_binding: Some(fl_gate::AppBinding {
+                issuer: "42".into(),
+                origin: "https://api.github.com:443".into(),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], false);
+    let mut json: Value = serde_json::from_slice(&fs::read(&vault_path).unwrap()).unwrap();
+    json["secrets"]["GITHUB_APP_KEY"]["metadata"]["allowed_hosts"] = json!(["evil.example"]);
+    fs::write(&vault_path, serde_json::to_vec(&json).unwrap()).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::remove_file(&key_path).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    assert!(!key_path.exists());
+}
+
 /// A snapshot of every file under `dir`: path, mode, length, modification time and bytes.
 fn snapshot(dir: &Path) -> BTreeMap<String, String> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {

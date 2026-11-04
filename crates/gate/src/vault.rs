@@ -437,6 +437,17 @@ impl Vault {
         &self,
         name: &str,
     ) -> Result<VerifiedSecretSnapshot, GateError> {
+        let snapshot = self.authenticated_snapshot_current(name)?;
+        check_lease(&snapshot.metadata)?;
+        Ok(snapshot)
+    }
+
+    /// Authenticate policy without interpreting its lease; callers must enforce the lease
+    /// after checking the authenticated usage class.
+    pub(crate) fn authenticated_snapshot_current(
+        &self,
+        name: &str,
+    ) -> Result<VerifiedSecretSnapshot, GateError> {
         let name = normalize_secret_name(name)?;
         let record = self
             .file
@@ -484,7 +495,7 @@ impl Vault {
             .get(&name)
             .is_some_and(|entry| entry.0 == fingerprint && entry.1 == epoch);
         if !cached {
-            let (_, plaintext) = self.decrypt_bytes(&name)?;
+            let (_, plaintext) = self.decrypt_authenticated_bytes(&name)?;
             drop(plaintext);
             self.verified
                 .lock()
@@ -493,7 +504,6 @@ impl Vault {
                 })?
                 .insert(name, (fingerprint, epoch.clone()));
         }
-        check_lease(&record.metadata)?;
         Ok(VerifiedSecretSnapshot {
             metadata: record.metadata.clone(),
             record_epoch: epoch,
@@ -516,6 +526,15 @@ impl Vault {
     /// [`Vault::decrypt_raw`] without the UTF-8 step: the plaintext stays in a [`Zeroizing`]
     /// buffer, which is wiped when it drops (this path keeps no other copy of it).
     pub(crate) fn decrypt_bytes(
+        &self,
+        name: &str,
+    ) -> Result<(VaultSecretMetadata, Zeroizing<Vec<u8>>), GateError> {
+        let (metadata, plaintext) = self.decrypt_authenticated_bytes(name)?;
+        check_lease(&metadata)?;
+        Ok((metadata, plaintext))
+    }
+
+    fn decrypt_authenticated_bytes(
         &self,
         name: &str,
     ) -> Result<(VaultSecretMetadata, Zeroizing<Vec<u8>>), GateError> {
@@ -565,7 +584,6 @@ impl Vault {
             })?
             .len();
         in_out.truncate(plaintext_len);
-        check_lease(&record.metadata)?;
         Ok((record.metadata.clone(), in_out))
     }
 

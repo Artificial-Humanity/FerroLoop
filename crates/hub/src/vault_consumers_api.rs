@@ -28,11 +28,14 @@
 //! environment variable), and `null` when the hub cannot tell. `last_denied` on a consumer is the
 //! newest `denied:*` audit entry that names the consumer's Vault secret; it is `null` for a
 //! consumer with no Vault secret. There are no timestamps.
+//! The App-key row's `binding_absent` is true or false only when its configured Vault
+//! signing secret was authenticated; null means the binding could not be established.
 //!
 //! **What is read.** The hub's own configuration (given by `fl hub serve` through
 //! [`VaultConsumerConfig`]), the PRESENCE of environment variables (a boolean, never a value),
 //! file METADATA (existence and mode bits, never contents), the Vault file's secret NAMES (the
-//! metadata list: nothing is decrypted, no master key is read or created, nothing is written), and
+//! metadata list, plus an authenticated snapshot of the configured App key when available;
+//! the existing master key may be read but is never created, and nothing is written), and
 //! the last 64 KiB of `gate-audit.jsonl` (opened without following a symlink, a regular file
 //! only; a missing, corrupt, oversized or symlinked log is reported as a state, never an error).
 //! No path, environment value or secret value leaves the hub: the text names config keys,
@@ -698,16 +701,44 @@ pub(crate) fn report(state: &HubState) -> Value {
     let audit = read_audit_tail(&vault_path.with_file_name("gate-audit.jsonl"));
     let vault_names = list_vault_names(&vault_path);
     let env = |name: &str| std::env::var(name).ok();
-    build(&Inputs {
+    let mut report = build(&Inputs {
         config: config.as_deref(),
         owner_token_in_use: state.config.owner_token.is_some(),
         peer_token_in_use: state.config.peer_token.is_some(),
         vendors,
-        key_path,
+        key_path: key_path.clone(),
         vault_names,
         audit,
         env: &env,
-    })
+    });
+    // Only the selected Vault App-key source is checked. A missing key, inaccessible or
+    // tampered record is unknown, never a positive assertion about the policy.
+    if let Some(rows) = report["consumers"].as_array_mut()
+        && let Some(row) = rows
+            .iter_mut()
+            .find(|row| row["id"] == "github-app-private-key")
+    {
+        let status = if row["class"] == "vault-ref" {
+            config
+                .as_ref()
+                .and_then(|cfg| cfg.github_app.as_ref())
+                .and_then(|app| app.private_key_ref.as_deref())
+                .and_then(|name| {
+                    if !vault_path.is_file() {
+                        return None;
+                    }
+                    let key = fl_gate::load_existing_master_key(&key_path).ok()?;
+                    let vault = fl_gate::Vault::open(&vault_path, key).ok()?;
+                    let meta = vault.verified_snapshot(name).ok()?.metadata;
+                    (meta.usage == fl_gate::SecretUsage::SignJwtRs256)
+                        .then_some(meta.app_binding.is_none())
+                })
+        } else {
+            None
+        };
+        row["binding_absent"] = json!(status);
+    }
+    report
 }
 
 /// `GET /api/v1/gate/vault-consumers`.

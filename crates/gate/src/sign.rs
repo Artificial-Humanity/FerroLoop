@@ -119,7 +119,7 @@ impl Vault {
 
         // Authenticate the actual current record before trusting any policy fields.
         let fresh = self.fresh().map_err(|err| deny("vault_error", err))?;
-        let snapshot = fresh.verified_snapshot_current(&name).map_err(|err| {
+        let snapshot = fresh.authenticated_snapshot_current(&name).map_err(|err| {
             let reason = match &err {
                 GateError::NoSuchSecret { .. } => "no_such_secret",
                 GateError::PolicyDenied { .. } => policy_reason(&err),
@@ -362,6 +362,41 @@ mod tests {
         ));
         let audit = std::fs::read_to_string(dir.path().join("gate-audit.jsonl")).unwrap();
         assert!(audit.contains("denied:usage"));
+    }
+
+    #[test]
+    fn expired_proxy_usage_is_authenticated_then_denied_as_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(dir.path().join("vault.enc"), [7; 32]).unwrap();
+        vault
+            .set(crate::vault::SetSecretArgs {
+                name: "KEY".into(),
+                value: "secret".into(),
+                allowed_hosts: vec!["api.github.com".into()],
+                lease_ttl_secs: Some(0),
+                usage: crate::vault::SecretUsage::Proxy,
+                ..Default::default()
+            })
+            .unwrap();
+        let key: VaultRef = "vault://KEY".parse().unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        assert!(
+            std::fs::read_to_string(dir.path().join("gate-audit.jsonl"))
+                .unwrap()
+                .contains("denied:usage")
+        );
+        let path = dir.path().join("vault.enc");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["secrets"]["KEY"]["metadata"]["usage"] = serde_json::json!("sign-jwt-rs256");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(matches!(
+            vault.sign_app_jwt(&key, "42", "owner", "api.github.com", SystemTime::now()),
+            Err(GateError::VaultTampered { .. })
+        ));
     }
 
     #[test]
