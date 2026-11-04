@@ -177,20 +177,20 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     unmount();
   });
 
-  it("enforces 326px minimum panel width, desktop sidebar close button, and stacked/single-column panel layouts", () => {
+  it("enforces 360px minimum panel width, desktop sidebar close button, and stacked/single-column panel layouts", () => {
     const apiClient = makeStubApiClient();
     const wsClient = makeStubWsClient();
 
     const { unmount } = render(<App apiClient={apiClient} wsClient={wsClient} />);
 
-    // 1. 326px minimum width & left header close button closes desktop sidebar
+    // 1. 360px minimum width & left header close button closes desktop sidebar
     const sidebar = screen.getByTestId("roster-sidebar");
-    expect(sidebar.style.width).toBe("326px");
+    expect(sidebar.style.width).toBe("360px");
     const leftResizeHandle = within(sidebar).getByTestId("left-panel-resize-handle");
-    fireEvent.mouseDown(leftResizeHandle, { clientX: 326 });
+    fireEvent.mouseDown(leftResizeHandle, { clientX: 360 });
     fireEvent.mouseMove(window, { clientX: 200 });
     fireEvent.mouseUp(window);
-    expect(sidebar.style.width).toBe("326px");
+    expect(sidebar.style.width).toBe("360px");
 
     const closeBtn = within(sidebar).getByLabelText("Close Roster");
     fireEvent.click(closeBtn);
@@ -360,7 +360,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       />,
     );
     expect(screen.getByTestId("cockpit-tab-bar").style.flexWrap).toBe("nowrap");
-    expect(screen.getByTestId("tier-agent-nav").style.flexWrap).toBe("wrap");
+    expect(screen.getByTestId("tier-agent-nav").style.flexWrap).toBe("nowrap");
     expect(screen.getByTestId("tier-agent-nav").style.minWidth).toBe("0");
     unmountHeader();
 
@@ -435,11 +435,11 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       const { unmount } = render(<App apiClient={apiClient} wsClient={wsClient} />);
 
       const sidebar = screen.getByTestId("roster-sidebar");
-      expect(sidebar.style.width).toBe("326px");
+      expect(sidebar.style.width).toBe("360px");
 
       // Resize left roster panel to 410px
       const leftHandle = screen.getByTestId("left-panel-resize-handle");
-      fireEvent.mouseDown(leftHandle, { clientX: 326 });
+      fireEvent.mouseDown(leftHandle, { clientX: 360 });
       fireEvent.mouseMove(window, { clientX: 410 });
       fireEvent.mouseUp(window);
 
@@ -858,32 +858,46 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(screen.getByTestId("agents-subtab-bar")).toBeInTheDocument();
     const rosterSubTab = screen.getByTestId("agents-subtab-roster");
     const rolesSubTab = screen.getByTestId("agents-subtab-roles");
-    const runtimesSubTab = screen.getByTestId("agents-subtab-runtimes");
+    const cloudSessionsSubTab = screen.getByTestId("agents-subtab-cloud-sessions");
+    const localRuntimesSubTab = screen.getByTestId("agents-subtab-local-runtimes");
 
     const rosterPanel = screen.getByTestId("agents-subpanel-roster");
     const rolesPanel = screen.getByTestId("agents-subpanel-roles");
-    const runtimesPanel = screen.getByTestId("agents-subpanel-runtimes");
+    const cloudSessionsPanel = screen.getByTestId("agents-subpanel-cloud-sessions");
+    const localRuntimesPanel = screen.getByTestId("agents-subpanel-local-runtimes");
 
     expect(rosterSubTab).toHaveAttribute("aria-selected", "true");
     expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
-    expect(runtimesSubTab).toHaveAttribute("aria-selected", "false");
+    expect(cloudSessionsSubTab).toHaveAttribute("aria-selected", "false");
+    expect(localRuntimesSubTab).toHaveAttribute("aria-selected", "false");
     expect(rosterPanel).toHaveStyle({ display: "flex" });
     expect(rolesPanel).toHaveStyle({ display: "none" });
-    expect(runtimesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
 
     fireEvent.click(rolesSubTab);
     expect(rosterSubTab).toHaveAttribute("aria-selected", "false");
     expect(rolesSubTab).toHaveAttribute("aria-selected", "true");
     expect(rosterPanel).toHaveStyle({ display: "none" });
     expect(rolesPanel).toHaveStyle({ display: "flex" });
-    expect(runtimesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
 
-    fireEvent.click(runtimesSubTab);
+    fireEvent.click(cloudSessionsSubTab);
     expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
-    expect(runtimesSubTab).toHaveAttribute("aria-selected", "true");
+    expect(cloudSessionsSubTab).toHaveAttribute("aria-selected", "true");
     expect(rosterPanel).toHaveStyle({ display: "none" });
     expect(rolesPanel).toHaveStyle({ display: "none" });
-    expect(runtimesPanel).toHaveStyle({ display: "flex" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "flex" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(localRuntimesSubTab);
+    expect(cloudSessionsSubTab).toHaveAttribute("aria-selected", "false");
+    expect(localRuntimesSubTab).toHaveAttribute("aria-selected", "true");
+    expect(rosterPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "flex" });
 
     // 2. System sub-tabs
     fireEvent.click(screen.getByTestId("settings-tab-system"));
@@ -939,7 +953,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(prodInstallerPanel).toHaveStyle({ display: "flex" });
   });
 
-  it("renders 4 focused sub-tabs in the Project-Level Settings Modal when initialProject is set", async () => {
+  it("renders 5 focused sub-tabs in the Project-Level Settings Modal when initialProject is set", async () => {
     const apiClient = makeStubApiClient();
     render(
       <SettingsModal
@@ -957,18 +971,21 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const overviewTab = screen.getByTestId("project-tab-overview");
     const agentsTab = screen.getByTestId("project-tab-agents");
     const rolesTab = screen.getByTestId("project-tab-roles");
-    const runtimesTab = screen.getByTestId("project-tab-runtimes");
+    const cloudSessionsTab = screen.getByTestId("project-tab-cloud-sessions");
+    const localRuntimesTab = screen.getByTestId("project-tab-local-runtimes");
 
     const overviewPanel = screen.getByTestId("project-subpanel-overview");
     const agentsPanel = screen.getByTestId("project-subpanel-agents");
     const rolesPanel = screen.getByTestId("project-subpanel-roles");
-    const runtimesPanel = screen.getByTestId("project-subpanel-runtimes");
+    const cloudSessionsPanel = screen.getByTestId("project-subpanel-cloud-sessions");
+    const localRuntimesPanel = screen.getByTestId("project-subpanel-local-runtimes");
 
     expect(overviewTab).toHaveAttribute("aria-selected", "true");
     expect(overviewPanel).toHaveStyle({ display: "flex" });
     expect(agentsPanel).toHaveStyle({ display: "none" });
     expect(rolesPanel).toHaveStyle({ display: "none" });
-    expect(runtimesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
 
     fireEvent.click(agentsTab);
     expect(overviewTab).toHaveAttribute("aria-selected", "false");
@@ -976,7 +993,8 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(overviewPanel).toHaveStyle({ display: "none" });
     expect(agentsPanel).toHaveStyle({ display: "flex" });
     expect(rolesPanel).toHaveStyle({ display: "none" });
-    expect(runtimesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
 
     fireEvent.click(rolesTab);
     expect(agentsTab).toHaveAttribute("aria-selected", "false");
@@ -984,14 +1002,232 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(overviewPanel).toHaveStyle({ display: "none" });
     expect(agentsPanel).toHaveStyle({ display: "none" });
     expect(rolesPanel).toHaveStyle({ display: "flex" });
-    expect(runtimesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
 
-    fireEvent.click(runtimesTab);
+    fireEvent.click(cloudSessionsTab);
     expect(rolesTab).toHaveAttribute("aria-selected", "false");
-    expect(runtimesTab).toHaveAttribute("aria-selected", "true");
+    expect(cloudSessionsTab).toHaveAttribute("aria-selected", "true");
     expect(overviewPanel).toHaveStyle({ display: "none" });
     expect(agentsPanel).toHaveStyle({ display: "none" });
     expect(rolesPanel).toHaveStyle({ display: "none" });
-    expect(runtimesPanel).toHaveStyle({ display: "flex" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "flex" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(localRuntimesTab);
+    expect(cloudSessionsTab).toHaveAttribute("aria-selected", "false");
+    expect(localRuntimesTab).toHaveAttribute("aria-selected", "true");
+    expect(overviewPanel).toHaveStyle({ display: "none" });
+    expect(agentsPanel).toHaveStyle({ display: "none" });
+    expect(rolesPanel).toHaveStyle({ display: "none" });
+    expect(cloudSessionsPanel).toHaveStyle({ display: "none" });
+    expect(localRuntimesPanel).toHaveStyle({ display: "flex" });
+  });
+
+  it("Record #109: scopes bulk session operations strictly to the active project in Project Settings and filtered views, never the entire fleet", async () => {
+    const apiClient = makeStubApiClient();
+    const onBulkSessionAction = vi.fn().mockResolvedValue({
+      action: "compact",
+      targeted_sessions: 2,
+      succeeded_sessions: 2,
+      failed_sessions: 0,
+      results: [],
+    });
+
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+        initialProject="FerroLoop"
+        initialProjectSubTab="agents"
+        onBulkSessionAction={onBulkSessionAction}
+      />,
+    );
+
+    const heading = screen.getByTestId("bulk-session-ops-heading");
+    expect(heading).toHaveTextContent(
+      "Project Bulk Session Operations — FerroLoop",
+    );
+    expect(heading).not.toHaveTextContent("Fleet Bulk Session Operations");
+
+    const compactBtn = screen.getByTestId("bulk-compact-btn");
+    expect(compactBtn).toHaveTextContent(/Compact FerroLoop/i);
+
+    fireEvent.click(compactBtn);
+    const confirmPanel = screen.getByTestId("bulk-confirm-panel");
+    expect(confirmPanel).toHaveTextContent(/FerroLoop project agent sessions/i);
+    expect(confirmPanel).not.toHaveTextContent(/fleet-wide/i);
+
+    fireEvent.click(screen.getByTestId("bulk-confirm-btn"));
+    expect(onBulkSessionAction).toHaveBeenCalledTimes(1);
+    const [actionArg, agentsArg] = onBulkSessionAction.mock.calls[0];
+    expect(actionArg).toBe("compact");
+    expect(Array.isArray(agentsArg)).toBe(true);
+    expect(agentsArg.length).toBeGreaterThan(0);
+    // Every passed agent must belong to FerroLoop (e.g. ferris, ferrah, felix, forge), never jarvis/sonya/etc.
+    expect(agentsArg).toContain("ferris");
+    expect(agentsArg).not.toContain("jarvis");
+    expect(agentsArg).not.toContain("sonya");
+  });
+
+  it("Record #109: preserves origin modal memento and returns from AgentSettingsModal back to Project Settings on close or back button click", async () => {
+    const apiClient = makeStubApiClient();
+    const wsClient = makeStubWsClient();
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsClient} />);
+
+    // Open FerroLoop Project Settings from the roster sidebar project cog
+    const projectSettingsBtn = await screen.findByTestId(
+      "project-settings-btn-ferroloop",
+    );
+    fireEvent.click(projectSettingsBtn);
+
+    expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-modal-title")).toHaveTextContent(
+      "Project Settings — FerroLoop",
+    );
+
+    // Switch to Agents & Bulk Ops sub-tab and click individual agent cog for Ferris
+    fireEvent.click(screen.getByTestId("project-tab-agents"));
+    fireEvent.click(screen.getByTestId("settings-agent-cog-btn-ferris"));
+
+    // SettingsModal closes and AgentSettingsModal opens with breadcrumb back button
+    expect(screen.queryByTestId("settings-modal")).toBeNull();
+    const agentModal = screen.getByTestId("agent-settings-modal");
+    expect(agentModal).toBeInTheDocument();
+    const backBtn = within(agentModal).getByTestId(
+      "agent-settings-back-to-origin-btn",
+    );
+    expect(backBtn).toHaveTextContent("← Back to Project Settings (FerroLoop)");
+
+    // Closing AgentSettingsModal returns to Project Settings — FerroLoop on the Agents & Bulk Ops sub-tab
+    fireEvent.click(within(agentModal).getByTestId("close-agent-settings-btn"));
+    expect(screen.queryByTestId("agent-settings-modal")).toBeNull();
+    expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("settings-modal-title")).toHaveTextContent(
+      "Project Settings — FerroLoop",
+    );
+    expect(screen.getByTestId("project-tab-agents")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    unmount();
+  });
+
+  it("Record #109: renders dedicated Appearance top-level tab and locks modal geometry across tab switches", async () => {
+    const apiClient = makeStubApiClient();
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+      />,
+    );
+
+    const modal = screen.getByTestId("settings-modal");
+    expect(modal.style.minWidth).toBe("360px");
+    expect(modal.style.width).toBe("920px");
+    expect(modal.style.height).toBe("780px");
+
+    const appearanceTab = screen.getByTestId("settings-tab-appearance");
+    const accessibilityTab = screen.getByTestId("settings-tab-accessibility");
+    const appearancePanel = screen.getByTestId("settings-panel-appearance");
+    const accessibilityPanel = screen.getByTestId("settings-accessibility-panel");
+
+    expect(appearancePanel).toHaveStyle({ display: "none" });
+    expect(accessibilityPanel).toHaveStyle({ display: "none" });
+
+    fireEvent.click(appearanceTab);
+    expect(appearanceTab).toHaveAttribute("aria-selected", "true");
+    expect(appearancePanel).toHaveStyle({ display: "flex" });
+    expect(
+      within(appearancePanel).getByTestId("settings-theme-select"),
+    ).toBeInTheDocument();
+    expect(
+      within(appearancePanel).getByTestId("system-console-layout-card"),
+    ).toBeInTheDocument();
+
+    // Outer modal width/height remain identical after switching tabs
+    expect(modal.style.width).toBe("920px");
+    expect(modal.style.height).toBe("780px");
+
+    fireEvent.click(accessibilityTab);
+    expect(accessibilityTab).toHaveAttribute("aria-selected", "true");
+    expect(accessibilityPanel).toHaveStyle({ display: "flex" });
+    expect(appearancePanel).toHaveStyle({ display: "none" });
+    expect(
+      within(accessibilityPanel).getByTestId("font-scale-slider"),
+    ).toBeInTheDocument();
+  });
+
+  it("Record #109: enforces 3-tier viewport panel constraints (<720px single-panel, 720-1079px two-panel mutual exclusion, >=1080px three-panel)", () => {
+    const originalInnerWidth = window.innerWidth;
+    try {
+      const apiClient = makeStubApiClient();
+      const wsClient = makeStubWsClient();
+
+      // Start at 900px (720px - 1079px Two-Panel Mutual-Exclusion Mode)
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 900,
+      });
+
+      const { unmount } = render(<App apiClient={apiClient} wsClient={wsClient} />);
+      const cockpit = screen.getByTestId("ferrodeck-cockpit");
+      const sidebar = screen.getByTestId("roster-sidebar");
+      const splitToggleBtn = screen.getByTestId("split-view-toggle");
+      const leftToggleBtn = screen.getByTestId("mobile-sidebar-toggle-btn");
+
+      expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "two-panel");
+      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
+
+      // Opening Right panel in 720-1079px mode automatically collapses Left panel
+      fireEvent.click(splitToggleBtn);
+      expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
+      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "true");
+
+      // Opening Left panel in 720-1079px mode automatically closes Right panel
+      fireEvent.click(leftToggleBtn);
+      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
+      expect(screen.queryByTestId("right-split-panel")).toBeNull();
+
+      // Resize to 1280px (>= 1080px Three-Panel Mode): both Left and Right can stay open simultaneously
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 1280,
+      });
+      fireEvent(window, new Event("resize"));
+      expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "three-panel");
+
+      fireEvent.click(splitToggleBtn);
+      expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
+      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
+
+      // Resize down to 600px (< 720px Single-Panel Mode): Left auto-collapses so at most 1 panel is onscreen,
+      // and RosterSidebar does not set inline position: relative or desktop width that would push ChatPane offscreen.
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 600,
+      });
+      fireEvent(window, new Event("resize"));
+      expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "single");
+      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "true");
+      expect(sidebar.style.position).toBe("");
+      expect(sidebar.style.width).toBe("");
+      expect(screen.getByTestId("tier-agent-nav").style.flexWrap).toBe("nowrap");
+
+      unmount();
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: originalInnerWidth,
+      });
+    }
   });
 });

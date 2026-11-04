@@ -528,24 +528,24 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           className={`fd-tier-group fd-tier-agent${activeTier === "agent" || activeTier === "project" ? " is-active-tier" : ""}`}
           data-testid="tier-agent-nav"
           data-active-tier={activeTier === "agent" || activeTier === "project" ? "true" : undefined}
-          style={{ flexWrap: "wrap", minWidth: 0, flex: "0 1 auto" }}
+          style={{ flexWrap: "nowrap", minWidth: 0, flex: "0 1 auto", overflow: "hidden" }}
         >
           <span className="fd-tier-label" title="Active Agent">
             Agent
           </span>
 
           {selectedAgent ? (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <span style={{ fontWeight: 700, fontSize: "14px" }} title="Active Agent Name">
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>
+              <span style={{ fontWeight: 700, fontSize: "14px", whiteSpace: "nowrap" }} title="Active Agent Name">
                 {selectedAgent.display_name}
               </span>
-              <span className="fd-badge" title="Agent Role">
+              <span className="fd-badge" title="Agent Role" style={{ flexShrink: 0 }}>
                 {formatRoleLabel(selectedAgent.role)}
               </span>
             </div>
           ) : (
             <span
-              style={{ fontWeight: 600, color: "var(--text-muted)" }}
+              style={{ fontWeight: 600, color: "var(--text-muted)", whiteSpace: "nowrap" }}
               title="Active Agent Name"
             >
               No Agent Selected
@@ -553,7 +553,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           )}
 
           {agentSessions.length > 0 && (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>
               {agentSessions.length > 1 && (
                 <select
                   aria-label="Active Session"

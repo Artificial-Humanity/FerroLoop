@@ -28,6 +28,10 @@ import {
 import {
   SettingsModal,
   executeScopedBulkSessionAction,
+  type AgentsSubTabId,
+  type ProjectSettingsSubTabId,
+  type SettingsOriginMemento,
+  type SettingsTabId,
 } from "./components/SettingsModal";
 import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
@@ -93,6 +97,22 @@ export interface AppProps {
   apiClient?: HubApiClient;
   wsClient?: HubWsClient;
   initialSelectedAgentName?: string | null;
+}
+
+export const PANEL_MIN_WIDTH_PX = 360;
+export const TWO_PANEL_MIN_VIEWPORT_PX = 720;
+export const THREE_PANEL_MIN_VIEWPORT_PX = 1080;
+
+export type ViewportPanelMode = "single" | "two-panel" | "three-panel";
+
+export function resolveViewportPanelMode(width: number): ViewportPanelMode {
+  if (width < TWO_PANEL_MIN_VIEWPORT_PX) {
+    return "single";
+  }
+  if (width < THREE_PANEL_MIN_VIEWPORT_PX) {
+    return "two-panel";
+  }
+  return "three-panel";
 }
 
 function readStoredPanelWidth(
@@ -406,6 +426,16 @@ export const App: React.FC<AppProps> = ({
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
   const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
+  const [settingsInitialProjectFilter, setSettingsInitialProjectFilter] =
+    useState<string | null>(null);
+  const [settingsInitialTab, setSettingsInitialTab] =
+    useState<SettingsTabId | undefined>(undefined);
+  const [settingsInitialProjectSubTab, setSettingsInitialProjectSubTab] =
+    useState<ProjectSettingsSubTabId | undefined>(undefined);
+  const [settingsInitialAgentsSubTab, setSettingsInitialAgentsSubTab] =
+    useState<AgentsSubTabId | undefined>(undefined);
+  const [settingsOriginMemento, setSettingsOriginMemento] =
+    useState<SettingsOriginMemento | null>(null);
   const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
   const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
@@ -420,17 +450,20 @@ export const App: React.FC<AppProps> = ({
   const [splitView, setSplitView] = useState<boolean>(false);
   const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>("roster");
   const [leftRosterWidth, setLeftRosterWidth] = useState<number>(() =>
-    readStoredPanelWidth("fd_left_roster_width", 326, 326, 720),
+    readStoredPanelWidth("fd_left_roster_width", PANEL_MIN_WIDTH_PX, PANEL_MIN_WIDTH_PX, 720),
   );
   const [leftConsoleWidth, setLeftConsoleWidth] = useState<number>(() =>
-    readStoredPanelWidth("fd_left_console_width", 440, 326, 720),
+    readStoredPanelWidth("fd_left_console_width", 440, PANEL_MIN_WIDTH_PX, 720),
   );
   const [rightPanelWidth, setRightPanelWidth] = useState<number>(() =>
-    readStoredPanelWidth("fd_right_panel_width", 460, 326, 800),
+    readStoredPanelWidth("fd_right_panel_width", 460, PANEL_MIN_WIDTH_PX, 800),
   );
   const panelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1200,
+  );
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
   const [fontScalePct, setFontScalePct] = useState<number>(getInitialFontScalePct);
   useActiveTimeZone();
@@ -443,8 +476,30 @@ export const App: React.FC<AppProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleResize = () => {
+      const vw = window.innerWidth;
+      setViewportWidth(vw);
+      if (vw < THREE_PANEL_MIN_VIEWPORT_PX) {
+        setSplitView((currentSplit) => {
+          if (currentSplit) {
+            setDesktopSidebarCollapsed(true);
+            setMobileRosterOpen(false);
+          }
+          return currentSplit;
+        });
+      }
+      if (vw < TWO_PANEL_MIN_VIEWPORT_PX) {
+        setDesktopSidebarCollapsed(true);
+      }
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
   const effectiveLeftWidth = Math.max(
-    326,
+    PANEL_MIN_WIDTH_PX,
     leftPanelTab === "roster" ? leftRosterWidth : leftConsoleWidth,
   );
 
@@ -457,14 +512,23 @@ export const App: React.FC<AppProps> = ({
       const startWidth = isRoster ? leftRosterWidth : leftConsoleWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = moveEvent.clientX - startX;
+        const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+        const mode = resolveViewportPanelMode(vw);
         const maxAllowed =
-          typeof window !== "undefined" && window.innerWidth > 1024
+          mode === "three-panel"
             ? Math.max(
-                326,
-                Math.min(720, window.innerWidth - 360 - (splitView ? rightPanelWidth : 0)),
+                PANEL_MIN_WIDTH_PX,
+                Math.min(
+                  720,
+                  vw - PANEL_MIN_WIDTH_PX - (splitView ? rightPanelWidth : 0),
+                ),
               )
-            : 720;
-        const nextWidth = Math.round(Math.max(326, Math.min(maxAllowed, startWidth + delta)));
+            : mode === "two-panel"
+              ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(720, vw - PANEL_MIN_WIDTH_PX))
+              : 720;
+        const nextWidth = Math.round(
+          Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
+        );
         if (isRoster) {
           setLeftRosterWidth(nextWidth);
           persistPanelWidth("fd_left_roster_width", nextWidth);
@@ -493,17 +557,25 @@ export const App: React.FC<AppProps> = ({
       const startWidth = rightPanelWidth;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = startX - moveEvent.clientX;
+        const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+        const mode = resolveViewportPanelMode(vw);
         const maxAllowed =
-          typeof window !== "undefined" && window.innerWidth > 1024
+          mode === "three-panel"
             ? Math.max(
-                326,
+                PANEL_MIN_WIDTH_PX,
                 Math.min(
                   800,
-                  window.innerWidth - 360 - (desktopSidebarCollapsed ? 0 : effectiveLeftWidth),
+                  vw -
+                    PANEL_MIN_WIDTH_PX -
+                    (desktopSidebarCollapsed ? 0 : effectiveLeftWidth),
                 ),
               )
-            : 800;
-        const nextWidth = Math.round(Math.max(326, Math.min(maxAllowed, startWidth + delta)));
+            : mode === "two-panel"
+              ? Math.max(PANEL_MIN_WIDTH_PX, Math.min(800, vw - PANEL_MIN_WIDTH_PX))
+              : 800;
+        const nextWidth = Math.round(
+          Math.max(PANEL_MIN_WIDTH_PX, Math.min(maxAllowed, startWidth + delta)),
+        );
         setRightPanelWidth(nextWidth);
         persistPanelWidth("fd_right_panel_width", nextWidth);
       };
@@ -532,6 +604,13 @@ export const App: React.FC<AppProps> = ({
       return [normalized, ...filtered].slice(0, 20);
     });
     setSplitView(true);
+    if (
+      typeof window !== "undefined" &&
+      window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+    ) {
+      setDesktopSidebarCollapsed(true);
+    }
+    setMobileRosterOpen(false);
     setSecondaryTab("artifacts");
     setActiveTab("artifacts");
   }, []);
@@ -817,7 +896,10 @@ export const App: React.FC<AppProps> = ({
       setLeftPanelTab(tab);
       setDesktopSidebarCollapsed(false);
       setMobileRosterOpen(true);
-      if (typeof window !== "undefined" && window.innerWidth <= 768) {
+      if (
+        typeof window !== "undefined" &&
+        window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+      ) {
         setSplitView(false);
       }
       setActiveTab(tab);
@@ -845,6 +927,12 @@ export const App: React.FC<AppProps> = ({
       setSecondaryTab(tab);
       setActiveTab(tab);
       setSplitView(true);
+      if (
+        typeof window !== "undefined" &&
+        window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+      ) {
+        setDesktopSidebarCollapsed(true);
+      }
       setMobileRosterOpen(false);
     }
     void refreshSessionsAndTranscriptRef.current();
@@ -2220,8 +2308,13 @@ export const App: React.FC<AppProps> = ({
             loading={loading}
             wsConnected={wsConnected}
             agentSettingsOpen={agentSettingsOpen}
-            onOpenAgentSettings={() => setAgentSettingsOpen(true)}
-            onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+            onOpenAgentSettings={() => {
+              setSettingsOriginMemento(null);
+              setAgentSettingsOpen(true);
+            }}
+            onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
+            returnToSettingsLabel={returnToSettingsLabel}
+            onReturnToSettings={handleReturnToOriginSettings}
             onRefresh={() => void refreshSessionsAndTranscript()}
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
@@ -2365,6 +2458,38 @@ export const App: React.FC<AppProps> = ({
     selectedAgentName,
   ]);
 
+  const handleReturnToOriginSettings = useCallback(() => {
+    if (!settingsOriginMemento) {
+      setAgentSettingsOpen(false);
+      return;
+    }
+    const memento = settingsOriginMemento;
+    setAgentSettingsOpen(false);
+    setSettingsOriginMemento(null);
+    setSettingsInitialProject(memento.initialProject);
+    setSettingsInitialProjectFilter(memento.projectFilter);
+    setSettingsInitialTab(memento.activeTab);
+    setSettingsInitialProjectSubTab(memento.projectSubTab);
+    setSettingsInitialAgentsSubTab(memento.agentsSubTab);
+    setSettingsModalOpen(true);
+  }, [settingsOriginMemento]);
+
+  const returnToSettingsLabel = useMemo(() => {
+    if (!settingsOriginMemento) return null;
+    if (settingsOriginMemento.initialProject) {
+      return `← Back to Project Settings (${settingsOriginMemento.initialProject})`;
+    }
+    return "← Back to Settings & Fleet Operations";
+  }, [settingsOriginMemento]);
+
+  const handleCloseAgentSettingsWithOrigin = useCallback(() => {
+    if (settingsOriginMemento) {
+      handleReturnToOriginSettings();
+    } else {
+      setAgentSettingsOpen(false);
+    }
+  }, [settingsOriginMemento, handleReturnToOriginSettings]);
+
   const handleToggleSplitView = useCallback(() => {
     setSplitView((prev) => {
       const next = !prev;
@@ -2382,6 +2507,12 @@ export const App: React.FC<AppProps> = ({
                 : leftPanelTab,
       );
       if (next) {
+        if (
+          typeof window !== "undefined" &&
+          window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+        ) {
+          setDesktopSidebarCollapsed(true);
+        }
         setMobileRosterOpen(false);
       }
       return next;
@@ -2389,9 +2520,25 @@ export const App: React.FC<AppProps> = ({
   }, [secondaryTab, selectedAgent, leftPanelTab]);
 
   const handleToggleLeftSidebar = useCallback(() => {
+    const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
+    if (vw < THREE_PANEL_MIN_VIEWPORT_PX && splitView) {
+      setSplitView(false);
+      setMobileRosterOpen(true);
+      setDesktopSidebarCollapsed(false);
+      setActiveTab(
+        leftPanelTab === "roster"
+          ? "chat"
+          : leftPanelTab === "watch"
+            ? "state"
+            : leftPanelTab === "triage"
+              ? "hub"
+              : leftPanelTab,
+      );
+      return;
+    }
     setMobileRosterOpen((prev) => {
       const next = !prev;
-      if (next && typeof window !== "undefined" && window.innerWidth <= 768) {
+      if (next && vw < THREE_PANEL_MIN_VIEWPORT_PX) {
         setSplitView(false);
         setActiveTab(
           leftPanelTab === "roster"
@@ -2406,16 +2553,22 @@ export const App: React.FC<AppProps> = ({
       return next;
     });
     setDesktopSidebarCollapsed((prev) => !prev);
-  }, [leftPanelTab]);
+  }, [leftPanelTab, splitView]);
 
-  const isMobileViewport =
-    typeof window !== "undefined" && window.innerWidth <= 768;
+  const currentInnerWidth =
+    typeof window !== "undefined" ? window.innerWidth : viewportWidth;
+  const viewportPanelMode = resolveViewportPanelMode(currentInnerWidth);
+  const isMobileViewport = currentInnerWidth < TWO_PANEL_MIN_VIEWPORT_PX;
   const leftSidebarOpen = isMobileViewport
     ? mobileRosterOpen
     : !desktopSidebarCollapsed;
 
   return (
-    <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
+    <div
+      className="fd-cockpit"
+      data-testid="ferrodeck-cockpit"
+      data-viewport-panel-mode={viewportPanelMode}
+    >
       <ContextHeader
         selectedAgent={selectedAgent}
         sessions={mergedRoutes}
@@ -2444,14 +2597,22 @@ export const App: React.FC<AppProps> = ({
         onlineNodesCount={onlineNodesCount}
         onOpenNodesModal={() => setNodesModalOpen(true)}
         onOpenSettingsModal={() => {
+          setSettingsOriginMemento(null);
           setSettingsInitialProject(null);
+          setSettingsInitialProjectFilter(null);
+          setSettingsInitialTab(undefined);
+          setSettingsInitialProjectSubTab(undefined);
+          setSettingsInitialAgentsSubTab(undefined);
           setSettingsModalOpen(true);
         }}
         onOpenHelpModal={(tab) => {
           setHelpTopic(tab ?? activeTab);
           setHelpDrawerOpen(true);
         }}
-        onOpenAgentSettings={() => handleOpenAgentSettingsFor()}
+        onOpenAgentSettings={() => {
+          setSettingsOriginMemento(null);
+          handleOpenAgentSettingsFor();
+        }}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         onOpenPairingModal={() => setPairingOpen(true)}
         onLogout={handleLogout}
@@ -2498,13 +2659,26 @@ export const App: React.FC<AppProps> = ({
             setMobileRosterOpen(false);
             void refreshSessionsAndTranscript();
           }}
-          onOpenAgentSettings={(nameKey) => handleOpenAgentSettingsFor(nameKey)}
+          onOpenAgentSettings={(nameKey) => {
+            setSettingsOriginMemento(null);
+            handleOpenAgentSettingsFor(nameKey);
+          }}
           onOpenProjectSettings={(project) => {
+            setSettingsOriginMemento(null);
             setSettingsInitialProject(project);
+            setSettingsInitialProjectFilter(null);
+            setSettingsInitialTab(undefined);
+            setSettingsInitialProjectSubTab(undefined);
+            setSettingsInitialAgentsSubTab(undefined);
             setSettingsModalOpen(true);
           }}
           onOpenSettingsModal={() => {
+            setSettingsOriginMemento(null);
             setSettingsInitialProject(null);
+            setSettingsInitialProjectFilter(null);
+            setSettingsInitialTab(undefined);
+            setSettingsInitialProjectSubTab(undefined);
+            setSettingsInitialAgentsSubTab(undefined);
             setSettingsModalOpen(true);
           }}
           onOpenHelpModal={() => {
@@ -2525,7 +2699,7 @@ export const App: React.FC<AppProps> = ({
           consoleContent={
             leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
           }
-          width={effectiveLeftWidth}
+          width={isMobileViewport ? undefined : effectiveLeftWidth}
           onResizeStart={handleLeftResizeStart}
         />
 
@@ -2560,8 +2734,13 @@ export const App: React.FC<AppProps> = ({
             loading={loading}
             wsConnected={wsConnected}
             agentSettingsOpen={agentSettingsOpen}
-            onOpenAgentSettings={() => setAgentSettingsOpen(true)}
-            onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+            onOpenAgentSettings={() => {
+              setSettingsOriginMemento(null);
+              setAgentSettingsOpen(true);
+            }}
+            onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
+            returnToSettingsLabel={returnToSettingsLabel}
+            onReturnToSettings={handleReturnToOriginSettings}
             onRefresh={() => {
               void refreshSessionsAndTranscript();
               void refreshWireAndRoster();
@@ -2592,9 +2771,9 @@ export const App: React.FC<AppProps> = ({
                 className="fd-pane fd-right-split-pane"
                 data-testid="right-split-panel"
               style={{
-                width: `${rightPanelWidth}px`,
-                minWidth: `${rightPanelWidth}px`,
-                flex: `0 0 ${rightPanelWidth}px`,
+                width: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
+                minWidth: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
+                flex: `0 0 ${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
                 position: "relative",
               }}
             >
@@ -2623,6 +2802,13 @@ export const App: React.FC<AppProps> = ({
                   setSecondaryTab(tab);
                   setActiveTab(tab);
                   setSplitView(true);
+                  if (
+                    typeof window !== "undefined" &&
+                    window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+                  ) {
+                    setDesktopSidebarCollapsed(true);
+                    setMobileRosterOpen(false);
+                  }
                   void refreshSessionsAndTranscriptRef.current();
                 }}
                 onClose={handleToggleSplitView}
@@ -2670,8 +2856,16 @@ export const App: React.FC<AppProps> = ({
         onClose={() => {
           setSettingsModalOpen(false);
           setSettingsInitialProject(null);
+          setSettingsInitialProjectFilter(null);
+          setSettingsInitialTab(undefined);
+          setSettingsInitialProjectSubTab(undefined);
+          setSettingsInitialAgentsSubTab(undefined);
         }}
         initialProject={settingsInitialProject}
+        initialProjectFilter={settingsInitialProjectFilter}
+        initialTab={settingsInitialTab}
+        initialProjectSubTab={settingsInitialProjectSubTab}
+        initialAgentsSubTab={settingsInitialAgentsSubTab}
         agents={agents}
         authority={authority}
         wsConnected={wsConnected}
@@ -2684,9 +2878,11 @@ export const App: React.FC<AppProps> = ({
           setSpinUpModalOpen(true);
         }}
         onOpenPairingModal={() => setPairingOpen(true)}
-        onOpenAgentSettings={(nameKey) => {
+        onOpenAgentSettings={(nameKey, originMemento) => {
           setSettingsModalOpen(false);
-          setSettingsInitialProject(null);
+          if (originMemento) {
+            setSettingsOriginMemento(originMemento);
+          }
           handleOpenAgentSettingsFor(nameKey);
         }}
         onLogout={handleLogout}

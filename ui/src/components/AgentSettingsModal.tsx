@@ -370,6 +370,9 @@ export interface AgentSettingsModalProps {
     report: AgentMcpPostureReport,
   ) => void;
   initialTab?: "overview" | "permissions" | "runtime";
+  /** Record #109: Breadcrumb label and callback to return to originating SettingsModal (Project Settings or Fleet Settings). */
+  returnToSettingsLabel?: string | null;
+  onReturnToSettings?: () => void;
 }
 
 export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
@@ -405,6 +408,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   postureInput,
   onRemediatePosture,
   initialTab = "overview",
+  returnToSettingsLabel = null,
+  onReturnToSettings,
 }) => {
   const { pinnedAgents } = usePinnedState();
   const [activeTab, setActiveTab] = useState<AgentSettingsTabId>(initialTab);
@@ -614,9 +619,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
         style={{
-          maxWidth: "560px",
-          width: "95vw",
-          maxHeight: "min(88vh, 860px)",
+          width: "560px",
+          maxWidth: "calc(100vw - 32px)",
+          minWidth: "360px",
+          height: "760px",
+          maxHeight: "calc(100vh - 48px)",
+          minHeight: "520px",
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
@@ -636,6 +644,23 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             borderBottom: "1px solid var(--border-subtle)",
           }}
         >
+          {returnToSettingsLabel && onReturnToSettings && (
+            <div style={{ display: "flex", alignItems: "center" }}>
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="agent-settings-back-to-origin-btn"
+                onClick={onReturnToSettings}
+                style={{
+                  fontSize: "11.5px",
+                  padding: "3px 8px",
+                  fontWeight: 600,
+                }}
+              >
+                {returnToSettingsLabel}
+              </button>
+            </div>
+          )}
           <div
             style={{
               display: "flex",
