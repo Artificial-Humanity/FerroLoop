@@ -930,7 +930,7 @@ mod route_lookup {
     }
 
     #[test]
-    fn a_live_saved_route_is_used_even_when_the_table_is_old() {
+    fn a_stale_live_webhook_is_rescanned_without_connecting() {
         let home = TempDir::new().unwrap();
         let (route, _listener) = listening_webhook(home.path(), "live.sock");
         save_route(home.path(), "ada", route.clone());
@@ -939,19 +939,67 @@ mod route_lookup {
             .unwrap();
         note_route_file_scan(Some(home.path()), long_ago);
         let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(found, Some(RouteLookup::Saved(route)));
-            assert_eq!(
-                costs.route_scans, 0,
-                "a verified listener does not need a scan"
-            );
+        assert_eq!(found, Some(RouteLookup::Scanned(route)));
+        assert_eq!(
+            costs.route_scans, 1,
+            "a pathname cannot verify listener identity"
+        );
+        assert!(
+            connections(&_listener).is_empty(),
+            "lookup must not connect"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rebound_non_listening_webhook_does_not_reuse_the_old_listener() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = TempDir::new().unwrap();
+        let socket_path = home.path().join("rebound.sock");
+        let old_listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::remove_file(&socket_path).unwrap();
+        // Bind another stream socket at the same pathname, but deliberately do not listen.
+        // SAFETY: socket returns an owned descriptor; sockaddr_un is initialized before bind.
+        let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(raw_fd >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: socket returned a valid, uniquely owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let path_bytes = socket_path.as_os_str().as_bytes();
+        // SAFETY: zero is a valid initial representation for sockaddr_un.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        assert!(path_bytes.len() < addr.sun_path.len());
+        for (dest, src) in addr.sun_path.iter_mut().zip(path_bytes) {
+            *dest = *src as libc::c_char;
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert_eq!(found, Some(RouteLookup::Scanned(route)));
-            assert_eq!(costs.route_scans, 1, "without a listener verifier, rescan");
-        }
+        // SAFETY: addr is a fully initialized sockaddr_un and remains alive for the call.
+        let ret = unsafe {
+            libc::bind(
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
+                (&raw const addr).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+        assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
+        save_route(home.path(), "ada", VendorRoute::Webhook { socket_path });
+        host_runs_claude(home.path(), "ada", "new-sid");
+        let long_ago = Instant::now()
+            .checked_sub(ROUTE_REDISCOVERY_INTERVAL + Duration::from_secs(1))
+            .unwrap();
+        note_route_file_scan(Some(home.path()), long_ago);
+        let (found, costs) = measure(|| lookup_route(Some(home.path()), by_persona("ada")));
+        assert!(
+            matches!(found, Some(RouteLookup::Scanned(ref route)) if claude_session_id(route) == "new-sid"),
+            "{found:?}"
+        );
+        assert_eq!(costs.route_scans, 1);
+        assert!(
+            connections(&old_listener).is_empty(),
+            "liveness must not send a probe"
+        );
     }
 
     #[test]

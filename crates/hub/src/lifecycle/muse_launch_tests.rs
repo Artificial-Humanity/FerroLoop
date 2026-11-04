@@ -1004,6 +1004,39 @@ fn a_gone_muse_window_does_not_fall_back_to_headless_via_a_neighbor() {
 }
 
 #[test]
+fn a_stale_exact_live_muse_route_is_used_without_a_rescan() {
+    crate::direct_quota::with_probe_lock(|| {
+        let home = TempDir::new().unwrap();
+        let _tmux = FakeTmuxWindows::install(home.path(), &["muse:ada"]);
+        let route = VendorRoute::Muse {
+            session_id: "sid-ada".into(),
+            cwd: None,
+            tmux_target: Some("muse:ada".into()),
+            tmux_pane: None,
+        };
+        let path = crate::discovery::route_table_path(Some(home.path())).unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert("ada", route.clone(), At::from_unix_millis(1));
+        routes.save(Some(&path)).unwrap();
+        let old = std::time::Instant::now()
+            .checked_sub(
+                fl_wire::dispatcher::ROUTE_REDISCOVERY_INTERVAL + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        crate::discovery::note_route_file_scan(Some(home.path()), old);
+        let query = RouteQuery {
+            persona: Some("ada"),
+            fallback_session_id: "sid-ada",
+            session_id: Some("sid-ada"),
+        };
+        let (found, costs) =
+            crate::discovery::cost_counters::measure(|| lookup_route(Some(home.path()), query));
+        assert_eq!(found, Some(RouteLookup::Saved(route)));
+        assert_eq!(costs.route_scans, 0);
+    });
+}
+
+#[test]
 fn a_live_unrelated_pid_does_not_prove_a_stale_claude_route() {
     let route = VendorRoute::Claude {
         pid: std::process::id(),

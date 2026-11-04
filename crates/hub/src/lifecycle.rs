@@ -1714,48 +1714,11 @@ fn route_looks_live(route: &VendorRoute, home_override: Option<&Path>) -> bool {
     }
 }
 
-/// Verify a Unix webhook listener without connecting to it. A probe connection would itself
-/// reach the receiver as a delivery. Linux exposes listening sockets in `/proc/net/unix`;
-/// elsewhere, or when the table cannot be read, rediscovery is required.
-#[cfg(target_os = "linux")]
-fn webhook_listener_is_live(socket_path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    let Some(path) = socket_path.to_str().filter(|p| !p.contains(['\n', '\r'])) else {
-        return false;
-    };
-    if !socket_path
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_socket())
-    {
-        return false;
-    }
-    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
-        return false;
-    };
-    table.lines().any(|line| {
-        let Some(prefix) = line.strip_suffix(path) else {
-            return false;
-        };
-        if !prefix.ends_with(' ') {
-            return false;
-        }
-        let fields: Vec<_> = prefix.split_whitespace().collect();
-        fields.len() == 7
-            && u32::from_str_radix(fields[3], 16).is_ok_and(|flags| flags & 0x0001_0000 != 0)
-            && fields[4] == "0001"
-            && fields[5] == "01"
-    })
-}
-#[cfg(not(target_os = "linux"))]
-fn webhook_listener_is_live(_socket_path: &Path) -> bool {
-    false
-}
-
 /// A stale saved route needs a positive endpoint check. A PID alone is not a stable Claude
-/// session identity; stale Claude, Codex, and Antigravity routes require rediscovery.
+/// session identity, and a socket pathname cannot prove which listener owns it. Unverifiable
+/// stale routes require rediscovery.
 fn stale_route_verified_live(route: &VendorRoute, _home_override: Option<&Path>) -> bool {
     match route {
-        VendorRoute::Webhook { socket_path } => webhook_listener_is_live(socket_path),
         VendorRoute::Muse {
             tmux_target,
             tmux_pane,
