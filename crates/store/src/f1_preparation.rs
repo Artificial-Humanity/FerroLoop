@@ -1079,4 +1079,90 @@ mod tests {
     fn sqlite_preparation_refuses_memory_pseudopath() {
         assert!(crate::SqliteF1PreparationStore::open(std::path::Path::new(":memory:")).is_err());
     }
+    #[test]
+    fn sqlite_refuses_similar_reserved_prefix_schema_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = tmp.path().join("foreign.sqlite");
+        let raw = rusqlite::Connection::open(&foreign).unwrap();
+        raw.execute_batch(
+            "CREATE TABLE sqliteXforeign (x); INSERT INTO sqliteXforeign VALUES (42);",
+        )
+        .unwrap();
+        drop(raw);
+        let before = std::fs::read(&foreign).unwrap();
+        assert!(crate::SqliteF1PreparationStore::open(&foreign).is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), before);
+        for timing in ["BEFORE INSERT", "AFTER UPDATE"] {
+            let path = tmp
+                .path()
+                .join(format!("{}.sqlite", timing.replace(' ', "-")));
+            let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+            store.insert_allocation(allocation()).unwrap();
+            let raw = rusqlite::Connection::open(&path).unwrap();
+            raw.execute_batch(&format!("CREATE TRIGGER sqliteXevil {timing} ON f1_records BEGIN DELETE FROM f1_records; END;")).unwrap();
+            if timing == "BEFORE INSERT" {
+                let mut another = allocation();
+                another.allocation_id = "another".into();
+                another.root_id = "another".into();
+                assert!(store.insert_allocation(another).is_err());
+            } else {
+                assert!(store.request_allocation_stop("allocation", 1).is_err());
+            }
+            let count: i64 = raw
+                .query_row("SELECT count(*) FROM f1_records", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            drop(store);
+            assert!(crate::SqliteF1PreparationStore::open(&path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_refuses_symlinked_parent_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("actual");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
+        assert!(crate::SqliteF1PreparationStore::open(&tmp.path().join("link/db.sqlite")).is_err());
+        assert!(!target.join("db.sqlite").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_refuses_final_symlink_swap_before_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&victim).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        drop(store);
+        let before = std::fs::read(&victim).unwrap();
+        let path = tmp.path().join("requested.sqlite");
+        std::fs::File::create(&path).unwrap();
+        let replacement = path.clone();
+        let link_target = victim.clone();
+        crate::f1_sqlite::before_sqlite_open(move || {
+            std::fs::remove_file(&replacement).unwrap();
+            std::os::unix::fs::symlink(&link_target, &replacement).unwrap();
+        });
+        assert!(crate::SqliteF1PreparationStore::open(&path).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), before);
+    }
+    #[test]
+    fn sqlite_refuses_forged_reserved_prefix_trigger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("forged.sqlite");
+        let store = crate::SqliteF1PreparationStore::open(&path).unwrap();
+        store.insert_allocation(allocation()).unwrap();
+        drop(store);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch("PRAGMA writable_schema=ON; INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql) VALUES('trigger','sqlite_evil','f1_records',0,'CREATE TRIGGER sqlite_evil AFTER UPDATE ON f1_records BEGIN DELETE FROM f1_records; END');").unwrap();
+        drop(raw);
+        assert!(crate::SqliteF1PreparationStore::open(&path).is_err());
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let count: i64 = raw
+            .query_row("SELECT count(*) FROM f1_records", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 }

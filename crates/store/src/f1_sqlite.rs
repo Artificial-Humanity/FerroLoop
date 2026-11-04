@@ -3,7 +3,7 @@
 //! This is a separate database, not the hub's native Ferro/redb control ledger. Its
 //! transactions cannot coordinate with hub records and it does not authorize or dispatch
 //! work. No caller should treat it as the production admission store.
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -13,6 +13,16 @@ use fl_core::f1_records::{
     decode_allocation_record, decode_intent_record, decode_routine_record, encode_record,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_SQLITE_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn before_sqlite_open(f: impl FnOnce() + 'static) {
+    BEFORE_SQLITE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
 
 const APPLICATION_ID: i64 = 0x4631_5052; // F1PR
 const SCHEMA_VERSION: i64 = 1;
@@ -26,11 +36,7 @@ fn check_schema(db: &Connection) -> Result<(), F1RecordError> {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(backend)?;
     let count: i64 = db
-        .query_row(
-            "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
         .map_err(backend)?;
     let sql: Option<String> = db
         .query_row(
@@ -54,6 +60,31 @@ fn backend(e: impl std::fmt::Display) -> F1RecordError {
     F1RecordError::Backend(e.to_string())
 }
 
+/// Reject symlinked ancestors and traversal. The caller must also keep the parent
+/// directories trusted and fenced against concurrent replacement throughout open/use:
+/// SQLite's no-follow flag protects the final component, not mutable ancestors.
+fn check_parent(path: &Path) -> Result<(), F1RecordError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(backend)?.join(path)
+    };
+    let parent = absolute.parent().ok_or(F1RecordError::InvalidRecord)?;
+    let mut prefix = PathBuf::new();
+    for component in parent.components() {
+        match component {
+            Component::ParentDir => return Err(F1RecordError::InvalidRecord),
+            Component::CurDir => continue,
+            other => prefix.push(other.as_os_str()),
+        }
+        let meta = prefix.symlink_metadata().map_err(backend)?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(F1RecordError::InvalidRecord);
+        }
+    }
+    Ok(())
+}
+
 /// Separate opt-in local SQLite preparation database. Operations require external caller
 /// authorization; records are inert evidence, never authority or admission.
 pub struct SqliteF1PreparationStore {
@@ -63,6 +94,8 @@ pub struct SqliteF1PreparationStore {
 impl SqliteF1PreparationStore {
     /// Open an existing F1 preparation database or initialize an empty file. Refuses foreign
     /// databases and unsupported schemas. This does not open or modify the hub's store.
+    /// The caller must ensure the parent path is trusted and cannot be replaced concurrently
+    /// while the database or its SQLite sidecars are in use.
     pub fn open(path: &Path) -> Result<Self, F1RecordError> {
         if path.as_os_str().is_empty()
             || path == Path::new(":memory:")
@@ -72,11 +105,21 @@ impl SqliteF1PreparationStore {
         {
             return Err(F1RecordError::InvalidRecord);
         }
+        check_parent(path)?;
+        // Create only new files with private permissions. Existing files are never chmodded.
+        crate::private::create_private_file(path).map_err(backend)?;
+        #[cfg(all(test, unix))]
+        BEFORE_SQLITE_OPEN.with(|hook| {
+            if let Some(f) = hook.borrow_mut().take() {
+                f()
+            }
+        });
         let mut db = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(backend)?;
         db.busy_timeout(Duration::from_secs(5)).map_err(backend)?;
@@ -91,11 +134,7 @@ impl SqliteF1PreparationStore {
             .map_err(backend)?;
         if app == 0 && version == 0 {
             let count: i64 = tx
-                .query_row(
-                    "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
                 .map_err(backend)?;
             if count != 0 {
                 return Err(F1RecordError::InvalidRecord);
