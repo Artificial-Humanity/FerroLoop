@@ -15,6 +15,7 @@ pub mod runner;
 pub mod stamp;
 pub mod state_sync;
 pub mod workflow;
+pub mod worktree;
 pub use adapters::{
     AdapterBuild, AntigravityAdapter, AnyAdapter, ApiKeyResolver, ClaudeAdapter, CodexAdapter,
     ExecVendorAdapter, GrokAdapter, HttpApiAdapter, LivenessSink, MuseAdapter,

@@ -429,12 +429,14 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "globset",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
  "tiktoken-rs",
+ "toml",
 ]
 
 [[package]]
@@ -443,6 +445,7 @@ version = "0.1.0"
 dependencies = [
  "fl-core",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -1184,6 +1187,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

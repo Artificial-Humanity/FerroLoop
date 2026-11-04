@@ -1784,6 +1784,7 @@ mod tests {
             default_context_window: 54_321,
             default_rate_card: fl_core::telemetry::RateCard::default(),
             mcp_config_rel_path: Some(".custom/mcp.json".to_string()),
+            slice_bounds: Vec::new(),
         })
         .unwrap();
     }
@@ -1911,6 +1912,7 @@ mod tests {
             default_context_window: 0,
             default_rate_card: fl_core::telemetry::RateCard::default(),
             mcp_config_rel_path: None,
+            slice_bounds: Vec::new(),
         })
         .unwrap();
         let matrix = build_matrix(&inputs("", None), Some("vendors")).unwrap();
