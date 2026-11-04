@@ -77,9 +77,10 @@ use crate::cloud_adapters;
 use crate::discovery::{
     DiscoveredSessionSummary, DiscoveryStoreSnapshot, TranscriptReads, context_usage_from_sessions,
     discover_route_sessions_without_model_info, discover_sessions_from_snapshot,
-    list_git_worktrees, lookup_sessions, read_session_quota_usage_with_reads,
-    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
-    snapshot_discovery_store, transcript_from_sessions,
+    list_git_worktrees, lookup_one_route_session, lookup_sessions,
+    read_session_quota_usage_with_reads, read_session_transcript_from_snapshot, read_worktree_diff,
+    scan_cargo_architecture_conformance, snapshot_discovery_names, snapshot_discovery_store,
+    transcript_from_sessions,
 };
 use crate::github_pr;
 use crate::lifecycle::{
@@ -5609,24 +5610,29 @@ fn handle_post_session_prompt(
 
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
-    drain_ready_session_queues(state);
-    // One store snapshot and one route lookup serve the resolve, the busy check and the
-    // in-flight mark below.
-    let snap = load_discovery_snapshot(state);
     let home = state.config.home_override.as_deref();
-    let sessions = lookup_sessions(&snap, home);
+    // Most prompts target a live route. Its identity needs agent ordering but not the
+    // project's entire attempt history. Preserve the full lookup for unknown targets.
+    let names = state
+        .open_store()
+        .map(|store| snapshot_discovery_names(&store))
+        .unwrap_or_default();
+    let fast = lookup_one_route_session(&names, home, session_id);
+    let (snap, sessions) = if let Some(session) = fast {
+        (names, vec![session])
+    } else {
+        let snap = load_discovery_snapshot(state);
+        let sessions = lookup_sessions(&snap, home);
+        (snap, sessions)
+    };
     let (canonical_session_id, target_persona) = resolve_session_target_in(&sessions, session_id);
     let has_queued = !state.session_queue(&canonical_session_id).is_empty();
+    let mut files = TranscriptReads::default();
     // `send_now` dispatches busy or not, so it skips the transcript parse. The check's one side
     // effect, dropping a finished in-flight marker, is overwritten by the mark after dispatch.
     let busy = !payload.send_now && {
-        let turns = transcript_from_sessions(
-            &canonical_session_id,
-            &sessions,
-            &snap,
-            home,
-            &mut TranscriptReads::default(),
-        );
+        let turns =
+            transcript_from_sessions(&canonical_session_id, &sessions, &snap, home, &mut files);
         state.is_session_busy_from_turns(&canonical_session_id, &turns)
     };
 
@@ -5671,14 +5677,8 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    // The transcript as the dispatch left it: read again, not taken from the busy check.
-    let after = transcript_from_sessions(
-        &canonical_session_id,
-        &sessions,
-        &snap,
-        home,
-        &mut TranscriptReads::default(),
-    );
+    // A changed transcript is refreshed; an unchanged one reuses the busy check's parse.
+    let after = transcript_from_sessions(&canonical_session_id, &sessions, &snap, home, &mut files);
     state.mark_session_in_flight_from_turns(&canonical_session_id, &after);
     let queue = state.session_queue(&canonical_session_id);
 

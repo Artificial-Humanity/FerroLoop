@@ -497,14 +497,14 @@ fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
 }
 
 #[test]
-fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
+fn known_prompt_skips_attempt_snapshot_and_reuses_unchanged_transcript() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let (queued_check, checked) = post_prompt(&state, false);
     assert_eq!(queued_check.json_value().unwrap()["status"], "sent");
-    // Busy check, then the in-flight mark after the dispatch.
-    assert_eq!(checked.transcript_parses, 2);
-    assert_eq!(checked.store_snapshots, 1);
+    // Busy check and in-flight mark share the unchanged transcript.
+    assert_eq!(checked.transcript_parses, 1);
+    assert_eq!(checked.store_snapshots, 0);
 
     let (sent, skipped) = post_prompt(&state, true);
     let body = sent.json_value().unwrap();
@@ -514,11 +514,124 @@ fn send_now_skips_the_busy_parse_and_a_prompt_takes_one_store_snapshot() {
         skipped.transcript_parses, 1,
         "only the in-flight mark parses"
     );
-    assert_eq!(skipped.store_snapshots, 1);
+    assert_eq!(skipped.store_snapshots, 0);
 
     // The in-flight mark still took: a prompt without send_now now queues.
     let (queued, _) = post_prompt(&state, false);
     assert_eq!(queued.json_value().unwrap()["status"], "queued");
+}
+
+#[test]
+fn unknown_prompt_uses_full_attempt_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (response, costs) = measure(|| {
+        handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/not-a-route/prompt")
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+        )
+    });
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        costs.store_snapshots, 1,
+        "unknown targets retain attempt fallback"
+    );
+}
+
+#[test]
+fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
+    let attempt = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["source"] == "attempt")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let (response, costs) = measure(|| {
+        handle_http_request(
+            &state,
+            &HttpRequest::new("POST", format!("/api/v1/sessions/{attempt}/prompt"))
+                .with_header("Authorization", OWNER)
+                .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+        )
+    });
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json_value().unwrap()["session_id"], attempt);
+    assert_eq!(costs.store_snapshots, 1);
+}
+
+#[test]
+fn single_route_lookup_does_not_search_unrelated_transcripts() {
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    let tmp = TempDir::new().unwrap();
+    let path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    let mut routes = RouteTable::default();
+    for i in 0..25 {
+        routes.upsert(
+            &format!("agent{i}"),
+            VendorRoute::Codex {
+                thread_id: format!("thread-{i}"),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+    }
+    routes.save(Some(&path)).unwrap();
+    let snapshot = crate::discovery::DiscoveryStoreSnapshot::default();
+    let (found, costs) = measure(|| {
+        crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), "thread-12")
+    });
+    assert_eq!(found.unwrap().persona.as_deref(), Some("agent12"));
+    assert_eq!(
+        costs.transcript_finds, 1,
+        "only the selected route is searched"
+    );
+    let full = crate::discovery::lookup_sessions(&snapshot, Some(tmp.path()));
+    for requested in ["thread-12", "agent12", "missing"] {
+        let fast =
+            crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), requested);
+        let full_match = full
+            .iter()
+            .find(|s| s.id == requested || s.persona.as_deref() == Some(requested));
+        assert_eq!(fast.as_ref(), full_match, "{requested}");
+    }
+}
+
+#[test]
+fn fast_lookup_preserves_full_discoverys_deduplicated_route_order() {
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    let tmp = TempDir::new().unwrap();
+    let path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    let mut routes = RouteTable::default();
+    for persona in ["alice", "bob"] {
+        routes.upsert(
+            persona,
+            VendorRoute::Codex {
+                thread_id: "shared-thread".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+    }
+    routes.save(Some(&path)).unwrap();
+    let snapshot = crate::discovery::DiscoveryStoreSnapshot::default();
+    let full = crate::discovery::lookup_sessions(&snapshot, Some(tmp.path()));
+    for requested in ["alice", "bob", "shared-thread"] {
+        let fast =
+            crate::discovery::lookup_one_route_session(&snapshot, Some(tmp.path()), requested);
+        let full_match = full
+            .iter()
+            .find(|s| s.id == requested || s.persona.as_deref() == Some(requested));
+        assert_eq!(fast.as_ref(), full_match, "{requested}");
+    }
 }
 
 // ---- item 3: lazy route lookup ----

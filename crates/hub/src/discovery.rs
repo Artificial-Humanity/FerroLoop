@@ -199,6 +199,7 @@ pub(crate) mod cost_counters {
         pub(crate) static TRANSCRIPT_READS: Cell<u64> = const { Cell::new(0) };
         /// Transcripts parsed into turns ([`super::parse_jsonl_transcript`]).
         pub(crate) static TRANSCRIPT_PARSES: Cell<u64> = const { Cell::new(0) };
+        pub(crate) static TRANSCRIPT_FINDS: Cell<u64> = const { Cell::new(0) };
         /// Store snapshots ([`super::snapshot_discovery_store`]): `2 + projects` store reads each.
         pub(crate) static STORE_SNAPSHOTS: Cell<u64> = const { Cell::new(0) };
         /// Workspace store opens (`HubState::open_store_at`).
@@ -217,6 +218,7 @@ pub(crate) mod cost_counters {
         pub route_scans: u64,
         pub transcript_reads: u64,
         pub transcript_parses: u64,
+        pub transcript_finds: u64,
         pub store_snapshots: u64,
         pub store_opens: u64,
     }
@@ -226,6 +228,7 @@ pub(crate) mod cost_counters {
             route_scans: ROUTE_SCANS.with(Cell::get),
             transcript_reads: TRANSCRIPT_READS.with(Cell::get),
             transcript_parses: TRANSCRIPT_PARSES.with(Cell::get),
+            transcript_finds: TRANSCRIPT_FINDS.with(Cell::get),
             store_snapshots: STORE_SNAPSHOTS.with(Cell::get),
             store_opens: STORE_OPENS.with(Cell::get),
         }
@@ -240,6 +243,7 @@ pub(crate) mod cost_counters {
             route_scans: after.route_scans - before.route_scans,
             transcript_reads: after.transcript_reads - before.transcript_reads,
             transcript_parses: after.transcript_parses - before.transcript_parses,
+            transcript_finds: after.transcript_finds - before.transcript_finds,
             store_snapshots: after.store_snapshots - before.store_snapshots,
             store_opens: after.store_opens - before.store_opens,
         };
@@ -581,6 +585,19 @@ pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     }
 }
 
+/// The route ordering needs agent names, but not attempt history.
+pub(crate) fn snapshot_discovery_names(store: &AnyStore) -> DiscoveryStoreSnapshot {
+    DiscoveryStoreSnapshot {
+        registered_names: store
+            .list_agents(None, true)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|agent| agent.name_key.to_ascii_lowercase())
+            .collect(),
+        attempts: Vec::new(),
+    }
+}
+
 /// Summary of a Git worktree discovered via `git worktree list --porcelain` (spec §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeSummary {
@@ -663,11 +680,76 @@ fn discover_sessions_impl(
     home_override: Option<&Path>,
     with_model_info: bool,
 ) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_from_routes(
+        snap,
+        home_override,
+        with_model_info,
+        discovered_route_table(home_override),
+        None,
+    )
+}
+
+/// The canonical ID used both for fast resolution and complete discovery.
+fn route_session_id(persona: &str, route: &VendorRoute) -> String {
+    match route {
+        VendorRoute::Claude {
+            pid, session_id, ..
+        } if session_id.trim().is_empty() => {
+            format!("claude-{persona}-{pid}")
+        }
+        VendorRoute::Claude { session_id, .. } | VendorRoute::Grok { session_id, .. } => {
+            session_id.clone()
+        }
+        VendorRoute::Agy {
+            conversation_id, ..
+        } => conversation_id.clone(),
+        VendorRoute::Codex { thread_id, .. } => thread_id.clone(),
+        VendorRoute::Muse { session_id, .. } if session_id.is_empty() => format!("muse-{persona}"),
+        VendorRoute::Muse { session_id, .. } => session_id.clone(),
+        VendorRoute::Webhook { .. } => format!("webhook-{persona}"),
+    }
+}
+
+/// Resolve one route in the same order and with the same deduplication as full discovery.
+/// No transcript path is searched for an unrelated route.
+pub(crate) fn lookup_one_route_session(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    requested: &str,
+) -> Option<DiscoveredSessionSummary> {
+    let routes = discovered_route_table(home_override);
+    let mut ordered: Vec<_> = routes.entries.iter().collect();
+    ordered.sort_by_key(|(persona, entry)| {
+        (
+            !snap
+                .registered_names
+                .contains(&persona.to_ascii_lowercase()),
+            std::cmp::Reverse(entry.updated_at.unix_millis()),
+            *persona,
+        )
+    });
+    let mut seen = BTreeSet::new();
+    let requested = requested.trim();
+    let persona = ordered.into_iter().find_map(|(persona, entry)| {
+        let id = route_session_id(persona, &entry.route);
+        (seen.insert(id.clone()) && (id == requested || persona == requested))
+            .then(|| persona.clone())
+    })?;
+    discover_sessions_from_routes(snap, home_override, false, routes, Some(&persona))
+        .into_iter()
+        .next()
+}
+
+fn discover_sessions_from_routes(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    with_model_info: bool,
+    routes: RouteTable,
+    only_persona: Option<&str>,
+) -> Vec<DiscoveredSessionSummary> {
     let mut out = Vec::new();
     let mut agy_endpoints: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut seen_ids = BTreeSet::new();
-
-    let routes = discovered_route_table(home_override);
 
     let home = home_override
         .map(Path::to_path_buf)
@@ -686,19 +768,16 @@ fn discover_sessions_impl(
     });
 
     for (persona, entry) in ordered_routes {
-        let (adapter, raw_id, cwd, transcript_path) = match &entry.route {
-            VendorRoute::Claude {
-                pid, session_id, ..
-            } => {
-                let id = if session_id.trim().is_empty() {
-                    format!("claude-{persona}-{pid}")
-                } else {
-                    session_id.clone()
-                };
+        if only_persona.is_some_and(|selected| selected != persona) {
+            continue;
+        }
+        let raw_id = route_session_id(persona, &entry.route);
+        let (adapter, cwd, transcript_path) = match &entry.route {
+            VendorRoute::Claude { .. } => {
                 let tpath = home
                     .as_deref()
-                    .and_then(|h| find_transcript_file_in_home(h, &id));
-                ("claude", id, None, tpath)
+                    .and_then(|h| find_transcript_file_in_home(h, &raw_id));
+                ("claude", None, tpath)
             }
             VendorRoute::Agy {
                 conversation_id,
@@ -732,7 +811,7 @@ fn discover_sessions_impl(
                             .join("transcript.jsonl");
                         p.is_file().then(|| p.display().to_string())
                     });
-                ("antigravity", conversation_id.clone(), None, tpath)
+                ("antigravity", None, tpath)
             }
             VendorRoute::Codex { thread_id, cwd } => {
                 let tpath = home
@@ -740,7 +819,6 @@ fn discover_sessions_impl(
                     .and_then(|h| find_transcript_file_in_home(h, thread_id));
                 (
                     "codex",
-                    thread_id.clone(),
                     cwd.as_ref().map(|p| p.display().to_string()),
                     tpath,
                 )
@@ -748,22 +826,11 @@ fn discover_sessions_impl(
             VendorRoute::Muse {
                 session_id, cwd, ..
             } => {
-                // A route made from a live tmux window has no id until Muse writes a transcript.
-                let id = if session_id.is_empty() {
-                    format!("muse-{persona}")
-                } else {
-                    session_id.clone()
-                };
                 let tpath = home
                     .as_deref()
                     .filter(|_| !session_id.is_empty())
-                    .and_then(|h| find_transcript_file_in_home(h, &id));
-                (
-                    "muse",
-                    id,
-                    cwd.as_ref().map(|p| p.display().to_string()),
-                    tpath,
-                )
+                    .and_then(|h| find_transcript_file_in_home(h, &raw_id));
+                ("muse", cwd.as_ref().map(|p| p.display().to_string()), tpath)
             }
             VendorRoute::Grok {
                 session_id, cwd, ..
@@ -771,19 +838,11 @@ fn discover_sessions_impl(
                 let tpath = home
                     .as_deref()
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
-                (
-                    "grok",
-                    session_id.clone(),
-                    cwd.as_ref().map(|p| p.display().to_string()),
-                    tpath,
-                )
+                ("grok", cwd.as_ref().map(|p| p.display().to_string()), tpath)
             }
-            VendorRoute::Webhook { socket_path } => (
-                "webhook",
-                format!("webhook-{persona}"),
-                Some(socket_path.display().to_string()),
-                None,
-            ),
+            VendorRoute::Webhook { socket_path } => {
+                ("webhook", Some(socket_path.display().to_string()), None)
+            }
         };
 
         if seen_ids.insert(raw_id.clone()) {
@@ -1800,6 +1859,8 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
 }
 
 fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::TRANSCRIPT_FINDS);
     if !is_safe_path_component(session_id) {
         return None;
     }
@@ -2411,19 +2472,59 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
 pub(crate) struct TranscriptReads {
     raw: BTreeMap<String, Option<String>>,
     turns: BTreeMap<String, Vec<TranscriptTurn>>,
+    stamps: BTreeMap<String, TranscriptStamp>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TranscriptStamp {
+    main: (std::time::SystemTime, u64),
+    agy_full: Option<(std::time::SystemTime, u64)>,
 }
 
 impl TranscriptReads {
-    /// The file's text, read on the first call for `path` only.
+    fn stamp(path: &str) -> Option<TranscriptStamp> {
+        fn one(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+            let meta = fs::metadata(path).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        }
+        let path = Path::new(path);
+        Some(TranscriptStamp {
+            main: one(path)?,
+            agy_full: is_antigravity_transcript(path)
+                .then(|| one(&path.with_file_name("transcript_full.jsonl")))
+                .flatten(),
+        })
+    }
+
+    fn refresh_if_changed(&mut self, path: &str) {
+        let current = Self::stamp(path);
+        if current.is_none() || current.as_ref() != self.stamps.get(path) {
+            self.raw.remove(path);
+            self.turns.remove(path);
+            self.stamps.remove(path);
+        }
+    }
+
+    /// Reuse a read only while the file's modification time and length are unchanged.
     fn raw(&mut self, path: &str) -> Option<&str> {
-        self.raw
-            .entry(path.to_string())
-            .or_insert_with(|| read_transcript(path).ok())
-            .as_deref()
+        self.refresh_if_changed(path);
+        if !self.raw.contains_key(path) {
+            let before = Self::stamp(path);
+            let text = read_transcript(path).ok();
+            let after = Self::stamp(path);
+            if before == after
+                && let Some(stamp) = before
+            {
+                self.stamps.insert(path.to_string(), stamp);
+            }
+            self.raw.insert(path.to_string(), text);
+        }
+        self.raw.get(path).and_then(Option::as_deref)
     }
 
     /// The file's turns, parsed on the first call for `path` only; `None` when it cannot be read.
     fn turns(&mut self, path: &str) -> Option<&[TranscriptTurn]> {
+        self.refresh_if_changed(path);
         if !self.turns.contains_key(path) {
             let raw = self.raw(path)?;
             let hydrated = hydrate_agy_truncated_turns(Path::new(path), raw);
@@ -4720,6 +4821,61 @@ pub fn scan_cargo_architecture_conformance(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn transcript_reads_refreshes_after_file_changes_but_reuses_unchanged_data() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"one\"}}\n",
+        )
+        .unwrap();
+        let name = path.to_str().unwrap();
+        let mut reads = TranscriptReads::default();
+        let (_, cost) = cost_counters::measure(|| {
+            reads.turns(name).unwrap();
+            reads.turns(name).unwrap();
+        });
+        assert_eq!((cost.transcript_reads, cost.transcript_parses), (1, 1));
+        fs::write(&path, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"different message\"}}\n").unwrap();
+        let (turns, cost) = cost_counters::measure(|| reads.turns(name).unwrap().to_vec());
+        assert_eq!((cost.transcript_reads, cost.transcript_parses), (1, 1));
+        assert!(
+            turns
+                .iter()
+                .any(|t| t.content.contains("different message"))
+        );
+    }
+
+    #[test]
+    fn transcript_cache_refreshes_when_hydration_companion_changes() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join(".system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let compact = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let row = |content: &str, truncated: bool| {
+            let mut row =
+                serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": content});
+            if truncated {
+                row["truncated_fields"] = serde_json::json!(["content"]);
+            }
+            format!("{row}\n")
+        };
+        fs::write(&compact, row("short", true)).unwrap();
+        fs::write(&full, row("first full text", false)).unwrap();
+        let mut cache = TranscriptReads::default();
+        let path = compact.to_str().unwrap();
+        assert!(
+            cache.turns(path).unwrap()[0]
+                .content
+                .contains("first full text")
+        );
+        fs::write(&full, row("a longer changed full text", false)).unwrap();
+        let turns = cache.turns(path).unwrap();
+        assert!(turns[0].content.contains("a longer changed full text"));
+    }
 
     /// A workspace with `crates/a`, a nested `crates/a/submodules` package, a top-level
     /// `submodules/Standalone` package whose source imports `pkg_a`, and a `vendor/lib`
