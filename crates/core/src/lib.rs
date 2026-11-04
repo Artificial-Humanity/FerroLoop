@@ -40,10 +40,7 @@ pub mod notifications;
 pub mod pr_policy;
 pub mod ref_index;
 pub mod routine;
-pub mod routine_store;
-#[cfg(any(test, feature = "conformance"))]
-#[doc(hidden)]
-pub mod routine_store_tests;
+pub mod routine_authority;
 pub mod routing;
 pub mod session_protocol;
 pub mod slice_proof;
@@ -182,6 +179,12 @@ pub use routine::{
     FiringRecord, FiringState, RoutineError, RoutineSpec, RoutineState, RoutineTarget, RoutineWork,
     Schedule, ScheduledInstant, Window, firing_key,
 };
+pub use routine_authority::{
+    AuthorityError, LifecycleAuthority, LifecycleTarget, LifecycleVerificationRequest,
+    ProofRegistryVerifier, ProofVerificationRequest, TerminalReceiptVerifier,
+    TerminalVerificationRequest, UnavailableAuthority, VerifiedLifecycle, VerifiedProof,
+    VerifiedTerminal, VerifiedTerminalOutcome,
+};
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use session_protocol::{
     AcpOperation, AcpProfileFingerprint, AcpProfileProofRecord, ConformanceState,
@@ -235,11 +238,3 @@ pub use workspace::{
 /// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the
 /// engine must recognise the file too: it never makes a gate stale.
 pub const MANIFEST_PATH: &str = ".fl/manifest.json";
-
-pub use routine_store::{
-    AdmissionRequest as RoutineAdmissionRequest, AllocationRecord, BudgetWindow, CatchUpProgress,
-    ChildRequest, ControlError, ControlLedger, ControlResult, ControlTransaction, DispatchAuth,
-    ExecutionReservation, Funds, IntentEffect, IntentStore, IntentTransaction,
-    MemoryRoutineIntentStore, OutboxRecord, Resolution, RoutineStore, RoutineTransaction,
-    TicketState,
-};
