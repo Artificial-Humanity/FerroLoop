@@ -53,11 +53,29 @@ fn codex_matrix_account_is_bound_to_credential_home() {
             quota_cache: Arc::default(),
         };
         let matrix = build_matrix(&inputs, Some("codex")).unwrap();
+        if mode == "switch" {
+            let first = &matrix.vendor_quotas["codex"];
+            assert_eq!(first.tier.as_deref(), Some("pro"));
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"enterprise"}}).to_string(),
+            );
+            let auth = PathBuf::from(std::env::var_os("CODEX_HOME").unwrap()).join("auth.json");
+            std::fs::write(
+                auth,
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+            let updated = build_matrix(&inputs, Some("codex")).unwrap();
+            let current = &updated.vendor_quotas["codex"];
+            assert_eq!(current.tier.as_deref(), Some("enterprise"));
+            assert!(current.primary_window.is_none());
+            return;
+        }
         match mode.as_str() {
             "same" | "override" => {
                 let reading = &matrix.vendor_quotas["codex"];
                 assert_eq!(reading.tier.as_deref(), Some("pro"));
-                assert_eq!(reading.primary_window.as_ref().unwrap().used_percent, 7.0);
+                assert!(reading.primary_window.is_none());
             }
             "other" => {
                 let reading = &matrix.vendor_quotas["codex"];
@@ -91,6 +109,7 @@ fn codex_matrix_account_is_bound_to_credential_home() {
         ("other", account_b.path().join(".codex")),
         ("override", account_b.path().join(".codex")),
         ("missing", account_b.path().join("missing")),
+        ("switch", account_a.path().join(".codex")),
     ] {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([

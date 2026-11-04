@@ -2301,70 +2301,6 @@ fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
     Some(normalize_codex_plan(plan))
 }
 
-/// Session discovery searches `<home>/.codex/sessions`; a route does not carry a
-/// credential-home identity. Only a rollout inside that sessions tree binds a
-/// session to the corresponding auth file. Never use the hub's CODEX_HOME for it.
-fn codex_bound_session_home(home: &Path, transcript: Option<&str>) -> Option<PathBuf> {
-    let transcript = Path::new(transcript?);
-    if !home.is_absolute() {
-        return None;
-    }
-    let home = fs::canonicalize(home).ok()?;
-    let codex = home.join(".codex");
-    let sessions = codex.join("sessions");
-    if fs::symlink_metadata(&codex).ok()?.file_type().is_symlink()
-        || fs::symlink_metadata(&sessions)
-            .ok()?
-            .file_type()
-            .is_symlink()
-    {
-        return None;
-    }
-    let session_root = fs::canonicalize(sessions).ok()?;
-    let path = fs::canonicalize(transcript).ok()?;
-    if !session_root.starts_with(&home) || !path.starts_with(&session_root) {
-        return None;
-    }
-    Some(home)
-}
-
-fn codex_session_auth_plan(home: &Path, transcript: Option<&str>) -> Option<String> {
-    codex_auth_plan(Some(&codex_bound_session_home(home, transcript)?))
-}
-
-/// A matrix account probe and a session's usage describe the same credential home only when
-/// the session has a rollout in discovery's sessions tree and the configured account home
-/// resolves to that tree's `.codex` directory. Missing paths and unbound sessions fail closed.
-pub(crate) fn codex_session_matches_account(
-    session: &DiscoveredSessionSummary,
-    home_override: Option<&Path>,
-) -> bool {
-    let home = home_override
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    let Some(bound_home) = home
-        .as_deref()
-        .and_then(|h| codex_bound_session_home(h, session.transcript_path.as_deref()))
-    else {
-        return false;
-    };
-    let account_path = codex_auth_path(
-        home_override,
-        std::env::var_os("CODEX_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
-    );
-    let Some(account_dir) = account_path.as_deref().and_then(Path::parent) else {
-        return false;
-    };
-    match (
-        fs::canonicalize(bound_home.join(".codex")),
-        fs::canonicalize(account_dir),
-    ) {
-        (Ok(session_dir), Ok(account_dir)) => session_dir == account_dir,
-        _ => false,
-    }
-}
-
 /// An account-level probe is not attached to a session and uses the configured
 /// account home. It must not be merged into a session whose home is unknown.
 pub(crate) fn codex_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
@@ -3016,25 +2952,11 @@ fn quota_for_resolved_route_locked(
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     match adapter {
-        "codex" => {
-            let mut quota = transcript_path
-                .and_then(|path| files.raw(path))
-                .and_then(codex_quota_from_rollout);
-            if let Some(plan) = home
-                .as_deref()
-                .and_then(|h| codex_session_auth_plan(h, transcript_path))
-            {
-                quota
-                    .get_or_insert(SessionQuotaUsage {
-                        tier: None,
-                        primary_window: None,
-                        secondary_window: None,
-                        exhausted_reason: None,
-                    })
-                    .tier = Some(plan);
-            }
-            quota
-        }
+        // Rollouts lack a stable account identifier. Keep their historical quota
+        // separate from the credentials that happen to occupy the same home now.
+        "codex" => transcript_path
+            .and_then(|path| files.raw(path))
+            .and_then(codex_quota_from_rollout),
         "grok" => {
             transcript_path?;
             let home = home?;
@@ -9066,7 +8988,7 @@ mod tests {
             };
             let source = crate::runtime_matrix::QuotaSource::HOST;
             let quota = (source.session)(&session, None).unwrap();
-            assert_eq!(quota.tier.as_deref(), Some("plus"));
+            assert_eq!(quota.tier.as_deref(), Some("free"));
             assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
             assert_eq!(
                 (source.account)("codex", None).unwrap().tier.as_deref(),
@@ -9145,7 +9067,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn codex_auth_plan_overrides_stale_rollout_without_changing_windows() {
+    fn codex_rollout_quota_does_not_inherit_current_auth_plan() {
         use base64::Engine;
         let home = TempDir::new().unwrap();
         let codex = home.path().join(".codex");
@@ -9157,7 +9079,7 @@ mod tests {
         let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()));
         let quota =
             quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s").unwrap();
-        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert_eq!(quota.tier.as_deref(), Some("plus"));
         assert!(
             !serde_json::to_string(&quota)
                 .unwrap()
@@ -9202,13 +9124,17 @@ mod tests {
                 serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
             )
             .unwrap();
-            assert_eq!(tier(), expected);
+            assert_eq!(tier(), "plus");
+            assert_eq!(
+                codex_auth_plan(Some(home.path())).as_deref(),
+                Some(expected)
+            );
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn codex_auth_plan_reaches_by_id_and_account_quota() {
+    fn codex_by_id_rollout_and_account_quota_stay_separate() {
         use base64::Engine;
         let home = TempDir::new().unwrap();
         let id = "abc123";
@@ -9222,7 +9148,7 @@ mod tests {
         )
         .unwrap();
         let quota = read_session_quota_usage_with_home(id, Some(home.path())).unwrap();
-        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert_eq!(quota.tier.as_deref(), Some("plus"));
         assert_eq!(quota.primary_window.unwrap().used_percent, 3.0);
         let account = codex_account_quota(Some(home.path())).unwrap();
         assert_eq!(account.tier.as_deref(), Some("pro"));
