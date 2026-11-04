@@ -20,9 +20,9 @@ recapture and review; tests alone do not detect a changed binary on a user's mac
 
 Muse's captured `exec --help` advertises `--max-model-steps` and
 `--max-tool-output-bytes`, but neither this help nor parent help advertises
-`--max-turns`. `cargo test -p fl-exec --test slice_proof_flags
-muse_all_candidate_flags_are_available -- --ignored` exposes the resulting
-missing-flag failure. The normal suite records this absence without pretending
-it is an available capability. Codex's captured turn schema exposes `input` and
-`threadId` but no `maxOutputTokens` or `maxSteps` property. None of these
-observations establishes whether internal calls or spend are bounded.
+`--max-turns`. The active L2 tests pin the two observed flags and reject a candidate
+requiring `--max-turns` as unproven because that knob is missing. Matching help
+alone does not establish a proof or authorize production work. Codex's captured
+turn schema exposes `input` and `threadId` but no `maxOutputTokens` or `maxSteps`
+property. None of these observations establishes whether internal calls or spend
+are bounded.

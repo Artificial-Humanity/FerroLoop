@@ -17,15 +17,30 @@ fn option_present(help: &str, flag: &str) -> bool {
             .any(|word| word == flag)
     })
 }
-fn missing_muse_exec_flags(help: &str) -> Vec<&'static str> {
-    [
-        "--max-model-steps",
-        "--max-turns",
-        "--max-tool-output-bytes",
-    ]
-    .into_iter()
-    .filter(|flag| !option_present(help, flag))
-    .collect()
+
+/// A candidate's recorded help preflight; even AllPresent does not establish a proof.
+struct Candidate<'a> {
+    required_knobs: &'a [&'a str],
+}
+#[derive(Debug, PartialEq, Eq)]
+enum KnobCheck<'a> {
+    AllPresent,
+    UnprovenMissingKnobs(Vec<&'a str>),
+}
+impl<'a> Candidate<'a> {
+    fn check(&self, help: &str) -> KnobCheck<'a> {
+        let missing: Vec<_> = self
+            .required_knobs
+            .iter()
+            .copied()
+            .filter(|knob| !option_present(help, knob))
+            .collect();
+        if missing.is_empty() {
+            KnobCheck::AllPresent
+        } else {
+            KnobCheck::UnprovenMissingKnobs(missing)
+        }
+    }
 }
 
 #[test]
@@ -38,28 +53,34 @@ fn claude_budget_flag_is_pinned_to_recorded_help() {
 }
 
 #[test]
-fn muse_record_shows_both_present_knobs_and_missing_max_turns() {
-    assert!(option_present(MUSE_EXEC, "--max-model-steps"));
-    assert!(option_present(MUSE_EXEC, "--max-tool-output-bytes"));
+fn muse_candidate_requiring_missing_turns_is_unproven() {
+    let candidate = Candidate {
+        required_knobs: &[
+            "--max-model-steps",
+            "--max-turns",
+            "--max-tool-output-bytes",
+        ],
+    };
     assert!(!option_present(MUSE_TOP, "--max-turns"));
-    assert_eq!(missing_muse_exec_flags(MUSE_EXEC), ["--max-turns"]);
-    let removed = MUSE_EXEC.replace("--max-model-steps", "--removed-model-steps");
     assert_eq!(
-        missing_muse_exec_flags(&removed),
-        ["--max-model-steps", "--max-turns"]
+        candidate.check(MUSE_EXEC),
+        KnobCheck::UnprovenMissingKnobs(vec!["--max-turns"])
     );
 }
 
-/// Run explicitly when evaluating the candidate: this is red on the captured 1.4.14 help.
-/// An absent required knob is not proof that a vendor is safe to admit.
 #[test]
-#[ignore = "known missing --max-turns in captured Muse 1.4.14 help; candidate remains unproven"]
-fn muse_all_candidate_flags_are_available() {
-    assert!(
-        missing_muse_exec_flags(MUSE_EXEC).is_empty(),
-        "missing: {:?}",
-        missing_muse_exec_flags(MUSE_EXEC)
-    );
+fn muse_observed_knobs_are_pinned_and_missing_either_rejects_candidate() {
+    let candidate = Candidate {
+        required_knobs: &["--max-model-steps", "--max-tool-output-bytes"],
+    };
+    assert_eq!(candidate.check(MUSE_EXEC), KnobCheck::AllPresent);
+    for knob in candidate.required_knobs {
+        let changed = MUSE_EXEC.replace(knob, "--removed-knob");
+        assert_eq!(
+            candidate.check(&changed),
+            KnobCheck::UnprovenMissingKnobs(vec![knob])
+        );
+    }
 }
 
 #[test]
