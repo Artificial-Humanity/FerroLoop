@@ -15,8 +15,8 @@ use crate::contract::{
     count_unit_string,
 };
 use crate::proxy::{
-    PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse, execute_proxied_request_with_contract,
-    execute_proxied_request_with_provider_and_contract,
+    DispatchPhaseError, PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse,
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
 };
 use crate::vault::Vault;
 
@@ -528,34 +528,109 @@ impl ConnectorManifest {
         arguments: &Value,
         caller_agent: Option<String>,
     ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
+        self.execute_tool_outcome_with_timeout(vault, tool_name, arguments, caller_agent, None)
+    }
+
+    /// [`Self::execute_tool_outcome`] with the HTTP timeout overridden
+    /// (governed dispatch clamps it to the permit's remaining deadline).
+    pub fn execute_tool_outcome_with_timeout(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
+        self.execute_tool_outcome_phased(
+            vault,
+            tool_name,
+            arguments,
+            caller_agent,
+            timeout_secs,
+            None,
+        )
+        .map_err(DispatchPhaseError::into_gate_error)
+    }
+
+    /// Phased dispatch: request-build and proxy-preparation failures are
+    /// `DispatchPhaseError::BeforeSend` (no byte sent); failures once send
+    /// has been initiated are `AfterSend`. Contract transport failures are
+    /// an executed outcome, not an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tool_outcome_phased(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        timeout_secs: Option<u64>,
+        provider: Option<&dyn crate::adapter::SecretProviderAdapter>,
+    ) -> Result<(ProxyResponse, ToolOutcome), DispatchPhaseError> {
+        self.execute_tool_outcome_phased_with_deadline(
+            vault,
+            tool_name,
+            arguments,
+            caller_agent,
+            timeout_secs,
+            provider,
+            None,
+            &crate::vault::now_unix_millis,
+        )
+    }
+
+    /// [`Self::execute_tool_outcome_phased`] with a permit deadline re-checked
+    /// (fresh `now_fn()`) after preparation, before any byte is sent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tool_outcome_phased_with_deadline(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        timeout_secs: Option<u64>,
+        provider: Option<&dyn crate::adapter::SecretProviderAdapter>,
+        deadline_mono_ms: Option<u64>,
+        now_fn: &dyn Fn() -> u64,
+    ) -> Result<(ProxyResponse, ToolOutcome), DispatchPhaseError> {
         let tool = self
             .tools
             .iter()
             .find(|t| t.name == tool_name)
-            .ok_or_else(|| GateError::NoSuchTool {
-                tool: tool_name.to_string(),
+            .ok_or_else(|| {
+                DispatchPhaseError::BeforeSend(GateError::NoSuchTool {
+                    tool: tool_name.to_string(),
+                })
             })?;
-        let req = self.build_tool_request(tool, arguments, caller_agent)?;
-        // Contracted dispatch caps/strict-decodes on the wire; transport
-        // contract failures become a body-free outcome with a synthetic
-        // empty-body response carrying only the upstream status.
-        let resp = match &tool.response_contract {
-            Some(contract) => match execute_proxied_request_with_contract(vault, &req, contract) {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(outcome) = contract_outcome_for_transport_error(&e) {
-                        let synthetic = ProxyResponse {
-                            status: transport_error_status(&e),
-                            headers: BTreeMap::new(),
-                            body: String::new(),
-                            scrubbed_secrets: vec![],
-                        };
-                        return Ok((synthetic, outcome));
-                    }
-                    return Err(e);
+        let mut req = self
+            .build_tool_request(tool, arguments, caller_agent)
+            .map_err(DispatchPhaseError::BeforeSend)?;
+        if let Some(t) = timeout_secs {
+            req.timeout_secs = Some(t);
+        }
+        let resp = match execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+            vault,
+            &req,
+            provider,
+            tool.response_contract.as_ref(),
+            deadline_mono_ms,
+            now_fn,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // Contract transport errors only arise after execution.
+                if let DispatchPhaseError::AfterSend(ge) = &e
+                    && let Some(outcome) = contract_outcome_for_transport_error(ge)
+                {
+                    let synthetic = ProxyResponse {
+                        status: transport_error_status(ge),
+                        headers: BTreeMap::new(),
+                        body: String::new(),
+                        scrubbed_secrets: vec![],
+                    };
+                    return Ok((synthetic, outcome));
                 }
-            },
-            None => crate::proxy::execute_proxied_request(vault, &req)?,
+                return Err(e);
+            }
         };
         let outcome = evaluate_tool_response_bytes(
             tool.response_contract.as_ref(),
@@ -574,40 +649,8 @@ impl ConnectorManifest {
         caller_agent: Option<String>,
         provider: Option<&dyn crate::adapter::SecretProviderAdapter>,
     ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
-        let tool = self
-            .tools
-            .iter()
-            .find(|t| t.name == tool_name)
-            .ok_or_else(|| GateError::NoSuchTool {
-                tool: tool_name.to_string(),
-            })?;
-        let req = self.build_tool_request(tool, arguments, caller_agent)?;
-        let resp = match execute_proxied_request_with_provider_and_contract(
-            vault,
-            &req,
-            provider,
-            tool.response_contract.as_ref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                if let Some(outcome) = contract_outcome_for_transport_error(&e) {
-                    let synthetic = ProxyResponse {
-                        status: transport_error_status(&e),
-                        headers: BTreeMap::new(),
-                        body: String::new(),
-                        scrubbed_secrets: vec![],
-                    };
-                    return Ok((synthetic, outcome));
-                }
-                return Err(e);
-            }
-        };
-        let outcome = evaluate_tool_response_bytes(
-            tool.response_contract.as_ref(),
-            resp.body.as_bytes(),
-            &tool.response_fields,
-        );
-        Ok((resp, outcome))
+        self.execute_tool_outcome_phased(vault, tool_name, arguments, caller_agent, None, provider)
+            .map_err(DispatchPhaseError::into_gate_error)
     }
 
     /// Alias for [`Self::execute_tool_outcome`].
@@ -619,6 +662,24 @@ impl ConnectorManifest {
         caller_agent: Option<String>,
     ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
         self.execute_tool_outcome(vault, tool_name, arguments, caller_agent)
+    }
+
+    /// [`Self::invoke_tool_outcome`] with an HTTP timeout override.
+    pub fn invoke_tool_outcome_with_timeout(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        timeout_secs: Option<u64>,
+    ) -> Result<(ProxyResponse, ToolOutcome), GateError> {
+        self.execute_tool_outcome_with_timeout(
+            vault,
+            tool_name,
+            arguments,
+            caller_agent,
+            timeout_secs,
+        )
     }
 
     /// Alias for [`Self::execute_tool`].

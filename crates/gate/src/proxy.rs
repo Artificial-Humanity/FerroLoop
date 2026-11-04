@@ -860,6 +860,108 @@ pub fn execute_proxied_request_with_provider(
     execute_proxied_request_inner(vault, req, provider, LEGACY_MAX_RESPONSE_BYTES, false)
 }
 
+/// Error from proxied dispatch, classified by phase: `BeforeSend` errors
+/// arise during request preparation (before any byte is sent);
+/// `AfterSend` errors arise once send has been initiated.
+#[derive(Debug)]
+pub enum DispatchPhaseError {
+    BeforeSend(GateError),
+    AfterSend(GateError),
+}
+
+impl DispatchPhaseError {
+    pub fn into_gate_error(self) -> GateError {
+        match self {
+            Self::BeforeSend(e) | Self::AfterSend(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchPhaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeSend(e) | Self::AfterSend(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchPhaseError {}
+
+impl From<DispatchPhaseError> for GateError {
+    fn from(e: DispatchPhaseError) -> Self {
+        e.into_gate_error()
+    }
+}
+
+/// Phased form of [`execute_proxied_request_with_provider_and_contract`]:
+/// preparation failures are `BeforeSend`, send/response failures `AfterSend`.
+pub fn execute_proxied_request_with_provider_and_contract_phased(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    contract: Option<&crate::contract::ResponseContract>,
+) -> Result<ProxyResponse, DispatchPhaseError> {
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+        vault,
+        req,
+        provider,
+        contract,
+        None,
+        &crate::vault::now_unix_millis,
+    )
+}
+
+/// Floor timeout (whole seconds) from `deadline_mono_ms - fresh_now_ms`;
+/// `None` when under 1000 ms remains (refuse before send).
+pub fn remaining_deadline_timeout_secs(deadline_mono_ms: u64, fresh_now_ms: u64) -> Option<u64> {
+    let remaining_ms = deadline_mono_ms.saturating_sub(fresh_now_ms);
+    if remaining_ms < 1000 {
+        None
+    } else {
+        Some(remaining_ms / 1000)
+    }
+}
+
+/// Deadline-aware phased dispatch (shared by governed connector, hub raw,
+/// and CLI raw paths): after preparation completes and before the first
+/// byte is sent, re-check the permit deadline against a FRESH `now_fn()`.
+/// Expired / <1000 ms remaining is `BeforeSend` (no send). Otherwise the
+/// send timeout is `deadline - fresh_now` (floor), capped by any caller
+/// timeout already on `req`.
+pub fn execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+    contract: Option<&crate::contract::ResponseContract>,
+    deadline_mono_ms: Option<u64>,
+    now_fn: &dyn Fn() -> u64,
+) -> Result<ProxyResponse, DispatchPhaseError> {
+    let (cap, strict) = match contract {
+        Some(c) => (c.max_response_bytes, true),
+        None => (LEGACY_MAX_RESPONSE_BYTES, false),
+    };
+    let prepared_secrets = prepare_proxied_request_inner(vault, req, provider)
+        .map_err(DispatchPhaseError::BeforeSend)?;
+    // Re-check after prepare: preparation must not eat the deadline invisibly.
+    let mut effective;
+    let req = match deadline_mono_ms {
+        Some(deadline) => {
+            let fresh_now = now_fn();
+            let Some(secs) = remaining_deadline_timeout_secs(deadline, fresh_now) else {
+                return Err(DispatchPhaseError::BeforeSend(GateError::InvalidUrl {
+                    url: req.url.clone(),
+                    reason: "permit_deadline_exceeded".into(),
+                }));
+            };
+            effective = req.clone();
+            effective.timeout_secs = Some(effective.timeout_secs.unwrap_or(30).min(secs).max(1));
+            &effective
+        }
+        None => req,
+    };
+    send_prepared_proxied_request(vault, req, prepared_secrets, cap, strict)
+}
+
 fn execute_proxied_request_inner(
     vault: &Vault,
     req: &ProxyRequest,
@@ -868,6 +970,18 @@ fn execute_proxied_request_inner(
     strict_utf8: bool,
 ) -> Result<ProxyResponse, GateError> {
     let prepared_secrets = prepare_proxied_request_inner(vault, req, provider)?;
+    send_prepared_proxied_request(vault, req, prepared_secrets, cap, strict_utf8)
+        .map_err(DispatchPhaseError::into_gate_error)
+}
+
+fn send_prepared_proxied_request(
+    vault: &Vault,
+    req: &ProxyRequest,
+    prepared_secrets: PreparedSecrets,
+    cap: u64,
+    strict_utf8: bool,
+) -> Result<ProxyResponse, DispatchPhaseError> {
+    use DispatchPhaseError::{AfterSend as After, BeforeSend as Before};
     let prepared = prepared_secrets.request;
     let external = prepared_secrets.external_plaintexts;
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(1, 300));
@@ -932,19 +1046,19 @@ fn execute_proxied_request_inner(
         other => {
             audit_after_send("denied:unsupported_method");
             // `prepared.url` holds injected plaintext in its query: report the request's own URL.
-            return Err(GateError::InvalidUrl {
+            return Err(Before(GateError::InvalidUrl {
                 url: req.url.clone(),
                 reason: format!("unsupported HTTP method `{other}`"),
-            });
+            }));
         }
     };
 
     let mut resp = send_result.map_err(|e| {
         audit_after_send("error:upstream");
         let (scrubbed_err, _) = scrub_with_external(vault, &e.to_string(), &external);
-        GateError::UpstreamHttp {
+        After(GateError::UpstreamHttp {
             cause: scrubbed_err,
-        }
+        })
     })?;
 
     let status = resp.status().as_u16();
@@ -966,10 +1080,10 @@ fn execute_proxied_request_inner(
         .collect();
     if let Err(e) = validate_headers(&raw_header_pairs, MAX_HEADERS, MAX_HEADER_BYTES) {
         let GateError::UpstreamHttp { cause } = e else {
-            return Err(e);
+            return Err(After(e));
         };
         let (cause, _) = scrub_with_external(vault, &cause, &external);
-        return Err(GateError::UpstreamHttp { cause });
+        return Err(After(GateError::UpstreamHttp { cause }));
     }
     let mut resp_headers = BTreeMap::new();
     let mut scrubbed_names = BTreeSet::new();
@@ -996,21 +1110,21 @@ fn execute_proxied_request_inner(
         match read {
             Ok(_) if buf.len() as u64 > cap => {
                 if strict_utf8 {
-                    return Err(GateError::ContractResponseTooLarge {
+                    return Err(After(GateError::ContractResponseTooLarge {
                         prefix_sha256: sha256_hex(&buf),
                         read_bytes: buf.len() as u64,
                         max_bytes: cap,
                         status,
-                    });
+                    }));
                 }
                 let cause = format!("response body exceeds {cap} bytes");
                 let (cause, _) = scrub_with_external(vault, &cause, &external);
-                return Err(GateError::UpstreamHttp { cause });
+                return Err(After(GateError::UpstreamHttp { cause }));
             }
             Ok(_) => buf,
             Err(e) => {
                 let (cause, _) = scrub_with_external(vault, &e.to_string(), &external);
-                return Err(GateError::UpstreamHttp { cause });
+                return Err(After(GateError::UpstreamHttp { cause }));
             }
         }
     };
@@ -1019,11 +1133,11 @@ fn execute_proxied_request_inner(
             Ok(s) => s,
             Err(e) => {
                 let bytes = e.into_bytes();
-                return Err(GateError::ContractInvalidUtf8 {
+                return Err(After(GateError::ContractInvalidUtf8 {
                     body_sha256: sha256_hex(&bytes),
                     body_bytes: bytes.len() as u64,
                     status,
-                });
+                }));
             }
         }
     } else {
@@ -1072,6 +1186,32 @@ mod tests {
             caller_agent: None,
             timeout_secs: Some(5),
         }
+    }
+
+    #[test]
+    fn deadline_crossed_during_prepare_is_before_send() {
+        assert_eq!(remaining_deadline_timeout_secs(10_000, 8_500), Some(1));
+        assert_eq!(remaining_deadline_timeout_secs(10_000, 9_001), None);
+        assert_eq!(remaining_deadline_timeout_secs(10_000, 10_000), None);
+        let tmp = TempDir::new().unwrap();
+        let vault = Vault::open(tmp.path().join("vault.enc"), [7u8; 32]).unwrap();
+        let req = request("GET", "http://example.com/thing", &[]);
+        // Injected fresh now is already past the deadline at the post-prepare
+        // re-check (simulating a slow prepare): no byte may be sent, so the
+        // error must be BeforeSend, not an AfterSend upstream failure.
+        let err = execute_proxied_request_with_provider_and_contract_phased_with_deadline(
+            &vault,
+            &req,
+            None,
+            None,
+            Some(2_500),
+            &|| 10_000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DispatchPhaseError::BeforeSend(GateError::InvalidUrl { ref reason, .. }) if reason == "permit_deadline_exceeded"),
+            "{err}"
+        );
     }
 
     #[test]

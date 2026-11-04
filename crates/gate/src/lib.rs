@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod bridge;
 pub mod connector;
 pub mod contract;
+pub mod governor;
 pub mod mcp;
 pub mod proxy;
 pub mod registry;
@@ -35,18 +36,25 @@ pub use contract::{
     ContractViolation, ResponseContract, ResponseSchema, bracket_depth, check_pre_parse_depth,
     count_tokens_bounded, count_unit_string, validate_value,
 };
+pub use governor::{
+    ADMISSION_UNAVAILABLE, DispatchResult, GateGovernor, GovernedOrGateError, GovernedOutcome,
+    admission_refusal_text, connector_endpoint_aliases, join_url_paths, url_path,
+};
 pub use mcp::{
-    build_mcp_tools_list, handle_mcp_jsonrpc_request,
+    build_mcp_tools_list, handle_mcp_jsonrpc_request, handle_mcp_jsonrpc_request_with_governor,
+    handle_mcp_jsonrpc_request_with_governor_and_secret_provider,
     handle_mcp_jsonrpc_request_with_secret_provider,
 };
 pub use proxy::{
-    LEGACY_MAX_RESPONSE_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, PLACEHOLDER_PREFIX,
-    PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse, execute_proxied_request,
-    execute_proxied_request_with_contract, execute_proxied_request_with_provider,
-    execute_proxied_request_with_provider_and_contract, extract_placeholder_keys,
-    host_matches_pattern, is_private_or_loopback_ip, parse_url_scheme_host_port,
-    prepare_proxied_request, prepare_proxied_request_with_provider, scrub_secrets,
-    verify_host_ssrf,
+    DispatchPhaseError, LEGACY_MAX_RESPONSE_BYTES, MAX_HEADER_BYTES, MAX_HEADERS,
+    PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse,
+    execute_proxied_request, execute_proxied_request_with_contract,
+    execute_proxied_request_with_provider, execute_proxied_request_with_provider_and_contract,
+    execute_proxied_request_with_provider_and_contract_phased,
+    execute_proxied_request_with_provider_and_contract_phased_with_deadline,
+    extract_placeholder_keys, host_matches_pattern, is_private_or_loopback_ip,
+    parse_url_scheme_host_port, prepare_proxied_request, prepare_proxied_request_with_provider,
+    remaining_deadline_timeout_secs, scrub_secrets, verify_host_ssrf,
 };
 pub use registry::{connector_to_registry_entry, handle_registry_v01_get};
 pub use sign::SIGN_AUDIT_METHOD;
@@ -461,12 +469,18 @@ default_target = "wire:ferris"
                 }
             }
         });
-        let mcp_resp = handle_mcp_jsonrpc_request(
+        let gov = GateGovernor::new(std::sync::Arc::new(
+            fl_core::governor::MemGovernorStore::new(fl_core::governor::GovernorPolicy::default()),
+        ));
+        let mcp_resp = handle_mcp_jsonrpc_request_with_governor(
             &mcp_call,
             &vault,
             std::slice::from_ref(&manifest),
             None,
             Some("ferris".into()),
+            Some(&gov),
+            &fl_core::governor::Principal::Owner,
+            "",
         )
         .unwrap();
         handle.join().unwrap();

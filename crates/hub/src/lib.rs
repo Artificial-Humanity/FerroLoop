@@ -216,6 +216,38 @@ pub struct HubState {
     pub(crate) mcp: Arc<mcp_api::McpHub>,
     /// What `fl hub serve` told the hub about its credential sources (see [`vault_consumers_api`]).
     pub(crate) vault_consumers: Arc<Mutex<Option<Arc<VaultConsumerConfig>>>>,
+    /// The ONE persistent gate-governor store shared by every hub governed
+    /// gate path, built lazily on first use (see [`GateGovernorStoreCache`]).
+    pub(crate) gate_governor_store: GateGovernorStoreCache,
+}
+
+/// Lazily-built single [`fl_store::PersistentGovernorStore`] shared by all
+/// hub governed gate paths. A failed build is not cached, so a later
+/// request retries; a successful build is reused for the hub's lifetime.
+#[derive(Clone, Default)]
+pub(crate) struct GateGovernorStoreCache {
+    inner: Arc<Mutex<Option<Arc<fl_store::PersistentGovernorStore>>>>,
+}
+
+impl std::fmt::Debug for GateGovernorStoreCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GateGovernorStoreCache(..)")
+    }
+}
+
+impl GateGovernorStoreCache {
+    pub(crate) fn get_or_try_init(
+        &self,
+        init: impl FnOnce() -> Result<Arc<fl_store::PersistentGovernorStore>, ()>,
+    ) -> Result<Arc<fl_store::PersistentGovernorStore>, ()> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = &*guard {
+            return Ok(Arc::clone(store));
+        }
+        let store = init()?;
+        *guard = Some(Arc::clone(&store));
+        Ok(store)
+    }
 }
 
 /// How long the read-only discovery endpoints reuse one store snapshot. A snapshot costs
@@ -335,6 +367,7 @@ impl HubState {
             watch_caches: Arc::new(watch_api::WatchCaches::default()),
             mcp: Arc::default(),
             vault_consumers: Arc::default(),
+            gate_governor_store: GateGovernorStoreCache::default(),
         }
     }
 
@@ -6653,8 +6686,8 @@ default_target = "wire:felicity"
     #[test]
     fn cli_mcp_hub_public_result_parity() {
         use fl_gate::{
-            ResponseContract, ResponseSchema, SetSecretArgs, ToolOutcome, Vault,
-            evaluate_tool_response, handle_mcp_jsonrpc_request,
+            GateGovernor, ResponseContract, ResponseSchema, SetSecretArgs, ToolOutcome, Vault,
+            evaluate_tool_response, handle_mcp_jsonrpc_request_with_governor,
         };
         use std::io::{Read as _, Write as _};
         use std::sync::{Arc, Mutex};
@@ -6753,12 +6786,18 @@ default_target = "connector:parity:get_thing"
         let ok_body = r#"{"id":"x1"}"#;
         let gate_ok = evaluate_tool_response(Some(&contract), ok_body, &[]);
         assert_eq!(gate_ok.value(), Some(&json!({"id": "x1"})));
-        let mcp_ok = handle_mcp_jsonrpc_request(
+        let gov = GateGovernor::new(Arc::new(fl_core::governor::MemGovernorStore::new(
+            fl_core::governor::GovernorPolicy::default(),
+        )));
+        let mcp_ok = handle_mcp_jsonrpc_request_with_governor(
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
             &vault,
             &connectors,
             None,
             None,
+            Some(&gov),
+            &fl_core::governor::Principal::Owner,
+            "",
         )
         .unwrap();
         assert_eq!(mcp_ok["result"]["structuredContent"], json!({"id": "x1"}));
@@ -6781,12 +6820,15 @@ default_target = "connector:parity:get_thing"
             gate_bad,
             ToolOutcome::ContractFailedAfterExecution { .. }
         ));
-        let mcp_bad = handle_mcp_jsonrpc_request(
+        let mcp_bad = handle_mcp_jsonrpc_request_with_governor(
             &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_thing","arguments":{}}}),
             &vault,
             &connectors,
             None,
             None,
+            Some(&gov),
+            &fl_core::governor::Principal::Owner,
+            "",
         )
         .unwrap();
         assert_eq!(mcp_bad["result"]["isError"], json!(true));

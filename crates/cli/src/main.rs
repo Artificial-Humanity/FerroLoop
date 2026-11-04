@@ -1054,10 +1054,20 @@ fn run(cli: Cli) -> Result<i32> {
             return cmd::store::run(&path, cmd);
         }
         Cli {
-            db: _,
+            db,
             command: Command::Vault { cmd },
         } => {
-            return match cmd::vault::run(&cwd, cmd) {
+            // Wire the governor into `fl vault mcp` by opening the CLI's
+            // configured store the way other CLI state commands do.
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let state_env = cmd::state::StateEnv {
+                explicit_db: explicit.as_deref(),
+                default_store: &default_store,
+                cfg: &cfg,
+                cwd: &cwd,
+            };
+            return match cmd::vault::run_with_state_env(&cwd, cmd, &state_env) {
                 Ok(code) => Ok(code),
                 Err((code, msg)) => {
                     eprintln!("error: {msg}");
