@@ -842,6 +842,51 @@ fn binding_absent_requires_an_authenticated_signing_snapshot() {
     assert_eq!(status, 200);
     assert_eq!(consumer(&body, KEY)["binding_absent"], true);
     assert!(!body.to_string().contains(CANARY_VAULT));
+    let original = fs::read(&vault_path).unwrap();
+    let mut oversized = original.clone();
+    oversized.resize((VAULT_LIST_MAX_BYTES + 1) as usize, b' ');
+    fs::write(&vault_path, &oversized).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::write(&vault_path, original).unwrap();
+    let original_key = fs::read(&key_path).unwrap();
+    let mut oversized_key = original_key.clone();
+    oversized_key.resize(1024 * 1024, b' ');
+    fs::write(&key_path, &oversized_key).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::write(&key_path, original_key).unwrap();
+    let saved_key = fs::read(&key_path).unwrap();
+    fs::remove_file(&key_path).unwrap();
+    let key_target = home.join("key-target");
+    fs::write(&key_target, &saved_key).unwrap();
+    symlink(&key_target, &key_path).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::remove_file(&key_path).unwrap();
+    use std::os::unix::ffi::OsStrExt;
+    let fifo_path = std::ffi::CString::new(key_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: fifo_path is NUL-terminated and lives until mkfifo returns.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::remove_file(&key_path).unwrap();
+    fs::write(&key_path, saved_key).unwrap();
+    let saved_vault = fs::read(&vault_path).unwrap();
+    let target = home.join("vault-target");
+    fs::write(&target, &saved_vault).unwrap();
+    fs::remove_file(&vault_path).unwrap();
+    symlink(&target, &vault_path).unwrap();
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::remove_file(&vault_path).unwrap();
+    let vault_fifo = std::ffi::CString::new(vault_path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: vault_fifo is NUL-terminated and lives until mkfifo returns.
+    assert_eq!(unsafe { libc::mkfifo(vault_fifo.as_ptr(), 0o600) }, 0);
+    let (_, body) = request(&state, "GET", Some(OWNER));
+    assert_eq!(consumer(&body, KEY)["binding_absent"], Value::Null);
+    fs::remove_file(&vault_path).unwrap();
+    fs::write(&vault_path, saved_vault).unwrap();
     vault
         .set(fl_gate::SetSecretArgs {
             name: "GITHUB_APP_KEY".into(),

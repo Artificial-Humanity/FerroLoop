@@ -15,9 +15,11 @@
 
 use fl_core::vendor::{VendorDescriptor, VendorTransport};
 use fl_exec::adapters::{ApiKeyError, ApiKeyResolver};
+#[cfg(test)]
+use fl_gate::load_or_init_master_key;
 use fl_gate::{
-    ProxyRequest, Vault, load_or_init_master_key, normalize_secret_name, prepare_proxied_request,
-    resolve_master_key_path, resolve_vault_path,
+    ProxyRequest, Vault, normalize_secret_name, prepare_proxied_request, resolve_master_key_path,
+    resolve_vault_path,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -85,11 +87,10 @@ fn resolve_key_checked(
 /// The environment variable the Vault reads its master key from.
 const MASTER_KEY_ENV: &str = "FL_VAULT_MASTER_KEY";
 
-/// Whether the Vault will find a master key without creating one: the variable holds a value that
-/// is not blank once trimmed (`load_or_init_master_key`'s own rule, which trims it), or the key
-/// file exists.
-fn master_key_exists(env_master: Option<&str>, key_path: &Path) -> bool {
-    env_master.is_some_and(|v| !v.trim().is_empty()) || key_path.exists()
+#[cfg(test)]
+thread_local! {
+    static BEFORE_EXISTING_KEY_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 /// Reads `secret` from the Vault for a request to `url`, under the Vault's policy.
@@ -101,11 +102,19 @@ fn from_vault(
     vault_path: &Path,
     key_path: &Path,
 ) -> Result<Option<String>, ApiKeyError> {
-    // `load_or_init_master_key` would create a master key; a read must not.
-    if !vault_path.is_file() || !master_key_exists(env_master, key_path) {
+    if !vault_path.is_file() {
         return Ok(None);
     }
-    let Some(master_key) = load_or_init_master_key(key_path).ok() else {
+    #[cfg(test)]
+    BEFORE_EXISTING_KEY_READ.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    // This reader must never initialize a key, including when the file disappears.
+    let Some(master_key) =
+        fl_gate::vault::load_existing_master_key_with_env(key_path, env_master).ok()
+    else {
         return Ok(None);
     };
     let Some(vault) = Vault::open(vault_path, master_key).ok() else {
@@ -292,22 +301,30 @@ mod tests {
     }
 
     #[test]
+    fn removed_key_between_vault_check_and_key_read_is_not_recreated() {
+        let f = fixture("VK_KEY", "v", "api.example.com", &[], false);
+        let d = vendor(None, Some("VK_KEY"), "https://api.example.com/v1");
+        let key = f.key.clone();
+        BEFORE_EXISTING_KEY_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || std::fs::remove_file(key).unwrap()));
+        });
+        assert_eq!(resolve_key(&d, None, &no_env, &f.vault, &f.key), None);
+        assert!(!f.key.exists(), "a read must not replace a disappeared key");
+    }
+
+    #[test]
     fn a_blank_master_key_variable_is_not_a_master_key_and_creates_none() {
-        // The Vault trims the variable, so a blank one is no key: it would create the key file.
-        assert!(!master_key_exists(
-            None,
-            Path::new("/nonexistent/vault.key")
-        ));
+        // A blank variable does not create a key or count as an existing key.
         for blank in ["", "   ", "\n\t "] {
             assert!(
-                !master_key_exists(Some(blank), Path::new("/nonexistent/vault.key")),
+                fl_gate::vault::load_existing_master_key_with_env(
+                    Path::new("/nonexistent/vault.key"),
+                    Some(blank)
+                )
+                .is_err(),
                 "{blank:?}"
             );
         }
-        assert!(master_key_exists(
-            Some(" 00ff "),
-            Path::new("/nonexistent/vault.key")
-        ));
 
         // End to end: a Vault, no key file, and a whitespace-only variable.
         let f = fixture("VK_KEY", "k", "api.example.com", &[], false);

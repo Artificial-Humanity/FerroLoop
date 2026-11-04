@@ -662,12 +662,12 @@ fn list_vault_names(vault_path: &Path) -> Option<BTreeSet<String>> {
         Ok(m) if !m.file_type().is_file() || m.len() > VAULT_LIST_MAX_BYTES => return None,
         Ok(_) => {}
     }
-    fl_gate::Vault::open(vault_path, [0u8; fl_gate::vault::MASTER_KEY_LEN])
+    fl_gate::vault::inspect_vault_names_bounded(vault_path)
         .ok()
-        .map(|v| {
-            v.list()
+        .map(|names| {
+            names
                 .into_iter()
-                .map(|m| m.name.to_ascii_uppercase())
+                .map(|name| name.to_ascii_uppercase())
                 .collect()
         })
 }
@@ -724,12 +724,12 @@ pub(crate) fn report(state: &HubState) -> Value {
                 .and_then(|cfg| cfg.github_app.as_ref())
                 .and_then(|app| app.private_key_ref.as_deref())
                 .and_then(|name| {
-                    if !vault_path.is_file() {
-                        return None;
-                    }
-                    let key = fl_gate::load_existing_master_key(&key_path).ok()?;
-                    let vault = fl_gate::Vault::open(&vault_path, key).ok()?;
-                    let meta = vault.verified_snapshot(name).ok()?.metadata;
+                    let key =
+                        fl_gate::vault::load_existing_master_key_for_inspection(&key_path).ok()?;
+                    let meta =
+                        fl_gate::vault::inspect_verified_secret_bounded(&vault_path, key, name)
+                            .ok()?
+                            .metadata;
                     (meta.usage == fl_gate::SecretUsage::SignJwtRs256)
                         .then_some(meta.app_binding.is_none())
                 })

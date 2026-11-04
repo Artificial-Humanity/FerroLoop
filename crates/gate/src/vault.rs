@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,10 @@ use crate::GateError;
 pub const VAULT_SCHEMA_VERSION: u32 = 1;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
+/// Maximum size of a vault snapshot inspected by a read-only report.
+pub const MAX_INSPECT_VAULT_BYTES: usize = 8 * 1024 * 1024;
+/// A hex key needs 64 bytes; allow a small amount of surrounding whitespace.
+const MAX_MASTER_KEY_FILE_BYTES: usize = 256;
 
 /// Authorized use of a vault record.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -198,7 +203,64 @@ impl std::fmt::Debug for Vault {
     }
 }
 
+/// Read metadata names from one bounded, existing regular vault file. No key or file is created.
+pub fn inspect_vault_names_bounded(path: &Path) -> Result<Vec<String>, GateError> {
+    let vault = Vault::open_existing_bounded(path, [0; MASTER_KEY_LEN])?;
+    Ok(vault.list().into_iter().map(|m| m.name).collect())
+}
+
+/// Authenticate one record from a single bounded on-disk snapshot without reopening it.
+/// This observational result is not an authorization to dispatch.
+pub fn inspect_verified_secret_bounded(
+    path: &Path,
+    master_key: [u8; MASTER_KEY_LEN],
+    name: &str,
+) -> Result<VerifiedSecretSnapshot, GateError> {
+    let vault = Vault::open_existing_bounded(path, master_key)?;
+    #[cfg(test)]
+    AFTER_INSPECTION_OPEN.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    vault.verified_snapshot_current(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INSPECTION_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 impl Vault {
+    /// Open one bounded, regular, no-follow snapshot for read-only inspection. Unlike
+    /// `open`, a missing file is an error. The returned handle must not be used to
+    /// infer that its snapshot is still current after another writer changes the file.
+    fn open_existing_bounded(
+        vault_path: impl Into<PathBuf>,
+        master_key: [u8; MASTER_KEY_LEN],
+    ) -> Result<Self, GateError> {
+        let path = vault_path.into();
+        let raw = read_bounded_regular(&path, MAX_INSPECT_VAULT_BYTES)?;
+        let file: VaultFile =
+            serde_json::from_slice(&raw).map_err(|e| GateError::VaultCorrupt {
+                path: path.clone(),
+                cause: e.to_string(),
+            })?;
+        if file.schema_version != VAULT_SCHEMA_VERSION {
+            return Err(GateError::VaultCorrupt {
+                path,
+                cause: format!("unsupported vault schema_version {}", file.schema_version),
+            });
+        }
+        Ok(Self {
+            path,
+            master_key,
+            file,
+            verified: Default::default(),
+        })
+    }
+
     /// Open or initialize a [`Vault`] at `vault_path` using `master_key`.
     pub fn open(
         vault_path: impl Into<PathBuf>,
@@ -727,6 +789,45 @@ impl Drop for Vault {
     }
 }
 
+/// Read through one descriptor so a FIFO cannot block and a final symlink cannot redirect it.
+#[cfg(unix)]
+fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    let failure = |cause: String| GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause,
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| failure(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| failure(e.to_string()))?;
+    if !meta.is_file() || meta.len() > limit as u64 {
+        return Err(failure(
+            "file is not regular or exceeds the size limit".into(),
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| failure(e.to_string()))?;
+    if raw.len() > limit {
+        return Err(failure("file exceeds the size limit".into()));
+    }
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn read_bounded_regular(path: &Path, _limit: usize) -> Result<Vec<u8>, GateError> {
+    Err(GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause: "bounded no-follow file reads are unsupported on this platform".into(),
+    })
+}
+
 /// Read and validate `vault.enc` at `path`; a missing file is an empty vault.
 fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
     let file = if path.exists() {
@@ -1143,14 +1244,97 @@ fn existing_master_key(key_path: &Path) -> Option<Result<[u8; MASTER_KEY_LEN], G
 /// Load the master key that exists, from `FL_VAULT_MASTER_KEY` or `key_path`, and never create
 /// one: a missing key is an error. A reader uses this so that a read cannot initialise a Vault.
 pub fn load_existing_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
-    existing_master_key(key_path).unwrap_or_else(|| {
-        Err(GateError::Io {
-            op: "read",
-            path: key_path.to_path_buf(),
-            cause: "no Vault master key (FL_VAULT_MASTER_KEY is unset and the file does not exist)"
-                .to_string(),
-        })
-    })
+    let env = std::env::var("FL_VAULT_MASTER_KEY")
+        .ok()
+        .map(Zeroizing::new);
+    load_existing_master_key_with_env(key_path, env.as_deref().map(String::as_str))
+}
+
+/// Report-only key load: fail closed where a nonblocking no-follow opener is unavailable.
+pub fn load_existing_master_key_for_inspection(
+    key_path: &Path,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    let env = std::env::var("FL_VAULT_MASTER_KEY")
+        .ok()
+        .map(Zeroizing::new);
+    load_key_from_reader(
+        key_path,
+        env.as_deref().map(String::as_str),
+        read_bounded_regular,
+    )
+}
+
+/// No-create key load with the caller's environment snapshot; a blank value falls back to file.
+pub fn load_existing_master_key_with_env(
+    key_path: &Path,
+    env_key: Option<&str>,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    load_key_from_reader(key_path, env_key, read_existing_key_no_create)
+}
+
+fn load_key_from_reader(
+    key_path: &Path,
+    env_key: Option<&str>,
+    read: fn(&Path, usize) -> Result<Vec<u8>, GateError>,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    if let Some(value) = env_key.map(str::trim).filter(|value| !value.is_empty()) {
+        return parse_hex_master_key(value, Path::new("FL_VAULT_MASTER_KEY"));
+    }
+    let raw = match read(key_path, MAX_MASTER_KEY_FILE_BYTES) {
+        Ok(raw) => Zeroizing::new(raw),
+        Err(error) => {
+            if fs::symlink_metadata(key_path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(GateError::Io {
+                    op: "read",
+                    path: key_path.to_path_buf(),
+                    cause: "no Vault master key (FL_VAULT_MASTER_KEY is unset and the file does not exist)".into(),
+                });
+            }
+            return Err(error);
+        }
+    };
+    let text = std::str::from_utf8(&raw).map_err(|_| GateError::Io {
+        op: "read",
+        path: key_path.to_path_buf(),
+        cause: "master key is not UTF-8".into(),
+    })?;
+    parse_hex_master_key(text.trim(), key_path)
+}
+
+#[cfg(unix)]
+fn read_existing_key_no_create(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    read_bounded_regular(path, limit)
+}
+
+/// Preserve the existing no-create file-key path on non-Unix platforms. The
+/// stricter report-only inspector still refuses there until it has a verified
+/// no-follow, nonblocking opener.
+#[cfg(not(unix))]
+fn read_existing_key_no_create(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    let fail = |cause: String| GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause,
+    };
+    reject_if_symlink(path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| fail(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+    if !meta.is_file() || meta.len() > limit as u64 {
+        return Err(fail("file is not regular or exceeds the size limit".into()));
+    }
+    let mut raw = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| fail(e.to_string()))?;
+    if raw.len() > limit {
+        return Err(fail("file exceeds the size limit".into()));
+    }
+    Ok(raw)
 }
 
 /// Load a 32-byte master key from `FL_VAULT_MASTER_KEY` or `key_path`, generating and persisting
@@ -1412,6 +1596,44 @@ mod tests {
             allowed_hosts: vec!["example.com".into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn bounded_inspection_authenticates_the_opened_snapshot_without_reopening() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut writer = Vault::open(&path, [9; 32]).unwrap();
+        writer.set(args("KEY", "secret")).unwrap();
+        let mut changed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        changed["secrets"]["KEY"]["metadata"]["allowed_hosts"] =
+            serde_json::json!(["evil.example"]);
+        let replacement = tmp.path().join("replacement");
+        fs::write(&replacement, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let target = path.clone();
+        AFTER_INSPECTION_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, target).unwrap()));
+        });
+        assert!(inspect_verified_secret_bounded(&path, [9; 32], "KEY").is_ok());
+        assert!(matches!(
+            inspect_verified_secret_bounded(&path, [9; 32], "KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_existing_key_load_never_initializes_and_honors_environment() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("missing.key");
+        assert!(load_existing_master_key_with_env(&path, None).is_err());
+        assert!(!path.exists());
+        assert_eq!(
+            load_existing_master_key_with_env(&path, Some(&"01".repeat(32))).unwrap(),
+            [1; 32]
+        );
+        assert!(!path.exists());
+        fs::write(&path, format!("{}{}", "01".repeat(32), " ".repeat(1024))).unwrap();
+        assert!(load_existing_master_key_with_env(&path, None).is_err());
     }
 
     fn leftover_temp_files(dir: &Path) -> Vec<String> {
