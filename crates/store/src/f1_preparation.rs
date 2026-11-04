@@ -179,19 +179,12 @@ impl F1PreparationStore for RedbStore {
         reason: &str,
     ) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::PauseRoutine {
-                id: id.into(),
-                expected_version,
-                reason: reason.into(),
-            }],
+            changes: vec![SafetyChange::pause_routine(id, expected_version, reason)?],
         })
     }
     fn quarantine_intent(&self, id: &str, expected_version: u64) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::QuarantineIntent {
-                id: id.into(),
-                expected_version,
-            }],
+            changes: vec![SafetyChange::quarantine_intent(id, expected_version)?],
         })
     }
     fn request_allocation_stop(
@@ -200,10 +193,7 @@ impl F1PreparationStore for RedbStore {
         expected_version: u64,
     ) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::RequestAllocationStop {
-                id: id.into(),
-                expected_version,
-            }],
+            changes: vec![SafetyChange::request_allocation_stop(id, expected_version)?],
         })
     }
 }
@@ -383,6 +373,21 @@ mod tests {
         assert_eq!(direct.routine(""), Err(F1RecordError::UnsupportedRemote));
         assert_eq!(direct.intent(""), Err(F1RecordError::UnsupportedRemote));
         assert_eq!(direct.allocation(""), Err(F1RecordError::UnsupportedRemote));
+        let oversized = "x".repeat(2 * 1024 * 1024);
+        for target in [direct as &dyn F1PreparationStore, &store] {
+            assert_eq!(
+                target.pause_routine(&oversized, 0, &oversized),
+                Err(F1RecordError::UnsupportedRemote)
+            );
+            assert_eq!(
+                target.quarantine_intent(&oversized, 0),
+                Err(F1RecordError::UnsupportedRemote)
+            );
+            assert_eq!(
+                target.request_allocation_stop(&oversized, 0),
+                Err(F1RecordError::UnsupportedRemote)
+            );
+        }
         assert_eq!(
             store.routine("routine"),
             Err(F1RecordError::UnsupportedRemote)
@@ -427,6 +432,53 @@ mod tests {
         assert_eq!(store.accept_effect(), Err(F1RecordError::UnsupportedRemote));
         assert_eq!(store.settle(), Err(F1RecordError::UnsupportedRemote));
         assert_eq!(FerroStore::stats_at(&file).unwrap().last_seq, before);
+    }
+
+    #[test]
+    fn redb_and_its_any_store_wrapper_reject_oversized_borrowed_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AnyStore::from(RedbStore::open(&dir.path().join("f1.redb")).unwrap());
+        let direct = store.as_redb().unwrap();
+        let oversized = "x".repeat(2 * 1024 * 1024);
+        for target in [direct as &dyn F1PreparationStore, &store] {
+            assert_eq!(
+                target.pause_routine("routine", 1, &oversized),
+                Err(F1RecordError::InvalidRecord)
+            );
+            assert_eq!(
+                target.pause_routine(&oversized, 1, "reason"),
+                Err(F1RecordError::InvalidIdentity)
+            );
+            assert_eq!(
+                target.quarantine_intent(&oversized, 1),
+                Err(F1RecordError::InvalidIdentity)
+            );
+            assert_eq!(
+                target.request_allocation_stop(&oversized, 1),
+                Err(F1RecordError::InvalidIdentity)
+            );
+        }
+    }
+
+    #[test]
+    fn local_ferro_refuses_oversized_requests_before_validation() {
+        let store = AnyStore::in_memory();
+        let direct = store.as_ferro().unwrap();
+        let oversized = "x".repeat(2 * 1024 * 1024);
+        for target in [direct as &dyn F1PreparationStore, &store] {
+            assert_eq!(
+                target.pause_routine(&oversized, 0, &oversized),
+                Err(F1RecordError::UnsupportedLocal)
+            );
+            assert_eq!(
+                target.quarantine_intent(&oversized, 0),
+                Err(F1RecordError::UnsupportedLocal)
+            );
+            assert_eq!(
+                target.request_allocation_stop(&oversized, 0),
+                Err(F1RecordError::UnsupportedLocal)
+            );
+        }
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub enum F1RecordError {
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.trim().is_empty() && id.len() <= MAX_ID_BYTES && !id.chars().any(char::is_control)
+    id.len() <= MAX_ID_BYTES && !id.trim().is_empty() && !id.chars().any(char::is_control)
 }
 
 /// A typed key. Native keys encode the complete ID injectively. Slugs fit the existing
@@ -361,9 +361,7 @@ pub fn prepare_routine_pause(
     {
         return Err(F1RecordError::Conflict);
     }
-    if reason.trim().is_empty() || reason.len() > 1024 || reason.chars().any(char::is_control) {
-        return Err(F1RecordError::InvalidRecord);
-    }
+    validate_pause_reason(reason)?;
     let mut next = current.clone();
     next.version = current
         .version
@@ -437,6 +435,60 @@ pub enum SafetyChange {
     },
 }
 
+impl SafetyChange {
+    /// Validate borrowed arguments before allocating the owned request.
+    pub fn pause_routine(
+        id: &str,
+        expected_version: u64,
+        reason: &str,
+    ) -> Result<Self, F1RecordError> {
+        validate_pause_reason(reason)?;
+        ControlRecordKey::routine(id)?;
+        validate_safety_version(expected_version)?;
+        Ok(Self::PauseRoutine {
+            id: id.to_owned(),
+            expected_version,
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// Validate borrowed arguments before allocating the owned request.
+    pub fn quarantine_intent(id: &str, expected_version: u64) -> Result<Self, F1RecordError> {
+        ControlRecordKey::intent(id)?;
+        validate_safety_version(expected_version)?;
+        Ok(Self::QuarantineIntent {
+            id: id.to_owned(),
+            expected_version,
+        })
+    }
+
+    /// Validate borrowed arguments before allocating the owned request.
+    pub fn request_allocation_stop(id: &str, expected_version: u64) -> Result<Self, F1RecordError> {
+        ControlRecordKey::allocation(id)?;
+        validate_safety_version(expected_version)?;
+        Ok(Self::RequestAllocationStop {
+            id: id.to_owned(),
+            expected_version,
+        })
+    }
+}
+
+fn validate_pause_reason(reason: &str) -> Result<(), F1RecordError> {
+    if reason.len() > 1024 || reason.trim().is_empty() || reason.chars().any(char::is_control) {
+        Err(F1RecordError::InvalidRecord)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_safety_version(version: u64) -> Result<(), F1RecordError> {
+    if version == 0 {
+        Err(F1RecordError::InvalidRecord)
+    } else {
+        Ok(())
+    }
+}
+
 /// At most this many rows may participate in one atomic safety request.
 pub const MAX_SAFETY_CHANGES: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,12 +510,7 @@ impl SafetyBatch {
                     expected_version,
                     reason,
                 } => {
-                    if reason.trim().is_empty()
-                        || reason.len() > 1024
-                        || reason.chars().any(char::is_control)
-                    {
-                        return Err(F1RecordError::InvalidRecord);
-                    }
+                    validate_pause_reason(reason)?;
                     (ControlRecordKey::routine(id)?, *expected_version)
                 }
                 SafetyChange::QuarantineIntent {
@@ -475,7 +522,8 @@ impl SafetyBatch {
                     expected_version,
                 } => (ControlRecordKey::allocation(id)?, *expected_version),
             };
-            if version == 0 || !keys.insert(key.native_key().to_owned()) {
+            validate_safety_version(version)?;
+            if !keys.insert(key.native_key().to_owned()) {
                 return Err(F1RecordError::InvalidRecord);
             }
         }

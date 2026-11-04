@@ -138,19 +138,12 @@ impl F1PreparationStore for MemoryF1PreparationStore {
         reason: &str,
     ) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::PauseRoutine {
-                id: id.into(),
-                expected_version,
-                reason: reason.into(),
-            }],
+            changes: vec![SafetyChange::pause_routine(id, expected_version, reason)?],
         })
     }
     fn quarantine_intent(&self, id: &str, expected_version: u64) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::QuarantineIntent {
-                id: id.into(),
-                expected_version,
-            }],
+            changes: vec![SafetyChange::quarantine_intent(id, expected_version)?],
         })
     }
     fn request_allocation_stop(
@@ -159,10 +152,7 @@ impl F1PreparationStore for MemoryF1PreparationStore {
         expected_version: u64,
     ) -> Result<(), F1RecordError> {
         self.apply_safety_batch(&SafetyBatch {
-            changes: vec![SafetyChange::RequestAllocationStop {
-                id: id.into(),
-                expected_version,
-            }],
+            changes: vec![SafetyChange::request_allocation_stop(id, expected_version)?],
         })
     }
 }
@@ -175,6 +165,44 @@ mod tests {
         SafetyState,
     };
     use std::sync::{Arc, Barrier};
+
+    struct TrackingAlloc;
+    thread_local! {
+        static LARGEST_ALLOC: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    // SAFETY: all allocation operations are forwarded unchanged to the system allocator.
+    unsafe impl std::alloc::GlobalAlloc for TrackingAlloc {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = LARGEST_ALLOC.try_with(|cell| cell.set(cell.get().max(layout.size())));
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, n: usize) -> *mut u8 {
+            let _ = LARGEST_ALLOC.try_with(|cell| cell.set(cell.get().max(n)));
+            unsafe { std::alloc::System.realloc(ptr, layout, n) }
+        }
+    }
+    #[global_allocator]
+    static ALLOC: TrackingAlloc = TrackingAlloc;
+
+    #[test]
+    fn safety_wrappers_reject_oversized_borrowed_inputs_before_copying() {
+        let store = MemoryF1PreparationStore::default();
+        let oversized = "a".repeat(2 * 1024 * 1024);
+        for call in [
+            (&|| store.pause_routine("routine", 1, &oversized)) as &dyn Fn() -> _,
+            &|| store.pause_routine(&oversized, 1, "reason"),
+            &|| store.quarantine_intent(&oversized, 1),
+            &|| store.request_allocation_stop(&oversized, 1),
+        ] {
+            LARGEST_ALLOC.with(|cell| cell.set(0));
+            assert!(call().is_err());
+            let largest = LARGEST_ALLOC.with(|cell| cell.get());
+            assert!(largest < 1024 * 1024, "copied oversized input: {largest}");
+        }
+    }
 
     fn allocation(id: &str) -> AllocationEvidenceRecord {
         AllocationEvidenceRecord {
