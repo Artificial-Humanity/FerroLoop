@@ -1083,6 +1083,71 @@ describe("Agent switch transcript isolation", () => {
     unmount();
   });
 
+  it("does not apply a late initial transcript after the implicit session changes", async () => {
+    let sessionListener: ((frame: unknown) => void) | null = null;
+    let current = "session-a";
+    let releaseInitial!: (response: Response) => void;
+    const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
+    let held = false;
+    const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) return Promise.resolve(response({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } }));
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return Promise.resolve(response({ sessions: [
+        { id: current, source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+        { id: current === "session-a" ? "session-b" : "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] }));
+      if (url.includes("/session-a/transcript") && !held) { held = true; return initialResponse; }
+      if (url.includes("/transcript")) {
+        const isB = url.includes("session-b");
+        return Promise.resolve(response({ session_id: isB ? "session-b" : "session-a", turns: [turn({ index: 0, content: isB ? "Session B initial" : "Session A interim" })], queue: [], is_busy: false }));
+      }
+      return Promise.resolve(response({}));
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") sessionListener = cb; return () => {}; } } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await waitFor(() => expect(held).toBe(true));
+    current = "session-b";
+    act(() => sessionListener?.({ type: "event", topic: "session", event: "updated", data: {} }));
+    await screen.findByText("Session B initial");
+    await act(async () => {
+      releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Stale initial A" })], queue: [{ id: "old", prompt: "Stale A queue" }], is_busy: true }));
+      await initialResponse;
+    });
+    expect(screen.getByText("Session B initial")).toBeInTheDocument();
+    expect(screen.queryByText("Stale initial A")).toBeNull();
+    expect(screen.queryByText("Stale A queue")).toBeNull();
+    unmount();
+  });
+
+  it("applies the initial transcript when its implicit session remains active", async () => {
+    let releaseInitial!: (response: Response) => void;
+    const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
+    let held = false;
+    const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) return Promise.resolve(response({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } }));
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return Promise.resolve(response({ sessions: [
+        { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
+      ] }));
+      if (url.includes("/session-a/transcript") && !held) { held = true; return initialResponse; }
+      if (url.includes("/transcript")) return Promise.resolve(response({ session_id: "session-a", turns: [], queue: [], is_busy: false }));
+      return Promise.resolve(response({}));
+    });
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: () => () => {} } as unknown as HubWsClient;
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    await waitFor(() => expect(held).toBe(true));
+    await act(async () => {
+      releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Legitimate initial A" })], queue: [], is_busy: false }));
+      await initialResponse;
+    });
+    expect(screen.getByText("Legitimate initial A")).toBeInTheDocument();
+    unmount();
+  });
+
   it("preserves multiple outbound prompts across polls and keeps prompt_sent WebSocket / queued prompts visible while in FerroWire transit", async () => {
     const now = Date.now();
     const baseTurns: TranscriptTurn[] = [

@@ -1192,6 +1192,9 @@ export const App: React.FC<AppProps> = ({
         if (
           trRes &&
           !loggedOutRef.current &&
+          selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
+          selectedSessionIdRef.current === initialSessionId &&
+          (activeSessionIdRef.current === null || activeSessionIdRef.current === matchedSessionId) &&
           !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
           !tornDownTargetsRef.current.has(initialKey)
         ) {
@@ -1205,16 +1208,11 @@ export const App: React.FC<AppProps> = ({
               ? trRes.is_busy
               : hasTrailingIncompleteWork(trRes.turns ?? []),
           );
-          if (
-            selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
-            selectedSessionIdRef.current === initialSessionId
-          ) {
-            applyTranscriptTurns(trRes.turns ?? []);
-            setSessionQueue(trRes.queue ?? []);
-            setIsSessionBusy(Boolean(trRes.is_busy));
-            setSessionContextUsage(trRes.context_usage ?? null);
-            setSessionQuotaUsage(trRes.quota_usage ?? null);
-          }
+          applyTranscriptTurns(trRes.turns ?? []);
+          setSessionQueue(trRes.queue ?? []);
+          setIsSessionBusy(Boolean(trRes.is_busy));
+          setSessionContextUsage(trRes.context_usage ?? null);
+          setSessionQuotaUsage(trRes.quota_usage ?? null);
         }
       }
     } finally {
