@@ -187,9 +187,29 @@ describe("ArtifactPreviewPane", () => {
     rerender(<ArtifactPreviewPane apiClient={apiClient} activePath={imgPath} />);
     const imgView = await screen.findByTestId("artifact-image-preview");
     expect(imgView).toBeInTheDocument();
+    expect(imgView.style.maxHeight).toBe("none");
+
+    const pane = screen.getByTestId("artifact-preview-pane");
+    expect(pane.style.overflowY).toBe("auto");
+
+    const zoomToolbar = screen.getByTestId("artifact-zoom-toolbar");
+    expect(zoomToolbar.style.flexWrap).toBe("nowrap");
+    expect(zoomToolbar.style.overflowX).toBe("auto");
+
+    const zoomCanvas = screen.getByTestId("artifact-zoom-canvas");
+    expect(zoomCanvas.style.minHeight).toBe("65dvh");
+    expect(zoomCanvas.style.maxHeight).toBe("none");
+
     const zoom150 = screen.getByTestId("artifact-zoom-150");
     fireEvent.click(zoom150);
     expect(zoom150.className).toContain("fd-btn-active");
+
+    // Touch pan works when zoomed in (scale > 100)
+    fireEvent.touchStart(zoomCanvas, { touches: [{ clientX: 50, clientY: 60 }] });
+    fireEvent.touchMove(zoomCanvas, { touches: [{ clientX: 80, clientY: 40 }] });
+    fireEvent.touchEnd(zoomCanvas);
+    expect(zoomCanvas.getAttribute("data-offset-x")).toBe("30");
+    expect(zoomCanvas.getAttribute("data-offset-y")).toBe("-20");
 
     rerender(<ArtifactPreviewPane apiClient={apiClient} activePath={codePath} />);
     const codeView = await screen.findByTestId("artifact-code-viewer");

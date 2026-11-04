@@ -406,11 +406,11 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     );
     const chatPane = screen.getByTestId("chat-pane");
     const chatToolbar = chatPane.querySelector(".fd-chat-toolbar") as HTMLElement | null;
-    expect(chatToolbar?.style.flexWrap).toBe("wrap");
+    expect(chatToolbar?.style.flexWrap).toBe("nowrap");
     const filterInput = chatPane.querySelector(
       ".fd-transcript-filter-input",
     ) as HTMLElement | null;
-    expect(filterInput?.style.flex).toBe("1 1 180px");
+    expect(filterInput?.style.flex).toBe("1 1 0%");
     const workBlock = screen.getByTestId("encapsulated-work-block");
     expect(workBlock.style.overflow).toBe("hidden");
     const workMeta = screen.getByTestId("encapsulated-work-meta");

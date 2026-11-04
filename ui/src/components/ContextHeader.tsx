@@ -535,8 +535,18 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           </span>
 
           {selectedAgent ? (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0, whiteSpace: "nowrap" }}>
-              <span style={{ fontWeight: 700, fontSize: "14px", whiteSpace: "nowrap" }} title="Active Agent Name">
+            <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0, whiteSpace: "nowrap" }}>
+              <span
+                style={{
+                  fontWeight: 700,
+                  fontSize: "14px",
+                  whiteSpace: "nowrap",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  minWidth: 0,
+                }}
+                title="Active Agent Name"
+              >
                 {selectedAgent.display_name}
               </span>
               <span className="fd-badge" title="Agent Role" style={{ flexShrink: 0 }}>
@@ -576,6 +586,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
                 <span
                   className={getAdapterBadgeClass(activeSession.adapter)}
                   title="Agent Harness / Adapter"
+                  style={{ flexShrink: 0 }}
                 >
                   {activeSession.adapter}
                 </span>
@@ -587,6 +598,12 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             className="fd-badge"
             data-testid="active-project-badge"
             title="Current Project"
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
           >
             {selectedAgent?.project ?? "Workspace"}
           </span>

@@ -810,9 +810,32 @@ button.fd-badge:hover:not(:disabled) {
   }
 
   .fd-header {
-    min-height: 48px;
+    min-height: 44px;
     padding: 4px 8px;
-    gap: 6px;
+    gap: 4px;
+    overflow-x: hidden;
+  }
+
+  .fd-three-tier-bar {
+    gap: 4px !important;
+    overflow-x: hidden !important;
+  }
+
+  [data-testid="ferrodeck-brand-title"] {
+    font-size: 15px !important;
+  }
+
+  [data-testid="ferrodeck-brand-icon"] {
+    width: 24px !important;
+    height: 24px !important;
+  }
+
+  [data-testid="ferrodeck-brand"] {
+    gap: 6px !important;
+  }
+
+  [data-testid="header-left-group"] {
+    gap: 6px !important;
   }
 
   [data-testid="session-cwd-badge"],
@@ -896,19 +919,22 @@ button.fd-badge:hover:not(:disabled) {
   }
 
   .fd-chat-toolbar {
-    padding: 8px 10px !important;
-    gap: 6px !important;
+    padding: 5px 8px !important;
+    gap: 4px !important;
+    flex-wrap: nowrap !important;
   }
 
   .chat-header-meta {
     width: 100%;
     min-width: 0;
-    gap: 6px !important;
+    gap: 4px !important;
+    flex-wrap: nowrap !important;
   }
 
   .fd-transcript-filter-input {
     max-width: 100% !important;
-    flex: 1 1 100%;
+    flex: 1 1 0%;
+    min-width: 0;
   }
 }
 

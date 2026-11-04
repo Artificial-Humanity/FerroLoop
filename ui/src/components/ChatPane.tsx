@@ -2432,14 +2432,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          gap: "8px",
-          padding: "6px clamp(8px, 1.4vw, 14px)",
+          gap: "6px",
+          padding: "5px clamp(8px, 1.4vw, 14px)",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
+          flexWrap: "nowrap",
           width: "100%",
           maxWidth: "100%",
           boxSizing: "border-box",
+          flexShrink: 0,
         }}
       >
         <div
@@ -2447,9 +2448,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           style={{
             display: "flex",
             alignItems: "center",
-            gap: "8px",
+            gap: "4px",
             flex: 1,
-            flexWrap: "wrap",
+            flexWrap: "nowrap",
+            width: "100%",
             minWidth: 0,
           }}
         >
@@ -2471,10 +2473,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{
               width: "100%",
               maxWidth: "420px",
-              flex: "1 1 180px",
+              flex: "1 1 0%",
               minWidth: 0,
               fontSize: "16px",
-              padding: "5px 9px",
+              padding: "4px 8px",
             }}
           />
           <span
@@ -2537,7 +2539,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           )}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
           {(onRefresh || apiClient) && (
             <button
               type="button"
@@ -2553,6 +2555,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 }
               }}
               disabled={effectiveLoading}
+              style={{ flexShrink: 0, padding: "4px 8px" }}
             >
               <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path
@@ -2589,6 +2592,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             className="fd-btn"
             onClick={handleJumpToBottom}
             title="Scroll to latest turn"
+            style={{ flexShrink: 0, whiteSpace: "nowrap", padding: "4px 8px" }}
           >
             ↓ Latest
           </button>
@@ -2604,8 +2608,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             flexDirection: "column",
             backgroundColor: "var(--bg-surface)",
             borderBottom: "1px solid var(--border-subtle)",
-            padding: "6px clamp(8px, 1.4vw, 14px)",
-            gap: "6px",
+            padding: "4px clamp(8px, 1.4vw, 14px)",
+            gap: "4px",
             flexShrink: 0,
             width: "100%",
             maxWidth: "100%",
@@ -2619,8 +2623,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               display: "flex",
               alignItems: "center",
               justifyContent: "space-between",
-              gap: "8px",
-              flexWrap: "wrap",
+              gap: "6px",
+              flexWrap: sinceLastPromptExpanded ? "wrap" : "nowrap",
+              overflow: "hidden",
               minWidth: 0,
             }}
           >
@@ -2628,9 +2633,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: "8px",
-                flex: "1 1 180px",
+                gap: "6px",
+                flex: "1 1 0%",
                 minWidth: 0,
+                overflow: "hidden",
               }}
             >
               <button
@@ -2691,17 +2697,30 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               >
                 <span
                   data-testid="since-last-prompt-text"
-                  style={{
-                    fontSize: "12px",
-                    fontWeight: 500,
-                    color: "var(--accent-primary, #F59E0B)",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    display: "-webkit-box",
-                    WebkitLineClamp: sinceLastPromptExpanded ? 4 : 2,
-                    WebkitBoxOrient: "vertical",
-                    lineHeight: 1.35,
-                  }}
+                  style={
+                    sinceLastPromptExpanded
+                      ? {
+                          fontSize: "12px",
+                          fontWeight: 500,
+                          color: "var(--accent-primary, #F59E0B)",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          display: "-webkit-box",
+                          WebkitLineClamp: 4,
+                          WebkitBoxOrient: "vertical",
+                          lineHeight: 1.35,
+                        }
+                      : {
+                          fontSize: "12px",
+                          fontWeight: 500,
+                          color: "var(--accent-primary, #F59E0B)",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                          display: "block",
+                          lineHeight: 1.35,
+                        }
+                  }
                 >
                   {sinceLastPrompt.promptText || "(attachment / empty prompt)"}
                 </span>
@@ -2713,8 +2732,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               style={{
                 display: "flex",
                 alignItems: "center",
-                gap: "6px",
-                flexWrap: "wrap",
+                gap: "4px",
+                flexWrap: sinceLastPromptExpanded ? "wrap" : "nowrap",
+                flexShrink: 0,
                 minWidth: 0,
               }}
             >
