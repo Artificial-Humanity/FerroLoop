@@ -564,6 +564,8 @@ export interface SavedPromptAttachment {
 }
 
 export interface QueuedOperatorPrompt {
+  delivery_state?: "pending" | "sending" | "unconfirmed";
+  delivery_error?: string | null;
   id: string;
   session_id: string;
   persona?: string | null;

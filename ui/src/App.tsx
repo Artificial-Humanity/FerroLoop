@@ -1768,12 +1768,21 @@ export const App: React.FC<AppProps> = ({
   const handleSendQueuedNow = async (promptId: string) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) return;
+    const submittedSession = activeSessionIdRef.current;
+    const submittedAgent = selectedAgentNameRef.current;
     const res = await apiClient.sendQueuedPromptNow(targetId, promptId);
+    if (activeSessionIdRef.current !== submittedSession || selectedAgentNameRef.current !== submittedAgent) {
+      if (res.delivered === false) throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+      return;
+    }
     if (Array.isArray(res.queue)) {
       setSessionQueue(res.queue);
     }
     if (typeof res.is_busy === "boolean") {
       setIsSessionBusy(res.is_busy);
+    }
+    if (res.delivered === false) {
+      throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
     }
     const content = res.effective_body || res.prompt;
     if (content) {

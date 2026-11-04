@@ -1994,11 +1994,11 @@ fn tmux_target_exists(target: &str) -> bool {
 /// scan then finds a different route. A gone tmux target never falls back to the same session's
 /// headless command. Every other failure of `send` is returned as it is, never retried: by then
 /// part of the delivery may have landed.
-pub(crate) fn dispatch_with_rediscovery<T>(
+pub(crate) fn dispatch_with_rediscovery_typed<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
     mut send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
-) -> Option<Result<T, String>> {
+) -> Option<Result<T, PushError>> {
     let (route, from_saved) = match lookup_route(home_override, query)? {
         RouteLookup::Saved(saved) if undeliverable(&saved).is_some() => {
             let refreshed = rescan_route(home_override, query);
@@ -2007,7 +2007,9 @@ pub(crate) fn dispatch_with_rediscovery<T>(
                     same_tmux_vendor_session(&saved, new) && !tmux_route_has_live_target(new)
                 })
             {
-                return Some(Err("the session's tmux target no longer exists".to_string()));
+                return Some(Err(PushError::NotConnected(
+                    "the session's tmux target no longer exists".to_string(),
+                )));
             }
             (refreshed.unwrap_or(saved), false)
         }
@@ -2017,12 +2019,21 @@ pub(crate) fn dispatch_with_rediscovery<T>(
     Some(match send(&route) {
         Err(PushError::NotConnected(refused)) if from_saved => {
             match rescan_route(home_override, query).filter(|fresh| *fresh != route) {
-                Some(fresh) => send(&fresh).map_err(String::from),
-                None => Err(refused),
+                Some(fresh) => send(&fresh),
+                None => Err(PushError::NotConnected(refused)),
             }
         }
-        sent => sent.map_err(String::from),
+        sent => sent,
     })
+}
+
+pub(crate) fn dispatch_with_rediscovery<T>(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+    send: impl FnMut(&VendorRoute) -> Result<T, PushError>,
+) -> Option<Result<T, String>> {
+    dispatch_with_rediscovery_typed(home_override, query, send)
+        .map(|result| result.map_err(String::from))
 }
 
 /// Run `send` once on the route [`lookup_route`] finds, with no pre-delivery check and no second

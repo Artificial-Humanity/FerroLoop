@@ -3,6 +3,7 @@ import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatPane, sessionDraftMemory, sessionSendErrors } from "../components/ChatPane";
 import type { TranscriptTurn } from "../types/api";
+import { HubApiClient } from "../api/client";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -38,6 +39,47 @@ describe("optimistic prompt submission", () => {
     expect(screen.getByText(/Check the session before sending queued messages/)).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("queued-send-now-q1"));
     expect(onSendQueuedNow).toHaveBeenCalledWith("q1");
+  });
+  it("shows failed queued delivery without adding a sent turn", async () => {
+    const handler = vi.fn(async () => ({ delivered: false, delivery_error: "delivery uncertain" }));
+    render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now" }]} onSendQueuedNow={handler} />);
+    fireEvent.click(screen.getByTestId("queued-send-now-q1"));
+    expect(await screen.findByText("delivery uncertain")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-prompt-item-q1")).toBeInTheDocument();
+    expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+  });
+  it("shows a direct API queued delivery failure without a phantom turn", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/send-now")) return new Response(JSON.stringify({ delivered: false, delivery_error: "receiver unavailable", queue: [{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now", delivery_state: "pending" }] }), { status: 200 });
+      return new Response(JSON.stringify({ turns: [], queue: [] }), { status: 200 });
+    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    render(<ChatPane agentName="alpha" sessionId="a" turns={[]} apiClient={apiClient} queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now" }]} />);
+    fireEvent.click(screen.getByTestId("queued-send-now-q1"));
+    expect(await screen.findByText("receiver unavailable")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-prompt-item-q1")).toBeInTheDocument();
+    expect(screen.queryByTestId("turn-card-0")).toBeNull();
+  });
+  it("keeps unconfirmed queue evidence visible and blocks another send", () => {
+    const handler = vi.fn();
+    render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now", delivery_state: "unconfirmed", delivery_error: "partial write" }]} onSendQueuedNow={handler} />);
+    expect(screen.getByText(/Delivery unconfirmed/)).toBeInTheDocument();
+    expect(screen.getByText("partial write")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-send-now-q1")).toBeDisabled();
+    expect(screen.queryByText(/Send Now sends that item/)).toBeNull();
+  });
+  it("requires confirmation before removing unconfirmed delivery evidence", async () => {
+    const onCancelQueued = vi.fn();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<ChatPane {...props(() => Promise.resolve())} queue={[{ id: "q1", session_id: "a", prompt: "next", by: "owner", created_at: "now", delivery_state: "unconfirmed" }]} onCancelQueued={onCancelQueued} />);
+    fireEvent.click(screen.getByTestId("queued-cancel-q1"));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(onCancelQueued).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByTestId("queued-cancel-q1"));
+    await waitFor(() => expect(onCancelQueued).toHaveBeenCalledWith("q1"));
+    confirm.mockRestore();
   });
   it("does not suggest Send Now when no queued action exists", () => {
     render(<ChatPane {...props(() => Promise.resolve())} inFlightUnconfirmed queue={[]} />);

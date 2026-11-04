@@ -499,6 +499,7 @@ fn post_prompt(state: &HubState, send_now: bool) -> (HttpResponse, Costs) {
 
 #[test]
 fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let home = tmp.path().to_path_buf();
@@ -524,6 +525,7 @@ fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
 
 #[test]
 fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
     for send_now in [false, true] {
         let tmp = TempDir::new().unwrap();
         let state = hub_with_ferris(&tmp, 3);
@@ -568,6 +570,7 @@ fn removed_post_dispatch_transcript_keeps_queue_fenced_until_new_reply() {
 
 #[test]
 fn removed_queued_dispatch_transcript_keeps_following_prompt_fenced() {
+    let _queued_delivery = crate::api::stub_queued_delivery_success();
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let path = tmp.path().join(

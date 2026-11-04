@@ -2091,8 +2091,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent) return;
     const submittedTarget = targetSessionOrAgent;
     try {
+      setSubmitError(null);
       if (onSendQueuedNow) {
-        await onSendQueuedNow(promptId);
+        const res = (await onSendQueuedNow(promptId)) as PromptResponse | undefined;
+        if (res?.delivered === false) {
+          throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
+        }
       } else if (apiClient) {
         const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
         if (currentTargetRef.current === submittedTarget) {
@@ -2101,6 +2105,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
           if (typeof res.is_busy === "boolean") {
             setInternalIsBusy(res.is_busy);
+          }
+          if (res.delivered === false) {
+            throw new Error(res.delivery_error || "Queued message delivery could not be confirmed");
           }
           const content = res.effective_body || res.prompt;
           if (content) {
@@ -2132,6 +2139,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    const item = effectiveQueue.find((queued) => queued.id === promptId);
+    if (item?.delivery_state === "unconfirmed" && !window.confirm(
+      "Delivery may have succeeded. Check the session before removing this record. Remove it anyway?",
+    )) return;
     const submittedTarget = targetSessionOrAgent;
     if (editingQueueId === promptId) {
       setEditingQueueId(null);
@@ -3432,7 +3443,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         )}
 
         {(inFlightUnconfirmed ?? internalInFlightUnconfirmed) && (
-          <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.length > 0 && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
+          <div role="status">Previous send could not be confirmed. Check the session before sending queued messages.{effectiveQueue.some((item) => !item.delivery_state || item.delivery_state === "pending") && (onSendQueuedNow || apiClient) && " Send Now sends that item immediately and may overlap the previous turn."}</div>
         )}
 
         {effectiveQueue.length > 0 && (
@@ -3550,6 +3561,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         >
                           {item.prompt}
                         </span>
+                        {item.delivery_state === "unconfirmed" && (
+                          <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
+                        )}
+                        {item.delivery_error && <span role="status">{item.delivery_error}</span>}
                         {item.attachments && item.attachments.length > 0 && (
                           <span className="fd-badge" style={{ fontSize: "10px" }}>
                             {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
@@ -3559,6 +3574,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           type="button"
                           className="fd-btn"
                           data-testid={`queued-edit-${item.id}`}
+                          disabled={Boolean(item.delivery_state && item.delivery_state !== "pending")}
                           onClick={() => {
                             setEditingQueueId(item.id);
                             setEditingQueueText(item.prompt);
@@ -3572,6 +3588,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           type="button"
                           className="fd-btn fd-btn-primary"
                           data-testid={`queued-send-now-${item.id}`}
+                          disabled={Boolean(item.delivery_state && item.delivery_state !== "pending")}
                           onClick={() => void handleSendQueuedNow(item.id)}
                           style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
                         >
@@ -3582,6 +3599,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           className="fd-btn"
                           aria-label="Remove"
                           data-testid={`queued-cancel-${item.id}`}
+                          disabled={item.delivery_state === "sending"}
                           onClick={() => void handleCancelQueued(item.id)}
                           style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
                           title="Remove from queue"
