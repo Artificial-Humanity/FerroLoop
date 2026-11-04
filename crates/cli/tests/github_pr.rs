@@ -946,6 +946,7 @@ fn review_and_merge_sign_through_the_vault_with_a_private_key_ref() {
         let mut v = Vault::open(&vault_path, master).unwrap();
         v.set(SetSecretArgs {
             name: "REVIEWER_APP_KEY".into(),
+            usage: fl_gate::SecretUsage::SignJwtRs256,
             value: pem.clone(),
             allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
             ..SetSecretArgs::default()
@@ -1055,7 +1056,7 @@ fn review_and_merge_sign_through_the_vault_with_a_private_key_ref() {
     assert!(f.fake.pull(1).merged);
     let allowed = audit()
         .into_iter()
-        .filter(|e| e["outcome"] == "allowed")
+        .filter(|e| e["outcome"] == "allowed:binding-absent")
         .count();
     assert!(allowed >= 2, "one signing per client built: {allowed}");
     let text = fs::read_to_string(vault_dir.join("gate-audit.jsonl")).unwrap();

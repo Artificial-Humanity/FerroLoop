@@ -7316,6 +7316,7 @@ fn handle_post_gate_secret(
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct SetSecretPayload {
         name: String,
         value: String,
@@ -7352,6 +7353,7 @@ fn handle_post_gate_secret(
         allowed_agents: payload.allowed_agents,
         allow_private_network: payload.allow_private_network,
         lease_ttl_secs: payload.lease_ttl_secs,
+        ..Default::default()
     }) {
         Ok(meta) => HttpResponse::json(200, json!({ "secret": meta })),
         Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),

@@ -620,6 +620,7 @@ fn the_host_probe_reads_vault_metadata_and_a_missing_vault_is_not_a_key() {
             allowed_agents: Vec::new(),
             allow_private_network: false,
             lease_ttl_secs: None,
+            ..Default::default()
         })
         .unwrap();
     assert!(probe.key_provisioned(Some(home.path()), Some(unset), Some("HUBREG_VAULT_KEY")));
@@ -657,6 +658,7 @@ fn the_host_probe_does_not_count_an_expired_vault_secret() {
                 allowed_agents: Vec::new(),
                 allow_private_network: false,
                 lease_ttl_secs: ttl,
+                ..Default::default()
             })
             .unwrap();
     }

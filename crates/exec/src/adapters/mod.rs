@@ -7,7 +7,7 @@ pub mod harness;
 pub mod muse;
 
 pub use antigravity::AntigravityAdapter;
-pub use api::{ApiKeyResolver, HttpApiAdapter, env_key_resolver};
+pub use api::{ApiKeyError, ApiKeyResolver, HttpApiAdapter, env_key_resolver};
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use grok::GrokAdapter;

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,72 @@ use crate::GateError;
 pub const VAULT_SCHEMA_VERSION: u32 = 1;
 pub const MASTER_KEY_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
+/// Maximum size of a vault snapshot inspected by a read-only report.
+pub const MAX_INSPECT_VAULT_BYTES: usize = 8 * 1024 * 1024;
+/// A hex key needs 64 bytes; allow a small amount of surrounding whitespace.
+const MAX_MASTER_KEY_FILE_BYTES: usize = 256;
+
+/// Authorized use of a vault record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretUsage {
+    #[default]
+    Proxy,
+    SignJwtRs256,
+}
+fn is_proxy(usage: &SecretUsage) -> bool {
+    *usage == SecretUsage::Proxy
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// App identity and exact network origin authenticated with the record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppBinding {
+    pub issuer: String,
+    pub origin: String,
+}
+
+/// Verified metadata and record identity; this contains no plaintext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSecretSnapshot {
+    pub metadata: VaultSecretMetadata,
+    pub record_epoch: String,
+}
+
+/// Normalize an exact HTTPS origin; paths, query, fragment and credentials are forbidden.
+pub fn normalize_signing_origin(raw: &str) -> Result<String, GateError> {
+    if raw.trim() != raw || raw.chars().any(char::is_control) {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "origin has whitespace or controls".into(),
+        });
+    }
+    let (_, authority) = raw.split_once("://").ok_or_else(|| GateError::InvalidUrl {
+        url: raw.into(),
+        reason: "origin needs a scheme".into(),
+    })?;
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "origin must not contain credentials, path, query or fragment".into(),
+        });
+    }
+    let (scheme, host, port) = crate::proxy::parse_url_scheme_host_port(raw)?;
+    if scheme != "https" || port == 0 {
+        return Err(GateError::InvalidUrl {
+            url: raw.into(),
+            reason: "signing origin requires HTTPS and a valid port".into(),
+        });
+    }
+    let formatted_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Ok(format!("https://{formatted_host}:{port}"))
+}
 
 /// Public, redacted metadata for a secret stored in [`Vault`] (spec §2.2).
 /// Never holds plaintext secret values.
@@ -43,6 +110,12 @@ pub struct VaultSecretMetadata {
     pub lease_ttl_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "is_proxy")]
+    pub usage: SecretUsage,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bundle_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_binding: Option<AppBinding>,
 }
 
 /// Parameters for inserting or updating a secret in [`Vault`].
@@ -59,6 +132,9 @@ pub struct SetSecretArgs {
     pub allowed_agents: Vec<String>,
     pub allow_private_network: bool,
     pub lease_ttl_secs: Option<u64>,
+    pub usage: SecretUsage,
+    pub bundle_required: bool,
+    pub app_binding: Option<AppBinding>,
 }
 
 impl std::fmt::Debug for SetSecretArgs {
@@ -72,6 +148,9 @@ impl std::fmt::Debug for SetSecretArgs {
             .field("allowed_agents", &self.allowed_agents)
             .field("allow_private_network", &self.allow_private_network)
             .field("lease_ttl_secs", &self.lease_ttl_secs)
+            .field("usage", &self.usage)
+            .field("bundle_required", &self.bundle_required)
+            .field("app_binding", &self.app_binding)
             .finish()
     }
 }
@@ -101,6 +180,8 @@ impl Default for VaultFile {
     }
 }
 
+type VerifiedSnapshotCache = std::sync::Arc<Mutex<BTreeMap<String, ([u8; 32], String)>>>;
+
 /// Zero-knowledge AES-256-GCM encrypted secrets vault (`crates/gate/src/vault.rs`).
 ///
 /// `Debug` prints the path and the number of secrets, never the master key: a `{:?}` of a
@@ -110,6 +191,7 @@ pub struct Vault {
     path: PathBuf,
     master_key: [u8; MASTER_KEY_LEN],
     file: VaultFile,
+    verified: VerifiedSnapshotCache,
 }
 
 impl std::fmt::Debug for Vault {
@@ -121,18 +203,78 @@ impl std::fmt::Debug for Vault {
     }
 }
 
+/// Read metadata names from one bounded, existing regular vault file. No key or file is created.
+pub fn inspect_vault_names_bounded(path: &Path) -> Result<Vec<String>, GateError> {
+    let vault = Vault::open_existing_bounded(path, [0; MASTER_KEY_LEN])?;
+    Ok(vault.list().into_iter().map(|m| m.name).collect())
+}
+
+/// Authenticate one record from a single bounded on-disk snapshot without reopening it.
+/// This observational result is not an authorization to dispatch.
+pub fn inspect_verified_secret_bounded(
+    path: &Path,
+    master_key: [u8; MASTER_KEY_LEN],
+    name: &str,
+) -> Result<VerifiedSecretSnapshot, GateError> {
+    let vault = Vault::open_existing_bounded(path, master_key)?;
+    #[cfg(test)]
+    AFTER_INSPECTION_OPEN.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    vault.verified_snapshot_current(name)
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_INSPECTION_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 impl Vault {
+    /// Open one bounded, regular, no-follow snapshot for read-only inspection. Unlike
+    /// `open`, a missing file is an error. The returned handle must not be used to
+    /// infer that its snapshot is still current after another writer changes the file.
+    fn open_existing_bounded(
+        vault_path: impl Into<PathBuf>,
+        master_key: [u8; MASTER_KEY_LEN],
+    ) -> Result<Self, GateError> {
+        let path = vault_path.into();
+        validate_vault_path(&path)?;
+        let raw = read_bounded_regular(&path, MAX_INSPECT_VAULT_BYTES)?;
+        let file: VaultFile =
+            serde_json::from_slice(&raw).map_err(|e| GateError::VaultCorrupt {
+                path: path.clone(),
+                cause: e.to_string(),
+            })?;
+        if file.schema_version != VAULT_SCHEMA_VERSION {
+            return Err(GateError::VaultCorrupt {
+                path,
+                cause: format!("unsupported vault schema_version {}", file.schema_version),
+            });
+        }
+        Ok(Self {
+            path,
+            master_key,
+            file,
+            verified: Default::default(),
+        })
+    }
+
     /// Open or initialize a [`Vault`] at `vault_path` using `master_key`.
     pub fn open(
         vault_path: impl Into<PathBuf>,
         master_key: [u8; MASTER_KEY_LEN],
     ) -> Result<Self, GateError> {
         let path = vault_path.into();
+        validate_vault_path(&path)?;
         let file = read_vault_file(&path)?;
         Ok(Self {
             path,
             master_key,
             file,
+            verified: Default::default(),
         })
     }
 
@@ -140,12 +282,21 @@ impl Vault {
     pub fn open_default(home_override: Option<&Path>) -> Result<Self, GateError> {
         let vault_path = resolve_vault_path(home_override);
         let key_path = resolve_master_key_path(home_override);
+        validate_vault_path(&vault_path)?;
         let master_key = load_or_init_master_key(&key_path)?;
         Self::open(vault_path, master_key)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    pub(crate) fn fresh(&self) -> Result<Self, GateError> {
+        Ok(Self {
+            path: self.path.clone(),
+            master_key: self.master_key,
+            file: read_vault_file(&self.path)?,
+            verified: self.verified.clone(),
+        })
     }
 
     /// List redacted metadata for all secrets in deterministic key order.
@@ -188,6 +339,33 @@ impl Vault {
             });
         }
 
+        if args.usage == SecretUsage::Proxy && args.app_binding.is_some() {
+            return Err(GateError::InvalidSecret {
+                name,
+                reason: "app binding requires signing usage".into(),
+            });
+        }
+        let app_binding = args
+            .app_binding
+            .map(|binding| {
+                if binding.issuer.is_empty()
+                    || binding.issuer.len() > 64
+                    || !binding
+                        .issuer
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                {
+                    return Err(GateError::InvalidSecret {
+                        name: name.clone(),
+                        reason: "invalid app issuer".into(),
+                    });
+                }
+                Ok(AppBinding {
+                    issuer: binding.issuer,
+                    origin: normalize_signing_origin(&binding.origin)?,
+                })
+            })
+            .transpose()?;
         let allowed_hosts = normalize_string_list(&args.allowed_hosts, true);
         let allowed_methods = normalize_string_list(&args.allowed_methods, false)
             .into_iter()
@@ -214,7 +392,9 @@ impl Vault {
         // vault lock. `self.file` may be stale (another `fl vault set` process, or the hub, may
         // have saved since this `Vault` was opened), so the disk copy is the base and this one
         // secret is applied to it: a stale in-memory map is never written back over it.
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         let mut next = read_vault_file(&self.path)?;
         if only_if_absent && let Some(existing) = next.secrets.get(&name) {
             let metadata = existing.metadata.clone();
@@ -248,6 +428,9 @@ impl Vault {
             updated_at: now_str,
             lease_ttl_secs: args.lease_ttl_secs,
             expires_at,
+            usage: args.usage,
+            bundle_required: args.bundle_required,
+            app_binding,
         };
 
         let rng = SystemRandom::new();
@@ -262,11 +445,25 @@ impl Vault {
                 reason: "invalid AES-256-GCM master key".to_string(),
             })?;
         let key = LessSafeKey::new(unbound);
-        let mut in_out = args.value.into_bytes();
+        let value = Zeroizing::new(args.value);
+        let capacity = value
+            .len()
+            .checked_add(AES_256_GCM.tag_len())
+            .ok_or_else(|| GateError::Crypto {
+                reason: "secret is too large".into(),
+            })?;
+        let mut in_out = Zeroizing::new(Vec::new());
+        in_out
+            .try_reserve_exact(capacity)
+            .map_err(|_| GateError::Crypto {
+                reason: "secret is too large".into(),
+            })?;
+        in_out.extend_from_slice(value.as_bytes());
+        drop(value);
         key.seal_in_place_append_tag(
             Nonce::assume_unique_for_key(nonce_bytes),
             Aad::from(aad_str.as_bytes()),
-            &mut in_out,
+            &mut *in_out,
         )
         .map_err(|_| GateError::Crypto {
             reason: "AES-256-GCM encryption failed".to_string(),
@@ -275,7 +472,7 @@ impl Vault {
         let record = EncryptedSecretRecord {
             metadata: metadata.clone(),
             nonce_b64: BASE64.encode(nonce_bytes),
-            ciphertext_b64: BASE64.encode(in_out),
+            ciphertext_b64: BASE64.encode(&*in_out),
         };
         next.secrets.insert(name, record);
         self.write_file(&next)?;
@@ -287,7 +484,9 @@ impl Vault {
     pub fn remove(&mut self, name: &str) -> Result<bool, GateError> {
         let key = normalize_secret_name(name)?;
         // Same lock and same disk-first rule as `set`: the disk copy is the base.
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         let mut next = read_vault_file(&self.path)?;
         let existed = next.secrets.remove(&key).is_some();
         if existed {
@@ -295,6 +494,89 @@ impl Vault {
         }
         self.file = next;
         Ok(existed)
+    }
+
+    /// Verify AEAD before trusting policy and retain only an authenticated epoch and key fingerprint.
+    pub fn verified_snapshot(&self, name: &str) -> Result<VerifiedSecretSnapshot, GateError> {
+        let name = normalize_secret_name(name)?;
+        self.fresh()?.verified_snapshot_current(&name)
+    }
+
+    pub(crate) fn verified_snapshot_current(
+        &self,
+        name: &str,
+    ) -> Result<VerifiedSecretSnapshot, GateError> {
+        let snapshot = self.authenticated_snapshot_current(name)?;
+        check_lease(&snapshot.metadata)?;
+        Ok(snapshot)
+    }
+
+    /// Authenticate policy without interpreting its lease; callers must enforce the lease
+    /// after checking the authenticated usage class.
+    pub(crate) fn authenticated_snapshot_current(
+        &self,
+        name: &str,
+    ) -> Result<VerifiedSecretSnapshot, GateError> {
+        let name = normalize_secret_name(name)?;
+        let record = self
+            .file
+            .secrets
+            .get(&name)
+            .ok_or_else(|| GateError::NoSuchSecret { name: name.clone() })?;
+        if record.metadata.name != name || !valid_authenticated_metadata(&record.metadata) {
+            return Err(GateError::VaultTampered { secret: name });
+        }
+        let nonce = BASE64
+            .decode(&record.nonce_b64)
+            .map_err(|e| GateError::VaultCorrupt {
+                path: self.path.clone(),
+                cause: format!("invalid nonce: {e}"),
+            })?;
+        let cipher =
+            BASE64
+                .decode(&record.ciphertext_b64)
+                .map_err(|e| GateError::VaultCorrupt {
+                    path: self.path.clone(),
+                    cause: format!("invalid ciphertext: {e}"),
+                })?;
+        let aad = canonical_aad(&record.metadata);
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        for part in [aad.as_bytes(), nonce.as_slice(), cipher.as_slice()] {
+            digest.update(&(part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        let epoch: String = digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let fingerprint: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &self.master_key)
+            .as_ref()
+            .try_into()
+            .expect("sha256 width");
+        let cached = self
+            .verified
+            .lock()
+            .map_err(|_| GateError::Crypto {
+                reason: "verified snapshot lock poisoned".into(),
+            })?
+            .get(&name)
+            .is_some_and(|entry| entry.0 == fingerprint && entry.1 == epoch);
+        if !cached {
+            let (_, plaintext) = self.decrypt_authenticated_bytes(&name)?;
+            drop(plaintext);
+            self.verified
+                .lock()
+                .map_err(|_| GateError::Crypto {
+                    reason: "verified snapshot lock poisoned".into(),
+                })?
+                .insert(name, (fingerprint, epoch.clone()));
+        }
+        Ok(VerifiedSecretSnapshot {
+            metadata: record.metadata.clone(),
+            record_epoch: epoch,
+        })
     }
 
     /// Decrypt a secret for internal proxy substitution, verifying its AAD policy and expiration.
@@ -316,17 +598,24 @@ impl Vault {
         &self,
         name: &str,
     ) -> Result<(VaultSecretMetadata, Zeroizing<Vec<u8>>), GateError> {
+        let (metadata, plaintext) = self.decrypt_authenticated_bytes(name)?;
+        check_lease(&metadata)?;
+        Ok((metadata, plaintext))
+    }
+
+    fn decrypt_authenticated_bytes(
+        &self,
+        name: &str,
+    ) -> Result<(VaultSecretMetadata, Zeroizing<Vec<u8>>), GateError> {
         let key_name = normalize_secret_name(name)?;
         let Some(record) = self.file.secrets.get(&key_name) else {
             return Err(GateError::NoSuchSecret { name: key_name });
         };
         // The AAD binds `metadata.name`, not the map key. A record copied under another key
         // would otherwise decrypt as that other secret, with its own value and policy.
-        if record.metadata.name != key_name {
+        if record.metadata.name != key_name || !valid_authenticated_metadata(&record.metadata) {
             return Err(GateError::VaultTampered { secret: key_name });
         }
-
-        check_lease(&record.metadata)?;
 
         let nonce_vec = BASE64
             .decode(&record.nonce_b64)
@@ -385,7 +674,9 @@ impl Vault {
     /// was opened is overwritten. Use [`Vault::set`] or [`Vault::remove`] to change a secret;
     /// they re-read the disk copy under the lock first.
     pub fn save(&self) -> Result<(), GateError> {
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         self.write_file(&self.file)
     }
 
@@ -394,7 +685,9 @@ impl Vault {
     /// a `set` that lands after [`Vault::open`] is never overwritten by an initialising `save`.
     /// An existing vault is left exactly as it is.
     pub fn save_if_absent(&self) -> Result<bool, GateError> {
-        let _lock = VaultLock::acquire(&self.path)?;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        refuse_direct_write_if_broker_required(&self.path)?;
         // A symlink in the vault's place counts as present: it is never replaced here.
         if fs::symlink_metadata(&self.path).is_ok() {
             return Ok(false);
@@ -410,6 +703,55 @@ impl Vault {
             cause: e.to_string(),
         })?;
         write_atomic_0600(&self.path, format!("{encoded}\n").as_bytes())
+    }
+
+    /// Permanently require the broker for subsequent direct vault mutations.
+    ///
+    /// The caller must authorize this operation. The vault directory and its ancestors must
+    /// be trusted and fenced against concurrent replacement; the lock is advisory and cannot
+    /// protect files from same-user code that edits or removes them directly. There is no
+    /// bypass here: once configured, direct writes refuse until a future broker path exists.
+    #[cfg(unix)]
+    pub fn require_broker(&self) -> Result<(), GateError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock = VaultLock::acquire(&self.path)?;
+        lock.ensure_current()?;
+        let marker = broker_marker_path(&self.path)?;
+        let error = |op, e: std::io::Error| GateError::Io {
+            op,
+            path: marker.clone(),
+            cause: e.to_string(),
+        };
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let mut file = options
+            .open(&marker)
+            .map_err(|e| error("create broker marker", e))?;
+        // If any later operation fails, leave the marker in place so writes remain refused.
+        file.write_all(b"ferrogate-broker-required-v1\n")
+            .map_err(|e| error("write broker marker", e))?;
+        file.sync_all()
+            .map_err(|e| error("sync broker marker", e))?;
+        let parent = marker
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| error("sync broker marker directory", e))?;
+        Ok(())
+    }
+
+    /// Broker-required configuration is unavailable without a process-shared vault lock.
+    #[cfg(not(unix))]
+    pub fn require_broker(&self) -> Result<(), GateError> {
+        Err(GateError::DispatchAuthority(
+            "broker marker requires a process-shared lock",
+        ))
     }
 
     /// Compare `candidate` against the decrypted value of `secret_name` in constant time.
@@ -507,8 +849,48 @@ impl Drop for Vault {
     }
 }
 
+/// Read through one descriptor so a FIFO cannot block and a final symlink cannot redirect it.
+#[cfg(unix)]
+fn read_bounded_regular(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    let failure = |cause: String| GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause,
+    };
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| failure(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| failure(e.to_string()))?;
+    if !meta.is_file() || meta.len() > limit as u64 {
+        return Err(failure(
+            "file is not regular or exceeds the size limit".into(),
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| failure(e.to_string()))?;
+    if raw.len() > limit {
+        return Err(failure("file exceeds the size limit".into()));
+    }
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn read_bounded_regular(path: &Path, _limit: usize) -> Result<Vec<u8>, GateError> {
+    Err(GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause: "bounded no-follow file reads are unsupported on this platform".into(),
+    })
+}
+
 /// Read and validate `vault.enc` at `path`; a missing file is an empty vault.
 fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
+    validate_vault_path(path)?;
     let file = if path.exists() {
         reject_if_symlink(path)?;
         let raw = fs::read_to_string(path).map_err(|e| GateError::Io {
@@ -535,6 +917,90 @@ fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
 /// The lock file beside the vault. Not `vault.enc` itself: that file is replaced by a rename on
 /// every save, so a lock on its inode would not exclude the next writer.
 pub(crate) const LOCK_FILE_NAME: &str = ".vault.lock";
+
+/// A vault must not replace the lock or any broker marker belonging to a vault in
+/// the same directory. The directory and its ancestors remain caller-fenced.
+fn validate_vault_path(path: &Path) -> Result<(), GateError> {
+    let invalid = || GateError::Io {
+        op: "open",
+        path: path.to_path_buf(),
+        cause: "vault path aliases a reserved internal file".into(),
+    };
+    let name = path.file_name().ok_or_else(invalid)?.to_string_lossy();
+    let lower = name.to_ascii_lowercase();
+    if lower == LOCK_FILE_NAME || lower == "gate-audit.jsonl" || lower.ends_with(".broker-required")
+    {
+        return Err(invalid());
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(invalid()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(GateError::Io {
+                op: "stat",
+                path: path.to_path_buf(),
+                cause: error.to_string(),
+            });
+        }
+    }
+    // An existing hardlink to the lock must not be treated as a vault, even if
+    // it has a different name. `VaultLock::acquire` repeats this after locking.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let existing = fs::metadata(path).map_err(|e| GateError::Io {
+            op: "stat",
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        })?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        match fs::symlink_metadata(parent.join(LOCK_FILE_NAME)) {
+            Ok(lock) if existing.dev() == lock.dev() && existing.ino() == lock.ino() => {
+                return Err(invalid());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(GateError::Io {
+                    op: "stat",
+                    path: parent.join(LOCK_FILE_NAME),
+                    cause: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+fn broker_marker_path(vault_path: &Path) -> Result<PathBuf, GateError> {
+    let name = vault_path
+        .file_name()
+        .ok_or(GateError::DispatchAuthority("invalid vault path"))?;
+    let mut marker = name.to_os_string();
+    marker.push(".broker-required");
+    Ok(vault_path.with_file_name(marker))
+}
+
+/// A marker of any type or contents refuses direct writes. A corrupt marker must never
+/// turn broker enforcement off; access errors are also refusals, not absence.
+fn refuse_direct_write_if_broker_required(vault_path: &Path) -> Result<(), GateError> {
+    let path = broker_marker_path(vault_path)?;
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(GateError::DispatchAuthority(
+            "broker required for vault mutation",
+        )),
+    }
+}
 
 /// Lock directories held by this process. `flock` locks belong to an open file description, so
 /// two threads that each open the lock file would conflict anyway; this set makes the wait
@@ -621,11 +1087,14 @@ mod flock {
 pub(crate) struct VaultLock {
     #[cfg_attr(not(unix), allow(dead_code))]
     file: fs::File,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    path: PathBuf,
     _slot: ProcessSlot,
 }
 
 impl VaultLock {
     pub(crate) fn acquire(vault_path: &Path) -> Result<Self, GateError> {
+        validate_vault_path(vault_path)?;
         let parent = match vault_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => PathBuf::from("."),
@@ -647,17 +1116,62 @@ impl VaultLock {
             .join(LOCK_FILE_NAME);
         let slot = ProcessSlot::acquire(key);
         reject_if_symlink(&lock_path)?;
+        #[cfg(test)]
+        BEFORE_LOCK_OPEN.with(|hook| {
+            if let Some(f) = hook.borrow_mut().take() {
+                f();
+            }
+        });
         let mut opts = fs::OpenOptions::new();
         opts.create(true).truncate(false).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            opts.mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         }
         let file = opts.open(&lock_path).map_err(|e| io_err("open", e))?;
+        if !file.metadata().map_err(|e| io_err("stat", e))?.is_file() {
+            return Err(io_err(
+                "open",
+                std::io::Error::other("vault lock is not a regular file"),
+            ));
+        }
         #[cfg(unix)]
         flock::lock_exclusive(&file).map_err(|e| io_err("lock", e))?;
-        Ok(Self { file, _slot: slot })
+        let lock = Self {
+            file,
+            path: lock_path,
+            _slot: slot,
+        };
+        lock.ensure_current()?;
+        validate_vault_path(vault_path)?;
+        Ok(lock)
+    }
+
+    /// Refuse a lock whose directory entry was replaced while this process waited.
+    /// Callers must also fence the directory against replacement during the operation.
+    #[cfg(unix)]
+    fn ensure_current(&self) -> Result<(), GateError> {
+        use std::os::unix::fs::MetadataExt;
+        let opened = self.file.metadata();
+        let named = fs::symlink_metadata(&self.path);
+        match (opened, named) {
+            (Ok(a), Ok(b))
+                if b.file_type().is_file()
+                    && a.dev() == b.dev()
+                    && a.ino() == b.ino()
+                    && a.nlink() == 1 =>
+            {
+                Ok(())
+            }
+            _ => Err(GateError::DispatchAuthority("vault lock identity changed")),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_current(&self) -> Result<(), GateError> {
+        Ok(())
     }
 }
 
@@ -733,15 +1247,75 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     std::hint::black_box(diff) == 0 && len_diff == 0
 }
 
+/// Reject metadata that the vault writer would not produce and that could alias an AAD.
+/// Legacy records retain the original v1 AAD bytes.
+fn valid_authenticated_metadata(meta: &VaultSecretMetadata) -> bool {
+    if meta
+        .allowed_hosts
+        .iter()
+        .chain(&meta.allowed_methods)
+        .chain(&meta.allowed_agents)
+        .any(|item| item.trim().is_empty() || item.contains(['|', ',']))
+        || meta
+            .expires_at
+            .as_deref()
+            .is_some_and(|value| At::parse(value).is_err())
+    {
+        return false;
+    }
+    match &meta.app_binding {
+        None => true,
+        Some(binding) => {
+            meta.usage == SecretUsage::SignJwtRs256
+                && !binding.issuer.is_empty()
+                && binding.issuer.len() <= 64
+                && binding
+                    .issuer
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && normalize_signing_origin(&binding.origin)
+                    .is_ok_and(|origin| origin == binding.origin)
+        }
+    }
+}
+
 /// Build the canonical AEAD Additional Authenticated Data (AAD) string for `meta`.
 pub fn canonical_aad(meta: &VaultSecretMetadata) -> String {
     let hosts = meta.allowed_hosts.join(",");
     let methods = meta.allowed_methods.join(",");
     let agents = meta.allowed_agents.join(",");
     let exp = meta.expires_at.as_deref().unwrap_or("none");
-    format!(
+    let v1 = format!(
         "ferrogate:v1|{}|{}|{}|{}|{}|{}",
         meta.name, hosts, methods, agents, meta.allow_private_network, exp
+    );
+    if meta.usage == SecretUsage::Proxy && !meta.bundle_required && meta.app_binding.is_none() {
+        return v1;
+    }
+    let usage = match meta.usage {
+        SecretUsage::Proxy => "proxy",
+        SecretUsage::SignJwtRs256 => "sign-jwt-rs256",
+    };
+    let issuer = meta
+        .app_binding
+        .as_ref()
+        .map_or("none", |b| b.issuer.as_str());
+    let origin = meta
+        .app_binding
+        .as_ref()
+        .map_or("none", |b| b.origin.as_str());
+    format!(
+        "ferrogate:v2|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        meta.name,
+        hosts,
+        methods,
+        agents,
+        meta.allow_private_network,
+        exp,
+        usage,
+        meta.bundle_required,
+        issuer,
+        origin
     )
 }
 
@@ -863,14 +1437,97 @@ fn existing_master_key(key_path: &Path) -> Option<Result<[u8; MASTER_KEY_LEN], G
 /// Load the master key that exists, from `FL_VAULT_MASTER_KEY` or `key_path`, and never create
 /// one: a missing key is an error. A reader uses this so that a read cannot initialise a Vault.
 pub fn load_existing_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
-    existing_master_key(key_path).unwrap_or_else(|| {
-        Err(GateError::Io {
-            op: "read",
-            path: key_path.to_path_buf(),
-            cause: "no Vault master key (FL_VAULT_MASTER_KEY is unset and the file does not exist)"
-                .to_string(),
-        })
-    })
+    let env = std::env::var("FL_VAULT_MASTER_KEY")
+        .ok()
+        .map(Zeroizing::new);
+    load_existing_master_key_with_env(key_path, env.as_deref().map(String::as_str))
+}
+
+/// Report-only key load: fail closed where a nonblocking no-follow opener is unavailable.
+pub fn load_existing_master_key_for_inspection(
+    key_path: &Path,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    let env = std::env::var("FL_VAULT_MASTER_KEY")
+        .ok()
+        .map(Zeroizing::new);
+    load_key_from_reader(
+        key_path,
+        env.as_deref().map(String::as_str),
+        read_bounded_regular,
+    )
+}
+
+/// No-create key load with the caller's environment snapshot; a blank value falls back to file.
+pub fn load_existing_master_key_with_env(
+    key_path: &Path,
+    env_key: Option<&str>,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    load_key_from_reader(key_path, env_key, read_existing_key_no_create)
+}
+
+fn load_key_from_reader(
+    key_path: &Path,
+    env_key: Option<&str>,
+    read: fn(&Path, usize) -> Result<Vec<u8>, GateError>,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    if let Some(value) = env_key.map(str::trim).filter(|value| !value.is_empty()) {
+        return parse_hex_master_key(value, Path::new("FL_VAULT_MASTER_KEY"));
+    }
+    let raw = match read(key_path, MAX_MASTER_KEY_FILE_BYTES) {
+        Ok(raw) => Zeroizing::new(raw),
+        Err(error) => {
+            if fs::symlink_metadata(key_path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(GateError::Io {
+                    op: "read",
+                    path: key_path.to_path_buf(),
+                    cause: "no Vault master key (FL_VAULT_MASTER_KEY is unset and the file does not exist)".into(),
+                });
+            }
+            return Err(error);
+        }
+    };
+    let text = std::str::from_utf8(&raw).map_err(|_| GateError::Io {
+        op: "read",
+        path: key_path.to_path_buf(),
+        cause: "master key is not UTF-8".into(),
+    })?;
+    parse_hex_master_key(text.trim(), key_path)
+}
+
+#[cfg(unix)]
+fn read_existing_key_no_create(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    read_bounded_regular(path, limit)
+}
+
+/// Preserve the existing no-create file-key path on non-Unix platforms. The
+/// stricter report-only inspector still refuses there until it has a verified
+/// no-follow, nonblocking opener.
+#[cfg(not(unix))]
+fn read_existing_key_no_create(path: &Path, limit: usize) -> Result<Vec<u8>, GateError> {
+    let fail = |cause: String| GateError::Io {
+        op: "read",
+        path: path.to_path_buf(),
+        cause,
+    };
+    reject_if_symlink(path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|e| fail(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
+    if !meta.is_file() || meta.len() > limit as u64 {
+        return Err(fail("file is not regular or exceeds the size limit".into()));
+    }
+    let mut raw = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| fail(e.to_string()))?;
+    if raw.len() > limit {
+        return Err(fail("file exceeds the size limit".into()));
+    }
+    Ok(raw)
 }
 
 /// Load a 32-byte master key from `FL_VAULT_MASTER_KEY` or `key_path`, generating and persisting
@@ -1125,6 +1782,164 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[test]
+    fn reserved_lock_and_marker_paths_are_not_vault_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        for path in [
+            tmp.path().join(LOCK_FILE_NAME),
+            tmp.path().join(".").join(LOCK_FILE_NAME),
+            tmp.path().join("sub").join("..").join(LOCK_FILE_NAME),
+            tmp.path().join("vault.enc.broker-required"),
+            tmp.path().join("gate-audit.jsonl"),
+        ] {
+            assert!(Vault::open(&path, [9; 32]).is_err(), "{}", path.display());
+            assert!(!path.exists());
+        }
+        let path = tmp.path().join("a-vault.enc");
+        let vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.save().unwrap();
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vault_path_rejects_symlinks_and_hardlinks_to_lock_before_writing() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("alias.enc");
+        let alias = Vault::open(&path, [9; 32]).unwrap();
+        let other = Vault::open(tmp.path().join("other.enc"), [9; 32]).unwrap();
+        other.save().unwrap();
+        let lock_path = tmp.path().join(LOCK_FILE_NAME);
+        let before = fs::metadata(&lock_path).unwrap().ino();
+        fs::hard_link(&lock_path, &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+        assert!(alias.save().is_err());
+        assert!(alias.require_broker().is_err());
+        assert_eq!(fs::metadata(&lock_path).unwrap().ino(), before);
+        fs::remove_file(&path).unwrap();
+        symlink(&lock_path, &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+        assert!(alias.save().is_err());
+        fs::remove_file(&path).unwrap();
+        symlink(tmp.path().join("missing"), &path).unwrap();
+        assert!(Vault::open(&path, [9; 32]).is_err());
+    }
+
+    #[test]
+    fn broker_marker_refuses_every_direct_vault_write() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        vault.set(args("EXISTING", "old")).unwrap();
+        let original = fs::read(vault.path()).unwrap();
+        fs::write(tmp.path().join("vault.enc.broker-required"), b"corrupt").unwrap();
+        assert!(matches!(
+            vault.set(args("NEW", "value")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(
+            vault.set_if_absent(args("NEW", "value")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(
+            vault.remove("EXISTING"),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(matches!(vault.save(), Err(GateError::DispatchAuthority(_))));
+        assert!(matches!(
+            vault.save_if_absent(),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert_eq!(fs::read(vault.path()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_marker_is_private_durable_and_scoped_to_one_vault() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut first = open_at(tmp.path());
+        first.set(args("EXISTING", "old")).unwrap();
+        let mut other = Vault::open(tmp.path().join("other.enc"), [9; 32]).unwrap();
+        first.require_broker().unwrap();
+        let marker = tmp.path().join("vault.enc.broker-required");
+        assert_eq!(
+            fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let mut reopened = open_at(tmp.path());
+        assert!(matches!(
+            reopened.set(args("DENIED", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        other.set(args("OTHER", "allowed")).unwrap();
+        assert!(!fs::read_to_string(marker).unwrap().contains("old"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_symlink_and_unexpected_type_never_allow_writes() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        let marker = tmp.path().join("vault.enc.broker-required");
+        symlink(tmp.path().join("missing"), &marker).unwrap();
+        assert!(matches!(
+            vault.set(args("X", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+        assert!(vault.require_broker().is_err());
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        assert!(matches!(vault.save(), Err(GateError::DispatchAuthority(_))));
+        assert!(vault.require_broker().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_marker_remains_enforced_when_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        vault.set(args("EXISTING", "old")).unwrap();
+        vault.require_broker().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = vault.set(args("NEXT", "secret"));
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(tmp.path().join("vault.enc.broker-required").exists());
+        assert!(matches!(
+            vault.set(args("NEXT", "secret")),
+            Err(GateError::DispatchAuthority(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_symlink_swap_and_replaced_inode_fail_closed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let lock_path = tmp.path().join(LOCK_FILE_NAME);
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        let replacement = lock_path.clone();
+        let target = victim.clone();
+        BEFORE_LOCK_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                symlink(target, replacement).unwrap();
+            }))
+        });
+        assert!(VaultLock::acquire(&path).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+        fs::remove_file(&lock_path).unwrap();
+        let lock = VaultLock::acquire(&path).unwrap();
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"").unwrap();
+        assert!(lock.ensure_current().is_err());
+    }
+
     fn args(name: &str, value: &str) -> SetSecretArgs {
         SetSecretArgs {
             name: name.into(),
@@ -1134,6 +1949,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bounded_inspection_authenticates_the_opened_snapshot_without_reopening() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut writer = Vault::open(&path, [9; 32]).unwrap();
+        writer.set(args("KEY", "secret")).unwrap();
+        let mut changed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        changed["secrets"]["KEY"]["metadata"]["allowed_hosts"] =
+            serde_json::json!(["evil.example"]);
+        let replacement = tmp.path().join("replacement");
+        fs::write(&replacement, serde_json::to_vec(&changed).unwrap()).unwrap();
+        let target = path.clone();
+        AFTER_INSPECTION_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::rename(replacement, target).unwrap()));
+        });
+        assert!(inspect_verified_secret_bounded(&path, [9; 32], "KEY").is_ok());
+        assert!(matches!(
+            inspect_verified_secret_bounded(&path, [9; 32], "KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn bounded_existing_key_load_never_initializes_and_honors_environment() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("missing.key");
+        assert!(load_existing_master_key_with_env(&path, None).is_err());
+        assert!(!path.exists());
+        assert_eq!(
+            load_existing_master_key_with_env(&path, Some(&"01".repeat(32))).unwrap(),
+            [1; 32]
+        );
+        assert!(!path.exists());
+        fs::write(&path, format!("{}{}", "01".repeat(32), " ".repeat(1024))).unwrap();
+        assert!(load_existing_master_key_with_env(&path, None).is_err());
+    }
+
     fn leftover_temp_files(dir: &Path) -> Vec<String> {
         fs::read_dir(dir)
             .unwrap()
@@ -1141,6 +1994,281 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp."))
             .collect()
+    }
+
+    #[test]
+    fn proxy_aad_is_legacy_and_v2_fields_are_authenticated() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let meta = vault.set(args("PLAIN", "token")).unwrap();
+        assert_eq!(
+            canonical_aad(&meta),
+            "ferrogate:v1|PLAIN|example.com|||false|none"
+        );
+        let mut bundled = args("BUNDLED", "token");
+        bundled.bundle_required = true;
+        vault.set(bundled).unwrap();
+        let mut signing = args("SIGNING", "token");
+        signing.usage = SecretUsage::SignJwtRs256;
+        signing.app_binding = Some(AppBinding {
+            issuer: "123".into(),
+            origin: "https://EXAMPLE.com".into(),
+        });
+        vault.set(signing).unwrap();
+        let original = fs::read(&path).unwrap();
+        for (name, field, changed) in [
+            ("BUNDLED", "bundle_required", serde_json::json!(false)),
+            ("SIGNING", "usage", serde_json::json!("proxy")),
+            (
+                "SIGNING",
+                "app_binding",
+                serde_json::json!({"issuer":"456", "origin":"https://example.com:443"}),
+            ),
+            (
+                "SIGNING",
+                "app_binding",
+                serde_json::json!({"issuer":"123", "origin":"https://example.com:444"}),
+            ),
+        ] {
+            let mut altered: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            altered["secrets"][name]["metadata"][field] = changed;
+            fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    vault.verified_snapshot(name),
+                    Err(GateError::VaultTampered { .. })
+                ),
+                "{name} {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_binding_cannot_alias_unbound_aad_even_when_snapshot_cached() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let mut signing = args("SIGNING", "secret");
+        signing.usage = SecretUsage::SignJwtRs256;
+        vault.set(signing).unwrap();
+        vault.verified_snapshot("SIGNING").unwrap();
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["SIGNING"]["metadata"]["app_binding"] =
+            serde_json::json!({"issuer":"none", "origin":"none"});
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("SIGNING"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn delimiter_alias_in_policy_is_rejected_without_changing_v1_aad() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        let mut input = args("KEY", "secret");
+        input.allowed_hosts = vec!["a.example".into(), "b.example".into()];
+        let meta = vault.set(input).unwrap();
+        assert!(canonical_aad(&meta).starts_with("ferrogate:v1|"));
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["KEY"]["metadata"]["allowed_hosts"] =
+            serde_json::json!(["a.example,b.example"]);
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_handle_observes_current_usage_bundle_policy_and_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut writer = Vault::open(&path, [9; 32]).unwrap();
+        writer.set(args("KEY", "old")).unwrap();
+        let stale = Vault::open(&path, [9; 32]).unwrap();
+        let mut sign = args("KEY", "new");
+        sign.usage = SecretUsage::SignJwtRs256;
+        writer.set(sign).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let mut bundle = args("KEY", "new");
+        bundle.bundle_required = true;
+        writer.set(bundle).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None),
+            Err(GateError::PolicyDenied { .. })
+        ));
+        let mut restricted = args("KEY", "latest");
+        restricted.allowed_hosts = vec!["other.example".into()];
+        writer.set(restricted).unwrap();
+        let (meta, value) =
+            crate::adapter::resolve_vault_secret(&stale, None, "KEY", None).unwrap();
+        assert_eq!(value, "latest");
+        assert_eq!(meta.allowed_hosts, ["other.example"]);
+    }
+
+    #[test]
+    fn epoch_changes_for_key_policy_and_ciphertext_and_wrong_key_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.set(args("A", "first")).unwrap();
+        let first = vault.verified_snapshot("A").unwrap().record_epoch;
+        assert_eq!(first, vault.verified_snapshot("A").unwrap().record_epoch);
+        vault.set(args("A", "second")).unwrap();
+        let second = vault.verified_snapshot("A").unwrap().record_epoch;
+        assert_ne!(first, second);
+        let mut changed = args("A", "second");
+        changed.allowed_hosts.push("other.example".into());
+        vault.set(changed).unwrap();
+        assert_ne!(second, vault.verified_snapshot("A").unwrap().record_epoch);
+        assert!(matches!(
+            Vault::open(&path, [8; 32]).unwrap().verified_snapshot("A"),
+            Err(GateError::VaultTampered { .. })
+        ));
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let ciphertext = disk["secrets"]["A"]["ciphertext_b64"].as_str().unwrap();
+        let mut bytes = BASE64.decode(ciphertext).unwrap();
+        bytes[0] ^= 1;
+        disk["secrets"]["A"]["ciphertext_b64"] = BASE64.encode(bytes).into();
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("A"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_expiry_is_authenticated_before_refusal() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [9; 32]).unwrap();
+        vault.set(args("KEY", "secret")).unwrap();
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["KEY"]["metadata"]["expires_at"] = "1970-01-01T00:00:00.000Z".into();
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        assert!(matches!(
+            vault.verified_snapshot("KEY"),
+            Err(GateError::VaultTampered { .. })
+        ));
+    }
+
+    #[test]
+    fn signing_origin_is_exact_https_authority() {
+        assert_eq!(
+            normalize_signing_origin("HTTPS://EXAMPLE.COM").unwrap(),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            normalize_signing_origin("https://example.com:8443").unwrap(),
+            "https://example.com:8443"
+        );
+        assert_eq!(
+            normalize_signing_origin("https://[::1]").unwrap(),
+            "https://[::1]:443"
+        );
+        for invalid in [
+            "http://example.com",
+            "https://user@example.com",
+            "https://example.com/",
+            "https://example.com?q=1",
+            "https://example.com#x",
+            "https://example.com:0",
+            " https://example.com",
+        ] {
+            assert!(normalize_signing_origin(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn proxy_resolution_refuses_sign_usage_and_bundle_without_authority() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = Vault::open(tmp.path().join("vault.enc"), [7; 32]).unwrap();
+        let mut input = args("SIGNING", "key");
+        input.usage = SecretUsage::SignJwtRs256;
+        vault.set(input).unwrap();
+        assert!(matches!(
+            crate::adapter::resolve_vault_secret(&vault, None, "SIGNING", None),
+            Err(GateError::UsageMismatch { .. })
+        ));
+        let mut input = args("BUNDLE", "key");
+        input.bundle_required = true;
+        vault.set(input).unwrap();
+        assert!(crate::adapter::resolve_vault_secret(&vault, None, "BUNDLE", None).is_err());
+    }
+
+    #[test]
+    fn signing_usage_is_refused_and_audited_in_every_proxy_position() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = Vault::open(tmp.path().join("vault.enc"), [7; 32]).unwrap();
+        let mut input = args("SIGNING", "private-key-marker");
+        input.allowed_hosts = vec!["8.8.8.8".into()];
+        input.usage = SecretUsage::SignJwtRs256;
+        vault.set(input).unwrap();
+        for position in ["header", "query", "body"] {
+            let mut req = crate::ProxyRequest {
+                method: "POST".into(),
+                url: "https://8.8.8.8/".into(),
+                headers: BTreeMap::new(),
+                body: None,
+                caller_agent: None,
+                timeout_secs: None,
+            };
+            match position {
+                "header" => {
+                    req.headers
+                        .insert("authorization".into(), "{{FERROGATE:SIGNING}}".into());
+                }
+                "query" => req.url.push_str("?key={{FERROGATE:SIGNING}}"),
+                _ => req.body = Some("{{FERROGATE:SIGNING}}".into()),
+            }
+            assert!(
+                matches!(
+                    crate::prepare_proxied_request(&vault, &req),
+                    Err(GateError::UsageMismatch { .. })
+                ),
+                "{position}"
+            );
+        }
+        let audit = fs::read_to_string(tmp.path().join("gate-audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("denied:usage_mismatch").count(), 3);
+        assert!(!audit.contains("private-key-marker"));
+    }
+
+    #[test]
+    fn signing_usage_and_binding_are_authenticated_and_epoch_rotates() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [7; 32]).unwrap();
+        let mut input = args("SIGNING", "first-key");
+        input.usage = SecretUsage::SignJwtRs256;
+        input.app_binding = Some(AppBinding {
+            issuer: "123".into(),
+            origin: "https://api.github.com:443".into(),
+        });
+        vault.set(input.clone()).unwrap();
+        let first = vault.verified_snapshot("SIGNING").unwrap();
+        vault.set(input).unwrap();
+        let second = vault.verified_snapshot("SIGNING").unwrap();
+        assert_ne!(first.record_epoch, second.record_epoch);
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk["secrets"]["SIGNING"]["metadata"]["usage"] = serde_json::json!("proxy");
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        let reopened = Vault::open(&path, [7; 32]).unwrap();
+        assert!(matches!(
+            reopened.verified_snapshot("SIGNING"),
+            Err(GateError::VaultTampered { .. })
+        ));
     }
 
     #[test]

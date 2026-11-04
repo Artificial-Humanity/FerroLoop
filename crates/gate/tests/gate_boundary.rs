@@ -466,6 +466,7 @@ fn key_pair(pem: &str) -> RsaKeyPair {
 fn sign_secret(pem: &str) -> SetSecretArgs {
     SetSecretArgs {
         name: "GITHUB_APP_KEY".into(),
+        usage: fl_gate::SecretUsage::SignJwtRs256,
         value: pem.into(),
         allowed_hosts: vec![HOST.into()],
         allowed_agents: vec!["ferris".into()],
@@ -525,7 +526,7 @@ fn sign_app_jwt_returns_a_jwt_that_verifies_and_matches_the_github_app_shape() {
                 .expect("the signature verifies against the throwaway public key");
 
             let e = f.last_audit();
-            assert_eq!(e["outcome"], "allowed");
+            assert_eq!(e["outcome"], "allowed:binding-absent");
             assert_eq!(e["method"], SIGN_AUDIT_METHOD);
             assert_eq!(e["host"], HOST);
             assert_eq!(e["caller"], "ferris");
@@ -780,7 +781,11 @@ fn caller_text_cannot_forge_or_split_an_audit_line_on_the_sign_path() {
             .unwrap();
     }
     let entries = assert_audit_is_clean(&g, callers.len());
-    assert!(entries.iter().all(|e| e["outcome"] == "allowed"));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e["outcome"] == "allowed:binding-absent")
+    );
 }
 
 #[test]

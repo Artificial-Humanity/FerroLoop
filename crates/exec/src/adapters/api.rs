@@ -50,18 +50,28 @@ const BYTES_PER_PROMPT_TOKEN: u64 = 3;
 /// Tokens added to the prompt estimate for the request's own framing.
 const PROMPT_OVERHEAD_TOKENS: u64 = 32;
 
-/// Gives the API key for a vendor, or `None` when there is none. It is called once per attempt,
-/// so a Vault-backed resolver reads the secret as late as possible.
-pub type ApiKeyResolver = Arc<dyn Fn(&VendorDescriptor) -> Option<String> + Send + Sync>;
+/// A typed refusal prevents an incompatible Vault secret from being reported as merely absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ApiKeyError {
+    #[error("the configured Vault secret has an incompatible usage class")]
+    UsageMismatch,
+}
+
+/// Gives the API key for a vendor, `None` when absent, or a typed policy refusal. It is called
+/// once per attempt, so a Vault-backed resolver reads the secret as late as possible.
+pub type ApiKeyResolver =
+    Arc<dyn Fn(&VendorDescriptor) -> Result<Option<String>, ApiKeyError> + Send + Sync>;
 
 /// A resolver that reads the vendor's `env_key_name` from the process environment.
 pub fn env_key_resolver() -> ApiKeyResolver {
-    Arc::new(|d: &VendorDescriptor| match &d.transport {
-        VendorTransport::HttpApi {
-            env_key_name: Some(name),
-            ..
-        } => std::env::var(name).ok().filter(|k| !k.trim().is_empty()),
-        _ => None,
+    Arc::new(|d: &VendorDescriptor| {
+        Ok(match &d.transport {
+            VendorTransport::HttpApi {
+                env_key_name: Some(name),
+                ..
+            } => std::env::var(name).ok().filter(|k| !k.trim().is_empty()),
+            _ => None,
+        })
     })
 }
 
@@ -244,7 +254,13 @@ impl HttpApiAdapter {
         let needs_key = self.descriptor.transport.needs_api_key();
         let api_key = if needs_key {
             match (self.key_resolver)(&self.descriptor) {
-                Some(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+                Ok(Some(k)) if !k.trim().is_empty() => Some(k.trim().to_string()),
+                Err(e) => {
+                    return refuse(
+                        &mut hb,
+                        format!("API key refused for `{}`: {e}", self.descriptor.id),
+                    );
+                }
                 _ => {
                     return refuse(
                         &mut hb,
@@ -821,7 +837,7 @@ mod tests {
     const KEY: &str = "test-key-AAAA";
 
     fn key() -> ApiKeyResolver {
-        Arc::new(|_| Some(KEY.to_string()))
+        Arc::new(|_| Ok(Some(KEY.to_string())))
     }
 
     fn card() -> Option<RateCard> {
@@ -1119,11 +1135,19 @@ mod tests {
             );
         };
         // No key.
-        let a = adapter("kimi-api", &mock).with_key_resolver(Arc::new(|_| None));
+        let a = adapter("kimi-api", &mock).with_key_resolver(Arc::new(|_| Ok(None)));
         let out = a.attempt(spec(dir.path(), 1_000_000)).await.unwrap();
         refused(&out, "MOONSHOT_API_KEY");
+        // An incompatible Vault usage remains a distinct refusal and sends nothing.
+        let a = adapter("kimi-api", &mock)
+            .with_key_resolver(Arc::new(|_| Err(ApiKeyError::UsageMismatch)));
+        refused(
+            &a.attempt(spec(dir.path(), 1_000_000)).await.unwrap(),
+            "incompatible usage class",
+        );
+        assert!(mock.requests().is_empty());
         // A blank key is no key.
-        let a = adapter("kimi-api", &mock).with_key_resolver(Arc::new(|_| Some("  ".into())));
+        let a = adapter("kimi-api", &mock).with_key_resolver(Arc::new(|_| Ok(Some("  ".into()))));
         refused(
             &a.attempt(spec(dir.path(), 1_000_000)).await.unwrap(),
             "no API key",
@@ -1167,7 +1191,7 @@ mod tests {
         }
         let a = HttpApiAdapter::new(kimi)
             .unwrap()
-            .with_key_resolver(Arc::new(|_| Some("super-secret-key".into())));
+            .with_key_resolver(Arc::new(|_| Ok(Some("super-secret-key".into()))));
         assert!(!format!("{a:?}").contains("super-secret"));
         // A hand-built descriptor with a remote plain-http default is refused by `new` itself.
         let mut remote = lookup_vendor("kimi-api").unwrap();
