@@ -448,6 +448,61 @@ fn transcript_response_reference(
     .body
 }
 
+#[cfg(unix)]
+#[test]
+fn transcript_quota_does_not_assign_unbound_codex_account_to_route() {
+    use base64::Engine as _;
+    use fl_core::At;
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 1);
+    let auth_dir = tmp.path().join(".codex");
+    fs::create_dir_all(&auth_dir).unwrap();
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}).to_string());
+    fs::write(
+        auth_dir.join("auth.json"),
+        json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+    )
+    .unwrap();
+    let mut routes = RouteTable::default();
+    routes.upsert(
+        "ada",
+        VendorRoute::Codex {
+            thread_id: "known-codex".into(),
+            cwd: None,
+        },
+        At::from_unix_millis(1),
+    );
+    routes.upsert(
+        "bob",
+        VendorRoute::Grok {
+            session_id: "known-grok".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        },
+        At::from_unix_millis(1),
+    );
+    let path = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    routes.save(Some(&path)).unwrap();
+    let codex = get(&state, "/api/v1/sessions/known-codex/transcript")
+        .0
+        .json_value()
+        .unwrap();
+    assert!(codex["quota_usage"].is_null());
+    let unknown = get(&state, "/api/v1/sessions/unknown/transcript")
+        .0
+        .json_value()
+        .unwrap();
+    assert!(unknown["quota_usage"].is_null());
+    let grok = get(&state, "/api/v1/sessions/known-grok/transcript")
+        .0
+        .json_value()
+        .unwrap();
+    assert!(grok["quota_usage"].is_null());
+}
+
 #[test]
 fn the_transcript_endpoint_scans_once_parses_once_and_answers_byte_for_byte_the_same() {
     let tmp = TempDir::new().unwrap();

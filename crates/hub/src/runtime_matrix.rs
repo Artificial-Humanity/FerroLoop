@@ -18,7 +18,8 @@
 //!
 //! The quota reads are the slow part (each cold read may run a CLI or a network call), so they have
 //! a wall-clock budget of their own ([`QUOTA_BUDGET`]): a vendor that is not read in time is left
-//! out of `vendor_quotas`, and every reading is kept for 30 s ([`QuotaCache`]).
+//! out of `vendor_quotas`. Non-Codex readings are kept for 30 s ([`QuotaCache`]); Codex
+//! account tier reads bypass the cache so credential changes are reflected immediately.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -44,8 +45,10 @@ use crate::api::{HttpRequest, HttpResponse};
 use crate::auth::HubAuthority;
 use crate::direct_quota::AgyQuotaTarget;
 use crate::discovery::{
-    DiscoveredSessionSummary, SessionQuotaUsage, discover_route_sessions_without_model_info,
-    quota_for_resolved_route, quota_for_resolved_route_at, snapshot_discovery_store,
+    DiscoveredSessionSummary, SessionQuotaUsage, codex_account_quota,
+    codex_session_matches_account, discover_route_sessions_without_model_info,
+    normalize_codex_plan, quota_for_resolved_route, quota_for_resolved_route_at,
+    snapshot_discovery_store,
 };
 use crate::runtime_update::update_command;
 
@@ -380,7 +383,11 @@ fn host_session_quota(
 /// The account probe `GET /api/v1/watch/balance` uses: no session, so no route, model or
 /// conversation id.
 fn host_account_quota(adapter: &str, home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
-    quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+    if adapter == "codex" {
+        codex_account_quota(home_override)
+    } else {
+        quota_for_resolved_route_at(adapter, None, home_override, &AgyQuotaTarget::default())
+    }
 }
 
 /// Route sessions per adapter whose allowance is read from disk, newest first. Bounds the cost
@@ -412,6 +419,10 @@ fn quota_richness(q: &SessionQuotaUsage, now_ms: u64) -> usize {
 fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage> {
     let home = inputs.home_override.as_deref();
     let now_ms = inputs.now_ms;
+    let codex_account = (adapter == "codex")
+        .then(|| (inputs.quota_source.account)(adapter, home))
+        .flatten()
+        .filter(|q| quota_richness(q, now_ms) > 0);
     let mut sessions: Vec<&DiscoveredSessionSummary> = inputs
         .sessions
         .iter()
@@ -422,6 +433,9 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
     let mut reads_left = MAX_QUOTA_SESSIONS_PER_ADAPTER;
     let mut best: Option<(usize, SessionQuotaUsage)> = None;
     for session in sessions {
+        if codex_account.is_some() && !codex_session_matches_account(session, home) {
+            continue;
+        }
         let reading = match &session.quota_usage {
             Some(q) => Some(q.clone()),
             None if session.source == "route" && reads_left > 0 => {
@@ -431,13 +445,27 @@ fn vendor_quota(adapter: &str, inputs: &QuotaInputs) -> Option<SessionQuotaUsage
             None => None,
         };
         let Some(reading) = reading else { continue };
+        if let Some(account) = &codex_account {
+            let matching_tier = account
+                .tier
+                .as_deref()
+                .zip(reading.tier.as_deref())
+                .is_some_and(|(a, b)| normalize_codex_plan(a) == normalize_codex_plan(b));
+            if !matching_tier {
+                continue;
+            }
+        }
         let richness = quota_richness(&reading, now_ms);
         if richness > 0 && best.as_ref().is_none_or(|(r, _)| richness > *r) {
             best = Some((richness, reading));
         }
     }
-    best.map(|(_, q)| q).or_else(|| {
-        (inputs.quota_source.account)(adapter, home).filter(|q| quota_richness(q, now_ms) > 0)
+    // Without an auth reading this is session evidence, not proof of the current account.
+    best.map(|(_, q)| q).or(codex_account).or_else(|| {
+        (adapter != "codex")
+            .then(|| (inputs.quota_source.account)(adapter, home))
+            .flatten()
+            .filter(|q| quota_richness(q, now_ms) > 0)
     })
 }
 
@@ -481,9 +509,11 @@ fn start_vendor_quotas(clis: &[&'static str], inputs: &ProbeInputs) -> PendingQu
     let mut pending = 0usize;
     for cli in clis {
         let adapter = quota_adapter(cli);
-        if let Some(cached) = inputs
-            .quota_cache
-            .get(&inputs.home_override, adapter, inputs.now_ms)
+        if adapter != "codex"
+            && let Some(cached) =
+                inputs
+                    .quota_cache
+                    .get(&inputs.home_override, adapter, inputs.now_ms)
         {
             if let Some(q) = cached {
                 quotas.insert(adapter.to_string(), q);
@@ -510,7 +540,9 @@ fn start_vendor_quotas(clis: &[&'static str], inputs: &ProbeInputs) -> PendingQu
                     vendor_quota(adapter, &read_inputs)
                 }))
                 .ok();
-                if let Some(reading) = &reading {
+                if adapter != "codex"
+                    && let Some(reading) = &reading
+                {
                     cache.put(
                         &read_inputs.home_override,
                         adapter,
@@ -2158,21 +2190,21 @@ mod tests {
         let mut inp = inputs("", None);
         inp.sessions = vec![
             quota_session(
-                "codex",
+                "claude",
                 "older",
                 "2026-11-01T10:00:00Z",
                 Some(quota(None, Some(90.0), None)),
             ),
             quota_session(
-                "codex",
+                "claude",
                 "newer",
                 "2026-11-02T10:00:00Z",
                 Some(quota(None, Some(12.0), None)),
             ),
         ];
-        let m = only_cli(&inp, "codex");
+        let m = only_cli(&inp, "claude");
         assert_eq!(
-            m.vendor_quotas["codex"]
+            m.vendor_quotas["claude"]
                 .primary_window
                 .as_ref()
                 .unwrap()
@@ -2364,22 +2396,27 @@ mod tests {
             exhausted_reason: None,
         };
         inp.sessions = vec![
-            quota_session("codex", "old", "2026-10-01T10:00:00Z", Some(stale_but_rich)),
             quota_session(
-                "codex",
+                "claude",
+                "old",
+                "2026-10-01T10:00:00Z",
+                Some(stale_but_rich),
+            ),
+            quota_session(
+                "claude",
                 "new",
                 "2026-11-02T10:00:00Z",
                 Some(quota(None, Some(12.0), None)),
             ),
         ];
-        let m = only_cli(&inp, "codex");
-        let codex = &m.vendor_quotas["codex"];
-        assert_eq!(codex.primary_window.as_ref().unwrap().used_percent, 12.0);
+        let m = only_cli(&inp, "claude");
+        let claude = &m.vendor_quotas["claude"];
+        assert_eq!(claude.primary_window.as_ref().unwrap().used_percent, 12.0);
 
         // A reading that is stale all through is not a quota: the account probe is asked instead.
         inp.sessions.truncate(1);
         inp.quota_cache = Arc::default();
-        let m = only_cli(&inp, "codex");
+        let m = only_cli(&inp, "claude");
         assert!(m.vendor_quotas.is_empty(), "{:?}", m.vendor_quotas);
     }
 
@@ -2390,7 +2427,7 @@ mod tests {
         inp.quota_source = QuotaSource {
             session: |_, _| None,
             account: |adapter, _| {
-                if adapter == "codex" {
+                if adapter == "grok" {
                     std::thread::sleep(Duration::from_millis(1500));
                 }
                 Some(quota(Some("pro"), Some(1.0), None))
@@ -2405,21 +2442,21 @@ mod tests {
         );
         assert_eq!(
             m.vendor_quotas.keys().collect::<Vec<_>>(),
-            ["antigravity", "claude", "grok", "muse"]
+            ["antigravity", "claude", "codex", "muse"]
         );
         assert_eq!(m.cli_runtimes.len(), CLI_RUNTIMES.len());
         // The slow read finishes on its own and is kept for the next request.
         let late = (0..100).any(|_| {
             std::thread::sleep(Duration::from_millis(50));
             inp.quota_cache
-                .get(&inp.home_override, "codex", inp.now_ms)
+                .get(&inp.home_override, "grok", inp.now_ms)
                 .is_some()
         });
         assert!(late, "the late reading never reached the cache");
         let began = Instant::now();
         let again = build_matrix(&inp, Some("cli")).unwrap();
         assert!(began.elapsed() < Duration::from_millis(1000));
-        assert!(again.vendor_quotas.contains_key("codex"));
+        assert!(again.vendor_quotas.contains_key("grok"));
     }
 
     #[test]

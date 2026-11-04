@@ -2091,6 +2091,11 @@ fn parse_reset_instant_from_reason(reason: &str) -> Option<u64> {
 fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindowUsage> {
     let value = value?;
     let used_percent = json_f64(value.get("used_percent"))?;
+    let window_minutes = value
+        .get("window_minutes")
+        .and_then(Value::as_u64)
+        .filter(|minutes| *minutes > 0)
+        .unwrap_or(window_minutes);
     let resets_at_ms = value.get("resets_at").and_then(|raw| {
         raw.as_i64()
             .or_else(|| raw.as_u64().map(|n| n as i64))
@@ -2105,14 +2110,260 @@ fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindo
     })
 }
 
-/// Codex reports the ChatGPT Plus plan as `prolite`. Show it as `plus`.
-fn normalize_codex_plan(plan: &str) -> String {
+/// Normalize Codex's legacy plan spelling for display.
+pub(crate) fn normalize_codex_plan(plan: &str) -> String {
     let key = plan.trim().to_ascii_lowercase();
     if matches!(key.as_str(), "prolite" | "pro_lite" | "pro-lite") {
-        "plus".to_owned()
+        "pro".to_owned()
     } else {
         plan.to_owned()
     }
+}
+
+fn codex_auth_path(
+    home_override: Option<&Path>,
+    codex_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(home) = home_override {
+        let base = fs::canonicalize(home).ok()?;
+        let dir = fs::canonicalize(base.join(".codex")).ok()?;
+        if !dir.starts_with(&base) {
+            return None;
+        }
+        Some(dir.join("auth.json"))
+    } else if let Some(configured) = codex_home.filter(|s| !s.is_empty()) {
+        let dir = PathBuf::from(configured);
+        if !dir.is_absolute() {
+            return None;
+        }
+        Some(dir.join("auth.json"))
+    } else {
+        let home = PathBuf::from(home?);
+        home.is_absolute().then(|| home.join(".codex/auth.json"))
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_CODEX_AUTH_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+/// Open the sandbox's Codex credentials without following a replaced path component.
+#[cfg(unix)]
+fn open_sandboxed_codex_auth(home: &Path) -> Option<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let canonical_home = fs::canonicalize(home).ok()?;
+    let root_name = CString::new("/").ok()?;
+    // SAFETY: root_name is a valid C string; ownership of a successful fd is transferred to File.
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return None;
+    }
+    // SAFETY: root_fd is a fresh successful descriptor.
+    let mut dir = unsafe { fs::File::from_raw_fd(root_fd) };
+    for component in canonical_home.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => CString::new(name.as_bytes()).ok()?,
+            _ => return None,
+        };
+        // SAFETY: dir owns a live directory fd and name is NUL terminated.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: fd is fresh and ownership is transferred once.
+        dir = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    let codex = CString::new(".codex").ok()?;
+    // SAFETY: dir owns a live directory fd and codex is a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            codex.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is fresh and ownership is transferred once.
+    let codex_dir = unsafe { fs::File::from_raw_fd(fd) };
+    #[cfg(test)]
+    BEFORE_CODEX_AUTH_OPEN.with(|hook| {
+        if let Some(f) = hook.borrow_mut().take() {
+            f();
+        }
+    });
+    let auth = CString::new("auth.json").ok()?;
+    // SAFETY: codex_dir is a live directory fd and auth is a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            codex_dir.as_raw_fd(),
+            auth.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: fd is fresh and ownership is transferred once.
+    Some(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_sandboxed_codex_auth(_home: &Path) -> Option<fs::File> {
+    // Without descriptor-anchored traversal, an override cannot be safely confined.
+    None
+}
+
+/// Read only the plan claim from Codex's current account file. The token is never returned
+/// or included in an error. A home override is hermetic and ignores ambient CODEX_HOME.
+fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+
+    const MAX_AUTH_BYTES: u64 = 256 * 1024;
+    let file = if let Some(home) = home_override {
+        open_sandboxed_codex_auth(home)?
+    } else {
+        let path = codex_auth_path(
+            None,
+            std::env::var_os("CODEX_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        #[cfg(not(any(unix, windows)))]
+        if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+            return None;
+        }
+        options.open(path).ok()?
+    };
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_AUTH_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTH_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_AUTH_BYTES {
+        return None;
+    }
+    let auth: Value = serde_json::from_slice(&bytes).ok()?;
+    let token = auth.pointer("/tokens/id_token")?.as_str()?;
+    let mut segments = token.split('.');
+    let _header = segments.next()?;
+    let payload = segments.next()?;
+    let _signature = segments.next()?;
+    if segments.next().is_some() || payload.is_empty() {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    let plan = claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_plan_type")?
+        .as_str()?
+        .trim();
+    if plan.is_empty()
+        || plan.len() > 64
+        || !plan
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(normalize_codex_plan(plan))
+}
+
+/// Home binding prevents mixing different credential directories. It cannot prove that
+/// a rollout belongs to the current account after a same-tier account switch in place.
+pub(crate) fn codex_session_matches_account(
+    session: &DiscoveredSessionSummary,
+    home_override: Option<&Path>,
+) -> bool {
+    let home = match home_override {
+        Some(home) => home.to_path_buf(),
+        None => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home),
+            None => return false,
+        },
+    };
+    if !home.is_absolute() {
+        return false;
+    }
+    let Ok(home) = fs::canonicalize(home) else {
+        return false;
+    };
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions");
+    if fs::symlink_metadata(&codex)
+        .ok()
+        .is_none_or(|m| m.file_type().is_symlink())
+        || fs::symlink_metadata(&sessions)
+            .ok()
+            .is_none_or(|m| m.file_type().is_symlink())
+    {
+        return false;
+    }
+    let Some(transcript) = session.transcript_path.as_deref() else {
+        return false;
+    };
+    let (Ok(root), Ok(path)) = (fs::canonicalize(&sessions), fs::canonicalize(transcript)) else {
+        return false;
+    };
+    if !root.starts_with(&home) || !path.starts_with(&root) {
+        return false;
+    }
+    let account_dir = match home_override {
+        Some(_) => codex.clone(),
+        None => std::env::var_os("CODEX_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| codex.clone()),
+    };
+    matches!((fs::canonicalize(codex), fs::canonicalize(account_dir)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// An account-level probe is not attached to a session and uses the configured
+/// account home. It must not be merged into a session whose home is unknown.
+pub(crate) fn codex_account_quota(home_override: Option<&Path>) -> Option<SessionQuotaUsage> {
+    Some(SessionQuotaUsage {
+        tier: Some(codex_auth_plan(home_override)?),
+        primary_window: None,
+        secondary_window: None,
+        exhausted_reason: None,
+    })
 }
 
 fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
@@ -2149,8 +2400,16 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let primary_window = codex_window(limits.get("primary"), 300);
-        let secondary_window = codex_window(limits.get("secondary"), 10_080);
+        let mut primary_window = codex_window(limits.get("primary"), 300);
+        let mut secondary_window = codex_window(limits.get("secondary"), 10_080);
+        if secondary_window.is_none()
+            && primary_window
+                .as_ref()
+                .and_then(|window| window.window_minutes)
+                .is_some_and(|minutes| minutes >= 1440)
+        {
+            secondary_window = primary_window.take();
+        }
         if tier.is_none()
             && exhausted_reason.is_none()
             && primary_window.is_none()
@@ -2174,7 +2433,7 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         QUOTA_LOG_TAIL_BYTES,
     )
     .ok()?;
-    let mut latest = None;
+    let mut latest: Option<SessionQuotaUsage> = None;
     for line in raw.lines() {
         let trimmed = line.trim();
         if !trimmed.contains("billing: fetched credits config") {
@@ -2211,12 +2470,18 @@ fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
         if tier.is_none() && secondary_window.is_none() {
             continue;
         }
-        latest = Some(SessionQuotaUsage {
-            tier,
+        let quota = latest.get_or_insert(SessionQuotaUsage {
+            tier: None,
             primary_window: None,
-            secondary_window,
+            secondary_window: None,
             exhausted_reason: None,
         });
+        if tier.is_some() {
+            quota.tier = tier;
+        }
+        if secondary_window.is_some() {
+            quota.secondary_window = secondary_window;
+        }
     }
     latest
 }
@@ -2755,10 +3020,11 @@ fn quota_for_resolved_route_locked(
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     match adapter {
-        "codex" => {
-            let path = transcript_path?;
-            codex_quota_from_rollout(files.raw(path)?)
-        }
+        // Rollouts lack a stable account identifier. Keep their historical quota
+        // separate from the credentials that happen to occupy the same home now.
+        "codex" => transcript_path
+            .and_then(|path| files.raw(path))
+            .and_then(codex_quota_from_rollout),
         "grok" => {
             transcript_path?;
             let home = home?;
@@ -8706,9 +8972,56 @@ mod tests {
     }
 
     #[test]
-    fn codex_prolite_plan_is_shown_as_plus() {
+    fn codex_reported_window_durations_and_weekly_primary() {
+        let rollout = |primary: Value, secondary: Value| {
+            serde_json::json!({"type":"event_msg", "payload": {"type":"token_count", "rate_limits": {
+                "plan_type":"prolite", "primary":primary, "secondary":secondary
+            }}}).to_string()
+        };
+        let weekly =
+            serde_json::json!({"used_percent":26.0,"window_minutes":10080,"resets_at":1700000000});
+        let quota = codex_quota_from_rollout(&rollout(weekly.clone(), Value::Null)).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert!(quota.primary_window.is_none());
+        let window = quota.secondary_window.unwrap();
+        assert_eq!(window.used_percent, 26.0);
+        assert_eq!(window.window_minutes, Some(10080));
+        assert_eq!(window.resets_at_ms, Some(1700000000000));
+
+        let quota = codex_quota_from_rollout(&rollout(
+            serde_json::json!({"used_percent":3.0,"window_minutes":1440}),
+            weekly,
+        ))
+        .unwrap();
+        assert_eq!(quota.primary_window.unwrap().window_minutes, Some(1440));
+        assert_eq!(quota.secondary_window.unwrap().window_minutes, Some(10080));
+
+        for invalid in [
+            Value::Null,
+            serde_json::json!(0),
+            serde_json::json!("10080"),
+            serde_json::json!(-1),
+        ] {
+            let quota = codex_quota_from_rollout(&rollout(
+                serde_json::json!({"used_percent":4.0,"window_minutes":invalid}),
+                Value::Null,
+            ))
+            .unwrap();
+            assert_eq!(quota.primary_window.unwrap().window_minutes, Some(300));
+            assert!(quota.secondary_window.is_none());
+        }
+        let quota = codex_quota_from_rollout(&rollout(
+            serde_json::json!({"used_percent":4.0}),
+            Value::Null,
+        ))
+        .unwrap();
+        assert_eq!(quota.primary_window.unwrap().window_minutes, Some(300));
+    }
+
+    #[test]
+    fn codex_prolite_plan_is_shown_as_pro() {
         for raw in ["prolite", "ProLite", "pro_lite", "PRO-LITE"] {
-            assert_eq!(normalize_codex_plan(raw), "plus", "{raw}");
+            assert_eq!(normalize_codex_plan(raw), "pro", "{raw}");
         }
         for raw in ["pro", "plus", "free", "team"] {
             assert_eq!(normalize_codex_plan(raw), raw);
@@ -8729,7 +9042,345 @@ mod tests {
         })
         .to_string();
         let quota = codex_quota_from_rollout(&format!("{rollout}\n")).expect("rollout quota");
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_override_directory_swap_never_reads_outside_home() {
+        use base64::Engine as _;
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dir = home.path().join(".codex");
+        fs::create_dir(&dir).unwrap();
+        let make_auth = |plan: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string()
+        };
+        fs::write(dir.join("auth.json"), make_auth("plus")).unwrap();
+        fs::write(outside.path().join("auth.json"), make_auth("enterprise")).unwrap();
+        let original = dir.clone();
+        let parked = home.path().join("old-codex");
+        let target = outside.path().to_owned();
+        BEFORE_CODEX_AUTH_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&original, &parked).unwrap();
+                symlink(&target, &original).unwrap();
+            }))
+        });
+        assert_ne!(
+            codex_auth_plan(Some(home.path())).as_deref(),
+            Some("enterprise")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_session_and_matrix_account_use_their_own_homes() {
+        use base64::Engine as _;
+        const CHILD: &str = "FL_TEST_CODEX_HOME_BINDING_CHILD";
+        if let Ok(rollout) = std::env::var(CHILD) {
+            let session = DiscoveredSessionSummary {
+                id: "bound".into(),
+                source: "route".into(),
+                adapter: "codex".into(),
+                persona: None,
+                status: "active".into(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: Some(rollout),
+                quota_usage: None,
+                model: None,
+                thinking_level: None,
+                available_models: vec![],
+                context_usage: None,
+                execution_mode: None,
+            };
+            let source = crate::runtime_matrix::QuotaSource::HOST;
+            let quota = (source.session)(&session, None).unwrap();
+            assert_eq!(quota.tier.as_deref(), Some("free"));
+            assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+            assert_eq!(
+                (source.account)("codex", None).unwrap().tier.as_deref(),
+                Some("enterprise")
+            );
+            return;
+        }
+        let account_a = TempDir::new().unwrap();
+        let account_b = TempDir::new().unwrap();
+        for (home, plan) in [(account_a.path(), "plus"), (account_b.path(), "enterprise")] {
+            fs::create_dir_all(home.join(".codex")).unwrap();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            fs::write(
+                home.join(".codex/auth.json"),
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+        }
+        let rollout = write_codex_rollout(account_a.path(), "bound", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"free","primary":{"used_percent":7.0}}}}).to_string());
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::tests::codex_session_and_matrix_account_use_their_own_homes",
+            ])
+            .env(CHILD, rollout)
+            .env("HOME", account_a.path())
+            .env("CODEX_HOME", account_b.path().join(".codex"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_session_never_uses_auth_from_an_unrelated_home() {
+        use base64::Engine as _;
+        let account_a = TempDir::new().unwrap();
+        let account_b = TempDir::new().unwrap();
+        for (home, plan) in [(account_a.path(), "plus"), (account_b.path(), "pro")] {
+            fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}})
+                    .to_string(),
+            );
+            fs::write(
+                home.join(".codex/auth.json"),
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+        }
+        let id = "foreign-session";
+        let rollout = account_b
+            .path()
+            .join(".codex/sessions/foreign-session.jsonl");
+        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"pro","primary":{"used_percent":7.0}}}}).to_string()).unwrap();
+        let quota = quota_for_resolved_route("codex", rollout.to_str(), Some(account_a.path()), id)
+            .unwrap();
+        assert_eq!(
+            quota.tier.as_deref(),
+            Some("pro"),
+            "unrelated A auth must not override B rollout"
+        );
+        assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+        assert!(
+            quota_for_resolved_route("codex", None, Some(account_a.path()), id).is_none(),
+            "an unbound route must not inherit a plan"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_rollout_quota_does_not_inherit_current_auth_plan() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let codex = home.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let claims =
+            serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        fs::write(codex.join("auth.json"), serde_json::json!({"tokens": {"id_token": format!("e30.{payload}.signature"), "access_token": "secret-token"}}).to_string()).unwrap();
+        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()));
+        let quota =
+            quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s").unwrap();
         assert_eq!(quota.tier.as_deref(), Some("plus"));
+        assert!(
+            !serde_json::to_string(&quota)
+                .unwrap()
+                .contains("secret-token")
+        );
+        assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_invalid_or_missing_falls_back_and_rotation_is_live() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+        let rollout = PathBuf::from(write_codex_rollout(home.path(), "bound-session", &serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus"}}}).to_string()));
+        let tier = || {
+            quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s")
+                .unwrap()
+                .tier
+                .unwrap()
+        };
+        assert_eq!(tier(), "plus");
+        for invalid in [
+            "not json",
+            "{}",
+            "{\"tokens\":{\"id_token\":\"e30.!!!.sig\"}}",
+        ] {
+            fs::write(&auth, invalid).unwrap();
+            assert_eq!(tier(), "plus");
+        }
+        fs::write(&auth, vec![b'x'; 256 * 1024 + 1]).unwrap();
+        assert_eq!(tier(), "plus");
+        for (plan, expected) in [("prolite", "pro"), ("team", "team")] {
+            let claims =
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}});
+            let payload =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+            fs::write(
+                &auth,
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(tier(), "plus");
+            assert_eq!(
+                codex_auth_plan(Some(home.path())).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_by_id_rollout_and_account_quota_stay_separate() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let id = "abc123";
+        let event = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":3.0}}}});
+        write_codex_rollout(home.path(), id, &event.to_string());
+        let claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        fs::write(
+            home.path().join(".codex/auth.json"),
+            serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+        )
+        .unwrap();
+        let quota = read_session_quota_usage_with_home(id, Some(home.path())).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("plus"));
+        assert_eq!(quota.primary_window.unwrap().used_percent, 3.0);
+        let account = codex_account_quota(Some(home.path())).unwrap();
+        assert_eq!(account.tier.as_deref(), Some("pro"));
+        assert!(account.primary_window.is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn sandboxed_auth_without_anchored_open_fails_closed() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_fifo_is_refused_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let home = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        let path = home.path().join(".codex/auth.json");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path, owned for this call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (send, recv) = std::sync::mpsc::channel();
+        let root = home.path().to_path_buf();
+        std::thread::spawn(move || send.send(codex_auth_plan(Some(&root))).unwrap());
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_auth_path_honors_explicit_home_and_isolates_overrides() {
+        use std::ffi::OsStr;
+        let home = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        let configured = other.path().as_os_str();
+        assert_eq!(
+            codex_auth_path(None, Some(configured), Some(home.path().as_os_str())),
+            Some(other.path().join("auth.json"))
+        );
+        assert_eq!(
+            codex_auth_path(None, None, Some(home.path().as_os_str())),
+            Some(home.path().join(".codex/auth.json"))
+        );
+        assert!(
+            codex_auth_path(
+                None,
+                Some(OsStr::new("relative")),
+                Some(home.path().as_os_str())
+            )
+            .is_none()
+        );
+        assert!(codex_auth_path(None, None, Some(OsStr::new("relative"))).is_none());
+        assert_eq!(
+            codex_auth_path(Some(home.path()), Some(configured), None),
+            Some(home.path().join(".codex/auth.json"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_does_not_follow_symlink_or_escape_sandbox() {
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), home.path().join(".codex")).unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
+        fs::remove_file(home.path().join(".codex")).unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        fs::write(outside.path().join("auth.json"), "{}").unwrap();
+        symlink(
+            outside.path().join("auth.json"),
+            home.path().join(".codex/auth.json"),
+        )
+        .unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
+    }
+
+    #[test]
+    fn grok_retains_latest_weekly_usage_across_partial_billing_entries() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join(".grok/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("unified.jsonl");
+        let first = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "subscriptionTier":"SUPERGROK", "config":{"creditUsagePercent":100.0,
+            "billingPeriodEnd":"2026-12-01T00:00:00Z"}}});
+        let unrelated = serde_json::json!({"msg":"other billing: fetched credits config", "ctx":{
+            "config":{"creditUsagePercent":0.0}}});
+        let partial = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "subscriptionTier":"SUPERGROK", "config":{"onDemandCap":10}}});
+        fs::write(&path, format!("{first}\n{unrelated}\n{partial}\n")).unwrap();
+        let quota = grok_quota_from_home(tmp.path()).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("SUPERGROK"));
+        assert_eq!(quota.secondary_window.unwrap().used_percent, 100.0);
+
+        let newer = serde_json::json!({"msg":"billing: fetched credits config", "ctx":{
+            "config":{"creditUsagePercent":34.0}}});
+        fs::write(&path, format!("{first}\n{unrelated}\n{partial}\n{newer}\n")).unwrap();
+        let quota = grok_quota_from_home(tmp.path()).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("SUPERGROK"));
+        assert_eq!(quota.secondary_window.unwrap().used_percent, 34.0);
+
+        fs::write(&path, format!("{partial}\n")).unwrap();
+        assert!(
+            grok_quota_from_home(tmp.path())
+                .unwrap()
+                .secondary_window
+                .is_none()
+        );
     }
 
     #[test]
@@ -8871,8 +9522,9 @@ mod tests {
             }
         });
         fs::write(&rollout, format!("{event}\n")).unwrap();
-        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None, "s")
-            .expect("resolved codex path");
+        let codex =
+            quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), Some(home), "s")
+                .expect("resolved codex path");
         assert_eq!(codex.tier.as_deref(), Some("plus"));
         assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
         assert!(quota_for_resolved_route("codex", None, Some(home), "s").is_none());
