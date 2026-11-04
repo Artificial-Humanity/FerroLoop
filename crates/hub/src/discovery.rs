@@ -2105,14 +2105,108 @@ fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindo
     })
 }
 
-/// Codex reports the ChatGPT Plus plan as `prolite`. Show it as `plus`.
+/// Normalize Codex's legacy plan spelling for display.
 fn normalize_codex_plan(plan: &str) -> String {
     let key = plan.trim().to_ascii_lowercase();
     if matches!(key.as_str(), "prolite" | "pro_lite" | "pro-lite") {
-        "plus".to_owned()
+        "pro".to_owned()
     } else {
         plan.to_owned()
     }
+}
+
+fn codex_auth_path(
+    home_override: Option<&Path>,
+    codex_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(home) = home_override {
+        let base = fs::canonicalize(home).ok()?;
+        let dir = fs::canonicalize(base.join(".codex")).ok()?;
+        if !dir.starts_with(&base) {
+            return None;
+        }
+        Some(dir.join("auth.json"))
+    } else if let Some(configured) = codex_home.filter(|s| !s.is_empty()) {
+        let dir = PathBuf::from(configured);
+        if !dir.is_absolute() {
+            return None;
+        }
+        Some(dir.join("auth.json"))
+    } else {
+        let home = PathBuf::from(home?);
+        home.is_absolute().then(|| home.join(".codex/auth.json"))
+    }
+}
+
+/// Read only the plan claim from Codex's current account file. The token is never returned
+/// or included in an error. A home override is hermetic and ignores ambient CODEX_HOME.
+fn codex_auth_plan(home_override: Option<&Path>) -> Option<String> {
+    use base64::Engine as _;
+    use std::io::Read as _;
+
+    const MAX_AUTH_BYTES: u64 = 256 * 1024;
+    let path = codex_auth_path(
+        home_override,
+        std::env::var_os("CODEX_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the reparse point itself rather than following a replaced auth.json link.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(not(any(unix, windows)))]
+    if fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_AUTH_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_AUTH_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > MAX_AUTH_BYTES {
+        return None;
+    }
+    let auth: Value = serde_json::from_slice(&bytes).ok()?;
+    let token = auth.pointer("/tokens/id_token")?.as_str()?;
+    let mut segments = token.split('.');
+    let _header = segments.next()?;
+    let payload = segments.next()?;
+    let _signature = segments.next()?;
+    if segments.next().is_some() || payload.is_empty() {
+        return None;
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    let plan = claims
+        .get("https://api.openai.com/auth")?
+        .get("chatgpt_plan_type")?
+        .as_str()?
+        .trim();
+    if plan.is_empty()
+        || plan.len() > 64
+        || !plan
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(normalize_codex_plan(plan))
 }
 
 fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
@@ -2756,8 +2850,20 @@ fn quota_for_resolved_route_locked(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     match adapter {
         "codex" => {
-            let path = transcript_path?;
-            codex_quota_from_rollout(files.raw(path)?)
+            let mut quota = transcript_path
+                .and_then(|path| files.raw(path))
+                .and_then(codex_quota_from_rollout);
+            if let Some(plan) = codex_auth_plan(home_override) {
+                quota
+                    .get_or_insert(SessionQuotaUsage {
+                        tier: None,
+                        primary_window: None,
+                        secondary_window: None,
+                        exhausted_reason: None,
+                    })
+                    .tier = Some(plan);
+            }
+            quota
         }
         "grok" => {
             transcript_path?;
@@ -8706,9 +8812,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_prolite_plan_is_shown_as_plus() {
+    fn codex_prolite_plan_is_shown_as_pro() {
         for raw in ["prolite", "ProLite", "pro_lite", "PRO-LITE"] {
-            assert_eq!(normalize_codex_plan(raw), "plus", "{raw}");
+            assert_eq!(normalize_codex_plan(raw), "pro", "{raw}");
         }
         for raw in ["pro", "plus", "free", "team"] {
             assert_eq!(normalize_codex_plan(raw), raw);
@@ -8729,7 +8835,162 @@ mod tests {
         })
         .to_string();
         let quota = codex_quota_from_rollout(&format!("{rollout}\n")).expect("rollout quota");
-        assert_eq!(quota.tier.as_deref(), Some("plus"));
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn codex_auth_plan_overrides_stale_rollout_without_changing_windows() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let codex = home.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let claims =
+            serde_json::json!({"https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        fs::write(codex.join("auth.json"), serde_json::json!({"tokens": {"id_token": format!("e30.{payload}.signature"), "access_token": "secret-token"}}).to_string()).unwrap();
+        let rollout = home.path().join("rollout.jsonl");
+        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":7.0,"resets_at":100}}}}).to_string()).unwrap();
+        let quota =
+            quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s").unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert!(
+            !serde_json::to_string(&quota)
+                .unwrap()
+                .contains("secret-token")
+        );
+        assert_eq!(quota.primary_window.unwrap().used_percent, 7.0);
+    }
+
+    #[test]
+    fn codex_auth_invalid_or_missing_falls_back_and_rotation_is_live() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let dir = home.path().join(".codex");
+        fs::create_dir_all(&dir).unwrap();
+        let auth = dir.join("auth.json");
+        let rollout = home.path().join("rollout.jsonl");
+        fs::write(&rollout, serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus"}}}).to_string()).unwrap();
+        let tier = || {
+            quota_for_resolved_route("codex", rollout.to_str(), Some(home.path()), "s")
+                .unwrap()
+                .tier
+                .unwrap()
+        };
+        assert_eq!(tier(), "plus");
+        for invalid in [
+            "not json",
+            "{}",
+            "{\"tokens\":{\"id_token\":\"e30.!!!.sig\"}}",
+        ] {
+            fs::write(&auth, invalid).unwrap();
+            assert_eq!(tier(), "plus");
+        }
+        fs::write(&auth, vec![b'x'; 256 * 1024 + 1]).unwrap();
+        assert_eq!(tier(), "plus");
+        for (plan, expected) in [("prolite", "pro"), ("team", "team")] {
+            let claims =
+                serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":plan}});
+            let payload =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+            fs::write(
+                &auth,
+                serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(tier(), expected);
+        }
+    }
+
+    #[test]
+    fn codex_auth_plan_reaches_by_id_and_account_quota() {
+        use base64::Engine;
+        let home = TempDir::new().unwrap();
+        let id = "abc123";
+        let event = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"plan_type":"plus","primary":{"used_percent":3.0}}}});
+        write_codex_rollout(home.path(), id, &event.to_string());
+        let claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        fs::write(
+            home.path().join(".codex/auth.json"),
+            serde_json::json!({"tokens":{"id_token":format!("e30.{payload}.sig")}}).to_string(),
+        )
+        .unwrap();
+        let quota = read_session_quota_usage_with_home(id, Some(home.path())).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("pro"));
+        assert_eq!(quota.primary_window.unwrap().used_percent, 3.0);
+        let account = quota_for_resolved_route("codex", None, Some(home.path()), id).unwrap();
+        assert_eq!(account.tier.as_deref(), Some("pro"));
+        assert!(account.primary_window.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_fifo_is_refused_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let home = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        let path = home.path().join(".codex/auth.json");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a valid NUL-terminated path, owned for this call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (send, recv) = std::sync::mpsc::channel();
+        let root = home.path().to_path_buf();
+        std::thread::spawn(move || send.send(codex_auth_plan(Some(&root))).unwrap());
+        assert_eq!(
+            recv.recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_auth_path_honors_explicit_home_and_isolates_overrides() {
+        use std::ffi::OsStr;
+        let home = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        let configured = other.path().as_os_str();
+        assert_eq!(
+            codex_auth_path(None, Some(configured), Some(home.path().as_os_str())),
+            Some(other.path().join("auth.json"))
+        );
+        assert_eq!(
+            codex_auth_path(None, None, Some(home.path().as_os_str())),
+            Some(home.path().join(".codex/auth.json"))
+        );
+        assert!(
+            codex_auth_path(
+                None,
+                Some(OsStr::new("relative")),
+                Some(home.path().as_os_str())
+            )
+            .is_none()
+        );
+        assert!(codex_auth_path(None, None, Some(OsStr::new("relative"))).is_none());
+        assert_eq!(
+            codex_auth_path(Some(home.path()), Some(configured), None),
+            Some(home.path().join(".codex/auth.json"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_does_not_follow_symlink_or_escape_sandbox() {
+        use std::os::unix::fs::symlink;
+        let home = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), home.path().join(".codex")).unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
+        fs::remove_file(home.path().join(".codex")).unwrap();
+        fs::create_dir(home.path().join(".codex")).unwrap();
+        fs::write(outside.path().join("auth.json"), "{}").unwrap();
+        symlink(
+            outside.path().join("auth.json"),
+            home.path().join(".codex/auth.json"),
+        )
+        .unwrap();
+        assert!(codex_auth_plan(Some(home.path())).is_none());
     }
 
     #[test]
@@ -8871,8 +9132,9 @@ mod tests {
             }
         });
         fs::write(&rollout, format!("{event}\n")).unwrap();
-        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None, "s")
-            .expect("resolved codex path");
+        let codex =
+            quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), Some(home), "s")
+                .expect("resolved codex path");
         assert_eq!(codex.tier.as_deref(), Some("plus"));
         assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
         assert!(quota_for_resolved_route("codex", None, Some(home), "s").is_none());
