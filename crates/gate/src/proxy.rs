@@ -350,8 +350,8 @@ pub fn verify_host_ssrf(
 
 struct PreparedSecrets {
     request: PreparedProxyRequest,
-    /// Plaintext from a provider, not the local vault. Scrubbed on the way out.
-    external_plaintexts: Vec<(String, String)>,
+    /// Exact injected values, wiped on drop even if the source rotates or expires.
+    injected_plaintexts: Vec<(String, zeroize::Zeroizing<String>)>,
 }
 
 /// Validate all `{{FERROGATE:KEY}}` placeholders in `req` against `vault` policies and SSRF rules,
@@ -520,7 +520,6 @@ fn prepare_checked(
     let vault = &fresh;
 
     let mut decrypted_map = BTreeMap::new();
-    let mut external_plaintexts = Vec::new();
     let mut allow_private = false;
 
     for secret_name in &referenced {
@@ -530,9 +529,6 @@ fn prepare_checked(
             secret_name,
             req.caller_agent.as_deref(),
         )?;
-        if vault.get_metadata(secret_name).is_none() {
-            external_plaintexts.push((secret_name.clone(), secret_val.clone()));
-        }
 
         if !meta.allow_private_network && scheme != "https" {
             return trace.refuse(
@@ -609,7 +605,7 @@ fn prepare_checked(
         if meta.allow_private_network {
             allow_private = true;
         }
-        decrypted_map.insert(secret_name.clone(), secret_val);
+        decrypted_map.insert(secret_name.clone(), zeroize::Zeroizing::new(secret_val));
     }
 
     verify_host_ssrf(
@@ -642,6 +638,7 @@ fn prepare_checked(
         );
     }
 
+    let injected_plaintexts = decrypted_map.into_iter().collect();
     Ok(PreparedSecrets {
         request: PreparedProxyRequest {
             method,
@@ -651,7 +648,7 @@ fn prepare_checked(
             body: final_body,
             injected_secrets,
         },
-        external_plaintexts,
+        injected_plaintexts,
     })
 }
 
@@ -660,7 +657,10 @@ fn prepare_checked(
 /// Keys are normalized exactly as [`extract_placeholder_keys`] normalizes them, so a lowercase or
 /// padded key is replaced like the policy check resolved it. A value is never rescanned, so a
 /// secret whose text holds another placeholder is not expanded a second time.
-fn substitute_placeholders(input: &str, values: &BTreeMap<String, String>) -> String {
+fn substitute_placeholders(
+    input: &str,
+    values: &BTreeMap<String, zeroize::Zeroizing<String>>,
+) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find(PLACEHOLDER_PREFIX) {
@@ -774,17 +774,28 @@ fn simple_percent_encode(s: &str) -> String {
     out
 }
 
-/// Redact injected external plaintext of length >= 4. Vault values stay in [`scrub_secrets`].
-fn redact_external_plaintexts(text: &str, external: &[(String, String)]) -> (String, Vec<String>) {
+/// Redact exact injected values and their encoded representations.
+fn redact_external_plaintexts(
+    text: &str,
+    external: &[(String, zeroize::Zeroizing<String>)],
+) -> (String, Vec<String>) {
     let mut scrubbed = text.to_string();
     let mut matched = Vec::new();
     for (name, secret) in external {
-        if secret.len() < 4 || !scrubbed.contains(secret) {
+        if secret.is_empty() {
             continue;
         }
         let replacement = format!("[REDACTED:FERROGATE:{name}]");
-        scrubbed = scrubbed.replace(secret, &replacement);
-        if !matched.iter().any(|existing: &String| existing == name) {
+        let b64 = zeroize::Zeroizing::new(BASE64.encode(secret.as_bytes()));
+        let encoded = zeroize::Zeroizing::new(simple_percent_encode(secret));
+        let mut hit = false;
+        for value in [secret.as_str(), b64.as_str(), encoded.as_str()] {
+            if !value.is_empty() && scrubbed.contains(value) {
+                scrubbed = scrubbed.replace(value, &replacement);
+                hit = true;
+            }
+        }
+        if hit && !matched.iter().any(|existing: &String| existing == name) {
             matched.push(name.clone());
         }
     }
@@ -794,12 +805,13 @@ fn redact_external_plaintexts(text: &str, external: &[(String, String)]) -> (Str
 fn scrub_with_external(
     vault: &Vault,
     text: &str,
-    external: &[(String, String)],
+    external: &[(String, zeroize::Zeroizing<String>)],
 ) -> (String, BTreeSet<String>) {
-    let (scrubbed, hits) = scrub_secrets(vault, text);
-    let mut names: BTreeSet<String> = hits.into_iter().collect();
-    let (scrubbed, extra) = redact_external_plaintexts(&scrubbed, external);
-    names.extend(extra);
+    // Exact injected values take priority over an older vault value that may be a substring.
+    let (scrubbed, extra) = redact_external_plaintexts(text, external);
+    let (scrubbed, hits) = scrub_secrets(vault, &scrubbed);
+    let mut names: BTreeSet<String> = extra.into_iter().collect();
+    names.extend(hits);
     (scrubbed, names)
 }
 
@@ -923,7 +935,7 @@ pub fn execute_proxied_request_with_provider_and_contract(
 
 /// [`execute_proxied_request`] with an optional external secret provider.
 ///
-/// Response and upstream error text also redact injected external plaintext of length >= 4.
+/// Response and upstream error text also redact the exact injected values and their encodings.
 pub fn execute_proxied_request_with_provider(
     vault: &Vault,
     req: &ProxyRequest,
@@ -1131,7 +1143,7 @@ fn send_prepared_inner(
 ) -> Result<ProxyResponse, SendPhaseError> {
     use SendPhaseError::{AfterSend as After, BeforeSend as Before};
     let prepared = prepared_secrets.request;
-    let external = prepared_secrets.external_plaintexts;
+    let external = prepared_secrets.injected_plaintexts;
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(1, 300));
     // After the `allowed` entry: what became of the request. Best effort, like every audit write.
     let audit_after_send = |outcome: &str| {
@@ -1572,6 +1584,79 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert!(resp.body.starts_with("ok "), "{:?}", resp.body);
         assert!(resp.body.ends_with(" tail"), "{:?}", resp.body);
+    }
+
+    #[test]
+    fn rotated_secret_echo_is_scrubbed_using_the_injection_snapshot() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let value = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("X-Key"))
+                .unwrap()
+                .value
+                .as_str()
+                .to_owned();
+            let body = format!(
+                "{} {} {}",
+                value,
+                simple_percent_encode(&value),
+                BASE64.encode(value.as_bytes())
+            );
+            let response = tiny_http::Response::from_string(body)
+                .with_header(tiny_http::Header::from_bytes("X-Echo", value.as_bytes()).unwrap());
+            req.respond(response).unwrap();
+        });
+        let tmp = TempDir::new().unwrap();
+        // The old value is a prefix of the new one: scrub the injected value first.
+        let stale = vault_with(&tmp, "API_KEY", "rotated", &["127.0.0.1"]);
+        let mut current = Vault::open(tmp.path().join("vault.enc"), [7u8; 32]).unwrap();
+        current
+            .set(SetSecretArgs {
+                name: "API_KEY".into(),
+                value: "rotated/value+42".into(),
+                allowed_hosts: vec!["127.0.0.1".into()],
+                allow_private_network: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let req = request(
+            "GET",
+            &format!("http://127.0.0.1:{port}/"),
+            &[("X-Key", "{{FERROGATE:API_KEY}}")],
+        );
+        let response = execute_proxied_request(&stale, &req).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            response.body,
+            "[REDACTED:FERROGATE:API_KEY] [REDACTED:FERROGATE:API_KEY] [REDACTED:FERROGATE:API_KEY]"
+        );
+        assert_eq!(
+            response.headers.get("x-echo").map(String::as_str),
+            Some("[REDACTED:FERROGATE:API_KEY]")
+        );
+    }
+
+    #[test]
+    fn injected_provider_values_scrub_encoded_and_short_forms() {
+        let vals = vec![(
+            "EXTERNAL".into(),
+            zeroize::Zeroizing::new("a/b+z".to_string()),
+        )];
+        let (clean, names) = redact_external_plaintexts("a/b+z a%2Fb%2Bz YS9iK3o=", &vals);
+        assert_eq!(
+            clean,
+            "[REDACTED:FERROGATE:EXTERNAL] [REDACTED:FERROGATE:EXTERNAL] [REDACTED:FERROGATE:EXTERNAL]"
+        );
+        assert_eq!(names, ["EXTERNAL"]);
+        let short = vec![("SHORT".into(), zeroize::Zeroizing::new("xy".to_string()))];
+        assert_eq!(
+            redact_external_plaintexts("xy eHk=", &short).0,
+            "[REDACTED:FERROGATE:SHORT] [REDACTED:FERROGATE:SHORT]"
+        );
     }
 
     #[test]
