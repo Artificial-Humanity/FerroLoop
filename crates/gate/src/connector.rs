@@ -15,7 +15,8 @@ use crate::contract::{
     count_unit_string,
 };
 use crate::proxy::{
-    DispatchPhaseError, PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse,
+    DispatchPhaseError, PLACEHOLDER_PREFIX, ProxyAttemptError, ProxyRequest, ProxyResponse,
+    execute_proxied_request_failover_attempt_with_provider_and_contract_phased_with_deadline,
     execute_proxied_request_with_provider_and_contract_phased_with_deadline,
 };
 use crate::vault::Vault;
@@ -71,6 +72,8 @@ pub struct ConnectorToolDef {
     pub input_schema: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_contract: Option<ResponseContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_set: Option<fl_core::EndpointSet>,
 }
 
 /// Outcome of evaluating a tool response against its contract, if any.
@@ -393,6 +396,23 @@ impl ConnectorManifest {
                     });
                 }
             }
+            if let Some(set) = &tool.endpoint_set {
+                if set.connector_id != self.id || set.tool != tool.name {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!(
+                            "tool `{}` endpoint_set must match connector id `{}` and tool name (got connector_id `{}`, tool `{}`)",
+                            tool.name, self.id, set.connector_id, set.tool
+                        ),
+                    });
+                }
+                if let Err(e) = set.validate() {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!("tool `{}` endpoint_set: {e}", tool.name),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -638,6 +658,130 @@ impl ConnectorManifest {
             &tool.response_fields,
         );
         Ok((resp, outcome))
+    }
+
+    /// One failover attempt against `endpoint`: when `endpoint` is a URL it
+    /// replaces `base_url` for this attempt, otherwise the manifest base URL
+    /// is used and `endpoint` is only the canonical label. Transport errors
+    /// are classified via the non-pooled proxy attempt witness mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tool_outcome_failover_attempt(
+        &self,
+        vault: &Vault,
+        tool_name: &str,
+        arguments: &Value,
+        caller_agent: Option<String>,
+        timeout_secs: Option<u64>,
+        provider: Option<&dyn crate::adapter::SecretProviderAdapter>,
+        deadline_mono_ms: Option<u64>,
+        now_fn: &dyn Fn() -> u64,
+        endpoint: &str,
+        idempotency_key: Option<&str>,
+    ) -> crate::failover::ClassifiedAttempt<(ProxyResponse, ToolOutcome)> {
+        use fl_core::{AttemptOutcome, ZeroBytesWitness};
+        let fail = |outcome: AttemptOutcome, e: GateError| crate::failover::ClassifiedAttempt {
+            outcome,
+            response: None,
+            bytes: 0,
+            error: Some(e),
+        };
+        let mut manifest = self.clone();
+        if endpoint.contains("://") {
+            manifest.base_url = endpoint.to_string();
+        }
+        let tool = match manifest.tools.iter().find(|t| t.name == tool_name) {
+            Some(t) => t.clone(),
+            None => {
+                return fail(
+                    AttemptOutcome::NoExecutionProven {
+                        witness: ZeroBytesWitness::PreDispatchRefusal,
+                    },
+                    GateError::NoSuchTool {
+                        tool: tool_name.to_string(),
+                    },
+                );
+            }
+        };
+        let mut req = match manifest.build_tool_request(&tool, arguments, caller_agent) {
+            Ok(r) => r,
+            Err(e) => {
+                return fail(
+                    AttemptOutcome::NoExecutionProven {
+                        witness: ZeroBytesWitness::PreDispatchRefusal,
+                    },
+                    e,
+                );
+            }
+        };
+        if let Some(ts) = timeout_secs {
+            req.timeout_secs = Some(ts);
+        }
+        // The operation's idempotency key (from the governor request) is
+        // actually sent, identically on the first and failover attempts.
+        if let Some(key) = idempotency_key {
+            req.headers
+                .insert("Idempotency-Key".to_string(), key.to_string());
+        }
+        match execute_proxied_request_failover_attempt_with_provider_and_contract_phased_with_deadline(
+            vault,
+            &req,
+            provider,
+            tool.response_contract.as_ref(),
+            deadline_mono_ms,
+            now_fn,
+        ) {
+            Ok(resp) => {
+                let bytes = resp.body.len() as u64;
+                let outcome = evaluate_tool_response_bytes(
+                    tool.response_contract.as_ref(),
+                    resp.body.as_bytes(),
+                    &tool.response_fields,
+                );
+                crate::failover::ClassifiedAttempt {
+                    outcome: AttemptOutcome::Executed,
+                    response: Some((resp, outcome)),
+                    bytes,
+                    error: None,
+                }
+            }
+            Err(ProxyAttemptError::BeforeSend(e)) => fail(
+                AttemptOutcome::NoExecutionProven { witness: ZeroBytesWitness::PreDispatchRefusal },
+                e,
+            ),
+            Err(ProxyAttemptError::NoExecutionProven(e)) => crate::failover::ClassifiedAttempt {
+                outcome: crate::failover::classify_transport(true, 0, false),
+                response: None,
+                bytes: 0,
+                error: Some(e),
+            },
+            Err(ProxyAttemptError::UnknownAfterSend(e)) => {
+                // Contract transport errors arise after execution.
+                if let Some(outcome) = contract_outcome_for_transport_error(&e) {
+                    let synthetic = ProxyResponse {
+                        status: transport_error_status(&e),
+                        headers: BTreeMap::new(),
+                        body: String::new(),
+                        scrubbed_secrets: vec![],
+                    };
+                    let bytes = match &outcome {
+                        ToolOutcome::ContractFailedAfterExecution { body_bytes, .. } => *body_bytes,
+                        _ => 0,
+                    };
+                    return crate::failover::ClassifiedAttempt {
+                        outcome: AttemptOutcome::Executed,
+                        response: Some((synthetic, outcome)),
+                        bytes,
+                        error: None,
+                    };
+                }
+                crate::failover::ClassifiedAttempt {
+                    outcome: crate::failover::classify_transport(true, 1, true),
+                    response: None,
+                    bytes: 0,
+                    error: Some(e),
+                }
+            }
+        }
     }
 
     /// Provider variant of [`Self::execute_tool_outcome`] (MCP provider path).
@@ -1182,6 +1326,7 @@ pub fn import_openapi_to_connector(
                     response_fields: Vec::new(),
                     input_schema,
                     response_contract: None,
+                    endpoint_set: None,
                 });
             }
         }

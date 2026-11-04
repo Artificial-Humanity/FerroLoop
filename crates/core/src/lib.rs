@@ -18,6 +18,7 @@ pub mod doctor;
 pub mod embed;
 pub mod escalate;
 pub mod escalation;
+pub mod failover;
 pub mod fault;
 pub mod feedback;
 pub mod ferrostate;
@@ -91,6 +92,13 @@ pub use embed::{
 };
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
+pub use failover::{
+    AttemptJournal, AttemptJournalEntry, AttemptOutcome, AttemptState, EndpointSet, FailoverAction,
+    FailoverDecision, FailoverError, JournalStore, MemJournal, ParentEnvelope, PolicyFingerprint,
+    StopReason, TransportWitnessInput, ZeroBytesWitness, canonical_json,
+    classify_from_connection_facts, classify_transport_witness, drift_invalidates,
+    effective_endpoint_set, is_absolute_http_url, next_action,
+};
 pub use fault::LedgerFault;
 pub use feedback::{
     BindingAuthorization, BindingStatus, DiffSide, EventSource, ExistingMessage,

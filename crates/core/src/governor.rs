@@ -475,6 +475,19 @@ pub trait GovernorStore: Send + Sync {
     fn record_and_check_replay(&self, req: &ReplayRequest)
     -> Result<ReplayDecision, GovernorError>;
     fn unconfirmed_permits(&self) -> Vec<Permit>;
+    /// Durable failover journal backend (Runtime slug `failover-journal`
+    /// in persistent impls). Default: unavailable.
+    fn load_failover_journal(
+        &self,
+    ) -> Result<Vec<crate::failover::AttemptJournalEntry>, GovernorError> {
+        Err(GovernorError::Unavailable)
+    }
+    fn save_failover_journal(
+        &self,
+        _entries: &[crate::failover::AttemptJournalEntry],
+    ) -> Result<(), GovernorError> {
+        Err(GovernorError::Unavailable)
+    }
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -499,6 +512,7 @@ struct Inner {
 }
 pub struct MemGovernorStore {
     inner: Mutex<Inner>,
+    failover_journal: Mutex<Vec<crate::failover::AttemptJournalEntry>>,
 }
 impl MemGovernorStore {
     pub fn new(policy: GovernorPolicy) -> Self {
@@ -510,6 +524,7 @@ impl MemGovernorStore {
                 replay: Vec::new(),
                 next_id: 1,
             }),
+            failover_journal: Mutex::new(Vec::new()),
         }
     }
     pub fn update_policy(&self, f: impl FnOnce(&mut GovernorPolicy)) {
@@ -589,6 +604,7 @@ impl MemGovernorStore {
                 replay: snap.replay,
                 next_id: snap.next_id,
             }),
+            failover_journal: Mutex::new(Vec::new()),
         }
     }
     pub fn snapshot_json(&self) -> String {
@@ -871,6 +887,26 @@ impl GovernorStore for MemGovernorStore {
             .filter(|r| !r.completed)
             .map(|r| r.permit.clone())
             .collect()
+    }
+    fn load_failover_journal(
+        &self,
+    ) -> Result<Vec<crate::failover::AttemptJournalEntry>, GovernorError> {
+        Ok(self
+            .failover_journal
+            .lock()
+            .map_err(|_| GovernorError::Unavailable)?
+            .clone())
+    }
+    fn save_failover_journal(
+        &self,
+        entries: &[crate::failover::AttemptJournalEntry],
+    ) -> Result<(), GovernorError> {
+        let mut g = self
+            .failover_journal
+            .lock()
+            .map_err(|_| GovernorError::Unavailable)?;
+        *g = entries.to_vec();
+        Ok(())
     }
 }
 

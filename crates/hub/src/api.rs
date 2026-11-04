@@ -7364,7 +7364,11 @@ fn hub_gate_governor(state: &HubState) -> Result<std::sync::Arc<GateGovernor>, (
             ),
         ))
     })?;
-    Ok(std::sync::Arc::new(GateGovernor::new(persistent)))
+    // Owner policy channel: FL_GATE_APPROVED_POLICY_DIGESTS (empty = no failover).
+    Ok(std::sync::Arc::new(
+        GateGovernor::new(persistent)
+            .with_approved_policy_digests(fl_gate::approved_policy_digests_from_env()),
+    ))
 }
 
 fn hub_admission_unavailable() -> HttpResponse {
