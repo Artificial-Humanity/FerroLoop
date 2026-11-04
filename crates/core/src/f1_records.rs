@@ -32,6 +32,8 @@ pub enum F1RecordError {
     UnverifiedAuthority,
     #[error("routine control operations are not supported over this remote backend")]
     UnsupportedRemote,
+    #[error("routine control operations are not yet supported on this local backend")]
+    UnsupportedLocal,
     #[error("storage backend failure: {0}")]
     Backend(String),
 }

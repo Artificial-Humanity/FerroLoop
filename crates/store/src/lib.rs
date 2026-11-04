@@ -16,6 +16,7 @@ use std::path::Path;
 pub mod any;
 pub mod cli;
 pub mod code_knowledge;
+mod f1_preparation;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod formats;
