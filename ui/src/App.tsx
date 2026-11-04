@@ -26,8 +26,11 @@ import {
   type UnreadSeverity,
 } from "./components/RosterSidebar";
 import {
+  SAFE_AREA_MARGINS_EVENT,
   SettingsModal,
   executeScopedBulkSessionAction,
+  persistShowSafeAreaMargins,
+  readInitialShowSafeAreaMargins,
   type AgentsSubTabId,
   type ProjectSettingsSubTabId,
   type SettingsOriginMemento,
@@ -466,6 +469,26 @@ export const App: React.FC<AppProps> = ({
   );
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
   const [fontScalePct, setFontScalePct] = useState<number>(getInitialFontScalePct);
+  const [showSafeAreaMargins, setShowSafeAreaMargins] = useState<boolean>(
+    readInitialShowSafeAreaMargins,
+  );
+  const safeAreaProbeRef = useRef<HTMLDivElement | null>(null);
+  const [safeAreaMetrics, setSafeAreaMetrics] = useState(() => ({
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    width: typeof window !== "undefined" ? window.innerWidth : 1200,
+    height: typeof window !== "undefined" ? window.innerHeight : 800,
+    visualHeight:
+      typeof window !== "undefined"
+        ? Math.round(window.visualViewport?.height ?? window.innerHeight)
+        : 800,
+    dpr:
+      typeof window !== "undefined"
+        ? Number((window.devicePixelRatio || 1).toFixed(2))
+        : 1,
+  }));
   useActiveTimeZone();
   const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
   const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
@@ -497,6 +520,64 @@ export const App: React.FC<AppProps> = ({
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleSafeMarginsEvent = (event: Event) => {
+      const custom = event as CustomEvent<{ enabled?: boolean }>;
+      if (typeof custom.detail?.enabled === "boolean") {
+        setShowSafeAreaMargins(custom.detail.enabled);
+      } else {
+        setShowSafeAreaMargins(readInitialShowSafeAreaMargins());
+      }
+    };
+    window.addEventListener(SAFE_AREA_MARGINS_EVENT, handleSafeMarginsEvent);
+    return () =>
+      window.removeEventListener(
+        SAFE_AREA_MARGINS_EVENT,
+        handleSafeMarginsEvent,
+      );
+  }, []);
+
+  useEffect(() => {
+    if (!showSafeAreaMargins || typeof window === "undefined") return;
+    const measureSafeArea = () => {
+      const probe = safeAreaProbeRef.current;
+      let top = 0;
+      let right = 0;
+      let bottom = 0;
+      let left = 0;
+      if (probe && typeof window.getComputedStyle === "function") {
+        const computed = window.getComputedStyle(probe);
+        top = Math.round( parseFloat(computed.paddingTop || "0") || 0 );
+        right = Math.round( parseFloat(computed.paddingRight || "0") || 0 );
+        bottom = Math.round( parseFloat(computed.paddingBottom || "0") || 0 );
+        left = Math.round( parseFloat(computed.paddingLeft || "0") || 0 );
+      }
+      setSafeAreaMetrics({
+        top,
+        right,
+        bottom,
+        left,
+        width: window.innerWidth,
+        height: window.innerHeight,
+        visualHeight: Math.round(
+          window.visualViewport?.height ?? window.innerHeight,
+        ),
+        dpr: Number((window.devicePixelRatio || 1).toFixed(2)),
+      });
+    };
+    measureSafeArea();
+    window.addEventListener("resize", measureSafeArea);
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", measureSafeArea);
+    vv?.addEventListener("scroll", measureSafeArea);
+    return () => {
+      window.removeEventListener("resize", measureSafeArea);
+      vv?.removeEventListener("resize", measureSafeArea);
+      vv?.removeEventListener("scroll", measureSafeArea);
+    };
+  }, [showSafeAreaMargins]);
 
   const effectiveLeftWidth = Math.max(
     PANEL_MIN_WIDTH_PX,
@@ -2976,6 +3057,11 @@ export const App: React.FC<AppProps> = ({
         onChangeThemeMode={handleChangeThemeMode}
         fontScalePct={fontScalePct}
         onChangeFontScalePct={handleChangeFontScalePct}
+        showSafeAreaMargins={showSafeAreaMargins}
+        onChangeShowSafeAreaMargins={(next) => {
+          persistShowSafeAreaMargins(next);
+          setShowSafeAreaMargins(next);
+        }}
         onSettingsUpdated={(updated) => {
           if (
             updated.theme_preference === "dark" ||
@@ -3014,6 +3100,152 @@ export const App: React.FC<AppProps> = ({
         onSelectTopic={setHelpTopic}
         onClose={() => setHelpDrawerOpen(false)}
       />
+
+      {showSafeAreaMargins && (
+        <div
+          data-testid="ios-safe-area-overlay"
+          style={{
+            position: "fixed",
+            top: 0,
+            right: 0,
+            bottom: 0,
+            left: 0,
+            pointerEvents: "none",
+            zIndex: 9999,
+            border: "2px dashed rgba(56, 189, 248, 0.85)",
+            boxSizing: "border-box",
+          }}
+        >
+          <div
+            ref={safeAreaProbeRef}
+            data-testid="ios-safe-area-probe"
+            aria-hidden="true"
+            style={{
+              position: "fixed",
+              top: 0,
+              left: 0,
+              width: 0,
+              height: 0,
+              paddingTop: "env(safe-area-inset-top, 0px)",
+              paddingRight: "env(safe-area-inset-right, 0px)",
+              paddingBottom: "env(safe-area-inset-bottom, 0px)",
+              paddingLeft: "env(safe-area-inset-left, 0px)",
+              pointerEvents: "none",
+              visibility: "hidden",
+              zIndex: -1,
+            }}
+          />
+          <div
+            data-testid="ios-safe-area-band-top"
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              right: 0,
+              height: `${Math.max(0, safeAreaMetrics.top)}px`,
+              backgroundColor: "rgba(245, 158, 11, 0.22)",
+              borderBottom: "2px dashed #F59E0B",
+              boxSizing: "border-box",
+            }}
+          />
+          <div
+            data-testid="ios-safe-area-band-bottom"
+            style={{
+              position: "absolute",
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: `${Math.max(0, safeAreaMetrics.bottom)}px`,
+              backgroundColor: "rgba(245, 158, 11, 0.22)",
+              borderTop: "2px dashed #F59E0B",
+              boxSizing: "border-box",
+            }}
+          />
+          <div
+            data-testid="ios-safe-area-band-left"
+            style={{
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              left: 0,
+              width: `${Math.max(0, safeAreaMetrics.left)}px`,
+              backgroundColor: "rgba(56, 189, 248, 0.18)",
+              borderRight:
+                safeAreaMetrics.left > 0 ? "2px dashed #38BDF8" : "none",
+              boxSizing: "border-box",
+            }}
+          />
+          <div
+            data-testid="ios-safe-area-band-right"
+            style={{
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              right: 0,
+              width: `${Math.max(0, safeAreaMetrics.right)}px`,
+              backgroundColor: "rgba(56, 189, 248, 0.18)",
+              borderLeft:
+                safeAreaMetrics.right > 0 ? "2px dashed #38BDF8" : "none",
+              boxSizing: "border-box",
+            }}
+          />
+          <div
+            data-testid="ios-safe-area-hud"
+            className="fd-mono"
+            style={{
+              position: "fixed",
+              top: `${Math.max(4, safeAreaMetrics.top + 4)}px`,
+              left: "50%",
+              transform: "translateX(-50%)",
+              maxWidth: "calc(100vw - 12px)",
+              backgroundColor: "rgba(10, 13, 18, 0.92)",
+              border: "1px solid #F59E0B",
+              borderRadius: "999px",
+              padding: "2px 8px",
+              fontSize: "10px",
+              lineHeight: 1.35,
+              color: "#FBBF24",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              pointerEvents: "auto",
+              zIndex: 10000,
+              boxShadow: "0 4px 12px rgba(0, 0, 0, 0.55)",
+            }}
+          >
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
+              Safe Margins: T:{safeAreaMetrics.top}px B:{safeAreaMetrics.bottom}px L:{safeAreaMetrics.left}px R:{safeAreaMetrics.right}px · Viewport: {safeAreaMetrics.width}×{safeAreaMetrics.height}px (dpr:{safeAreaMetrics.dpr})
+            </span>
+            <button
+              type="button"
+              data-testid="ios-safe-area-close-btn"
+              aria-label="Hide iOS safe-area margins overlay"
+              title="Hide iOS safe-area margins overlay"
+              onClick={() => {
+                persistShowSafeAreaMargins(false);
+                setShowSafeAreaMargins(false);
+              }}
+              style={{
+                border: "none",
+                background: "rgba(245, 158, 11, 0.2)",
+                color: "#FBBF24",
+                borderRadius: "999px",
+                padding: "0 5px",
+                fontSize: "10px",
+                fontWeight: 700,
+                cursor: "pointer",
+                lineHeight: 1.4,
+                flexShrink: 0,
+              }}
+            >
+              [×]
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
