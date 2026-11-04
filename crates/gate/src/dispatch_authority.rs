@@ -135,12 +135,36 @@ pub struct VerifiedAdmission {
     /// Obtained and authenticated by the host, never from request text.
     pub worker: WorkerIdentity,
 }
+/// A non-I/O guard supplied by an authoritative source after authentication. While this
+/// guard is alive, every sanctioned mutation of the guarded scopes must be fenced from
+/// taking effect or advancing their authority generation. The implementation must not hold
+/// `VaultLock`, perform I/O, or wait on broker operations while the broker mutex is held.
+/// This is a trusted source contract; the in-process kernel cannot enforce it across a
+/// separately running writer. No production guarded source is provided by this module.
+pub trait AdmissionGenerationGuard {
+    /// The current authenticated generation held stable by this guard.
+    fn generation(&self) -> u64;
+}
+
 /// Trusted host adapter. It must authenticate all evidence, expand aliases, ensure
 /// revisions cannot be replayed, and fence pre-crash grants on every reconcile.
 /// This trait is a trust boundary, not a public proof that values are authenticated.
 pub trait AuthoritySource: Send + Sync {
     fn reconcile(&self) -> Result<u64, GateError>;
     fn verify_admission(&self, request: &AdmitRequest) -> Result<VerifiedAdmission, GateError>;
+    /// Establish a scope-local, non-I/O mutation fence and report the generation that is
+    /// current under that fence. The default refuses: comparing a cached generation without
+    /// coordinating every sanctioned writer is not a freshness guarantee. An implementation
+    /// must cover every verified alias and keep the generation stable until the guard drops.
+    /// An empty scope is a reconciliation fence and must cover the complete source state.
+    fn guard_admission<'a>(
+        &'a self,
+        _scope: &BTreeSet<ScopeKey>,
+    ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+        Err(GateError::DispatchAuthority(
+            "coordinated source unavailable",
+        ))
+    }
     fn resolve_revocation(
         &self,
         requested: &BTreeSet<ScopeKey>,
@@ -465,6 +489,13 @@ impl DispatchAuthority for BrokerState {
             .fill(&mut id)
             .map_err(|_| GateError::DispatchAuthority("permit randomness unavailable"))?;
         let id = PermitId(id);
+        // Authentication is outside the broker mutex. A source-owned, scope-local guard
+        // then fences all sanctioned mutations while we recheck its generation and publish
+        // the permit. A bare cached generation is not sufficient to establish freshness.
+        let generation_guard = self.source.guard_admission(&verified.scope)?;
+        if generation_guard.generation() != verified.generation {
+            return Err(GateError::DispatchAuthority("stale source authority"));
+        }
         let mut s = self.state()?;
         if s.generation != Some(verified.generation) {
             return Err(GateError::DispatchAuthority("sealed or stale authority"));
@@ -550,15 +581,30 @@ impl DispatchAuthority for BrokerState {
             state.revocation_failed = true;
             return Err(GateError::DispatchAuthority("invalid revocation aliases"));
         }
+        // The resolved alias set is authenticated outside the broker mutex. Fence the
+        // source before publishing the revocation so it cannot change between those steps.
+        let generation_guard = match self.source.guard_admission(&expanded) {
+            Ok(guard) if guard.generation() == generation => guard,
+            Ok(_) | Err(_) => {
+                let mut state = self.state()?;
+                state.generation = None;
+                state.revocation_failed = true;
+                return Err(GateError::DispatchAuthority(
+                    "stale or uncoordinated revocation",
+                ));
+            }
+        };
         let (index, ready) = {
             let mut s = self.state()?;
             if s.generation != Some(generation) {
                 s.generation = None;
+                s.revocation_failed = true;
                 return Err(GateError::DispatchAuthority("sealed or stale authority"));
             }
             // Capacity exhaustion seals all new work; it never allows a revocation to fail open.
             if s.fences.len() >= 4096 {
                 s.generation = None;
+                s.revocation_failed = true;
                 return Err(GateError::DispatchAuthority("revocation capacity reached"));
             }
             // This insertion is the revocation linearization point.
@@ -571,6 +617,8 @@ impl DispatchAuthority for BrokerState {
             let ready = Self::ready_to_persist(&mut s);
             (index, ready)
         };
+        // Persistence may need the source's write side. Never hold its read fence over I/O.
+        drop(generation_guard);
         self.persist_ready(ready)?;
         let started = Instant::now();
         let mut s = self.state()?;
@@ -608,6 +656,14 @@ impl DispatchAuthority for BrokerState {
         if generation == 0 {
             return Err(GateError::DispatchAuthority("invalid authority generation"));
         }
+        // A stale reconciliation snapshot cannot unseal the broker. Empty scope asks the
+        // source to fence its complete authority state during the non-I/O recheck.
+        let guard = self.source.guard_admission(&BTreeSet::new())?;
+        if guard.generation() != generation {
+            return Err(GateError::DispatchAuthority(
+                "stale authority reconciliation",
+            ));
+        }
         let mut s = self.state()?;
         if s.reconciled
             || s.revocation_failed
@@ -638,6 +694,7 @@ mod tests {
     }
     struct TestSource {
         generation: AtomicU64,
+        generation_gate: std::sync::RwLock<()>,
         failed: AtomicBool,
         aliases_failed: AtomicBool,
         cancellation_failed: AtomicBool,
@@ -649,6 +706,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 generation: AtomicU64::new(1),
+                generation_gate: std::sync::RwLock::new(()),
                 failed: AtomicBool::new(false),
                 aliases_failed: AtomicBool::new(false),
                 cancellation_failed: AtomicBool::new(false),
@@ -658,7 +716,35 @@ mod tests {
             }
         }
     }
+    struct TestAdmissionGuard<'a> {
+        _guard: std::sync::RwLockReadGuard<'a, ()>,
+        generation: u64,
+    }
+    impl AdmissionGenerationGuard for TestAdmissionGuard<'_> {
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+    }
+    impl TestSource {
+        fn rotate(&self, generation: u64) {
+            let _guard = self.generation_gate.write().unwrap();
+            self.generation.store(generation, Ordering::SeqCst);
+        }
+    }
     impl AuthoritySource for TestSource {
+        fn guard_admission<'a>(
+            &'a self,
+            _: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            let guard = self
+                .generation_gate
+                .read()
+                .map_err(|_| GateError::DispatchAuthority("source gate poisoned"))?;
+            Ok(Box::new(TestAdmissionGuard {
+                _guard: guard,
+                generation: self.generation.load(Ordering::SeqCst),
+            }))
+        }
         fn reconcile(&self) -> Result<u64, GateError> {
             Ok(self.generation.load(Ordering::SeqCst))
         }
@@ -758,6 +844,12 @@ mod tests {
         resume: Mutex<mpsc::Receiver<()>>,
     }
     impl AuthoritySource for BlockingReconcile {
+        fn guard_admission<'a>(
+            &'a self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(scope)
+        }
         fn reconcile(&self) -> Result<u64, GateError> {
             let generation = self.source.reconcile()?;
             self.entered.send(()).unwrap();
@@ -819,6 +911,41 @@ mod tests {
         assert!(worker.join().unwrap().is_err());
         assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
         assert!(broker.admit(&AdmitRequest::secret("KEY")).is_err());
+    }
+
+    #[test]
+    fn revoke_while_initial_reconcile_is_unsealed_never_gets_lost() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(BlockingReconcile {
+            source: TestSource::default(),
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source,
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.reconcile())
+        };
+        entered_rx.recv().unwrap();
+        assert!(
+            broker
+                .revoke(&scope("KEY"), "owner", Duration::ZERO)
+                .is_err()
+        );
+        resume_tx.send(()).unwrap();
+        assert!(
+            worker.join().unwrap().is_err(),
+            "failed revoke must remain latched"
+        );
+        assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
     }
 
     #[test]
@@ -891,10 +1018,170 @@ mod tests {
         assert!(b.confirm_terminated(&permit.id).unwrap());
         assert_eq!(source.persisted.lock().unwrap().len(), 1);
     }
+    /// Authenticates data but does not provide a coordinated mutation fence.
+    /// The default trait method must make this source unusable for admission.
+    struct UnguardedSource(TestSource);
+    impl AuthoritySource for UnguardedSource {
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.0.reconcile()
+        }
+        fn verify_admission(&self, request: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            self.0.verify_admission(request)
+        }
+        fn resolve_revocation(
+            &self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            self.0.resolve_revocation(scope)
+        }
+        fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            self.0.persist_fence(scope, reason)
+        }
+        fn worker_terminated(
+            &self,
+            worker: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.0.worker_terminated(worker)
+        }
+        fn request_cancellation(
+            &self,
+            id: &PermitId,
+            worker: &WorkerIdentity,
+        ) -> Result<(), GateError> {
+            self.0.request_cancellation(id, worker)
+        }
+    }
+
+    #[test]
+    fn source_without_mutation_fence_never_admits() {
+        let source = Arc::new(UnguardedSource(TestSource::default()));
+        let broker = BrokerState::new(
+            source,
+            Arc::new(TestClock::default()),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(matches!(
+            broker.reconcile(),
+            Err(GateError::DispatchAuthority(
+                "coordinated source unavailable"
+            ))
+        ));
+        assert_eq!(broker.health().unwrap(), AuthorityHealth::Sealed);
+        assert!(broker.admit(&AdmitRequest::secret("KEY")).is_err());
+        assert!(broker.state().unwrap().live.is_empty());
+    }
+
+    struct GuardObservingClock {
+        source: Arc<TestSource>,
+        calls: AtomicU64,
+    }
+    impl MonotonicClock for GuardObservingClock {
+        fn now_ns(&self) -> Result<u64, GateError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                // The second clock read is inside the permit insertion section.
+                // A source writer must be unable to cross its gate at that point.
+                assert!(self.source.generation_gate.try_write().is_err());
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn source_mutations_remain_fenced_until_permit_is_registered() {
+        let source = Arc::new(TestSource::default());
+        let clock = Arc::new(GuardObservingClock {
+            source: source.clone(),
+            calls: AtomicU64::new(0),
+        });
+        let broker = BrokerState::new(source.clone(), clock, Duration::from_secs(30)).unwrap();
+        broker.reconcile().unwrap();
+        let permit = broker.admit(&AdmitRequest::secret("KEY")).unwrap();
+        assert!(broker.state().unwrap().live.contains_key(&permit.id));
+        // The writer gate is released after registration.
+        assert!(source.generation_gate.try_write().is_ok());
+    }
+
+    struct BlockingAdmission {
+        source: TestSource,
+        verified: mpsc::Sender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    impl AuthoritySource for BlockingAdmission {
+        fn guard_admission<'a>(
+            &'a self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<Box<dyn AdmissionGenerationGuard + 'a>, GateError> {
+            self.source.guard_admission(scope)
+        }
+        fn reconcile(&self) -> Result<u64, GateError> {
+            self.source.reconcile()
+        }
+        fn verify_admission(&self, request: &AdmitRequest) -> Result<VerifiedAdmission, GateError> {
+            let verified = self.source.verify_admission(request)?;
+            self.verified.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            Ok(verified)
+        }
+        fn resolve_revocation(
+            &self,
+            scope: &BTreeSet<ScopeKey>,
+        ) -> Result<(u64, BTreeSet<ScopeKey>), GateError> {
+            self.source.resolve_revocation(scope)
+        }
+        fn persist_fence(&self, scope: &BTreeSet<ScopeKey>, reason: &str) -> Result<(), GateError> {
+            self.source.persist_fence(scope, reason)
+        }
+        fn worker_terminated(
+            &self,
+            worker: &WorkerIdentity,
+        ) -> Result<Option<VerifiedTermination>, GateError> {
+            self.source.worker_terminated(worker)
+        }
+        fn request_cancellation(
+            &self,
+            id: &PermitId,
+            worker: &WorkerIdentity,
+        ) -> Result<(), GateError> {
+            self.source.request_cancellation(id, worker)
+        }
+    }
+
+    #[test]
+    fn rotated_source_after_verification_never_grants_stale_permit() {
+        let (verified_tx, verified_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let source = Arc::new(BlockingAdmission {
+            source: TestSource::default(),
+            verified: verified_tx,
+            resume: Mutex::new(resume_rx),
+        });
+        let broker = Arc::new(
+            BrokerState::new(
+                source.clone(),
+                Arc::new(TestClock::default()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        broker.reconcile().unwrap();
+        let worker = {
+            let broker = broker.clone();
+            std::thread::spawn(move || broker.admit(&AdmitRequest::secret("KEY")))
+        };
+        verified_rx.recv().unwrap();
+        source.source.rotate(2);
+        resume_tx.send(()).unwrap();
+        assert!(
+            worker.join().unwrap().is_err(),
+            "old authenticated generation must not authorize after rotation"
+        );
+    }
+
     #[test]
     fn stale_verified_generation_does_not_grant() {
         let (b, source, _) = broker();
-        source.generation.store(2, Ordering::SeqCst);
+        source.rotate(2);
         assert!(b.admit(&AdmitRequest::secret("KEY")).is_err());
         assert!(b.revoke(&scope("KEY"), "owner", Duration::ZERO).is_err());
     }
