@@ -600,7 +600,7 @@ fn a_session_adopted_without_a_target_is_pruned_once_it_is_not_running() {
     let target = adopted(&store, "codex:fiona");
 
     let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
-    assert!(!out.runtime_stopped);
+    assert!(out.runtime_stopped);
     assert_eq!(
         out.restore_source,
         Some(RestoreSourceOutcome::Pruned {
@@ -616,7 +616,7 @@ fn a_session_adopted_without_a_target_is_pruned_once_it_is_not_running() {
 }
 
 #[test]
-fn a_running_session_adopted_without_a_target_is_neither_killed_nor_pruned() {
+fn a_running_session_adopted_without_a_target_is_stopped_and_pruned() {
     let store = MemStore::default();
     let home = TempDir::new().unwrap();
     let dir = resurrect_dir(&home);
@@ -625,10 +625,56 @@ fn a_running_session_adopted_without_a_target_is_neither_killed_nor_pruned() {
     let target = adopted(&store, "codex:fiona");
 
     let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
-    assert_eq!(out.restore_source, Some(RestoreSourceOutcome::Running));
-    assert!(fake.is_live("Fiona"));
-    assert!(!fake.calls.borrow().iter().any(|c| c.starts_with("kill")));
-    assert_eq!(fs::read_to_string(dir.join(SAVE)).unwrap(), save_text());
+    assert!(out.runtime_stopped);
+    assert!(!fake.is_live("Fiona"));
+    assert!(
+        fake.calls
+            .borrow()
+            .iter()
+            .any(|call| call == "kill-owner Fiona:codex")
+    );
+    assert_eq!(
+        out.restore_source,
+        Some(RestoreSourceOutcome::Pruned {
+            file: SAVE.into(),
+            lines: 5
+        })
+    );
+    assert!(
+        !fs::read_to_string(dir.join(SAVE))
+            .unwrap()
+            .contains("Fiona\t")
+    );
+}
+
+#[test]
+fn an_adopted_vendor_window_is_pruned_and_a_sibling_window_stays() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let dir = resurrect_dir(&home);
+    let fake = FakeRuntime::default();
+    fake.add_session_windows(&[("Fiona", "codex"), ("Fiona", "claude")]);
+    let env = fake.env(home.path());
+    let target = adopted(&store, "codex:fiona");
+
+    let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+    assert!(out.runtime_stopped);
+    assert!(fake.is_live("Fiona"), "session Fiona stays");
+    assert!(fake.has_session_window("Fiona:claude"));
+    assert!(!fake.has_session_window("Fiona:codex"));
+    assert_eq!(
+        out.restore_source,
+        Some(RestoreSourceOutcome::Pruned {
+            file: SAVE.into(),
+            lines: 2
+        })
+    );
+    let left = fs::read_to_string(dir.join(SAVE)).unwrap();
+    assert!(
+        !left.contains("window\tFiona\t0\t:codex") && left.contains("pane\tFiona\t1\t"),
+        "{left}"
+    );
+    assert!(left.contains("pane\tFeira\t"), "{left}");
 }
 
 #[test]
