@@ -19,6 +19,10 @@ type ProjectKind = "project" | "virtual";
 
 interface ProjectSummary {            // GET list entry; POST and PATCH response body
   slug: string;
+  id: string;                         // equal to slug
+  artifacts_dir: string | null;
+  default_artifacts_dir: string;
+  effective_artifacts_dir: string;
   name: string;
   kind: ProjectKind;
   path: string | null;                // null for a virtual group
@@ -52,14 +56,12 @@ interface DeleteProjectResponse {
 
 * The tab shows the 409 as an inline error that names the active agents, and keeps the dialog
   open on the agent-guard section.
-* **Artifact directories.** `listProjectsArtifactsDirs` reads `id`, `artifacts_dir`,
-  `default_artifacts_dir` and `effective_artifacts_dir` from `GET /api/v1/projects`, and the
-  Lead's list entry has none of them. Open question for Feira: keep those fields in the list
-  entry (with `id` as an alias of `slug`) or serve them only from
-  `GET /api/v1/projects/:id/artifacts-dir`. Until that is answered the client merges both:
-  `listProjects()` is the source of truth for the entries, and the artifact-directory info is
-  read per entry through the existing `artifacts-dir` route when the list lacks it. The create
-  form has no artifacts-directory field; the card sets it after creation.
+* **Artifact directories.** Every `ProjectSummary` carries `id` (equal to `slug`),
+  `artifacts_dir`, `default_artifacts_dir` and `effective_artifacts_dir` (Lead, 2026-11-05), so
+  one `GET /api/v1/projects` feeds both the cards and the existing artifacts-directory flow.
+  If an older hub omits them, the client falls back to
+  `GET /api/v1/projects/:id/artifacts-dir` for that entry. The create form has no
+  artifacts-directory field; the card sets it after creation.
 * The path is editable on `PATCH`. Changing it is a Directory Project action only, and the edit
   form warns that the registered directory changes while files stay where they are.
 
