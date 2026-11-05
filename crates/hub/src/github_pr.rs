@@ -72,7 +72,7 @@ impl fmt::Debug for HubGithub {
 }
 
 /// Why the Hub could not get a GitHub client.
-enum ClientError {
+pub(crate) enum ClientError {
     /// No credential of the kind this action needs is configured.
     Missing(&'static str),
     /// A credential is configured but unusable (unreadable key, …). Detail stays in the log.
@@ -119,8 +119,13 @@ impl HubGithub {
         }
     }
 
+    /// The Reviewer App client, when one is configured. `Ok(None)` means no App.
+    pub(crate) fn reviewer_app_client(&self, repo: &str) -> Result<Option<Client>, ClientError> {
+        self.app_client(repo)
+    }
+
     /// The client that reads a pull request: the token, else the App.
-    fn reader(&self, repo: &str) -> Result<Client, ClientError> {
+    pub(crate) fn reader(&self, repo: &str) -> Result<Client, ClientError> {
         if let Some(c) = self.token_client() {
             return Ok(c);
         }
