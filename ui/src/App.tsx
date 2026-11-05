@@ -14,6 +14,7 @@ import {
 import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
+import { PHONE_MAX_VIEWPORT_PX, useDeviceLayout } from "./hooks/useDeviceLayout";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import {
@@ -103,7 +104,7 @@ export interface AppProps {
 }
 
 export const PANEL_MIN_WIDTH_PX = 360;
-export const TWO_PANEL_MIN_VIEWPORT_PX = 720;
+export const TWO_PANEL_MIN_VIEWPORT_PX = PHONE_MAX_VIEWPORT_PX;
 export const THREE_PANEL_MIN_VIEWPORT_PX = 1080;
 
 export type ViewportPanelMode = "single" | "two-panel" | "three-panel";
@@ -464,6 +465,7 @@ export const App: React.FC<AppProps> = ({
   const panelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
+  const { layout: deviceLayout } = useDeviceLayout();
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== "undefined" ? window.innerWidth : 1200,
   );
@@ -2712,7 +2714,7 @@ export const App: React.FC<AppProps> = ({
   const currentInnerWidth =
     typeof window !== "undefined" ? window.innerWidth : viewportWidth;
   const viewportPanelMode = resolveViewportPanelMode(currentInnerWidth);
-  const isMobileViewport = currentInnerWidth < TWO_PANEL_MIN_VIEWPORT_PX;
+  const isMobileViewport = deviceLayout === "phone";
   const leftSidebarOpen = isMobileViewport
     ? mobileRosterOpen
     : !desktopSidebarCollapsed;
@@ -2722,6 +2724,7 @@ export const App: React.FC<AppProps> = ({
       className="fd-cockpit"
       data-testid="ferrodeck-cockpit"
       data-viewport-panel-mode={viewportPanelMode}
+      data-device-layout={deviceLayout}
     >
       <ContextHeader
         selectedAgent={selectedAgent}

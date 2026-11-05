@@ -157,7 +157,7 @@ body,
   box-sizing: border-box;
 }
 
-@media (pointer: coarse) and (min-width: 720px) {
+@media (pointer: coarse) and (min-width: 768px) {
   .fd-cockpit {
     padding-top: max(env(safe-area-inset-top, 0px), 32px);
   }
@@ -720,13 +720,13 @@ button.fd-badge:hover:not(:disabled) {
   color: var(--text-secondary);
 }
 
-@media (min-width: 720px) {
+@media (min-width: 768px) {
   .fd-sidebar.is-desktop-collapsed {
     display: none;
   }
 }
 
-@media (max-width: 719px) {
+@media (max-width: 767px) {
   .fd-sidebar-backdrop {
     display: block;
     position: absolute;
@@ -809,7 +809,7 @@ button.fd-badge:hover:not(:disabled) {
   }
 }
 
-@media (max-width: 719px) {
+@media (max-width: 767px) {
   .fd-scroll {
     padding: 8px;
     width: 100%;

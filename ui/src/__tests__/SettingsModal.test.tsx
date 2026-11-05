@@ -1182,13 +1182,13 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     ).toBeInTheDocument();
   });
 
-  it("Record #109: enforces 3-tier viewport panel constraints (<720px single-panel, 720-1079px two-panel mutual exclusion, >=1080px three-panel)", () => {
+  it("Record #109: enforces 3-tier viewport panel constraints (<768px single-panel, 768-1079px two-panel mutual exclusion, >=1080px three-panel)", () => {
     const originalInnerWidth = window.innerWidth;
     try {
       const apiClient = makeStubApiClient();
       const wsClient = makeStubWsClient();
 
-      // Start at 900px (720px - 1079px Two-Panel Mutual-Exclusion Mode)
+      // Start at 900px (768px - 1079px Two-Panel Mutual-Exclusion Mode)
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
         writable: true,
@@ -1204,12 +1204,12 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "two-panel");
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
 
-      // Opening Right panel in 720-1079px mode automatically collapses Left panel
+      // Opening Right panel in 768-1079px mode automatically collapses Left panel
       fireEvent.click(splitToggleBtn);
       expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "true");
 
-      // Opening Left panel in 720-1079px mode automatically closes Right panel
+      // Opening Left panel in 768-1079px mode automatically closes Right panel
       fireEvent.click(leftToggleBtn);
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
       expect(screen.queryByTestId("right-split-panel")).toBeNull();
@@ -1227,7 +1227,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
 
-      // Resize down to 600px (< 720px Single-Panel Mode): Left auto-collapses so at most 1 panel is onscreen,
+      // Resize down to 600px (< 768px Single-Panel Mode): Left auto-collapses so at most 1 panel is onscreen,
       // and RosterSidebar does not set inline position: relative or desktop width that would push ChatPane offscreen.
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
@@ -1251,7 +1251,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     }
   });
 
-  it("Record #114 & #117: disables iOS safe-area margins overlay by default on mobile (<720px, including 320px zoomed iOS viewport), toggles on from Appearance settings, and allows closing via HUD [×]", () => {
+  it("Record #114 & #117: disables iOS safe-area margins overlay by default on mobile (<768px, including 320px zoomed iOS viewport), toggles on from Appearance settings, and allows closing via HUD [×]", () => {
     const originalInnerWidth = window.innerWidth;
     try {
       window.localStorage.setItem("fd_show_safe_margins", "true");
