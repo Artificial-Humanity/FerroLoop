@@ -667,7 +667,7 @@ fn fault_delete_area() -> Result<(), fl_core::store::StoreError> {
     Ok(())
 }
 
-fn fault_write_config() -> Result<(), InitError> {
+pub(crate) fn fault_write_config() -> Result<(), InitError> {
     #[cfg(test)]
     if hooks::fails(hooks::Fault::WriteConfig) {
         return Err(failed("could not write the config: injected failure"));

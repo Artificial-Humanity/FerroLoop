@@ -1752,6 +1752,58 @@ fn an_update_refuses_what_cannot_be_used_and_changes_nothing() {
 }
 
 #[test]
+fn a_failed_config_write_removes_the_area_the_update_made() {
+    let sb = Sandbox::new();
+    sb.init(&sb.request(&sb.dir("proj"))).unwrap();
+    // The project has a config block and a store but no area (a hand-edited registry).
+    sb.workspace()
+        .delete_area("proj", fl_core::At::from_unix_millis(3), "t")
+        .unwrap();
+    let config = sb.config();
+    crate::project_delete::hooks::reset();
+    crate::project_delete::hooks::inject(crate::project_delete::hooks::Fault::WriteConfig);
+    let mut set = change();
+    set.name = Some("Renamed".into());
+    set.github = Some("acme/one".into());
+    let err = sb.update("proj", &set).unwrap_err();
+    assert!(matches!(err, InitError::Failed(_)), "{err:?}");
+    assert!(
+        sb.workspace().get_area("proj").unwrap().is_none(),
+        "the area the update made is gone again"
+    );
+    assert_eq!(sb.config(), config);
+    // Without the fault the same update makes the area and writes the config.
+    crate::project_delete::hooks::reset();
+    sb.update("proj", &set).unwrap();
+    assert_eq!(
+        sb.workspace().get_area("proj").unwrap().unwrap().name,
+        "Renamed"
+    );
+}
+
+#[test]
+fn a_move_of_a_project_whose_store_file_is_gone_is_refused_and_makes_no_store() {
+    let sb = Sandbox::new();
+    let out = sb.init(&sb.request(&sb.dir("proj"))).unwrap();
+    let store = PathBuf::from(out.store.unwrap());
+    fs::remove_file(&store).unwrap();
+    let there = sb.dir("there");
+    fs::create_dir_all(&there).unwrap();
+    let config = sb.config();
+    let mut mv = change();
+    mv.path = Some(there.clone());
+    let err = sb.update("proj", &mv).unwrap_err();
+    assert!(
+        matches!(&err, InitError::Conflict(m) if m.contains("does not exist")),
+        "{err:?}"
+    );
+    assert!(!store.exists(), "no empty store was made");
+    assert_eq!(sb.config(), config);
+    let area = sb.workspace().get_area("proj").unwrap().unwrap();
+    assert_eq!(area.path.as_deref(), Some(sb.dir("proj").to_str().unwrap()));
+}
+
+#[test]
 fn an_update_sets_replaces_and_clears_the_tracker_and_keeps_the_rest_of_the_config() {
     let sb = Sandbox::new();
     fs::create_dir_all(sb.paths.config_path.parent().unwrap()).unwrap();

@@ -474,6 +474,15 @@ where
                 .to_string_lossy()
                 .into_owned()
         }));
+        // Opening a store that is not there would make an empty one.
+        if !fl_store::store_exists(&store_path) {
+            return Err(conflict(format!(
+                "the store {} of project `{slug}` does not exist, so the project cannot be moved \
+                 (opening it would make an empty store). Restore the store, or register the \
+                 project again with `fl project create`",
+                store_path.display()
+            )));
+        }
         let store = open_project(&store_path)?;
         let held = store
             .list_projects()
@@ -501,8 +510,16 @@ where
     }
 
     let put_back = |why: InitError| {
-        if area_changes && let Some(before) = &existing {
-            let _ = ws.upsert_area(before.clone());
+        if area_changes {
+            match &existing {
+                Some(before) => {
+                    let _ = ws.upsert_area(before.clone());
+                }
+                // The area was made by this update: it goes again.
+                None => {
+                    let _ = ws.delete_area(slug, fl_exec::stamp::now(), req.by.trim());
+                }
+            }
         }
         if let Some((path, root, id)) = &moved
             && let Ok(store) = open_project(path)
@@ -533,6 +550,7 @@ where
             let text = doc.to_string();
             text.parse::<DocumentMut>()
                 .map_err(|e| failed(format!("the edited config is not valid TOML: {e}")))?;
+            crate::project_delete::fault_write_config()?;
             write_atomic(&paths.config_path, &text)
         });
         written.map_err(put_back)?;
