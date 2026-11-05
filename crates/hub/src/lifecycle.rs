@@ -2563,8 +2563,9 @@ pub fn authorize_teardown<S: AgentRegistry>(
 /// the agent, and mark the record `decommissioned`. Safe to repeat.
 ///
 /// `caller` gates adopting a session that has no hosted record (owner only). `clear_queue` is
-/// called with each id the session may be queued under. Everything that can fail on a lookup
-/// runs before the first side effect.
+/// called with each id the session may be queued under. Another running session of the same
+/// persona keeps the persona key and the persona route; the session ids are still cleared.
+/// Everything that can fail on a lookup runs before the first side effect.
 pub fn teardown_session<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -2589,14 +2590,30 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         record.runtime_spawned = false;
     }
 
+    // Another running session of this persona (a second vendor) still owns the registry
+    // record, the persona route, and the persona-keyed queue. One lookup covers the route
+    // and queue decision and the retire guard below.
+    let persona_still_running = list_hosted_sessions(store)?.iter().any(|other| {
+        other.session_id != record.session_id
+            && other.persona.eq_ignore_ascii_case(&target.persona)
+            && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
+    });
     for key in target.keys() {
+        if persona_still_running && key.eq_ignore_ascii_case(&target.persona) {
+            continue;
+        }
         clear_queue(key);
     }
-    remove_routes(
-        env.home_override,
-        &[target.persona.as_str()],
-        &[target.session_id.as_str(), target.raw_id.as_str()],
-    );
+    let session_ids = [
+        target.session_id.as_str(),
+        target.raw_id.as_str(),
+        target.discovered_id.as_str(),
+    ];
+    if persona_still_running {
+        remove_routes(env.home_override, &[], &session_ids);
+    } else {
+        remove_routes(env.home_override, &[target.persona.as_str()], &session_ids);
+    }
 
     // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
     // start, one still running for the sessions that share it, or none at all (runtime calls are
@@ -2617,13 +2634,6 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     // Its routes are gone and its runtime may be: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
 
-    // Another live session of this persona (a second vendor) still owns the registry
-    // record. Retiring it here would mark that session's agent retired.
-    let persona_still_running = list_hosted_sessions(store)?.iter().any(|other| {
-        other.session_id != record.session_id
-            && other.persona.eq_ignore_ascii_case(&target.persona)
-            && other.status.eq_ignore_ascii_case(STATUS_RUNNING)
-    });
     if let Some(agent) = agent
         && agent.status == AgentStatus::Active
         && !persona_still_running
@@ -4231,6 +4241,79 @@ mod tests {
             store.agent_by_name("felicity").unwrap().unwrap().status,
             AgentStatus::Retired
         );
+    }
+
+    #[test]
+    fn teardown_keeps_a_running_siblings_route_and_persona_queue() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut other = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        other.session_id = "codex:felicity".into();
+        other.vendor = "codex".into();
+        other.tmux_target = Some("Felicity:codex".into());
+        other.status = STATUS_RUNNING.into();
+        persist_hosted_session(&store, &other, "owner").unwrap();
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "felicity",
+            VendorRoute::Codex {
+                thread_id: "thread-felicity".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+
+        let claude = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        let mut cleared = Vec::new();
+        teardown_session(&store, &env, &claude, "owner", Caller::Owner, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap();
+
+        let table = RouteTable::load(Some(&path));
+        let route = &table.get("felicity").expect("felicity route").route;
+        assert!(
+            matches!(
+                route,
+                VendorRoute::Codex {
+                    thread_id,
+                    cwd: None,
+                } if thread_id == "thread-felicity"
+            ),
+            "{route:?}"
+        );
+        assert!(cleared.iter().any(|key| key == "claude:felicity"));
+        assert!(
+            !cleared
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case("felicity"))
+        );
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, STATUS_DECOMMISSIONED);
     }
 
     #[test]
