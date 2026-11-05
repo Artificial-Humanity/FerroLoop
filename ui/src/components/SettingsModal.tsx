@@ -44,6 +44,11 @@ import {
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
 } from "./AgentSettingsModal";
+import {
+  ProjectArtifactsDirRow,
+  ProjectsSettingsTab,
+  type ProjectsArtifactsDirProps,
+} from "./settings/ProjectsSettingsTab";
 
 export {
   ACP_CONFORMANCE_OPERATIONS,
@@ -725,11 +730,13 @@ import {
   type OperatorAccount,
   type OperatorRole,
   type ProjectArtifactsDirInfo,
+  type ProjectSummary,
   type TotpEnrollmentResponse,
 } from "../types/api";
 
 export type SettingsTabId =
   | "agents"
+  | "projects"
   | "system"
   | "products"
   | "runtimes"
@@ -1444,9 +1451,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [systemArtifactsDirStatus, setSystemArtifactsDirStatus] = useState<
     string | null
   >(null);
-  const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<
-    string | null
-  >(null);
+  const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<{
+    slug: string;
+    message: string;
+  } | null>(null);
+  const [projectList, setProjectList] = useState<ProjectSummary[]>([]);
+  const [projectListLoading, setProjectListLoading] = useState(false);
+  const [projectListError, setProjectListError] = useState<string | null>(null);
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -1707,6 +1718,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         })
         .catch(() => {
           // Ignore if /api/v1/projects is not yet available
+        });
+    }
+
+    if (typeof client.listProjects === "function") {
+      setProjectListLoading(true);
+      setProjectListError(null);
+      client
+        .listProjects()
+        .then((list) => {
+          if (!cancelled) {
+            setProjectList(Array.isArray(list) ? list : []);
+          }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) {
+            setProjectListError(
+              err instanceof Error ? err.message : "Failed to load projects",
+            );
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setProjectListLoading(false);
         });
     }
 
@@ -2248,11 +2281,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         });
         const migratedFiles = res?.migrated_files ?? 0;
         const migratedBytes = res?.migrated_bytes ?? 0;
-        setProjectArtifactsDirStatus(
-          artifactsDirMigrate
+        setProjectArtifactsDirStatus({
+          slug: info.slug,
+          message: artifactsDirMigrate
             ? `Updated ${projectName} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
             : `Updated ${projectName} artifacts directory to ${nextEffective}.`,
-        );
+        });
         setArtifactsDirModalTarget(null);
       }
     } catch (err) {
@@ -2455,6 +2489,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const projectArtifactsDirProps: ProjectsArtifactsDirProps = {
+    getState: (slug) => {
+      const info = getProjectArtifactsDirState(slug);
+      return { effectiveDir: info.effectiveDir, artifactsDir: info.artifactsDir };
+    },
+    onChange: openProjectArtifactsDirModal,
+    status: projectArtifactsDirStatus,
+  };
+
   const projectSummaryCardNode =
     resolvedProjectFilter !== "all" ? (
       <div
@@ -2593,118 +2636,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Project Artifacts Directory row (Issue #207) */}
-        {(() => {
-          const projArtifactsInfo = getProjectArtifactsDirState(
-            resolvedProjectFilter,
-          );
-          return (
-            <div
-              data-testid="settings-project-artifacts-dir-row"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "6px",
-                paddingTop: "8px",
-                borderTop: "1px solid var(--border-subtle)",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                    minWidth: 0,
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: "11.5px",
-                      fontWeight: 600,
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    Artifacts Directory:
-                  </span>
-                  <code
-                    data-testid="settings-project-artifacts-dir-value"
-                    className="fd-badge fd-mono"
-                    title={projArtifactsInfo.effectiveDir}
-                    style={{
-                      fontSize: "11px",
-                      maxWidth: "100%",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                  >
-                    {projArtifactsInfo.effectiveDir}
-                  </code>
-                  <span
-                    data-testid="settings-project-artifacts-hierarchy-badge"
-                    className="fd-badge fd-mono"
-                    title="Default project hierarchy under [home]/artifacts/[project-name]"
-                    style={{
-                      fontSize: "10px",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    [home]/artifacts/[project-name]
-                  </span>
-                  {projArtifactsInfo.artifactsDir && (
-                    <span
-                      data-testid="settings-project-artifacts-dir-override-badge"
-                      className="fd-badge fd-mono"
-                      style={{
-                        fontSize: "10px",
-                        color: "var(--accent-primary, #f59e0b)",
-                      }}
-                    >
-                      Override
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  data-testid="settings-project-change-artifacts-dir-btn"
-                  className="fd-btn"
-                  style={{ fontSize: "11px", padding: "3px 8px" }}
-                  onClick={() =>
-                    openProjectArtifactsDirModal(resolvedProjectFilter)
-                  }
-                >
-                  Change Artifacts Directory
-                </button>
-              </div>
-
-              {projectArtifactsDirStatus && (
-                <div
-                  role="status"
-                  data-testid="project-artifacts-dir-status"
-                  className="fd-card"
-                  style={{
-                    borderColor: "var(--diff-add-border)",
-                    backgroundColor: "var(--diff-add-bg)",
-                    color: "var(--diff-add-text)",
-                    fontSize: "11.5px",
-                    padding: "6px 10px",
-                  }}
-                >
-                  {projectArtifactsDirStatus}
-                </div>
-              )}
-            </div>
-          );
-        })()}
+        {/* Project-scoped Settings has no Projects tab, so the row stays here (Issue #207) */}
+        {initialProject && (
+          <ProjectArtifactsDirRow
+            slug={resolvedProjectFilter}
+            artifactsDir={projectArtifactsDirProps}
+          />
+        )}
       </div>
     ) : null;
 
@@ -2805,6 +2743,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               Agents
             </option>
             {!initialProject && (
+              <option value="projects" data-testid="settings-tab-option-projects">
+                Projects
+              </option>
+            )}
+            {!initialProject && (
               <>
                 <option value="system" data-testid="settings-tab-option-system">
                   System
@@ -2856,6 +2799,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             >
               {filteredAgents.length} Agents
             </button>
+            {!initialProject && (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "projects"}
+                data-testid="settings-tab-projects"
+                className={`fd-btn${activeTab === "projects" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("projects")}
+              >
+                Projects
+              </button>
+            )}
             {!initialProject && (
               <>
                 <button
@@ -4867,6 +4822,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
           </div>
         </div>
+
+        {/* TAB: Projects */}
+        {!initialProject && (
+          <div
+            role="tabpanel"
+            aria-label="Projects Panel"
+            data-testid="settings-panel-projects"
+            style={{
+              display: activeTab === "projects" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            <ProjectsSettingsTab
+              projects={projectList}
+              loading={projectListLoading}
+              error={projectListError}
+              onViewAgents={(slug) => {
+                setSelectedProjectFilter(slug);
+                setProjectArtifactsDirStatus(null);
+                setActiveTab("agents");
+              }}
+              artifactsDir={projectArtifactsDirProps}
+            />
+          </div>
+        )}
 
         {/* TAB 2: System */}
         {!initialProject && (

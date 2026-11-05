@@ -691,23 +691,21 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(putCall?.body).not.toHaveProperty("effective_artifacts_dir");
     expect(putCall?.body).not.toHaveProperty("project_artifacts_dirs");
 
-    // Switch to Agents & Projects tab and select Sonora (derived from the updated system artifacts root)
-    fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "Sonora" },
-    });
+    // Switch to the Projects tab and use the Sonora card (derived from the updated system artifacts root)
+    fireEvent.click(screen.getByTestId("settings-tab-projects"));
+    const sonoraCard = await screen.findByTestId("settings-project-card-sonora");
 
     expect(
-      screen.getByTestId("settings-project-artifacts-dir-value"),
+      within(sonoraCard).getByTestId("settings-project-artifacts-dir-value"),
     ).toHaveTextContent("/mnt/fast-ssd/fl-artifacts/sonora");
 
     fireEvent.click(
-      screen.getByTestId("settings-project-change-artifacts-dir-btn"),
+      within(sonoraCard).getByTestId("settings-project-change-artifacts-dir-btn"),
     );
     const projModal = screen.getByTestId("change-artifacts-dir-modal");
     expect(
       within(projModal).getByTestId("change-artifacts-dir-modal-title"),
-    ).toHaveTextContent("Change Sonora Artifacts Directory");
+    ).toHaveTextContent("Change sonora Artifacts Directory");
     expect(
       (
         within(projModal).getByTestId(
@@ -727,12 +725,14 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       within(projModal).getByTestId("change-artifacts-dir-confirm-btn"),
     );
 
-    const projStatus = await screen.findByTestId("project-artifacts-dir-status");
+    const projStatus = await within(sonoraCard).findByTestId(
+      "project-artifacts-dir-status",
+    );
     expect(projStatus).toHaveTextContent(
-      /Updated Sonora artifacts directory to \/mnt\/nvme\/sonora-artifacts/i,
+      /Updated sonora artifacts directory to \/mnt\/nvme\/sonora-artifacts/i,
     );
     expect(
-      screen.getByTestId("settings-project-artifacts-dir-value"),
+      within(sonoraCard).getByTestId("settings-project-artifacts-dir-value"),
     ).toHaveTextContent("/mnt/nvme/sonora-artifacts");
 
     const projPostCall = calls.find(
