@@ -33,6 +33,8 @@ mod ws;
 #[cfg(test)]
 mod crash_sim;
 #[cfg(test)]
+mod mq_buffer;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_auth;
