@@ -33,6 +33,39 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+## Host reboot behaviour
+
+A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three
+rules for what comes back.
+
+**A decommission leaves nothing to restore.** A teardown that stops a whole tmux session also
+removes that session's `pane`, `window`, `grouped_session` and `state` lines from the newest
+tmux-resurrect save (the file the `last` link names, else the newest `tmux_resurrect_*.txt`).
+The directory is `FL_TMUX_RESURRECT_DIR` when set, else `~/.tmux/resurrect` when it exists, else
+`$XDG_DATA_HOME/tmux/resurrect`. Hub edits the file itself (temp file, rename, old content kept
+as `<save>.bak`) and does not run the plugin's `save.sh`. It does nothing when the save does not
+name the session. The result is the `restore_source` field of the teardown response:
+`pruned`, `clean`, `no_save` or `failed`. A `failed` or `no_save` result never fails the teardown.
+A session that Hub did not start, or that another session still shares, is not stopped and is not
+pruned.
+
+**A restored pane of a retired or unknown persona gets no route.** When `fl hub serve` starts,
+Hub lists the tmux panes. For each pane that runs a vendor CLI, the persona is the pane's tmux
+session name; an inherited `AGENT_PERSONA` is never used. If that persona is not an active agent,
+Hub drops its route from the route table, leaves the pane running, and sends one
+`session.restore_orphan` event on the `sessions` channel (`session`, `pane_id`, `persona`,
+`reason` of `retired` or `unknown`, `command`, `boot_id`) and one line to the service log. The
+same pane is reported once per boot.
+
+**Each active agent is told once per boot.** After Hub registers routes from the sessions' own
+identity, it sends each active agent whose route is live one `system` message with the subject
+`Host restarted`. The boot is the host `boot_id` (`/proc/sys/kernel/random/boot_id`). The agents
+already told are kept in the workspace runtime state entry `host-boot-epoch`, so a Hub restart in
+the same boot sends nothing and a new boot sends again. An agent with no live route is tried
+again every 15 seconds, for at most 20 passes. No message goes to a retired agent, to an agent
+decommissioning, or when the host has been up for more than one hour (a late Hub start tells
+nobody).
+
 ## Runtime matrix: quotas and CLI updates
 
 `GET /api/v1/runtimes/matrix` and `POST /api/v1/runtimes/probe` (owner only) list the CLI
