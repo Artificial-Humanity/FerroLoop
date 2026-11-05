@@ -653,7 +653,7 @@ fn it_refuses_a_project_with_no_directory() {
         paths: &fx.paths,
         stores: &hints,
         home: Some(&fx.home),
-        workspace_roots: &[fx.ws_root.clone()],
+        workspace_roots: std::slice::from_ref(&fx.ws_root),
         lifecycle: &env,
     };
     let why = refused(delete_project_in(
@@ -681,7 +681,7 @@ fn it_refuses_a_directory_that_is_itself_a_workspace_root_wherever_the_caller_st
             &dir_req(),
             Some(&fx.home),
             Some(fx.home.clone()),
-            &[fx.ws_root.clone()],
+            std::slice::from_ref(&fx.ws_root),
         ));
         assert!(why.contains("is a workspace root"), "{marker}: {why}");
         assert_eq!(before, fx.snapshot(&[&root]));
@@ -768,7 +768,13 @@ fn it_refuses_the_directory_when_no_home_directory_is_known() {
     let fx = Fx::new();
     let root = fx.project("alpha");
     let before = fx.snapshot(&[&root]);
-    let why = refused(fx.call_in("alpha", &dir_req(), None, None, &[fx.ws_root.clone()]));
+    let why = refused(fx.call_in(
+        "alpha",
+        &dir_req(),
+        None,
+        None,
+        std::slice::from_ref(&fx.ws_root),
+    ));
     assert!(why.contains("home directory is unknown"), "{why}");
     assert_eq!(before, fx.snapshot(&[&root]));
     // An empty `$HOME` is no home either.
@@ -777,7 +783,7 @@ fn it_refuses_the_directory_when_no_home_directory_is_known() {
         &dir_req(),
         None,
         Some(PathBuf::new()),
-        &[fx.ws_root.clone()],
+        std::slice::from_ref(&fx.ws_root),
     ));
     assert!(why.contains("home directory is unknown"), "{why}");
     // Either one is enough.
@@ -787,7 +793,7 @@ fn it_refuses_the_directory_when_no_home_directory_is_known() {
             &dir_req(),
             None,
             Some(fx.home.clone()),
-            &[fx.ws_root.clone()]
+            std::slice::from_ref(&fx.ws_root)
         )
         .unwrap()
         .dir_deleted
@@ -897,7 +903,7 @@ fn delete_store_knows_another_projects_store_from_the_data_directory_hints() {
         &req,
         Some(&fx.home),
         Some(fx.home.clone()),
-        &[fx.ws_root.clone()],
+        std::slice::from_ref(&fx.ws_root),
         &hints,
     ));
     assert!(why.contains("another project's store"), "{why}");

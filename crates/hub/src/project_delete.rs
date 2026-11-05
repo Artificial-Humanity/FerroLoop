@@ -140,56 +140,6 @@ fn assert_deletable_in_test(path: &Path) {
     );
 }
 
-/// What a test can make go wrong or change at a given step of a deletion. The flow's own code
-/// reaches none of these outside tests.
-#[cfg(test)]
-pub(crate) mod hooks {
-    use std::cell::RefCell;
-
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) enum Fault {
-        /// `delete_area` fails.
-        DeleteArea,
-        /// Writing the edited config fails.
-        WriteConfig,
-        /// `remove_dir_all` fails.
-        RemoveDir,
-    }
-
-    #[derive(Default)]
-    pub(crate) struct Hooks {
-        pub(crate) fault: Option<Fault>,
-        pub(crate) after_unregister: Option<Box<dyn FnOnce()>>,
-    }
-
-    thread_local! {
-        pub(crate) static HOOKS: RefCell<Hooks> = RefCell::new(Hooks::default());
-    }
-
-    pub(crate) fn fails(which: Fault) -> bool {
-        HOOKS.with(|h| h.borrow().fault == Some(which))
-    }
-
-    pub(crate) fn run_after_unregister() {
-        let hook = HOOKS.with(|h| h.borrow_mut().after_unregister.take());
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-
-    pub(crate) fn inject(fault: Fault) {
-        HOOKS.with(|h| h.borrow_mut().fault = Some(fault));
-    }
-
-    pub(crate) fn after_unregister(f: impl FnOnce() + 'static) {
-        HOOKS.with(|h| h.borrow_mut().after_unregister = Some(Box::new(f)));
-    }
-
-    pub(crate) fn reset() {
-        HOOKS.with(|h| *h.borrow_mut() = Hooks::default());
-    }
-}
-
 /// How far below the home directory [`locate_workspace_roots`] looks for a workspace.
 const HOME_SCAN_DEPTH: usize = 2;
 /// The most entries of one directory [`locate_workspace_roots`] reads.
@@ -1000,4 +950,54 @@ where
         }
     }
     Ok(outcome)
+}
+
+/// What a test can make go wrong or change at a given step of a deletion. The flow's own code
+/// reaches none of these outside tests.
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Fault {
+        /// `delete_area` fails.
+        DeleteArea,
+        /// Writing the edited config fails.
+        WriteConfig,
+        /// `remove_dir_all` fails.
+        RemoveDir,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Hooks {
+        pub(crate) fault: Option<Fault>,
+        pub(crate) after_unregister: Option<Box<dyn FnOnce()>>,
+    }
+
+    thread_local! {
+        pub(crate) static HOOKS: RefCell<Hooks> = RefCell::new(Hooks::default());
+    }
+
+    pub(crate) fn fails(which: Fault) -> bool {
+        HOOKS.with(|h| h.borrow().fault == Some(which))
+    }
+
+    pub(crate) fn run_after_unregister() {
+        let hook = HOOKS.with(|h| h.borrow_mut().after_unregister.take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    pub(crate) fn inject(fault: Fault) {
+        HOOKS.with(|h| h.borrow_mut().fault = Some(fault));
+    }
+
+    pub(crate) fn after_unregister(f: impl FnOnce() + 'static) {
+        HOOKS.with(|h| h.borrow_mut().after_unregister = Some(Box::new(f)));
+    }
+
+    pub(crate) fn reset() {
+        HOOKS.with(|h| *h.borrow_mut() = Hooks::default());
+    }
 }
