@@ -409,4 +409,170 @@ describe("Settings Projects tab", () => {
     fireEvent.click(screen.getByTestId("settings-project-edit-ferroloop"));
     fireEvent.click(screen.getByTestId("settings-project-delete-ferroloop"));
   });
+
+  describe("create flow", () => {
+    const NEW_GROUP: ProjectSummary = {
+      id: "council",
+      slug: "council",
+      name: "Council",
+      kind: "virtual",
+      path: null,
+      has_git: false,
+      purpose: "Cross-project scope",
+      tracker: null,
+      store_path: null,
+      active_agent_count: 0,
+    };
+
+    const createHandler =
+      (created: ProjectSummary) =>
+      (url: string, method: string): Response | null =>
+        url.endsWith("/api/v1/projects") && method === "POST"
+          ? json(created, 201)
+          : null;
+
+    it("opens the New Project modal from the create button", async () => {
+      const { client } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      expect(screen.getByTestId("new-project-modal")).toBeInTheDocument();
+    });
+
+    it("shows the new card and calls onProjectsChanged once after a create", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client, calls } = makeClient(
+        [PLAIN, GIT, GROUP],
+        createHandler(NEW_GROUP),
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Council" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-purpose"), {
+        target: { value: "Cross-project scope" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(screen.getByTestId("settings-tab-projects")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      const card = screen.getByTestId("settings-project-card-council");
+      expect(card).toHaveTextContent("Council");
+      expect(card).toHaveTextContent("Workspace Root");
+      expect(onProjectsChanged).toHaveBeenCalledTimes(1);
+      expect(
+        calls.find((c) => c.method === "POST" && c.url.endsWith("/api/v1/projects"))
+          ?.body,
+      ).toEqual({
+        name: "Council",
+        slug: "council",
+        kind: "virtual",
+        purpose: "Cross-project scope",
+      });
+    });
+
+    it("replaces an existing card with the same slug instead of duplicating it", async () => {
+      const renamed = { ...PLAIN, name: "Sonora Renamed" };
+      const { client } = makeClient([PLAIN], createHandler(renamed));
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Other" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-path"), {
+        target: { value: "/work/other" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(screen.getAllByTestId("settings-project-card-sonora")).toHaveLength(1);
+      expect(screen.getByTestId("settings-project-card-sonora")).toHaveTextContent(
+        "Sonora Renamed",
+      );
+    });
+
+    it("rejects a slug already on the list without calling the hub", async () => {
+      const { client, calls } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Sonora" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-path"), {
+        target: { value: "/work/s" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(
+        calls.filter((c) => c.method === "POST" && c.url.endsWith("/api/v1/projects")),
+      ).toHaveLength(0);
+      expect(screen.getByTestId("new-project-slug")).toHaveAttribute(
+        "aria-invalid",
+        "true",
+      );
+    });
+
+    it("Escape closes only the New Project modal, not Settings", async () => {
+      const onClose = vi.fn();
+      const { client } = makeClient();
+      await renderModal(client, { onClose });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.queryByTestId("new-project-modal")).toBeNull();
+      expect(onClose).not.toHaveBeenCalled();
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns focus to the create button after closing", async () => {
+      const { client } = makeClient();
+      await renderModal(client);
+      await openProjectsTab();
+      const btn = screen.getByTestId("settings-projects-create-btn");
+      btn.focus();
+      fireEvent.click(btn);
+      expect(screen.getByTestId("new-project-name")).toHaveFocus();
+      fireEvent.click(screen.getByTestId("new-project-cancel"));
+      expect(btn).toHaveFocus();
+    });
+
+    it("keeps the Projects tab and shows the server error on a failed create", async () => {
+      const onProjectsChanged = vi.fn();
+      const { client } = makeClient([PLAIN], (url, method) =>
+        url.endsWith("/api/v1/projects") && method === "POST"
+          ? json({ error: "slug already registered" }, 409)
+          : null,
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Fresh" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-path"), {
+        target: { value: "/work/fresh" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(screen.getByTestId("new-project-error")).toHaveTextContent(
+        /slug already registered/,
+      );
+      expect(screen.getByTestId("new-project-name")).toHaveValue("Fresh");
+      expect(onProjectsChanged).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("settings-project-card-fresh")).toBeNull();
+    });
+  });
 });

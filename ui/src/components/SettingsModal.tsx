@@ -49,6 +49,7 @@ import {
   ProjectsSettingsTab,
   type ProjectsArtifactsDirProps,
 } from "./settings/ProjectsSettingsTab";
+import { NewProjectModal } from "./settings/NewProjectModal";
 
 export {
   ACP_CONFORMANCE_OPERATIONS,
@@ -796,6 +797,8 @@ export interface SettingsModalProps {
   ) => void;
   onLogout?: () => void;
   onAgentsUpdated?: () => void;
+  /** Called after a project or virtual group is created, edited or deleted. */
+  onProjectsChanged?: () => void;
   onDecommissionAgent?: (
     targetId: string,
     mode: DecommissionMode,
@@ -1350,6 +1353,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenAgentSettings,
   onLogout,
   onAgentsUpdated,
+  onProjectsChanged,
   onDecommissionAgent,
   onBulkSessionAction,
   themeMode: propThemeMode,
@@ -1460,6 +1464,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [projectList, setProjectList] = useState<ProjectSummary[]>([]);
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -1754,6 +1759,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      // The New Project modal handles its own Escape.
+      if (newProjectOpen) return;
       if (artifactsDirModalTarget) {
         if (!changingArtifactsDir) {
           setArtifactsDirModalTarget(null);
@@ -1780,6 +1787,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
   }, [
     isOpen,
+    newProjectOpen,
     artifactsDirModalTarget,
     changingArtifactsDir,
     recastModalAgentKey,
@@ -4853,6 +4861,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 setActiveTab("agents");
               }}
               artifactsDir={projectArtifactsDirProps}
+              onCreate={() => setNewProjectOpen(true)}
             />
           </div>
         )}
@@ -10205,6 +10214,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           );
         })()}
+
+        <NewProjectModal
+          isOpen={newProjectOpen}
+          apiClient={apiClient ?? new HubApiClient()}
+          existingSlugs={projectList.map((p) => p.slug)}
+          onClose={() => setNewProjectOpen(false)}
+          onCreated={(created) => {
+            setProjectList((prev) =>
+              prev.some((p) => p.slug === created.slug)
+                ? prev.map((p) => (p.slug === created.slug ? created : p))
+                : [...prev, created],
+            );
+            onProjectsChanged?.();
+          }}
+        />
 
         {/* System / Project Change Artifacts Directory Sub-Modal (Issue #207) */}
         {artifactsDirModalTarget && (() => {
