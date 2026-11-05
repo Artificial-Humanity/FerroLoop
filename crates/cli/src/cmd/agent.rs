@@ -622,6 +622,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 node_id,
                 hosted: Some(hosted),
                 cwd,
+                context_window: None,
             }
             .with_default_cwd(
                 store,

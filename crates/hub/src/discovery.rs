@@ -3279,11 +3279,19 @@ const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
 /// the sizes the model offers (`context_windows`). `None` when the cache, the model or a
 /// positive window is missing.
 fn grok_catalog_windows(tpath: &Path, model_id: &str) -> Option<(Option<u64>, Vec<u64>)> {
-    #[cfg(test)]
-    cost_counters::bump(&cost_counters::GROK_CATALOG_READS);
     let grok_dir = tpath
         .ancestors()
         .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".grok"))?;
+    grok_catalog_windows_in(grok_dir, model_id)
+}
+
+/// [`grok_catalog_windows`] for a known Grok data directory (`<home>/.grok`).
+pub(crate) fn grok_catalog_windows_in(
+    grok_dir: &Path,
+    model_id: &str,
+) -> Option<(Option<u64>, Vec<u64>)> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::GROK_CATALOG_READS);
     let cache = read_json_file(&grok_dir.join("models_cache.json"))?;
     let info = cache.get("models")?.get(model_id)?.get("info")?;
     let window = info

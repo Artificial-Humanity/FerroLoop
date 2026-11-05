@@ -390,6 +390,21 @@ fn plain_models_accept_one_window_tag_and_nothing_else_in_brackets() {
 }
 
 #[test]
+fn a_record_without_a_window_serialises_as_before_and_old_records_still_load() {
+    let store = MemStore::default();
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    spin(&store, &fake.env(home.path()), "ada", "muse");
+    let record = record_of(&store);
+    assert_eq!(record.context_window, None);
+    let mut json = serde_json::to_value(&record).unwrap();
+    assert!(json.get("context_window").is_none(), "{json}");
+    json["context_window"] = serde_json::json!(500_000);
+    let with: HostedSessionRecord = serde_json::from_value(json).unwrap();
+    assert_eq!(with.context_window, Some(500_000));
+}
+
+#[test]
 fn plain_models_reject_flags_and_invalid_ids() {
     let long = "a".repeat(65);
     for invalid in [

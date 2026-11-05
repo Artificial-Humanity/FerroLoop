@@ -467,7 +467,7 @@ pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
 
 /// Split a trailing context-window tag (`[1m]`, `[200k]`: one to four digits, then lower-case
 /// `k` or `m`) off a model id. `None` for an id with no such tag.
-fn split_window_tag(id: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_window_tag(id: &str) -> Option<(&str, &str)> {
     let open = id.rfind('[')?;
     let (base, tag) = id.split_at(open);
     let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
@@ -911,6 +911,29 @@ pub struct SpinUpRequest {
     pub hosted: Option<bool>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The context window to give the session, in tokens. Validated against the vendor and model
+    /// ([`crate::context_window::validate_context_window`]) and recorded; Grok and Claude only.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_context_window",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<u64>,
+}
+
+/// `context_window` from JSON: absent or `null` is none; anything but a non-negative integer is
+/// refused with a message that says what is wanted.
+fn deserialize_context_window<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value>>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            serde::de::Error::custom("context_window must be a positive integer number of tokens")
+        }),
+    }
 }
 
 impl SpinUpRequest {
@@ -949,6 +972,7 @@ struct ValidSpinUp {
     node_id: String,
     hosted: bool,
     cwd: Option<String>,
+    context_window: Option<u64>,
 }
 
 fn trimmed_opt(raw: &Option<String>) -> Option<String> {
@@ -1154,6 +1178,7 @@ impl SpinUpRequest {
             node_id,
             hosted: self.hosted.unwrap_or(true),
             cwd,
+            context_window: self.context_window,
         })
     }
 }
@@ -1173,6 +1198,9 @@ pub struct SpinUpResponse {
     pub tmux_target: Option<String>,
     pub hydration_dispatched: bool,
     pub prompt: Option<String>,
+    /// The context window recorded for the session, in tokens, when one was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// Whether this spin-up started the session's `tmux` runtime. `false` when the session is
     /// not hosted, runtime calls are off, or the start failed (tmux failed, or a session of the
     /// name already runs).
@@ -1197,6 +1225,10 @@ pub struct HostedSessionRecord {
     pub restart_count: u32,
     pub tmux_target: Option<String>,
     pub cwd: Option<String>,
+    /// The context window chosen for the session, in tokens. Validated and recorded; whether and
+    /// how a launch applies it is separate. Absent when none was chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     pub hydration_dispatched: bool,
     /// Whether this lifecycle created the tmux session; only then does teardown kill it.
     #[serde(default)]
@@ -2175,6 +2207,17 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
     caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let mut v = req.validate()?;
+    // Before any side effect: a window the vendor does not offer registers nothing. It is only
+    // recorded here; the launch below does not apply it.
+    if let Some(tokens) = v.context_window {
+        crate::context_window::validate_context_window(
+            &v.vendor,
+            v.model.as_deref(),
+            tokens,
+            env.home_override,
+        )
+        .map_err(LifecycleError::Invalid)?;
+    }
     if v.cwd.is_none() {
         v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root);
     }
@@ -2222,6 +2265,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
         tmux_target: tmux_target.clone(),
         cwd: v.cwd.clone(),
+        context_window: v.context_window,
         hydration_dispatched: false,
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
@@ -2291,6 +2335,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         tmux_target,
         hydration_dispatched,
         prompt: Some(prompt),
+        context_window: v.context_window,
     })
 }
 
@@ -2462,6 +2507,7 @@ fn record_for_target<S: AgentRegistry>(
         restart_count: 0,
         tmux_target: None,
         cwd: None,
+        context_window: None,
         hydration_dispatched: false,
         runtime_spawned: false,
         created_at_ms: now,
@@ -2952,6 +2998,8 @@ impl RemodelPlan {
             node_id: Some(self.to.node_id.clone()),
             hosted: Some(self.to.hosted),
             cwd: self.to.cwd.clone(),
+            // A window is chosen for one vendor and model: a remodel starts without one.
+            context_window: None,
         }
     }
 }
@@ -3095,6 +3143,7 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
         // The new session keeps the old one's `hosted`; with no record, spin-up's default.
         hosted: req.hosted.or(old.map(|r| r.hosted)),
         cwd: req.cwd.clone().or_else(|| old_cwd.clone()),
+        context_window: None,
     }
     .validate()?;
     // Before the teardown: a remodel onto an API vendor with no key would retire the old
@@ -3116,6 +3165,8 @@ fn plan_remodel<S: AgentRegistry + StateStore>(
             node_id: Some(old_node),
             hosted: Some(old.is_some_and(|r| r.hosted)),
             cwd: old_cwd,
+            // A restore must not fail on a window: it puts the session back as it can start.
+            context_window: None,
         });
     // With no restore, a failed spin-up leaves the persona down; only the Owner may take that
     // risk (the remodel then warns that no restore is possible).
@@ -5588,6 +5639,7 @@ mod tests {
             restart_count: 0,
             tmux_target: Some(format!("{}:{vendor}", capitalize(persona))),
             cwd: None,
+            context_window: None,
             hydration_dispatched: false,
             runtime_spawned: spawned,
             created_at_ms: 1,

@@ -6402,12 +6402,22 @@ fn handle_post_session_spin_up(
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
+    // Choosing a window is an Owner decision, like the hub-wide defaults.
+    if payload.context_window.is_some() && !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may choose a session's context window" }),
+        );
+    }
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
     // A virtual scope has no directory of its own: its agents start in the workspace root.
-    let payload =
+    let mut payload =
         payload.with_default_cwd(&*store, &resolve_workspace_root(&state.config.repo_root));
+    if payload.context_window.is_none() {
+        payload.context_window = default_context_window_for(state, &payload);
+    }
     match lifecycle::spin_up(
         &*store,
         &lifecycle_env(state),
@@ -6425,6 +6435,20 @@ fn handle_post_session_spin_up(
         }
         Err(e) => lifecycle_error_response(&e),
     }
+}
+
+/// The hub-wide context window default for the vendor of `req`, when it suits the requested
+/// model; `None` when there is no default or it is stale (never an error).
+fn default_context_window_for(state: &HubState, req: &SpinUpRequest) -> Option<u64> {
+    let home = hub_home_dir(state)?;
+    let defaults = settings::load(&home).context_window_defaults;
+    let vendor = req.vendor.trim().to_ascii_lowercase();
+    let model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    crate::context_window::applicable_default(&defaults, &vendor, model, Some(&home))
 }
 
 /// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see

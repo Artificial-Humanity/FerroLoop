@@ -78,6 +78,12 @@ pub(crate) struct Settings {
     /// rules as [`Settings::artifacts_dir`]; changed only through
     /// `POST /api/v1/projects/:id/artifacts-dir`.
     pub project_artifacts_dirs: BTreeMap<String, String>,
+    /// The context window, in tokens, a spin-up of a vendor gets when it names none, keyed by
+    /// vendor. Only vendors whose window is selectable (see [`crate::context_window`]) can
+    /// appear. A default that does not suit the spun-up model is ignored, never an error.
+    /// Omitted from the JSON when empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub context_window_defaults: BTreeMap<String, u64>,
 }
 
 impl Default for Settings {
@@ -103,6 +109,7 @@ impl Default for Settings {
             attachment_retention_days: DEFAULT_ATTACHMENT_RETENTION_DAYS,
             artifacts_dir: None,
             project_artifacts_dirs: BTreeMap::new(),
+            context_window_defaults: BTreeMap::new(),
         }
     }
 }
@@ -129,6 +136,9 @@ pub(crate) struct SettingsPatch {
     pub hub_connection: Option<HubConnectionPatch>,
     /// See [`Settings::attachment_retention_days`]. A value above 365 is refused.
     pub attachment_retention_days: Option<u64>,
+    /// See [`Settings::context_window_defaults`]. Merged per vendor: a number sets that vendor's
+    /// default and `null` removes it; vendors the patch does not name keep theirs.
+    pub context_window_defaults: Option<BTreeMap<String, Option<u64>>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -238,6 +248,20 @@ impl Settings {
             }
             next.attachment_retention_days = days;
         }
+        if let Some(defaults) = patch.context_window_defaults {
+            for (vendor, tokens) in defaults {
+                match tokens {
+                    Some(tokens) => {
+                        crate::context_window::validate_default(&vendor, tokens)
+                            .map_err(|why| format!("context_window_defaults.{vendor}: {why}"))?;
+                        next.context_window_defaults.insert(vendor, tokens);
+                    }
+                    None => {
+                        next.context_window_defaults.remove(&vendor);
+                    }
+                }
+            }
+        }
         Ok(next)
     }
 
@@ -343,6 +367,20 @@ impl Settings {
                 if let Some(dir) = dir.as_str().filter(|d| slug_ok && is_valid_stored_dir(d)) {
                     s.project_artifacts_dirs
                         .insert(slug.clone(), dir.to_string());
+                }
+            }
+        }
+        if let Some(map) = root
+            .get("context_window_defaults")
+            .and_then(Value::as_object)
+        {
+            for (vendor, tokens) in map {
+                // A stored entry that no longer passes is dropped, not an error.
+                if let Some(tokens) = tokens
+                    .as_u64()
+                    .filter(|&t| crate::context_window::validate_default(vendor, t).is_ok())
+                {
+                    s.context_window_defaults.insert(vendor.clone(), tokens);
                 }
             }
         }
@@ -521,6 +559,51 @@ mod tests {
         let again = update_artifact_dirs(tmp.path(), |s| s.artifacts_dir = None).unwrap();
         assert_eq!(again.timezone, "Asia/Tokyo");
         assert_eq!(again.artifacts_dir, None);
+    }
+
+    #[test]
+    fn context_window_defaults_merge_per_vendor_and_drop_stored_invalid_entries() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let set = update(
+            tmp.path(),
+            patch(json!({ "context_window_defaults": { "grok": 500_000 } })),
+        )
+        .unwrap();
+        assert_eq!(set.context_window_defaults.get("grok"), Some(&500_000));
+        assert_eq!(load(tmp.path()), set);
+        // Refused: nothing changes.
+        for bad in [
+            json!({ "claude": 1_000_000 }),
+            json!({ "codex": 1 }),
+            json!({ "grok": 0 }),
+        ] {
+            let res = update(tmp.path(), patch(json!({ "context_window_defaults": bad })));
+            assert!(matches!(res, Err(UpdateError::Invalid(_))), "{bad}");
+        }
+        assert_eq!(load(tmp.path()), set);
+        // Stored entries that no longer pass are dropped on load, the rest is kept.
+        let doc = json!({
+            "timezone": "Asia/Tokyo",
+            "context_window_defaults": { "grok": 256_000, "claude": 200_000, "codex": 1, "x": "y" },
+        });
+        std::fs::write(settings_path(tmp.path()), doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(
+            loaded.context_window_defaults,
+            BTreeMap::from([("grok".to_string(), 256_000)])
+        );
+        assert_eq!(loaded.timezone, "Asia/Tokyo");
+        // Empty: the key is not written.
+        let cleared = update(
+            tmp.path(),
+            patch(json!({ "context_window_defaults": { "grok": null } })),
+        )
+        .unwrap();
+        assert!(cleared.context_window_defaults.is_empty());
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(settings_path(tmp.path())).unwrap()).unwrap();
+        assert!(doc.get("context_window_defaults").is_none());
     }
 
     #[test]
