@@ -2273,10 +2273,11 @@ pub struct DecommissionResponse {
     pub unregistered: bool,
     pub runtime_stopped: bool,
     /// What the teardown did to the tmux restore source (the newest tmux-resurrect save), so a
-    /// host reboot does not start the stopped session again. The session is pruned only when it
-    /// is not running after the teardown; one that still runs is reported as `running` and left
-    /// alone. `None` when the teardown made no runtime call, and for a Muse window (the shared
-    /// session stays). A failure is reported here and never fails the teardown.
+    /// host reboot does not start the stopped session again. What is pruned matches what is gone:
+    /// the whole session when it is gone, only the window when a window of a session that stays
+    /// (the shared Muse session) is gone. A runtime that still runs after the teardown is
+    /// reported as `running` and left alone. `None` when the teardown made no runtime call. A
+    /// failure is reported here and never fails the teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_source: Option<crate::restore_source::RestoreSourceOutcome>,
     pub prompt: Option<String>,
@@ -2662,23 +2663,27 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             // The unit, not the session: a Muse window is killed alone, never the shared session.
             let unit = runtime_unit(tmux_target);
             let gone = env.runtime.kill(unit, &record.session_id);
-            // A whole session that is gone must not come back at the next boot restore. A Muse
-            // window is one of several in a shared session that stays, so it is not pruned.
-            if !is_muse_window_target(unit) {
-                restore_source = Some(prune_restore_source(env, unit));
-            }
+            // What was killed must not come back at the next boot restore: the session when it
+            // is gone, else (a Muse window) that window alone.
+            restore_source = Some(prune_unit_after_stop(env, unit));
             // The runtime is gone, so the decommissioned record must not claim it any more.
             record.runtime_spawned &= !gone;
             // A window of the name that is not ours is left running: "nothing of ours to kill"
             // clears the claim, but is not a stopped runtime.
             gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
         }
-        // A session this lifecycle did not start is never killed. When it is not running either,
-        // nothing can save it again, so it is pruned from the restore source all the same.
-        (Some(tmux_target), false)
-            if env.spawn_runtime && !is_muse_window_target(runtime_unit(tmux_target)) =>
+        // A runtime this lifecycle did not start is never killed. A record that names no tmux
+        // target (a session adopted by `record_for_target`) is addressed by the target a spin-up
+        // of its vendor would have used. When that runtime is not running, nothing can save it
+        // again, so it is pruned from the restore source all the same; a running one is neither
+        // stopped nor pruned (`running`).
+        (target, false)
+            if env.spawn_runtime && (target.is_some() || vendor_has_runtime(&record.vendor)) =>
         {
-            restore_source = Some(prune_restore_source(env, runtime_unit(tmux_target)));
+            let target = target
+                .clone()
+                .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+            restore_source = Some(prune_unit_after_stop(env, runtime_unit(&target)));
             false
         }
         _ => false,
@@ -2710,19 +2715,43 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     })
 }
 
-/// Prune the tmux session `unit` from the restore source, but only when it is not running: a
-/// running session is saved again by the next resurrect save, so the prune would be undone. The
-/// result says so ([`RestoreSourceOutcome::Running`]); the session is not stopped.
-///
-/// [`RestoreSourceOutcome::Running`]: crate::restore_source::RestoreSourceOutcome::Running
-fn prune_restore_source(
+/// [`prune_after_stop`] for a runtime unit ([`runtime_unit`]): a window unit (`muse:<persona>`)
+/// is `session:window`, a session unit has no window.
+fn prune_unit_after_stop(
     env: &LifecycleEnv<'_>,
     unit: &str,
 ) -> crate::restore_source::RestoreSourceOutcome {
-    if env.runtime.exists(unit) {
-        return crate::restore_source::RestoreSourceOutcome::Running;
+    match unit.split_once(':') {
+        Some((session, window)) => prune_after_stop(env, session, Some(window)),
+        None => prune_after_stop(env, unit, None),
     }
-    crate::restore_source::prune_session(env.home_override, unit)
+}
+
+/// Prune what a teardown stopped from the restore source. The one call a kill path makes after
+/// it has stopped (or found stopped) the tmux runtime `session`, or its window `window`:
+///
+/// - the session is gone: the whole session is pruned;
+/// - the session runs and `window` is given and gone: only that window is pruned (the session's
+///   other windows stay in the save);
+/// - the session or the window still runs: nothing is pruned, because the next resurrect save
+///   would write it back; the result is [`RestoreSourceOutcome::Running`].
+///
+/// [`RestoreSourceOutcome::Running`]: crate::restore_source::RestoreSourceOutcome::Running
+pub(crate) fn prune_after_stop(
+    env: &LifecycleEnv<'_>,
+    session: &str,
+    window: Option<&str>,
+) -> crate::restore_source::RestoreSourceOutcome {
+    use crate::restore_source::{RestoreSourceOutcome, prune_session, prune_window};
+    if !env.runtime.exists(session) {
+        return prune_session(env.home_override, session);
+    }
+    match window {
+        Some(window) if !env.runtime.exists(&format!("{session}:{window}")) => {
+            prune_window(env.home_override, session, window)
+        }
+        _ => RestoreSourceOutcome::Running,
+    }
 }
 
 /// `POST /api/v1/hosted-sessions/:id/restart` response: the updated record plus the reforge prompt.

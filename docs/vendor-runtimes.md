@@ -38,25 +38,35 @@ in the transcript.
 A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three
 rules for what comes back.
 
-**A decommission leaves nothing to restore.** A teardown removes the session's `pane`, `window`
-and `grouped_session` lines from the newest tmux-resurrect save (the file the `last` link names,
-else the newest `tmux_resurrect_*.txt`). A `last` link that points outside the directory is not
-followed. A `state` line (the client's session and last session) is kept; only the field that
-names the session is emptied. The directory is `FL_TMUX_RESURRECT_DIR` when set, else
-`~/.tmux/resurrect` when it exists, else `$XDG_DATA_HOME/tmux/resurrect`. A hub that runs with a
-home override ignores `FL_TMUX_RESURRECT_DIR`. Hub edits the file itself (temp file, rename) and
-does not run the plugin's `save.sh`. The first prune of a save keeps the old content as
-`<save>.bak`; a later prune keeps that first backup. A save that does not name the session is not
-touched. A continuum save that started before the session was killed can still write the session
-back after the prune.
+**A decommission leaves nothing to restore.** A teardown removes what it stopped from the newest
+tmux-resurrect save (the file the `last` link names, else the newest `tmux_resurrect_*.txt`). A
+`last` link that points outside the directory is not followed. What goes matches what is gone:
+
+- A session that is gone: its `pane`, `window` and `grouped_session` lines. A `state` line (the
+  client's session and last session) is kept; only the field that names the session is emptied.
+- One window of a session that stays (a window of the shared `muse` session): its `window` line
+  and the `pane` lines of that window. A `pane` line carries only the window index, so Hub maps the
+  window name to the index first. The session's other windows, its `state` lines and its
+  `grouped_session` lines stay. The shared `muse` session itself is pruned only when it is gone.
+
+The directory is `FL_TMUX_RESURRECT_DIR` when set, else `~/.tmux/resurrect` when it exists, else
+`$XDG_DATA_HOME/tmux/resurrect`. A hub that runs with a home override ignores
+`FL_TMUX_RESURRECT_DIR`. Hub edits the file itself (a temp file with the permissions of the save,
+flushed to disk, then a rename) and does not run the plugin's `save.sh`. The first prune of a save
+keeps the old content as `<save>.bak`; a later prune keeps that first backup. A backup that cannot
+be written stops the prune. The directory keeps the newest five `tmux_resurrect_*.txt.bak` files;
+older ones are removed, and files of other names are never touched. A save that does not name the
+session or window is not touched. A continuum save that started before the runtime was killed can
+still write it back after the prune.
 
 The result is the `restore_source` field of the teardown response: `pruned`, `clean`, `no_save`,
-`running` or `failed`. It is absent when the teardown made no runtime call, and for a window of
-the shared Muse session (that session stays). `failed` and `no_save` never fail the teardown.
-Hub prunes a session only when the session is not running after the teardown: a session that Hub
-started is killed and pruned, and a session that Hub did not start is pruned only if it is
-already gone. A running session that Hub did not start is neither killed nor pruned; the result
-is `running`.
+`running` or `failed`. It is absent when the teardown made no runtime call. `failed` and `no_save`
+never fail the teardown. Hub prunes only what is not running after the teardown: a runtime that
+Hub started is killed and then pruned, and a runtime that Hub did not start is pruned only if it
+is already gone. A session found without a hosted record (a hand-started one) is addressed by the
+target a spin-up of its vendor would use (`<Display>` for a session, `muse:<persona>` for Muse)
+and follows the same rule. A runtime that still runs and that Hub did not start is neither killed
+nor pruned; the result is `running`.
 
 **A restored pane of a retired or unknown persona gets no route.** When `fl hub serve` starts,
 Hub lists the tmux panes. For each pane that runs a vendor CLI, the persona is the pane's tmux
