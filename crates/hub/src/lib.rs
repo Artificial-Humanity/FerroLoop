@@ -6973,6 +6973,122 @@ mod tests {
     }
 
     #[test]
+    fn the_claude_settings_model_is_never_a_live_report_for_any_operator_override() {
+        use fl_wire::identity::VendorRoute;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let project = tmp.path().join(".claude/projects/p");
+        fs::create_dir_all(&project).unwrap();
+        let settings = tmp.path().join(".claude/settings.json");
+        let set_mtime = |path: &std::path::Path, secs: u64| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        // Each session's own transcript names the model it runs.
+        let write_transcript = |persona: &str, model: &str, secs: u64| {
+            let path = project.join(format!("cs-{persona}.jsonl"));
+            let line = json!({
+                "type": "assistant",
+                "message": { "role": "assistant", "model": model },
+            });
+            fs::write(&path, line.to_string()).unwrap();
+            set_mtime(&path, secs);
+        };
+        // ~/.claude/settings.json is one global file shared by every Claude session.
+        let write_settings = |body: Value, secs: u64| {
+            fs::write(&settings, body.to_string()).unwrap();
+            set_mtime(&settings, secs);
+        };
+        for persona in ["ada", "bea"] {
+            write_transcript(persona, "claude-opus-5-5", 1_000);
+            install_route(
+                tmp.path(),
+                persona,
+                VendorRoute::Claude {
+                    pid: 0,
+                    session_id: format!("cs-{persona}"),
+                    socket_path: tmp.path().join(format!("{persona}.sock")),
+                    key_path: None,
+                },
+            );
+        }
+        write_settings(json!({ "model": "claude-opus-4-1" }), 500);
+        let listed = |id: &str| {
+            let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+            let sessions = listed.json_value().unwrap()["sessions"].clone();
+            let session = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap_or_else(|| panic!("session {id} is listed"))
+                .clone();
+            assert!(session.get("model_is_default").is_none(), "{session}");
+            session
+        };
+        let assert_both_overrides_hold = |step: &str| {
+            let ada = listed("cs-ada");
+            assert_eq!(ada["model"], "claude-sonnet-5-5", "{step}");
+            assert_eq!(ada["thinking_level"], "low", "{step}");
+            let bea = listed("cs-bea");
+            assert_eq!(bea["model"], "claude-haiku-4-5", "{step}");
+            assert_eq!(bea["thinking_level"], "high", "{step}");
+            assert!(state.session_model_override("cs-ada").is_some(), "{step}");
+            assert!(state.session_model_override("cs-bea").is_some(), "{step}");
+        };
+
+        for (persona, model, effort) in [
+            ("ada", "claude-sonnet-5-5", "low"),
+            ("bea", "claude-haiku-4-5", "high"),
+        ] {
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{persona}/model"),
+                OWNER,
+                &json!({ "model": model, "thinking_level": effort }),
+            );
+            assert_eq!(resp.status, 200, "{persona}: {}", error_text(&resp));
+        }
+        // The transcripts are newer than settings.json: each session's own report is the
+        // baseline, and the choices show.
+        assert_both_overrides_hold("transcripts newer than settings.json");
+
+        // An unrelated settings write (the model is unchanged) makes settings.json newer than
+        // both transcripts. It says nothing about either session.
+        write_settings(
+            json!({
+                "model": "claude-opus-4-1",
+                "permissions": { "allow": ["Bash(ls)"] },
+            }),
+            2_000,
+        );
+        assert_both_overrides_hold("an unrelated settings.json key");
+        // A new `model` in settings.json (a `/model` switch in some other session or terminal)
+        // is the global default, not a report about these two sessions.
+        write_settings(json!({ "model": "claude-opus-4-0" }), 3_000);
+        assert_both_overrides_hold("a different settings.json model");
+        write_settings(
+            json!({ "model": "claude-opus-4-1", "effortLevel": "max" }),
+            4_000,
+        );
+        assert_both_overrides_hold("a different settings.json model and effort");
+
+        // One session's own transcript later names another model: that is a real report. Its
+        // override goes, and the other session keeps its choice.
+        write_transcript("ada", "claude-sonnet-4-5", 5_000);
+        let ada = listed("cs-ada");
+        assert_eq!(ada["model"], "claude-sonnet-4-5");
+        assert!(state.session_model_override("cs-ada").is_none());
+        let bea = listed("cs-bea");
+        assert_eq!(bea["model"], "claude-haiku-4-5");
+        assert_eq!(bea["thinking_level"], "high");
+        assert!(state.session_model_override("cs-bea").is_some());
+    }
+
+    #[test]
     fn model_override_is_dropped_on_reset_spin_up_and_teardown() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

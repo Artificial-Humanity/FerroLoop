@@ -1735,10 +1735,14 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 }
 
 /// A Claude session's model and effort. The transcript names the session's own model (a turn's
-/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` wins
+/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` shows
 /// when it was written after the transcript: a model changed in the Claude app or in that file
 /// shows at once, before any new transcript line exists. Without a transcript signal,
 /// `settings.json` supplies the model.
+///
+/// `settings.json` is one global file shared by every Claude session, so a model that came from
+/// it is never evidence about this session: it is always flagged `model_is_default`, newer than
+/// the transcript or not. Only a transcript signal counts as a live report.
 fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
     let transcript = transcript_path.map(Path::new);
     let from_transcript = transcript
@@ -1766,8 +1770,9 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
             let model = settings_model.clone().unwrap_or_default();
             // The transcript's command effort still holds when settings.json names that model.
             let effort = settings_effort(&model).or(effort.filter(|_| signal == model));
-            // A settings.json written after the transcript is a deliberate live report.
-            (Some(model), effort, false)
+            // It shows, but it is the global default and says nothing about this session
+            // (any session or write may have changed the file): never a live report.
+            (Some(model), effort, true)
         }
         Some((model, effort)) => {
             let effort = effort.or_else(|| settings_effort(&model));
@@ -1775,11 +1780,9 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         }
         None => {
             let effort = settings_model.as_deref().and_then(settings_effort);
-            // No transcript signal: settings.json is a default, not what the session runs,
-            // unless it was written after the transcript (a deliberate live report, as in the
-            // arm above). With no transcript at all `settings_newer` is false, so it stays a
-            // default.
-            let is_default = settings_model.is_some() && !settings_newer;
+            // No transcript signal: settings.json is the global default, not what this
+            // session runs, whether or not it is newer than the transcript.
+            let is_default = settings_model.is_some();
             (settings_model, effort, is_default)
         }
     };
@@ -8643,7 +8646,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_settings_default_is_flagged_but_a_newer_settings_report_is_not() {
+    fn claude_settings_model_is_always_flagged_and_a_transcript_model_never_is() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let claude = home.join(".claude");
@@ -8671,11 +8674,12 @@ mod tests {
         assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
         assert!(!info.model_is_default);
 
-        // settings.json written afterwards is a deliberate live report: it wins, and is real.
+        // settings.json written afterwards still shows, but it is one global file shared by
+        // every session, so it is never a live report about this one: flagged.
         set_mtime_secs(&settings, 3_000);
         let info = claude_model_info(Some(tp), Some(home));
         assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
-        assert!(!info.model_is_default);
+        assert!(info.model_is_default);
 
         // No model anywhere: nothing to flag.
         let bare = TempDir::new().unwrap();
@@ -8685,7 +8689,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_settings_is_a_default_only_when_not_newer_than_a_modelless_transcript() {
+    fn claude_settings_model_stays_flagged_with_a_modelless_transcript_whether_newer_or_older() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let claude = home.join(".claude");
@@ -8695,21 +8699,21 @@ mod tests {
         let transcript = home.join("t.jsonl");
         let tp = transcript.to_str().unwrap();
 
-        // No transcript at all: nothing is newer, so settings.json stays a default.
+        // No transcript at all: settings.json is a default.
         let info = claude_model_info(None, Some(home));
         assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
         assert!(info.model_is_default);
 
-        // A transcript with no model signal, older than settings.json: the user switched model
-        // in the Claude app after the session began, a deliberate live report.
+        // A transcript with no model signal, older than settings.json: the model still shows,
+        // but settings.json is a global file, so it is flagged as a default all the same.
         fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
         set_mtime_secs(&transcript, 1_000);
         set_mtime_secs(&settings, 2_000);
         let info = claude_model_info(Some(tp), Some(home));
         assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
-        assert!(!info.model_is_default);
+        assert!(info.model_is_default);
 
-        // The same transcript, newer than settings.json: settings.json is only a default.
+        // The same transcript, newer than settings.json: flagged too.
         set_mtime_secs(&settings, 500);
         let info = claude_model_info(Some(tp), Some(home));
         assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));

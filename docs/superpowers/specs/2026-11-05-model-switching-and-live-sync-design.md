@@ -71,10 +71,16 @@ ignores it. The fallbacks that set the marker:
   from the config.
 * Grok: `~/.grok/config.toml` `default`, when `summary.json` is missing, too large, or has no
   `current_model_id`.
-* Claude: `~/.claude/settings.json` `model`, when the transcript carries no model signal. A
-  `settings.json` written after the transcript stays a deliberate live report and is not marked.
+* Claude: `~/.claude/settings.json` `model`, whenever the displayed model comes from it: when the
+  transcript carries no model signal, and also when `settings.json` is newer than the transcript
+  (it then still shows, so a change made in the Claude app appears at once). `settings.json` is
+  one global file shared by every Claude session, so it is never evidence about one session: an
+  unrelated write (permissions, hooks, env) or a `/model` switch in another session or terminal
+  would otherwise drop the overrides of every other idle session. Only the session's own
+  transcript (its `/model` command or an assistant message's model) counts as a live report.
 
-The displayed model is unchanged in each case. Only the override decision differs.
+The displayed model is unchanged in each case. Only the override decision differs. A model from a
+global file (Claude `settings.json`) is always marked; a model from the session's own record never is.
 
 **Known limit:** a change made out-of-band *back to the baseline* before the vendor ever
 confirmed the override cannot be told apart from "not applied yet", and the override stays. This
