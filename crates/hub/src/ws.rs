@@ -136,6 +136,8 @@ pub struct HubServer {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     gates: ConnectionGates,
+    /// Set when `serve` reconciles restored tmux panes and agents after a host boot.
+    boot_reconcile: Option<crate::boot_reconcile::Plan>,
 }
 
 impl HubServer {
@@ -152,6 +154,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
+            boot_reconcile: None,
         })
     }
 
@@ -172,6 +175,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
+            boot_reconcile: None,
         })
     }
 
@@ -180,6 +184,31 @@ impl HubServer {
     pub fn with_limits(mut self, limits: ConnectionLimits) -> Self {
         self.gates = ConnectionGates::new(limits);
         self
+    }
+
+    /// Make [`HubServer::serve`] reconcile the host's restored tmux panes with the agent registry
+    /// and tell each active agent once per boot that the host restarted (see
+    /// [`crate::boot_reconcile`]). Off by default: it reads the host's tmux and route table, so
+    /// only the daemon (`fl hub serve`) turns it on.
+    #[must_use]
+    pub fn with_boot_reconcile(mut self) -> Self {
+        self.boot_reconcile = Some(crate::boot_reconcile::Plan::host());
+        self
+    }
+
+    /// [`Self::with_boot_reconcile`] with the host and tmux given, so a test never reads the
+    /// real ones.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_boot_reconcile_plan(mut self, plan: crate::boot_reconcile::Plan) -> Self {
+        self.boot_reconcile = Some(plan);
+        self
+    }
+
+    /// Whether [`Self::serve`] will run the boot reconciliation.
+    #[cfg(test)]
+    pub(crate) fn boot_reconcile_enabled(&self) -> bool {
+        self.boot_reconcile.is_some()
     }
 
     /// Bound local socket address (useful when `config.listen` uses port `0`).
@@ -220,10 +249,23 @@ impl HubServer {
             shutdown_tx: _shutdown_tx,
             mut shutdown_rx,
             gates,
+            boot_reconcile,
             ..
         } = self;
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
+        if let Some(plan) = boot_reconcile {
+            // Not awaited: the reconciliation never holds up the accept loop. It ends with
+            // `serve`: a shutdown stops the passes between two of them.
+            let mut stop = shutdown_rx.clone();
+            let reconcile_state = state.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = crate::boot_reconcile::run(reconcile_state, plan) => {}
+                    _ = stop.wait_for(|down| *down) => {}
+                }
+            });
+        }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.

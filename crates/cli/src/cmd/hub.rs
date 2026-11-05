@@ -467,7 +467,8 @@ fn cmd_serve(
     rt.block_on(async move {
         let server = HubServer::bind(server_config)
             .await
-            .map_err(|e| (2, format!("failed to bind Hub server: {e}")))?;
+            .map_err(|e| (2, format!("failed to bind Hub server: {e}")))?
+            .with_boot_reconcile();
         server.state().set_vault_consumer_config(vault_consumers);
         server.state().set_mcp_switches(move |project| {
             let entry =
