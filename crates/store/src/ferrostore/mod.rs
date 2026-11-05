@@ -1522,7 +1522,7 @@ impl FerroStore {
                 }
             }
             let txn = Txn::new(self.read_state()?);
-            let next = next_mq_seq(&txn, topic)?;
+            let next = state::next_mq_seq_for_memory(&txn, topic)?;
             mq.topics.insert(
                 topic.to_owned(),
                 mq_runtime::Topic {

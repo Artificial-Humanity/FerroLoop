@@ -92,6 +92,89 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stale_high_water_seeds_adaptive_above_every_stored_message_local_and_remote() {
+        fn check(store: &FerroStore) {
+            store
+                .put_doc("mq_hw:events", "high_water", &json!({"seq": 2}))
+                .unwrap();
+            store
+                .put_doc(
+                    "mq:events",
+                    "5",
+                    &json!({"seq":5,"key":"stored","payload":"old"}),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .publish_mq_with("events", "adaptive", &json!(1), MqDurability::Adaptive)
+                    .unwrap(),
+                6
+            );
+            assert_eq!(store.publish_mq("events", "durable", &json!(2)).unwrap(), 7);
+            let records = store.poll_mq_group("events", "g", 10).unwrap();
+            assert_eq!(
+                records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+                [5, 6, 7]
+            );
+            assert_eq!(
+                store.get_doc("mq:events", "5").unwrap().unwrap()["key"],
+                "stored"
+            );
+        }
+        check(&FerroStore::in_memory());
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mq.sock");
+        let _server = FerroStoreServer::bind_unix(&socket, FerroStore::in_memory()).unwrap();
+        let remote = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        check(&remote);
+    }
+
+    #[test]
+    fn adaptive_seed_rejects_corrupt_or_exhausted_high_water() {
+        let corrupt = FerroStore::in_memory();
+        corrupt
+            .put_doc("mq_hw:events", "high_water", &json!({"seq":"invalid"}))
+            .unwrap();
+        assert!(
+            corrupt
+                .publish_mq_with("events", "key", &json!(1), MqDurability::Adaptive)
+                .is_err()
+        );
+        let exhausted = FerroStore::in_memory();
+        exhausted
+            .put_doc("mq_hw:events", "high_water", &json!({"seq":2}))
+            .unwrap();
+        exhausted
+            .put_doc(
+                "mq:events",
+                &u64::MAX.to_string(),
+                &json!({"seq":u64::MAX,"key":"x","payload":null}),
+            )
+            .unwrap();
+        assert!(
+            exhausted
+                .publish_mq_with("events", "key", &json!(1), MqDurability::Adaptive)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_only_sequence_behavior_is_unchanged() {
+        let store = FerroStore::in_memory();
+        store
+            .put_doc("mq_hw:events", "high_water", &json!({"seq":2}))
+            .unwrap();
+        store
+            .put_doc(
+                "mq:events",
+                "5",
+                &json!({"seq":5,"key":"stored","payload":null}),
+            )
+            .unwrap();
+        assert_eq!(store.publish_mq("events", "durable", &json!(1)).unwrap(), 3);
+    }
+
     struct Adapter;
     impl SyncAdapter for Adapter {
         fn name(&self) -> &str {
