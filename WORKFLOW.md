@@ -26,7 +26,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    GitHub.
    If the target reviewer is an agent, ask it for a review over `agent-msg`; the owner is
    reached through the GitHub review request. In summary:
-   * A pull request co-authored by an assisting agent is reviewed by the project Lead.
+   * A pull request co-authored by an assisting agent is reviewed by the project Lead. If the
+     Lead is unavailable for any reason, the Lab Manager (`jarvis`) may review and approve it
+     instead; try the Lead first.
    * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
      The Lab Manager may also approve a Lead-tier pull request.
    * `fl` puts a pull request in the Owner tier when it touches a protected path (the
@@ -71,8 +73,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 The owner permits an author to merge their own pull request once all of these hold:
 
 1. **The required reviewer approved it.** For a pull request by an assisting agent or the
-   UI developer that is the project Lead. For a Lead's pull request it is the Lab Manager
-   (`jarvis`). For an Owner-tier pull request it is the owner. An approval counts only
+   UI developer that is the project Lead, or the Lab Manager (`jarvis`) if the Lead is
+   unavailable for any reason (try the Lead first). For a Lead's pull request it is the Lab
+   Manager. For an Owner-tier pull request it is the owner. An approval counts only
    when the Reviewer GitHub App or the owner posts it, as step 5 describes, and on the
    current head: a push dismisses an earlier approval, so ask for the review again after
    you update the branch.
