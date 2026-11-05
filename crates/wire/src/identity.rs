@@ -168,6 +168,48 @@ pub fn save_decommissioned_session_ids(
     Ok(())
 }
 
+/// Vendors whose `vendor:persona` slug is a hosted session name, not a native id.
+const PERSONA_DERIVED_VENDORS: [&str; 6] =
+    ["claude", "antigravity", "agy", "codex", "muse", "grok"];
+
+/// Discovery placeholders `{prefix}-{persona}` when a route has no native id yet.
+const PERSONA_DERIVED_PREFIXES: [&str; 5] = ["grok", "muse", "webhook", "agy", "codex"];
+
+/// `true` for a hosted slug (`claude:ada`, `agy:ada`) or a discovery placeholder
+/// (`grok-ada`, `codex-ada`, `claude-ada-1234`). Those name the persona, not one
+/// vendor conversation, so a tombstone of them would ban the name.
+pub fn is_persona_derived_id(id: &str) -> bool {
+    let id = id.trim();
+    if id.is_empty() {
+        return false;
+    }
+    if let Some((vendor, persona)) = id.split_once(':') {
+        return PERSONA_DERIVED_VENDORS.contains(&vendor.to_ascii_lowercase().as_str())
+            && validate_slug(persona).is_ok();
+    }
+    let lower = id.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("claude-")
+        && let Some((persona, pid)) = rest.rsplit_once('-')
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && validate_slug(persona).is_ok()
+    {
+        return true;
+    }
+    PERSONA_DERIVED_PREFIXES.iter().any(|prefix| {
+        lower
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|persona| validate_slug(persona).is_ok())
+    })
+}
+
+/// A non-empty id that is a vendor's own session id, not a persona name.
+pub fn is_native_session_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty() && !is_persona_derived_id(id)
+}
+
 pub fn default_routes_path() -> PathBuf {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
         let p = PathBuf::from(rt);
@@ -775,16 +817,16 @@ impl RouteTable {
         self.drop_decommissioned_routes(home_override);
     }
 
-    /// Drop routes whose native id or `vendor:persona` session id was decommissioned.
-    /// A webhook route and an empty session id are kept. The hosted vendor name for an
-    /// Antigravity route is `antigravity`, not the route kind `agy`.
+    /// Drop routes whose native session id was decommissioned.
+    /// A webhook, an empty session id, and a persona-derived id are kept. A later
+    /// route for the same persona with a different native id stays.
     fn drop_decommissioned_routes(&mut self, home_override: Option<&Path>) {
         let banned = load_decommissioned_session_ids(home_override);
         if banned.is_empty() {
             return;
         }
         self.entries
-            .retain(|persona, entry| !route_is_decommissioned(persona, &entry.route, &banned));
+            .retain(|_persona, entry| !route_is_decommissioned(&entry.route, &banned));
     }
 
     /// Merge the routes of every scanner registered with
@@ -1649,25 +1691,14 @@ impl RouteTable {
     }
 }
 
-/// `true` when `route` names a decommissioned native id or `vendor:persona`.
-/// Webhook routes are not vendor sessions. An empty session id matches nothing.
-fn route_is_decommissioned(persona: &str, route: &VendorRoute, banned: &BTreeSet<String>) -> bool {
-    if let Some((_, id)) = route.session_identity()
-        && !id.is_empty()
-        && banned.contains(id)
-    {
-        return true;
-    }
-    let vendor = match route {
-        VendorRoute::Claude { .. } => "claude",
-        VendorRoute::Agy { .. } => "antigravity",
-        VendorRoute::Codex { .. } => "codex",
-        VendorRoute::Muse { .. } => "muse",
-        VendorRoute::Grok { .. } => "grok",
-        VendorRoute::Webhook { .. } => return false,
-    };
-    let hosted = format!("{vendor}:{persona}");
-    banned.iter().any(|id| id.eq_ignore_ascii_case(&hosted))
+/// `true` when `route` names a decommissioned native session id.
+/// Webhook routes are not vendor sessions. An empty id and a persona-derived id
+/// (`vendor:persona`, `grok-ada`, `claude-ada-1234`) match nothing.
+fn route_is_decommissioned(route: &VendorRoute, banned: &BTreeSet<String>) -> bool {
+    matches!(
+        route.session_identity(),
+        Some((_, id)) if is_native_session_id(id) && banned.contains(id)
+    )
 }
 
 struct GrokActiveSession {
@@ -6564,10 +6595,28 @@ mod tests {
         }
     }
 
+    fn agy_route(conversation_id: &str) -> VendorRoute {
+        VendorRoute::Agy {
+            conversation_id: conversation_id.into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        }
+    }
+
+    fn codex_route(thread_id: &str) -> VendorRoute {
+        VendorRoute::Codex {
+            thread_id: thread_id.into(),
+            cwd: None,
+        }
+    }
+
     #[test]
     fn decommissioned_session_ids_are_dropped_on_discovery() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
+        let at = At::from_unix_millis(1);
         let ids = std::collections::BTreeSet::from([
             "conv-1".to_string(),
             "antigravity:ada".to_string(),
@@ -6576,26 +6625,8 @@ mod tests {
         ]);
         save_decommissioned_session_ids(Some(home), &ids).unwrap();
         let mut table = RouteTable::default();
-        let at = At::from_unix_millis(1);
-        table.upsert(
-            "ada",
-            VendorRoute::Agy {
-                conversation_id: "conv-1".into(),
-                ls_pid: None,
-                ls_address: None,
-                csrf_token: None,
-                agentapi_exe: None,
-            },
-            at.clone(),
-        );
-        table.upsert(
-            "bob",
-            VendorRoute::Codex {
-                thread_id: "thread-bob".into(),
-                cwd: None,
-            },
-            at.clone(),
-        );
+        table.upsert("ada", agy_route("conv-1"), at.clone());
+        table.upsert("bob", codex_route("thread-bob"), at.clone());
         table.upsert(
             "cara",
             VendorRoute::Webhook {
@@ -6611,15 +6642,98 @@ mod tests {
                 tmux_target: Some("Dee:grok".into()),
                 tmux_pane: None,
             },
-            at,
+            at.clone(),
         );
         table.drop_decommissioned_routes(Some(home));
         assert!(table.get("ada").is_none(), "native conversation id");
-        assert!(table.get("bob").is_none(), "hosted vendor:persona id");
+        assert!(
+            table.get("bob").is_some(),
+            "thread-bob is not banned by codex:bob"
+        );
         assert!(table.get("cara").is_some(), "a webhook route stays");
         assert!(
-            table.get("dee").is_none(),
-            "an empty grok placeholder still matches grok:dee"
+            table.get("dee").is_some(),
+            "an empty grok placeholder is not banned by grok:dee"
+        );
+
+        let ids = std::collections::BTreeSet::from(["thread-bob".to_string()]);
+        save_decommissioned_session_ids(Some(home), &ids).unwrap();
+        let mut table = RouteTable::default();
+        table.upsert("bob", codex_route("thread-bob"), at.clone());
+        table.upsert("eve", codex_route("thread-eve"), at.clone());
+        table.drop_decommissioned_routes(Some(home));
+        assert!(table.get("bob").is_none(), "thread-bob is banned");
+        assert!(table.get("eve").is_some(), "a different thread stays");
+
+        let mut table = RouteTable::default();
+        table.upsert("bob", codex_route("thread-bob-2"), at);
+        table.drop_decommissioned_routes(Some(home));
+        assert!(
+            table.get("bob").is_some(),
+            "a different thread id for bob stays"
+        );
+    }
+
+    #[test]
+    fn a_reregistered_route_survives_discover_routes_and_the_old_native_id_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home).unwrap();
+        let banned = std::collections::BTreeSet::from([
+            "conv-old".to_string(),
+            "gs-old".to_string(),
+            "antigravity:ada".to_string(),
+            "grok:ada".to_string(),
+        ]);
+        save_decommissioned_session_ids(Some(home), &banned).unwrap();
+        let at = At::from_unix_millis(5);
+        let mut table = RouteTable::default();
+        table.upsert("ada", agy_route("conv-new"), at.clone());
+        table.discover_routes(Some(home), at.clone());
+        match table.get("ada").map(|entry| &entry.route) {
+            Some(VendorRoute::Agy {
+                conversation_id, ..
+            }) => assert_eq!(conversation_id, "conv-new"),
+            other => panic!("new native id must stay deliverable: {other:?}"),
+        }
+
+        table.upsert(
+            "ada",
+            VendorRoute::Grok {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Ada:grok".into()),
+                tmux_pane: None,
+            },
+            at.clone(),
+        );
+        table.discover_routes(Some(home), at.clone());
+        assert!(
+            matches!(
+                table.get("ada").map(|entry| &entry.route),
+                Some(VendorRoute::Grok { session_id, .. }) if session_id.is_empty()
+            ),
+            "an empty grok id is not banned by grok:ada"
+        );
+
+        table.upsert(
+            "ada",
+            VendorRoute::Grok {
+                session_id: "gs-old".into(),
+                cwd: None,
+                tmux_target: Some("Ada:grok".into()),
+                tmux_pane: None,
+            },
+            at.clone(),
+        );
+        table.discover_routes(Some(home), at.clone());
+        assert!(table.get("ada").is_none(), "the old grok id stays banned");
+
+        table.upsert("ada", agy_route("conv-old"), at.clone());
+        table.discover_routes(Some(home), at);
+        assert!(
+            table.get("ada").is_none(),
+            "the old conversation id stays banned"
         );
     }
 

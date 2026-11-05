@@ -1343,6 +1343,10 @@ pub(crate) fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapsho
 
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
+    // A store error here must not hide the session list.
+    if let Ok(store) = state.open_store() {
+        let _ = lifecycle::reconcile_dead_hosted_sessions(&*store, &lifecycle_env(state), "hub");
+    }
     let Ok(snap) = state.cached_discovery_snapshot() else {
         return store_open_failure();
     };

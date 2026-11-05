@@ -1083,86 +1083,6 @@ fn agy_csrf_token(route_csrf: &Option<String>) -> Option<String> {
         })
 }
 
-/// `true` when `conversation_id` is one directory name: no slash, backslash, NUL, `..`, or `.`.
-pub fn agy_conversation_id_is_path_safe(conversation_id: &str) -> bool {
-    validate_agy_conversation_id(conversation_id).is_ok()
-}
-
-/// Best-effort `DeleteCascadeTrajectory` on the live Antigravity language server.
-/// A missing server, csrf token, or bad id does nothing: decommission must still finish.
-pub fn delete_agy_cascade_best_effort(
-    conversation_id: &str,
-    ls_address: Option<&str>,
-    csrf_token: Option<&str>,
-) {
-    if validate_agy_conversation_id(conversation_id).is_err() {
-        return;
-    }
-    let address = ls_address.map(str::to_string);
-    let csrf_owned = csrf_token.map(str::to_string);
-    let Some(addr) = agy_listening_address(&address) else {
-        return;
-    };
-    let Some(csrf) = agy_csrf_token(&csrf_owned) else {
-        return;
-    };
-    if csrf.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
-        return;
-    }
-    let Some(port) = crate::identity::agy_ls_port(&addr) else {
-        return;
-    };
-    let body = serde_json::json!({ "cascadeId": conversation_id }).to_string();
-    let _ = post_agy_connect_rpc(
-        port,
-        &csrf,
-        "/exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory",
-        &body,
-        Duration::from_secs(5),
-    );
-}
-
-/// Remove an archived Antigravity conversation so discovery cannot find it again.
-/// `~/.gemini/antigravity-cli/brain/<id>` and `~/.gemini/antigravity/conversations/<id>.pb`.
-/// A symlink is left in place. An unsafe id removes nothing.
-pub fn remove_agy_conversation_files(home: &Path, conversation_id: &str) {
-    if !agy_conversation_id_is_path_safe(conversation_id) {
-        return;
-    }
-    let brain = home
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("brain")
-        .join(conversation_id);
-    let pb = home
-        .join(".gemini")
-        .join("antigravity")
-        .join("conversations")
-        .join(format!("{conversation_id}.pb"));
-    remove_dir_unless_symlink(&brain);
-    remove_file_unless_symlink(&pb);
-}
-
-fn remove_dir_unless_symlink(path: &Path) {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.file_type().is_symlink() {
-        return;
-    }
-    let _ = fs::remove_dir_all(path);
-}
-
-fn remove_file_unless_symlink(path: &Path) {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-        return;
-    }
-    let _ = fs::remove_file(path);
-}
-
 fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
     if conversation_id.is_empty()
         || conversation_id.contains(['/', '\\', '\0'])
@@ -1832,7 +1752,7 @@ pub(crate) fn tmux_bin() -> PathBuf {
 /// `=session:=window` (a trailing `.pane` index or `.%id` is kept), which resolves only to a
 /// window of exactly that name or not at all. A pane id (`%3`), a window id (`@2`), a numeric
 /// window index, a bare session name and a target that already carries `=` are returned as given.
-pub(crate) fn tmux_exact_target(target: &str) -> String {
+pub fn tmux_exact_target(target: &str) -> String {
     let Some((session, rest)) = target.split_once(':') else {
         return target.to_string();
     };
@@ -2356,65 +2276,6 @@ mod tests {
         assert!(!saw);
         assert_eq!(waits, 6);
         assert_eq!(captures, 6);
-    }
-
-    #[test]
-    fn remove_agy_conversation_files_drops_the_brain_and_pb_and_skips_symlinks() {
-        let home = TempDir::new().unwrap();
-        let id = "conv-felicia";
-        let brain = home.path().join(".gemini/antigravity-cli/brain").join(id);
-        let pb_dir = home.path().join(".gemini/antigravity/conversations");
-        fs::create_dir_all(brain.join(".system_generated/logs")).unwrap();
-        fs::write(brain.join(".system_generated/logs/transcript.jsonl"), "x").unwrap();
-        fs::create_dir_all(&pb_dir).unwrap();
-        fs::write(pb_dir.join(format!("{id}.pb")), "pb").unwrap();
-        let linked = "conv-link";
-        std::os::unix::fs::symlink(
-            &brain,
-            home.path()
-                .join(".gemini/antigravity-cli/brain")
-                .join(linked),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
-            pb_dir.join(format!("{id}.pb")),
-            pb_dir.join(format!("{linked}.pb")),
-        )
-        .unwrap();
-
-        remove_agy_conversation_files(home.path(), id);
-        assert!(!brain.exists());
-        assert!(!pb_dir.join(format!("{id}.pb")).exists());
-
-        remove_agy_conversation_files(home.path(), linked);
-        assert!(
-            home.path()
-                .join(".gemini/antigravity-cli/brain")
-                .join(linked)
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(
-            pb_dir
-                .join(format!("{linked}.pb"))
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(!pb_dir.join(format!("{id}.pb")).exists());
-
-        let before = fs::read_dir(home.path().join(".gemini")).unwrap().count();
-        remove_agy_conversation_files(home.path(), "../etc");
-        remove_agy_conversation_files(home.path(), ".");
-        remove_agy_conversation_files(home.path(), "");
-        assert_eq!(
-            fs::read_dir(home.path().join(".gemini")).unwrap().count(),
-            before
-        );
-        delete_agy_cascade_best_effort("../etc", None, None);
     }
 
     #[test]
