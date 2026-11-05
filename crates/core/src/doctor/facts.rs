@@ -105,6 +105,26 @@ impl Default for VaultFacts {
     }
 }
 
+/// One `ferro*.service` file in the user unit directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitFileFact {
+    pub name: String,
+    /// The file was read. A symlink or a non-file is not read.
+    pub readable: bool,
+    /// `[Unit]` `After=` names `default.target`.
+    pub after_default_target: bool,
+    /// `[Install]` `WantedBy=` names `default.target`.
+    pub wanted_by_default_target: bool,
+}
+
+/// The user units `fl doctor` inspected. Empty, with no note, means none are installed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitFacts {
+    /// Set when the directory could not be listed in full. The check then cannot pass.
+    pub note: Option<String>,
+    pub units: Vec<UnitFileFact>,
+}
+
 /// The UI bundle the binary serves or would serve.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiFacts {

@@ -99,7 +99,7 @@ export const DEFAULT_VERSION_PROVENANCE: HubVersionProvenanceResponse = {
 };
 
 /**
- * Record #220 (Issue #205 Phase A3): Observational `fl doctor` 6 canonical G7 checks.
+ * Record #220 (Issue #205 Phase A3): Observational `fl doctor` canonical G7 checks.
  */
 export type DoctorCheckStatus =
   | "pass"
@@ -115,7 +115,8 @@ export interface DoctorCheckItem {
     | "G7.path-ownership"
     | "G7.store-health"
     | "G7.vault-perms"
-    | "G7.code-ui-agree";
+    | "G7.code-ui-agree"
+    | "G7.unit-order";
   title: string;
   status: DoctorCheckStatus;
   detail: string;
@@ -128,6 +129,7 @@ export const CANONICAL_DOCTOR_CHECK_IDS = [
   "G7.store-health",
   "G7.vault-perms",
   "G7.code-ui-agree",
+  "G7.unit-order",
 ] as const;
 
 export const DEFAULT_DOCTOR_CHECKS: DoctorCheckItem[] = [
@@ -164,6 +166,12 @@ export const DEFAULT_DOCTOR_CHECKS: DoctorCheckItem[] = [
   {
     id: "G7.code-ui-agree",
     title: "Hub Binary <-> UI Bundle Commit Agreement",
+    status: "not-installed",
+    detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
+  },
+  {
+    id: "G7.unit-order",
+    title: "User unit ordering",
     status: "not-installed",
     detail: "Awaiting live GET /api/v1/doctor check — no false passes per #205 §7",
   },
@@ -1367,7 +1375,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       () => propVersionProvenance ?? DEFAULT_VERSION_PROVENANCE,
     );
   const [verifyingVersion, setVerifyingVersion] = useState(false);
-  // Record #220 (Issue #205 Phase A3): Observational `fl doctor` 6 canonical G7 checks
+  // Record #220 (Issue #205 Phase A3): Observational `fl doctor` canonical G7 checks
   const [doctorChecks, setDoctorChecks] = useState<DoctorCheckItem[]>(
     () => propDoctorChecks ?? DEFAULT_DOCTOR_CHECKS,
   );

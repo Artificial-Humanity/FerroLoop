@@ -1,6 +1,6 @@
 # `fl doctor` and `GET /api/v1/doctor`
 
-`fl doctor` observes this install and reports six checks. It changes nothing. The Hub serves
+`fl doctor` observes this install and reports seven checks. It changes nothing. The Hub serves
 the same report to the Owner at `GET /api/v1/doctor`, and FerroDeck renders it.
 
 Code: `fl_core::doctor` (the pure engine: facts in, report out; no I/O), `fl_install::observe`
@@ -46,7 +46,7 @@ fl doctor --fix <check-id>
 
 ## The checks
 
-The report lists exactly these six, in this order.
+The report lists exactly these seven, in this order.
 
 **`G7.release-identity`.** The running binary's build stamp (`fl` for the CLI, `fl-hub` for the
 Hub). `pass` only for a known commit built from a clean tree. `warn`: the commit is unknown, the
@@ -105,20 +105,32 @@ of `GET /api/v1/version`). The CLI looks in `[hub].ui_dir` of the config, else
 tree it is `warn`. Different commits are `fail`. No bundle is `not-installed`. A bundle with no
 valid `build-info.json`, or a binary whose commit is unknown, is `unsupported`.
 
+**`G7.unit-order`.** Installed `ferro*.service` files in the layout's user unit directory
+(`~/.config/systemd/user`, or `<root>/.config/systemd/user` under `$FL_INSTALL_ROOT`). The
+names looked for include `ferrostore.service`, `ferrostore@.service`, `ferrowire.service` and
+`ferroloop-hub.service`. A unit whose `[Install]` `WantedBy=` names `default.target` and whose
+`[Unit]` `After=` also names it is `warn`: that pair is a `systemd --user` boot ordering cycle
+(`WantedBy=default.target` implies `Before=default.target`). The detail names the unit and
+advises `fl install`, or removing `After=default.target`. A unit that cannot be read (a symlink,
+anything that is not a regular file, or a file larger than 64 KiB) is `warn`. A directory that
+cannot be listed, or a `~/` path with no home directory, is `unsupported`. No `ferro*.service`
+file is `not-installed`. Comments and the same keys in the wrong section do not count. Other
+unit names in the directory are not read.
+
 ## JSON contract
 
 ```json
 {
   "schema_version": 1,
   "overall": "warn",
-  "summary": { "pass": 0, "warn": 1, "fail": 0, "not_installed": 5, "unsupported": 0 },
+  "summary": { "pass": 0, "warn": 1, "fail": 0, "not_installed": 6, "unsupported": 0 },
   "checks": [
     { "id": "G7.release-identity", "title": "Release identity", "status": "warn", "detail": "..." }
   ]
 }
 ```
 
-* `checks` has the six ids above, in that order, each with exactly `id`, `title`, `status` and
+* `checks` has the seven ids above, in that order, each with exactly `id`, `title`, `status` and
   `detail`. `status` is one of `pass`, `warn`, `fail`, `not-installed`, `unsupported`.
 * The report has no timestamp. Equal inputs give equal bytes; lists are sorted and bounded.
 * A field is only ever added at the top level. A reader ignores fields it does not know.

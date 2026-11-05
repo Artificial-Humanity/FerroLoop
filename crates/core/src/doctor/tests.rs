@@ -158,6 +158,15 @@ fn healthy<'a>(probe: &'a MapProbe) -> DoctorInputs<'a> {
             dir_exists: true,
             info: ui_info(&C[..12], Some(false)),
         },
+        units: UnitFacts {
+            note: None,
+            units: vec![UnitFileFact {
+                name: "ferroloop-hub.service".into(),
+                readable: true,
+                after_default_target: false,
+                wanted_by_default_target: true,
+            }],
+        },
     }
 }
 
@@ -172,21 +181,10 @@ fn detail(r: &DoctorReport, id: &str) -> String {
 }
 
 #[test]
-fn the_report_has_exactly_the_six_ids_in_order_and_a_healthy_install_passes_them_all() {
+fn the_report_has_exactly_the_check_ids_in_order_and_a_healthy_install_passes_them_all() {
     let probe = healthy_probe();
     let r = run(&healthy(&probe));
     let ids: Vec<&str> = r.checks.iter().map(|c| c.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        [
-            "G7.release-identity",
-            "G7.receipt-integrity",
-            "G7.path-ownership",
-            "G7.store-health",
-            "G7.vault-perms",
-            "G7.code-ui-agree"
-        ]
-    );
     assert_eq!(ids, CHECK_IDS);
     for c in &r.checks {
         assert_eq!(c.status, CheckStatus::Pass, "{}: {}", c.id, c.detail);
@@ -196,7 +194,7 @@ fn the_report_has_exactly_the_six_ids_in_order_and_a_healthy_install_passes_them
     assert_eq!(
         r.summary,
         Summary {
-            pass: 6,
+            pass: 7,
             ..Summary::default()
         }
     );
@@ -206,7 +204,7 @@ fn the_report_has_exactly_the_six_ids_in_order_and_a_healthy_install_passes_them
 fn no_check_passes_on_empty_inputs() {
     let probe = MapProbe::new();
     let r = run(&DoctorInputs::empty(&probe));
-    assert_eq!(r.checks.len(), 6);
+    assert_eq!(r.checks.len(), CHECK_IDS.len());
     for c in &r.checks {
         assert_ne!(c.status, CheckStatus::Pass, "{} passed on nothing", c.id);
     }
@@ -220,6 +218,7 @@ fn no_check_passes_on_empty_inputs() {
         ids::STORE_HEALTH,
         ids::VAULT_PERMS,
         ids::CODE_UI_AGREE,
+        ids::UNIT_ORDER,
     ] {
         assert_eq!(status(&r, id), CheckStatus::NotInstalled, "{id}");
     }
@@ -235,7 +234,7 @@ fn every_check_defaults_away_from_pass_whatever_single_fact_is_missing() {
     // keep its pass.
     let probe = healthy_probe();
     type Strip = fn(&mut DoctorInputs<'_>);
-    let strips: [(&str, Strip); 6] = [
+    let strips: [(&str, Strip); 7] = [
         (ids::RELEASE_IDENTITY, |i| {
             i.binary = BuildInfo::from_stamp("0.1.0", "", "false", "", None)
         }),
@@ -246,6 +245,7 @@ fn every_check_defaults_away_from_pass_whatever_single_fact_is_missing() {
         (ids::STORE_HEALTH, |i| i.stores = StoreFacts::default()),
         (ids::VAULT_PERMS, |i| i.vault.files.clear()),
         (ids::CODE_UI_AGREE, |i| i.ui.info = None),
+        (ids::UNIT_ORDER, |i| i.units.units.clear()),
     ];
     for (id, strip) in strips {
         let mut i = healthy(&probe);
@@ -906,7 +906,7 @@ fn overall_and_exit_code_follow_the_worst_check() {
     assert_eq!(r.overall, CheckStatus::Fail);
     assert_eq!(r.exit_code(), 1);
     assert_eq!(r.summary.fail, 1);
-    assert_eq!(r.summary.pass, 5);
+    assert_eq!(r.summary.pass, 6);
 
     let mut i = healthy(&probe);
     i.ui.info = None;
@@ -950,7 +950,7 @@ fn the_json_matches_the_contract_ferrodeck_reads() {
     i.vault.files.clear();
     let v: Value = serde_json::from_str(&run(&i).to_json()).unwrap();
     let checks = v["checks"].as_array().unwrap();
-    assert_eq!(checks.len(), 6);
+    assert_eq!(checks.len(), CHECK_IDS.len());
     let allowed = ["pass", "warn", "fail", "not-installed", "unsupported"];
     for c in checks {
         let mut keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
@@ -985,4 +985,71 @@ fn a_secret_shaped_receipt_field_is_never_echoed() {
     let r = run(&i);
     let all = r.to_json() + &r.render_text();
     assert!(!all.contains("s3cr3t-value"), "{all}");
+}
+
+fn unit_fact(name: &str, text: &str) -> UnitFileFact {
+    let d = user_unit_directives(text);
+    UnitFileFact {
+        name: name.into(),
+        readable: true,
+        after_default_target: d.after_default_target,
+        wanted_by_default_target: d.wanted_by_default_target,
+    }
+}
+
+#[test]
+fn a_unit_file_wanted_by_and_ordered_after_default_target_warns() {
+    let probe = MapProbe::new();
+    let mut i = DoctorInputs::empty(&probe);
+    i.units.units.push(unit_fact(
+        "ferrostore.service",
+        "[Unit]\nAfter=default.target\n\n[Install]\nWantedBy=default.target\n",
+    ));
+    i.units.units.push(unit_fact(
+        "ferrowire.service",
+        "[Unit]\nAfter=ferrostore.service default.target\n\n[Install]\nWantedBy=default.target\n",
+    ));
+    let r = run(&i);
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&r, ids::UNIT_ORDER);
+    assert!(d.contains("systemd --user boot ordering cycle"), "{d}");
+    assert!(d.contains("`fl install`"), "{d}");
+    assert!(d.contains("remove `After=default.target`"), "{d}");
+    assert!(
+        d.starts_with("ferrostore.service; ferrowire.service declare"),
+        "{d}"
+    );
+    assert_eq!(r.exit_code(), 0, "a cycle is a warning, not a failed check");
+}
+
+#[test]
+fn a_clean_unit_passes_and_an_unreadable_one_does_not() {
+    let probe = MapProbe::new();
+    let mut i = DoctorInputs::empty(&probe);
+    i.units.units.push(unit_fact(
+        "ferroloop-hub.service",
+        "[Unit]\nAfter=ferrostore.service ferrowire.service\n\n[Install]\nWantedBy=default.target\n",
+    ));
+    let r = run(&i);
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+
+    i.units.units.push(UnitFileFact {
+        name: "ferrostore.service".into(),
+        readable: false,
+        after_default_target: false,
+        wanted_by_default_target: false,
+    });
+    let r = run(&i);
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    assert!(detail(&r, ids::UNIT_ORDER).contains("ferrostore.service"),);
+
+    i.units.note = Some("unit directory could not be listed".into());
+    i.units.units.retain(|u| u.readable);
+    let r = run(&i);
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Unsupported);
 }
