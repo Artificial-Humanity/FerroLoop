@@ -906,26 +906,17 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               </button>
             ))}
         </div>
-      </div>
 
-      <div
-        className="fd-scroll"
-        data-testid="ferrostate-body"
-        style={{
-          padding: "12px 16px",
-          display: "flex",
-          flexDirection: "column",
-          gap: "20px",
-          flex: 1,
-          minHeight: 0,
-          overflowY: "auto",
-          overflowX: "hidden",
-        }}
-      >
         <div
           data-testid="token-gain-bar"
           className="fd-card"
-          style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "13px" }}
+          style={{
+            display: "flex",
+            gap: "12px",
+            flexWrap: "wrap",
+            fontSize: "12px",
+            padding: "8px 10px",
+          }}
         >
           <span>
             Tokens saved:{" "}
@@ -1019,6 +1010,22 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             </button>
           </div>
         </div>
+      </div>
+
+      <div
+        className="fd-scroll"
+        data-testid="ferrostate-body"
+        style={{
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "20px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+        }}
+      >
 
         {effectiveError && (
           <div role="alert" className="fd-card" style={{ color: "var(--diff-del-text)" }}>

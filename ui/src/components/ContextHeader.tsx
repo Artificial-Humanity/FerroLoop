@@ -528,7 +528,13 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           className={`fd-tier-group fd-tier-agent${activeTier === "agent" || activeTier === "project" ? " is-active-tier" : ""}`}
           data-testid="tier-agent-nav"
           data-active-tier={activeTier === "agent" || activeTier === "project" ? "true" : undefined}
-          style={{ flexWrap: "nowrap", minWidth: 0, flex: "0 1 auto", overflow: "hidden" }}
+          style={{
+            marginLeft: "auto",
+            flexWrap: "nowrap",
+            minWidth: 0,
+            flex: "0 1 auto",
+            overflow: "hidden",
+          }}
         >
           <span
             className="fd-tier-label sr-only"
@@ -780,7 +786,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
 
         <div
           style={{
-            marginLeft: "auto",
             display: "inline-flex",
             alignItems: "center",
             gap: "6px",

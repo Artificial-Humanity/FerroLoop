@@ -2767,8 +2767,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           aria-label="Settings Categories"
           data-testid="settings-tab-bar"
           style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(115px, 1fr))",
+            display: "flex",
+            flexDirection: "column",
             gap: "6px",
             borderBottom: "1px solid var(--border-subtle)",
             paddingBottom: "8px",
@@ -2777,87 +2777,502 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             minWidth: 0,
           }}
         >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "agents"}
-            data-testid="settings-tab-agents"
-            className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
-            style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-            onClick={() => setActiveTab("agents")}
+          <select
+            aria-label="Settings Categories"
+            data-testid="settings-tab-select"
+            className="fd-select"
+            value={activeTab}
+            onChange={(e) => setActiveTab(e.target.value as typeof activeTab)}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12.5px",
+              padding: "6px 10px",
+              fontWeight: 600,
+            }}
           >
-            {filteredAgents.length} Agents
-          </button>
-          {!initialProject && (
-            <>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "system"}
-                data-testid="settings-tab-system"
-                className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
-                style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                onClick={() => setActiveTab("system")}
-              >
-                System
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "products"}
-                data-testid="settings-tab-products"
-                className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
-                style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                onClick={() => setActiveTab("products")}
-              >
-                Products
-              </button>
-              {authority?.tier === "owner" && (
+            <option value="agents" data-testid="settings-tab-option-agents">
+              {filteredAgents.length} Agents
+            </option>
+            {!initialProject && (
+              <>
+                <option value="system" data-testid="settings-tab-option-system">
+                  System
+                </option>
+                <option value="products" data-testid="settings-tab-option-products">
+                  Products
+                </option>
+                {authority?.tier === "owner" && (
+                  <option value="runtimes" data-testid="settings-tab-option-runtimes">
+                    Runtimes &amp; Quotas
+                  </option>
+                )}
+                <option value="appearance" data-testid="settings-tab-option-appearance">
+                  Appearance
+                </option>
+                <option
+                  value="accessibility"
+                  data-testid="settings-tab-option-accessibility"
+                >
+                  Accessibility
+                </option>
+                <option value="auth" data-testid="settings-tab-option-auth">
+                  Auth
+                </option>
+              </>
+            )}
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "agents"}
+              data-testid="settings-tab-agents"
+              className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
+              onClick={() => setActiveTab("agents")}
+            >
+              {filteredAgents.length} Agents
+            </button>
+            {!initialProject && (
+              <>
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={activeTab === "runtimes"}
-                  data-testid="settings-tab-runtimes"
-                  className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
-                  style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                  onClick={() => setActiveTab("runtimes")}
+                  aria-selected={activeTab === "system"}
+                  data-testid="settings-tab-system"
+                  className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("system")}
                 >
-                  Runtimes &amp; Quotas
+                  System
                 </button>
-              )}
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "appearance"}
-                data-testid="settings-tab-appearance"
-                className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
-                style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                onClick={() => setActiveTab("appearance")}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "products"}
+                  data-testid="settings-tab-products"
+                  className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("products")}
+                >
+                  Products
+                </button>
+                {authority?.tier === "owner" && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeTab === "runtimes"}
+                    data-testid="settings-tab-runtimes"
+                    className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
+                    onClick={() => setActiveTab("runtimes")}
+                  >
+                    Runtimes &amp; Quotas
+                  </button>
+                )}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "appearance"}
+                  data-testid="settings-tab-appearance"
+                  className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("appearance")}
+                >
+                  Appearance
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "accessibility"}
+                  data-testid="settings-tab-accessibility"
+                  className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("accessibility")}
+                >
+                  Accessibility
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "auth"}
+                  data-testid="settings-tab-auth"
+                  className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("auth")}
+                >
+                  Auth
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* Sub-tab selectors pinned directly above settings-scroll-body */}
+          {initialProject ? (
+            <div
+              role="tablist"
+              aria-label="Project Settings Sub-Tabs"
+              data-testid="project-settings-subtab-bar"
+              style={{
+                display: activeTab === "agents" ? "block" : "none",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
+              <select
+                aria-label="Project Settings Section"
+                data-testid="project-settings-subtab-select"
+                className="fd-select"
+                value={projectSubTab}
+                onChange={(e) =>
+                  setProjectSubTab(
+                    e.target.value as
+                      | "overview"
+                      | "agents"
+                      | "roles"
+                      | "cloud-sessions"
+                      | "local-runtimes",
+                  )
+                }
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                  boxSizing: "border-box",
+                  fontSize: "12.5px",
+                  padding: "6px 10px",
+                }}
               >
-                Appearance
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "accessibility"}
-                data-testid="settings-tab-accessibility"
-                className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
-                style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                onClick={() => setActiveTab("accessibility")}
+                <option value="overview" data-testid="project-subtab-option-overview">
+                  Overview &amp; Storage
+                </option>
+                <option value="agents" data-testid="project-subtab-option-agents">
+                  Agents &amp; Bulk Ops
+                </option>
+                <option value="roles" data-testid="project-subtab-option-roles">
+                  Roles
+                </option>
+                <option
+                  value="cloud-sessions"
+                  data-testid="project-subtab-option-cloud-sessions"
+                >
+                  Cloud Sessions
+                </option>
+                <option
+                  value="local-runtimes"
+                  data-testid="project-subtab-option-local-runtimes"
+                >
+                  Local &amp; API Runtimes
+                </option>
+              </select>
+              <div
+                className="sr-only"
+                style={{
+                  position: "absolute",
+                  width: "1px",
+                  height: "1px",
+                  padding: 0,
+                  margin: "-1px",
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
               >
-                Accessibility
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "auth"}
-                data-testid="settings-tab-auth"
-                className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
-                style={{ justifyContent: "center", width: "100%", minWidth: 0, boxSizing: "border-box" }}
-                onClick={() => setActiveTab("auth")}
+                {(
+                  [
+                    { id: "overview", label: "Overview & Storage" },
+                    { id: "agents", label: "Agents & Bulk Ops" },
+                    { id: "roles", label: "Roles" },
+                    { id: "cloud-sessions", label: "Cloud Sessions" },
+                    { id: "local-runtimes", label: "Local & API Runtimes" },
+                  ] as const
+                ).map((sub) => {
+                  const isSelected = projectSubTab === sub.id;
+                  return (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      data-testid={`project-tab-${sub.id}`}
+                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                      onClick={() => setProjectSubTab(sub.id)}
+                    >
+                      {sub.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <div
+              role="tablist"
+              aria-label="Agents Settings Sub-Tabs"
+              data-testid="agents-subtab-bar"
+              style={{
+                display: activeTab === "agents" ? "block" : "none",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
+              <select
+                aria-label="Agents Settings Section"
+                data-testid="agents-subtab-select"
+                className="fd-select"
+                value={agentsSubTab}
+                onChange={(e) =>
+                  setAgentsSubTab(
+                    e.target.value as
+                      | "roster"
+                      | "roles"
+                      | "cloud-sessions"
+                      | "local-runtimes",
+                  )
+                }
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                  boxSizing: "border-box",
+                  fontSize: "12.5px",
+                  padding: "6px 10px",
+                }}
               >
-                Auth
-              </button>
+                <option value="roster" data-testid="agents-subtab-option-roster">
+                  Roster &amp; Bulk Ops
+                </option>
+                <option value="roles" data-testid="agents-subtab-option-roles">
+                  Role Registry
+                </option>
+                <option
+                  value="cloud-sessions"
+                  data-testid="agents-subtab-option-cloud-sessions"
+                >
+                  Cloud Sessions
+                </option>
+                <option
+                  value="local-runtimes"
+                  data-testid="agents-subtab-option-local-runtimes"
+                >
+                  Local &amp; API Runtimes
+                </option>
+              </select>
+              <div
+                className="sr-only"
+                style={{
+                  position: "absolute",
+                  width: "1px",
+                  height: "1px",
+                  padding: 0,
+                  margin: "-1px",
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
+              >
+                {(
+                  [
+                    { id: "roster", label: "Roster & Bulk Ops" },
+                    { id: "roles", label: "Role Registry" },
+                    { id: "cloud-sessions", label: "Cloud Sessions" },
+                    { id: "local-runtimes", label: "Local & API Runtimes" },
+                  ] as const
+                ).map((sub) => {
+                  const isSelected = agentsSubTab === sub.id;
+                  return (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      data-testid={`agents-subtab-${sub.id}`}
+                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                      onClick={() => setAgentsSubTab(sub.id)}
+                    >
+                      {sub.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {!initialProject && (
+            <>
+              <div
+                role="tablist"
+                aria-label="System Settings Sub-Tabs"
+                data-testid="system-subtab-bar"
+                style={{
+                  display: activeTab === "system" ? "block" : "none",
+                  width: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <select
+                  aria-label="System Settings Section"
+                  data-testid="system-subtab-select"
+                  className="fd-select"
+                  value={systemSubTab}
+                  onChange={(e) =>
+                    setSystemSubTab(
+                      e.target.value as "general" | "storage" | "notifications",
+                    )
+                  }
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                    fontSize: "12.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  <option value="general" data-testid="system-subtab-option-general">
+                    General &amp; Connectivity
+                  </option>
+                  <option value="storage" data-testid="system-subtab-option-storage">
+                    Storage &amp; Artifacts
+                  </option>
+                  <option
+                    value="notifications"
+                    data-testid="system-subtab-option-notifications"
+                  >
+                    Notifications &amp; Push
+                  </option>
+                </select>
+                <div
+                  className="sr-only"
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
+                >
+                  {(
+                    [
+                      { id: "general", label: "General & Connectivity" },
+                      { id: "storage", label: "Storage & Artifacts" },
+                      { id: "notifications", label: "Notifications & Push" },
+                    ] as const
+                  ).map((sub) => {
+                    const isSelected = systemSubTab === sub.id;
+                    return (
+                      <button
+                        key={sub.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isSelected}
+                        data-testid={`system-subtab-${sub.id}`}
+                        className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                        onClick={() => setSystemSubTab(sub.id)}
+                      >
+                        {sub.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div
+                role="tablist"
+                aria-label="Products Settings Sub-Sections"
+                data-testid="products-subtab-bar"
+                style={{
+                  display: activeTab === "products" ? "block" : "none",
+                  width: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <select
+                  aria-label="Products Settings Section"
+                  data-testid="products-subtab-select"
+                  className="fd-select"
+                  value={productsSubTab}
+                  onChange={(e) =>
+                    setProductsSubTab(e.target.value as "catalog" | "installer")
+                  }
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                    fontSize: "12.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  <option value="catalog" data-testid="products-subtab-option-catalog">
+                    Products &amp; Profiles
+                  </option>
+                  <option
+                    value="installer"
+                    data-testid="products-subtab-option-installer"
+                  >
+                    Installer, Doctor &amp; Releases
+                  </option>
+                </select>
+                <div
+                  className="sr-only"
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
+                >
+                  {(
+                    [
+                      {
+                        id: "catalog" as const,
+                        label: "Products & Profiles",
+                        testId: "products-subtab-catalog",
+                      },
+                      {
+                        id: "installer" as const,
+                        label: "Installer, Doctor & Releases",
+                        testId: "products-subtab-installer",
+                      },
+                    ]
+                  ).map((sub) => {
+                    const isSelected = productsSubTab === sub.id;
+                    return (
+                      <button
+                        key={sub.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isSelected}
+                        data-testid={sub.testId}
+                        className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                        onClick={() => setProductsSubTab(sub.id)}
+                      >
+                        {sub.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </>
           )}
         </div>
@@ -2995,195 +3410,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
-          {initialProject ? (
-            <div
-              role="tablist"
-              aria-label="Project Settings Sub-Tabs"
-              data-testid="project-settings-subtab-bar"
-              style={{
-                width: "100%",
-                minWidth: 0,
-              }}
-            >
-              <select
-                aria-label="Project Settings Section"
-                data-testid="project-settings-subtab-select"
-                className="fd-select"
-                value={projectSubTab}
-                onChange={(e) =>
-                  setProjectSubTab(
-                    e.target.value as
-                      | "overview"
-                      | "agents"
-                      | "roles"
-                      | "cloud-sessions"
-                      | "local-runtimes",
-                  )
-                }
-                style={{
-                  width: "100%",
-                  minWidth: 0,
-                  maxWidth: "100%",
-                  boxSizing: "border-box",
-                  fontSize: "12.5px",
-                  padding: "6px 10px",
-                }}
-              >
-                <option value="overview" data-testid="project-subtab-option-overview">
-                  Overview &amp; Storage
-                </option>
-                <option value="agents" data-testid="project-subtab-option-agents">
-                  Agents &amp; Bulk Ops
-                </option>
-                <option value="roles" data-testid="project-subtab-option-roles">
-                  Roles
-                </option>
-                <option
-                  value="cloud-sessions"
-                  data-testid="project-subtab-option-cloud-sessions"
-                >
-                  Cloud Sessions
-                </option>
-                <option
-                  value="local-runtimes"
-                  data-testid="project-subtab-option-local-runtimes"
-                >
-                  Local &amp; API Runtimes
-                </option>
-              </select>
-              <div
-                className="sr-only"
-                style={{
-                  position: "absolute",
-                  width: "1px",
-                  height: "1px",
-                  padding: 0,
-                  margin: "-1px",
-                  overflow: "hidden",
-                  clip: "rect(0, 0, 0, 0)",
-                  whiteSpace: "nowrap",
-                  border: 0,
-                }}
-              >
-                {(
-                  [
-                    { id: "overview", label: "Overview & Storage" },
-                    { id: "agents", label: "Agents & Bulk Ops" },
-                    { id: "roles", label: "Roles" },
-                    { id: "cloud-sessions", label: "Cloud Sessions" },
-                    { id: "local-runtimes", label: "Local & API Runtimes" },
-                  ] as const
-                ).map((sub) => {
-                  const isSelected = projectSubTab === sub.id;
-                  return (
-                    <button
-                      key={sub.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={isSelected}
-                      data-testid={`project-tab-${sub.id}`}
-                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                      onClick={() => setProjectSubTab(sub.id)}
-                    >
-                      {sub.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ) : (
-            <div
-              role="tablist"
-              aria-label="Agents Settings Sub-Tabs"
-              data-testid="agents-subtab-bar"
-              style={{
-                width: "100%",
-                minWidth: 0,
-              }}
-            >
-              <select
-                aria-label="Agents Settings Section"
-                data-testid="agents-subtab-select"
-                className="fd-select"
-                value={agentsSubTab}
-                onChange={(e) =>
-                  setAgentsSubTab(
-                    e.target.value as
-                      | "roster"
-                      | "roles"
-                      | "cloud-sessions"
-                      | "local-runtimes",
-                  )
-                }
-                style={{
-                  width: "100%",
-                  minWidth: 0,
-                  maxWidth: "100%",
-                  boxSizing: "border-box",
-                  fontSize: "12.5px",
-                  padding: "6px 10px",
-                }}
-              >
-                <option value="roster" data-testid="agents-subtab-option-roster">
-                  Roster &amp; Bulk Ops
-                </option>
-                <option value="roles" data-testid="agents-subtab-option-roles">
-                  Role Registry
-                </option>
-                <option
-                  value="cloud-sessions"
-                  data-testid="agents-subtab-option-cloud-sessions"
-                >
-                  Cloud Sessions
-                </option>
-                <option
-                  value="local-runtimes"
-                  data-testid="agents-subtab-option-local-runtimes"
-                >
-                  Local &amp; API Runtimes
-                </option>
-              </select>
-              <div
-                className="sr-only"
-                style={{
-                  position: "absolute",
-                  width: "1px",
-                  height: "1px",
-                  padding: 0,
-                  margin: "-1px",
-                  overflow: "hidden",
-                  clip: "rect(0, 0, 0, 0)",
-                  whiteSpace: "nowrap",
-                  border: 0,
-                }}
-              >
-                {(
-                  [
-                    { id: "roster", label: "Roster & Bulk Ops" },
-                    { id: "roles", label: "Role Registry" },
-                    { id: "cloud-sessions", label: "Cloud Sessions" },
-                    { id: "local-runtimes", label: "Local & API Runtimes" },
-                  ] as const
-                ).map((sub) => {
-                  const isSelected = agentsSubTab === sub.id;
-                  return (
-                    <button
-                      key={sub.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={isSelected}
-                      data-testid={`agents-subtab-${sub.id}`}
-                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                      onClick={() => setAgentsSubTab(sub.id)}
-                    >
-                      {sub.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
           {initialProject && (
             <div
               data-testid="project-subpanel-overview"
@@ -4647,86 +4873,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 gap: "12px",
               }}
             >
-              <div
-                role="tablist"
-                aria-label="System Settings Sub-Tabs"
-                data-testid="system-subtab-bar"
-                style={{
-                  width: "100%",
-                  minWidth: 0,
-                }}
-              >
-                <select
-                  aria-label="System Settings Section"
-                  data-testid="system-subtab-select"
-                  className="fd-select"
-                  value={systemSubTab}
-                  onChange={(e) =>
-                    setSystemSubTab(
-                      e.target.value as "general" | "storage" | "notifications",
-                    )
-                  }
-                  style={{
-                    width: "100%",
-                    minWidth: 0,
-                    maxWidth: "100%",
-                    boxSizing: "border-box",
-                    fontSize: "12.5px",
-                    padding: "6px 10px",
-                  }}
-                >
-                  <option value="general" data-testid="system-subtab-option-general">
-                    General &amp; Connectivity
-                  </option>
-                  <option value="storage" data-testid="system-subtab-option-storage">
-                    Storage &amp; Artifacts
-                  </option>
-                  <option
-                    value="notifications"
-                    data-testid="system-subtab-option-notifications"
-                  >
-                    Notifications &amp; Push
-                  </option>
-                </select>
-                <div
-                  className="sr-only"
-                  style={{
-                    position: "absolute",
-                    width: "1px",
-                    height: "1px",
-                    padding: 0,
-                    margin: "-1px",
-                    overflow: "hidden",
-                    clip: "rect(0, 0, 0, 0)",
-                    whiteSpace: "nowrap",
-                    border: 0,
-                  }}
-                >
-                  {(
-                    [
-                      { id: "general", label: "General & Connectivity" },
-                      { id: "storage", label: "Storage & Artifacts" },
-                      { id: "notifications", label: "Notifications & Push" },
-                    ] as const
-                  ).map((sub) => {
-                    const isSelected = systemSubTab === sub.id;
-                    return (
-                      <button
-                        key={sub.id}
-                        type="button"
-                        role="tab"
-                        aria-selected={isSelected}
-                        data-testid={`system-subtab-${sub.id}`}
-                        className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                        onClick={() => setSystemSubTab(sub.id)}
-                      >
-                        {sub.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
               <div
                 data-testid="system-subpanel-general"
                 style={{
@@ -6678,89 +6824,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
-          {/* Sub-tab bar for Products Settings */}
-          <div
-            role="tablist"
-            aria-label="Products Settings Sub-Sections"
-            data-testid="products-subtab-bar"
-            style={{
-              width: "100%",
-              minWidth: 0,
-            }}
-          >
-            <select
-              aria-label="Products Settings Section"
-              data-testid="products-subtab-select"
-              className="fd-select"
-              value={productsSubTab}
-              onChange={(e) =>
-                setProductsSubTab(e.target.value as "catalog" | "installer")
-              }
-              style={{
-                width: "100%",
-                minWidth: 0,
-                maxWidth: "100%",
-                boxSizing: "border-box",
-                fontSize: "12.5px",
-                padding: "6px 10px",
-              }}
-            >
-              <option value="catalog" data-testid="products-subtab-option-catalog">
-                Products &amp; Profiles
-              </option>
-              <option
-                value="installer"
-                data-testid="products-subtab-option-installer"
-              >
-                Installer, Doctor &amp; Releases
-              </option>
-            </select>
-            <div
-              className="sr-only"
-              style={{
-                position: "absolute",
-                width: "1px",
-                height: "1px",
-                padding: 0,
-                margin: "-1px",
-                overflow: "hidden",
-                clip: "rect(0, 0, 0, 0)",
-                whiteSpace: "nowrap",
-                border: 0,
-              }}
-            >
-              {(
-                [
-                  {
-                    id: "catalog" as const,
-                    label: "Products & Profiles",
-                    testId: "products-subtab-catalog",
-                  },
-                  {
-                    id: "installer" as const,
-                    label: "Installer, Doctor & Releases",
-                    testId: "products-subtab-installer",
-                  },
-                ]
-              ).map((sub) => {
-                const isSelected = productsSubTab === sub.id;
-                return (
-                  <button
-                    key={sub.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={isSelected}
-                    data-testid={sub.testId}
-                    className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
-                    onClick={() => setProductsSubTab(sub.id)}
-                  >
-                    {sub.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
           {(() => {
             const activeProfile = inferInstallProfilePreset(
               settings.subsystems,

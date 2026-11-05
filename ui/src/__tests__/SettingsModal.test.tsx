@@ -1327,10 +1327,19 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       />,
     );
 
+    const tabBar = screen.getByTestId("settings-tab-bar");
     const scrollBody = screen.getByTestId("settings-scroll-body");
     expect(scrollBody).toHaveClass("fd-scroll");
     expect(scrollBody.style.overflowX).toBe("hidden");
     expect(scrollBody.style.minWidth).toBe("0");
+
+    // 0. Top-level category <select> and sub-tab selectors sit inside settings-tab-bar above settings-scroll-body
+    const topSelect = screen.getByTestId("settings-tab-select") as HTMLSelectElement;
+    expect(topSelect.style.width).toBe("100%");
+    expect(tabBar).toContainElement(topSelect);
+    expect(tabBar).toContainElement(screen.getByTestId("agents-subtab-bar"));
+    expect(tabBar).toContainElement(screen.getByTestId("system-subtab-bar"));
+    expect(tabBar).toContainElement(screen.getByTestId("products-subtab-bar"));
 
     // 1. Agents sub-tab full-width <select>
     const agentsSelect = screen.getByTestId("agents-subtab-select") as HTMLSelectElement;
@@ -1339,8 +1348,8 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(screen.getByTestId("agents-subpanel-roles")).toHaveStyle({ display: "flex" });
     expect(screen.getByTestId("agents-subpanel-roster")).toHaveStyle({ display: "none" });
 
-    // 2. System sub-tab full-width <select>
-    fireEvent.click(screen.getByTestId("settings-tab-system"));
+    // 2. System sub-tab full-width <select> via top-level settings-tab-select
+    fireEvent.change(topSelect, { target: { value: "system" } });
     const systemSelect = screen.getByTestId("system-subtab-select") as HTMLSelectElement;
     expect(systemSelect.style.width).toBe("100%");
     fireEvent.change(systemSelect, { target: { value: "storage" } });
@@ -1350,7 +1359,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(screen.getByTestId("system-subpanel-notifications")).toHaveStyle({ display: "flex" });
 
     // 3. Products sub-tab full-width <select>, vertical presets, and bounded grids
-    fireEvent.click(screen.getByTestId("settings-tab-products"));
+    fireEvent.change(topSelect, { target: { value: "products" } });
     const productsSelect = screen.getByTestId("products-subtab-select") as HTMLSelectElement;
     expect(productsSelect.style.width).toBe("100%");
     const productsGrid = screen.getByTestId("products-cards-grid");
@@ -1362,7 +1371,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(screen.getByTestId("products-subpanel-catalog")).toHaveStyle({ display: "none" });
 
     // 4. Appearance tab: settings-theme-select is visually hidden (.sr-only) and 3 theme buttons remain visible
-    fireEvent.click(screen.getByTestId("settings-tab-appearance"));
+    fireEvent.change(topSelect, { target: { value: "appearance" } });
     const themeSelect = screen.getByTestId("settings-theme-select");
     expect(themeSelect).toHaveClass("sr-only");
     expect(screen.getByTestId("theme-mode-dark")).not.toHaveClass("sr-only");
@@ -1370,7 +1379,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(screen.getByTestId("theme-mode-system")).not.toHaveClass("sr-only");
 
     // 5. Accessibility tab: font-scale-current-badge is visually hidden (.sr-only) and 5 preset buttons remain visible
-    fireEvent.click(screen.getByTestId("settings-tab-accessibility"));
+    fireEvent.change(topSelect, { target: { value: "accessibility" } });
     const fontScaleBadge = screen.getByTestId("font-scale-current-badge");
     expect(fontScaleBadge).toHaveClass("sr-only");
     expect(screen.getByTestId("font-scale-preset-100")).not.toHaveClass("sr-only");
