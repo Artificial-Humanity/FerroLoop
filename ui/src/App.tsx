@@ -15,6 +15,8 @@ import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { PHONE_MAX_VIEWPORT_PX, useDeviceLayout } from "./hooks/useDeviceLayout";
+import { PhoneShell } from "./components/phone/PhoneShell";
+import { mapToPhoneView, type PhoneView } from "./components/phone/phoneNavigation";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import {
@@ -466,6 +468,14 @@ export const App: React.FC<AppProps> = ({
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
   const { layout: deviceLayout } = useDeviceLayout();
+  const deviceLayoutRef = useRef(deviceLayout);
+  deviceLayoutRef.current = deviceLayout;
+  // Phone navigation state. Lives apart from the desktop arrangement (splitView, leftPanelTab,
+  // mobileRosterOpen, desktopSidebarCollapsed) so rotating or resizing restores the desktop view.
+  const [phoneView, setPhoneView] = useState<PhoneView>("chat");
+  const navigatePhone = useCallback((tab: CockpitTab | LeftPanelTab) => {
+    setPhoneView(mapToPhoneView(tab));
+  }, []);
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== "undefined" ? window.innerWidth : 1200,
   );
@@ -506,6 +516,11 @@ export const App: React.FC<AppProps> = ({
     const handleResize = () => {
       const vw = window.innerWidth;
       setViewportWidth(vw);
+      // The phone shell keeps its own navigation state and never edits the desktop arrangement,
+      // so a phone-width resize leaves split view and the left panel exactly as they were.
+      if (vw < TWO_PANEL_MIN_VIEWPORT_PX) {
+        return;
+      }
       if (vw < THREE_PANEL_MIN_VIEWPORT_PX) {
         setSplitView((currentSplit) => {
           if (currentSplit) {
@@ -514,9 +529,6 @@ export const App: React.FC<AppProps> = ({
           }
           return currentSplit;
         });
-      }
-      if (vw < TWO_PANEL_MIN_VIEWPORT_PX) {
-        setDesktopSidebarCollapsed(true);
       }
     };
     window.addEventListener("resize", handleResize);
@@ -759,6 +771,10 @@ export const App: React.FC<AppProps> = ({
       const filtered = prev.filter((item) => item !== normalized);
       return [normalized, ...filtered].slice(0, 20);
     });
+    if (deviceLayoutRef.current === "phone") {
+      navigatePhone("artifacts");
+      return;
+    }
     setSplitView(true);
     if (
       typeof window !== "undefined" &&
@@ -769,7 +785,7 @@ export const App: React.FC<AppProps> = ({
     setMobileRosterOpen(false);
     setSecondaryTab("artifacts");
     setActiveTab("artifacts");
-  }, []);
+  }, [navigatePhone]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1048,6 +1064,11 @@ export const App: React.FC<AppProps> = ({
   // ChatPane always stays on the primary canvas; system consoles open in the Left Panel;
   // agent/project secondary tabs ("mail" | "artifacts" | "git" | "board") open in the Right Panel.
   const handleSelectTab = (tab: CockpitTab) => {
+    if (deviceLayoutRef.current === "phone") {
+      navigatePhone(tab);
+      void refreshSessionsAndTranscriptRef.current();
+      return;
+    }
     if (tab === "terminal" || tab === "hub" || tab === "gate" || tab === "state") {
       setLeftPanelTab(tab);
       setDesktopSidebarCollapsed(false);
@@ -1096,6 +1117,10 @@ export const App: React.FC<AppProps> = ({
 
   const handleSelectLeftPanelTab = useCallback(
     (tab: LeftPanelTab) => {
+      if (deviceLayoutRef.current === "phone") {
+        navigatePhone(tab);
+        return;
+      }
       setLeftPanelTab(tab);
       if (tab === "roster") {
         setActiveTab((prev) =>
@@ -1113,7 +1138,7 @@ export const App: React.FC<AppProps> = ({
         setActiveTab(tab);
       }
     },
-    [splitView, secondaryTab],
+    [splitView, secondaryTab, navigatePhone],
   );
 
   const refreshWireAndRoster = useCallback(async () => {
@@ -2719,6 +2744,200 @@ export const App: React.FC<AppProps> = ({
     ? mobileRosterOpen
     : !desktopSidebarCollapsed;
 
+  const isPhoneLayout = deviceLayout === "phone";
+
+  const handleOpenSettingsFromHeader = () => {
+    setSettingsOriginMemento(null);
+    setSettingsInitialProject(null);
+    setSettingsInitialProjectFilter(null);
+    setSettingsInitialTab(undefined);
+    setSettingsInitialProjectSubTab(undefined);
+    setSettingsInitialAgentsSubTab(undefined);
+    setSettingsModalOpen(true);
+  };
+
+  const handleSelectSessionFromHeader = (sessionId: string) => {
+    if (sessionId !== selectedSessionIdRef.current) {
+      selectedSessionIdRef.current = sessionId;
+      activeSessionIdRef.current = sessionId;
+      setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
+    setSelectedSessionId(sessionId);
+    void refreshSessionsAndTranscript(sessionId);
+  };
+
+  const phoneHelpTopic: HelpTopicId =
+    phoneView === "agents" || phoneView === "watch"
+      ? "chat"
+      : phoneView === "events"
+        ? "hub"
+        : phoneView;
+
+  const chatPaneElement = (
+    <ChatPane
+      agentName={selectedAgent?.name_key ?? null}
+      agentDisplayName={selectedAgent?.display_name ?? null}
+      agentRole={selectedAgent?.role ?? null}
+      agentProject={selectedAgent?.project ?? null}
+      adapter={activeAdapter}
+      model={activeModel}
+      thinkingLevel={activeSession?.thinking_level ?? null}
+      availableModels={
+        activeSession?.available_models ??
+        activeRoute?.available_models ??
+        null
+      }
+      executionMode={
+        activeSession?.execution_mode ?? activeRoute?.execution_mode
+      }
+      sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
+      turns={transcriptTurns}
+      contextUsage={sessionContextUsage}
+      quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
+      isBusy={isSessionBusy}
+      inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
+      queue={sessionQueue}
+      loading={loading}
+      wsConnected={wsConnected}
+      agentSettingsOpen={agentSettingsOpen}
+      onOpenAgentSettings={() => {
+        setSettingsOriginMemento(null);
+        setAgentSettingsOpen(true);
+      }}
+      onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
+      returnToSettingsLabel={returnToSettingsLabel}
+      onReturnToSettings={handleReturnToOriginSettings}
+      splitView={splitView}
+      onToggleSplitView={handleToggleSplitView}
+      onOpenMobileRoster={
+        isPhoneLayout ? () => navigatePhone("roster") : handleToggleLeftSidebar
+      }
+      mobileSidebarOpen={
+        isPhoneLayout ? phoneView === "agents" : leftSidebarOpen
+      }
+      onRefresh={() => {
+        void refreshSessionsAndTranscript();
+        void refreshWireAndRoster();
+      }}
+      onSendPrompt={handleSendPrompt}
+      onSendQueuedNow={handleSendQueuedNow}
+      onCancelQueued={handleCancelQueued}
+      onUpdateQueued={handleUpdateQueued}
+      onDecommissionSession={handleDecommissionSession}
+      onInterruptSession={handleInterruptSession}
+      onSetSessionModel={handleSetSessionModel}
+      onOpenArtifact={handleOpenArtifact}
+      onOpenHelpTopic={(topic) => {
+        setHelpTopic(topic);
+        setHelpDrawerOpen(true);
+      }}
+      apiClient={apiClient}
+    />
+  );
+
+  const renderRosterSidebar = (embedded: boolean) => (
+    <RosterSidebar
+      agents={agents}
+      routes={mergedRoutes}
+      sessions={sessions}
+      liveness={liveness}
+      unreadByAgent={unreadByAgent}
+      unreadSeverityByAgent={unreadSeverityByAgent}
+      busyByAgent={effectiveBusyByAgent}
+      contextUsageByAgent={effectiveContextUsageByAgent}
+      transcriptsByAgent={transcriptsByAgent}
+      selectedAgentName={selectedAgent?.name_key ?? null}
+      onSelectAgent={(nameKey) => {
+        const nextKey = nameKey.trim().toLowerCase();
+        if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+          selectedAgentNameRef.current = nameKey;
+          selectedSessionIdRef.current = null;
+          setTranscriptTurns(
+            preserveOptimisticTurn(
+              backgroundTranscriptsRef.current[nextKey] ?? [],
+              optimisticPromptRef.current,
+              Date.now(),
+              nextKey,
+              null,
+            ),
+          );
+          setSessionQueue([]);
+          setIsSessionBusy(false);
+          setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
+          setSessionQuotaUsage(null);
+        }
+        setSelectedAgentName(nameKey);
+        setSelectedSessionId(null);
+        if (deviceLayoutRef.current === "phone") {
+          setPhoneView("chat");
+        }
+        setMobileRosterOpen(false);
+        void refreshSessionsAndTranscript();
+      }}
+      onOpenAgentSettings={(nameKey) => {
+        setSettingsOriginMemento(null);
+        handleOpenAgentSettingsFor(nameKey);
+      }}
+      onOpenProjectSettings={(project) => {
+        setSettingsOriginMemento(null);
+        setSettingsInitialProject(project);
+        setSettingsInitialProjectFilter(null);
+        setSettingsInitialTab(undefined);
+        setSettingsInitialProjectSubTab(undefined);
+        setSettingsInitialAgentsSubTab(undefined);
+        setSettingsModalOpen(true);
+      }}
+      onOpenSettingsModal={() => {
+        setSettingsOriginMemento(null);
+        setSettingsInitialProject(null);
+        setSettingsInitialProjectFilter(null);
+        setSettingsInitialTab(undefined);
+        setSettingsInitialProjectSubTab(undefined);
+        setSettingsInitialAgentsSubTab(undefined);
+        setSettingsModalOpen(true);
+      }}
+      onOpenHelpModal={() => {
+        setHelpTopic(isPhoneLayout ? phoneHelpTopic : activeTab);
+        setHelpDrawerOpen(true);
+      }}
+      themeMode={themeMode}
+      onToggleTheme={handleToggleTheme}
+      onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
+      isOpen={mobileRosterOpen}
+      isCollapsedDesktop={desktopSidebarCollapsed}
+      onClose={() => {
+        setMobileRosterOpen(false);
+        setDesktopSidebarCollapsed(true);
+      }}
+      leftPanelTab={leftPanelTab}
+      onSelectLeftPanelTab={handleSelectLeftPanelTab}
+      consoleContent={
+        leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
+      }
+      width={isMobileViewport ? undefined : effectiveLeftWidth}
+      onResizeStart={handleLeftResizeStart}
+      onTouchResizeStart={handleLeftTouchResizeStart}
+      embedded={embedded}
+    />
+  );
+
+  const renderPhoneView = (): React.ReactNode => {
+    switch (phoneView) {
+      case "chat":
+        return chatPaneElement;
+      case "agents":
+        return renderRosterSidebar(true);
+      case "events":
+        return renderSecondaryPane("triage");
+      default:
+        return renderSecondaryPane(phoneView);
+    }
+  };
+
   return (
     <div
       className="fd-cockpit"
@@ -2726,264 +2945,143 @@ export const App: React.FC<AppProps> = ({
       data-viewport-panel-mode={viewportPanelMode}
       data-device-layout={deviceLayout}
     >
-      <ContextHeader
-        selectedAgent={selectedAgent}
-        sessions={mergedRoutes}
-        selectedSessionId={activeSession?.id ?? null}
-        onSelectSession={(sessionId) => {
-          if (sessionId !== selectedSessionIdRef.current) {
-            selectedSessionIdRef.current = sessionId;
-            activeSessionIdRef.current = sessionId;
-            setTranscriptTurns([]);
-            setSessionQueue([]);
-            setIsSessionBusy(false);
-            setSessionContextUsage(null);
-            setSessionQuotaUsage(null);
-          }
-          setSelectedSessionId(sessionId);
-          void refreshSessionsAndTranscript(sessionId);
-        }}
-        activeTab={activeTab}
-        onSelectTab={handleSelectTab}
-        splitView={splitView}
-        onToggleSplitView={handleToggleSplitView}
-        themeMode={themeMode}
-        onToggleTheme={handleToggleTheme}
-        authority={authority}
-        wsConnected={wsConnected}
-        onlineNodesCount={onlineNodesCount}
-        onOpenNodesModal={() => setNodesModalOpen(true)}
-        onOpenSettingsModal={() => {
-          setSettingsOriginMemento(null);
-          setSettingsInitialProject(null);
-          setSettingsInitialProjectFilter(null);
-          setSettingsInitialTab(undefined);
-          setSettingsInitialProjectSubTab(undefined);
-          setSettingsInitialAgentsSubTab(undefined);
-          setSettingsModalOpen(true);
-        }}
-        onOpenHelpModal={(tab) => {
-          setHelpTopic(tab ?? activeTab);
-          setHelpDrawerOpen(true);
-        }}
-        onOpenAgentSettings={() => {
-          setSettingsOriginMemento(null);
-          handleOpenAgentSettingsFor();
-        }}
-        onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
-        onOpenPairingModal={() => setPairingOpen(true)}
-        onLogout={handleLogout}
-        onOpenMobileRoster={handleToggleLeftSidebar}
-        mobileSidebarOpen={leftSidebarOpen}
-        leftPanelWidth={
-          leftSidebarOpen && !isMobileViewport ? effectiveLeftWidth : undefined
-        }
-      />
-
-      <div className="fd-cockpit-body" data-testid="cockpit-body">
-        <RosterSidebar
-          agents={agents}
-          routes={mergedRoutes}
-          sessions={sessions}
-          liveness={liveness}
-          unreadByAgent={unreadByAgent}
-          unreadSeverityByAgent={unreadSeverityByAgent}
-          busyByAgent={effectiveBusyByAgent}
-          contextUsageByAgent={effectiveContextUsageByAgent}
-          transcriptsByAgent={transcriptsByAgent}
-          selectedAgentName={selectedAgent?.name_key ?? null}
-          onSelectAgent={(nameKey) => {
-            const nextKey = nameKey.trim().toLowerCase();
-            if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
-              selectedAgentNameRef.current = nameKey;
-              selectedSessionIdRef.current = null;
-              setTranscriptTurns(
-                preserveOptimisticTurn(
-                  backgroundTranscriptsRef.current[nextKey] ?? [],
-                  optimisticPromptRef.current,
-                  Date.now(),
-                  nextKey,
-                  null,
-                ),
-              );
-              setSessionQueue([]);
-              setIsSessionBusy(false);
-              setSessionContextUsage(contextUsageByAgent[nextKey] ?? null);
-              setSessionQuotaUsage(null);
-            }
-            setSelectedAgentName(nameKey);
-            setSelectedSessionId(null);
-            setMobileRosterOpen(false);
-            void refreshSessionsAndTranscript();
+      {isPhoneLayout ? (
+        <PhoneShell
+          view={phoneView}
+          onNavigate={setPhoneView}
+          onBack={() => navigatePhone("chat")}
+          selectedAgent={selectedAgent}
+          sessions={mergedRoutes}
+          selectedSessionId={activeSession?.id ?? null}
+          onSelectSession={handleSelectSessionFromHeader}
+          wsConnected={wsConnected}
+          agentsUnread={Object.values(unreadByAgent).reduce((sum, n) => sum + n, 0)}
+          actions={{
+            themeMode,
+            onToggleTheme: handleToggleTheme,
+            onOpenSettings: handleOpenSettingsFromHeader,
+            onOpenHelp: () => {
+              setHelpTopic(phoneHelpTopic);
+              setHelpDrawerOpen(true);
+            },
+            onOpenNodes: () => setNodesModalOpen(true),
+            onOpenSpinUp: () => setSpinUpModalOpen(true),
+            onOpenPairing: () => setPairingOpen(true),
+            onLogout: handleLogout,
           }}
-          onOpenAgentSettings={(nameKey) => {
-            setSettingsOriginMemento(null);
-            handleOpenAgentSettingsFor(nameKey);
-          }}
-          onOpenProjectSettings={(project) => {
-            setSettingsOriginMemento(null);
-            setSettingsInitialProject(project);
-            setSettingsInitialProjectFilter(null);
-            setSettingsInitialTab(undefined);
-            setSettingsInitialProjectSubTab(undefined);
-            setSettingsInitialAgentsSubTab(undefined);
-            setSettingsModalOpen(true);
-          }}
-          onOpenSettingsModal={() => {
-            setSettingsOriginMemento(null);
-            setSettingsInitialProject(null);
-            setSettingsInitialProjectFilter(null);
-            setSettingsInitialTab(undefined);
-            setSettingsInitialProjectSubTab(undefined);
-            setSettingsInitialAgentsSubTab(undefined);
-            setSettingsModalOpen(true);
-          }}
-          onOpenHelpModal={() => {
-            setHelpTopic(activeTab);
-            setHelpDrawerOpen(true);
-          }}
-          themeMode={themeMode}
-          onToggleTheme={handleToggleTheme}
-          onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
-          isOpen={mobileRosterOpen}
-          isCollapsedDesktop={desktopSidebarCollapsed}
-          onClose={() => {
-            setMobileRosterOpen(false);
-            setDesktopSidebarCollapsed(true);
-          }}
-          leftPanelTab={leftPanelTab}
-          onSelectLeftPanelTab={handleSelectLeftPanelTab}
-          consoleContent={
-            leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
-          }
-          width={isMobileViewport ? undefined : effectiveLeftWidth}
-          onResizeStart={handleLeftResizeStart}
-          onTouchResizeStart={handleLeftTouchResizeStart}
-        />
-
-        <div className="fd-main">
-          <main
-            className={`fd-workspace${splitView ? " is-split" : ""}`}
-            data-testid="cockpit-workspace"
-          >
-          <ChatPane
-            agentName={selectedAgent?.name_key ?? null}
-            agentDisplayName={selectedAgent?.display_name ?? null}
-            agentRole={selectedAgent?.role ?? null}
-            agentProject={selectedAgent?.project ?? null}
-            adapter={activeAdapter}
-            model={activeModel}
-            thinkingLevel={activeSession?.thinking_level ?? null}
-            availableModels={
-              activeSession?.available_models ??
-              activeRoute?.available_models ??
-              null
-            }
-            executionMode={
-              activeSession?.execution_mode ?? activeRoute?.execution_mode
-            }
-            sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
-            turns={transcriptTurns}
-            contextUsage={sessionContextUsage}
-            quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
-            isBusy={isSessionBusy}
-            inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
-            queue={sessionQueue}
-            loading={loading}
-            wsConnected={wsConnected}
-            agentSettingsOpen={agentSettingsOpen}
-            onOpenAgentSettings={() => {
-              setSettingsOriginMemento(null);
-              setAgentSettingsOpen(true);
-            }}
-            onCloseAgentSettings={handleCloseAgentSettingsWithOrigin}
-            returnToSettingsLabel={returnToSettingsLabel}
-            onReturnToSettings={handleReturnToOriginSettings}
+        >
+          {renderPhoneView()}
+        </PhoneShell>
+      ) : (
+        <>
+          <ContextHeader
+            selectedAgent={selectedAgent}
+            sessions={mergedRoutes}
+            selectedSessionId={activeSession?.id ?? null}
+            onSelectSession={handleSelectSessionFromHeader}
+            activeTab={activeTab}
+            onSelectTab={handleSelectTab}
             splitView={splitView}
             onToggleSplitView={handleToggleSplitView}
-            onOpenMobileRoster={handleToggleLeftSidebar}
-            mobileSidebarOpen={leftSidebarOpen}
-            onRefresh={() => {
-              void refreshSessionsAndTranscript();
-              void refreshWireAndRoster();
-            }}
-            onSendPrompt={handleSendPrompt}
-            onSendQueuedNow={handleSendQueuedNow}
-            onCancelQueued={handleCancelQueued}
-            onUpdateQueued={handleUpdateQueued}
-            onDecommissionSession={handleDecommissionSession}
-            onInterruptSession={handleInterruptSession}
-            onSetSessionModel={handleSetSessionModel}
-            onOpenArtifact={handleOpenArtifact}
-            onOpenHelpTopic={(topic) => {
-              setHelpTopic(topic);
+            themeMode={themeMode}
+            onToggleTheme={handleToggleTheme}
+            authority={authority}
+            wsConnected={wsConnected}
+            onlineNodesCount={onlineNodesCount}
+            onOpenNodesModal={() => setNodesModalOpen(true)}
+            onOpenSettingsModal={handleOpenSettingsFromHeader}
+            onOpenHelpModal={(tab) => {
+              setHelpTopic(tab ?? activeTab);
               setHelpDrawerOpen(true);
             }}
-            apiClient={apiClient}
+            onOpenAgentSettings={() => {
+              setSettingsOriginMemento(null);
+              handleOpenAgentSettingsFor();
+            }}
+            onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
+            onOpenPairingModal={() => setPairingOpen(true)}
+            onLogout={handleLogout}
+            onOpenMobileRoster={handleToggleLeftSidebar}
+            mobileSidebarOpen={leftSidebarOpen}
+            leftPanelWidth={
+              leftSidebarOpen && !isMobileViewport ? effectiveLeftWidth : undefined
+            }
           />
-          {splitView && (
-            <>
-              <div
-                className="fd-right-split-backdrop"
-                data-testid="mobile-split-backdrop"
-                aria-hidden="true"
-                onClick={handleToggleSplitView}
-              />
-              <div
-                className="fd-pane fd-right-split-pane"
-                data-testid="right-split-panel"
-              style={{
-                width: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
-                minWidth: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
-                flex: `0 0 ${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
-                position: "relative",
-              }}
-            >
-              <div
-                data-testid="right-panel-resize-handle"
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="Resize right panel"
-                title="Drag left or right to resize right panel"
-                onMouseDown={handleRightResizeStart}
-                onTouchStart={handleRightTouchResizeStart}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: "-6px",
-                  bottom: 0,
-                  width: "12px",
-                  cursor: "col-resize",
-                  zIndex: 25,
-                  userSelect: "none",
-                  touchAction: "none",
-                }}
-              />
-              <RightPanelHeader
-                selectedAgent={selectedAgent}
-                rightSplitTab={rightSplitTab}
-                onSelectTab={(tab) => {
-                  setSecondaryTab(tab);
-                  setActiveTab(tab);
-                  setSplitView(true);
-                  if (
-                    typeof window !== "undefined" &&
-                    window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
-                  ) {
-                    setDesktopSidebarCollapsed(true);
-                    setMobileRosterOpen(false);
-                  }
-                  void refreshSessionsAndTranscriptRef.current();
-                }}
-                onClose={handleToggleSplitView}
-              />
-              {renderSecondaryPane(rightSplitTab)}
-              </div>
-            </>
-          )}
-          </main>
-        </div>
-      </div>
+
+          <div className="fd-cockpit-body" data-testid="cockpit-body">
+            {renderRosterSidebar(false)}
+
+            <div className="fd-main">
+              <main
+                className={`fd-workspace${splitView ? " is-split" : ""}`}
+                data-testid="cockpit-workspace"
+              >
+              {chatPaneElement}
+              {splitView && (
+                <>
+                  <div
+                    className="fd-right-split-backdrop"
+                    data-testid="mobile-split-backdrop"
+                    aria-hidden="true"
+                    onClick={handleToggleSplitView}
+                  />
+                  <div
+                    className="fd-pane fd-right-split-pane"
+                    data-testid="right-split-panel"
+                  style={{
+                    width: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
+                    minWidth: `${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
+                    flex: `0 0 ${Math.max(PANEL_MIN_WIDTH_PX, rightPanelWidth)}px`,
+                    position: "relative",
+                  }}
+                >
+                  <div
+                    data-testid="right-panel-resize-handle"
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="Resize right panel"
+                    title="Drag left or right to resize right panel"
+                    onMouseDown={handleRightResizeStart}
+                    onTouchStart={handleRightTouchResizeStart}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: "-6px",
+                      bottom: 0,
+                      width: "12px",
+                      cursor: "col-resize",
+                      zIndex: 25,
+                      userSelect: "none",
+                      touchAction: "none",
+                    }}
+                  />
+                  <RightPanelHeader
+                    selectedAgent={selectedAgent}
+                    rightSplitTab={rightSplitTab}
+                    onSelectTab={(tab) => {
+                      setSecondaryTab(tab);
+                      setActiveTab(tab);
+                      setSplitView(true);
+                      if (
+                        typeof window !== "undefined" &&
+                        window.innerWidth < THREE_PANEL_MIN_VIEWPORT_PX
+                      ) {
+                        setDesktopSidebarCollapsed(true);
+                        setMobileRosterOpen(false);
+                      }
+                      void refreshSessionsAndTranscriptRef.current();
+                    }}
+                    onClose={handleToggleSplitView}
+                  />
+                  {renderSecondaryPane(rightSplitTab)}
+                  </div>
+                </>
+              )}
+              </main>
+            </div>
+          </div>
+        </>
+      )}
 
       <PairingModal
         isOpen={pairingOpen}
