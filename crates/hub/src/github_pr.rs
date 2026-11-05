@@ -711,6 +711,7 @@ mod tests {
 
     fn co_authored(sha: &str) -> PrCommitSummary {
         PrCommitSummary {
+            parent_count: 1,
             sha: sha.into(),
             author_login: Some("artificially-human".into()),
             message: "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>".into(),

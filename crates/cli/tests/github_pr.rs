@@ -165,6 +165,7 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
         "felicia/feat-1",
         "sha-pr1",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-pr1".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -381,6 +382,7 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
         "ferris/lead-change",
         "sha-pr2",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-pr2".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -473,6 +475,7 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
         "felicia/ci-update",
         "sha-pr3",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-pr3".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -563,6 +566,7 @@ fn separate_workspace_state_store_and_env_app_credentials_work() {
         "felicia/separate-store",
         "sha-sep",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-sep".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -660,6 +664,7 @@ fn pr_create_with_app_credential_authors_as_user_so_app_can_approve() {
         "felicia/feat-app-create",
         "sha-app-create",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-app-create".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -722,6 +727,7 @@ fn an_outsiders_forged_agent_approval_counts_for_nothing_and_cannot_stop_verify_
         "felicia/forged",
         "sha-forged",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-forged".into(),
             author_login: Some(USER_LOGIN.into()),
             message:
@@ -830,6 +836,7 @@ fn a_lookalike_of_the_reviewer_apps_login_counts_for_nothing_under_reviewer_ids(
         "felicia/lookalike",
         "sha-look",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-look".into(),
             author_login: Some(USER_LOGIN.into()),
             message: "feat: lookalike\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -985,6 +992,7 @@ fn review_and_merge_sign_through_the_vault_with_a_private_key_ref() {
         "felicia/feat-1",
         "sha-pr1",
         vec![PrCommitSummary {
+            parent_count: 1,
             sha: "sha-pr1".into(),
             author_login: Some(USER_LOGIN.into()),
             message: "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>".into(),

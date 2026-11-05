@@ -115,6 +115,21 @@ pub struct PrCommitSummary {
     pub sha: String,
     pub author_login: Option<String>,
     pub message: String,
+    /// How many parents the commit has. A GitHub merge commit has two. A source that does not
+    /// report it reads as `1`, so such a commit is still checked for attribution.
+    #[serde(default = "default_parent_count")]
+    pub parent_count: usize,
+}
+
+fn default_parent_count() -> usize {
+    1
+}
+
+impl PrCommitSummary {
+    /// A merge commit has more than one parent.
+    pub fn is_merge(&self) -> bool {
+        self.parent_count > 1
+    }
 }
 
 /// Minimal review metadata extracted from a pull request.
@@ -427,7 +442,18 @@ pub fn evaluate_pr_policy(
     let mut unknown_co_authors = Vec::new();
     let mut owner_authored_commits = false;
 
+    // A merge commit (for example the one GitHub makes when a pull request merges into `uat`)
+    // carries no trailer of its own; the commits it merged are on the pull request too. Exempt it
+    // from the trailer check only while a non-merge commit remains to carry the attribution. A
+    // pull request of merge commits alone is checked in full, so it cannot pass with no attributed
+    // commit. An exempt merge commit is still parsed: its trailers raise the reviewer tier
+    // (`co_authors`, `co_author_roles`) and flag unregistered names (`unknown_co_authors`), but it
+    // attributes nothing, so it never enters `unattributed_commits` and never sets
+    // `owner_authored_commits`.
+    let skip_merge_commits = commits.iter().any(|c| !c.is_merge());
+
     for commit in commits {
+        let exempt = skip_merge_commits && commit.is_merge();
         let trailers = parse_co_authors(&commit.message);
         let is_owner_commit = commit
             .author_login
@@ -435,7 +461,9 @@ pub fn evaluate_pr_policy(
             .is_some_and(|login| login.eq_ignore_ascii_case(owner));
 
         if trailers.is_empty() {
-            if is_owner_commit {
+            if exempt {
+                // Nothing to attribute and nothing to flag.
+            } else if is_owner_commit {
                 owner_authored_commits = true;
             } else {
                 push_unique(&mut unattributed_commits, commit.sha.clone());
@@ -449,7 +477,7 @@ pub fn evaluate_pr_policy(
                 // A trailer is text anyone can write: it names the Owner only on
                 // a commit the Owner's login authored. Otherwise it attributes
                 // nothing (so it cannot launder an unattributed commit).
-                if is_owner_commit {
+                if is_owner_commit && !exempt {
                     owner_authored_commits = true;
                     attributed = true;
                 }
@@ -468,7 +496,7 @@ pub fn evaluate_pr_policy(
                 }
             }
         }
-        if !attributed && !is_owner_commit {
+        if !attributed && !is_owner_commit && !exempt {
             push_unique(&mut unattributed_commits, commit.sha.clone());
         }
     }
@@ -954,6 +982,7 @@ mod tests {
 
     fn commit(sha: &str, login: Option<&str>, message: &str) -> PrCommitSummary {
         PrCommitSummary {
+            parent_count: 1,
             sha: sha.into(),
             author_login: login.map(str::to_string),
             message: message.into(),
@@ -985,6 +1014,187 @@ mod tests {
         );
         assert_eq!(eval.unattributed_commits, vec!["forged".to_string()]);
         assert_eq!(eval.required_tier, RequiredTier::Owner);
+    }
+
+    fn merge_commit(sha: &str, login: Option<&str>, message: &str) -> PrCommitSummary {
+        PrCommitSummary {
+            parent_count: 2,
+            ..commit(sha, login, message)
+        }
+    }
+
+    const PROMOTION_MERGE_MESSAGE: &str = "Merge pull request #43 from acme/wesley/feature";
+    const WESLEY_TRAILER: &str =
+        "feat: page\n\nCo-authored-by: Wesley <wesley@artificialhumanity.io>";
+
+    #[test]
+    fn promotion_pr_skips_the_github_merge_commit_when_an_agent_commit_is_present() {
+        let mut roster = sample_roster();
+        roster.push(make_agent(6, "Wesley", "website", AgentRole::Lead, &[]));
+        // uat -> main: the agent commit, then the 2-parent commit GitHub made merging #43 into uat.
+        let commits = vec![
+            commit("e135141", Some("machine"), WESLEY_TRAILER),
+            merge_commit("edb5e67", Some("machine"), PROMOTION_MERGE_MESSAGE),
+        ];
+        let eval = evaluate_pr_policy(
+            "website",
+            &commits,
+            &["src/a.rs".into()],
+            &[],
+            &roster,
+            "lmcfarlin",
+        );
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+        assert_eq!(eval.co_authors, vec!["wesley".to_string()]);
+        assert_eq!(eval.required_tier, RequiredTier::LabManager);
+    }
+
+    #[test]
+    fn merge_commit_listed_before_the_agent_commit_is_skipped_too() {
+        let mut roster = sample_roster();
+        roster.push(make_agent(6, "Wesley", "website", AgentRole::Lead, &[]));
+        let commits = vec![
+            merge_commit("edb5e67", Some("machine"), PROMOTION_MERGE_MESSAGE),
+            commit("e135141", Some("machine"), WESLEY_TRAILER),
+        ];
+        let eval = evaluate_pr_policy("website", &commits, &[], &[], &roster, "lmcfarlin");
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+    }
+
+    #[test]
+    fn a_non_merge_commit_without_a_trailer_still_escalates_beside_a_merge_commit() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit("bare", Some("machine"), "fix: no trailer"),
+            merge_commit("edb5e67", Some("machine"), PROMOTION_MERGE_MESSAGE),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert_eq!(eval.unattributed_commits, vec!["bare".to_string()]);
+        assert_eq!(eval.required_tier, RequiredTier::Owner);
+    }
+
+    #[test]
+    fn a_pr_of_merge_commits_alone_fails_closed() {
+        let roster = sample_roster();
+        let commits = vec![merge_commit(
+            "edb5e67",
+            Some("machine"),
+            PROMOTION_MERGE_MESSAGE,
+        )];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert_eq!(eval.unattributed_commits, vec!["edb5e67".to_string()]);
+        assert_eq!(eval.required_tier, RequiredTier::Owner);
+    }
+
+    #[test]
+    fn a_merge_commit_does_not_launder_an_unattributed_commit_beside_it() {
+        // The skipped merge commit attributes nothing, and an unattributed non-merge commit
+        // beside it still escalates.
+        let roster = sample_roster();
+        let commits = vec![
+            commit(
+                "forged",
+                Some("mallory"),
+                "y\n\nCo-authored-by: Some Body <lmcfarlin@evil.example>",
+            ),
+            merge_commit("m", Some("machine"), PROMOTION_MERGE_MESSAGE),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert_eq!(eval.unattributed_commits, vec!["forged".to_string()]);
+    }
+
+    const FELICIA_TRAILER: &str =
+        "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>";
+
+    #[test]
+    fn a_skipped_merge_commit_trailer_still_raises_the_tier() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit("felicia", Some("machine"), FELICIA_TRAILER),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: Jarvis <jarvis@artificialhumanity.io>",
+            ),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+        assert!(eval.co_authors.contains(&"jarvis".to_string()), "{eval:?}");
+        assert!(eval.co_authors.contains(&"felicia".to_string()), "{eval:?}");
+        assert!(
+            eval.escalation_reasons
+                .contains(&"co-authored by lab_manager".to_string()),
+            "{eval:?}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_merge_commit_by_the_owner_does_not_set_owner_authored() {
+        let roster = sample_roster();
+        for merge in [
+            merge_commit("m", Some("lmcfarlin"), "Merge x"),
+            merge_commit(
+                "m",
+                Some("lmcfarlin"),
+                "Merge x\n\nCo-authored-by: lmcfarlin <lmcfarlin@gmail.com>",
+            ),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: lmcfarlin <lmcfarlin@gmail.com>",
+            ),
+        ] {
+            let commits = vec![
+                commit("felicia", Some("machine"), FELICIA_TRAILER),
+                merge.clone(),
+            ];
+            let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+            assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+            assert_eq!(eval.co_authors, vec!["felicia".to_string()]);
+            assert_eq!(
+                eval.required_tier,
+                RequiredTier::Lead {
+                    project: "ferroloop".into()
+                }
+            );
+
+            // With no registered co-author the Owner-authored flag would add a reason; it must not.
+            let commits = vec![commit("bare", Some("machine"), "fix: no trailer"), merge];
+            let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+            assert_eq!(eval.unattributed_commits, vec!["bare".to_string()]);
+            assert!(
+                !eval
+                    .escalation_reasons
+                    .iter()
+                    .any(|r| r.contains("authored directly by repository Owner")),
+                "{eval:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_merge_commit_with_an_unregistered_co_author_is_flagged() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit("felicia", Some("machine"), FELICIA_TRAILER),
+            merge_commit(
+                "m",
+                Some("machine"),
+                "Merge x\n\nCo-authored-by: Ghost <ghost@example.com>",
+            ),
+        ];
+        let eval = evaluate_pr_policy("ferroloop", &commits, &[], &[], &roster, "lmcfarlin");
+        assert_eq!(eval.unknown_co_authors, vec!["ghost".to_string()]);
+        assert!(eval.unattributed_commits.is_empty(), "{eval:?}");
+        assert_eq!(eval.required_tier, RequiredTier::Owner);
+    }
+
+    #[test]
+    fn a_commit_summary_without_parent_count_reads_as_one_parent() {
+        let c: PrCommitSummary =
+            serde_json::from_str(r#"{"sha":"a","author_login":null,"message":"m"}"#).unwrap();
+        assert_eq!(c.parent_count, 1);
+        assert!(!c.is_merge());
     }
 
     #[test]
@@ -1163,6 +1373,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_assistant = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: task\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1186,6 +1397,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_no_lead = evaluate_pr_policy(
             "prosodia",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: task\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1204,6 +1416,7 @@ Signed-off-by: Someone <someone@example.com>
             "ferroloop",
             &[
                 PrCommitSummary {
+                    parent_count: 1,
                     sha: "sha1".into(),
                     author_login: Some("artificially-human".into()),
                     message:
@@ -1211,6 +1424,7 @@ Signed-off-by: Someone <someone@example.com>
                             .into(),
                 },
                 PrCommitSummary {
+                    parent_count: 1,
                     sha: "sha2".into(),
                     author_login: Some("artificially-human".into()),
                     message:
@@ -1230,6 +1444,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_lm = evaluate_pr_policy(
             "ai-lab-amd",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: infra\n\nCo-authored-by: Jarvis <jarvis@artificialhumanity.io>"
@@ -1247,6 +1462,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_protected = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "ci: tweak\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1268,6 +1484,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_unattributed = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "deadbeef".into(),
                 author_login: Some("artificially-human".into()),
                 message: "chore: mystery commit".into(),
@@ -1293,6 +1510,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_assistant = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: work\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1332,6 +1550,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_lead = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha2".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: lead work\n\nCo-authored-by: Ferris <ferris@artificialhumanity.io>"
@@ -1367,6 +1586,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "head-1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: item\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1515,6 +1735,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_assistant = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha1".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: task\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1550,6 +1771,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_lead = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha2".into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: lead work\n\nCo-authored-by: Ferris <ferris@artificialhumanity.io>"
@@ -1573,6 +1795,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval_protected = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: "sha3".into(),
                 author_login: Some("artificially-human".into()),
                 message: "ci: update\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -1602,6 +1825,7 @@ Signed-off-by: Someone <someone@example.com>
         evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: HEAD.into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: item\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
@@ -2009,6 +2233,7 @@ Signed-off-by: Someone <someone@example.com>
         let eval = evaluate_pr_policy(
             "ferroloop",
             &[PrCommitSummary {
+                parent_count: 1,
                 sha: HEAD.into(),
                 author_login: Some("artificially-human".into()),
                 message: "feat: item\n\nCo-authored-by: Ferris <ferris@artificialhumanity.io>"

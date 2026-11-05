@@ -2023,6 +2023,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                             "commit": {
                                 "message": c.message,
                             },
+                            "parents": (0..c.parent_count)
+                                .map(|i| json!({"sha": format!("{}-parent-{i}", c.sha)}))
+                                .collect::<Vec<_>>(),
                         })
                     })
                     .collect(),
