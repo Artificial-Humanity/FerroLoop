@@ -717,6 +717,10 @@ pub trait AgentRegistry {
     fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError>;
     fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError>;
     fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError>;
+    /// Removes the area `area_key` and logs an `AreaDelete` registry event. `true` when there
+    /// was one; asking for one that is absent changes nothing and logs nothing. Agents are not
+    /// touched: the caller moves or retires them first.
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError>;
 
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError>;
     fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError>;

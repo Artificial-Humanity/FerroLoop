@@ -1222,6 +1222,7 @@ delegate! {
         fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError>;
         fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError>;
         fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError>;
+        fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError>;
         fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError>;
         fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError>;
         fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, StoreError>;

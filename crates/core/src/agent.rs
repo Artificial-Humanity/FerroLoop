@@ -297,6 +297,9 @@ pub enum RegistryEventKind {
     AreaUpsert(AreaRecord),
     AgentUpsert(AgentRecord),
     AgentRetire { id: AgentId },
+    /// The area is gone (a project or virtual group was deleted). A later `AreaUpsert` makes it
+    /// again.
+    AreaDelete { area_key: String },
 }
 
 crate::wire::wire_tags!(RegistryEventKind as registry_event_kind_wire {
@@ -322,6 +325,9 @@ crate::wire::wire_tags!(RegistryEventKind as registry_event_kind_wire {
     });
     RegistryEventKind::AgentRetire { .. } => "agent_retire", RegistryEventKind::AgentRetire {
         id: AgentId(crate::ids::seq_iri(1)),
+    };
+    RegistryEventKind::AreaDelete { .. } => "area_delete", RegistryEventKind::AreaDelete {
+        area_key: "ferroloop".into(),
     };
 });
 

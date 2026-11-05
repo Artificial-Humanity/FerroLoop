@@ -1036,6 +1036,9 @@ impl AgentRegistry for FaultyStore {
     fn list_areas(&self) -> Result<Vec<fl_core::agent::AreaRecord>, StoreError> {
         self.inner.list_areas()
     }
+    fn delete_area(&self, key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        self.inner.delete_area(key, at, by)
+    }
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         self.inner.register_agent(args)
     }

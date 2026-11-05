@@ -1225,6 +1225,22 @@ impl AgentRegistry for MemStore {
         Ok(s.areas.values().cloned().collect())
     }
 
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        let key = validate_slug(area_key).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let mut s = self.inner.borrow_mut();
+        if s.areas.remove(&key).is_none() {
+            return Ok(false);
+        }
+        let ev = RegistryEvent {
+            event_id: s.mint_unindexed(),
+            at,
+            by: by.to_string(),
+            kind: RegistryEventKind::AreaDelete { area_key: key },
+        };
+        s.append_registry_event(ev);
+        Ok(true)
+    }
+
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         let (name_key, display_name, email) =
             validate_agent_identity(&args.display_name, args.email.as_deref())
@@ -1459,6 +1475,9 @@ impl AgentRegistry for MemStore {
                     s.index_imported(Kind::Agent, rec.id.iri())?;
                     s.agent_by_name.insert(rec.name_key.clone(), rec.id.clone());
                     s.agents.insert(rec.id.clone(), rec.clone());
+                }
+                RegistryEventKind::AreaDelete { area_key } => {
+                    s.areas.remove(area_key);
                 }
                 RegistryEventKind::AgentRetire { id } => {
                     let resolved = AgentId(s.resolve(id.iri()));

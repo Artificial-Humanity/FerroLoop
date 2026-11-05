@@ -2567,7 +2567,7 @@ impl RemoteControl for MemRemote {
 }
 
 /// How many cases [`agent_registry`] runs. Update deliberately — see [`run_suite`].
-const AGENT_REGISTRY_CASES: usize = 7;
+const AGENT_REGISTRY_CASES: usize = 8;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
@@ -2578,6 +2578,7 @@ const WORKFLOW_STORE_CASES: usize = 3;
 pub fn agent_registry<S: AgentRegistry + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         area_round_trips_and_normalizes_key::<S>,
+        area_delete_removes_the_area_logs_one_event_and_is_idempotent::<S>,
         register_agent_requires_existing_area_unless_create_area_is_set::<S>,
         agent_resolves_by_case_insensitive_name_and_numeric_handle::<S>,
         agent_collision_refuses_active_and_retired_without_replace_and_preserves_iri_on_replace::<S>,
@@ -2714,6 +2715,42 @@ fn area_round_trips_and_normalizes_key<S: AgentRegistry>(s: &S) {
     assert_eq!(a.area_key, "ferro_loop");
     assert_eq!(s.get_area("FERRO_LOOP").unwrap(), Some(a.clone()));
     assert_eq!(s.list_areas().unwrap(), vec![a]);
+}
+
+fn area_delete_removes_the_area_logs_one_event_and_is_idempotent<S: AgentRegistry>(s: &S) {
+    let area = |key: &str| crate::agent::AreaRecord {
+        area_key: key.into(),
+        name: key.into(),
+        path: None,
+        purpose: "p".into(),
+        updated_at: At::from_unix_millis(10),
+        by: "jarvis".into(),
+    };
+    s.upsert_area(area("gone")).unwrap();
+    s.upsert_area(area("kept")).unwrap();
+    let before = s.registry_events_after(0).unwrap().len();
+    assert!(s.delete_area("GONE", At::from_unix_millis(11), "owner").unwrap());
+    assert_eq!(s.get_area("gone").unwrap(), None);
+    assert!(s.get_area("kept").unwrap().is_some());
+    let events = s.registry_events_after(0).unwrap();
+    assert_eq!(events.len(), before + 1);
+    assert!(matches!(
+        &events.last().unwrap().1.kind,
+        crate::agent::RegistryEventKind::AreaDelete { area_key } if area_key == "gone"
+    ));
+    // Absent: nothing changes, nothing is logged.
+    assert!(!s.delete_area("gone", At::from_unix_millis(12), "owner").unwrap());
+    assert_eq!(s.registry_events_after(0).unwrap().len(), before + 1);
+    // An imported delete removes the area too, and a later upsert makes it again.
+    let mut remote = events.last().unwrap().1.clone();
+    remote.event_id = crate::ids::seq_iri(9_000_001);
+    remote.kind = crate::agent::RegistryEventKind::AreaDelete {
+        area_key: "kept".into(),
+    };
+    s.import_registry_events(&[remote]).unwrap();
+    assert_eq!(s.get_area("kept").unwrap(), None);
+    s.upsert_area(area("kept")).unwrap();
+    assert!(s.get_area("kept").unwrap().is_some());
 }
 
 fn register_agent_requires_existing_area_unless_create_area_is_set<S: AgentRegistry>(s: &S) {
