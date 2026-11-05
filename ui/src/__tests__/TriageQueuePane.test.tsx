@@ -350,8 +350,11 @@ describe("Record #90 — Operator Today & Incidents Triage Queue", () => {
     expect(within(sidebar).getByTestId("triage-pane-title")).toHaveTextContent(
       "Today & Incidents",
     );
+    const headerTopRow = within(triagePane).getByTestId("triage-header-top-row");
+    expect(headerTopRow.style.flexWrap).toBe("wrap");
     const headerActions = within(triagePane).getByTestId("triage-header-actions");
     expect(headerActions.style.marginLeft).toBe("auto");
+    expect(headerActions.style.flexWrap).toBe("wrap");
     const refreshBtn = within(headerActions).getByTestId("triage-refresh-btn");
     expect(refreshBtn).toHaveAttribute("aria-label", "Refresh");
     expect(refreshBtn.querySelector("svg")).not.toBeNull();
