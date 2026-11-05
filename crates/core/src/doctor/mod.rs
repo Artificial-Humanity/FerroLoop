@@ -2,9 +2,9 @@
 //!
 //! [`run`] is pure. It takes [`DoctorInputs`] (facts a caller read without writing anything:
 //! the build stamp, the install receipt's text, a read-only [`HostProbe`], the outcome of a
-//! read-only store verification, the vault files' modes, the UI bundle's `build-info.json`)
-//! and returns a [`DoctorReport`] of exactly six checks, in a fixed order, each with a stable
-//! id:
+//! read-only store verification, the vault files' modes, the UI bundle's `build-info.json`,
+//! and the `After=` / `WantedBy=` lines of installed `ferro*.service` user units) and returns
+//! a [`DoctorReport`] of exactly seven checks, in a fixed order, each with a stable id:
 //!
 //! | id | observes |
 //! |---|---|
@@ -14,10 +14,11 @@
 //! | `G7.store-health` | each store opens read-only at a format this build reads |
 //! | `G7.vault-perms` | the vault and master key files are private to the owner |
 //! | `G7.code-ui-agree` | the UI bundle was built from the binary's commit |
+//! | `G7.unit-order` | no installed `ferro*.service` is both wanted by and ordered after `default.target` |
 //!
-//! A status is `pass` only on positive evidence. An absent receipt, store, vault or UI bundle
-//! is `not-installed`; a proof the inputs cannot make is `unsupported`; neither is ever
-//! `pass`. The report carries no timestamp, so equal inputs give equal bytes.
+//! A status is `pass` only on positive evidence. An absent receipt, store, vault, UI bundle
+//! or user unit is `not-installed`; a proof the inputs cannot make is `unsupported`; neither
+//! is ever `pass`. The report carries no timestamp, so equal inputs give equal bytes.
 //!
 //! This module does no I/O, reads no clock and uses no `unsafe`. The caller gathers the facts:
 //! `fl_install::observe` reads the file system (reads only) and calls [`run`]; it is what the
@@ -30,6 +31,7 @@ mod receipt;
 mod render;
 mod store;
 mod ui;
+mod units;
 mod vault;
 
 #[cfg(test)]
@@ -40,8 +42,10 @@ use crate::install::{HostProbe, InstallReceipt};
 use serde::{Deserialize, Serialize};
 
 pub use facts::{
-    NodeMeta, ReceiptSource, StoreFact, StoreFacts, StoreOutcome, UiFacts, VaultFacts, VaultNode,
+    NodeMeta, ReceiptSource, StoreFact, StoreFacts, StoreOutcome, UiFacts, UnitFacts, UnitFileFact,
+    VaultFacts, VaultNode,
 };
+pub use units::user_unit_directives;
 
 /// `schema_version` of the printed report.
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -54,16 +58,18 @@ pub mod ids {
     pub const STORE_HEALTH: &str = "G7.store-health";
     pub const VAULT_PERMS: &str = "G7.vault-perms";
     pub const CODE_UI_AGREE: &str = "G7.code-ui-agree";
+    pub const UNIT_ORDER: &str = "G7.unit-order";
 }
 
 /// Every check id, in report order.
-pub const CHECK_IDS: [&str; 6] = [
+pub const CHECK_IDS: [&str; 7] = [
     ids::RELEASE_IDENTITY,
     ids::RECEIPT_INTEGRITY,
     ids::PATH_OWNERSHIP,
     ids::STORE_HEALTH,
     ids::VAULT_PERMS,
     ids::CODE_UI_AGREE,
+    ids::UNIT_ORDER,
 ];
 
 /// The outcome of one check.
@@ -188,6 +194,8 @@ pub struct DoctorInputs<'a> {
     pub stores: StoreFacts,
     pub vault: VaultFacts,
     pub ui: UiFacts,
+    /// Installed `ferro*.service` user units, already parsed. Empty when none are installed.
+    pub units: UnitFacts,
 }
 
 impl<'a> DoctorInputs<'a> {
@@ -202,6 +210,7 @@ impl<'a> DoctorInputs<'a> {
             stores: StoreFacts::default(),
             vault: VaultFacts::default(),
             ui: UiFacts::default(),
+            units: UnitFacts::default(),
         }
     }
 }
@@ -229,7 +238,7 @@ impl ReceiptView {
     }
 }
 
-/// Run the six checks.
+/// Run the seven checks.
 pub fn run(inputs: &DoctorInputs<'_>) -> DoctorReport {
     let receipt = ReceiptView::of(&inputs.receipt);
     let checks = vec![
@@ -239,6 +248,7 @@ pub fn run(inputs: &DoctorInputs<'_>) -> DoctorReport {
         store::check(inputs),
         vault::check(inputs),
         ui::check(inputs),
+        units::check(inputs),
     ];
     DoctorReport::new(checks)
 }

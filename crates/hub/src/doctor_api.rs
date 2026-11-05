@@ -3,13 +3,14 @@
 //! **Owner only.** The answer names filesystem paths and permissions, so a Peer gets a 403 and an
 //! unauthenticated caller a 401. The body is the [`fl_core::doctor::DoctorReport`]:
 //! `{ "schema_version", "overall", "summary", "checks": [ { "id", "title", "status", "detail" } ] }`
-//! with the six `G7.*` checks in a fixed order and no timestamp.
+//! with the seven `G7.*` checks in a fixed order and no timestamp.
 //!
 //! The hub reports on its own context: its build stamp (`fl-hub`), the install receipt under
 //! `$FL_INSTALL_ROOT` or the home directory, its configured store (verified read-only through
 //! [`fl_store::health`]: never migrated, no write lock, no wait beyond about 300 ms, and not
 //! behind the hub's `store_lock`, so other requests never queue behind it), the vault files'
-//! modes (contents never read) and the UI bundle it serves. Nothing is written, no key is
+//! modes (contents never read), the UI bundle it serves, and the `After=` / `WantedBy=`
+//! lines of installed `ferro*.service` user units. Nothing is written, no key is
 //! generated, nothing is started, and no network call is made. A request runs on the HTTP
 //! worker thread that already runs blocking handlers; the path hashing is capped at
 //! [`PATH_BUDGET`].

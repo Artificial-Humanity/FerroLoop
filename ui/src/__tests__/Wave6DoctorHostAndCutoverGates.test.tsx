@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 describe("Wave 6 Item 1 (Record #220 / Issue #205 Phase A3): Observational System Doctor (fl doctor) Panel", () => {
-  it("renders all 6 canonical G7 doctor checks and the Observational · Read-Only guarantee badge in SettingsModal", () => {
+  it("renders every canonical G7 doctor check and the Observational · Read-Only guarantee badge in SettingsModal", () => {
     expect(CANONICAL_DOCTOR_CHECK_IDS).toEqual([
       "G7.release-identity",
       "G7.receipt-integrity",
@@ -30,6 +30,7 @@ describe("Wave 6 Item 1 (Record #220 / Issue #205 Phase A3): Observational Syste
       "G7.store-health",
       "G7.vault-perms",
       "G7.code-ui-agree",
+      "G7.unit-order",
     ]);
 
     render(

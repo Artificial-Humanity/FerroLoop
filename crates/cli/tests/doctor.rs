@@ -1,5 +1,5 @@
 //! `fl doctor` (#205 phase A3), driven as a black box. It only observes: these tests check the
-//! report (the six ids, the statuses, the JSON contract), the exit codes (0 no failure, 1 a
+//! report (the seven ids, the statuses, the JSON contract), the exit codes (0 no failure, 1 a
 //! failure, 3 a refused repair) and, above all, that NOTHING was written, anywhere.
 
 use assert_cmd::Command;
@@ -13,13 +13,14 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-const IDS: [&str; 6] = [
+const IDS: [&str; 7] = [
     "G7.release-identity",
     "G7.receipt-integrity",
     "G7.path-ownership",
     "G7.store-health",
     "G7.vault-perms",
     "G7.code-ui-agree",
+    "G7.unit-order",
 ];
 
 fn sha(bytes: &[u8]) -> String {

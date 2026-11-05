@@ -203,6 +203,12 @@ fn a_real_install_passes_and_the_tree_is_untouched() {
         detail(&r, ids::PATH_OWNERSHIP)
     );
     assert_eq!(status(&r, ids::RELEASE_IDENTITY), CheckStatus::Pass);
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
     // No store, no vault, no UI bundle here.
     assert_eq!(status(&r, ids::STORE_HEALTH), CheckStatus::NotInstalled);
     assert_eq!(status(&r, ids::VAULT_PERMS), CheckStatus::NotInstalled);
@@ -363,4 +369,115 @@ fn a_missing_home_makes_the_receipt_unlocatable_not_absent() {
     let r = observe(o);
     assert_eq!(status(&r, ids::RECEIPT_INTEGRITY), CheckStatus::Unsupported);
     assert!(detail(&r, ids::RECEIPT_INTEGRITY).contains("HOME"));
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Unsupported);
+    assert!(detail(&r, ids::UNIT_ORDER).contains("HOME"));
+}
+
+const CLEAN_TEMPLATES: [(&str, &str); 4] = [
+    (
+        "ferrostore.service",
+        include_str!("../../../contrib/units/ferrostore.service"),
+    ),
+    (
+        "ferrostore@.service",
+        include_str!("../../../contrib/units/ferrostore@.service"),
+    ),
+    (
+        "ferrowire.service",
+        include_str!("../../../contrib/units/ferrowire.service"),
+    ),
+    (
+        "ferroloop-hub.service",
+        include_str!("../../../contrib/units/ferroloop-hub.service"),
+    ),
+];
+
+fn write_units(root: &Path, files: &[(&str, &str)]) -> PathBuf {
+    let dir = root.join(".config/systemd/user");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_unit_after_default_target_and_wanted_by_it_is_caught_and_clean_templates_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = "\
+[Unit]
+Description=stale header
+After=default.target
+
+[Install]
+WantedBy=default.target
+";
+    write_units(tmp.path(), &[("ferrostore.service", bad)]);
+    std::fs::write(
+        tmp.path().join(".config/systemd/user/notferro.service"),
+        bad,
+    )
+    .unwrap();
+    let before = tree(tmp.path());
+    let r = observe(spec(tmp.path(), StoreFacts::default()));
+    assert_eq!(tree(tmp.path()), before, "reading units wrote something");
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&r, ids::UNIT_ORDER);
+    assert!(d.contains("ferrostore.service"), "{d}");
+    assert!(d.contains("systemd --user boot ordering cycle"), "{d}");
+    assert!(d.contains("`fl install`"), "{d}");
+    assert!(d.contains("remove `After=default.target`"), "{d}");
+    assert!(!d.contains("notferro.service"), "{d}");
+
+    let clean = tempfile::tempdir().unwrap();
+    write_units(clean.path(), &CLEAN_TEMPLATES);
+    let r = observe(spec(clean.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+
+    let commented = tempfile::tempdir().unwrap();
+    write_units(
+        commented.path(),
+        &[(
+            "ferrowire.service",
+            "# After=default.target\n[Install]\nWantedBy=default.target\n",
+        )],
+    );
+    let r = observe(spec(commented.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+
+    let link = tempfile::tempdir().unwrap();
+    let dir = write_units(link.path(), &[]);
+    let outside = link.path().join("secret-unit.txt");
+    std::fs::write(&outside, "SENTINEL-UNIT\n[Unit]\nAfter=default.target\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("ferrostore.service")).unwrap();
+    let r = observe(spec(link.path(), StoreFacts::default()));
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    assert!(detail(&r, ids::UNIT_ORDER).contains("ferrostore.service"));
+    assert!(!r.to_json().contains("SENTINEL-UNIT"));
+
+    // The unit directory itself may be a symlink. The files inside still are not followed.
+    let via = tempfile::tempdir().unwrap();
+    let real = via.path().join("real-units");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("ferrostore.service"), bad).unwrap();
+    let linked = via.path().join(".config/systemd/user");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let r = observe(spec(via.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Warn,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
 }

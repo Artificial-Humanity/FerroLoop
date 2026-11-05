@@ -1265,11 +1265,15 @@ fn systemd_unit(exe: &Path, cwd: &Path) -> String {
     format!(
         "[Unit]\n\
          Description=FerroLoop Hub\n\
+         Wants=ferrostore.service ferrowire.service\n\
+         After=ferrostore.service ferrowire.service\n\
          \n\
          [Service]\n\
          Type=simple\n\
          ExecStart={exe} hub serve\n\
          WorkingDirectory={cwd}\n\
+         Restart=on-failure\n\
+         RestartSec=3\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n"

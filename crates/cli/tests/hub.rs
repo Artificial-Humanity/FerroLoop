@@ -616,6 +616,21 @@ fn fl_hub_init_service_writes_systemd_unit() {
     assert!(text.contains("hub serve"), "{text}");
     assert!(text.contains("ExecStart="), "{text}");
     assert!(text.contains(&env.work_dir.display().to_string()), "{text}");
+    assert!(
+        text.contains("Wants=ferrostore.service ferrowire.service"),
+        "{text}"
+    );
+    assert!(
+        text.contains("After=ferrostore.service ferrowire.service"),
+        "{text}"
+    );
+    assert!(text.contains("Restart=on-failure"), "{text}");
+    assert!(text.contains("RestartSec=3"), "{text}");
+    assert!(text.contains("WantedBy=default.target"), "{text}");
+    assert!(
+        !text.contains("After=default.target"),
+        "the generated unit must not order itself after default.target: {text}"
+    );
 }
 
 #[test]

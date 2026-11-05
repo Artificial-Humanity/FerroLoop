@@ -1,14 +1,14 @@
 //! Gather the doctor's inputs from the file system and run the engine. Reads only:
-//! `lstat`, `readlink`, a bounded read of the receipt and of `build-info.json`, and a bounded
-//! hash of the files the receipt owns. Nothing is created, written, locked or executed, and
-//! the vault files are only `lstat`ed.
+//! `lstat`, `readlink`, a bounded read of the receipt, of `build-info.json` and of installed
+//! `ferro*.service` user units, and a bounded hash of the files the receipt owns. Nothing is
+//! created, written, locked or executed, and the vault files are only `lstat`ed.
 
 use crate::fsprobe::{FsProbe, read_bounded};
 use crate::ui::read_ui_build_info;
 use fl_core::build_info::BuildInfo;
 use fl_core::doctor::{
-    DoctorInputs, DoctorReport, NodeMeta, ReceiptSource, StoreFacts, UiFacts, VaultFacts,
-    VaultNode, run,
+    DoctorInputs, DoctorReport, NodeMeta, ReceiptSource, StoreFacts, UiFacts, UnitFacts,
+    UnitFileFact, VaultFacts, VaultNode, run, user_unit_directives,
 };
 use fl_core::install::{Layout, MAX_RECEIPT_BYTES};
 use std::path::{Path, PathBuf};
@@ -107,6 +107,140 @@ fn vault_facts(o: &Observe<'_>) -> VaultFacts {
     }
 }
 
+/// The most bytes read from one user unit. A larger file is reported unread, not parsed.
+const MAX_UNIT_BYTES: usize = 64 * 1024;
+/// The most `ferro*.service` names one report lists. The rest are a note, so the check
+/// cannot pass on a partial directory.
+const MAX_UNITS: usize = 32;
+
+/// `ferrostore.service`, `ferrostore@.service`, `ferrowire.service`, `ferroloop-hub.service`,
+/// and any other `ferro*.service` in the user unit directory.
+fn is_ferro_unit(name: &str) -> bool {
+    name.starts_with("ferro")
+        && name.ends_with(".service")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '_' | '.' | '+' | '-'))
+}
+
+fn expand_unit_dir(shown: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    match shown.strip_prefix("~/") {
+        Some(rest) => home
+            .map(|h| h.join(rest))
+            .ok_or_else(|| format!("unit directory {shown} needs HOME")),
+        None if shown.starts_with('/') => Ok(PathBuf::from(shown)),
+        None => Err(format!("unit directory {shown} is not absolute")),
+    }
+}
+
+fn read_unit(name: &str, path: &Path) -> UnitFileFact {
+    match read_bounded(path, MAX_UNIT_BYTES) {
+        Ok(Some(text)) => {
+            let d = user_unit_directives(&text);
+            UnitFileFact {
+                name: name.to_string(),
+                readable: true,
+                after_default_target: d.after_default_target,
+                wanted_by_default_target: d.wanted_by_default_target,
+            }
+        }
+        Ok(None) | Err(_) => UnitFileFact {
+            name: name.to_string(),
+            readable: false,
+            after_default_target: false,
+            wanted_by_default_target: false,
+        },
+    }
+}
+
+/// List installed `ferro*.service` units. A missing directory is "none installed", not an error.
+fn unit_facts(shown: &str, home: Option<&Path>) -> UnitFacts {
+    let dir = match expand_unit_dir(shown, home) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            return UnitFacts {
+                note: Some(reason),
+                units: Vec::new(),
+            };
+        }
+    };
+    // Follow a symlink for the directory itself (`read_dir` does too). Unit files are opened
+    // separately and a symlink there is not followed.
+    match std::fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return UnitFacts {
+                note: Some(format!(
+                    "unit directory {} is not a directory",
+                    dir.display()
+                )),
+                units: Vec::new(),
+            };
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UnitFacts::default(),
+        Err(e) => {
+            return UnitFacts {
+                note: Some(format!(
+                    "unit directory {} could not be listed ({})",
+                    dir.display(),
+                    e.kind()
+                )),
+                units: Vec::new(),
+            };
+        }
+    }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return UnitFacts {
+                note: Some(format!(
+                    "unit directory {} could not be listed ({})",
+                    dir.display(),
+                    e.kind()
+                )),
+                units: Vec::new(),
+            };
+        }
+    };
+    let mut names = Vec::new();
+    let mut note = None;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                note = Some(format!(
+                    "unit directory {} could not be listed in full ({})",
+                    dir.display(),
+                    e.kind()
+                ));
+                break;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if is_ferro_unit(name) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    let omitted = names.len().saturating_sub(MAX_UNITS);
+    if omitted > 0 {
+        names.truncate(MAX_UNITS);
+        let more = format!("+{omitted} more ferro*.service units were not read");
+        note = Some(match note {
+            Some(first) => format!("{first}; {more}"),
+            None => more,
+        });
+    }
+    let units = names
+        .iter()
+        .map(|name| read_unit(name, &dir.join(name)))
+        .collect();
+    UnitFacts { note, units }
+}
+
 /// Gather and run.
 pub fn observe(o: Observe<'_>) -> DoctorReport {
     let probe = FsProbe::new(o.home.clone()).with_deadline(Instant::now() + o.budget);
@@ -140,6 +274,7 @@ pub fn observe(o: Observe<'_>) -> DoctorReport {
         probe: &probe,
         stores: o.stores,
         ui,
+        units: unit_facts(&o.layout.unit_dir, o.home.as_deref()),
     };
     run(&inputs)
 }
