@@ -82,6 +82,11 @@ pub enum InitError {
     /// The machine could not do it: git, a store or a file failed.
     #[error("{0}")]
     Failed(String),
+    /// The user config file cannot be read as a project registry (it is not TOML, or `project`
+    /// is not a list of tables). No request is at fault: every flow that reads the config
+    /// stops, and the message names the file and what is wrong with it.
+    #[error("{0}")]
+    ConfigInvalid(String),
 }
 
 pub(crate) fn invalid(msg: impl Into<String>) -> InitError {
@@ -337,8 +342,8 @@ pub(crate) fn read_config(path: &Path) -> Result<DocumentMut, InitError> {
         Err(e) => return Err(failed(format!("could not read {}: {e}", path.display()))),
     };
     text.parse::<DocumentMut>().map_err(|e| {
-        invalid(format!(
-            "{} is not valid TOML, so no project is added to it: {e}",
+        InitError::ConfigInvalid(format!(
+            "the config {} is not valid TOML: {e}",
             path.display()
         ))
     })
@@ -352,8 +357,8 @@ pub(crate) fn config_entries(
         return Ok(Vec::new());
     };
     let Some(blocks) = item.as_array_of_tables() else {
-        return Err(invalid(format!(
-            "`project` in {} is not a list of `[[project]]` tables",
+        return Err(InitError::ConfigInvalid(format!(
+            "`project` in the config {} is not a list of `[[project]]` tables",
             path.display()
         )));
     };

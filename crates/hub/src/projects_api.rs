@@ -35,7 +35,7 @@ fn init_error_response(e: &InitError) -> HttpResponse {
         InitError::Invalid(_) => 400,
         InitError::Conflict(_) => 409,
         InitError::NotFound(_) => 404,
-        InitError::Failed(_) => 500,
+        InitError::Failed(_) | InitError::ConfigInvalid(_) => 500,
     };
     error_response(status, &e.to_string())
 }

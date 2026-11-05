@@ -177,6 +177,13 @@ fn invalid(r: Result<InitOutcome, InitError>) -> String {
     }
 }
 
+fn config_invalid(r: Result<InitOutcome, InitError>) -> String {
+    match r {
+        Err(InitError::ConfigInvalid(m)) => m,
+        other => panic!("expected ConfigInvalid, got {other:?}"),
+    }
+}
+
 fn conflict(r: Result<InitOutcome, InitError>) -> String {
     match r {
         Err(InitError::Conflict(m)) => m,
@@ -747,13 +754,17 @@ fn a_config_that_is_not_toml_is_never_overwritten() {
     let sb = Sandbox::new();
     fs::create_dir_all(sb.paths.config_path.parent().unwrap()).unwrap();
     fs::write(&sb.paths.config_path, "this is [not toml").unwrap();
-    let msg = invalid(sb.init(&sb.request(&sb.dir("p"))));
+    let msg = config_invalid(sb.init(&sb.request(&sb.dir("p"))));
     assert!(msg.contains("not valid TOML"), "{msg}");
+    assert!(
+        msg.contains(&sb.paths.config_path.display().to_string()),
+        "{msg}"
+    );
     assert_eq!(sb.config(), "this is [not toml");
     assert!(!sb.dir("p").exists());
 
     fs::write(&sb.paths.config_path, "project = [1, 2]\n").unwrap();
-    let msg = invalid(sb.init(&sb.request(&sb.dir("p"))));
+    let msg = config_invalid(sb.init(&sb.request(&sb.dir("p"))));
     assert!(msg.contains("`[[project]]` tables"), "{msg}");
     assert_eq!(sb.config(), "project = [1, 2]\n");
 }
@@ -1126,6 +1137,39 @@ fn a_virtual_group_is_idempotent_and_updates_what_it_is_given() {
         ("Ops", "pager duty")
     );
     assert_eq!(sb.workspace().list_areas().unwrap().len(), 1);
+}
+
+#[test]
+fn a_config_that_is_not_toml_is_a_500_naming_the_file_for_every_route() {
+    let hub = Hub::new();
+    hub.post(OWNER, &json!({ "path": hub.work("alpha") }));
+    let config = hub.config();
+    fs::write(&config, "this is [not toml").unwrap();
+    let named = config.display().to_string();
+    let check = |what: &str, resp: HttpResponse| {
+        assert_eq!(resp.status, 500, "{what}: {}", text_of(&resp));
+        let msg = error_of(&resp);
+        assert!(
+            msg.contains(&named) && msg.contains("not valid TOML"),
+            "{what}: {msg}"
+        );
+    };
+    check("GET", hub.get("/api/v1/projects"));
+    check(
+        "POST",
+        hub.post(OWNER, &json!({ "path": hub.work("beta") })),
+    );
+    check(
+        "POST virtual",
+        hub.post(OWNER, &json!({ "kind": "virtual", "name": "Council" })),
+    );
+    check(
+        "PATCH",
+        hub.patch(OWNER, "alpha", &json!({ "name": "Renamed" })),
+    );
+    check("DELETE", hub.delete(OWNER, "alpha", None));
+    assert_eq!(fs::read_to_string(&config).unwrap(), "this is [not toml");
+    assert!(!hub.work("beta").exists());
 }
 
 #[test]

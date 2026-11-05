@@ -920,3 +920,31 @@ fn delete_dir_fails_closed_when_no_workspace_root_can_be_found() {
     assert!(root.join(".fl/mcp.toml").is_file());
     assert_eq!(env.slugs(), ["anywhere"]);
 }
+
+#[test]
+fn a_config_whose_projects_are_not_tables_stops_every_project_command_and_names_the_file() {
+    let env = Env::new();
+    let root = env.dir("alpha");
+    env.run_json("create", &["Alpha", "--path", root.to_str().unwrap()]);
+    std::fs::write(env.config_path(), "project = [1, 2]\n").unwrap();
+    let named = env.config_path().display().to_string();
+    for args in [
+        vec!["project", "list"],
+        vec![
+            "project",
+            "create",
+            "Beta",
+            "--path",
+            env.dir("beta").to_str().unwrap(),
+        ],
+        vec!["project", "delete", "alpha"],
+    ] {
+        env.fl(env.work.path())
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains(named.as_str()).and(contains("project")));
+    }
+    assert_eq!(env.config(), "project = [1, 2]\n");
+    assert!(!env.dir("beta").exists());
+}
