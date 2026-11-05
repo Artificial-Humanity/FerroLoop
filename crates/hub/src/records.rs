@@ -30,7 +30,7 @@ use crate::auth::HubAuthority;
 use crate::{HubState, HubStoreGuard, ProjectOpenError, ProjectStoreGuard};
 
 /// The project a request names when it names none.
-const DEFAULT_PROJECT: &str = "ferroloop";
+pub(crate) const DEFAULT_PROJECT: &str = "ferroloop";
 /// `fl.redb` is the hub's own store, never a project store.
 const RESERVED_PROJECT: &str = "fl";
 const MAX_PROJECT_LEN: usize = 64;

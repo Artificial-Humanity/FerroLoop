@@ -32,6 +32,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
+use crate::project_list::{StoreHint, is_project_slug};
 use fl_core::agent::AreaRecord;
 use fl_core::routing::{Routes, RoutingMap, Tier};
 use fl_core::state::{validate_slug, validate_summary};
@@ -892,6 +893,27 @@ fn check_not_a_virtual_group(ws: &AnyStore, r: &Resolved) -> Result<(), InitErro
     }
 }
 
+/// A new directory-backed project onto an area that records another directory is refused: the
+/// area would be re-pointed away from the project it names. A project the config already
+/// registers keeps the area it has (its flows move it deliberately).
+fn check_area_not_repointed(ws: &AnyStore, r: &Resolved) -> Result<(), InitError> {
+    if !r.registers {
+        return Ok(());
+    }
+    let area = ws
+        .get_area(&r.slug)
+        .map_err(|e| failed(format!("workspace store: {e}")))?;
+    match area.and_then(|a| a.path).filter(|p| !p.trim().is_empty()) {
+        Some(path) if !same_root(&path, &r.root) => Err(conflict(format!(
+            "`{}` is already an area for the directory {path}, not {}. Choose another slug \
+             with --slug or --name, or register the project at {path}",
+            r.slug,
+            r.root.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Upserts the project's area in the workspace store (name, root as path, purpose). What the
 /// request does not name stays as the area has it. An area that is already right is left alone.
 /// Returns the area as it is.
@@ -967,6 +989,7 @@ where
     let resolved = resolve(req, paths)?;
     let workspace_store = open_workspace()?;
     check_not_a_virtual_group(&workspace_store, &resolved)?;
+    check_area_not_repointed(&workspace_store, &resolved)?;
 
     std::fs::create_dir_all(&resolved.root)
         .map_err(|e| failed(format!("could not create {}: {e}", resolved.root.display())))?;
@@ -1061,6 +1084,16 @@ where
 
     let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
     let ws = open_workspace()?;
+    // A slug the project list shows as a project (the default project, one the workspace store
+    // holds a row for) is not a group, whatever its area says.
+    let entries = config_entries(&doc, &paths.config_path)?;
+    let hints: [StoreHint; 1] = [(crate::records::DEFAULT_PROJECT.to_string(), None)];
+    if is_project_slug(&slug, &entries, &hints, &ws.list_projects().map_err(st)?) {
+        return Err(conflict(format!(
+            "`{slug}` is already a project, so it cannot also be a virtual group. Choose \
+             another slug"
+        )));
+    }
     let existing = ws.get_area(&slug).map_err(st)?;
     if let Some(a) = &existing
         && let Some(path) = &a.path

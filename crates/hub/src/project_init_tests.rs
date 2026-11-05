@@ -819,6 +819,9 @@ impl Hub {
         for dir in ["home", "data", "repo", "work"] {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
+        // The Hub's repository is the test's workspace: a deletion that finds no workspace root
+        // refuses to remove a directory.
+        fs::create_dir_all(base.join("repo/Notes")).unwrap();
         let mut state = HubState::new(HubServerConfig {
             listen: "127.0.0.1:0".into(),
             store_path: base.join("data/store.redb"),
@@ -1162,6 +1165,67 @@ fn a_virtual_groups_slug_is_explicit_or_derived_and_checked() {
         Err(InitError::Invalid(_))
     ));
     assert_eq!(sb.workspace().list_areas().unwrap().len(), 1, "only `ag`");
+}
+
+#[test]
+fn a_group_is_refused_on_a_slug_the_list_shows_as_a_project() {
+    let sb = Sandbox::new();
+    // The default project is a project though it has no config block and no store here.
+    let mut req = sb.vrequest("ferroloop");
+    req.slug = Some("ferroloop".into());
+    let why = conflict(sb.virtual_group(&req));
+    assert!(why.contains("already a project"), "{why}");
+    // A project the workspace store holds a row for (`fl project add`).
+    sb.workspace().add_project("/work/held-one").unwrap();
+    let mut req = sb.vrequest("Held One");
+    req.slug = Some("held-one".into());
+    let why = conflict(sb.virtual_group(&req));
+    assert!(why.contains("already a project"), "{why}");
+    assert!(sb.workspace().get_area("ferroloop").unwrap().is_none());
+    assert!(sb.workspace().get_area("held-one").unwrap().is_none());
+    // A name no project has still makes a group.
+    sb.virtual_group(&sb.vrequest("Council")).unwrap();
+}
+
+#[test]
+fn a_project_does_not_re_point_an_area_that_records_another_directory() {
+    let sb = Sandbox::new();
+    let elsewhere = sb.dir("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    // `alpha` is an area for `elsewhere` (made by `fl agent register`), with no config block.
+    sb.workspace()
+        .upsert_area(fl_core::agent::AreaRecord {
+            area_key: "alpha".into(),
+            name: "Alpha".into(),
+            path: Some(elsewhere.display().to_string()),
+            purpose: "p".into(),
+            updated_at: fl_core::At::from_unix_millis(1),
+            by: "t".into(),
+        })
+        .unwrap();
+    let root = sb.dir("alpha");
+    let why = conflict(sb.init(&sb.request(&root)));
+    assert!(
+        why.contains("already an area") && why.contains("elsewhere"),
+        "{why}"
+    );
+    assert!(!root.exists(), "nothing was made");
+    assert!(!sb.paths.config_path.exists());
+    let area = sb.workspace().get_area("alpha").unwrap().unwrap();
+    assert_eq!(area.path.as_deref(), Some(elsewhere.to_str().unwrap()));
+    // The same directory is the same project: it registers.
+    let mut same = sb.request(&elsewhere);
+    same.slug = Some("alpha".into());
+    sb.init(&same).unwrap();
+    assert_eq!(
+        sb.workspace()
+            .get_area("alpha")
+            .unwrap()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some(elsewhere.to_str().unwrap())
+    );
 }
 
 #[test]
