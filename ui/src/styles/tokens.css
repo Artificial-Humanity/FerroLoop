@@ -858,17 +858,15 @@ button.fd-badge:hover:not(:disabled) {
 
   .fd-tier-agent,
   [data-testid="tier-agent-nav"] {
-    flex-direction: column !important;
+    flex-direction: row !important;
     align-items: center !important;
     justify-content: center;
-    gap: 2px !important;
-    padding: 3px 8px !important;
-    flex: 1 1 auto !important;
+    padding: 4px 10px !important;
+    flex: 0 1 auto !important;
     min-width: 0;
   }
 
-  .fd-tier-agent-identity,
-  .fd-tier-agent-meta {
+  .fd-tier-agent-identity {
     justify-content: center;
     max-width: 100%;
   }
