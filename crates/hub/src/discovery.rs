@@ -267,6 +267,8 @@ pub(crate) mod cost_counters {
         pub(crate) static STORE_OPENS: Cell<u64> = const { Cell::new(0) };
         /// Calls to [`super::invalidate_route_discovery_cache`].
         pub(crate) static ROUTE_CACHE_INVALIDATIONS: Cell<u64> = const { Cell::new(0) };
+        /// Grok `models_cache.json` lookups ([`super::grok_catalog_windows`]).
+        pub(crate) static GROK_CATALOG_READS: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(crate) fn bump(counter: &'static LocalKey<Cell<u64>>) {
@@ -1629,6 +1631,17 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     // `take` bounds the read even when the file grew after `metadata()` or is a special file.
     file.take(max_bytes).read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The last `max_bytes` bytes of `text`, moved forward to the next character boundary so the
+/// slice is valid UTF-8. The text itself when it is not longer.
+fn str_tail(text: &str, max_bytes: u64) -> &str {
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut start = text.len().saturating_sub(max);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 /// Canonical Claude model id for a `/model` display name (`Opus 5.5`), a `settings.json`
@@ -3266,6 +3279,8 @@ const ASSUMED_LARGE_CONTEXT_WINDOW: u64 = 1_000_000;
 /// the sizes the model offers (`context_windows`). `None` when the cache, the model or a
 /// positive window is missing.
 fn grok_catalog_windows(tpath: &Path, model_id: &str) -> Option<(Option<u64>, Vec<u64>)> {
+    #[cfg(test)]
+    cost_counters::bump(&cost_counters::GROK_CATALOG_READS);
     let grok_dir = tpath
         .ancestors()
         .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".grok"))?;
@@ -3290,8 +3305,7 @@ fn codex_catalog_window(tpath: &Path, raw: &str) -> Option<u64> {
     let codex_dir = tpath
         .ancestors()
         .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".codex"))?;
-    let tail = read_file_tail(tpath, CLAUDE_TRANSCRIPT_TAIL_BYTES);
-    let model = codex_rollout_settings(tail.as_deref().unwrap_or(raw))
+    let model = codex_rollout_settings(str_tail(raw, CLAUDE_TRANSCRIPT_TAIL_BYTES))
         .0
         .or_else(|| {
             read_toml_file(&codex_dir.join("config.toml"))
@@ -3450,30 +3464,31 @@ fn context_usage_for_transcript(
                     .as_ref()
                     .and_then(|v| non_empty_str(v.get("primaryModelId")))
             });
-        let (catalog_window, offered_windows) = model_id
-            .as_deref()
-            .and_then(|id| grok_catalog_windows(&tpath, id))
-            .unwrap_or_default();
-        let reported_max = signals_val
-            .as_ref()
-            .and_then(|v| v.get("contextWindowTokens").and_then(Value::as_u64))
-            .filter(|&n| n > 0)
-            .or_else(|| {
-                summary_val
-                    .as_ref()
-                    .and_then(|v| v.get("context_window").and_then(Value::as_u64))
-                    .filter(|&n| n > 0)
-            });
-        let (max_tokens, source) = match (reported_max, catalog_window) {
-            (Some(n), _) => (n, ContextWindowSource::Reported),
-            (None, Some(n)) => (n, ContextWindowSource::Catalog),
-            (None, None) => (
-                fallback_context_window("grok"),
-                ContextWindowSource::Assumed,
-            ),
-        };
-
+        // Without token usage this branch answers nothing, so the catalog is not read for it.
         if let Some(used_tokens) = used_tokens {
+            let (catalog_window, offered_windows) = model_id
+                .as_deref()
+                .and_then(|id| grok_catalog_windows(&tpath, id))
+                .unwrap_or_default();
+            let reported_max = signals_val
+                .as_ref()
+                .and_then(|v| v.get("contextWindowTokens").and_then(Value::as_u64))
+                .filter(|&n| n > 0)
+                .or_else(|| {
+                    summary_val
+                        .as_ref()
+                        .and_then(|v| v.get("context_window").and_then(Value::as_u64))
+                        .filter(|&n| n > 0)
+                });
+            let (max_tokens, source) = match (reported_max, catalog_window) {
+                (Some(n), _) => (n, ContextWindowSource::Reported),
+                (None, Some(n)) => (n, ContextWindowSource::Catalog),
+                (None, None) => (
+                    fallback_context_window("grok"),
+                    ContextWindowSource::Assumed,
+                ),
+            };
+
             return Some(SessionContextUsage::new(
                 used_tokens,
                 max_tokens,
@@ -11391,6 +11406,84 @@ mod tests {
             "model = \"gpt-x\"\n",
         )
         .unwrap();
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (272_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    fn grok_catalog_reads() -> u64 {
+        cost_counters::GROK_CATALOG_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn grok_without_token_usage_never_reads_the_models_cache() {
+        let home = TempDir::new().unwrap();
+        // A cache that is not even JSON: reading it would be visible as a count.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextWindowTokens": 500_000})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            None,
+        );
+        fs::write(home.path().join(".grok/models_cache.json"), "{ nope").unwrap();
+        let before = grok_catalog_reads();
+        assert_eq!(context_at(&chat), None);
+        assert_eq!(grok_catalog_reads(), before, "no usage, no cache read");
+
+        // With usage the cache is read once, and the answer is the same as before the change.
+        let chat = grok_session_files(
+            home.path(),
+            Some(serde_json::json!({"contextTokensUsed": 10})),
+            Some(serde_json::json!({"current_model_id": "grok-x"})),
+            Some(grok_cache()),
+        );
+        let before = grok_catalog_reads();
+        assert_eq!(
+            context_at(&chat).unwrap(),
+            SessionContextUsage {
+                used_tokens: 10,
+                max_tokens: 256_000,
+                source: ContextWindowSource::Catalog,
+                offered_windows: vec![256_000, 500_000],
+            }
+        );
+        assert_eq!(grok_catalog_reads(), before + 1);
+    }
+
+    #[test]
+    fn str_tail_keeps_the_last_bytes_on_a_character_boundary() {
+        assert_eq!(str_tail("abcdef", 3), "def");
+        assert_eq!(str_tail("abc", 10), "abc");
+        assert_eq!(str_tail("abc", 0), "");
+        // "é" is two bytes: a cut inside it moves forward to the next boundary.
+        assert_eq!(str_tail("aéb", 2), "b");
+        assert_eq!(str_tail("aéb", 3), "éb");
+    }
+
+    #[test]
+    fn codex_catalog_model_comes_from_the_tail_of_the_in_memory_rollout() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        // An old model far outside the tail, multibyte padding that straddles the tail's
+        // start, then the newest model and the token count.
+        let padding = serde_json::json!({"type": "note", "payload": {"text": "é".repeat(300_000)}});
+        let path = codex_rollout(
+            home.path(),
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-nowindow"}}),
+                padding,
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-x"}}),
+                codex_token_count(serde_json::json!({})),
+            ],
+        );
+        assert!(fs::metadata(&path).unwrap().len() > CLAUDE_TRANSCRIPT_TAIL_BYTES);
         let usage = context_at(&path).unwrap();
         assert_eq!(
             (usage.max_tokens, usage.source),
