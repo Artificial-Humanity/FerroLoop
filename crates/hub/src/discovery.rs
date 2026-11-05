@@ -3217,13 +3217,26 @@ fn codex_catalog_window(tpath: &Path, raw: &str) -> Option<u64> {
 }
 
 /// A Muse model's `context_limit` from the `model-catalog/*.json` rows (`rows[].model_id`) in
-/// the Muse data directory above `tpath` (the one holding `model-catalog`). Files are read in
-/// name order; the first row naming `model_id` with a positive limit wins.
+/// the Muse data directory above `tpath` (the one holding `model-catalog`). The search climbs
+/// from the transcript and stops at the Muse data directory itself (the first ancestor named
+/// `muse` or holding a `sessions` directory), so an unrelated `model-catalog` further up is never
+/// read. Files are read in name order; when several list the same model the first file by name
+/// wins, and within a file the first row naming `model_id` with a positive limit.
 fn muse_catalog_context_limit(tpath: &Path, model_id: &str) -> Option<u64> {
-    let catalog_dir = tpath
-        .ancestors()
-        .map(|a| a.join("model-catalog"))
-        .find(|d| d.is_dir())?;
+    let mut catalog_dir = None;
+    for ancestor in tpath.ancestors() {
+        let candidate = ancestor.join("model-catalog");
+        if candidate.is_dir() {
+            catalog_dir = Some(candidate);
+            break;
+        }
+        let is_muse_data_dir =
+            ancestor.file_name().is_some_and(|n| n == "muse") || ancestor.join("sessions").is_dir();
+        if is_muse_data_dir {
+            break;
+        }
+    }
+    let catalog_dir = catalog_dir?;
     let mut files: Vec<PathBuf> = fs::read_dir(catalog_dir)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -10618,8 +10631,11 @@ mod tests {
     }
 
     fn write_muse_catalog(home: &Path) {
-        let dir = home.join(".local/share/muse/model-catalog");
-        fs::create_dir_all(&dir).unwrap();
+        write_catalog_at(&home.join(".local/share/muse/model-catalog"));
+    }
+
+    fn write_catalog_at(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
         fs::write(
             dir.join("a.json"),
             serde_json::json!({"rows": [
@@ -10691,6 +10707,22 @@ mod tests {
             let path = muse_session(home.path(), &[muse_completed(model)]);
             assert_eq!(context_at(&path).unwrap(), assumed, "{model:?}");
         }
+    }
+
+    #[test]
+    fn muse_catalog_search_stops_at_the_muse_data_directory() {
+        let home = TempDir::new().unwrap();
+        // An unrelated catalog above the Muse data directory, listing the session's model.
+        write_catalog_at(&home.path().join("model-catalog"));
+        let path = muse_session(home.path(), &[muse_completed(Some("muse-x"))]);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (1_000_000, ContextWindowSource::Assumed)
+        );
+        // The Muse data directory's own catalog is still found.
+        write_muse_catalog(home.path());
+        assert_eq!(context_at(&path).unwrap().max_tokens, 1_007_997);
     }
 
     #[test]
