@@ -1436,7 +1436,7 @@ fn command_succeeds_within(cmd: &mut Command, timeout: Duration) -> bool {
 }
 
 /// The stdout of a `tmux` call that exits 0 within [`TMUX_TIMEOUT`]; `None` otherwise.
-fn tmux_stdout(args: &[&str]) -> Option<String> {
+pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
     use std::io::Read;
 
     let mut child = Command::new(tmux_bin())

@@ -136,6 +136,8 @@ pub struct HubServer {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     gates: ConnectionGates,
+    /// Whether `serve` reconciles restored tmux panes and agents after a host boot.
+    boot_reconcile: bool,
 }
 
 impl HubServer {
@@ -152,6 +154,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
+            boot_reconcile: false,
         })
     }
 
@@ -172,6 +175,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
+            boot_reconcile: false,
         })
     }
 
@@ -179,6 +183,16 @@ impl HubServer {
     #[must_use]
     pub fn with_limits(mut self, limits: ConnectionLimits) -> Self {
         self.gates = ConnectionGates::new(limits);
+        self
+    }
+
+    /// Make [`HubServer::serve`] reconcile the host's restored tmux panes with the agent registry
+    /// and tell each active agent once per boot that the host restarted (see
+    /// [`crate::boot_reconcile`]). Off by default: it reads the host's tmux and route table, so
+    /// only the daemon (`fl hub serve`) turns it on.
+    #[must_use]
+    pub fn with_boot_reconcile(mut self) -> Self {
+        self.boot_reconcile = true;
         self
     }
 
@@ -220,10 +234,15 @@ impl HubServer {
             shutdown_tx: _shutdown_tx,
             mut shutdown_rx,
             gates,
+            boot_reconcile,
             ..
         } = self;
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
+        if boot_reconcile {
+            // Not awaited: the reconciliation never holds up the accept loop.
+            tokio::spawn(crate::boot_reconcile::run(state.clone()));
+        }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
