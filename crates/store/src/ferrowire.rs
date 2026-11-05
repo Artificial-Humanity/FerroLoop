@@ -1,11 +1,11 @@
 //! `RedbStore` persistence for [`MessageStore`] (`FORMAT_WITH_WIRE = 7`, spec §2).
 
-use fl_core::agent::{AgentRecord, AgentStatus};
+use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord};
 use fl_core::at::At;
 use fl_core::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
-    validate_sender_name, validate_subject, validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, check_group_address,
+    resolve_recipients, validate_sender_name, validate_subject, validate_wire_body,
 };
 use fl_core::ids::{Kind, MessageId};
 use fl_core::iri::Iri;
@@ -13,7 +13,7 @@ use fl_core::state::{StateError, validate_slug};
 use fl_core::store::{MessageStore, StoreError};
 use redb::{ReadableTable, TableDefinition, TableHandle};
 
-use crate::state::{AGENT_BY_NAME, AGENTS};
+use crate::state::{AGENT_BY_NAME, AGENTS, AREAS};
 use crate::{
     ALIASES, FORMAT_WITH_WIRE, IDS, META, RedbStore, backend, decode, locate_in, mint, raise_format,
 };
@@ -157,6 +157,19 @@ impl RedbStore {
             let (_, v) = row.map_err(backend)?;
             let rec: AgentRecord = serde_json::from_str(v.value()).map_err(decode)?;
             out.push(rec);
+        }
+        Ok(out)
+    }
+
+    fn all_areas_in_wtx(&self, tx: &redb::WriteTransaction) -> Result<Vec<AreaRecord>, StoreError> {
+        if !Self::wtx_has_table(tx, AREAS.name())? {
+            return Ok(Vec::new());
+        }
+        let table = tx.open_table(AREAS).map_err(backend)?;
+        let mut out = Vec::new();
+        for row in table.iter().map_err(backend)? {
+            let (_, v) = row.map_err(backend)?;
+            out.push(serde_json::from_str(v.value()).map_err(decode)?);
         }
         Ok(out)
     }
@@ -512,11 +525,14 @@ impl MessageStore for RedbStore {
         msg.validate()
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
+        let areas = self.all_areas_in_wtx(&tx)?;
+        check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
         let recipients = resolve_recipients(
             &msg.to,
             msg.sender_id.as_ref(),
             &msg.sender_name,
             &all_agents,
+            &areas,
         );
 
         self.append_wire_message_in(&tx, &msg)?;
@@ -891,6 +907,7 @@ impl MessageStore for RedbStore {
         let tx = self.db.begin_write().map_err(backend)?;
         raise_format(&tx, FORMAT_WITH_WIRE)?;
         let all_agents = self.all_agents_in_wtx(&tx)?;
+        let areas = self.all_areas_in_wtx(&tx)?;
 
         for msg in messages {
             // Each message stands or falls alone: a skip writes nothing for it.
@@ -942,6 +959,7 @@ impl MessageStore for RedbStore {
                 msg.sender_id.as_ref(),
                 &msg.sender_name,
                 &all_agents,
+                &areas,
             );
             for (rec_id, rec_name) in resolved {
                 let in_incoming = receipts.iter().any(|r| {

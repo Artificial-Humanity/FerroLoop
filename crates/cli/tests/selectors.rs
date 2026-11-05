@@ -272,11 +272,31 @@ fn a_project_root_that_is_not_a_directory_is_refused_at_registration() {
 }
 
 #[test]
-fn a_project_root_that_is_not_a_git_working_tree_is_refused_at_registration() {
+fn a_project_root_that_is_not_a_git_working_tree_is_registered_and_a_gate_asks_for_a_commit() {
     let f = fixture();
     let plain = tempfile::tempdir().unwrap();
     f.cli()
         .args(["project", "add", &plain.path().display().to_string()])
+        .assert()
+        .success();
+    assert!(
+        !plain.path().join(".git").exists(),
+        "registering never runs git"
+    );
+    // A gate's provenance is a commit: the refusal comes where one is needed, and says so.
+    f.cli()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
         .assert()
         .failure()
         .stderr(contains("git working tree").and(contains("provenance")));

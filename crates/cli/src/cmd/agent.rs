@@ -622,7 +622,11 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
                 node_id,
                 hosted: Some(hosted),
                 cwd,
-            };
+            }
+            .with_default_cwd(
+                store,
+                &fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default()),
+            );
             let out = lifecycle::spin_up(
                 store,
                 &LifecycleEnv::new(None),

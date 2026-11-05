@@ -160,10 +160,17 @@ pub const FORMAT_WITH_WIRE: u64 = 7;
 /// workflow tables. This build opens 2 to 8.
 pub const FORMAT_WITH_WORKFLOW: u64 = 8;
 
+/// ⚠ The format of a store whose registry event log holds an `area_delete` event. The first
+/// area deletion (or the first import of such an event) raises the store to 9 in the same
+/// transaction, so an older fl refuses the store with `FormatVersion` instead of failing to
+/// decode the event in its state sync and registry cursor. A store that never deletes an area
+/// stays where it was. This build opens 2 to 9.
+pub const FORMAT_WITH_AREA_DELETE: u64 = 9;
+
 /// Every schema version this build opens, oldest first. Both `RedbStore` and
 /// `FerroStore` use this one ladder, so `format_version()` means the same on
 /// both; a new schema step adds a constant here and an upgrade for both.
-pub(crate) const FORMAT_LADDER: [u64; 7] = [
+pub(crate) const FORMAT_LADDER: [u64; 8] = [
     FORMAT_VERSION,
     FORMAT_WITH_IMPORTS,
     FORMAT_WITH_LEDGER_ROOT,
@@ -171,6 +178,7 @@ pub(crate) const FORMAT_LADDER: [u64; 7] = [
     FORMAT_WITH_STATE,
     FORMAT_WITH_WIRE,
     FORMAT_WITH_WORKFLOW,
+    FORMAT_WITH_AREA_DELETE,
 ];
 
 /// `FormatVersion` unless `found` is on [`FORMAT_LADDER`].
@@ -180,7 +188,7 @@ pub(crate) fn check_format(found: Option<u64>) -> Result<(), StoreError> {
         _ => Err(StoreError::FormatVersion {
             found,
             oldest: FORMAT_VERSION,
-            newest: FORMAT_WITH_WORKFLOW,
+            newest: FORMAT_WITH_AREA_DELETE,
         }),
     }
 }
@@ -1421,6 +1429,32 @@ impl Catalog for RedbStore {
         self.all_json(PROJECTS)
     }
 
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        self.check_kind(id.iri(), Kind::Project)?;
+        let Some(mut held) = self.get_json::<Project>(PROJECTS, id.iri())? else {
+            return Err(StoreError::InvalidState(format!("no project {}", id.iri())));
+        };
+        held.root = root.to_string();
+        self.put_json(PROJECTS, id.iri(), &held)
+    }
+
+    fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError> {
+        self.check_kind(id.iri(), Kind::Project)?;
+        if self.get_json::<Project>(PROJECTS, id.iri())?.is_none() {
+            return Ok(false);
+        }
+        fl_core::store::check_project_removable(self, id)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        let removed = tx
+            .open_table(PROJECTS)
+            .map_err(backend)?
+            .remove(id.iri().as_str())
+            .map_err(backend)?
+            .is_some();
+        tx.commit().map_err(backend)?;
+        Ok(removed)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_gate(
         &self,
@@ -2268,7 +2302,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_WORKFLOW
+                    newest: FORMAT_WITH_AREA_DELETE
                 }
             ),
             "{err:?}"
@@ -3009,7 +3043,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_WORKFLOW + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_AREA_DELETE + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
@@ -3545,6 +3579,87 @@ mod tests {
             reopened.handle_of(Kind::WorkflowRun, run.id.iri()).unwrap(),
             Some(1)
         );
+    }
+
+    fn area(key: &str) -> fl_core::agent::AreaRecord {
+        fl_core::agent::AreaRecord {
+            area_key: key.into(),
+            name: key.into(),
+            path: None,
+            purpose: "p".into(),
+            updated_at: fl_core::At::from_unix_millis(1),
+            by: "tester".into(),
+        }
+    }
+
+    // An older fl cannot decode an `area_delete` registry event, so the first deletion raises
+    // the store to format 9 in the same write and the older fl refuses the store.
+    #[test]
+    fn the_first_area_delete_raises_the_store_to_format_9_and_nothing_before_it_does() {
+        use fl_core::store::AgentRegistry;
+        const { assert!(FORMAT_WITH_AREA_DELETE > FORMAT_WITH_WORKFLOW) };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("area.redb");
+        let at = |n| fl_core::At::from_unix_millis(n);
+        {
+            let s = RedbStore::open(&path).unwrap();
+            s.upsert_area(area("kept")).unwrap();
+            s.upsert_area(area("gone")).unwrap();
+        }
+        assert_eq!(
+            format_at(&path),
+            Some(FORMAT_WITH_STATE),
+            "an area upsert is state"
+        );
+        // Deleting what is not there changes nothing, the format included.
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert!(!s.delete_area("nothere", at(2), "tester").unwrap());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_STATE));
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert!(s.delete_area("gone", at(3), "tester").unwrap());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_AREA_DELETE));
+        // This build still opens it; one whose ladder ends at 8 refuses it.
+        let reopened = RedbStore::open(&path).unwrap();
+        assert!(reopened.get_area("gone").unwrap().is_none());
+        assert!(
+            !FORMAT_LADDER[..FORMAT_LADDER.len() - 1].contains(&FORMAT_WITH_AREA_DELETE),
+            "the formats an older fl knows do not include the raised one"
+        );
+    }
+
+    #[test]
+    fn importing_an_area_delete_raises_the_store_to_format_9() {
+        use fl_core::store::AgentRegistry;
+        let dir = tempfile::tempdir().unwrap();
+        let events: Vec<_> = {
+            let source = RedbStore::open(&dir.path().join("src.redb")).unwrap();
+            source.upsert_area(area("gone")).unwrap();
+            source
+                .delete_area("gone", fl_core::At::from_unix_millis(2), "tester")
+                .unwrap();
+            source
+                .registry_events_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|(_, e)| e)
+                .collect()
+        };
+        let path = dir.path().join("dst.redb");
+        {
+            let dest = RedbStore::open(&path).unwrap();
+            dest.import_registry_events(&events[..1]).unwrap();
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_STATE));
+        {
+            let dest = RedbStore::open(&path).unwrap();
+            dest.import_registry_events(&events[1..]).unwrap();
+            assert!(dest.get_area("gone").unwrap().is_none());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_AREA_DELETE));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use crate::at::At;
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
-    validate_sender_name, validate_subject, validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, check_group_address,
+    resolve_recipients, validate_sender_name, validate_subject, validate_wire_body,
 };
 use crate::finding::{Finding, FindingState};
 use crate::ids::{
@@ -630,6 +630,30 @@ impl Catalog for MemStore {
         Ok(self.inner.borrow().projects.values().cloned().collect())
     }
 
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&id.0, Kind::Project)?;
+        match s.projects.get_mut(&id.0) {
+            Some(p) => {
+                p.root = root.to_string();
+                Ok(())
+            }
+            None => Err(StoreError::InvalidState(format!("no project {}", id.0))),
+        }
+    }
+
+    fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError> {
+        {
+            let s = self.inner.borrow();
+            s.check_kind(&id.0, Kind::Project)?;
+            if !s.projects.contains_key(&id.0) {
+                return Ok(false);
+            }
+        }
+        crate::store::check_project_removable(self, id)?;
+        Ok(self.inner.borrow_mut().projects.remove(&id.0).is_some())
+    }
+
     fn add_gate(
         &self,
         project: &ProjectId,
@@ -1213,6 +1237,22 @@ impl AgentRegistry for MemStore {
         Ok(s.areas.values().cloned().collect())
     }
 
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        let key = validate_slug(area_key).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let mut s = self.inner.borrow_mut();
+        if s.areas.remove(&key).is_none() {
+            return Ok(false);
+        }
+        let ev = RegistryEvent {
+            event_id: s.mint_unindexed(),
+            at,
+            by: by.to_string(),
+            kind: RegistryEventKind::AreaDelete { area_key: key },
+        };
+        s.append_registry_event(ev);
+        Ok(true)
+    }
+
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         let (name_key, display_name, email) =
             validate_agent_identity(&args.display_name, args.email.as_deref())
@@ -1447,6 +1487,9 @@ impl AgentRegistry for MemStore {
                     s.index_imported(Kind::Agent, rec.id.iri())?;
                     s.agent_by_name.insert(rec.name_key.clone(), rec.id.clone());
                     s.agents.insert(rec.id.clone(), rec.clone());
+                }
+                RegistryEventKind::AreaDelete { area_key } => {
+                    s.areas.remove(area_key);
                 }
                 RegistryEventKind::AgentRetire { id } => {
                     let resolved = AgentId(s.resolve(id.iri()));
@@ -1875,11 +1918,14 @@ impl MessageStore for MemStore {
         msg.validate()
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
+        let areas: Vec<AreaRecord> = s.areas.values().cloned().collect();
+        check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
         let recipients = resolve_recipients(
             &msg.to,
             msg.sender_id.as_ref(),
             &msg.sender_name,
             &all_agents,
+            &areas,
         );
 
         s.append_wire_message(msg.clone());
@@ -2127,6 +2173,7 @@ impl MessageStore for MemStore {
                 msg.sender_id.as_ref(),
                 &msg.sender_name,
                 &all_agents,
+                &s.areas.values().cloned().collect::<Vec<_>>(),
             );
             for (rec_id, rec_name) in resolved {
                 let in_incoming = receipts.iter().any(|r| {
