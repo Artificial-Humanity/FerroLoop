@@ -2267,6 +2267,11 @@ pub struct DecommissionResponse {
     pub handshake_dispatched: bool,
     pub unregistered: bool,
     pub runtime_stopped: bool,
+    /// What the teardown did to the tmux restore source (the newest tmux-resurrect save), so a
+    /// host reboot does not start the stopped session again. `None` unless the teardown stopped
+    /// a whole tmux session. A failure is reported here and never fails the teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_source: Option<crate::restore_source::RestoreSourceOutcome>,
     pub prompt: Option<String>,
 }
 
@@ -2469,6 +2474,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
         handshake_dispatched,
         unregistered: false,
         runtime_stopped: false,
+        restore_source: None,
         prompt: Some(prompt),
     })
 }
@@ -2643,11 +2649,20 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
     // start, one still running for the sessions that share it, or none at all (runtime calls are
     // off) is not reported as stopped.
+    let mut restore_source = None;
     let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
         (Some(tmux_target), true) if env.spawn_runtime => {
             // The unit, not the session: a Muse window is killed alone, never the shared session.
             let unit = runtime_unit(tmux_target);
             let gone = env.runtime.kill(unit, &record.session_id);
+            // A whole session that is gone must not come back at the next boot restore. A Muse
+            // window is one of several in a shared session that stays, so it is not pruned.
+            if gone && !is_muse_window_target(unit) {
+                restore_source = Some(crate::restore_source::prune_session(
+                    env.home_override,
+                    unit,
+                ));
+            }
             // The runtime is gone, so the decommissioned record must not claim it any more.
             record.runtime_spawned &= !gone;
             // A window of the name that is not ours is left running: "nothing of ours to kill"
@@ -2678,6 +2693,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         handshake_dispatched: false,
         unregistered: true,
         runtime_stopped,
+        restore_source,
         prompt: None,
     })
 }
@@ -3518,6 +3534,9 @@ mod vendor_registry_tests;
 
 #[cfg(test)]
 mod muse_launch_tests;
+
+#[cfg(test)]
+mod restore_source_tests;
 
 #[cfg(test)]
 mod tests {

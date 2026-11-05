@@ -26,6 +26,7 @@ pub mod project_init;
 pub mod project_list;
 mod projects_api;
 mod records;
+pub mod restore_source;
 pub mod runtime_matrix;
 pub mod runtime_update;
 pub mod session_actions;
