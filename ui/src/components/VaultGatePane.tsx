@@ -970,45 +970,88 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
   };
 
   return (
-    <section className="fd-pane" data-testid="vault-gate-pane" aria-label="Vault and Connectors">
+    <section
+      className="fd-pane"
+      data-testid="vault-gate-pane"
+      aria-label="Vault and Connectors"
+      style={{ overflowY: "auto", overflowX: "hidden" }}
+    >
       <div
         style={{
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: "10px",
+          flexDirection: "column",
+          gap: "8px",
           padding: "10px 16px",
           borderBottom: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          flexWrap: "wrap",
           flexShrink: 0,
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+        <div
+          data-testid="vault-header-top-row"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: "8px",
+            width: "100%",
+            minWidth: 0,
+          }}
+        >
           <strong
             data-testid="vault-gate-pane-title"
             style={{ fontSize: "14px", color: "var(--text-primary)" }}
           >
             Vault &amp; Connectors
           </strong>
-          <span className="fd-badge" data-testid="vault-zk-badge">
-            AES-256-GCM Zero-Knowledge Vault — raw secret values are never returned after
-            saving
-          </span>
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="vault-refresh-btn"
+            aria-label={effectiveLoading ? "Loading…" : "Refresh"}
+            title="Refresh"
+            style={{ marginLeft: "auto", padding: "5px 8px", lineHeight: 1, flexShrink: 0 }}
+            onClick={handleRefresh}
+            disabled={effectiveLoading}
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M13.5 8A5.5 5.5 0 0 1 3.7 11.45"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+              />
+              <path
+                d="M2.5 8A5.5 5.5 0 0 1 12.3 4.55"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+              />
+              <polyline
+                points="10.2 4.8 12.5 4.7 12.2 2.4"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <polyline
+                points="5.8 11.2 3.5 11.3 3.8 13.6"
+                stroke="currentColor"
+                strokeWidth="1.45"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
         </div>
-        <button
-          type="button"
-          className="fd-btn"
-          style={{ minHeight: "36px" }}
-          onClick={handleRefresh}
-          disabled={effectiveLoading}
-        >
-          {effectiveLoading ? "Loading…" : "Refresh"}
-        </button>
+        <span className="fd-badge" data-testid="vault-zk-badge">
+          AES-256-GCM Zero-Knowledge Vault — raw secret values are never returned after
+          saving
+        </span>
       </div>
       <div
-        className="fd-scroll"
-        style={{ display: "flex", flexDirection: "column", gap: "20px" }}
+        data-testid="vault-gate-body"
+        style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: "20px" }}
       >
 
         {effectiveError && (

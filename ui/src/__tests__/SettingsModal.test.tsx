@@ -219,7 +219,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const cmdInput = screen.getByLabelText("Shell Command") as HTMLInputElement;
     expect(cmdInput.style.width).toBe("100%");
     const cmdForm = cmdInput.closest("form") as HTMLFormElement;
-    expect(cmdForm.style.flexDirection).toBe("column");
+    expect(cmdForm.style.flexDirection).toBe("row");
     unmountTerm();
 
     // 3. HubDrawer: Workflow Definition occupies full row (1 1 100%)
@@ -1280,9 +1280,9 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(agentNav.querySelector(".fd-tier-agent-identity")).not.toBeNull();
       expect(agentNav.querySelector(".fd-tier-agent-meta")).not.toBeNull();
 
-      // Chat toolbar also exposes left and right panel show/hide toggles
-      expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
-      expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
+      // Duplicate panel show/hide toggles are removed from ChatPane toolbar (kept only in ContextHeader)
+      expect(screen.queryByTestId("chat-toolbar-left-panel-toggle")).toBeNull();
+      expect(screen.queryByTestId("chat-toolbar-right-panel-toggle")).toBeNull();
 
       // Enable via Left Sidebar -> Settings -> Appearance -> Show iOS Safe-Area Margins
       fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));

@@ -152,6 +152,10 @@ describe("TerminalPane", () => {
     const outputLog = screen.getByTestId("terminal-output-log");
     expect(xtermContainer.style.textAlign).toBe("left");
     expect(outputLog.style.textAlign).toBe("left");
+    expect(outputLog).toHaveClass("sr-only");
+    expect(outputLog.style.position).toBe("absolute");
+    const quickForm = screen.getByTestId("terminal-quick-command-form");
+    expect(quickForm.style.flexDirection).toBe("row");
   });
 
   it("reflows full rawOutputLog via term.reset() and term.write() when narrowing and widening terminal columns, and resets rawOutputLog on Clear", () => {

@@ -502,16 +502,17 @@ describe("Left & Right Panel Toggle Synchronization and Right-Panel Minimum-Widt
     expect(vaultForm.style.boxSizing).toBe("border-box");
     unmountVault();
 
-    // 3. HubDrawer: Two-line subtab buttons (subtab-arch, subtab-stats) and bounded workflow-slug-input
+    // 3. HubDrawer: Compact 2x2 subtab grid (subtab-workflows, subtab-routines, subtab-arch, subtab-stats) and bounded workflow-slug-input
     const { unmount: unmountHub } = render(
       <HubDrawer workflows={[]} workflowRuns={[]} />,
     );
+    const subtabGrid = screen.getByTestId("hub-subtab-grid");
+    expect(subtabGrid.style.display).toBe("grid");
+    expect(subtabGrid.style.gridTemplateColumns).toBe("repeat(2, minmax(0, 1fr))");
     const archBtn = screen.getByTestId("subtab-arch");
     const statsBtn = screen.getByTestId("subtab-stats");
-    expect(archBtn.style.flexDirection).toBe("column");
-    expect(archBtn.querySelectorAll("span").length).toBe(2);
-    expect(statsBtn.style.flexDirection).toBe("column");
-    expect(statsBtn.querySelectorAll("span").length).toBe(2);
+    expect(archBtn).toHaveTextContent("Architecture");
+    expect(statsBtn).toHaveTextContent("Telemetry");
     const slugInput = screen.getByTestId("workflow-slug-input");
     expect(slugInput.style.width).toBe("100%");
     expect(slugInput.style.boxSizing).toBe("border-box");
