@@ -1775,8 +1775,11 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         }
         None => {
             let effort = settings_model.as_deref().and_then(settings_effort);
-            // No transcript signal: settings.json is a default, not what the session runs.
-            let is_default = settings_model.is_some();
+            // No transcript signal: settings.json is a default, not what the session runs,
+            // unless it was written after the transcript (a deliberate live report, as in the
+            // arm above). With no transcript at all `settings_newer` is false, so it stays a
+            // default.
+            let is_default = settings_model.is_some() && !settings_newer;
             (settings_model, effort, is_default)
         }
     };
@@ -8679,6 +8682,38 @@ mod tests {
         let info = claude_model_info(None, Some(bare.path()));
         assert_eq!(info.model, None);
         assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_is_a_default_only_when_not_newer_than_a_modelless_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: nothing is newer, so settings.json stays a default.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // A transcript with no model signal, older than settings.json: the user switched model
+        // in the Claude app after the session began, a deliberate live report.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        set_mtime_secs(&transcript, 1_000);
+        set_mtime_secs(&settings, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(!info.model_is_default);
+
+        // The same transcript, newer than settings.json: settings.json is only a default.
+        set_mtime_secs(&settings, 500);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
     }
 
     #[test]
