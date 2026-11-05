@@ -3195,7 +3195,8 @@ fn resolve_cwd_lead(cwd: &Path, registry: &dyn AgentRegistry) -> Option<String> 
             continue;
         };
         let norm_base = base.to_ascii_lowercase();
-        for area in &areas {
+        // A virtual group (an area with no path) is not a directory: no cwd is "in" it.
+        for area in areas.iter().filter(|a| !a.is_virtual()) {
             let repo_match = area.path.as_ref().is_some_and(|rp| {
                 let trimmed = rp.trim_end_matches('/');
                 trimmed.eq_ignore_ascii_case(base)
@@ -3233,6 +3234,49 @@ mod tests {
     #[should_panic(expected = "never the machine's real route table")]
     fn test_code_cannot_save_to_the_default_route_table() {
         let _ = RouteTable::default().save(None);
+    }
+
+    #[test]
+    fn a_virtual_group_is_not_a_directory_so_its_lead_is_not_a_cwd_lead() {
+        let store = MemStore::default();
+        for (area, lead, project) in [
+            ("council", "Cora", None),
+            ("alpha", "Alma", Some("/work/alpha".to_string())),
+        ] {
+            store
+                .upsert_area(AreaRecord {
+                    area_key: area.into(),
+                    name: area.into(),
+                    path: project,
+                    purpose: "p".into(),
+                    updated_at: At::from_unix_millis(10),
+                    by: "owner".into(),
+                })
+                .unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: lead.into(),
+                    email: None,
+                    project: area.into(),
+                    role: AgentRole::Lead,
+                    extra_areas: vec![],
+                    create_area: false,
+                    replace: false,
+                    at: At::from_unix_millis(11),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        // A directory that happens to be named like the group is not in it.
+        assert_eq!(
+            resolve_cwd_lead(Path::new("/elsewhere/council/src"), &store),
+            None
+        );
+        // A directory-backed area is matched by name, as before.
+        assert_eq!(
+            resolve_cwd_lead(Path::new("/elsewhere/alpha/src"), &store).as_deref(),
+            Some("alma")
+        );
     }
 
     #[test]
