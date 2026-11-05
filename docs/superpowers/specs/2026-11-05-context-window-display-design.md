@@ -68,6 +68,9 @@ and FerroWatch use only `context_usage` from the server. With no `context_usage`
 what is used and no maximum. An `assumed` window shows a marker ("about 1M, assumed") and its
 tooltip says nothing reported it. The offered sizes are shown read-only in Agent Settings.
 FerroWatch shows used / max and the source for each agent.
+Compact stays available when the window is unknown (tooltip "Context window unknown — compact
+anyway"); with a known window the 50% rule compares tokens exactly (`used*2 >= max`), not the
+rounded percent. The evidence counts above are a dated snapshot from the audit day, not a live figure.
 
 ## Audit rules for Task 1
 

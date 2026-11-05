@@ -23,6 +23,7 @@ import {
 } from "../types/api";
 import { getAdapterBadgeClass } from "./RosterSidebar";
 import {
+  canonicalAdapter,
   contextWindowSourceTitle,
   formatContextMax,
   formatTokenCount,
@@ -2420,12 +2421,13 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   const contextUsage =
                     sessions.find((sess) => sess.id === hosted?.session_id)
                       ?.context_usage ??
-                    sessions.find(
-                      (sess) =>
-                        (sess.persona || sess.id).trim().toLowerCase() === key &&
-                        (sess.adapter ?? "").trim().toLowerCase() ===
-                          (item.adapter ?? "").trim().toLowerCase(),
-                    )?.context_usage ??
+                    sessions.find((sess) => {
+                      if ((sess.persona || sess.id).trim().toLowerCase() !== key) return false;
+                      // Compare the vendor the row displays; a missing side matches.
+                      const shown = canonicalAdapter(vendor);
+                      const theirs = canonicalAdapter(sess.adapter);
+                      return !shown || !theirs || shown === theirs;
+                    })?.context_usage ??
                     null;
 
                   return (

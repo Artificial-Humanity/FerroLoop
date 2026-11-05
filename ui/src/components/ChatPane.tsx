@@ -646,6 +646,11 @@ export function isAntigravityAdapter(adapter?: string | null): boolean {
   );
 }
 
+/** Lower-cased, trimmed adapter name with the antigravity aliases folded into "antigravity". */
+export function canonicalAdapter(adapter?: string | null): string {
+  return isAntigravityAdapter(adapter) ? "antigravity" : (adapter ?? "").trim().toLowerCase();
+}
+
 export function inferVendorFromModel(modelId?: string | null): string | null {
   const lower = (modelId ?? "").trim().toLowerCase();
   if (!lower) return null;
@@ -788,17 +793,18 @@ export function estimateSessionContextUsage(
 }
 
 /**
- * Compact token count: up to two decimals, trailing zeros trimmed ("1m", "256k", "828.4k",
- * "1.01m"). Two decimals keep 1,007,997 ("1.01m") apart from 1,000,000 ("1m").
+ * Compact token count rounded to three significant digits, trailing zeros trimmed ("1m", "262k",
+ * "828k", "12.3k", "1.01m"). Three digits keep 1,007,997 ("1.01m") apart from 1,000,000 ("1m"); a
+ * value that rounds up to 1000k reads "1m".
  */
 export function formatTokenCount(value: number): string {
-  const trim = (n: number) => n.toFixed(2).replace(/\.?0+$/, "");
+  const round3 = (n: number) => Number(n.toPrecision(3));
   if (value >= 1_000) {
-    const thousands = Number(trim(value / 1_000));
+    const thousands = round3(value / 1_000);
     if (thousands < 1_000) {
-      return `${trim(value / 1_000)}k`;
+      return `${thousands}k`;
     }
-    return `${trim(value / 1_000_000)}m`;
+    return `${round3(value / 1_000_000)}m`;
   }
   return String(value);
 }

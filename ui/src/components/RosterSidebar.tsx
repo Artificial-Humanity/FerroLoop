@@ -1481,6 +1481,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   className="fd-mono"
                                   style={{
                                     fontSize: "10px",
+                                    whiteSpace: "nowrap",
                                     color:
                                       contextPct === null
                                         ? "var(--text-muted)"

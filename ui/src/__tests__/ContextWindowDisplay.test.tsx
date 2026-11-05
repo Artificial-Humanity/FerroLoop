@@ -410,15 +410,18 @@ describe("formatTokenCount", () => {
     [999, "999"],
     [1_000, "1k"],
     [1_234, "1.23k"],
+    [12_345, "12.3k"],
     [1_500, "1.5k"],
     [200_000, "200k"],
     [256_000, "256k"],
     [272_000, "272k"],
     [500_000, "500k"],
-    [828_400, "828.4k"],
+    [262_144, "262k"],
+    [828_400, "828k"],
     [999_999, "1m"],
     [1_000_000, "1m"],
     [1_007_997, "1.01m"],
+    [1_048_576, "1.05m"],
     [1_500_000, "1.5m"],
     [2_000_000, "2m"],
   ])("formats %i as %s", (value, text) => {
@@ -544,6 +547,7 @@ describe("Roster ring with a transcript estimate", () => {
     );
     const ring = screen.getByTestId("context-ring-ferris");
     expect(ring).toHaveTextContent(/^~\d+(\.\d+)?k tok$/);
+    expect(screen.getByText(/tok$/)).toHaveStyle({ whiteSpace: "nowrap" });
     expect(ring).not.toHaveAttribute("data-percent");
   });
 });
@@ -608,5 +612,120 @@ describe("FerroWatch persona fallback across vendors", () => {
     );
     const cell = await screen.findByTestId("watch-liveness-context-ferris");
     expect(cell).toHaveTextContent(/^Context: 5k \/ 272k$/);
+  });
+});
+
+describe("FerroWatch persona match uses the displayed vendor", () => {
+  type Sess = { id: string; adapter: string | null; used: number };
+  async function renderCell(
+    item: { adapter: string | null; hosted: { vendor: string; session_id: string } | null },
+    sessions: Sess[],
+  ) {
+    const nowMs = Date.now();
+    const summary = {
+      telemetry: null,
+      health: {
+        thresholds: { stale_after_ms: 60_000, dead_after_ms: 300_000 },
+        hosted_sessions: 0,
+        hosted_sessions_undecodable: 0,
+        heartbeats_undecodable: 0,
+        agents: [
+          {
+            agent: "ferris",
+            project: "FerroLoop",
+            adapter: item.adapter,
+            active: true,
+            liveness: "live",
+            verdict: { state: "alive" },
+            heartbeat_at_ms: nowMs,
+            heartbeat_age_ms: 0,
+            node: "local",
+            hosted_session: item.hosted
+              ? {
+                  session_id: item.hosted.session_id,
+                  persona: "ferris",
+                  project: "FerroLoop",
+                  role: "lead",
+                  vendor: item.hosted.vendor,
+                  model: "m",
+                  node_id: "local",
+                  status: "running",
+                  restart_count: 0,
+                  updated_at_ms: nowMs,
+                }
+              : null,
+          },
+        ],
+      },
+      quotas: [],
+    } as unknown as WatchSummaryResponse;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        sessions={sessions.map((s) => ({
+          id: s.id,
+          source: "route",
+          adapter: s.adapter,
+          persona: "ferris",
+          status: "active",
+          context_usage: { used_tokens: s.used, max_tokens: 1_000_000, source: "catalog" },
+        })) as unknown as DiscoveredSessionSummary[]}
+      />,
+    );
+    return screen.findByTestId("watch-liveness-context-ferris");
+  }
+
+  it("keeps the hosted claude session's usage when a codex heartbeat shares the persona", async () => {
+    const cell = await renderCell(
+      { adapter: "codex", hosted: { vendor: "claude", session_id: "gone:ferris" } },
+      [
+        { id: "codex:ferris", adapter: "codex", used: 5_000 },
+        { id: "claude:ferris", adapter: "claude", used: 120_000 },
+      ],
+    );
+    expect(cell).toHaveTextContent(/^Context: 120k \/ 1m$/);
+  });
+
+  it("picks the session of the displayed vendor when two share a persona", async () => {
+    const cell = await renderCell({ adapter: "claude", hosted: null }, [
+      { id: "codex:ferris", adapter: "codex", used: 5_000 },
+      { id: "claude:ferris", adapter: "claude", used: 120_000 },
+    ]);
+    expect(cell).toHaveTextContent(/^Context: 120k \/ 1m$/);
+  });
+
+  it("compares against the hosted vendor when the row adapter is null", async () => {
+    const cell = await renderCell(
+      { adapter: null, hosted: { vendor: "claude", session_id: "gone:ferris" } },
+      [
+        { id: "codex:ferris", adapter: "codex", used: 5_000 },
+        { id: "claude:ferris", adapter: "claude", used: 120_000 },
+      ],
+    );
+    expect(cell).toHaveTextContent(/^Context: 120k \/ 1m$/);
+  });
+
+  it("matches the persona when neither the row nor the session names a vendor", async () => {
+    const cell = await renderCell({ adapter: null, hosted: null }, [
+      { id: "ferris", adapter: null, used: 7_000 },
+    ]);
+    expect(cell).toHaveTextContent(/^Context: 7k \/ 1m$/);
+  });
+
+  it("treats the antigravity aliases as one vendor", async () => {
+    const cell = await renderCell({ adapter: "agy", hosted: null }, [
+      { id: "claude:ferris", adapter: "claude", used: 120_000 },
+      { id: "antigravity:ferris", adapter: "antigravity", used: 9_000 },
+    ]);
+    expect(cell).toHaveTextContent(/^Context: 9k \/ 1m$/);
   });
 });
