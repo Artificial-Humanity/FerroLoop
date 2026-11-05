@@ -12,10 +12,13 @@
    record holds. `agy --model` accepts only effort-suffixed ids (`agy models`: `claude-sonnet-5-5-medium`,
    `gemini-4-argon-high`, `gemini-3.8-flash-low`, `claude-opus-5-5-low`, `gpt-oss-120b-medium`, ...).
    `gpt-oss-120b` exists only as `-medium`.
-3. A model switch made in the Antigravity UI before the next turn is not discovered:
-   `generator_model_from_json` (`crates/hub/src/discovery.rs`) reads only `metadata.generatorModel`
-   of a step, and a new conversation has no planner step yet. The choice is recorded on the
-   `CORTEX_STEP_TYPE_USER_INPUT` step itself (`userInput` on the step object).
+3. A new Antigravity conversation shows no model before its first turn: discovery
+   (`crates/hub/src/discovery.rs`) reads only `metadata.generatorModel` of a step, and a new
+   conversation has no planner step yet. The model the user picked is recorded as the REQUESTED
+   model on the `CORTEX_STEP_TYPE_USER_INPUT` step itself (`userInput` on the step object). It is
+   not the model that runs: an input sent while a tool step runs (`metadata.isInterruptingStep`)
+   requests a model that the planner keeps not using, and the next planner steps still report the
+   old `generatorModel`.
 4. `AgentSettingsModal` skips `getSessions()` whenever `executionMode` is already known, so opening
    Agent Settings never refreshes model, effort, mode or cwd. `inferVendorFromModel` classifies
    `claude-*` and `gpt-*` ids as Anthropic or OpenAI even when the session runs under Antigravity.
@@ -34,10 +37,15 @@ On each apply (`HubState::with_model_overrides`, now under a mutable lock), per 
 | Live (discovered) model + effort vs. | Action |
 | --- | --- |
 | no baseline yet | record the live pair as the baseline; keep the override |
-| equals the override (an absent override effort matches any live effort) | set `confirmed`; keep the override (no visible difference) |
+| equals the override: the model is equal ignoring case, and the effort is equal ignoring case, or the override has no effort, or the live effort is `None` (unknown) | set `confirmed`; keep the override; the override's effort is overlaid |
 | differs from the baseline and from the override | the vendor reports something newer: **drop the override**; show the live value |
 | equals the baseline, differs from the override, `confirmed` | the vendor had applied the choice and has since gone back: **drop the override** |
 | equals the baseline, differs from the override, not `confirmed` | the choice has not reached the vendor yet: keep the override |
+
+A live effort of `None` is "unknown", not a mismatch (`ModelOverride::matches_live`): Muse and
+Claude without an effort signal never report an effort and the UI always sends one, so without
+this rule the override would be dropped the moment the vendor applied the model and the
+operator's chosen effort would disappear. A different reported effort is still not a match.
 
 A session with no live model leaves the override alone. Override keys by persona are matched as
 today. The override is also dropped by the existing clear/reforge/spin-up/teardown paths.
@@ -64,16 +72,26 @@ Agy route stores the mapped id in the hosted record (so the next launch uses it)
 
 ### C. Antigravity discovery before the first turn
 
-`generator_model_from_json` scans the steps (`/steps`, else `/trajectory/steps`) newest first and
-returns the first step that carries a model signal. Within one step the signal is, in order,
-`/metadata/generatorModel`, `/userInput/userConfig/plannerConfig/planModel`, then
-`/userInput/lastUserConfig/plannerConfig/planModel` (empty and whitespace-only values are
-skipped). So the latest step that says anything about the model wins: a `USER_INPUT` step the
-planner has not answered yet gives the pending model, a later step with `generatorModel` replaces
-it, and a later `USER_INPUT` step (the user switched, then sent a message) replaces an earlier
-`generatorModel`. Steps with no signal (tool steps) are skipped. No steps array, an empty array, or
-no step with a signal gives no model. There is no `userInput` at the body root or under
-`/trajectory`, and nothing is read from there.
+The running model is the `metadata.generatorModel` of the LATEST step (scanning `/steps`, else
+`/trajectory/steps`, newest first) that has one; on the same step `metadata.modelUsage.model` (same
+placeholder form, carried only by `PLANNER_RESPONSE` steps; tool steps carry `generatorModel` but no
+`modelUsage`) is used when `generatorModel` is absent or blank. Steps with neither (user inputs,
+ephemeral messages) are skipped, so a newer user input never replaces a model that is running.
+
+`planModel` is only the REQUESTED model. It is read only when NO step has a running model, that
+is, before a conversation's first turn: the steps are scanned newest first for
+`/userInput/userConfig/plannerConfig/planModel`, then `/userInput/lastUserConfig/plannerConfig/planModel`
+on the same step, and the first non-blank value wins. Interrupting user inputs
+(`metadata.isInterruptingStep`) show why a requested model is not the running one. The
+tail-steps call (`GetCascadeTrajectorySteps` window) uses the running-model rule only, so a window
+that holds only user inputs names no model and the lookup falls through to the full trajectory;
+only the complete-trajectory parse applies the `planModel` fallback. Empty and whitespace-only
+values are skipped everywhere. No steps array, an empty array, or no step with any such value gives
+no model. There is no `userInput` at the body root or under `/trajectory`, and nothing is read from
+there.
+
+Showing a requested-but-different model as "pending" next to the running one is a follow-up and
+NOT part of this record.
 
 The value may be a placeholder (`MODEL_PLACEHOLDER_M26`, `M39`, `M404`, `M405`,
 `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) or an effort-suffixed id; both resolve through the existing
@@ -83,7 +101,8 @@ truncated-body path (`parse_agy_generator_model`) keeps its string scan and neve
 
 The response structure (`GetCascadeTrajectory` returns `{trajectory: {steps, generatorMetadata,
 metadata, ...}, status, numTotalSteps}`; `GetCascadeTrajectorySteps` returns `{steps}`; planner and
-tool steps carry `metadata.generatorModel`; `USER_INPUT` steps carry `userInput`) was confirmed
+tool steps carry `metadata.generatorModel`, `PLANNER_RESPONSE` steps also `metadata.modelUsage.model`;
+`USER_INPUT` steps carry `userInput`) was confirmed
 against the live Antigravity language server by the Lead on 2026-11-05, not by this branch's
 tests, which use JSON shaped like that response.
 
@@ -94,6 +113,23 @@ tests, which use JSON shaped like that response.
 * When the session adapter is known and is not the vendor that owns the model family, the adapter
   wins: a vendor is inferred from the model id only when the adapter is missing or `unknown`.
   `claude-sonnet-5-5`, `claude-opus-5-5` and `gpt-oss-120b` under `antigravity` stay Antigravity.
+
+## Known limits
+
+* (a) A model switch made in the Antigravity UI with no message sent leaves no step and is not
+  discoverable.
+* (b) Before a conversation's first turn the requested model may be shown although the turn never
+  ran (cancelled or failed), until the planner answers.
+* (c) When an override is dropped because the vendor reported a newer model, the hosted record
+  still holds the operator's older choice, so a later restart or reforge relaunches that older
+  choice (and FerroWatch may show an extra chip). Follow-up.
+* (d) The hosted-record model is effort-suffixed for Antigravity after the model endpoint but raw
+  after spin-up (the launch maps both). Follow-up.
+* (e) An Antigravity model switch is display-only for a running session and applies at the next
+  launch.
+* The `matches_live` rule in A (live effort `None` is unknown) means an override with an effort
+  stays confirmed for a vendor that never reports one; it is dropped only on a different model or
+  a different reported effort.
 
 ## Non-goals
 
