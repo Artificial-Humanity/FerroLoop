@@ -246,6 +246,70 @@ export interface ProjectsListResponse {
   projects: ProjectArtifactsDirInfo[];
 }
 
+export type ProjectKind = "project" | "virtual";
+
+export type ProjectTracker = {
+  kind: "github";
+  repo: string;
+  credential: "app" | "env";
+};
+
+/**
+ * One entry of `GET /api/v1/projects`, and the body of the `POST` and `PATCH` answers.
+ * The artifact-directory fields mirror `ProjectArtifactsDirInfo`; they are optional because an
+ * older hub may omit them. `id` always equals `slug`.
+ */
+export interface ProjectSummary {
+  id: string;
+  slug: string;
+  name: string;
+  kind: ProjectKind;
+  /** `null` for a virtual group. */
+  path: string | null;
+  has_git: boolean;
+  purpose: string | null;
+  tracker: ProjectTracker | null;
+  store_path: string | null;
+  active_agent_count: number;
+  artifacts_dir?: string | null;
+  default_artifacts_dir?: string;
+  effective_artifacts_dir?: string;
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  slug?: string;
+  kind: ProjectKind;
+  path?: string | null;
+  purpose?: string;
+  git_init?: boolean;
+  github?: string | null;
+  credential?: "app" | "env";
+}
+
+export interface UpdateProjectRequest {
+  name?: string;
+  purpose?: string;
+  path?: string | null;
+  github?: string | null;
+  credential?: "app" | "env";
+}
+
+export interface DeleteProjectRequest {
+  reassign_to?: string | null;
+  decommission_agents?: boolean;
+  delete_store?: boolean;
+  delete_dir?: boolean;
+}
+
+export interface DeleteProjectResponse {
+  deleted: string;
+  reassigned_agents: number;
+  decommissioned_agents: number;
+  store_deleted: boolean;
+  dir_deleted: boolean;
+}
+
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;

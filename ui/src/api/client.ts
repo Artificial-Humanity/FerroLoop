@@ -39,6 +39,11 @@ import {
   type ChangeArtifactsDirRequest,
   type ChangeArtifactsDirResponse,
   type ProjectArtifactsDirInfo,
+  type ProjectSummary,
+  type CreateProjectRequest,
+  type UpdateProjectRequest,
+  type DeleteProjectRequest,
+  type DeleteProjectResponse,
   type ProjectsListResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
@@ -660,6 +665,44 @@ export function resolvePasskeyOrigin(baseUrl: string): {
   return { origin, hostname };
 }
 
+function normalizeProjectEntry(entry: unknown): ProjectSummary | null {
+  if (!entry || typeof entry !== "object") return null;
+  const e = entry as Record<string, unknown>;
+  const slug =
+    typeof e.slug === "string" && e.slug
+      ? e.slug
+      : typeof e.id === "string" && e.id
+        ? e.id
+        : "";
+  if (!slug) return null;
+  const isLegacy = typeof e.slug !== "string" || !e.slug;
+  const out: ProjectSummary = isLegacy
+    ? {
+        id: slug,
+        slug,
+        name: slug,
+        kind: "project",
+        path: null,
+        has_git: false,
+        purpose: null,
+        tracker: null,
+        store_path: null,
+        active_agent_count: 0,
+      }
+    : { ...(e as unknown as ProjectSummary), id: slug, slug };
+  // Artifact-directory fields pass through when present; they are never invented.
+  if (e.artifacts_dir === null || typeof e.artifacts_dir === "string") {
+    out.artifacts_dir = e.artifacts_dir;
+  }
+  if (typeof e.default_artifacts_dir === "string") {
+    out.default_artifacts_dir = e.default_artifacts_dir;
+  }
+  if (typeof e.effective_artifacts_dir === "string") {
+    out.effective_artifacts_dir = e.effective_artifacts_dir;
+  }
+  return out;
+}
+
 export class HubApiError extends Error {
   public readonly status: number;
   public readonly detail?: string;
@@ -683,6 +726,30 @@ export class HubApiError extends Error {
     if (details && typeof details === "object") {
       this.details = details;
     }
+  }
+}
+
+/**
+ * `DELETE /api/v1/projects/:slug` answers 409 when the entry still has active agents and the
+ * request set neither `reassign_to` nor `decommission_agents`.
+ */
+export class ProjectDeleteConflictError extends HubApiError {
+  public readonly active_agent_count: number;
+  public readonly active_agents: string[];
+
+  constructor(message: string, details?: Record<string, unknown> | null) {
+    super(409, message, undefined, undefined, details);
+    this.name = "ProjectDeleteConflictError";
+    const agents = Array.isArray(details?.active_agents)
+      ? (details.active_agents as unknown[]).filter(
+          (a): a is string => typeof a === "string",
+        )
+      : [];
+    this.active_agents = agents;
+    this.active_agent_count =
+      typeof details?.active_agent_count === "number"
+        ? details.active_agent_count
+        : agents.length;
   }
 }
 
@@ -1473,6 +1540,57 @@ export class HubApiClient {
     } catch (err) {
       if (err instanceof HubApiError && err.status === 404) {
         return { projects: [] };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Project entries for the Projects tab and the shared project list. An older hub answers with
+   * `{id, ...artifact dirs}` entries only; those map to a plain directory project.
+   */
+  public async listProjects(): Promise<ProjectSummary[]> {
+    const res = await this.request<{ projects?: unknown }>("/api/v1/projects");
+    const raw = res?.projects;
+    if (!Array.isArray(raw)) return [];
+    const out: ProjectSummary[] = [];
+    for (const entry of raw) {
+      const item = normalizeProjectEntry(entry);
+      if (item) out.push(item);
+    }
+    return out;
+  }
+
+  public async createProject(req: CreateProjectRequest): Promise<ProjectSummary> {
+    return this.request<ProjectSummary>("/api/v1/projects", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  public async updateProject(
+    slug: string,
+    req: UpdateProjectRequest,
+  ): Promise<ProjectSummary> {
+    return this.request<ProjectSummary>(
+      `/api/v1/projects/${encodeURIComponent(slug)}`,
+      { method: "PATCH", body: JSON.stringify(req) },
+    );
+  }
+
+  /** Throws `ProjectDeleteConflictError` on 409 (active agents, no reassign or decommission). */
+  public async deleteProject(
+    slug: string,
+    req: DeleteProjectRequest,
+  ): Promise<DeleteProjectResponse> {
+    try {
+      return await this.request<DeleteProjectResponse>(
+        `/api/v1/projects/${encodeURIComponent(slug)}`,
+        { method: "DELETE", body: JSON.stringify(req) },
+      );
+    } catch (err) {
+      if (err instanceof HubApiError && err.status === 409) {
+        throw new ProjectDeleteConflictError(err.message, err.details);
       }
       throw err;
     }
