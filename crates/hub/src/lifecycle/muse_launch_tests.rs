@@ -263,6 +263,133 @@ fn a_restart_launches_with_the_recorded_model_normalised() {
 }
 
 #[test]
+fn a_claude_model_id_keeps_its_window_tag_through_spin_up_and_restart() {
+    for model in ["opus[1m]", "sonnet[1m]", "opus"] {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let first = FakeRuntime::default();
+        let mut request = req("ada", "claude");
+        request.model = Some(model.into());
+        let out = spin_up(
+            &store,
+            &first.env(home.path()),
+            &request,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let spun = first.launches.borrow()[0].1.clone().unwrap().argv;
+        assert_eq!(&spun[2..4], ["--model", model], "spin-up {model}");
+        assert_eq!(spun[1], "--enable-auto-mode");
+        assert_eq!(out.model.as_deref(), Some(model));
+        let record = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.model.as_deref(), Some(model));
+
+        let second = FakeRuntime::default();
+        restart_hosted_session(&store, &second.env(home.path()), &out.session_id, "owner").unwrap();
+        let restarted = second.launches.borrow()[0].1.clone().unwrap().argv;
+        assert_eq!(&restarted[2..4], ["--model", model], "restart {model}");
+    }
+}
+
+#[test]
+fn a_window_tag_is_kept_for_claude_only() {
+    for vendor in ["codex", "grok", "antigravity"] {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let mut request = req("ada", vendor);
+        request.model = Some("opus[1m]".into());
+        spin_up(
+            &store,
+            &fake.env(home.path()),
+            &request,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let argv = fake.launches.borrow()[0].1.clone().unwrap().argv;
+        assert!(!argv.iter().any(|a| a == "--model"), "{vendor}: {argv:?}");
+        assert!(!argv.iter().any(|a| a.contains('[')), "{vendor}: {argv:?}");
+    }
+}
+
+#[test]
+fn a_bracket_model_id_reaches_tmux_as_one_unquoted_argument_after_the_separator() {
+    // There is no shell string to quote: the command is an argument vector after `--`, which
+    // tmux runs directly when it is given more than one argument, so `opus[1m]` is never
+    // glob-expanded and never fails with "no matches found".
+    let home = TempDir::new().unwrap();
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let spec = launch_spec_for(&env, "claude", "ada", Some("opus[1m]"), "hi").unwrap();
+    let args = tmux_new_session_args("Ada", "claude", None, Some(&spec));
+    let separator = args.iter().position(|a| a == "--").unwrap();
+    let command = &args[separator + 1..];
+    assert!(command.len() > 1, "tmux runs several arguments directly");
+    assert_eq!(
+        command[command.len() - 3..command.len() - 1],
+        ["--model", "opus[1m]"]
+    );
+    assert_eq!(command.iter().filter(|a| a.contains('[')).count(), 1);
+}
+
+#[test]
+fn plain_models_accept_one_window_tag_and_nothing_else_in_brackets() {
+    for ok in [
+        "opus[1m]",
+        "sonnet[1m]",
+        "opus[200k]",
+        "claude-opus-5-5[1m]",
+        " opus[1m] ",
+        "a[1234k]",
+    ] {
+        assert_eq!(
+            normalize_plain_model(Some(ok)).as_deref(),
+            Some(ok.trim()),
+            "{ok:?}"
+        );
+    }
+    for bad in [
+        "opus[",
+        "opus[]",
+        "opus[1m]x",
+        "opus[1m][1m]",
+        "[1m]",
+        "op[1m]us",
+        "opus[1h]",
+        "opus[12345m]",
+        "opus[1M]",
+        "opus[m]",
+        "opus[1 m]",
+        "opus[1m] x",
+        "opus [1m]",
+        "opus[1m];ls",
+        "opus[1m]$x",
+        "opus[1m]`x`",
+        "opus[1m]\nx",
+        "opus;x[1m]",
+        "opus$x[1m]",
+        "opus`x`[1m]",
+        "opus\n[1m]",
+        "-opus[1m]",
+        "opus[-1m]",
+        "opus[+1m]",
+        "opus[1e3m]",
+        "opus]1m[",
+        "opus[1m",
+        "opus1m]",
+    ] {
+        assert_eq!(normalize_plain_model(Some(bad)), None, "{bad:?}");
+    }
+    // The 64 character limit applies to the id; the tag comes on top.
+    assert!(normalize_plain_model(Some(&format!("{}[1m]", "a".repeat(64)))).is_some());
+    assert!(normalize_plain_model(Some(&format!("{}[1m]", "a".repeat(65)))).is_none());
+}
+
+#[test]
 fn plain_models_reject_flags_and_invalid_ids() {
     let long = "a".repeat(65);
     for invalid in [

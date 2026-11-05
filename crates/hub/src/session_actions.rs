@@ -90,6 +90,13 @@ pub fn validate_model(raw: &str) -> Result<String, String> {
     Ok(model.to_string())
 }
 
+/// The text pasted into a live CLI to switch its model: `/model <id>`. `model` has been through
+/// [`validate_model`], so it is one line; a bracket tag such as `opus[1m]` is part of the id and
+/// is sent as is.
+pub fn model_command(model: &str) -> String {
+    format!("/model {model}")
+}
+
 /// `low`, `medium` or `high` in any case, normalized to lowercase.
 pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
     let level = raw.trim().to_ascii_lowercase();
@@ -263,6 +270,16 @@ mod tests {
         }
         assert!(validate_model(&"m".repeat(MAX_MODEL_CHARS)).is_ok());
         assert!(validate_model(&"m".repeat(MAX_MODEL_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn a_bracket_model_id_is_valid_and_forms_the_model_command() {
+        for id in ["opus[1m]", "sonnet[1m]", "opus[200k]"] {
+            let model = validate_model(&format!("  {id} ")).unwrap();
+            assert_eq!(model, id);
+            assert_eq!(model_command(&model), format!("/model {id}"));
+        }
+        assert_eq!(model_command("gpt-6-sol"), "/model gpt-6-sol");
     }
 
     #[test]

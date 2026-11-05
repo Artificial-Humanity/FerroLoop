@@ -465,15 +465,36 @@ pub(crate) fn normalize_muse_model(requested: Option<&str>) -> String {
     }
 }
 
-/// A plain model id cannot be interpreted as a command-line option.
-fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
-    let id = requested?.trim();
-    (id.len() <= 64
+/// Split a trailing context-window tag (`[1m]`, `[200k]`: one to four digits, then lower-case
+/// `k` or `m`) off a model id. `None` for an id with no such tag.
+fn split_window_tag(id: &str) -> Option<(&str, &str)> {
+    let open = id.rfind('[')?;
+    let (base, tag) = id.split_at(open);
+    let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
+    let (digits, unit) = inner.split_at(inner.len().checked_sub(1)?);
+    let valid = matches!(unit, "k" | "m")
+        && (1..=4).contains(&digits.len())
+        && digits.bytes().all(|b| b.is_ascii_digit());
+    valid.then_some((base, tag))
+}
+
+/// `true` for `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
+fn is_plain_model_id(id: &str) -> bool {
+    id.len() <= 64
         && id.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
-    .then(|| id.to_string())
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// A plain model id cannot be interpreted as a command-line option. It may end in ONE
+/// context-window tag (`opus[1m]`, `sonnet[1m]`: [`split_window_tag`]); no other bracket is
+/// accepted. The launch passes each argument to the process as is (never through a shell), so
+/// the tag is not glob-expanded.
+fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
+    let id = requested?.trim();
+    let base = split_window_tag(id).map_or(id, |(base, _)| base);
+    is_plain_model_id(base).then(|| id.to_string())
 }
 
 /// The `agy --model` id for `model`. `agy models` lists every id with an effort suffix
@@ -540,7 +561,11 @@ fn launch_spec_for(
         } else {
             model
         };
-        if let Some(model) = normalize_plain_model(model) {
+        // Only Claude names its window in the model id (`opus[1m]`); another vendor's id never
+        // carries a tag, so a tagged one is dropped as it always was.
+        if let Some(model) = normalize_plain_model(model)
+            .filter(|m| vendor == "claude" || split_window_tag(m).is_none())
+        {
             args.extend(["--model".into(), model]);
         }
         if vendor == "antigravity" {

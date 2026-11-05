@@ -6267,7 +6267,7 @@ fn handle_post_session_model(
             match dispatch_operator_prompt_to_route(
                 route,
                 authority.actor_name(),
-                &format!("/model {model}"),
+                &session_actions::model_command(&model),
             ) {
                 Ok(()) => METHOD_OPERATOR_PROMPT,
                 Err(_) => METHOD_OVERRIDE_ONLY,
