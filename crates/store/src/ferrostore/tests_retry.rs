@@ -212,6 +212,21 @@ const NOT_REMOTE: &[(&str, &str, &str)] = &[
         "let outcome = self.with_write_outcome(move |txn| {",
         "`publish_mq`: a remote handle sends one `publish_mq` RPC, which the server runs once",
     ),
+    (
+        "mod.rs",
+        "let (_, committed) = self.with_write_outcome(|txn| {",
+        "`mq_persist_snapshots`: only the owner calls this after remote flush/publish returns through its RPC branch",
+    ),
+    (
+        "mod.rs",
+        "let result = self.with_write_outcome(|txn| {",
+        "`mq_publish_durable_buffered`: reached only for a local owner; remote publish returns through its RPC branch",
+    ),
+    (
+        "mod.rs",
+        "let (_, commit) = self.with_write_outcome(|txn| {",
+        "`ack_mq_with_detail`: only the local owner reaches this write; remote ACK returns through v2 or legacy RPC",
+    ),
 ];
 
 /// The fewest write call sites the enumeration may find: it may grow, and a
@@ -466,6 +481,23 @@ pub(super) fn run_public_writes_over<G>(fresh: impl Fn() -> (FerroStore, G)) {
     store.delete_doc("docs", "a").unwrap();
     store.publish_mq("topic", "k", &json!(1)).unwrap();
     store.ack_mq("topic", "g", 1).unwrap();
+    struct AckAdapter;
+    impl super::SyncAdapter for AckAdapter {
+        fn name(&self) -> &str {
+            "retry-ack"
+        }
+        fn on_commit(&self, _: &super::SyncBatch) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+    store
+        .attach_sync_adapter(
+            super::SyncMode::WriteThrough,
+            std::sync::Arc::new(AckAdapter),
+        )
+        .unwrap();
+    store.ack_mq("topic", "adapter-group", 1).unwrap();
+    store.detach_sync_adapter().unwrap();
     let columns = [ColumnDef {
         name: "n".into(),
         ty: ColumnType::Int64,

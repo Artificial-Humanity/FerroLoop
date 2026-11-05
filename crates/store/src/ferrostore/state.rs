@@ -1000,7 +1000,7 @@ fn load_mq(state: &DocState, topic: &str) -> Result<Vec<MqRecord>, StoreError> {
     Ok(records)
 }
 
-fn acked_seqs(state: &DocState, topic: &str, group: &str) -> BTreeSet<u64> {
+pub(super) fn acked_seqs(state: &DocState, topic: &str, group: &str) -> BTreeSet<u64> {
     let collection = format!("mq_ack:{topic}:{group}");
     let mut seqs = BTreeSet::new();
     for (id, doc) in state.docs.in_collection(&collection) {

@@ -13,7 +13,7 @@ use super::layout::{Op, backend};
 use super::retry;
 use super::session::{self, Claim, Dedup, ReadKey, Sessions};
 use super::vector;
-use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
+use super::{FerroStore, MqDurability, MqRecord, SyncBatch, lock_mutex};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::iri::Iri;
@@ -397,8 +397,16 @@ impl FerroStoreServer {
     }
 }
 
-impl Drop for FerroStoreServer {
-    fn drop(&mut self) {
+impl FerroStoreServer {
+    /// Stop accepting requests, join all connection handlers, then flush buffered Adaptive
+    /// queue messages. An error is returned to the caller, including when flushing fails.
+    /// Repeated calls can retry a failed flush after the handlers have been joined.
+    pub fn shutdown(&mut self) -> Result<usize, StoreError> {
+        self.quiesce()?;
+        self.state.store.flush_mq(None)
+    }
+
+    fn quiesce(&mut self) -> Result<(), StoreError> {
         // Stop accept and connection readers before joining. Unlink only the
         // inode a unix server bound, so a replacement socket is left alone.
         // A tcp server has no filesystem path.
@@ -412,11 +420,21 @@ impl Drop for FerroStoreServer {
                 let _ = TcpStream::connect_timeout(addr, Duration::from_millis(200));
             }
         }
-        if let Some(handle) = self.accept.take() {
-            let _ = handle.join();
-        }
+        let joined = self.accept.take().map(|handle| handle.join());
         if let Bound::Unix { path, inode } = &self.bound {
             unlink_bound(path, *inode);
+        }
+        if joined.is_some_and(|result| result.is_err()) {
+            return Err(backend("FerroStore accept thread panicked during shutdown"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for FerroStoreServer {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            eprintln!("ferrostore: graceful shutdown failed: {error}");
         }
     }
 }
@@ -1091,12 +1109,53 @@ fn dispatch(
             ))
         }
         "publish_mq" => {
-            let (seq, store_seq) = store.publish_mq_detail(
-                param_str(params, "topic")?,
-                param_str(params, "key")?,
-                &param_value(params, "payload")?,
-            )?;
+            let topic = param_str(params, "topic")?;
+            let key = param_str(params, "key")?;
+            let payload = param_value(params, "payload")?;
+            let require_single = optional_bool(params, "require_single_publish")?;
+            if let Some(value) = params.get("durability").filter(|value| !value.is_null()) {
+                let durability: MqDurability = serde_json::from_value(value.clone())
+                    .map_err(|error| backend(format!("invalid mq durability: {error}")))?;
+                if require_single && durability != MqDurability::Durable {
+                    return Err(backend("require_single_publish requires durable MQ"));
+                }
+                let (seq, store_seq) = if require_single {
+                    let (seq, commit) = store.publish_mq_single_detail(topic, key, &payload)?;
+                    (seq, Some(commit))
+                } else {
+                    store.publish_mq_with_detail(topic, key, &payload, durability)?
+                };
+                let tier = if store_seq.is_some() {
+                    "disk"
+                } else {
+                    "memory"
+                };
+                return Ok(json!({"seq": seq, "store_seq": store_seq, "tier": tier}));
+            }
+            let (seq, store_seq) = if require_single {
+                store.publish_mq_single_detail(topic, key, &payload)?
+            } else {
+                store.publish_mq_detail(topic, key, &payload)?
+            };
             Ok(json!({"seq": seq, "store_seq": store_seq}))
+        }
+        "publish_mq_v2" => {
+            let topic = param_str(params, "topic")?;
+            let key = param_str(params, "key")?;
+            let payload = param_value(params, "payload")?;
+            let value = params
+                .get("durability")
+                .ok_or_else(|| backend("missing mq durability"))?;
+            let durability: MqDurability = serde_json::from_value(value.clone())
+                .map_err(|error| backend(format!("invalid mq durability: {error}")))?;
+            let (seq, store_seq) =
+                store.publish_mq_with_detail(topic, key, &payload, durability)?;
+            let tier = if store_seq.is_some() {
+                "disk"
+            } else {
+                "memory"
+            };
+            Ok(json!({"seq": seq, "store_seq": store_seq, "tier": tier}))
         }
         "poll_mq_group" => {
             let records = store.poll_mq_group(
@@ -1116,8 +1175,23 @@ fn dispatch(
             )?;
             Ok(Value::Null)
         }
+        "ack_mq_v2" => {
+            let store_seq = store.ack_mq_with_detail(
+                param_str(params, "topic")?,
+                param_str(params, "group")?,
+                param_u64(params, "seq")?,
+            )?;
+            Ok(json!({"store_seq": store_seq}))
+        }
+        "flush_mq" => Ok(json!({"flushed": store.flush_mq(optional_topic(params)?)?})),
+        "mq_telemetry" => serde_json::to_value(store.mq_telemetry(optional_topic(params)?)?)
+            .map_err(|error| backend(format!("encode mq telemetry: {error}"))),
         "checkpoint" => {
-            store.checkpoint()?;
+            if optional_bool(params, "forbid_mq_flush")? {
+                store.checkpoint_if_mq_idle()?;
+            } else {
+                store.checkpoint()?;
+            }
             Ok(Value::Null)
         }
         "compact" => {
@@ -1403,6 +1477,14 @@ fn optional_bool(params: &Value, key: &str) -> Result<bool, StoreError> {
 
 fn parse_sync_batches(value: &Value) -> Result<Vec<SyncBatch>, StoreError> {
     serde_json::from_value(value.clone()).map_err(|err| backend(format!("sync batches: {err}")))
+}
+
+fn optional_topic(params: &Value) -> Result<Option<&str>, StoreError> {
+    match params.get("topic") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(topic)) => Ok(Some(topic)),
+        Some(_) => Err(backend("param `topic` is not a string or null")),
+    }
 }
 
 fn optional_u32(params: &Value, key: &str) -> Result<Option<u32>, StoreError> {
@@ -2390,6 +2472,422 @@ fn fail_pending(shared: &RemoteShared, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_publish_rpc_accepts_optional_durability_without_changing_default_response() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("q.sock");
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                super::super::MqTierPolicy::default(),
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let _server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        let durable = client
+            .call_req(
+                "publish_mq",
+                json!({"topic":"events","key":"d","payload":1}),
+            )
+            .unwrap();
+        assert_eq!(durable["seq"], 1);
+        assert!(durable["store_seq"].is_u64());
+        assert!(durable.get("tier").is_none());
+        let buffered = client
+            .call_req(
+                "publish_mq",
+                json!({"topic":"events","key":"a","payload":2,"durability":"adaptive"}),
+            )
+            .unwrap();
+        assert_eq!(buffered["seq"], 2);
+        assert!(buffered["store_seq"].is_null());
+        assert_eq!(buffered["tier"], "memory");
+        let ephemeral = client
+            .call_req(
+                "publish_mq",
+                json!({"topic":"temporary","key":"e","payload":4,"durability":"ephemeral"}),
+            )
+            .unwrap();
+        assert_eq!(ephemeral["seq"], 1);
+        assert!(ephemeral["store_seq"].is_null());
+        assert_eq!(ephemeral["tier"], "memory");
+        assert!(client.call_req("publish_mq", json!({"topic":"events","key":"unsafe","payload":3,"durability":"ephemeral","require_single_publish":true})).is_err());
+        assert!(client.call_req("publish_mq", json!({"topic":"events","key":"unsafe","payload":3,"durability":"durable","require_single_publish":true})).is_err());
+        assert!(
+            client
+                .call_req(
+                    "publish_mq",
+                    json!({"topic":"events","key":"unsafe","payload":3,"durability":"unknown"})
+                )
+                .is_err()
+        );
+        let all = client
+            .call(
+                "poll_mq_group",
+                json!({"topic":"events","group":"g","limit":10}),
+            )
+            .unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tiered_mq_rpc_preserves_legacy_framing_and_flushes_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("queue.fls");
+        let sock = dir.path().join("queue.sock");
+        let mut server =
+            FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        let durable = client
+            .call_req(
+                "publish_mq",
+                json!({"topic":"events","key":"d","payload":1}),
+            )
+            .unwrap();
+        assert_eq!(durable["seq"], 1);
+        assert!(durable["store_seq"].is_u64());
+        assert!(durable.get("tier").is_none());
+        let adaptive = client
+            .call_req(
+                "publish_mq_v2",
+                json!({"topic":"events","key":"a","payload":2,"durability":"adaptive"}),
+            )
+            .unwrap();
+        assert_eq!(adaptive["seq"], 2);
+        assert!(adaptive["store_seq"].is_null());
+        assert_eq!(adaptive["tier"], "memory");
+        let telemetry = client
+            .call("mq_telemetry", json!({"topic":"events"}))
+            .unwrap();
+        let topic = telemetry["topics"].as_array().unwrap().first().unwrap();
+        assert_eq!(topic["topic"], "events");
+        assert_eq!(topic["memory_messages"], 1);
+        assert_eq!(topic["active_tier"], "memory");
+        let v2 = client
+            .call_req("ack_mq_v2", json!({"topic":"events","group":"g","seq":2}))
+            .unwrap();
+        assert!(v2["store_seq"].is_null());
+        let old = client
+            .call_req("ack_mq", json!({"topic":"events","group":"g","seq":1}))
+            .unwrap();
+        assert!(old.is_null());
+        drop(client);
+        assert_eq!(server.shutdown().unwrap(), 1);
+        drop(server);
+        let reopened = FerroStore::open(&file).unwrap();
+        let other = reopened.poll_mq_group("events", "other", 10).unwrap();
+        assert_eq!(
+            other.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            reopened
+                .poll_mq_group("events", "g", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shutdown_reports_a_failed_flush_and_allows_retry_without_losing_buffer() {
+        use std::sync::atomic::AtomicBool;
+        struct DiskProbe(AtomicBool);
+        impl super::super::MqResourceProbe for DiskProbe {
+            fn probe(&self, _path: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(if self.0.load(Ordering::SeqCst) {
+                        u64::MAX
+                    } else {
+                        0
+                    }),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("queue.fls");
+        let sock = dir.path().join("queue.sock");
+        let probe = Arc::new(DiskProbe(AtomicBool::new(true)));
+        let store = FerroStore::open(&file).unwrap();
+        store
+            .configure_mq(super::super::MqTierPolicy::default(), false, probe.clone())
+            .unwrap();
+        let mut server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        client
+            .call_req(
+                "publish_mq_v2",
+                json!({"topic":"events","key":"a","payload":2,"durability":"adaptive"}),
+            )
+            .unwrap();
+        probe.0.store(false, Ordering::SeqCst);
+        assert!(server.shutdown().is_err());
+        assert_eq!(
+            server
+                .store()
+                .poll_mq_group("events", "g", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        probe.0.store(true, Ordering::SeqCst);
+        assert_eq!(server.shutdown().unwrap(), 1);
+        drop(client);
+        drop(server);
+        let reopened = FerroStore::open(&file).unwrap();
+        assert_eq!(reopened.poll_mq_group("events", "g", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn optional_topic_rejects_invalid_shapes() {
+        assert_eq!(optional_topic(&json!({})).unwrap(), None);
+        assert_eq!(optional_topic(&json!({"topic":null})).unwrap(), None);
+        assert_eq!(
+            optional_topic(&json!({"topic":"events"})).unwrap(),
+            Some("events")
+        );
+        assert!(optional_topic(&json!({"topic":7})).is_err());
+    }
+
+    #[test]
+    fn repeated_adaptive_publish_request_replays_the_original_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let _server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        let req = json!({"req":"01900000000070008000000000000001","topic":"events","key":"a","payload":1,"durability":"adaptive"});
+        let first = client.call("publish_mq_v2", req.clone()).unwrap();
+        let again = client.call("publish_mq_v2", req).unwrap();
+        assert_eq!(first, again);
+        let records = client
+            .call(
+                "poll_mq_group",
+                json!({"topic":"events","group":"g","limit":10}),
+            )
+            .unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remote_attached_adapter_uses_durable_ack_for_another_clients_buffered_record() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _path: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Counter(AtomicUsize);
+        impl super::super::SyncAdapter for Counter {
+            fn name(&self) -> &str {
+                "test-counter"
+            }
+            fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                super::super::MqTierPolicy::default(),
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let _server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let sender = FerroStore::connect_uri(&uri).unwrap();
+        let consumer = FerroStore::connect_uri(&uri).unwrap();
+        let adapter = Arc::new(Counter::default());
+        consumer
+            .attach_sync_adapter(super::super::SyncMode::WriteThrough, adapter.clone())
+            .unwrap();
+        let seq = sender
+            .publish_mq_with("events", "a", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        consumer.ack_mq("events", "g", seq).unwrap();
+        assert_eq!(
+            adapter.0.load(Ordering::SeqCst),
+            1,
+            "ACK must expose a real durable sync batch"
+        );
+        assert!(
+            consumer
+                .poll_mq_group("events", "g", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            consumer.poll_mq_group("events", "other", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remote_adapter_durable_publish_refuses_another_clients_buffered_topic() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _path: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Counter(AtomicUsize);
+        impl super::super::SyncAdapter for Counter {
+            fn name(&self) -> &str {
+                "test-counter"
+            }
+            fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                super::super::MqTierPolicy::default(),
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let sender = FerroStore::connect_uri(&uri).unwrap();
+        let client = FerroStore::connect_uri(&uri).unwrap();
+        let adapter = Arc::new(Counter::default());
+        client
+            .attach_sync_adapter(super::super::SyncMode::WriteThrough, adapter.clone())
+            .unwrap();
+        let first = sender
+            .publish_mq_with("events", "a", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let before = server.store().stats().unwrap().last_seq;
+        assert!(client.publish_mq("events", "b", &json!(2)).is_err());
+        assert_eq!(server.store().stats().unwrap().last_seq, before);
+        assert_eq!(adapter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            sender.poll_mq_group("events", "g", 10).unwrap()[0].seq,
+            first
+        );
+        sender.flush_mq(Some("events")).unwrap();
+        assert_eq!(
+            client.publish_mq("events", "b", &json!(2)).unwrap(),
+            first + 1
+        );
+        assert_eq!(adapter.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn remote_adapter_checkpoint_refuses_buffered_work_then_succeeds_after_flush() {
+        struct Resources;
+        impl super::super::MqResourceProbe for Resources {
+            fn probe(&self, _path: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(u64::MAX),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        struct Sink;
+        impl super::super::SyncAdapter for Sink {
+            fn name(&self) -> &str {
+                "test-sink"
+            }
+            fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                super::super::MqTierPolicy::default(),
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let sender = FerroStore::connect_uri(&uri).unwrap();
+        let guarded = FerroStore::connect_uri(&uri).unwrap();
+        guarded
+            .attach_sync_adapter(super::super::SyncMode::WriteThrough, Arc::new(Sink))
+            .unwrap();
+        let seq = sender
+            .publish_mq_with("events", "a", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let before = server.store().stats().unwrap().last_seq;
+        assert!(guarded.checkpoint().is_err());
+        assert_eq!(server.store().stats().unwrap().last_seq, before);
+        assert_eq!(sender.poll_mq_group("events", "g", 10).unwrap()[0].seq, seq);
+        sender.flush_mq(None).unwrap();
+        guarded.checkpoint().unwrap();
+    }
+
+    #[test]
+    fn ephemeral_publish_to_an_old_server_never_falls_back_to_legacy_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("old.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut wire = UnixIo::new(stream, FrameCounter::default());
+            wire.write_value(&json!({"auth":"ok","scope":"admin"}))
+                .unwrap();
+            let Incoming::Value(request) = wire.read_value(MAX_FRAME_BYTES as usize).unwrap()
+            else {
+                panic!("expected request")
+            };
+            let method = request["method"].as_str().unwrap().to_string();
+            seen_tx.send(method).unwrap();
+            wire.write_value(
+                &json!({"id":request["id"],"ok":false,"error":"no such method `publish_mq_v2`"}),
+            )
+            .unwrap();
+            if let Ok(Incoming::Value(next)) = wire.read_value(MAX_FRAME_BYTES as usize) {
+                seen_tx
+                    .send(next["method"].as_str().unwrap().to_string())
+                    .unwrap();
+            }
+        });
+        let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+        let error = client
+            .publish_mq_with("events", "secret", &json!(1), MqDurability::Ephemeral)
+            .unwrap_err();
+        assert!(error.to_string().contains("no such method"), "{error}");
+        drop(client);
+        worker.join().unwrap();
+        let requests: Vec<_> = seen_rx.try_iter().collect();
+        assert_eq!(requests, ["publish_mq_v2"]);
+    }
 
     #[test]
     fn unknown_method_errors_and_the_connection_stays_up() {

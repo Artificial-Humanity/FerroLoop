@@ -13,6 +13,7 @@ mod inspect;
 mod layout;
 mod manifest_ops;
 mod migrate;
+mod mq_runtime;
 mod mq_tier;
 mod remote_txn;
 mod retry;
@@ -102,6 +103,10 @@ pub use inspect::{
     VectorCollectionReport, inspect_at,
 };
 pub use migrate::migrate_redb_to_ferrostore;
+pub use mq_runtime::{
+    MQ_MAX_MEMORY_ACKS, MQ_MAX_MEMORY_GROUPS, MQ_MAX_MEMORY_TOPICS, MQ_MAX_NAME_BYTES, MqTelemetry,
+    MqTopicTelemetry,
+};
 pub use mq_tier::{
     MqDurability, MqResourceProbe, MqResourceSnapshot, MqSystemResourceProbe, MqTierDecision,
     MqTierObservation, MqTierPolicy,
@@ -231,6 +236,8 @@ struct SyncSlot {
     notify_in_flight: bool,
     /// Thread that set `notify_in_flight`. Cleared with the flag.
     notify_owner: Option<ThreadId>,
+    /// A remote MQ flush is in flight without an attached client adapter.
+    mq_remote_flush_in_flight: bool,
 }
 
 impl SyncSlot {
@@ -238,7 +245,7 @@ impl SyncSlot {
     /// in neither `pending` nor `synced_seq` until the notify returns, so a check
     /// of `pending` alone would call that window idle.
     fn is_idle(&self) -> bool {
-        self.pending.is_empty() && !self.notify_in_flight
+        self.pending.is_empty() && !self.notify_in_flight && !self.mq_remote_flush_in_flight
     }
 }
 
@@ -1328,6 +1335,8 @@ impl Txn {
 pub struct FerroStore {
     inner: Inner,
     subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
+    mq_runtime: Mutex<mq_runtime::Runtime>,
+    mq_used: AtomicBool,
     /// Named in `NotOwned`: where a lookup looked.
     label: String,
     /// Process memory only. Not part of the `.fls` file.
@@ -1353,6 +1362,24 @@ struct BodyGuard<'a> {
     store: &'a FerroStore,
 }
 
+/// Retains the owner-local transition marker without holding the MQ mutex across I/O or callbacks.
+struct MqBusyGuard<'a>(&'a FerroStore);
+
+impl Drop for MqBusyGuard<'_> {
+    fn drop(&mut self) {
+        lock_mutex(&self.0.mq_runtime).busy = false;
+    }
+}
+
+struct MqRemoteFlushGuard<'a>(&'a FerroStore);
+
+impl Drop for MqRemoteFlushGuard<'_> {
+    fn drop(&mut self) {
+        lock_mutex(&self.0.sync).mq_remote_flush_in_flight = false;
+        self.0.sync_cv.notify_all();
+    }
+}
+
 impl Drop for BodyGuard<'_> {
     fn drop(&mut self) {
         let me = std::thread::current().id();
@@ -1369,6 +1396,8 @@ impl FerroStore {
         Self {
             inner,
             subs: Mutex::new(HashMap::new()),
+            mq_runtime: Mutex::new(mq_runtime::Runtime::default()),
+            mq_used: AtomicBool::new(false),
             label,
             sync: Mutex::new(SyncSlot::default()),
             commit_gate: Mutex::new(()),
@@ -1376,6 +1405,311 @@ impl FerroStore {
             body_threads: Mutex::new(Vec::new()),
             bodies: AtomicUsize::new(0),
         }
+    }
+
+    /// Configure owner-local MQ pressure thresholds and resource probing.
+    /// A connected remote client uses its server's configuration instead. This release has no
+    /// configuration RPC or daemon CLI option; a standalone daemon uses the owner defaults.
+    /// Memory-tier topic, group, acknowledgement and name metadata are separately bounded by
+    /// `MQ_MAX_*` constants; `memory_bytes` counts serialized payload and key bytes, not
+    /// allocator overhead.
+    pub fn configure_mq(
+        &self,
+        policy: MqTierPolicy,
+        evict_on_first_ack: bool,
+        probe: Arc<dyn MqResourceProbe>,
+    ) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
+        if matches!(&self.inner, Inner::Remote(_)) {
+            return Err(backend("configure MQ on the owning store"));
+        }
+        let mut mq = lock_mutex(&self.mq_runtime);
+        if mq.busy {
+            return Err(backend("MQ busy; retry"));
+        }
+        mq.policy = policy;
+        mq.evict_on_first_ack = evict_on_first_ack;
+        mq.probe = probe;
+        Ok(())
+    }
+
+    fn mq_storage_path(&self) -> &Path {
+        match &self.inner {
+            Inner::Disk(disk) => &disk.path,
+            Inner::Memory(_) | Inner::Remote(_) => Path::new("/"),
+        }
+    }
+
+    fn mq_begin(&self) -> Result<MqBusyGuard<'_>, StoreError> {
+        let mut mq = lock_mutex(&self.mq_runtime);
+        if mq.busy {
+            return Err(backend("MQ busy; retry"));
+        }
+        mq.busy = true;
+        Ok(MqBusyGuard(self))
+    }
+
+    fn mq_begin_remote_flush(&self) -> Result<MqRemoteFlushGuard<'_>, StoreError> {
+        self.mq_begin_remote_unadapted()?.ok_or_else(|| {
+            backend(
+                "remote MQ flush with a client SyncAdapter is unsupported; flush through the owner",
+            )
+        })
+    }
+
+    /// Claim an admission made without a client adapter, preventing one from attaching until
+    /// the remote operation completes without holding a mutex through the RPC.
+    fn mq_begin_remote_unadapted(&self) -> Result<Option<MqRemoteFlushGuard<'_>>, StoreError> {
+        let mut sync = lock_mutex(&self.sync);
+        if sync.adapter.is_some() {
+            return Ok(None);
+        }
+        if sync.mq_remote_flush_in_flight {
+            return Err(backend("remote MQ flush busy; retry"));
+        }
+        sync.mq_remote_flush_in_flight = true;
+        Ok(Some(MqRemoteFlushGuard(self)))
+    }
+
+    fn mq_begin_inbound_sync(&self) -> Result<MqBusyGuard<'_>, StoreError> {
+        let mut mq = lock_mutex(&self.mq_runtime);
+        if mq.busy {
+            return Err(backend("MQ busy; retry"));
+        }
+        if mq.topics.values().any(|topic| {
+            topic.high_water > topic.persisted_high_water
+                || !topic.messages.is_empty()
+                || !topic.acks.is_empty()
+        }) {
+            return Err(backend(
+                "buffered MQ work exists; call flush_mq and drain ephemeral messages first",
+            ));
+        }
+        mq.busy = true;
+        Ok(MqBusyGuard(self))
+    }
+
+    fn mq_seed(&self, mq: &mut mq_runtime::Runtime, topic: &str) -> Result<(), StoreError> {
+        if !mq.topics.contains_key(topic) {
+            if topic.len() > MQ_MAX_NAME_BYTES {
+                return Err(backend("MQ topic name exceeds memory-tier limit"));
+            }
+            if mq.topics.len() >= MQ_MAX_MEMORY_TOPICS {
+                let reusable = mq
+                    .topics
+                    .iter()
+                    .find(|(_, state)| {
+                        state.messages.is_empty()
+                            && state.acks.is_empty()
+                            && state.high_water == state.persisted_high_water
+                            && state.spilled_messages_total == 0
+                            && state.acked_in_memory_total == 0
+                    })
+                    .map(|(name, _)| name.clone());
+                if let Some(name) = reusable {
+                    if let Some(removed) = mq.topics.remove(&name) {
+                        mq.groups = mq.groups.saturating_sub(removed.groups.len());
+                    }
+                } else {
+                    return Err(backend(
+                        "MQ memory topic limit reached; flush MQ or use Durable",
+                    ));
+                }
+            }
+            let txn = Txn::new(self.read_state()?);
+            let next = next_mq_seq(&txn, topic)?;
+            mq.topics.insert(
+                topic.to_owned(),
+                mq_runtime::Topic {
+                    high_water: next - 1,
+                    persisted_high_water: next - 1,
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Persist owner-local Adaptive payloads, buffered acknowledgements, and high-water marks.
+    /// This runs without the MQ mutex; the caller retains an `MqBusyGuard` until finalization.
+    fn mq_persist_snapshots(
+        &self,
+        snapshots: &[(String, mq_runtime::Topic)],
+        extra: Option<(&str, &MqRecord)>,
+    ) -> Result<(usize, Option<u64>), StoreError> {
+        let count = snapshots
+            .iter()
+            .map(|(_, state)| {
+                state
+                    .messages
+                    .values()
+                    .filter(|entry| entry.durability == MqDurability::Adaptive)
+                    .count()
+            })
+            .sum();
+        let (_, committed) = self.with_write_outcome(|txn| {
+            for (topic, state) in snapshots {
+                for entry in state.messages.values().filter(|entry| entry.durability == MqDurability::Adaptive) {
+                    txn.put(mq_message_collection(topic), entry.record.seq.to_string(), json!({"seq":entry.record.seq,"key":entry.record.key,"payload":entry.record.payload}));
+                }
+                for (group, seqs) in &state.acks {
+                    for seq in seqs {
+                        txn.put(format!("mq_ack:{topic}:{group}"), seq.to_string(), json!({"seq":seq}));
+                    }
+                }
+                if state.high_water > state.persisted_high_water || !state.acks.is_empty() || state.messages.values().any(|entry| entry.durability == MqDurability::Adaptive) {
+                    let collection = mq_hw_collection(topic);
+                    let existing = match txn.get(&collection, MQ_HIGH_WATER_ID) {
+                        Some(doc) => doc.get("seq").and_then(Value::as_u64).ok_or_else(|| corrupt(format!("mq high-water for {topic} has no seq")))?,
+                        None => 0,
+                    };
+                    txn.put(collection, MQ_HIGH_WATER_ID.to_owned(), json!({"seq":existing.max(state.high_water)}));
+                }
+            }
+            if let Some((topic, record)) = extra {
+                txn.put(mq_message_collection(topic), record.seq.to_string(), json!({"seq":record.seq,"key":record.key,"payload":record.payload}));
+                txn.put(mq_hw_collection(topic), MQ_HIGH_WATER_ID.to_owned(), json!({"seq":record.seq}));
+            }
+            Ok(())
+        })?;
+        Ok((count, committed))
+    }
+
+    fn mq_finalize_snapshots(&self, snapshots: &[(String, mq_runtime::Topic)]) {
+        let mut mq = lock_mutex(&self.mq_runtime);
+        let mut removed_acks = 0usize;
+        for (name, snapshot) in snapshots {
+            if let Some(state) = mq.topics.get_mut(name) {
+                for entry in snapshot
+                    .messages
+                    .values()
+                    .filter(|entry| entry.durability == MqDurability::Adaptive)
+                {
+                    if let Some(removed) = state.messages.remove(&entry.record.seq) {
+                        state.memory_bytes -= removed.bytes;
+                    }
+                    state.spilled_messages_total = state.spilled_messages_total.saturating_add(1);
+                }
+                removed_acks = removed_acks
+                    .saturating_add(state.acks.values().map(|seqs| seqs.len()).sum::<usize>());
+                state.acks.clear();
+                state.persisted_high_water = state.persisted_high_water.max(snapshot.high_water);
+            }
+        }
+        mq.acks = mq.acks.saturating_sub(removed_acks);
+    }
+
+    /// Flush buffered Adaptive messages and ACKs in one transaction. Ephemeral payloads stay in
+    /// memory. An unclean crash can roll back memory-only sequence allocation to the last persisted
+    /// high-water; separate handles and generic MQ document writes are not coordinated.
+    pub fn flush_mq(&self, topic: Option<&str>) -> Result<usize, StoreError> {
+        self.refuse_reentry()?;
+        if let Inner::Remote(remote) = &self.inner {
+            let _claim = self.mq_begin_remote_flush()?;
+            let value = remote.call_req("flush_mq", json!({"topic":topic}))?;
+            let count = value
+                .get("flushed")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| backend("flush_mq result lacks count"))?;
+            return usize::try_from(count).map_err(|_| backend("flush_mq count overflow"));
+        }
+        let _claim = self.mq_begin()?;
+        let snapshots: Vec<_> = {
+            let mq = lock_mutex(&self.mq_runtime);
+            mq.topics
+                .iter()
+                .filter(|(name, _)| topic.is_none_or(|wanted| *name == wanted))
+                .map(|(name, state)| (name.clone(), state.clone()))
+                .collect()
+        };
+        if snapshots.is_empty() {
+            return Ok(0);
+        }
+        let pending = snapshots.iter().any(|(_, state)| {
+            state.high_water > state.persisted_high_water
+                || !state.acks.is_empty()
+                || state
+                    .messages
+                    .values()
+                    .any(|entry| entry.durability == MqDurability::Adaptive)
+        });
+        if !pending {
+            return Ok(0);
+        }
+        let (probe, minimum) = {
+            let mq = lock_mutex(&self.mq_runtime);
+            (Arc::clone(&mq.probe), mq.policy.min_free_disk_bytes)
+        };
+        let resources = probe.probe(self.mq_storage_path());
+        if resources.free_disk_bytes.is_none_or(|free| free <= minimum) {
+            return Err(backend("insufficient disk headroom for MQ flush"));
+        }
+        let result = self.mq_persist_snapshots(&snapshots, None);
+        match result {
+            Ok((count, _)) => {
+                self.mq_finalize_snapshots(&snapshots);
+                Ok(count)
+            }
+            Err(error @ StoreError::Undelivered { .. }) => {
+                self.mq_finalize_snapshots(&snapshots);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Report owner-local memory tiers and the current host resource sample.
+    pub fn mq_telemetry(&self, topic: Option<&str>) -> Result<MqTelemetry, StoreError> {
+        self.refuse_reentry()?;
+        if let Inner::Remote(remote) = &self.inner {
+            let value = remote.call("mq_telemetry", json!({"topic":topic}))?;
+            return serde_json::from_value(value)
+                .map_err(|error| backend(format!("invalid MQ telemetry: {error}")));
+        }
+        let (probe, mut snapshots) = {
+            let mq = lock_mutex(&self.mq_runtime);
+            if mq.busy {
+                return Err(backend("MQ busy; retry"));
+            }
+            (
+                Arc::clone(&mq.probe),
+                mq.topics
+                    .iter()
+                    .filter(|(name, _)| topic.is_none_or(|wanted| *name == wanted))
+                    .map(|(name, state)| (name.clone(), state.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        let state = self.read_state()?;
+        for collection in state.docs.collections() {
+            if let Some(name) = collection
+                .strip_prefix("mq:")
+                .or_else(|| collection.strip_prefix("mq_hw:"))
+                && topic.is_none_or(|wanted| wanted == name)
+            {
+                snapshots.entry(name.to_owned()).or_default();
+            }
+        }
+        let resources = probe.probe(self.mq_storage_path());
+        Ok(MqTelemetry {
+            topics: snapshots
+                .into_iter()
+                .map(|(name, state)| MqTopicTelemetry {
+                    topic: name,
+                    memory_messages: state.messages.len(),
+                    memory_bytes: state.memory_bytes,
+                    spilled_messages_total: state.spilled_messages_total,
+                    acked_in_memory_total: state.acked_in_memory_total,
+                    active_tier: if state.messages.is_empty() {
+                        "disk".into()
+                    } else {
+                        "memory".into()
+                    },
+                    available_ram_bytes: resources.available_ram_bytes,
+                    free_disk_bytes: resources.free_disk_bytes,
+                })
+                .collect(),
+        })
     }
 
     /// The current thread runs a write body on this handle until the guard
@@ -1648,10 +1982,50 @@ impl FerroStore {
     /// nothing.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         self.refuse_reentry()?;
+        if let Inner::Remote(remote) = &self.inner {
+            if lock_mutex(&self.sync).adapter.is_some() {
+                return remote.call_unit("checkpoint", json!({"forbid_mq_flush":true}));
+            }
+            let _claim = self.mq_begin_remote_flush()?;
+            return remote.call_unit("checkpoint", json!({}));
+        }
+        if !matches!(&self.inner, Inner::Remote(_)) && self.mq_used.load(Ordering::Acquire) {
+            self.flush_mq(None)?;
+        }
         match &self.inner {
-            Inner::Remote(remote) => remote.call_unit("checkpoint", json!({})),
+            Inner::Remote(_) => unreachable!("remote checkpoint returned above"),
             Inner::Memory(_) => Ok(()),
             Inner::Disk(disk) => checkpoint_disk(disk),
+        }
+    }
+
+    /// Checkpoint without flushing buffered MQ work; used when a remote client adapter cannot
+    /// reconstruct the resulting flush batch. The retained marker fences concurrent admission.
+    pub(super) fn checkpoint_if_mq_idle(&self) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
+        if matches!(&self.inner, Inner::Remote(_)) {
+            return Err(backend("MQ idle checkpoint must run on the owner"));
+        }
+        let _claim = self.mq_begin()?;
+        {
+            let mq = lock_mutex(&self.mq_runtime);
+            if mq.topics.values().any(|state| {
+                state.high_water > state.persisted_high_water
+                    || !state.acks.is_empty()
+                    || state
+                        .messages
+                        .values()
+                        .any(|entry| entry.durability == MqDurability::Adaptive)
+            }) {
+                return Err(backend(
+                    "buffered MQ work exists; flush on the owner before checkpoint",
+                ));
+            }
+        }
+        match &self.inner {
+            Inner::Memory(_) => Ok(()),
+            Inner::Disk(disk) => checkpoint_disk(disk),
+            Inner::Remote(_) => unreachable!(),
         }
     }
 
@@ -2134,6 +2508,279 @@ impl FerroStore {
         Ok(self.publish_mq_detail(topic, key, payload)?.0)
     }
 
+    /// Publish with an explicit durability hint. Adaptive and Ephemeral buffering belongs to
+    /// this owning handle (or the serving daemon), not independently opened file handles.
+    /// Generic MQ document writes and independent handles are not coordinated with that buffer;
+    /// inbound sync is refused while buffered work can conflict. Ephemeral admission is refused
+    /// when an attached adapter or resource pressure would require persistence.
+    /// A crash may lose buffered payloads and revert its unpersisted sequence high-water.
+    /// `sync_flush` handles adapter commits only; use `flush_mq` to persist earlier buffered work.
+    pub fn publish_mq_with(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: &Value,
+        durability: MqDurability,
+    ) -> Result<u64, StoreError> {
+        Ok(self
+            .publish_mq_with_detail(topic, key, payload, durability)?
+            .0)
+    }
+
+    pub(super) fn publish_mq_with_detail(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: &Value,
+        durability: MqDurability,
+    ) -> Result<(u64, Option<u64>), StoreError> {
+        self.refuse_reentry()?;
+        if durability == MqDurability::Durable {
+            let (seq, commit) = self.publish_mq_detail(topic, key, payload)?;
+            return Ok((seq, Some(commit)));
+        }
+        if let Inner::Remote(remote) = &self.inner {
+            let claim = self.mq_begin_remote_unadapted()?;
+            if claim.is_none() {
+                if durability == MqDurability::Ephemeral {
+                    return Err(backend(
+                        "Ephemeral MQ is unavailable with a client SyncAdapter",
+                    ));
+                }
+                let (seq, commit) = self.publish_mq_detail(topic, key, payload)?;
+                return Ok((seq, Some(commit)));
+            }
+            let _claim = claim;
+            let value = remote.call_req(
+                "publish_mq_v2",
+                json!({"topic":topic,"key":key,"payload":payload,"durability":durability}),
+            )?;
+            let seq = value
+                .get("seq")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| backend("publish_mq result lacks sequence"))?;
+            let store_seq = match value.get("store_seq") {
+                Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| backend("publish_mq store_seq is invalid"))?,
+                ),
+                None => return Err(backend("publish_mq result lacks store_seq")),
+            };
+            if let Some(store_seq) = store_seq {
+                let registered = {
+                    let _gate = lock_mutex(&self.commit_gate);
+                    self.register_committed(
+                        &Committed {
+                            seq: store_seq,
+                            ops: mq_publish_ops(topic, key, payload, seq),
+                        },
+                        false,
+                    )
+                };
+                self.deliver_owned(registered)?;
+            }
+            return Ok((seq, store_seq));
+        }
+
+        // Sample outside all store mutexes: a caller-supplied probe may execute arbitrary code.
+        let probe = { Arc::clone(&lock_mutex(&self.mq_runtime).probe) };
+        let resources = probe.probe(self.mq_storage_path());
+        // The gate orders the first memory admission against an already-started durable publish.
+        let gate = lock_mutex(&self.commit_gate);
+        let sync = lock_mutex(&self.sync);
+        if sync.adapter.is_some() {
+            if durability == MqDurability::Ephemeral {
+                return Err(backend("Ephemeral MQ is unavailable with a SyncAdapter"));
+            }
+            drop(sync);
+            drop(gate);
+            let (seq, commit) = self.publish_mq_detail(topic, key, payload)?;
+            return Ok((seq, Some(commit)));
+        }
+        let mut mq = lock_mutex(&self.mq_runtime);
+        if mq.busy {
+            return Err(backend("MQ busy; retry"));
+        }
+        if !Arc::ptr_eq(&probe, &mq.probe) {
+            return Err(backend("MQ probe changed; retry"));
+        }
+        self.mq_seed(&mut mq, topic)?;
+        let payload_bytes = u64::try_from(
+            serde_json::to_vec(payload)
+                .map_err(|e| backend(e.to_string()))?
+                .len(),
+        )
+        .map_err(|_| backend("MQ payload size overflow"))?;
+        let bytes = u64::try_from(key.len())
+            .ok()
+            .and_then(|size| size.checked_add(payload_bytes))
+            .ok_or_else(|| backend("MQ memory size overflow"))?;
+        let state = mq.topics.get(topic).expect("seeded topic");
+        let seq = state
+            .high_water
+            .checked_add(1)
+            .ok_or_else(|| backend("mq sequence overflow"))?;
+        let projected_bytes = state
+            .memory_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| backend("MQ memory size overflow"))?;
+        let total_messages = mq
+            .topics
+            .values()
+            .try_fold(1usize, |sum, current| {
+                sum.checked_add(current.messages.len())
+            })
+            .ok_or_else(|| backend("MQ memory count overflow"))?;
+        let total_bytes = mq
+            .topics
+            .values()
+            .try_fold(bytes, |sum, current| sum.checked_add(current.memory_bytes))
+            .ok_or_else(|| backend("MQ memory size overflow"))?;
+        let lag = mq
+            .topics
+            .values()
+            .flat_map(|current| {
+                current.messages.values().filter(|entry| {
+                    current.groups.is_empty()
+                        || current.groups.iter().any(|group| {
+                            !current
+                                .acks
+                                .get(group)
+                                .is_some_and(|acks| acks.contains(&entry.record.seq))
+                        })
+                })
+            })
+            .map(|entry| entry.at.elapsed())
+            .max()
+            .unwrap_or_default();
+        let observation = MqTierObservation {
+            memory_messages: total_messages,
+            memory_bytes: total_bytes,
+            oldest_unacked_lag: lag,
+            available_ram_bytes: resources.available_ram_bytes,
+            free_disk_bytes: resources.free_disk_bytes,
+        };
+        let decision = mq.policy.evaluate(&observation);
+        if decision == MqTierDecision::SpillBlocked {
+            return Err(backend("insufficient disk headroom for MQ spill"));
+        }
+        if decision == MqTierDecision::Spill && durability == MqDurability::Ephemeral {
+            let retained: Vec<_> = mq
+                .topics
+                .iter()
+                .flat_map(|(name, current)| {
+                    current.messages.values().filter(move |entry| {
+                        name != topic || entry.durability == MqDurability::Ephemeral
+                    })
+                })
+                .collect();
+            let retained_bytes = retained
+                .iter()
+                .try_fold(bytes, |sum, entry| sum.checked_add(entry.bytes))
+                .ok_or_else(|| backend("MQ memory size overflow"))?;
+            let after_spill = MqTierObservation {
+                memory_messages: retained.len().saturating_add(1),
+                memory_bytes: retained_bytes,
+                oldest_unacked_lag: retained
+                    .iter()
+                    .map(|entry| entry.at.elapsed())
+                    .max()
+                    .unwrap_or_default(),
+                available_ram_bytes: resources.available_ram_bytes,
+                free_disk_bytes: resources.free_disk_bytes,
+            };
+            if mq.policy.evaluate(&after_spill) != MqTierDecision::Memory {
+                return Err(backend(
+                    "Ephemeral MQ memory pressure; retry after consumption",
+                ));
+            }
+        }
+        let record = MqRecord {
+            seq,
+            key: key.to_owned(),
+            payload: payload.clone(),
+        };
+        self.mq_used.store(true, Ordering::Release);
+        if decision == MqTierDecision::Memory {
+            let state = mq.topics.get_mut(topic).expect("seeded topic");
+            state.high_water = seq;
+            state.memory_bytes = projected_bytes;
+            state.messages.insert(
+                seq,
+                mq_runtime::Buffered {
+                    record: record.clone(),
+                    durability,
+                    bytes,
+                    at: std::time::Instant::now(),
+                },
+            );
+            drop(mq);
+            drop(sync);
+            drop(gate);
+            self.notify(topic, &record);
+            return Ok((seq, None));
+        }
+        mq.busy = true;
+        let mut snapshot = mq.topics.get(topic).expect("seeded topic").clone();
+        snapshot.high_water = seq;
+        if durability == MqDurability::Adaptive {
+            snapshot.messages.insert(
+                seq,
+                mq_runtime::Buffered {
+                    record: record.clone(),
+                    durability,
+                    bytes,
+                    at: std::time::Instant::now(),
+                },
+            );
+        }
+        let snapshots = vec![(topic.to_owned(), snapshot)];
+        drop(mq);
+        drop(sync);
+        drop(gate);
+        let _claim = MqBusyGuard(self);
+        let result = self.mq_persist_snapshots(&snapshots, None);
+        let committed = result.is_ok() || matches!(&result, Err(StoreError::Undelivered { .. }));
+        if committed {
+            self.mq_finalize_snapshots(&snapshots);
+            let mut mq = lock_mutex(&self.mq_runtime);
+            let state = mq.topics.get_mut(topic).expect("seeded topic");
+            state.high_water = seq;
+            state.persisted_high_water = seq;
+            if durability == MqDurability::Ephemeral {
+                state.memory_bytes = state
+                    .memory_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| backend("MQ memory size overflow"))?;
+                state.messages.insert(
+                    seq,
+                    mq_runtime::Buffered {
+                        record: record.clone(),
+                        durability,
+                        bytes,
+                        at: std::time::Instant::now(),
+                    },
+                );
+            }
+            drop(mq);
+            self.notify(topic, &record);
+        }
+        result.map(|(_, commit)| {
+            // The spill transaction can persist older Adaptive records and the high-water, but
+            // an Ephemeral candidate itself remains memory-only and has no commit sequence.
+            (
+                seq,
+                if durability == MqDurability::Ephemeral {
+                    None
+                } else {
+                    commit
+                },
+            )
+        })
+    }
+
     /// Message sequence and the store sequence captured under the document lock.
     pub(super) fn publish_mq_detail(
         &self,
@@ -2142,13 +2789,19 @@ impl FerroStore {
         payload: &Value,
     ) -> Result<(u64, u64), StoreError> {
         self.refuse_reentry()?;
+        if !matches!(&self.inner, Inner::Remote(_)) && self.mq_used.load(Ordering::Acquire) {
+            return self.mq_publish_durable_buffered(topic, key, payload, false);
+        }
         if let Inner::Remote(remote) = &self.inner {
             let registered = {
                 let _gate = lock_mutex(&self.commit_gate);
-                let value = remote.call_req(
-                    "publish_mq",
-                    json!({"topic": topic, "key": key, "payload": payload}),
-                )?;
+                let claim = self.mq_begin_remote_unadapted()?;
+                let require_single = claim.is_none();
+                let mut params = json!({"topic": topic, "key": key, "payload": payload});
+                if require_single {
+                    params["require_single_publish"] = Value::Bool(true);
+                }
+                let value = remote.call_req("publish_mq", params)?;
                 let (mq_seq, store_seq) = parse_publish_result(&value)?;
                 let registered = self.register_committed(
                     &Committed {
@@ -2172,6 +2825,9 @@ impl FerroStore {
         // One `with_write`: the message and the high-water share a WAL frame.
         // A crash must not persist either document alone.
         let outcome = self.with_write_outcome(move |txn| {
+            if self.mq_used.load(Ordering::Acquire) {
+                return Err(backend("MQ state changed during durable publish; retry"));
+            }
             let seq = next_mq_seq(txn, &topic_owned)?;
             let record = MqRecord {
                 seq,
@@ -2213,6 +2869,129 @@ impl FerroStore {
         Ok((record.seq, store_seq))
     }
 
+    /// A remote client adapter can reconstruct only one publish's ops, so reject a combined
+    /// buffered spill instead of sending it an incomplete committed batch.
+    pub(super) fn publish_mq_single_detail(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: &Value,
+    ) -> Result<(u64, u64), StoreError> {
+        self.refuse_reentry()?;
+        if matches!(&self.inner, Inner::Remote(_)) {
+            return Err(backend("single publish must run on the MQ owner"));
+        }
+        if self.mq_used.load(Ordering::Acquire) {
+            return self.mq_publish_durable_buffered(topic, key, payload, true);
+        }
+        self.publish_mq_detail(topic, key, payload)
+    }
+
+    fn mq_publish_durable_buffered(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: &Value,
+        require_single: bool,
+    ) -> Result<(u64, u64), StoreError> {
+        let _claim = self.mq_begin()?;
+        if !lock_mutex(&self.mq_runtime).topics.contains_key(topic) {
+            // A Durable-only topic must not consume the bounded memory-tier topic table.
+            let mut staged = None;
+            let result = self.with_write_outcome(|txn| {
+                let seq = next_mq_seq(txn, topic)?;
+                let record = MqRecord {
+                    seq,
+                    key: key.to_owned(),
+                    payload: payload.clone(),
+                };
+                staged = Some(record.clone());
+                txn.put(
+                    mq_message_collection(topic),
+                    seq.to_string(),
+                    json!({"seq":seq,"key":key,"payload":payload}),
+                );
+                txn.put(
+                    mq_hw_collection(topic),
+                    MQ_HIGH_WATER_ID.to_owned(),
+                    json!({"seq":seq}),
+                );
+                Ok(record)
+            });
+            return match result {
+                Ok((record, Some(commit))) => {
+                    self.notify(topic, &record);
+                    Ok((record.seq, commit))
+                }
+                Ok((_, None)) => Err(backend("publish_mq did not commit")),
+                Err(error @ StoreError::Undelivered { .. }) => {
+                    if let Some(record) = staged {
+                        self.notify(topic, &record);
+                    }
+                    Err(error)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let (snapshots, record, probe, minimum, had_pending) = {
+            let mut mq = lock_mutex(&self.mq_runtime);
+            self.mq_seed(&mut mq, topic)?;
+            let state = mq.topics.get(topic).expect("seeded topic");
+            let seq = state
+                .high_water
+                .checked_add(1)
+                .ok_or_else(|| backend("mq sequence overflow"))?;
+            let had_pending = state.high_water > state.persisted_high_water
+                || !state.acks.is_empty()
+                || state
+                    .messages
+                    .values()
+                    .any(|entry| entry.durability == MqDurability::Adaptive);
+            if require_single && had_pending {
+                return Err(backend(
+                    "buffered MQ work exists; flush on the owner before publishing with a client SyncAdapter",
+                ));
+            }
+            let mut snapshot = state.clone();
+            snapshot.high_water = seq;
+            (
+                vec![(topic.to_owned(), snapshot)],
+                MqRecord {
+                    seq,
+                    key: key.to_owned(),
+                    payload: payload.clone(),
+                },
+                Arc::clone(&mq.probe),
+                mq.policy.min_free_disk_bytes,
+                had_pending,
+            )
+        };
+        if had_pending
+            && probe
+                .probe(self.mq_storage_path())
+                .free_disk_bytes
+                .is_none_or(|free| free <= minimum)
+        {
+            return Err(backend("insufficient disk headroom for MQ flush"));
+        }
+        let result = self.mq_persist_snapshots(&snapshots, Some((topic, &record)));
+        let committed = result.is_ok() || matches!(&result, Err(StoreError::Undelivered { .. }));
+        if committed {
+            self.mq_finalize_snapshots(&snapshots);
+            let mut mq = lock_mutex(&self.mq_runtime);
+            let state = mq.topics.get_mut(topic).expect("seeded topic");
+            state.high_water = record.seq;
+            state.persisted_high_water = record.seq;
+            drop(mq);
+            self.notify(topic, &record);
+        }
+        let (_, store_seq) = result?;
+        Ok((
+            record.seq,
+            store_seq.ok_or_else(|| backend("publish_mq did not commit"))?,
+        ))
+    }
+
     /// Oldest messages for `topic` that `group` has not acked, without acking them.
     pub fn poll_mq_group(
         &self,
@@ -2227,12 +3006,60 @@ impl FerroStore {
                 json!({"topic": topic, "group": group, "limit": limit}),
             );
         }
+        if !self.mq_used.load(Ordering::Acquire) {
+            let state = self.read_state()?;
+            return unread_mq(&state, topic, group, limit);
+        }
+        let mut mq = lock_mutex(&self.mq_runtime);
+        if mq.busy {
+            return Err(backend("MQ busy; retry"));
+        }
         let state = self.read_state()?;
-        unread_mq(&state, topic, group, limit)
+        let mut disk = unread_mq(&state, topic, group, limit)?;
+        let new_group = limit > 0
+            && mq.topics.get(topic).is_some_and(|buffer| {
+                !buffer.messages.is_empty() && !buffer.groups.contains(group)
+            });
+        if new_group {
+            if group.len() > MQ_MAX_NAME_BYTES {
+                return Err(backend("MQ group name exceeds memory-tier limit"));
+            }
+            if mq.groups >= MQ_MAX_MEMORY_GROUPS {
+                return Err(backend("MQ memory group limit reached"));
+            }
+            mq.groups += 1;
+        }
+        if let Some(buffer) = mq.topics.get_mut(topic) {
+            if new_group {
+                buffer.groups.insert(group.to_owned());
+            }
+            let persisted_acks = state::acked_seqs(&state, topic, group);
+            let memory_acks = buffer.acks.get(group);
+            for entry in buffer.messages.values() {
+                if !persisted_acks.contains(&entry.record.seq)
+                    && !memory_acks.is_some_and(|acked| acked.contains(&entry.record.seq))
+                {
+                    if disk.iter().any(|record| record.seq == entry.record.seq) {
+                        return Err(backend("MQ sequence appears in both memory and disk"));
+                    }
+                    disk.push(entry.record.clone());
+                }
+            }
+        }
+        disk.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.key.cmp(&b.key)));
+        disk.truncate(limit);
+        Ok(disk)
     }
 
     /// Record an ack. An unknown sequence is still stored.
     pub fn ack_mq(&self, topic: &str, group: &str, seq: u64) -> Result<(), StoreError> {
+        if self.mq_used.load(Ordering::Acquire) || matches!(&self.inner, Inner::Remote(_)) {
+            return self.ack_mq_with_detail(topic, group, seq).map(|_| ());
+        }
+        self.ack_mq_legacy(topic, group, seq)
+    }
+
+    fn ack_mq_legacy(&self, topic: &str, group: &str, seq: u64) -> Result<(), StoreError> {
         let topic = topic.to_string();
         let group = group.to_string();
         self.commit(
@@ -2248,6 +3075,126 @@ impl FerroStore {
             },
             false,
         )
+    }
+
+    pub(super) fn ack_mq_with_detail(
+        &self,
+        topic: &str,
+        group: &str,
+        seq: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        self.refuse_reentry()?;
+        if let Inner::Remote(remote) = &self.inner {
+            let gate = lock_mutex(&self.commit_gate);
+            let claim = self.mq_begin_remote_unadapted()?;
+            if claim.is_none() {
+                drop(gate);
+                self.ack_mq_legacy(topic, group, seq)?;
+                return Ok(None);
+            }
+            let _claim = claim;
+            let response =
+                remote.call_req("ack_mq_v2", json!({"topic":topic,"group":group,"seq":seq}));
+            let value = match response {
+                Ok(value) => value,
+                Err(StoreError::Backend(detail))
+                    if {
+                        let mut text = detail.as_str();
+                        while let Some(inner) = text.strip_prefix("backend failure: ") {
+                            text = inner;
+                        }
+                        text == "no such method `ack_mq_v2`"
+                    } =>
+                {
+                    drop(gate);
+                    self.ack_mq_legacy(topic, group, seq)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+            let store_seq = match value.get("store_seq") {
+                Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .ok_or_else(|| backend("ack_mq_v2 store_seq is invalid"))?,
+                ),
+                None => return Err(backend("ack_mq_v2 result lacks store_seq")),
+            };
+            let registered = store_seq.map(|commit| {
+                self.register_committed(
+                    &Committed {
+                        seq: commit,
+                        ops: vec![Op::Put {
+                            collection: format!("mq_ack:{topic}:{group}"),
+                            id: seq.to_string(),
+                            doc: json!({"seq":seq}),
+                        }],
+                    },
+                    false,
+                )
+            });
+            drop(gate);
+            if let Some(registered) = registered {
+                self.deliver_owned(registered)?;
+            }
+            return Ok(store_seq);
+        }
+        if self.mq_used.load(Ordering::Acquire) {
+            let mut mq = lock_mutex(&self.mq_runtime);
+            if mq.busy {
+                return Err(backend("MQ busy; retry"));
+            }
+            let evict = mq.evict_on_first_ack;
+            let memory_entry = mq
+                .topics
+                .get(topic)
+                .and_then(|state| state.messages.get(&seq))
+                .is_some();
+            if memory_entry {
+                let state = mq.topics.get(topic).expect("memory entry has topic");
+                let new_group = !state.groups.contains(group);
+                let new_ack = !state
+                    .acks
+                    .get(group)
+                    .is_some_and(|acks| acks.contains(&seq));
+                if new_group && group.len() > MQ_MAX_NAME_BYTES {
+                    return Err(backend("MQ group name exceeds memory-tier limit"));
+                }
+                if new_group && mq.groups >= MQ_MAX_MEMORY_GROUPS {
+                    return Err(backend("MQ memory group limit reached"));
+                }
+                if new_ack && mq.acks >= MQ_MAX_MEMORY_ACKS {
+                    return Err(backend("MQ memory ACK limit reached; call flush_mq"));
+                }
+                if new_group {
+                    mq.groups += 1;
+                }
+                if new_ack {
+                    mq.acks += 1;
+                }
+            }
+            if let Some(state) = mq.topics.get_mut(topic)
+                && let Some(entry) = state.messages.get(&seq)
+            {
+                let ephemeral = entry.durability == MqDurability::Ephemeral;
+                state.groups.insert(group.to_owned());
+                if state.acks.entry(group.to_owned()).or_default().insert(seq) {
+                    state.acked_in_memory_total = state.acked_in_memory_total.saturating_add(1);
+                    if evict || ephemeral {
+                        let removed = state.messages.remove(&seq).expect("message exists");
+                        state.memory_bytes -= removed.bytes;
+                    }
+                }
+                return Ok(None);
+            }
+        }
+        let collection = format!("mq_ack:{topic}:{group}");
+        let (_, commit) = self.with_write_outcome(|txn| {
+            txn.put(collection.clone(), seq.to_string(), json!({"seq":seq}));
+            Ok(())
+        })?;
+        Ok(commit)
     }
 
     /// Later publishes on this handle. History is not replayed.
@@ -3099,6 +4046,11 @@ impl FerroStore {
         if batches.is_empty() {
             return Ok(self.synced_seq());
         }
+        let _mq_claim = if matches!(&self.inner, Inner::Remote(_)) {
+            None
+        } else {
+            Some(self.mq_begin_inbound_sync()?)
+        };
         if let Inner::Remote(remote) = &self.inner {
             let seq = {
                 let _gate = lock_mutex(&self.commit_gate);
