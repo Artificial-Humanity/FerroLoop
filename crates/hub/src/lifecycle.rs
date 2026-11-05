@@ -2268,8 +2268,10 @@ pub struct DecommissionResponse {
     pub unregistered: bool,
     pub runtime_stopped: bool,
     /// What the teardown did to the tmux restore source (the newest tmux-resurrect save), so a
-    /// host reboot does not start the stopped session again. `None` unless the teardown stopped
-    /// a whole tmux session. A failure is reported here and never fails the teardown.
+    /// host reboot does not start the stopped session again. The session is pruned only when it
+    /// is not running after the teardown; one that still runs is reported as `running` and left
+    /// alone. `None` when the teardown made no runtime call, and for a Muse window (the shared
+    /// session stays). A failure is reported here and never fails the teardown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_source: Option<crate::restore_source::RestoreSourceOutcome>,
     pub prompt: Option<String>,
@@ -2657,17 +2659,22 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
             let gone = env.runtime.kill(unit, &record.session_id);
             // A whole session that is gone must not come back at the next boot restore. A Muse
             // window is one of several in a shared session that stays, so it is not pruned.
-            if gone && !is_muse_window_target(unit) {
-                restore_source = Some(crate::restore_source::prune_session(
-                    env.home_override,
-                    unit,
-                ));
+            if !is_muse_window_target(unit) {
+                restore_source = Some(prune_restore_source(env, unit));
             }
             // The runtime is gone, so the decommissioned record must not claim it any more.
             record.runtime_spawned &= !gone;
             // A window of the name that is not ours is left running: "nothing of ours to kill"
             // clears the claim, but is not a stopped runtime.
             gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+        }
+        // A session this lifecycle did not start is never killed. When it is not running either,
+        // nothing can save it again, so it is pruned from the restore source all the same.
+        (Some(tmux_target), false)
+            if env.spawn_runtime && !is_muse_window_target(runtime_unit(tmux_target)) =>
+        {
+            restore_source = Some(prune_restore_source(env, runtime_unit(tmux_target)));
+            false
         }
         _ => false,
     };
@@ -2696,6 +2703,21 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         restore_source,
         prompt: None,
     })
+}
+
+/// Prune the tmux session `unit` from the restore source, but only when it is not running: a
+/// running session is saved again by the next resurrect save, so the prune would be undone. The
+/// result says so ([`RestoreSourceOutcome::Running`]); the session is not stopped.
+///
+/// [`RestoreSourceOutcome::Running`]: crate::restore_source::RestoreSourceOutcome::Running
+fn prune_restore_source(
+    env: &LifecycleEnv<'_>,
+    unit: &str,
+) -> crate::restore_source::RestoreSourceOutcome {
+    if env.runtime.exists(unit) {
+        return crate::restore_source::RestoreSourceOutcome::Running;
+    }
+    crate::restore_source::prune_session(env.home_override, unit)
 }
 
 /// `POST /api/v1/hosted-sessions/:id/restart` response: the updated record plus the reforge prompt.
