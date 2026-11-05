@@ -65,12 +65,13 @@ pub use auth::{
     session_state_slug, sha256_hex, try_generate_hex_token,
 };
 pub use discovery::{
-    DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage, SessionQuotaUsage,
-    TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff, WorktreeFileStatus,
-    WorktreeSummary, discover_sessions, discover_sessions_with_home, is_transcript_busy,
-    list_git_worktrees, parse_jsonl_transcript, read_session_context_usage_with_home,
-    read_session_quota_usage_with_home, read_session_transcript, read_session_transcript_with_home,
-    read_worktree_diff, scan_cargo_architecture_conformance, scan_workspace_for_arch,
+    ContextWindowSource, DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage,
+    SessionQuotaUsage, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff,
+    WorktreeFileStatus, WorktreeSummary, discover_sessions, discover_sessions_with_home,
+    is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
+    read_session_context_usage_with_home, read_session_quota_usage_with_home,
+    read_session_transcript, read_session_transcript_with_home, read_worktree_diff,
+    scan_cargo_architecture_conformance, scan_workspace_for_arch,
 };
 pub use nodes::{
     DispatchTask, FederatedTask, TaskFail, TaskResult, dispatch_task, list_node_tasks,
