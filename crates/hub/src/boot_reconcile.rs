@@ -7,10 +7,13 @@
 //!    own session identity (transcript first, see `fl_wire::identity::resolve_persona`).
 //! 2. For every restored pane that runs a vendor CLI, take the persona from the pane's tmux
 //!    session name (never from an inherited `AGENT_PERSONA`), or, in the shared Muse session,
-//!    from the pane's window name. A persona that is not an active
-//!    agent (retired, or not in the registry) gets no route: its route is dropped from the route
-//!    table, and the pane is reported once as a `session.restore_orphan` event. The pane is not
-//!    killed.
+//!    from the pane's window name. A persona that is not an active agent (retired, or not in the
+//!    registry) is reported once as a `session.restore_orphan` event; the pane is not killed.
+//!    Routes are removed for a RETIRED persona only: the route keyed by its name, and any route
+//!    (whatever persona it is keyed to) that names the retired pane (`tmux_pane`) or its window
+//!    (`tmux_target`). Only Grok and Muse routes carry a pane or target; a Codex or Claude route
+//!    cannot be matched to a pane. The hub's registry is not the agent bus's, so a live agent
+//!    that is unknown to the hub keeps its routes and is only reported.
 //! 3. Send each expected agent whose route is live one `system` message, "Host restarted", once
 //!    per boot (see below for who is expected and what live means).
 //!
@@ -51,14 +54,14 @@ use fl_core::state::{
 use fl_core::store::{AgentRegistry, MessageStore, StateStore};
 use fl_core::{VendorRegistry, VendorTransport};
 use fl_exec::stamp;
-use fl_wire::identity::{RouteEntry, RouteTable, normalize_persona};
+use fl_wire::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::HubState;
 use crate::lifecycle::{
     HostedSessionRecord, MUSE_SESSION, STATUS_DECOMMISSIONING, list_hosted_sessions, remove_routes,
-    tmux_stdout, tmux_stdout_of, undeliverable,
+    route_table_paths, tmux_stdout, tmux_stdout_of, undeliverable,
 };
 
 /// Runtime state entry (workspace scope) that holds the boot the hub last reconciled.
@@ -215,6 +218,9 @@ pub(crate) struct Memory {
     /// Test hook: this many sends fail.
     #[cfg(test)]
     pub(crate) fail_sends: u32,
+    /// Test hook: this many store opens for a send fail.
+    #[cfg(test)]
+    pub(crate) fail_send_opens: u32,
 }
 
 pub(crate) fn vendor_binaries() -> Vec<String> {
@@ -300,6 +306,19 @@ fn send_notice<S: MessageStore + AgentRegistry>(store: &S, persona: &str) -> Res
 }
 
 impl Memory {
+    /// Open the store for one send; the error is the send's error.
+    fn open_for_send<'s>(
+        &mut self,
+        state: &'s HubState,
+    ) -> Result<crate::HubStoreGuard<'s>, String> {
+        #[cfg(test)]
+        if self.fail_send_opens > 0 {
+            self.fail_send_opens -= 1;
+            return Err("injected store failure".to_string());
+        }
+        state.open_store().map_err(|e| e.to_string())
+    }
+
     /// Test hook: whether this send is to fail.
     fn take_send_failure(&mut self) -> bool {
         #[cfg(test)]
@@ -340,6 +359,53 @@ fn route_is_live(entry: &RouteEntry, boot_ms: Option<u64>, pane_present: bool) -
         return false;
     }
     pane_present || boot_ms.is_some_and(|boot| entry.updated_at.unix_millis() >= boot)
+}
+
+/// Whether `route` names the tmux pane `pane_id`, or the window `target` (`session:window`) it
+/// lives in. Only the Grok and Muse routes carry a tmux pane or target; a Codex or Claude route
+/// names a conversation or a process and cannot be tied to a pane this way.
+fn route_names_pane(route: &VendorRoute, pane_id: &str, target: &str) -> bool {
+    match route {
+        VendorRoute::Grok {
+            tmux_target,
+            tmux_pane,
+            ..
+        }
+        | VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => {
+            (!pane_id.is_empty() && tmux_pane.as_deref() == Some(pane_id))
+                || tmux_target.as_deref() == Some(target)
+        }
+        _ => false,
+    }
+}
+
+/// Drop every route that names the restored pane `pane` or its window, whatever persona the route
+/// is keyed to: a retired pane's registration can sit under another persona's key. Returns the
+/// count. Holds the hub's route-file lock like [`remove_routes`].
+fn remove_routes_of_pane(home: Option<&Path>, pane: &Pane) -> usize {
+    let target = format!("{}:{}", pane.session, pane.window);
+    crate::discovery::with_route_file_lock(|| {
+        let mut removed = 0;
+        for path in route_table_paths(home) {
+            if !path.is_file() {
+                continue;
+            }
+            let mut table = RouteTable::load(Some(&path));
+            let before = table.entries.len();
+            table
+                .entries
+                .retain(|_, e| !route_names_pane(&e.route, &pane.pane_id, &target));
+            let dropped = before - table.entries.len();
+            if dropped > 0 && table.save(Some(&path)).is_ok() {
+                removed += dropped;
+            }
+        }
+        removed
+    })
 }
 
 /// The expected personas of a new record: the active agents now.
@@ -428,14 +494,19 @@ pub(crate) fn reconcile_pass_with(
                 pane_personas.extend(persona);
                 continue;
             }
-            if let Some(persona) = &persona {
+            // Only a RETIRED persona's routes are removed. The hub's agent registry is not the
+            // agent bus's: a live agent that was never registered with the hub (a lead, the
+            // workspace manager) looks unknown here, and its routes stay. An unknown persona's
+            // pane is reported and nothing more.
+            // TODO(#336 tombstones): a later route scan can find a retired persona's route again
+            // from the running transcript; once the tombstones are on main, drop the route through
+            // them so the scan cannot bring it back.
+            let is_retired = persona.as_deref().is_some_and(retired);
+            if is_retired && let Some(persona) = &persona {
                 remove_routes(home, &[persona.as_str()], &[]);
+                remove_routes_of_pane(home, pane);
             }
-            let reason = if persona.as_deref().is_some_and(retired) {
-                "retired"
-            } else {
-                "unknown"
-            };
+            let reason = if is_retired { "retired" } else { "unknown" };
             let orphan = OrphanPane {
                 session: pane.session.clone(),
                 pane_id: pane.pane_id.clone(),
@@ -500,11 +571,14 @@ pub(crate) fn reconcile_pass_with(
                 report.pending.push(name);
                 continue;
             }
+            // A store that cannot be opened is a failed send of this name only: the name is
+            // rolled back below and the other agents are still processed.
             let sent = if memory.take_send_failure() {
                 Err("injected send failure".to_string())
             } else {
-                let store = state.open_store().map_err(|e| e.to_string())?;
-                send_notice(&*store, &name)
+                memory
+                    .open_for_send(state)
+                    .and_then(|store| send_notice(&*store, &name))
             };
             match sent {
                 Ok(()) => {

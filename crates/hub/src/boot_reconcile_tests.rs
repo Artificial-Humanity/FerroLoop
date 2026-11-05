@@ -1095,3 +1095,196 @@ async fn a_pane_restored_late_is_still_found_and_reported_once() {
         .collect();
     assert_eq!(events.len(), 1, "reported once across the passes");
 }
+
+// Routes of a restored pane are removed for a retired persona only.
+
+impl Fixture {
+    /// A Grok route found just now, keyed to `key`, with the tmux pane and target it names.
+    fn grok_route(&self, key: &str, pane: Option<&str>, target: Option<&str>) {
+        self.put_route(
+            key,
+            VendorRoute::Grok {
+                session_id: format!("grok-{key}"),
+                cwd: None,
+                tmux_target: target.map(Into::into),
+                tmux_pane: pane.map(Into::into),
+            },
+            stamp::now(),
+        );
+    }
+}
+
+#[test]
+fn a_retired_panes_route_under_another_personas_key_is_removed_and_unrelated_routes_stay() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.agent(&state, "Ferris", false);
+    fx.agent(&state, "Fiona", true);
+    // The retired Fiona pane %6 sits registered under Freya's key; Ferris has a pane of his own,
+    // and Fiona has a route of her own key.
+    fx.grok_route("freya", Some("%6"), None);
+    fx.grok_route("ferris", Some("%9"), Some("Ferris:grok"));
+    fx.route("fiona", true);
+    let panes = FakePanes(Some(vec![pane("Fiona", "%6", "codex")]));
+
+    reconcile_pass(&state, &host("boot-a"), &panes).unwrap();
+
+    assert!(
+        !fx.has_route("freya"),
+        "the route that names the retired pane is dropped"
+    );
+    assert!(
+        !fx.has_route("fiona"),
+        "the retired persona's own route is dropped"
+    );
+    assert!(fx.has_route("ferris"), "an unrelated route stays");
+}
+
+#[test]
+fn a_route_that_names_the_retired_panes_window_is_removed_too() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.agent(&state, "Fiona", true);
+    fx.agent(&state, "Ada", true);
+    // The pane id differs (a reboot renumbers panes) but the target is the retired window.
+    fx.grok_route("freya", Some("%1"), Some("Fiona:codex"));
+    fx.put_route(
+        "ferris",
+        VendorRoute::Muse {
+            session_id: "muse-ada".into(),
+            cwd: None,
+            tmux_target: Some("muse:ada".into()),
+            tmux_pane: None,
+        },
+        stamp::now(),
+    );
+    // A Codex route cannot be matched to a pane: it stays.
+    fx.codex_route("ada-codex", stamp::now());
+    let panes = FakePanes(Some(vec![
+        pane("Fiona", "%6", "codex"),
+        muse_pane("ada", "%7"),
+    ]));
+
+    reconcile_pass(&state, &host("boot-a"), &panes).unwrap();
+
+    assert!(!fx.has_route("freya"));
+    assert!(
+        !fx.has_route("ferris"),
+        "a Muse route to the retired window is dropped"
+    );
+    assert!(fx.has_route("ada-codex"));
+}
+
+#[test]
+fn an_unknown_personas_routes_stay_and_it_is_still_reported_a_retired_ones_go() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.agent(&state, "Fiona", true);
+    // Jarvis lives on the agent bus but is not in the hub's registry.
+    fx.route("jarvis", true);
+    fx.grok_route("freya", Some("%7"), None);
+    fx.route("fiona", true);
+    let mut rx = state.subscribe();
+    let panes = FakePanes(Some(vec![
+        pane("Jarvis", "%7", "claude"),
+        pane("Fiona", "%6", "codex"),
+    ]));
+
+    let report = reconcile_pass(&state, &host("boot-a"), &panes).unwrap();
+
+    let reasons: Vec<_> = report
+        .orphans
+        .iter()
+        .map(|o| (o.session.as_str(), o.reason.as_str()))
+        .collect();
+    assert_eq!(reasons, [("Jarvis", "unknown"), ("Fiona", "retired")]);
+    assert!(fx.has_route("jarvis"), "an unknown persona keeps its route");
+    assert!(
+        fx.has_route("freya"),
+        "a route that names an unknown persona's pane is not removed either"
+    );
+    assert!(!fx.has_route("fiona"), "a retired persona loses its route");
+    let reported: Vec<_> = drain(&mut rx)
+        .into_iter()
+        .filter(|f| f.event == "session.restore_orphan")
+        .map(|f| f.data["reason"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(reported, ["unknown", "retired"]);
+}
+
+// A store that cannot be opened for a send is that name's send error.
+
+#[test]
+fn a_store_that_cannot_be_opened_for_a_send_fails_that_name_only() {
+    let fx = Fixture::new();
+    let state = fx.state();
+    fx.agent(&state, "Freya", false);
+    fx.agent(&state, "Ferris", false);
+    fx.route("freya", true);
+    fx.route("ferris", true);
+    let mut memory = Memory {
+        fail_send_opens: 1,
+        ..Memory::default()
+    };
+
+    let first = reconcile_pass_with(&state, &host("boot-a"), &no_panes(), &mut memory)
+        .expect("the pass does not fail");
+    assert_eq!(first.notified.len(), 1, "{first:?}");
+    assert_eq!(first.pending.len(), 1, "{first:?}");
+    let failed = first.pending[0].clone();
+    assert_eq!(
+        fx.epoch(&state)["notified"],
+        serde_json::json!(first.notified),
+        "the failed name was rolled back"
+    );
+    assert!(inbox(&state, &failed).is_empty());
+
+    let second = reconcile_pass_with(&state, &host("boot-a"), &no_panes(), &mut memory).unwrap();
+    assert_eq!(second.notified, std::slice::from_ref(&failed));
+    assert_eq!(inbox(&state, &failed).len(), 1);
+}
+
+// The reconciliation ends with `serve`.
+
+#[tokio::test]
+async fn the_reconciliation_stops_when_the_hub_shuts_down() {
+    use crate::HubServer;
+    let fx = Fixture::new();
+    let asked = Arc::new(AtomicU32::new(0));
+    // Passes forever at a short interval: only a shutdown can end them.
+    let plan = Plan {
+        host: Some(host("boot-a")),
+        panes: Arc::new(CountingPanes(asked.clone())),
+        interval: Duration::from_millis(5),
+        max_passes: u32::MAX,
+        min_window: Duration::from_secs(3600),
+    };
+    let server = HubServer::bind(server_config(&fx))
+        .await
+        .unwrap()
+        .with_boot_reconcile_plan(plan);
+    let stop = server.shutdown_handle();
+    let task = tokio::spawn(server.serve());
+    for _ in 0..200 {
+        if asked.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(asked.load(Ordering::SeqCst) >= 3, "the passes did not run");
+
+    stop.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    // Give an in-flight pass time to end, then the count must stand still.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after = asked.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        after,
+        "passes went on after the shutdown"
+    );
+}

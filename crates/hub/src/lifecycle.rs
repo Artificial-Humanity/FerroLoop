@@ -2019,7 +2019,7 @@ fn deliver_prompt(
 }
 
 /// Route-table files a teardown prunes: the override, or the default and legacy paths.
-fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn route_table_paths(home_override: Option<&Path>) -> Vec<PathBuf> {
     match home_override {
         Some(home) => vec![home.join(".cache").join("agent-bus").join("routes.json")],
         None => std::iter::once(default_routes_path())

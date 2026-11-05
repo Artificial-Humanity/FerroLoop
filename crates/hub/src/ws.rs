@@ -255,8 +255,16 @@ impl HubServer {
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
         if let Some(plan) = boot_reconcile {
-            // Not awaited: the reconciliation never holds up the accept loop.
-            tokio::spawn(crate::boot_reconcile::run(state.clone(), plan));
+            // Not awaited: the reconciliation never holds up the accept loop. It ends with
+            // `serve`: a shutdown stops the passes between two of them.
+            let mut stop = shutdown_rx.clone();
+            let reconcile_state = state.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = crate::boot_reconcile::run(reconcile_state, plan) => {}
+                    _ = stop.wait_for(|down| *down) => {}
+                }
+            });
         }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
