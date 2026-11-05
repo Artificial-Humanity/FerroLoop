@@ -97,3 +97,19 @@ fn codex_turn_schema_pins_input_thread_and_absence_of_step_controls() {
     assert!(!fields.contains_key("maxOutputTokens"));
     assert!(!fields.contains_key("maxSteps"));
 }
+
+#[test]
+fn option_matcher_ignores_prose_and_longer_or_shorter_flags() {
+    let help = "  --max-budget-usd-extra <n>  not the knob\n  Use --max-model-steps to cap work\n  --max-model <n>\n";
+    assert!(!option_present(help, "--max-budget-usd"));
+    assert!(!option_present(help, "--max-model-steps")); // prose, not an option line
+    assert!(option_present(help, "--max-model"));
+    assert!(option_present(
+        "  -b, --max-budget-usd <amount>  cap",
+        "--max-budget-usd"
+    ));
+    assert!(option_present(
+        "      --max-model-steps=<n>",
+        "--max-model-steps"
+    ));
+}
