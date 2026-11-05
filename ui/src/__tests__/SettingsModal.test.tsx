@@ -1336,6 +1336,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     // 0. Top-level category <select> and sub-tab selectors sit inside settings-tab-bar above settings-scroll-body
     const topSelect = screen.getByTestId("settings-tab-select") as HTMLSelectElement;
     expect(topSelect.style.width).toBe("100%");
+    expect(screen.getByTestId("settings-tab-option-agents").textContent).toBe("Agents");
     expect(tabBar).toContainElement(topSelect);
     expect(tabBar).toContainElement(screen.getByTestId("agents-subtab-bar"));
     expect(tabBar).toContainElement(screen.getByTestId("system-subtab-bar"));

@@ -2794,7 +2794,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             }}
           >
             <option value="agents" data-testid="settings-tab-option-agents">
-              {filteredAgents.length} Agents
+              Agents
             </option>
             {!initialProject && (
               <>
