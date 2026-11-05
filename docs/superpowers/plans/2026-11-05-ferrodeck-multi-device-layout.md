@@ -31,20 +31,25 @@ that changes that behavior.
    `mapToPhoneView(tab: CockpitTab | LeftPanelTab): PhoneView`). Test ids: `phone-shell`,
    `phone-top-bar`, `phone-back-btn`, `phone-bottom-nav`, `phone-tab-agents|chat|board|watch|more`,
    `phone-more-sheet`, `phone-more-item-<view>`. `aria-current="page"` on the active tab; the
-   sheet is `role="dialog"` with focus return and Escape to close.
+   sheet is `role="dialog"` with focus return, Escape to close, a Tab and Shift+Tab trap, and
+   `inert` on the background.
 2. `RosterSidebar.tsx`: add `embedded?: boolean`. When true: no backdrop, no `onClose` button, no
-   resize handle, no left-panel tab strip (roster only), in-flow full width. Desktop output is
-   byte-identical when the prop is absent.
+   resize handle, no left-panel tab strip (roster only), in-flow full width. `App` passes neutral
+   open and collapsed values to the embedded roster. Desktop output is byte-identical when the
+   prop is absent.
 3. `App.tsx`: `phoneView` state; a `deviceLayoutRef`; `navigatePhone(tab)`. When the layout is
    `phone`: `handleSelectTab`, `handleSelectLeftPanelTab`, `handleOpenArtifact` call
    `navigatePhone` and return before touching desktop state; roster `onSelectAgent` sets
    `phoneView = "chat"`. Render `PhoneShell` instead of `ContextHeader` + `fd-cockpit-body`.
    Modals (`SettingsModal`, `SpinUpAgentModal`, `HelpDrawer`, and the rest) stay mounted outside
-   the shell. Do not duplicate pane JSX: reuse `renderSecondaryPane` and the existing `ChatPane`
-   element.
+   the shell. Do not duplicate pane JSX: reuse `renderSecondaryPane` (tool panes only) and the
+   single `chatPaneElement`. The unread auto-mark and the Artifacts pane close control read the
+   phone view on the phone, never the desktop state.
 4. `tokens.css`: `.fd-phone-shell` (100dvh grid: auto / 1fr / auto), sticky top bar, bottom nav
    with safe-area padding, 44 px targets, More sheet with backdrop. Remove the phone-only
-   slide-over rules for `.fd-sidebar` that no longer apply.
+   slide-over rules that no longer apply (`.fd-header`, `.fd-three-tier-bar`, `.fd-tier-*`,
+   `.fd-workspace.is-split*` and the right dock rules in the `max-width: 767px` and `480px`
+   blocks).
 5. Tests `PhoneShell.test.tsx`: at 390 × 844 the shell renders and `context-header` /
    `right-split-panel` do not; each bottom tab shows its pane; More sheet lists every tool view
    and each opens its pane with the back button returning to Chat; selecting an agent lands on
@@ -58,21 +63,25 @@ that changes that behavior.
 1. `App.tsx`: derive `tabletMaster = orientation === "portrait" ? "overlay" : "docked"` when the
    layout is `tablet`; add `data-tablet-master` to the cockpit root. Overlay mode: the roster uses
    the existing `isOpen` / backdrop path, width `min(360px, 90vw)`, closes after an agent select
-   and after opening a tool pane. Docked mode: current two-panel behavior, master width clamped
-   to 320–360 px.
+   and after opening a tool pane, but console tabs keep it open. Docked mode: current two-panel
+   behavior, master width clamped to 320–360 px, no left resize handle. The right dock and the
+   master are mutually exclusive only in docked mode; the right dock keeps its resize handle.
 2. `tokens.css`: tablet rules scoped to `[data-device-layout="tablet"]` (44 px targets for tabs,
    roster rows, header buttons; overlay drawer width). No change for other layouts.
 3. Tests `TabletLayout.test.tsx`: 1024 × 768 landscape is `desktop`; 900 × 700 is tablet
    docked; 800 × 1100 is tablet overlay; rotating changes the mode without losing the selected
-   agent; overlay closes after agent select; the right dock still collapses the master.
+   agent; overlay closes after agent select; in docked mode the right dock still collapses the
+   master.
 
 ## Task 4 – Desktop regression and docs
 
 1. Desktop tests: at 1280 × 800 and 1440 × 900 the cockpit has `data-device-layout="desktop"`,
    the three panes render, and no phone or tablet element exists. A 1050 × 800 desktop keeps
    two-panel mutual exclusion.
-2. Help text: if `HelpDrawer.tsx` has a navigation topic, add one line for the phone bottom bar.
-3. Run the full UI suite, `npm run build`, and fix only what this record broke.
+2. Help text: not applicable. `HelpDrawer.tsx` has only per-tab topics, so it gets no phone or
+   tablet line.
+3. The window resize handler acts only on a width change and no longer auto-collapses below 768.
+4. Run the full UI suite, `npm run build`, and fix only what this record broke.
 
 ## Final review
 
