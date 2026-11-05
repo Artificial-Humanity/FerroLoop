@@ -182,6 +182,7 @@ pub(super) const METHODS: &[MethodRule] = &[
     method("ack_mq", Scope::Write, true),
     method("ack_mq_v2", Scope::Write, true),
     method("flush_mq", Scope::Write, true),
+    method("maintain_mq", Scope::Write, true),
     method("create_column_table", Scope::Write, true),
     method("append_column_rows", Scope::Write, true),
     method("create_vector_collection", Scope::Write, true),
@@ -1435,8 +1436,10 @@ mod tests {
         assert!(authorize(Scope::Read, "mq_telemetry").is_ok());
         assert!(authorize(Scope::Read, "flush_mq").is_err());
         assert!(authorize(Scope::Read, "ack_mq_v2").is_err());
+        assert!(authorize(Scope::Read, "maintain_mq").is_err());
         assert!(authorize(Scope::Read, "publish_mq_v2").is_err());
         assert!(authorize(Scope::Write, "flush_mq").unwrap().writes);
+        assert!(authorize(Scope::Write, "maintain_mq").unwrap().writes);
         assert!(authorize(Scope::Write, "ack_mq_v2").unwrap().writes);
         assert!(authorize(Scope::Write, "publish_mq_v2").unwrap().writes);
         assert!(!authorize(Scope::Read, "mq_telemetry").unwrap().writes);

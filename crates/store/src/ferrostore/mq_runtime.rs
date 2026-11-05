@@ -103,6 +103,323 @@ mod tests {
     }
 
     #[test]
+    fn owner_wide_pressure_spills_the_previously_buffered_topic() {
+        let store = FerroStore::in_memory();
+        let policy = MqTierPolicy {
+            max_memory_messages: 2,
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        store
+            .publish_mq_with("a", "first", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        store
+            .publish_mq_with("b", "second", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        let a = store.mq_telemetry(Some("a")).unwrap();
+        assert_eq!(a.topics[0].memory_messages, 0);
+        assert_eq!(store.poll_mq_group("a", "g", 10).unwrap().len(), 1);
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+        assert!(store.get_doc("mq:b", "1").unwrap().is_some());
+        assert_eq!(
+            store.last_seq().unwrap(),
+            1,
+            "both topics spill in one commit"
+        );
+    }
+
+    #[test]
+    fn ephemeral_pressure_spills_adaptive_topics_but_never_persists_ephemeral_payloads() {
+        let store = FerroStore::in_memory();
+        let policy = MqTierPolicy {
+            max_memory_messages: 3,
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        store
+            .publish_mq_with("a", "ephemeral-a", &json!(1), MqDurability::Ephemeral)
+            .unwrap();
+        store
+            .publish_mq_with("b", "adaptive", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        store
+            .publish_mq_with("c", "ephemeral-c", &json!(3), MqDurability::Ephemeral)
+            .unwrap();
+        assert!(store.get_doc("mq:b", "1").unwrap().is_some());
+        assert!(store.get_doc("mq:a", "1").unwrap().is_none());
+        assert!(store.get_doc("mq:c", "1").unwrap().is_none());
+        assert!(
+            store
+                .publish_mq_with("d", "too-many", &json!(4), MqDurability::Ephemeral)
+                .is_err()
+        );
+        assert_eq!(store.poll_mq_group("a", "g", 10).unwrap().len(), 1);
+        assert_eq!(store.poll_mq_group("c", "g", 10).unwrap().len(), 1);
+        let telemetry = store.mq_telemetry(None).unwrap();
+        assert_eq!(
+            telemetry
+                .topics
+                .iter()
+                .map(|t| t.memory_messages)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn blocked_cross_topic_spill_retains_all_prior_messages() {
+        struct Mutable(std::sync::Mutex<MqResourceSnapshot>);
+        impl MqResourceProbe for Mutable {
+            fn probe(&self, _: &Path) -> MqResourceSnapshot {
+                *self.0.lock().unwrap()
+            }
+        }
+        let store = FerroStore::in_memory();
+        let probe = Arc::new(Mutable(std::sync::Mutex::new(MqResourceSnapshot {
+            available_ram_bytes: Some(u64::MAX),
+            free_disk_bytes: Some(u64::MAX),
+        })));
+        let policy = MqTierPolicy {
+            max_memory_messages: 3,
+            ..Default::default()
+        };
+        store.configure_mq(policy, false, probe.clone()).unwrap();
+        store
+            .publish_mq_with("a", "adaptive", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        store
+            .publish_mq_with("b", "ephemeral", &json!(2), MqDurability::Ephemeral)
+            .unwrap();
+        *probe.0.lock().unwrap() = MqResourceSnapshot {
+            available_ram_bytes: Some(u64::MAX),
+            free_disk_bytes: Some(0),
+        };
+        assert!(
+            store
+                .publish_mq_with("c", "blocked", &json!(3), MqDurability::Adaptive)
+                .is_err()
+        );
+        assert_eq!(store.poll_mq_group("a", "g", 10).unwrap().len(), 1);
+        assert_eq!(store.poll_mq_group("b", "g", 10).unwrap().len(), 1);
+        assert!(store.get_doc("mq:a", "1").unwrap().is_none());
+        assert!(store.get_doc("mq:b", "1").unwrap().is_none());
+        assert!(store.poll_mq_group("c", "g", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_expired_work_waits_for_explicit_maintenance_and_reads_do_not_write() {
+        let store = FerroStore::in_memory();
+        let policy = MqTierPolicy {
+            max_memory_lag: Duration::from_secs(1),
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        store
+            .publish_mq_with("a", "first", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        {
+            let mut mq = lock_mutex(&store.mq_runtime);
+            mq.topics
+                .get_mut("a")
+                .unwrap()
+                .messages
+                .get_mut(&1)
+                .unwrap()
+                .at = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap();
+        }
+        let before = store.last_seq().unwrap();
+        assert_eq!(store.poll_mq_group("a", "g", 10).unwrap().len(), 1);
+        assert_eq!(
+            store.mq_telemetry(Some("a")).unwrap().topics[0].memory_messages,
+            1
+        );
+        assert_eq!(store.last_seq().unwrap(), before);
+        assert_eq!(store.maintain_mq().unwrap(), 1);
+        assert_eq!(
+            store.mq_telemetry(Some("a")).unwrap().topics[0].memory_messages,
+            0
+        );
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn polling_an_unseen_group_does_not_mutate_owner_mq_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("s.fls");
+        let store = FerroStore::open(&file).unwrap();
+        store
+            .configure_mq(MqTierPolicy::default(), false, Arc::new(Resources))
+            .unwrap();
+        store
+            .publish_mq_with("a", "first", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let before = store.mq_telemetry(Some("a")).unwrap();
+        let sequence = store.last_seq().unwrap();
+        let wal = wal_length_on_disk(&file);
+        assert_eq!(store.poll_mq_group("a", "new-group", 10).unwrap().len(), 1);
+        assert_eq!(store.mq_telemetry(Some("a")).unwrap(), before);
+        assert_eq!(store.last_seq().unwrap(), sequence);
+        assert_eq!(wal_length_on_disk(&file), wal);
+        let mq = lock_mutex(&store.mq_runtime);
+        assert_eq!(mq.groups, 0);
+        assert!(mq.topics["a"].groups.is_empty());
+    }
+
+    #[test]
+    fn acknowledging_another_topic_maintains_expired_adaptive_work() {
+        let store = FerroStore::in_memory();
+        let policy = MqTierPolicy {
+            max_memory_lag: Duration::from_secs(1),
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        store
+            .publish_mq_with("a", "old", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        store
+            .publish_mq_with("b", "fresh", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        {
+            let mut mq = lock_mutex(&store.mq_runtime);
+            mq.topics
+                .get_mut("a")
+                .unwrap()
+                .messages
+                .get_mut(&1)
+                .unwrap()
+                .at = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap();
+        }
+        store.ack_mq("b", "g", 1).unwrap();
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn durable_ack_also_maintains_expired_adaptive_work() {
+        let store = FerroStore::in_memory();
+        let policy = MqTierPolicy {
+            max_memory_lag: Duration::from_secs(1),
+            ..Default::default()
+        };
+        store
+            .configure_mq(policy, false, Arc::new(Resources))
+            .unwrap();
+        store.publish_mq("disk", "durable", &json!(1)).unwrap();
+        store
+            .publish_mq_with("a", "old", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        {
+            let mut mq = lock_mutex(&store.mq_runtime);
+            mq.topics
+                .get_mut("a")
+                .unwrap()
+                .messages
+                .get_mut(&1)
+                .unwrap()
+                .at = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap();
+        }
+        store.ack_mq("disk", "g", 1).unwrap();
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn maintenance_spills_all_topics_for_low_ram_and_preserves_data_on_low_disk() {
+        struct Mutable(std::sync::Mutex<MqResourceSnapshot>);
+        impl MqResourceProbe for Mutable {
+            fn probe(&self, _: &Path) -> MqResourceSnapshot {
+                *self.0.lock().unwrap()
+            }
+        }
+        let store = FerroStore::in_memory();
+        let probe = Arc::new(Mutable(std::sync::Mutex::new(MqResourceSnapshot {
+            available_ram_bytes: Some(u64::MAX),
+            free_disk_bytes: Some(u64::MAX),
+        })));
+        store
+            .configure_mq(MqTierPolicy::default(), false, probe.clone())
+            .unwrap();
+        store
+            .publish_mq_with("a", "one", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        store
+            .publish_mq_with("b", "two", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        *probe.0.lock().unwrap() = MqResourceSnapshot {
+            available_ram_bytes: Some(0),
+            free_disk_bytes: Some(0),
+        };
+        assert!(store.maintain_mq().is_err());
+        assert_eq!(
+            store.mq_telemetry(Some("a")).unwrap().topics[0].memory_messages,
+            1
+        );
+        assert_eq!(
+            store.mq_telemetry(Some("b")).unwrap().topics[0].memory_messages,
+            1
+        );
+        *probe.0.lock().unwrap() = MqResourceSnapshot {
+            available_ram_bytes: Some(0),
+            free_disk_bytes: Some(u64::MAX),
+        };
+        assert_eq!(store.maintain_mq().unwrap(), 2);
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+        assert!(store.get_doc("mq:b", "1").unwrap().is_some());
+    }
+
+    #[test]
+    fn remote_adapter_receives_exact_owner_batch_after_an_adaptive_flush() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<SyncBatch>>);
+        impl SyncAdapter for Recorder {
+            fn name(&self) -> &str {
+                "recorder"
+            }
+            fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+                self.0.lock().unwrap().push(batch.clone());
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("mq.sock");
+        let owner = FerroStore::in_memory();
+        owner
+            .configure_mq(MqTierPolicy::default(), false, Arc::new(Resources))
+            .unwrap();
+        owner
+            .publish_mq_with("events", "a", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        owner.flush_mq(Some("events")).unwrap();
+        let owner_capture = Arc::new(Recorder::default());
+        owner
+            .attach_sync_adapter(SyncMode::WriteThrough, owner_capture.clone())
+            .unwrap();
+        let _server = FerroStoreServer::bind_unix(&socket, owner).unwrap();
+        let client = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        let client_capture = Arc::new(Recorder::default());
+        client
+            .attach_sync_adapter(SyncMode::WriteThrough, client_capture.clone())
+            .unwrap();
+        assert_eq!(client.publish_mq("events", "b", &json!(2)).unwrap(), 2);
+        assert_eq!(
+            *owner_capture.0.lock().unwrap(),
+            *client_capture.0.lock().unwrap()
+        );
+    }
+
+    #[test]
     fn an_inflight_remote_flush_prevents_racing_adapter_attachment() {
         let store = FerroStore::in_memory();
         let claim = store.mq_begin_remote_flush().unwrap();
@@ -612,8 +929,10 @@ mod tests {
                 .iter()
                 .map(|topic| topic.memory_messages)
                 .sum::<usize>(),
-            2
+            0
         );
+        assert_eq!(store.poll_mq_group("a", "g", 10).unwrap().len(), 1);
+        assert_eq!(store.poll_mq_group("b", "g", 10).unwrap().len(), 1);
         assert_eq!(store.poll_mq_group("c", "g", 10).unwrap().len(), 1);
     }
 
@@ -637,9 +956,16 @@ mod tests {
         store.ack_mq("events", &long, 99).unwrap();
         assert_eq!(store.publish_mq(&long, "k", &json!(2)).unwrap(), 1);
         for n in 0..MQ_MAX_MEMORY_GROUPS {
-            store.poll_mq_group("events", &format!("g{n}"), 1).unwrap();
+            store.ack_mq("events", &format!("g{n}"), 1).unwrap();
         }
-        assert!(store.poll_mq_group("events", "one-too-many", 1).is_err());
+        assert_eq!(
+            store
+                .poll_mq_group("events", "one-too-many", 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.ack_mq("events", "one-too-many", 1).is_err());
     }
 
     #[test]

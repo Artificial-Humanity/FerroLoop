@@ -1184,6 +1184,7 @@ fn dispatch(
             Ok(json!({"store_seq": store_seq}))
         }
         "flush_mq" => Ok(json!({"flushed": store.flush_mq(optional_topic(params)?)?})),
+        "maintain_mq" => Ok(json!({"flushed": store.maintain_mq()?})),
         "mq_telemetry" => serde_json::to_value(store.mq_telemetry(optional_topic(params)?)?)
             .map_err(|error| backend(format!("encode mq telemetry: {error}"))),
         "checkpoint" => {
@@ -2472,6 +2473,112 @@ fn fail_pending(shared: &RemoteShared, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_maintenance_replays_one_spill_for_the_same_request_id() {
+        struct PressureProbe(AtomicBool);
+        impl super::super::MqResourceProbe for PressureProbe {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(if self.0.load(Ordering::SeqCst) {
+                        0
+                    } else {
+                        u64::MAX
+                    }),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let probe = Arc::new(PressureProbe(AtomicBool::new(false)));
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(super::super::MqTierPolicy::default(), false, probe.clone())
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        let published = client
+            .call_req(
+                "publish_mq_v2",
+                json!({"topic":"events","key":"a","payload":1,"durability":"adaptive"}),
+            )
+            .unwrap();
+        assert!(published["store_seq"].is_null());
+        let before = server.store().stats().unwrap().last_seq;
+        probe.0.store(true, Ordering::SeqCst);
+        let request = json!({"req":"01900000000070008000000000000002"});
+        let first = client.call("maintain_mq", request.clone()).unwrap();
+        let again = client.call("maintain_mq", request).unwrap();
+        assert_eq!(first, json!({"flushed":1}));
+        assert_eq!(again, first);
+        assert_eq!(server.store().stats().unwrap().last_seq, before + 1);
+        assert_eq!(
+            client
+                .call(
+                    "poll_mq_group",
+                    json!({"topic":"events","group":"g","limit":10})
+                )
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remote_adapter_cannot_maintain_another_clients_buffered_work() {
+        struct Probe(AtomicBool);
+        impl super::super::MqResourceProbe for Probe {
+            fn probe(&self, _: &Path) -> super::super::MqResourceSnapshot {
+                super::super::MqResourceSnapshot {
+                    available_ram_bytes: Some(if self.0.load(Ordering::SeqCst) {
+                        0
+                    } else {
+                        u64::MAX
+                    }),
+                    free_disk_bytes: Some(u64::MAX),
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Sink(AtomicUsize);
+        impl super::super::SyncAdapter for Sink {
+            fn name(&self) -> &str {
+                "maintenance-test"
+            }
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), StoreError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("queue.sock");
+        let probe = Arc::new(Probe(AtomicBool::new(false)));
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(super::super::MqTierPolicy::default(), false, probe.clone())
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&sock, store).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let sender = FerroStore::connect_uri(&uri).unwrap();
+        let adapter_client = FerroStore::connect_uri(&uri).unwrap();
+        let adapter = Arc::new(Sink::default());
+        adapter_client
+            .attach_sync_adapter(super::super::SyncMode::WriteThrough, adapter.clone())
+            .unwrap();
+        let seq = sender
+            .publish_mq_with("events", "a", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let before = server.store().stats().unwrap().last_seq;
+        probe.0.store(true, Ordering::SeqCst);
+        assert!(adapter_client.maintain_mq().is_err());
+        assert_eq!(server.store().stats().unwrap().last_seq, before);
+        assert_eq!(adapter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(sender.poll_mq_group("events", "g", 10).unwrap()[0].seq, seq);
+        assert_eq!(sender.maintain_mq().unwrap(), 1);
+    }
 
     #[test]
     fn legacy_publish_rpc_accepts_optional_durability_without_changing_default_response() {

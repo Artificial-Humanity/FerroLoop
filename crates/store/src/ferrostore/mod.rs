@@ -1599,6 +1599,96 @@ impl FerroStore {
         mq.acks = mq.acks.saturating_sub(removed_acks);
     }
 
+    /// Opportunistically spill Adaptive work when owner-wide pressure crosses a watermark.
+    /// Reads never call this method; callers can explicitly request maintenance on idle queues.
+    pub fn maintain_mq(&self) -> Result<usize, StoreError> {
+        self.refuse_reentry()?;
+        if let Inner::Remote(remote) = &self.inner {
+            let _claim = self.mq_begin_remote_flush()?;
+            let value = remote.call_req("maintain_mq", json!({}))?;
+            let count = value
+                .get("flushed")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| backend("maintain_mq result lacks count"))?;
+            return usize::try_from(count).map_err(|_| backend("maintain_mq count overflow"));
+        }
+        // Preserve the existing Durable-only path without probing host resources.
+        if !self.mq_used.load(Ordering::Acquire) {
+            return Ok(0);
+        }
+        let _claim = self.mq_begin()?;
+        let (probe, policy, snapshots, messages, bytes, lag) = {
+            let mq = lock_mutex(&self.mq_runtime);
+            let snapshots: Vec<_> = mq
+                .topics
+                .iter()
+                .filter(|(_, state)| {
+                    state
+                        .messages
+                        .values()
+                        .any(|entry| entry.durability == MqDurability::Adaptive)
+                })
+                .map(|(topic, state)| (topic.clone(), state.clone()))
+                .collect();
+            if snapshots.is_empty() {
+                return Ok(0);
+            }
+            let messages = mq
+                .topics
+                .values()
+                .try_fold(0usize, |sum, state| sum.checked_add(state.messages.len()))
+                .ok_or_else(|| backend("MQ memory count overflow"))?;
+            let bytes = mq
+                .topics
+                .values()
+                .try_fold(0u64, |sum, state| sum.checked_add(state.memory_bytes))
+                .ok_or_else(|| backend("MQ memory size overflow"))?;
+            // Consumer groups are open-ended, so any retained record can still be
+            // unacknowledged by a later group. Polls need not mutate group metadata.
+            let lag = mq
+                .topics
+                .values()
+                .flat_map(|state| state.messages.values())
+                .map(|entry| entry.at.elapsed())
+                .max()
+                .unwrap_or_default();
+            (
+                Arc::clone(&mq.probe),
+                mq.policy,
+                snapshots,
+                messages,
+                bytes,
+                lag,
+            )
+        };
+        let resources = probe.probe(self.mq_storage_path());
+        let observation = MqTierObservation {
+            memory_messages: messages,
+            memory_bytes: bytes,
+            oldest_unacked_lag: lag,
+            available_ram_bytes: resources.available_ram_bytes,
+            free_disk_bytes: resources.free_disk_bytes,
+        };
+        match policy.evaluate(&observation) {
+            MqTierDecision::Memory => return Ok(0),
+            MqTierDecision::SpillBlocked => {
+                return Err(backend("insufficient disk headroom for MQ maintenance"));
+            }
+            MqTierDecision::Spill => {}
+        }
+        match self.mq_persist_snapshots(&snapshots, None) {
+            Ok((count, _)) => {
+                self.mq_finalize_snapshots(&snapshots);
+                Ok(count)
+            }
+            Err(error @ StoreError::Undelivered { .. }) => {
+                self.mq_finalize_snapshots(&snapshots);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Flush buffered Adaptive messages and ACKs in one transaction. Ephemeral payloads stay in
     /// memory. An unclean crash can roll back memory-only sequence allocation to the last persisted
     /// high-water; separate handles and generic MQ document writes are not coordinated.
@@ -2641,17 +2731,7 @@ impl FerroStore {
         let lag = mq
             .topics
             .values()
-            .flat_map(|current| {
-                current.messages.values().filter(|entry| {
-                    current.groups.is_empty()
-                        || current.groups.iter().any(|group| {
-                            !current
-                                .acks
-                                .get(group)
-                                .is_some_and(|acks| acks.contains(&entry.record.seq))
-                        })
-                })
-            })
+            .flat_map(|current| current.messages.values())
             .map(|entry| entry.at.elapsed())
             .max()
             .unwrap_or_default();
@@ -2669,11 +2749,12 @@ impl FerroStore {
         if decision == MqTierDecision::Spill && durability == MqDurability::Ephemeral {
             let retained: Vec<_> = mq
                 .topics
-                .iter()
-                .flat_map(|(name, current)| {
-                    current.messages.values().filter(move |entry| {
-                        name != topic || entry.durability == MqDurability::Ephemeral
-                    })
+                .values()
+                .flat_map(|current| {
+                    current
+                        .messages
+                        .values()
+                        .filter(|entry| entry.durability == MqDurability::Ephemeral)
                 })
                 .collect();
             let retained_bytes = retained
@@ -2723,7 +2804,25 @@ impl FerroStore {
             return Ok((seq, None));
         }
         mq.busy = true;
-        let mut snapshot = mq.topics.get(topic).expect("seeded topic").clone();
+        // The decision is owner-wide, so persist all affected Adaptive topics in one
+        // transaction instead of leaving the topic that caused pressure in memory.
+        let mut snapshots: Vec<_> = mq
+            .topics
+            .iter()
+            .filter(|(name, current)| {
+                *name == topic
+                    || current
+                        .messages
+                        .values()
+                        .any(|entry| entry.durability == MqDurability::Adaptive)
+            })
+            .map(|(name, current)| (name.clone(), current.clone()))
+            .collect();
+        let snapshot = &mut snapshots
+            .iter_mut()
+            .find(|(name, _)| name == topic)
+            .expect("seeded topic")
+            .1;
         snapshot.high_water = seq;
         if durability == MqDurability::Adaptive {
             snapshot.messages.insert(
@@ -2736,7 +2835,6 @@ impl FerroStore {
                 },
             );
         }
-        let snapshots = vec![(topic.to_owned(), snapshot)];
         drop(mq);
         drop(sync);
         drop(gate);
@@ -2974,10 +3072,18 @@ impl FerroStore {
         {
             return Err(backend("insufficient disk headroom for MQ flush"));
         }
-        let result = self.mq_persist_snapshots(&snapshots, Some((topic, &record)));
+        // A remote client adapter reconstructs exactly the legacy publish pair. A clean topic
+        // needs no snapshot high-water write ahead of that pair.
+        let result = if require_single {
+            self.mq_persist_snapshots(&[], Some((topic, &record)))
+        } else {
+            self.mq_persist_snapshots(&snapshots, Some((topic, &record)))
+        };
         let committed = result.is_ok() || matches!(&result, Err(StoreError::Undelivered { .. }));
         if committed {
-            self.mq_finalize_snapshots(&snapshots);
+            if !require_single {
+                self.mq_finalize_snapshots(&snapshots);
+            }
             let mut mq = lock_mutex(&self.mq_runtime);
             let state = mq.topics.get_mut(topic).expect("seeded topic");
             state.high_water = record.seq;
@@ -3010,29 +3116,13 @@ impl FerroStore {
             let state = self.read_state()?;
             return unread_mq(&state, topic, group, limit);
         }
-        let mut mq = lock_mutex(&self.mq_runtime);
+        let mq = lock_mutex(&self.mq_runtime);
         if mq.busy {
             return Err(backend("MQ busy; retry"));
         }
         let state = self.read_state()?;
         let mut disk = unread_mq(&state, topic, group, limit)?;
-        let new_group = limit > 0
-            && mq.topics.get(topic).is_some_and(|buffer| {
-                !buffer.messages.is_empty() && !buffer.groups.contains(group)
-            });
-        if new_group {
-            if group.len() > MQ_MAX_NAME_BYTES {
-                return Err(backend("MQ group name exceeds memory-tier limit"));
-            }
-            if mq.groups >= MQ_MAX_MEMORY_GROUPS {
-                return Err(backend("MQ memory group limit reached"));
-            }
-            mq.groups += 1;
-        }
-        if let Some(buffer) = mq.topics.get_mut(topic) {
-            if new_group {
-                buffer.groups.insert(group.to_owned());
-            }
+        if let Some(buffer) = mq.topics.get(topic) {
             let persisted_acks = state::acked_seqs(&state, topic, group);
             let memory_acks = buffer.acks.get(group);
             for entry in buffer.messages.values() {
@@ -3186,6 +3276,13 @@ impl FerroStore {
                         state.memory_bytes -= removed.bytes;
                     }
                 }
+                // The ACK is already accepted in memory. Opportunistic maintenance happens
+                // only after releasing the MQ mutex; a pressure/probe failure must not undo
+                // the ACK or prevent consumers from reducing memory pressure.
+                drop(mq);
+                if let Err(error @ StoreError::Undelivered { .. }) = self.maintain_mq() {
+                    return Err(error);
+                }
                 return Ok(None);
             }
         }
@@ -3194,6 +3291,12 @@ impl FerroStore {
             txn.put(collection.clone(), seq.to_string(), json!({"seq":seq}));
             Ok(())
         })?;
+        // The durable ACK has already committed. A best-effort maintenance failure cannot
+        // undo that ACK; retain buffered work for an explicit retry, except that a committed
+        // spill whose sync delivery failed must report its Undelivered receipt.
+        if let Err(error @ StoreError::Undelivered { .. }) = self.maintain_mq() {
+            return Err(error);
+        }
         Ok(commit)
     }
 
