@@ -11,8 +11,9 @@ hard-coded canonical list, and a new project needs the CLI. Feira builds the bac
 
 Feira builds the endpoints on `feira/project-init-and-workspace-agents-310`. This is the contract
 the Lead shared on 2026-11-05. It is isolated in `ui/src/types/api.ts` and `HubApiClient`, so a
-change touches only those two files and the tab. **Confirm against Feira's merged handlers
-before the PR.**
+change touches only those two files and the tab. **Verified against Feira's branch
+`feira/project-init-and-workspace-agents-310` at f1a7fb1 (2026-11-05); re-check once it is
+merged.**
 
 ```ts
 type ProjectKind = "project" | "virtual";
@@ -20,9 +21,9 @@ type ProjectKind = "project" | "virtual";
 interface ProjectSummary {            // GET list entry; POST and PATCH response body
   slug: string;
   id: string;                         // equal to slug
-  artifacts_dir: string | null;
-  default_artifacts_dir: string;
-  effective_artifacts_dir: string;
+  artifacts_dir: string | null;       // all three are null for a virtual group
+  default_artifacts_dir: string | null;
+  effective_artifacts_dir: string | null;
   name: string;
   kind: ProjectKind;
   path: string | null;                // null for a virtual group
@@ -35,12 +36,13 @@ interface ProjectSummary {            // GET list entry; POST and PATCH response
 
 interface CreateProjectRequest {
   name: string; slug?: string; kind: ProjectKind;
-  path?: string | null; purpose?: string; git_init?: boolean;
-  github?: string | null; credential?: "app" | "env";
+  path?: string; purpose?: string; git_init?: boolean;
+  github?: string; credential?: "app" | "env";
 }
 interface UpdateProjectRequest {
-  name?: string; purpose?: string; path?: string | null;
-  github?: string | null; credential?: "app" | "env";
+  name?: string; purpose?: string; path?: string;
+  github?: string;   // "" clears the tracker; never send `credential` with it (JSON null reads as omitted)
+  credential?: "app" | "env";
 }
 interface DeleteProjectRequest {
   reassign_to?: string | null; decommission_agents?: boolean;
@@ -49,6 +51,7 @@ interface DeleteProjectRequest {
 interface DeleteProjectResponse {
   deleted: string; reassigned_agents: number; decommissioned_agents: number;
   store_deleted: boolean; dir_deleted: boolean;
+  error?: string;   // set only when the store files or directory could not be deleted AFTER unregistering
 }
 // DELETE answers 409 { error, active_agent_count, active_agents: string[] } when active agents
 // exist and neither reassign_to nor decommission_agents is set.
@@ -63,7 +66,8 @@ interface DeleteProjectResponse {
   (including the create and edit replies, which are merged in at once), and otherwise from the
   separate artifacts-dir list fetched when Settings opens. There is no per-entry
   `GET /api/v1/projects/:id/artifacts-dir` fallback. The create form has no
-  artifacts-directory field; the card sets it after creation.
+  artifacts-directory field; the card sets it after creation. A virtual group has no artifacts
+  directory (the hub sends explicit `null` values), so its card has no artifacts row.
 * The path is editable on `PATCH`. Changing it is a Directory Project action only, and the edit
   form warns that the registered directory changes while files stay where they are.
 
@@ -73,7 +77,8 @@ interface DeleteProjectResponse {
   tab strip. It is hidden in project-scoped Settings (`initialProject` set), like System.
 * **List.** One card per entry: name, slug badge, kind badge (`Project` or `Virtual Group`),
   `Git` badge when `has_git`, purpose, directory path (`Workspace Root` for a virtual group),
-  GitHub tracker, artifacts directory with the existing change flow, active agent count, and the
+  GitHub tracker, store path (`store_path`, when the project has one), artifacts directory with
+  the existing change flow (not for a virtual group), active agent count, and the
   actions `Edit`, `View Agents`, `Delete`.
 * **Artifacts directory.** The per-project row moves from the Agents tab into each card. The
   change-directory modal and its handlers are reused, not rewritten. The system-level row stays
@@ -89,7 +94,10 @@ interface DeleteProjectResponse {
   agents to another entry, or decommission them first. The confirm button stays disabled until a
   choice is made. For a directory project two checkboxes, both off: delete the FerroStore
   database (`<slug>.fls`) and delete the project directory (`<path>`, with a warning badge when
-  checked). The dialog says that unchecked, delete only unregisters the entry.
+  checked). The dialog says that unchecked, delete only unregisters the entry. When the reply carries
+  `error`, the project is already unregistered but cleanup failed: the tab shows a warning
+  (`role="alert"`) with the server text and which parts were deleted (`store_deleted`,
+  `dir_deleted`).
 * **View Agents.** Switches to the Agents tab with the project filter set to that entry.
 * **Switcher, roster, Spin-Up.** After a create, edit or delete the shared project list refreshes,
   so the Project switcher, the roster groups and the Spin-Up project dropdown include virtual

@@ -98,8 +98,10 @@ function EditProjectForm({
   if (isProject) {
     if (trimmedPath !== originalPath) body.path = trimmedPath;
     if (trimmedGithub !== originalGithub) {
-      body.github = trimmedGithub === "" ? null : trimmedGithub;
-      // A new tracker always names its credential; clearing needs none.
+      // An empty string clears the tracker (null would read as omitted); the
+      // hub rejects a clear that also names a credential.
+      body.github = trimmedGithub;
+      // A new tracker always names its credential; clearing sends none.
       if (trimmedGithub !== "" && originalGithub === "")
         body.credential = credential;
     }

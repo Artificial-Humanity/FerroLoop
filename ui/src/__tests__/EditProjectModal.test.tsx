@@ -170,12 +170,12 @@ describe("EditProjectModal", () => {
     expect(update).toHaveBeenCalledWith("alpha", { credential: "env" });
   });
 
-  it("clearing the tracker sends github: null and nothing else", async () => {
+  it("clearing the tracker sends an empty github and nothing else", async () => {
     const { update } = setup();
     type("edit-project-github", "");
     expect(screen.queryByTestId("edit-project-credential")).toBeNull();
     await save();
-    expect(update).toHaveBeenCalledWith("alpha", { github: null });
+    expect(update).toHaveBeenCalledWith("alpha", { github: "" });
   });
 
   it("adding a tracker sends the repo with its credential", async () => {

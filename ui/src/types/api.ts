@@ -288,15 +288,17 @@ export interface CreateProjectRequest {
   path?: string | null;
   purpose?: string;
   git_init?: boolean;
-  github?: string | null;
+  /** Tracker repo, `owner/name`. Omit for none. */
+  github?: string;
   credential?: "app" | "env";
 }
 
 export interface UpdateProjectRequest {
   name?: string;
   purpose?: string;
-  path?: string | null;
-  github?: string | null;
+  path?: string;
+  /** Tracker repo, `owner/name`; `""` clears the tracker on update (never send `credential` with it). */
+  github?: string;
   credential?: "app" | "env";
 }
 

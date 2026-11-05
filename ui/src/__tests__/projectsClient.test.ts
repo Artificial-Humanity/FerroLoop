@@ -200,14 +200,14 @@ describe("HubApiClient projects", () => {
     const { client, calls } = makeClient(() => json(FULL));
     const out = await client.updateProject("ferro", {
       purpose: "New",
-      github: null,
+      github: "",
     });
     expect(out).toEqual(FULL);
     expect(calls[0].url).toBe("http://hub.test/api/v1/projects/ferro");
     expect(calls[0].init?.method).toBe("PATCH");
     expect(JSON.parse(String(calls[0].init?.body))).toEqual({
       purpose: "New",
-      github: null,
+      github: "",
     });
     expect(new Headers(calls[0].init?.headers).get("Content-Type")).toBe(
       "application/json",

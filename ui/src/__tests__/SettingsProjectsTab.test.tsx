@@ -686,7 +686,7 @@ describe("Settings Projects tab", () => {
       expect(onProjectsChanged).toHaveBeenCalledTimes(1);
     });
 
-    it("clearing the tracker sends github: null", async () => {
+    it("clearing the tracker sends an empty github string", async () => {
       const { client, calls } = makeClient(
         [PLAIN, GIT, GROUP],
         patchHandler("ferroloop", (b) => ({ ...GIT, tracker: null, ...b }) as ProjectSummary),
@@ -700,7 +700,7 @@ describe("Settings Projects tab", () => {
       await act(async () => {
         fireEvent.click(screen.getByTestId("edit-project-submit"));
       });
-      expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ github: null });
+      expect(calls.find((c) => c.method === "PATCH")?.body).toEqual({ github: "" });
       expect(screen.getByTestId("settings-project-card-ferroloop")).not.toHaveTextContent(
         "acme/ferroloop",
       );
