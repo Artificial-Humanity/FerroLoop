@@ -1,24 +1,31 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
 import {
   formatModelOptionLabel,
   getVendorModelOptions,
 } from "./ChatPane";
+import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
 import type {
   EnrolledNode,
+  ProjectSummary,
   SpinUpSessionRequest,
   SpinUpSessionResponse,
 } from "../types/api";
 
-export const SPIN_UP_PROJECTS = [
-  { value: "ferroloop", label: "ferroloop (FerroLoop)" },
-  { value: "kaggle-gemma4", label: "kaggle-gemma4 (Kaggle-Gemma4)" },
-  { value: "sonora", label: "sonora (Sonora)" },
-  { value: "lucida", label: "lucida (Lucida)" },
-  { value: "prosodia", label: "prosodia (Prosodia)" },
-  { value: "website", label: "website (ArtificialHumanity.io)" },
-  { value: "ai-lab-amd", label: "ai-lab-amd (AI-Lab-AMD)" },
-] as const;
+export interface SpinUpProjectOption {
+  value: string;
+  label: string;
+}
+
+/** Spin-Up dropdown options for a project list: the slug is what is sent. */
+export function spinUpProjectOptions(
+  projects: readonly ProjectSummary[],
+): SpinUpProjectOption[] {
+  return projects.map((p) => {
+    const value = p.slug.trim().toLowerCase();
+    return { value, label: `${value} (${projectLabel(p)})` };
+  });
+}
 
 export const SPIN_UP_ROLES = [
   { value: "assistant", label: "assistant (Assisting Engineer)" },
@@ -46,21 +53,31 @@ export interface SpinUpAgentModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialProject?: string | null;
+  /** The shared project list for the Project dropdown. Defaults to the built-in list. */
+  projects?: readonly ProjectSummary[];
   nodes?: EnrolledNode[];
   onSpinUp?: (req: SpinUpSessionRequest) => Promise<SpinUpSessionResponse>;
   onSpunUp?: (res: SpinUpSessionResponse) => void;
   apiClient?: HubApiClient;
 }
 
-export function resolveSpinUpProject(rawProject?: string | null): string {
+export function resolveSpinUpProject(
+  rawProject?: string | null,
+  projects: readonly ProjectSummary[] = FALLBACK_PROJECTS,
+): string {
+  const options = spinUpProjectOptions(projects);
+  // The default is ferroloop, or the first listed project when the list has no ferroloop.
+  const fallback = options.some((o) => o.value === "ferroloop")
+    ? "ferroloop"
+    : (options[0]?.value ?? "ferroloop");
   const trimmed = (rawProject ?? "").trim().toLowerCase();
   if (!trimmed || trimmed === "all") {
-    return "ferroloop";
+    return fallback;
   }
-  const matched = SPIN_UP_PROJECTS.find(
-    (p) => p.value === trimmed || p.label.toLowerCase().includes(trimmed),
-  );
-  return matched ? matched.value : "ferroloop";
+  const matched =
+    options.find((p) => p.value === trimmed) ??
+    options.find((p) => p.label.toLowerCase().includes(trimmed));
+  return matched ? matched.value : fallback;
 }
 
 // Record #87: Worktree Policy, Bootstrap (.fl/worktree.toml) & Conflict-Free Port Allocation
@@ -802,6 +819,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   isOpen,
   onClose,
   initialProject = null,
+  projects = FALLBACK_PROJECTS,
   nodes = [],
   onSpinUp,
   onSpunUp,
@@ -809,8 +827,11 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
 }) => {
   const [persona, setPersona] = useState("");
   const [project, setProject] = useState<string>(() =>
-    resolveSpinUpProject(initialProject),
+    resolveSpinUpProject(initialProject, projects),
   );
+  // Latest list for the reset effect, which must not rerun when the list refreshes.
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
   const [role, setRole] = useState<string>("assistant");
   const [vendor, setVendor] = useState<string>("claude");
   const [model, setModel] = useState("");
@@ -841,7 +862,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      setProject(resolveSpinUpProject(initialProject));
+      setProject(resolveSpinUpProject(initialProject, projectsRef.current));
       setWorktreePolicyTouched(false);
       setPermissionsTouched(false);
     }
@@ -861,6 +882,12 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
 
   if (!isOpen) {
     return null;
+  }
+
+  const projectDropdownOptions = spinUpProjectOptions(projects);
+  if (!projectDropdownOptions.some((o) => o.value === project)) {
+    // The selected project (a deleted one, or an empty list) stays selectable.
+    projectDropdownOptions.unshift({ value: project, label: project });
   }
 
   const nodeOptions = Array.from(
@@ -1063,7 +1090,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 disabled={submitting}
                 style={{ width: "100%" }}
               >
-                {SPIN_UP_PROJECTS.map((proj) => (
+                {projectDropdownOptions.map((proj) => (
                   <option key={proj.value} value={proj.value}>
                     {proj.label}
                   </option>

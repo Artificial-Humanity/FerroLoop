@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
 import { formatCurrencyFromUsd, useActiveCurrency } from "../lib/currency";
+import { FALLBACK_PROJECTS } from "../hooks/useProjects";
 import type {
   ProjectRecordItem,
+  ProjectSummary,
   RecordState,
   RecordsBoardSummary,
 } from "../types/api";
@@ -10,17 +12,9 @@ import type {
 export interface RecordsBoardPaneProps {
   selectedProject?: string | null;
   apiClient?: HubApiClient;
+  /** The shared project list for the project select. Defaults to the built-in list. */
+  projects?: readonly ProjectSummary[];
 }
-
-const DEFAULT_PROJECTS = [
-  "ferroloop",
-  "sonora",
-  "prosodia",
-  "lucida",
-  "kaggle-gemma4",
-  "ai-lab-amd",
-  "website",
-];
 
 export const BOARD_BUCKET_STORAGE_KEY = "ferrodeck.records_board.selected_bucket";
 
@@ -76,6 +70,7 @@ function computeSummaryFromRecords(
 
 export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   selectedProject,
+  projects = FALLBACK_PROJECTS,
   apiClient: providedClient,
 }) => {
   const apiClient = useMemo(
@@ -89,8 +84,11 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
       ? selectedProject.trim().toLowerCase()
       : "ferroloop",
   );
-  const [availableProjects, setAvailableProjects] =
-    useState<string[]>(DEFAULT_PROJECTS);
+  const listedProjects = useMemo(
+    () => projects.map((p) => p.slug.trim().toLowerCase()),
+    [projects],
+  );
+  const [availableProjects, setAvailableProjects] = useState<string[]>([]);
   const [records, setRecords] = useState<ProjectRecordItem[]>([]);
   const [summary, setSummary] = useState<RecordsBoardSummary | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -233,7 +231,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const projectOptions = useMemo(() => {
     const seen = new Set<string>();
     const result: string[] = [];
-    for (const p of [project, ...availableProjects, ...DEFAULT_PROJECTS]) {
+    for (const p of [project, ...availableProjects, ...listedProjects]) {
       const normalized = p.trim();
       if (!normalized) continue;
       const key = normalized.toLowerCase();
@@ -243,7 +241,7 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
       }
     }
     return result;
-  }, [project, availableProjects]);
+  }, [project, listedProjects, availableProjects]);
 
   const effectiveSummary = useMemo<RecordsBoardSummary>(() => {
     if (summary) {

@@ -8,8 +8,10 @@ import {
   type SessionContextUsage,
   type TranscriptTurn,
   type WireInboxItem,
+  type ProjectSummary,
   type WireMessage,
 } from "../types/api";
+import { FALLBACK_PROJECTS, projectLabel } from "../hooks/useProjects";
 import {
   estimateSessionContextUsage,
   formatTokenCount,
@@ -360,6 +362,17 @@ export interface RosterSidebarProps {
    * resize handle or left-panel tab strip.
    */
   embedded?: boolean;
+  /**
+   * The shared project list. Every entry is a roster group, in list order; agents whose
+   * `project` matches a slug or name (case-insensitive) go to that group. Defaults to the
+   * built-in fallback list.
+   */
+  projects?: readonly ProjectSummary[];
+  /**
+   * Show a list entry's group even when it has no agents (and no search is active). The
+   * built-in fallback list leaves this off so it does not add empty groups.
+   */
+  showEmptyProjects?: boolean;
 }
 
 export type LeftPanelTab =
@@ -517,16 +530,6 @@ function renderLeftPanelTabIcon(tabId: LeftPanelTab): React.ReactNode {
   }
 }
 
-const CANONICAL_PROJECTS = [
-  "AI-Lab-AMD",
-  "FerroLoop",
-  "Kaggle-Gemma4",
-  "Lucida",
-  "Prosodia",
-  "Sonora",
-  "Website",
-];
-
 interface EnrichedAgent {
   record: AgentRecord;
   route: DiscoveredSessionSummary | null;
@@ -588,6 +591,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onResizeStart,
   onTouchResizeStart,
   embedded = false,
+  projects = FALLBACK_PROJECTS,
+  showEmptyProjects = false,
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState<LeftPanelTab>("roster");
   const effectiveLeftTab: LeftPanelTab = embedded
@@ -780,43 +785,66 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
       );
     });
 
-    const groups = new Map<string, EnrichedAgent[]>();
-    for (const proj of CANONICAL_PROJECTS) {
-      groups.set(proj, []);
+    // One group per list entry, keyed by the lowercase slug, in list order.
+    const groups = new Map<string, { label: string; list: EnrichedAgent[] }>();
+    const slugByName = new Map<string, string>();
+    for (const proj of projects) {
+      const key = proj.slug.trim().toLowerCase();
+      if (groups.has(key)) continue;
+      groups.set(key, { label: projectLabel(proj), list: [] });
+      slugByName.set(projectLabel(proj).toLowerCase(), key);
     }
+    const listOrder = new Map(Array.from(groups.keys()).map((k, i) => [k, i]));
 
     for (const item of filtered) {
       const rawProj = (item.record.project || "Workspace").trim();
-      const canonical =
-        CANONICAL_PROJECTS.find(
-          (p) => p.toLowerCase() === rawProj.toLowerCase(),
-        ) ?? rawProj;
-      const list = groups.get(canonical) ?? [];
-      list.push(item);
-      groups.set(canonical, list);
+      const lower = rawProj.toLowerCase();
+      const key = groups.has(lower) ? lower : (slugByName.get(lower) ?? lower);
+      const group = groups.get(key);
+      if (group) {
+        group.list.push(item);
+      } else {
+        // A project the list does not know still gets its own group.
+        groups.set(key, { label: rawProj, list: [item] });
+      }
     }
 
     const entries = Array.from(groups.entries())
-      .filter(([, list]) => list.length > 0)
-      .map(([proj, list]) => {
+      .filter(
+        ([, { list }]) => list.length > 0 || (showEmptyProjects && !query),
+      )
+      .map(([key, { label, list }]) => {
         const sortedList = [...list].sort((a, b) => {
           const aPinned = pinnedAgents.has(a.record.name_key.trim().toLowerCase());
           const bPinned = pinnedAgents.has(b.record.name_key.trim().toLowerCase());
           if (aPinned !== bPinned) return aPinned ? -1 : 1;
           return a.record.display_name.localeCompare(b.record.display_name);
         });
-        return [proj, sortedList] as [string, EnrichedAgent[]];
+        return [key, label, sortedList] as [string, string, EnrichedAgent[]];
       });
 
-    entries.sort(([projA], [projB]) => {
+    // Pinned groups first, then the list order, then projects the list does not know.
+    entries.sort(([keyA, projA], [keyB, projB]) => {
       const aPinned = pinnedProjects.has(projA.trim().toLowerCase());
       const bPinned = pinnedProjects.has(projB.trim().toLowerCase());
       if (aPinned !== bPinned) return aPinned ? -1 : 1;
+      const aIdx = listOrder.get(keyA);
+      const bIdx = listOrder.get(keyB);
+      if (aIdx !== undefined && bIdx !== undefined) return aIdx - bIdx;
+      if (aIdx !== undefined) return -1;
+      if (bIdx !== undefined) return 1;
       return projA.localeCompare(projB);
     });
 
-    return entries;
-  }, [enrichedAgents, searchQuery, pinnedProjects, pinnedAgents]);
+    return entries.map(([, label, list]) => [label, list] as [string, EnrichedAgent[]]);
+  }, [
+    enrichedAgents,
+    searchQuery,
+    pinnedProjects,
+    pinnedAgents,
+    projects,
+    showEmptyProjects,
+  ]);
 
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
 
