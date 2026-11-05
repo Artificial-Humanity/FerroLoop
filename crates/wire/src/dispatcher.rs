@@ -519,6 +519,19 @@ fn run_vendor_cli(
     run_status_with_timeout(cmd, cli_timeout(kind))
 }
 
+/// [`run_vendor_cli`] with stdout and stderr captured, for a caller that reports why the CLI
+/// failed or decides on a fallback from what it printed. The same scrub, ceiling and kill rule
+/// apply; the caller sets no stdio on `cmd`.
+fn run_vendor_cli_captured(
+    cmd: &mut Command,
+    vendor: AdapterKind,
+    extra: &[(OsString, OsString)],
+    kind: CliKind,
+) -> std::io::Result<CapturedRun> {
+    cmd.env_clear().envs(vendor_child_env(vendor, extra));
+    run_captured_with_timeout(cmd, cli_timeout(kind))
+}
+
 /// The scrubbed environment of a `vendor` child, read from this process's environment.
 fn vendor_child_env(
     vendor: AdapterKind,
@@ -527,23 +540,26 @@ fn vendor_child_env(
     fl_core::child_env::child_env_from(vendor, std::env::vars_os(), &[], extra)
 }
 
-/// Spawn `cmd` (retrying `ETXTBSY` for up to ~2s: a just-written script can raise it under load) and wait up to
-/// `timeout` for it. A child still running at the deadline is killed and reaped, and the call
-/// fails with `TimedOut`.
-fn run_status_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
+/// Spawn `cmd`, retrying `ETXTBSY` for up to ~2s: a just-written script can raise it under load.
+fn spawn_retrying_text_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     let mut attempt = 0;
-    let mut child = loop {
+    loop {
         match cmd.spawn() {
             Err(err) if err.raw_os_error() == Some(26) && attempt < 200 => {
                 attempt += 1;
                 std::thread::sleep(Duration::from_millis(10));
             }
-            other => break other?,
+            other => return other,
         }
-    };
+    }
+}
+
+/// Wait up to `timeout` for `child`. A child still running at the deadline is killed and reaped,
+/// and the call fails with `TimedOut`.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -558,6 +574,113 @@ fn run_status_with_timeout(
             ));
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Spawn `cmd` (see [`spawn_retrying_text_busy`]) and wait up to `timeout` for it
+/// (see [`wait_with_deadline`]).
+fn run_status_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = spawn_retrying_text_busy(cmd)?;
+    wait_with_deadline(&mut child, timeout)
+}
+
+/// Most bytes kept of each captured stream; the rest of the stream is read and dropped so the
+/// child never blocks on a full pipe.
+const CAPTURE_LIMIT_BYTES: usize = 16 * 1024;
+/// How long to wait for a stream to reach end-of-file once the child has exited. A grandchild
+/// that inherited the pipe (a daemon the CLI started) would otherwise hold the reader forever.
+const CAPTURE_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// What a captured vendor CLI run printed, and how it ended.
+struct CapturedRun {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// A stream being read on a thread: the bytes kept so far, and a signal that the stream ended.
+struct StreamCapture {
+    kept: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ended: std::sync::mpsc::Receiver<()>,
+}
+
+impl StreamCapture {
+    /// Wait for the stream to end until `deadline`, then return what has arrived. A stream that
+    /// is still open at the deadline yields the bytes read so far.
+    fn finish_by(&self, deadline: Instant) -> String {
+        let _ = self
+            .ended
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let kept = self.kept.lock().unwrap_or_else(|err| err.into_inner());
+        String::from_utf8_lossy(&kept).into_owned()
+    }
+}
+
+/// Read `stream` to the end on a thread, keeping the first [`CAPTURE_LIMIT_BYTES`] as they arrive.
+fn capture_stream<R: std::io::Read + Send + 'static>(stream: Option<R>) -> StreamCapture {
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (tx, ended) = std::sync::mpsc::channel();
+    let shared = std::sync::Arc::clone(&kept);
+    std::thread::spawn(move || {
+        if let Some(mut stream) = stream {
+            let mut buf = [0_u8; 4096];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let mut kept = shared.lock().unwrap_or_else(|err| err.into_inner());
+                let room = CAPTURE_LIMIT_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+        }
+        let _ = tx.send(());
+    });
+    StreamCapture { kept, ended }
+}
+
+/// [`run_status_with_timeout`] that also captures stdout and stderr (each bounded by
+/// [`CAPTURE_LIMIT_BYTES`]). The deadline and kill rule are the same. Both streams share one
+/// [`CAPTURE_DRAIN_GRACE`] after the child exits; a stream still open then (a grandchild holds
+/// the pipe) keeps the output that already arrived.
+fn run_captured_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<CapturedRun> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_retrying_text_busy(cmd)?;
+    let out = capture_stream(child.stdout.take());
+    let err = capture_stream(child.stderr.take());
+    let status = wait_with_deadline(&mut child, timeout)?;
+    let drain_deadline = Instant::now() + CAPTURE_DRAIN_GRACE;
+    Ok(CapturedRun {
+        status,
+        stdout: out.finish_by(drain_deadline),
+        stderr: err.finish_by(drain_deadline),
+    })
+}
+
+/// Longest excerpt of a failed vendor CLI's output put into an error message.
+const OUTPUT_EXCERPT_CHARS: usize = 300;
+
+/// The stderr and stdout of a failed vendor CLI, whitespace-collapsed and cut to
+/// [`OUTPUT_EXCERPT_CHARS`] characters (`...` marks a cut). Empty when the CLI printed nothing.
+fn output_excerpt(run: &CapturedRun) -> String {
+    let joined = format!("{} {}", run.stderr, run.stdout);
+    let collapsed = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+    match collapsed.char_indices().nth(OUTPUT_EXCERPT_CHARS) {
+        Some((cut, _)) => format!("{}...", &collapsed[..cut]),
+        None => collapsed,
+    }
+}
+
+/// `"<what> exited with <status>"`, plus `": <excerpt>"` when the CLI printed anything.
+fn failure_with_output(what: &str, run: &CapturedRun) -> String {
+    let excerpt = output_excerpt(run);
+    if excerpt.is_empty() {
+        format!("{what} exited with {}", run.status)
+    } else {
+        format!("{what} exited with {}: {excerpt}", run.status)
     }
 }
 
@@ -742,35 +865,65 @@ fn deliver_to_grok_route(
 }
 
 /// The non-tmux fallback: `grok -p` runs the whole turn, so it gets the headless ceiling.
+///
+/// `-r <id>` resumes an existing session; `-s <id>` only creates one and fails on an id that is
+/// already in use. So the turn resumes first, and falls back to `-s` once when grok reports that
+/// the session is not found (its file is not on disk yet).
 fn run_grok_headless(
     bin: &Path,
     session_id: &str,
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    let resumed = run_grok_turn(bin, "-r", session_id, cwd, text)?;
+    if resumed.status.success() {
+        return Ok(());
+    }
+    if !grok_session_missing(&resumed) {
+        return Err(failure_with_output("grok", &resumed));
+    }
+    let created = run_grok_turn(bin, "-s", session_id, cwd, text)?;
+    if created.status.success() {
+        return Ok(());
+    }
+    Err(failure_with_output("grok", &created))
+}
+
+/// One `grok -p` turn with `session_flag` (`-r` or `-s`) naming the session.
+fn run_grok_turn(
+    bin: &Path,
+    session_flag: &str,
+    session_id: &str,
+    cwd: Option<&PathBuf>,
+    text: &str,
+) -> Result<CapturedRun, String> {
     let mut cmd = Command::new(bin);
     cmd.args([
         "--no-auto-update",
         "--no-alt-screen",
         "--always-approve",
-        "-s",
+        session_flag,
         session_id,
         "-p",
         text,
-    ])
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
+    ]);
     if let Some(dir) = cwd
         && dir.exists()
     {
         cmd.current_dir(dir);
     }
-    let status = run_vendor_cli(&mut cmd, AdapterKind::Grok, &[], CliKind::Headless)
-        .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-    if !status.success() {
-        return Err(format!("grok exited with {status}"));
-    }
-    Ok(())
+    run_vendor_cli_captured(&mut cmd, AdapterKind::Grok, &[], CliKind::Headless)
+        .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))
+}
+
+/// Whether a failed `grok -r` run says the session does not exist. Only stderr counts: in
+/// headless `-p` mode stdout is the model's own output, so a turn that ran and then failed
+/// (a tool printing "file not found") must not start a second turn. grok 1.0.70 prints
+/// `Session "<id>" not found locally` and `Failed to restore session from remote` to stderr.
+fn grok_session_missing(run: &CapturedRun) -> bool {
+    let said = run.stderr.to_ascii_lowercase();
+    (said.contains("session") && said.contains("not found"))
+        || said.contains("failed to restore session")
 }
 
 fn deliver_to_agy_route(
@@ -806,9 +959,11 @@ fn deliver_to_agy_route(
         .unwrap_or_default();
 
     let mut cmd = Command::new(&exe);
-    cmd.args(["agentapi", "send-message", title, conversation_id, body])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title
+    // would be read as the recipient.
+    cmd.args(["agentapi", "send-message"])
+        .arg(format!("--title={title}"))
+        .args([conversation_id, body]);
     let mut extra = vec![
         (
             OsString::from("ANTIGRAVITY_CONVERSATION_ID"),
@@ -831,10 +986,10 @@ fn deliver_to_agy_route(
             OsString::from(&csrf),
         ));
     }
-    let status = run_vendor_cli(&mut cmd, AdapterKind::Antigravity, &extra, CliKind::Enqueue)
+    let run = run_vendor_cli_captured(&mut cmd, AdapterKind::Antigravity, &extra, CliKind::Enqueue)
         .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
-    if !status.success() {
-        return Err(format!("agy send-message exited with {status}"));
+    if !run.status.success() {
+        return Err(failure_with_output("agy send-message", &run));
     }
     Ok(())
 }
@@ -2325,7 +2480,7 @@ mod tests {
         assert_eq!(grok_lines[0], "--no-auto-update");
         assert_eq!(grok_lines[1], "--no-alt-screen");
         assert_eq!(grok_lines[2], "--always-approve");
-        assert_eq!(grok_lines[3], "-s");
+        assert_eq!(grok_lines[3], "-r");
         assert_eq!(grok_lines[4], "gs-99");
         assert_eq!(grok_lines[5], "-p");
         assert!(grok_lines[6].contains("muse check"));
@@ -4922,6 +5077,174 @@ mod tests {
         // No endpoint was resolved, so none is invented.
         assert!(!text.contains("ANTIGRAVITY_LS_ADDRESS="), "{text}");
         assert!(!text.contains("ANTIGRAVITY_CSRF_TOKEN="), "{text}");
+    }
+
+    #[test]
+    fn agy_send_message_passes_the_title_as_a_flag_before_the_recipient() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("args.txt");
+        let script = write_script(
+            tmp.path(),
+            "fake-agy.sh",
+            &format!("printf '%s\\n' \"$@\" > \"{}\"", out.display()),
+        );
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        deliver_to_agy_route(
+            "conv-7",
+            &None,
+            &None,
+            &Some(script),
+            "the title",
+            "the body",
+        )
+        .unwrap();
+        let lines: Vec<String> = fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "agentapi",
+                "send-message",
+                "--title=the title",
+                "conv-7",
+                "the body"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_agy_send_message_reports_what_agy_printed() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let rpc = write_script(
+            tmp.path(),
+            "rpc-agy.sh",
+            r#"echo '{"response":{},"error":"rpc error: code = Unauthenticated desc = invalid CSRF token"}'
+echo 'line two' >&2
+exit 1"#,
+        );
+        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(rpc), "t", "b").unwrap_err();
+        assert!(err.starts_with("agy send-message exited with"), "{err}");
+        assert!(err.contains("invalid CSRF token"), "{err}");
+        assert!(err.contains("line two"), "{err}");
+
+        let silent = write_script(tmp.path(), "silent-agy.sh", "exit 1");
+        let err =
+            deliver_to_agy_route("conv-1", &None, &None, &Some(silent), "t", "b").unwrap_err();
+        assert_eq!(err, "agy send-message exited with exit status: 1");
+
+        let noisy = write_script(
+            tmp.path(),
+            "noisy-agy.sh",
+            "i=0; while [ $i -lt 400 ]; do echo \"word   $i\"; i=$((i+1)); done; exit 2",
+        );
+        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(noisy), "t", "b").unwrap_err();
+        assert!(err.ends_with("..."), "{err}");
+        assert!(!err.contains("  "), "whitespace collapsed: {err}");
+        assert!(
+            err.chars().count() < 400,
+            "bounded: {}",
+            err.chars().count()
+        );
+    }
+
+    /// A fake grok that logs each launch's flags to `calls` and reports according to `body`.
+    fn grok_call_log(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+        let calls = dir.join("calls.txt");
+        let script = write_script(
+            dir,
+            "fake-grok.sh",
+            &format!(
+                "printf '%s %s\\n' \"$4\" \"$5\" >> \"{}\"\n{body}",
+                calls.display()
+            ),
+        );
+        (script, calls)
+    }
+
+    #[test]
+    fn grok_headless_resumes_an_existing_session_with_r() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(tmp.path(), "exit 0");
+        run_grok_headless(&bin, "sid-1", None, "hi").unwrap();
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-1\n");
+    }
+
+    #[test]
+    fn grok_headless_creates_the_session_with_s_when_resume_finds_none() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(
+            tmp.path(),
+            r#"if [ "$4" = "-r" ]; then echo 'Session "sid-2" not found locally' >&2; exit 1; fi
+exit 0"#,
+        );
+        run_grok_headless(&bin, "sid-2", None, "hi").unwrap();
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-2\n-s sid-2\n");
+    }
+
+    #[test]
+    fn grok_headless_does_not_fall_back_when_resume_fails_for_another_reason() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(tmp.path(), "echo 'rate limited' >&2; exit 1");
+        let err = run_grok_headless(&bin, "sid-3", None, "hi").unwrap_err();
+        assert!(err.contains("rate limited"), "{err}");
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-3\n");
+    }
+
+    #[test]
+    fn grok_headless_ignores_not_found_printed_on_stdout_by_a_turn_that_ran() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(
+            tmp.path(),
+            r#"if [ "$4" = "-r" ]; then echo 'tool error: file not found'; echo 'turn failed' >&2; exit 1; fi
+echo 'Error: Session ID sid-5 is already in use' >&2
+exit 1"#,
+        );
+        let err = run_grok_headless(&bin, "sid-5", None, "hi").unwrap_err();
+        assert!(err.contains("turn failed"), "{err}");
+        assert!(!err.contains("already in use"), "{err}");
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-5\n");
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipes_does_not_discard_what_the_cli_printed() {
+        let _scrub = SCRUB_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _agy = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let _no_ls = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _no_csrf = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let bin = write_script(
+            tmp.path(),
+            "daemonizing-agy.sh",
+            "echo 'rpc refused: bad token' >&2\nsleep 10 &\nexit 1",
+        );
+        let started = Instant::now();
+        let err = deliver_to_agy_route("conv-1", &None, &None, &Some(bin), "t", "b").unwrap_err();
+        let took = started.elapsed();
+        assert!(err.contains("rpc refused: bad token"), "{err}");
+        assert!(took < Duration::from_secs(5), "bounded: {took:?}");
+    }
+
+    #[test]
+    fn grok_headless_reports_the_failure_of_the_create_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let (bin, calls) = grok_call_log(
+            tmp.path(),
+            r#"if [ "$4" = "-r" ]; then echo 'Session not found' >&2; else echo 'Error: Session ID sid-4 is already in use' >&2; fi
+exit 1"#,
+        );
+        let err = run_grok_headless(&bin, "sid-4", None, "hi").unwrap_err();
+        assert!(err.contains("already in use"), "{err}");
+        assert_eq!(fs::read_to_string(calls).unwrap(), "-r sid-4\n-s sid-4\n");
     }
 
     #[test]

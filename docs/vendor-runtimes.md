@@ -113,8 +113,9 @@ when both are set.
 
 ### Delivery
 
-FerroLoop sends with `agy agentapi send-message` to the language-server HTTP endpoint, using
-the CSRF token and listen address from the route.
+FerroLoop sends with `agy agentapi send-message --title=<title> <conversation_id> <content>` to
+the language-server HTTP endpoint, using the CSRF token and listen address from the route. A
+failed send reports the first 300 characters of what `agy` printed.
 
 For `Clear` and `Reforge`, FerroLoop calls
 `POST /exa.language_server_pb.LanguageServerService/RevertToCascadeStep` with `stepIndex` `0`,
@@ -268,7 +269,9 @@ milliseconds.
 ### Delivery
 
 FerroLoop pastes into the session tmux pane (`load-buffer`, `paste-buffer`, `send-keys Enter`).
-The CLI fallback is `grok -s <session_id> -p`.
+The CLI fallback is `grok -r <session_id> -p`, which resumes the session. When grok reports that
+the session is not found (its file is not on disk yet), FerroLoop runs `grok -s <session_id> -p`
+once, which creates it. `-s` alone fails on a session id that is already in use.
 
 ## Meta Muse
 

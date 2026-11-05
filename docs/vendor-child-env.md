@@ -125,8 +125,8 @@ the hub's environment) plus the variables the launch sets itself:
 | --- | --- | --- |
 | `codex queue --thread ... --message ...` (`run_codex_queue`) | Codex | none |
 | `muse exec --session-id ... --json` (`run_muse_exec`) | Muse | `MUSE_NO_AUTO_UPDATE=1` |
-| `grok --always-approve -s ... -p ...` (`run_grok_headless`) | Grok | none |
-| `agy agentapi send-message` (`deliver_to_agy_route`) | Antigravity | `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENTAPI_EXE`, and `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN` when the route or the hub has them |
+| `grok --always-approve -r ... -p ...`, then `-s` if the session is not found (`run_grok_headless`) | Grok | none |
+| `agy agentapi send-message --title=... ...` (`deliver_to_agy_route`) | Antigravity | `ANTIGRAVITY_CONVERSATION_ID`, `ANTIGRAVITY_AGENTAPI_EXE`, and `ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN` when the route or the hub has them |
 
 `grok` runs with `--always-approve`, so it can start any tool; it sees no `FL_*`, `GITHUB_*` or
 other vendor's key. The test seams the hub reads (`FL_WIRE_CODEX_BIN`, `FL_WIRE_MUSE_BIN`,
@@ -163,3 +163,11 @@ These still inherit the hub's whole environment:
 The hub's runtime updater (`runtime_update.rs`) clears its environment with its own list, which
 keeps the proxy variables; its `--version` check goes through `run_version` and gets the probe
 environment above.
+
+## Which session variable names the caller's vendor
+
+`fl-wire` resolves the caller's route (`capture_env_route_from`) and persona
+(`resolve_persona_traced`) from the session variables in its environment. Every subshell of an
+Antigravity session inherits `ANTIGRAVITY_CONVERSATION_ID`, so an explicit `CODEX_THREAD_ID`,
+`MUSE_SESSION_ID`, `GROK_SESSION_ID` or `CLAUDE_SESSION_ID` takes precedence over it. A real Agy
+session whose shell also exports one of those resolves as that vendor.
