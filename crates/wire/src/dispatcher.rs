@@ -857,6 +857,11 @@ fn deliver_to_grok_route(
             }
         }
     }
+    // A live-window placeholder has no session file yet. Headless `grok -r` with an empty id
+    // would create or resume the wrong session, so it runs only after tmux delivery did not.
+    if session_id.trim().is_empty() {
+        return Err("grok route has no session id and tmux delivery did not run".to_string());
+    }
 
     let bin = std::env::var_os("FL_WIRE_GROK_BIN")
         .map(PathBuf::from)
@@ -1076,6 +1081,86 @@ fn agy_csrf_token(route_csrf: &Option<String>) -> Option<String> {
                 .map(|token| token.trim().to_string())
                 .filter(|token| !token.is_empty())
         })
+}
+
+/// `true` when `conversation_id` is one directory name: no slash, backslash, NUL, `..`, or `.`.
+pub fn agy_conversation_id_is_path_safe(conversation_id: &str) -> bool {
+    validate_agy_conversation_id(conversation_id).is_ok()
+}
+
+/// Best-effort `DeleteCascadeTrajectory` on the live Antigravity language server.
+/// A missing server, csrf token, or bad id does nothing: decommission must still finish.
+pub fn delete_agy_cascade_best_effort(
+    conversation_id: &str,
+    ls_address: Option<&str>,
+    csrf_token: Option<&str>,
+) {
+    if validate_agy_conversation_id(conversation_id).is_err() {
+        return;
+    }
+    let address = ls_address.map(str::to_string);
+    let csrf_owned = csrf_token.map(str::to_string);
+    let Some(addr) = agy_listening_address(&address) else {
+        return;
+    };
+    let Some(csrf) = agy_csrf_token(&csrf_owned) else {
+        return;
+    };
+    if csrf.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return;
+    }
+    let Some(port) = crate::identity::agy_ls_port(&addr) else {
+        return;
+    };
+    let body = serde_json::json!({ "cascadeId": conversation_id }).to_string();
+    let _ = post_agy_connect_rpc(
+        port,
+        &csrf,
+        "/exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory",
+        &body,
+        Duration::from_secs(5),
+    );
+}
+
+/// Remove an archived Antigravity conversation so discovery cannot find it again.
+/// `~/.gemini/antigravity-cli/brain/<id>` and `~/.gemini/antigravity/conversations/<id>.pb`.
+/// A symlink is left in place. An unsafe id removes nothing.
+pub fn remove_agy_conversation_files(home: &Path, conversation_id: &str) {
+    if !agy_conversation_id_is_path_safe(conversation_id) {
+        return;
+    }
+    let brain = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .join(conversation_id);
+    let pb = home
+        .join(".gemini")
+        .join("antigravity")
+        .join("conversations")
+        .join(format!("{conversation_id}.pb"));
+    remove_dir_unless_symlink(&brain);
+    remove_file_unless_symlink(&pb);
+}
+
+fn remove_dir_unless_symlink(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let _ = fs::remove_dir_all(path);
+}
+
+fn remove_file_unless_symlink(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return;
+    }
+    let _ = fs::remove_file(path);
 }
 
 fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
@@ -1886,25 +1971,55 @@ fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Res
         return Err(format!("tmux send-keys exited with {enter_status}"));
     }
 
+    // A large paste on a busy pane shows "[Pasted Content" a moment after the first Enter.
+    // Poll for up to 300ms and submit as soon as the marker appears. `FL_WIRE_TMUX_BIN` (tests)
+    // skips the wait entirely.
     if !skip_sleep {
-        std::thread::sleep(TMUX_ENTER_SETTLE_DELAY);
+        let tmux_cap = tmux.clone();
+        let target_cap = target.to_string();
+        let saw_paste = poll_for_pasted_content(
+            6,
+            || std::thread::sleep(TMUX_ENTER_SETTLE_DELAY),
+            || capture_pane_tail(&tmux_cap, &target_cap),
+        );
+        if saw_paste {
+            let _ = Command::new(&tmux)
+                .args(["send-keys", "-t", target, "Enter"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
-    if let Ok(cap) = Command::new(&tmux)
+
+    Ok(())
+}
+
+/// `true` when a capture shows tmux's bracketed-paste placeholder. `wait` runs before each of
+/// `attempts` captures. The first hit returns immediately.
+fn poll_for_pasted_content(
+    attempts: u32,
+    mut wait: impl FnMut(),
+    mut capture: impl FnMut() -> Option<String>,
+) -> bool {
+    for _ in 0..attempts {
+        wait();
+        if capture().is_some_and(|text| text.contains("[Pasted Content")) {
+            return true;
+        }
+    }
+    false
+}
+
+fn capture_pane_tail(tmux: &Path, target: &str) -> Option<String> {
+    let cap = Command::new(tmux)
         .args(["capture-pane", "-p", "-t", target, "-S", "-8"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
-        && cap.status.success()
-        && String::from_utf8_lossy(&cap.stdout).contains("[Pasted Content")
-    {
-        let _ = Command::new(&tmux)
-            .args(["send-keys", "-t", target, "Enter"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
-    Ok(())
+        .ok()?;
+    cap.status
+        .success()
+        .then(|| String::from_utf8_lossy(&cap.stdout).into_owned())
 }
 
 /// `true` when `sender_name` names the owner (`owner`, or the owner's login `lmcfarlin`).
@@ -2215,6 +2330,114 @@ mod tests {
     fn validate_agy_conversation_id_rejects_dot_and_nul() {
         assert!(validate_agy_conversation_id(".").is_err());
         assert!(validate_agy_conversation_id("a\0b").is_err());
+    }
+
+    #[test]
+    fn pasted_content_poll_submits_on_the_first_hit_and_stops_after_six_misses() {
+        let mut waits = 0u32;
+        let saw = poll_for_pasted_content(
+            6,
+            || waits += 1,
+            || Some("[Pasted Content 1400 chars]".into()),
+        );
+        assert!(saw);
+        assert_eq!(waits, 1);
+
+        let mut waits = 0u32;
+        let mut captures = 0u32;
+        let saw = poll_for_pasted_content(
+            6,
+            || waits += 1,
+            || {
+                captures += 1;
+                Some("still typing".into())
+            },
+        );
+        assert!(!saw);
+        assert_eq!(waits, 6);
+        assert_eq!(captures, 6);
+    }
+
+    #[test]
+    fn remove_agy_conversation_files_drops_the_brain_and_pb_and_skips_symlinks() {
+        let home = TempDir::new().unwrap();
+        let id = "conv-felicia";
+        let brain = home.path().join(".gemini/antigravity-cli/brain").join(id);
+        let pb_dir = home.path().join(".gemini/antigravity/conversations");
+        fs::create_dir_all(brain.join(".system_generated/logs")).unwrap();
+        fs::write(brain.join(".system_generated/logs/transcript.jsonl"), "x").unwrap();
+        fs::create_dir_all(&pb_dir).unwrap();
+        fs::write(pb_dir.join(format!("{id}.pb")), "pb").unwrap();
+        let linked = "conv-link";
+        std::os::unix::fs::symlink(
+            &brain,
+            home.path()
+                .join(".gemini/antigravity-cli/brain")
+                .join(linked),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            pb_dir.join(format!("{id}.pb")),
+            pb_dir.join(format!("{linked}.pb")),
+        )
+        .unwrap();
+
+        remove_agy_conversation_files(home.path(), id);
+        assert!(!brain.exists());
+        assert!(!pb_dir.join(format!("{id}.pb")).exists());
+
+        remove_agy_conversation_files(home.path(), linked);
+        assert!(
+            home.path()
+                .join(".gemini/antigravity-cli/brain")
+                .join(linked)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            pb_dir
+                .join(format!("{linked}.pb"))
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!pb_dir.join(format!("{id}.pb")).exists());
+
+        let before = fs::read_dir(home.path().join(".gemini")).unwrap().count();
+        remove_agy_conversation_files(home.path(), "../etc");
+        remove_agy_conversation_files(home.path(), ".");
+        remove_agy_conversation_files(home.path(), "");
+        assert_eq!(
+            fs::read_dir(home.path().join(".gemini")).unwrap().count(),
+            before
+        );
+        delete_agy_cascade_best_effort("../etc", None, None);
+    }
+
+    #[test]
+    fn grok_placeholder_without_a_live_tmux_target_refuses_an_empty_session_id() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
+        let prev_grok = std::env::var_os("FL_WIRE_GROK_BIN");
+        unsafe {
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+            std::env::set_var("FL_WIRE_GROK_BIN", "grok-not-invoked");
+        }
+        let err = deliver_to_grok_route("", None, Some("Felicia:grok"), None, "hello").unwrap_err();
+        unsafe {
+            match prev_tmux {
+                Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+            }
+            match prev_grok {
+                Some(v) => std::env::set_var("FL_WIRE_GROK_BIN", v),
+                None => std::env::remove_var("FL_WIRE_GROK_BIN"),
+            }
+        }
+        assert!(err.contains("no session id"), "{err}");
     }
 
     #[test]

@@ -170,6 +170,9 @@ pub struct SessionQuotaUsage {
 pub struct DiscoveryStoreSnapshot {
     registered_names: BTreeSet<String>,
     attempts: Vec<DiscoveryAttemptRow>,
+    /// Hosted `vendor:persona` ids and native vendor ids of records whose status is
+    /// `decommissioned`. Discovery skips a route that still names one of them.
+    decommissioned_session_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -582,7 +585,33 @@ pub fn snapshot_discovery_store(store: &AnyStore) -> DiscoveryStoreSnapshot {
     DiscoveryStoreSnapshot {
         registered_names,
         attempts,
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
+}
+
+/// Ids of hosted records that are still decommissioned. Empty strings are omitted.
+fn decommissioned_session_ids(store: &AnyStore) -> BTreeSet<String> {
+    let Ok(records) = crate::lifecycle::list_hosted_sessions(store) else {
+        return BTreeSet::new();
+    };
+    let mut ids = BTreeSet::new();
+    for record in records {
+        if !record
+            .status
+            .eq_ignore_ascii_case(crate::lifecycle::STATUS_DECOMMISSIONED)
+        {
+            continue;
+        }
+        for id in std::iter::once(record.session_id.as_str())
+            .chain(record.tombstone_ids.iter().map(String::as_str))
+        {
+            let id = id.trim();
+            if !id.is_empty() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids
 }
 
 /// The route ordering needs agent names, but not attempt history.
@@ -595,6 +624,7 @@ pub(crate) fn snapshot_discovery_names(store: &AnyStore) -> DiscoveryStoreSnapsh
             .map(|agent| agent.name_key.to_ascii_lowercase())
             .collect(),
         attempts: Vec::new(),
+        decommissioned_session_ids: decommissioned_session_ids(store),
     }
 }
 
@@ -689,6 +719,32 @@ fn discover_sessions_impl(
     )
 }
 
+/// `true` when `raw_id` or the hosted `vendor:persona` id is in `banned`.
+/// An empty id matches nothing. A webhook route is not a vendor session.
+fn route_was_decommissioned(
+    banned: &BTreeSet<String>,
+    persona: &str,
+    route: &VendorRoute,
+    raw_id: &str,
+) -> bool {
+    if banned.is_empty() {
+        return false;
+    }
+    if !raw_id.is_empty() && banned.contains(raw_id) {
+        return true;
+    }
+    let vendor = match route {
+        VendorRoute::Claude { .. } => "claude",
+        VendorRoute::Agy { .. } => "antigravity",
+        VendorRoute::Codex { .. } => "codex",
+        VendorRoute::Muse { .. } => "muse",
+        VendorRoute::Grok { .. } => "grok",
+        VendorRoute::Webhook { .. } => return false,
+    };
+    let hosted = format!("{vendor}:{persona}");
+    banned.iter().any(|id| id.eq_ignore_ascii_case(&hosted))
+}
+
 /// The canonical ID used both for fast resolution and complete discovery.
 fn route_session_id(persona: &str, route: &VendorRoute) -> String {
     match route {
@@ -772,6 +828,14 @@ fn discover_sessions_from_routes(
             continue;
         }
         let raw_id = route_session_id(persona, &entry.route);
+        if route_was_decommissioned(
+            &snap.decommissioned_session_ids,
+            persona,
+            &entry.route,
+            &raw_id,
+        ) {
+            continue;
+        }
         let (adapter, cwd, transcript_path) = match &entry.route {
             VendorRoute::Claude { .. } => {
                 let tpath = home
@@ -7904,10 +7968,55 @@ mod tests {
     }
 
     #[test]
+    fn a_decommissioned_route_is_skipped_even_when_the_route_file_still_has_it() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        routes.upsert(
+            "bea",
+            VendorRoute::Webhook {
+                socket_path: home.join("bea.sock"),
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::from([
+                "conv-1".to_string(),
+                "antigravity:ada".to_string(),
+            ]),
+        };
+        let sessions = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            sessions.iter().all(|session| session.id != "conv-1"),
+            "{sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|session| session.adapter == "webhook"),
+            "{sessions:?}"
+        );
+    }
+
+    #[test]
     fn attempt_rows_carry_no_model_fields() {
         let tmp = TempDir::new().unwrap();
         let snap = DiscoveryStoreSnapshot {
             registered_names: BTreeSet::new(),
+            decommissioned_session_ids: BTreeSet::new(),
             attempts: vec![DiscoveryAttemptRow {
                 id: "attempt-1".into(),
                 adapter: "claude".into(),

@@ -107,6 +107,67 @@ pub struct RouteTable {
     last_discovery: Option<Instant>,
 }
 
+/// Sidecar next to the route table. Rebuilt from hosted records that are still
+/// `decommissioned`, so a re-spin of the same session stops suppressing it.
+pub const DECOMMISSIONED_SESSIONS_FILE: &str = "decommissioned-sessions.json";
+
+/// Where discovery reads ids of decommissioned sessions. A home override uses
+/// `<home>/.cache/agent-bus/`; otherwise the file sits beside [`default_routes_path`].
+pub fn decommissioned_sessions_path(home_override: Option<&Path>) -> PathBuf {
+    match home_override {
+        Some(home) => home
+            .join(".cache")
+            .join("agent-bus")
+            .join(DECOMMISSIONED_SESSIONS_FILE),
+        None => default_routes_path()
+            .parent()
+            .map(|dir| dir.join(DECOMMISSIONED_SESSIONS_FILE))
+            .unwrap_or_else(|| PathBuf::from("/tmp").join(DECOMMISSIONED_SESSIONS_FILE)),
+    }
+}
+
+/// Ids in the decommission sidecar. An empty or unreadable file is an empty set.
+/// Empty strings are ignored.
+pub fn load_decommissioned_session_ids(home_override: Option<&Path>) -> BTreeSet<String> {
+    let Ok(raw) = fs::read_to_string(decommissioned_sessions_path(home_override)) else {
+        return BTreeSet::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return BTreeSet::new();
+    };
+    value
+        .get("session_ids")
+        .and_then(|ids| ids.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Replace the decommission sidecar with `ids`. Callers rebuild it from records that
+/// are still decommissioned rather than appending.
+pub fn save_decommissioned_session_ids(
+    home_override: Option<&Path>,
+    ids: &BTreeSet<String>,
+) -> std::io::Result<()> {
+    let path = decommissioned_sessions_path(home_override);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({ "session_ids": ids }))
+        .map_err(std::io::Error::other)?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
 pub fn default_routes_path() -> PathBuf {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
         let p = PathBuf::from(rt);
@@ -703,8 +764,27 @@ impl RouteTable {
         self.discover_grok_routes(&home, check_proc, &at);
         self.discover_scanner_routes(&home, &at);
         // Last, so a placeholder route for a live window cannot shadow a route a transcript
-        // scan above found for the same persona.
+        // scan above found for the same persona. Muse keeps a persona that has both a Muse
+        // window and a Grok window and no transcript route; Grok fills only what is left.
         self.discover_muse_windows(&home, home_override.is_some(), &at);
+        if muse_tmux_discovery_enabled(&home, home_override.is_some())
+            && let Some(windows) = list_tmux_windows()
+        {
+            self.attach_grok_tmux_placeholders(&windows, &at);
+        }
+        self.drop_decommissioned_routes(home_override);
+    }
+
+    /// Drop routes whose native id or `vendor:persona` session id was decommissioned.
+    /// A webhook route and an empty session id are kept. The hosted vendor name for an
+    /// Antigravity route is `antigravity`, not the route kind `agy`.
+    fn drop_decommissioned_routes(&mut self, home_override: Option<&Path>) {
+        let banned = load_decommissioned_session_ids(home_override);
+        if banned.is_empty() {
+            return;
+        }
+        self.entries
+            .retain(|persona, entry| !route_is_decommissioned(persona, &entry.route, &banned));
     }
 
     /// Merge the routes of every scanner registered with
@@ -1543,6 +1623,51 @@ impl RouteTable {
             }
         }
     }
+
+    fn attach_grok_tmux_placeholders(&mut self, windows: &[TmuxWindow], at: &At) {
+        for (session, window) in windows {
+            if window != "grok" {
+                continue;
+            }
+            let Some(persona) = normalize_claude_session_name(session) else {
+                continue;
+            };
+            if persona == "grok" || self.entries.contains_key(&persona) {
+                continue;
+            }
+            self.upsert_passive(
+                &persona,
+                VendorRoute::Grok {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(format!("{session}:grok")),
+                    tmux_pane: None,
+                },
+                at.clone(),
+            );
+        }
+    }
+}
+
+/// `true` when `route` names a decommissioned native id or `vendor:persona`.
+/// Webhook routes are not vendor sessions. An empty session id matches nothing.
+fn route_is_decommissioned(persona: &str, route: &VendorRoute, banned: &BTreeSet<String>) -> bool {
+    if let Some((_, id)) = route.session_identity()
+        && !id.is_empty()
+        && banned.contains(id)
+    {
+        return true;
+    }
+    let vendor = match route {
+        VendorRoute::Claude { .. } => "claude",
+        VendorRoute::Agy { .. } => "antigravity",
+        VendorRoute::Codex { .. } => "codex",
+        VendorRoute::Muse { .. } => "muse",
+        VendorRoute::Grok { .. } => "grok",
+        VendorRoute::Webhook { .. } => return false,
+    };
+    let hosted = format!("{vendor}:{persona}");
+    banned.iter().any(|id| id.eq_ignore_ascii_case(&hosted))
 }
 
 struct GrokActiveSession {
@@ -6357,6 +6482,145 @@ mod tests {
         table.attach_muse_tmux_windows(&windows(&[("muse", "mira")]), &at);
         assert!(table.get("kacey").is_none(), "{:?}", table.entries);
         assert!(table.get("mira").is_some());
+    }
+
+    #[test]
+    fn a_live_grok_window_without_a_route_becomes_a_placeholder() {
+        let at = At::from_unix_millis(5);
+        let mut table = RouteTable::default();
+        table.attach_grok_tmux_placeholders(
+            &windows(&[("Felicia", "grok"), ("grok", "grok"), ("Ada", "claude")]),
+            &at,
+        );
+        match &table.get("felicia").unwrap().route {
+            VendorRoute::Grok {
+                session_id,
+                tmux_target,
+                cwd,
+                tmux_pane,
+            } => {
+                assert!(session_id.is_empty());
+                assert_eq!(tmux_target.as_deref(), Some("Felicia:grok"));
+                assert!(cwd.is_none());
+                assert!(tmux_pane.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(table.get("grok").is_none());
+        assert!(table.get("ada").is_none());
+        table.upsert(
+            "felicia",
+            VendorRoute::Grok {
+                session_id: "gs-1".into(),
+                cwd: None,
+                tmux_target: Some("Felicia:grok".into()),
+                tmux_pane: None,
+            },
+            at.clone(),
+        );
+        table.attach_grok_tmux_placeholders(&windows(&[("Felicia", "grok")]), &at);
+        match &table.get("felicia").unwrap().route {
+            VendorRoute::Grok { session_id, .. } => assert_eq!(session_id, "gs-1"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_live_muse_window_keeps_the_persona_when_a_grok_window_is_also_live() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _tmux = TmuxEnv::fake(tmp.path(), &home, &["muse:felicia", "Felicia:grok"]);
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(&home), At::from_unix_millis(9));
+        assert!(
+            matches!(
+                table.get("felicia").map(|entry| &entry.route),
+                Some(VendorRoute::Muse { .. })
+            ),
+            "{:?}",
+            table.entries
+        );
+    }
+
+    #[test]
+    fn discover_routes_inserts_a_grok_placeholder_for_a_live_window() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _tmux = TmuxEnv::fake(tmp.path(), &home, &["Felicia:grok"]);
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(&home), At::from_unix_millis(9));
+        match &table.get("felicia").unwrap().route {
+            VendorRoute::Grok {
+                session_id,
+                tmux_target,
+                ..
+            } => {
+                assert!(session_id.is_empty());
+                assert_eq!(tmux_target.as_deref(), Some("Felicia:grok"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn decommissioned_session_ids_are_dropped_on_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let ids = std::collections::BTreeSet::from([
+            "conv-1".to_string(),
+            "antigravity:ada".to_string(),
+            "codex:bob".to_string(),
+            "grok:dee".to_string(),
+        ]);
+        save_decommissioned_session_ids(Some(home), &ids).unwrap();
+        let mut table = RouteTable::default();
+        let at = At::from_unix_millis(1);
+        table.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            at.clone(),
+        );
+        table.upsert(
+            "bob",
+            VendorRoute::Codex {
+                thread_id: "thread-bob".into(),
+                cwd: None,
+            },
+            at.clone(),
+        );
+        table.upsert(
+            "cara",
+            VendorRoute::Webhook {
+                socket_path: home.join("c.sock"),
+            },
+            at.clone(),
+        );
+        table.upsert(
+            "dee",
+            VendorRoute::Grok {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("Dee:grok".into()),
+                tmux_pane: None,
+            },
+            at,
+        );
+        table.drop_decommissioned_routes(Some(home));
+        assert!(table.get("ada").is_none(), "native conversation id");
+        assert!(table.get("bob").is_none(), "hosted vendor:persona id");
+        assert!(table.get("cara").is_some(), "a webhook route stays");
+        assert!(
+            table.get("dee").is_none(),
+            "an empty grok placeholder still matches grok:dee"
+        );
     }
 
     #[test]

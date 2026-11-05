@@ -7,6 +7,7 @@
 //! concerns (the in-memory operator prompt queue) reach this module through caller closures or the
 //! returned `handshake_dispatched` flag.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -320,6 +321,22 @@ pub trait SessionRuntime: std::fmt::Debug {
     /// name without it (or with another) is not ours, is left alone, and counts as "nothing of
     /// ours to kill" (`true`). A session unit is killed whole, `hosted_id` unused.
     fn kill(&self, unit: &str, hosted_id: &str) -> bool;
+    /// Stop `unit` for an owner teardown of a session this lifecycle did not spawn.
+    /// A session unit is stopped as [`Self::kill`]. A Muse window is stopped when exactly
+    /// one window has that name, even without [`HOSTED_MARK`]. Two windows of the name
+    /// answer `false`. The default is [`Self::kill`], which still requires the mark.
+    fn kill_owner(&self, unit: &str, hosted_id: &str) -> bool {
+        self.kill(unit, hosted_id)
+    }
+    /// Recent pane text, or empty when the runtime has none. Used to notice Grok's
+    /// directory-trust prompt after a spawn.
+    fn capture(&self, _unit: &str) -> String {
+        String::new()
+    }
+    /// Send `keys` to `unit` (for example `y` at Grok's trust prompt).
+    fn send_keys(&self, _unit: &str, _keys: &str) -> bool {
+        false
+    }
     /// `true` when a runtime unit of this name runs, whoever started it.
     fn exists(&self, unit: &str) -> bool;
     /// `true` when `unit` runs and is the one `hosted_id` started: for a window unit, a window of
@@ -498,7 +515,7 @@ fn launch_spec_for(
         let (variable, bin, flags): (&str, &str, &[&str]) = match vendor {
             "codex" => ("FL_WIRE_CODEX_BIN", "codex", &["--yolo"]),
             "claude" => ("FL_WIRE_CLAUDE_BIN", "claude", &["--enable-auto-mode"]),
-            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo"]),
+            "grok" => ("FL_WIRE_GROK_BIN", "grok", &["--yolo", "--always-approve"]),
             "antigravity" => ("FL_WIRE_AGY_BIN", "agy", &["--mode", "auto"]),
             _ => return None,
         };
@@ -607,6 +624,18 @@ impl SessionRuntime for TmuxRuntime {
         kill_tmux_runtime(unit, hosted_id)
     }
 
+    fn kill_owner(&self, unit: &str, hosted_id: &str) -> bool {
+        kill_tmux_runtime_owner(unit, hosted_id)
+    }
+
+    fn capture(&self, unit: &str) -> String {
+        capture_tmux_pane(unit)
+    }
+
+    fn send_keys(&self, unit: &str, keys: &str) -> bool {
+        send_tmux_keys(unit, keys)
+    }
+
     fn exists(&self, unit: &str) -> bool {
         tmux_unit_exists(unit)
     }
@@ -644,6 +673,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) exists_calls: std::cell::Cell<u32>,
     /// How many times `owns` was asked (the survival check of a launched command).
     pub(crate) owns_calls: std::cell::Cell<u32>,
+    /// Pane text [`SessionRuntime::capture`] returns, by runtime unit or tmux target.
+    pub(crate) panes: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -816,6 +847,37 @@ impl SessionRuntime for FakeRuntime {
         } else {
             self.live.borrow_mut().remove(unit);
         }
+        true
+    }
+
+    fn kill_owner(&self, unit: &str, _hosted_id: &str) -> bool {
+        self.calls.borrow_mut().push(format!("kill-owner {unit}"));
+        if !is_killable_unit(unit) {
+            return false;
+        }
+        if is_muse_window_target(unit) {
+            // One window of the name, mark or not. A second window of the same name
+            // cannot be represented here; the tmux path refuses that case.
+            if self.windows.borrow().contains(unit) {
+                self.close_window(unit);
+            }
+            true
+        } else if unit.contains(':') {
+            false
+        } else {
+            self.live.borrow_mut().remove(unit);
+            true
+        }
+    }
+
+    fn capture(&self, unit: &str) -> String {
+        self.panes.borrow().get(unit).cloned().unwrap_or_default()
+    }
+
+    fn send_keys(&self, unit: &str, keys: &str) -> bool {
+        self.calls
+            .borrow_mut()
+            .push(format!("send-keys {unit} {keys}"));
         true
     }
 
@@ -1116,9 +1178,16 @@ pub struct HostedSessionRecord {
     pub tmux_target: Option<String>,
     pub cwd: Option<String>,
     pub hydration_dispatched: bool,
-    /// Whether this lifecycle created the tmux session; only then does teardown kill it.
+    /// Whether this lifecycle created the tmux session. Teardown of a runtime it created
+    /// uses [`SessionRuntime::kill`]. An owner teardown of one it did not create still
+    /// stops the persona's tmux unit ([`SessionRuntime::kill_owner`]).
     #[serde(default)]
     pub runtime_spawned: bool,
+    /// Native vendor ids and the hosted `vendor:persona` id, recorded when the session
+    /// is decommissioned. Discovery skips a route that still names one of them.
+    /// Empty on a running record, including one that replaced a decommissioned record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tombstone_ids: Vec<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
@@ -1628,6 +1697,53 @@ fn kill_tmux_runtime(unit: &str, hosted_id: &str) -> bool {
         [foreign] if foreign.mark != hosted_id => true,
         // Two windows of the name, or an id tmux did not give as one.
         _ => false,
+    }
+}
+
+/// As [`kill_tmux_runtime`], except a Muse window is stopped when exactly one window has
+/// that name, whether or not it carries `hosted_id`. Two windows of the name are left
+/// alone (`false`). A session unit is killed whole, as [`kill_tmux_runtime`].
+fn kill_tmux_runtime_owner(unit: &str, hosted_id: &str) -> bool {
+    if !is_killable_unit(unit) {
+        return false;
+    }
+    if !is_muse_window_target(unit) {
+        return kill_tmux_runtime(unit, hosted_id);
+    }
+    let Some((session, window)) = unit.split_once(':') else {
+        return false;
+    };
+    let Some(windows) = marked_windows(session) else {
+        return false;
+    };
+    let named: Vec<&TmuxWindow> = windows.iter().filter(|w| w.name == window).collect();
+    match named.as_slice() {
+        [] => true,
+        [one] if is_window_id(&one.id) => {
+            tmux_ok(&["kill-window", "-t", &one.id])
+                || marked_windows(session).is_some_and(|after| after.iter().all(|w| w.id != one.id))
+        }
+        _ => false,
+    }
+}
+
+fn capture_tmux_pane(target: &str) -> String {
+    tmux_stdout(&["capture-pane", "-p", "-t", target, "-S", "-40"]).unwrap_or_default()
+}
+
+fn send_tmux_keys(target: &str, keys: &str) -> bool {
+    !keys.is_empty() && tmux_ok(&["send-keys", "-t", target, keys])
+}
+
+/// The text Grok Build 1.0.70 prints when `--yolo` is not enough for a new directory.
+const GROK_DIRECTORY_TRUST_PROMPT: &str = "Do you trust the contents of this directory";
+
+fn accept_grok_directory_trust(runtime: &dyn SessionRuntime, target: &str) {
+    if runtime
+        .capture(target)
+        .contains(GROK_DIRECTORY_TRUST_PROMPT)
+    {
+        let _ = runtime.send_keys(target, "y");
     }
 }
 
@@ -2141,6 +2257,7 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         tmux_target: tmux_target.clone(),
         cwd: v.cwd.clone(),
         hydration_dispatched: false,
+        tombstone_ids: Vec::new(),
         // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
         // is someone else's and a later teardown must not kill it.
         // Only when the record named this same target: a runtime under another name (an older
@@ -2157,6 +2274,11 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
         decommission_prepared_at_ms: None,
     };
     persist_hosted_session(store, &record, by)?;
+    // The running record replaced any decommissioned one on this slug. Drop that
+    // tombstone before hydration, or discovery would hide the new session.
+    refresh_decommission_tombstones(store, env.home_override);
+    // A route left by another vendor would take the hydration prompt.
+    purge_cross_vendor_routes(env.home_override, &v.persona, &v.vendor);
 
     let launch = launch_spec_for(env, &v.vendor, &v.persona, v.model.as_deref(), &prompt);
     let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
@@ -2170,6 +2292,12 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog>(
             launch.as_ref(),
             &session_id,
         );
+    if spawned
+        && v.vendor == "grok"
+        && let Some(target) = tmux_target.as_deref()
+    {
+        accept_grok_directory_trust(env.runtime, target);
+    }
     // A runtime launched with the prompt as its first input has the prompt already, provided the
     // command stayed up: one that exited at once took its session with it, and there is nothing
     // to deliver to.
@@ -2382,6 +2510,7 @@ fn record_for_target<S: AgentRegistry>(
         cwd: None,
         hydration_dispatched: false,
         runtime_spawned: false,
+        tombstone_ids: Vec::new(),
         created_at_ms: now,
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -2542,6 +2671,189 @@ fn runtime_sharers<S: StateStore>(
         .collect())
 }
 
+/// Drop a saved route for `persona` when it belongs to a vendor other than `vendor`.
+/// A webhook route stays: spin-up tests and headless delivery use it. A route of `vendor`
+/// stays. Persona keys are matched ignoring case.
+fn purge_cross_vendor_routes(home_override: Option<&Path>, persona: &str, vendor: &str) {
+    crate::discovery::with_route_file_lock(|| {
+        for path in route_table_paths(home_override) {
+            if !path.is_file() {
+                continue;
+            }
+            let mut table = RouteTable::load(Some(&path));
+            let Some(key) = table
+                .entries
+                .keys()
+                .find(|key| key.eq_ignore_ascii_case(persona))
+                .cloned()
+            else {
+                continue;
+            };
+            let keep = table.entries.get(&key).is_some_and(|entry| {
+                matches!(entry.route, VendorRoute::Webhook { .. })
+                    || route_is_vendor(&entry.route, vendor)
+            });
+            if keep {
+                continue;
+            }
+            table.entries.remove(&key);
+            let _ = table.save(Some(&path));
+        }
+    });
+}
+
+fn route_is_vendor(route: &VendorRoute, vendor: &str) -> bool {
+    matches!(
+        (vendor, route),
+        ("claude", VendorRoute::Claude { .. })
+            | ("antigravity", VendorRoute::Agy { .. })
+            | ("codex", VendorRoute::Codex { .. })
+            | ("muse", VendorRoute::Muse { .. })
+            | ("grok", VendorRoute::Grok { .. })
+    )
+}
+
+struct AgyCleanup {
+    conversation_id: String,
+    ls_address: Option<String>,
+    csrf_token: Option<String>,
+}
+
+fn push_tombstone(ids: &mut Vec<String>, id: &str) {
+    let id = id.trim();
+    if id.is_empty() || ids.iter().any(|have| have == id) {
+        return;
+    }
+    ids.push(id.to_string());
+}
+
+fn is_uuid_like(id: &str) -> bool {
+    let mut parts = id.split('-');
+    [8, 4, 4, 4, 12].into_iter().all(|len| {
+        parts
+            .next()
+            .is_some_and(|part| part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()))
+    }) && parts.next().is_none()
+}
+
+/// Antigravity conversation to delete, plus every id discovery should treat as gone.
+/// Loaded from the route files before they are pruned.
+fn teardown_route_ids(
+    home_override: Option<&Path>,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> (Option<AgyCleanup>, Vec<String>) {
+    let mut ids = Vec::new();
+    push_tombstone(&mut ids, &record.session_id);
+    push_tombstone(&mut ids, &target.session_id);
+    push_tombstone(&mut ids, &target.raw_id);
+    push_tombstone(&mut ids, &target.discovered_id);
+    let mut agy = None;
+    for path in route_table_paths(home_override) {
+        if !path.is_file() {
+            continue;
+        }
+        let table = RouteTable::load(Some(&path));
+        // The persona key may be a sibling vendor's route. Only this vendor's route,
+        // or a route that names this session, contributes a native id.
+        let Some(route) = route_for_teardown(&table, record, target) else {
+            continue;
+        };
+        if let Some((_, id)) = route.session_identity() {
+            push_tombstone(&mut ids, id);
+        }
+        if let VendorRoute::Agy {
+            conversation_id,
+            ls_address,
+            csrf_token,
+            ..
+        } = route
+            && fl_wire::dispatcher::agy_conversation_id_is_path_safe(&conversation_id)
+        {
+            agy = Some(AgyCleanup {
+                conversation_id,
+                ls_address,
+                csrf_token,
+            });
+        }
+    }
+    if agy.is_none() {
+        agy = agy_cleanup_from_target(record, target);
+    }
+    (agy, ids)
+}
+
+fn route_for_teardown(
+    table: &RouteTable,
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> Option<VendorRoute> {
+    if let Some(entry) = table.get(&record.persona)
+        && (record.vendor == "unknown" || route_is_vendor(&entry.route, &record.vendor))
+    {
+        return Some(entry.route.clone());
+    }
+    table
+        .entries
+        .values()
+        .find(|entry| {
+            [&record.session_id, &target.raw_id, &target.discovered_id]
+                .into_iter()
+                .any(|id| route_matches_session_id(&entry.route, id))
+        })
+        .map(|entry| entry.route.clone())
+}
+
+fn agy_cleanup_from_target(
+    record: &HostedSessionRecord,
+    target: &SessionTarget,
+) -> Option<AgyCleanup> {
+    // A saved Antigravity route is the conversation id. Without one, only a UUID on an
+    // Antigravity session, or on a target that names no vendor, is a conversation directory.
+    // Another vendor's session id is often a UUID too, and is not a brain path.
+    if record.vendor != "antigravity" && record.vendor != "unknown" {
+        return None;
+    }
+    for id in [
+        target.discovered_id.as_str(),
+        target.raw_id.as_str(),
+        target.session_id.as_str(),
+    ] {
+        let id = id.trim();
+        if is_uuid_like(id) && fl_wire::dispatcher::agy_conversation_id_is_path_safe(id) {
+            return Some(AgyCleanup {
+                conversation_id: id.to_string(),
+                ls_address: None,
+                csrf_token: None,
+            });
+        }
+    }
+    None
+}
+
+/// Rewrite the decommission sidecar from records that are still decommissioned.
+/// A re-spin overwrites the same slug with a running record, so its ids leave the file.
+fn refresh_decommission_tombstones<S: StateStore>(store: &S, home_override: Option<&Path>) {
+    let Ok(records) = list_hosted_sessions(store) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    for record in records {
+        if !record.status.eq_ignore_ascii_case(STATUS_DECOMMISSIONED) {
+            continue;
+        }
+        for id in std::iter::once(record.session_id.as_str())
+            .chain(record.tombstone_ids.iter().map(String::as_str))
+        {
+            let id = id.trim();
+            if !id.is_empty() {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    let _ = fl_wire::identity::save_decommissioned_session_ids(home_override, &ids);
+}
+
 /// The gate `teardown_session` runs before its first effect. A caller that wants to act on a
 /// teardown's behalf (such as archiving the session's artifacts) asks this first, so a refused
 /// teardown never causes a side effect and the decision stays in one place.
@@ -2609,27 +2921,46 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         target.raw_id.as_str(),
         target.discovered_id.as_str(),
     ];
+    // Capture native ids before the routes are removed. Discovery uses them to skip a
+    // conversation the hosted `vendor:persona` id does not name.
+    let (agy_cleanup, tombstone_ids) = teardown_route_ids(env.home_override, &record, target);
     if persona_still_running {
         remove_routes(env.home_override, &[], &session_ids);
     } else {
         remove_routes(env.home_override, &[target.persona.as_str()], &session_ids);
     }
 
-    // `true` only for a runtime this lifecycle started and has now stopped. A runtime it did not
-    // start, one still running for the sessions that share it, or none at all (runtime calls are
-    // off) is not reported as stopped.
-    let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
-        (Some(tmux_target), true) if env.spawn_runtime => {
-            // The unit, not the session: a Muse window is killed alone, never the shared session.
-            let unit = runtime_unit(tmux_target);
-            let gone = env.runtime.kill(unit, &record.session_id);
-            // The runtime is gone, so the decommissioned record must not claim it any more.
-            record.runtime_spawned &= !gone;
-            // A window of the name that is not ours is left running: "nothing of ours to kill"
-            // clears the claim, but is not a stopped runtime.
-            gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+    // `true` only for a runtime this call stopped. A runtime still shared, or none at all
+    // (runtime calls are off), is not reported as stopped. A runtime this lifecycle started
+    // is stopped with `kill` (a Muse window only when it carries our mark). An owner teardown
+    // of a session this lifecycle never recorded a target for (`record_for_target`: restored
+    // at boot, or started outside spin-up) stops the persona's tmux unit even though
+    // `runtime_spawned` is false, including an unmarked Muse window. A recorded target with
+    // the flag clear is a unit this lifecycle already decided is not ours, and stays up.
+    // An HTTP API vendor has no tmux unit, so its teardown never stops one.
+    let runtime_stopped = if env.spawn_runtime && record.runtime_spawned {
+        match &record.tmux_target {
+            Some(tmux_target) => {
+                let unit = runtime_unit(tmux_target);
+                let gone = env.runtime.kill(unit, &record.session_id);
+                record.runtime_spawned &= !gone;
+                gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+            }
+            None => false,
         }
-        _ => false,
+    } else if env.spawn_runtime
+        && caller == Caller::Owner
+        && !shared_runtime
+        && !persona_still_running
+        && record.tmux_target.is_none()
+        && vendor_has_runtime(&record.vendor)
+    {
+        let target_name = hosted_tmux_target(&record.vendor, &record.persona);
+        let unit = runtime_unit(&target_name);
+        let gone = env.runtime.kill_owner(unit, &record.session_id);
+        gone && !(is_muse_window_target(unit) && env.runtime.exists(unit))
+    } else {
+        false
     };
     // Its routes are gone and its runtime may be: the next discovery must scan the host again.
     crate::discovery::invalidate_route_discovery_cache();
@@ -2642,8 +2973,26 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     }
 
     record.status = STATUS_DECOMMISSIONED.to_string();
+    record.tombstone_ids = tombstone_ids;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
+    // Files go after the record is decommissioned. HTTP already archived artifacts
+    // before calling teardown. A missing language server does not fail the teardown.
+    if let Some(agy) = agy_cleanup {
+        fl_wire::dispatcher::delete_agy_cascade_best_effort(
+            &agy.conversation_id,
+            agy.ls_address.as_deref(),
+            agy.csrf_token.as_deref(),
+        );
+        let home = env
+            .home_override
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        if let Some(home) = home {
+            fl_wire::dispatcher::remove_agy_conversation_files(&home, &agy.conversation_id);
+        }
+    }
+    refresh_decommission_tombstones(store, env.home_override);
 
     Ok(DecommissionResponse {
         session_id: record.session_id,
@@ -4314,6 +4663,212 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rec.status, STATUS_DECOMMISSIONED);
+        assert!(
+            !rec.tombstone_ids.iter().any(|id| id == "thread-felicity"),
+            "a running sibling's thread is not a tombstone: {:?}",
+            rec.tombstone_ids
+        );
+    }
+
+    #[test]
+    fn owner_teardown_stops_an_unmanaged_tmux_session_and_an_unmarked_muse_window() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::running(&["Ada"]);
+        fake.open_foreign_window("muse:ada");
+        let env = fake.env(home.path());
+
+        let claude = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let peer = teardown_session(&store, &env, &claude, "peer", Caller::Peer, |_| {});
+        assert!(matches!(peer, Err(LifecycleError::Forbidden(_))));
+        assert!(fake.is_live("Ada"));
+
+        let out = teardown_session(&store, &env, &claude, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(!fake.is_live("Ada"));
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "kill-owner Ada")
+        );
+
+        let muse = SessionTarget::resolve(&store, "muse:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &muse, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(!fake.is_live("muse:ada"));
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "kill-owner muse:ada")
+        );
+    }
+
+    #[test]
+    fn owner_teardown_leaves_a_running_siblings_runtime_up() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::running(&["Ada"]);
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(fake.is_live("Ada"));
+        let grok = SessionTarget::resolve(&store, "grok:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &grok, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(!out.runtime_stopped);
+        assert!(fake.is_live("Ada"));
+        assert!(
+            !fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("kill-owner"))
+        );
+    }
+
+    #[test]
+    fn grok_spin_up_accepts_the_directory_trust_prompt() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        fake.panes.borrow_mut().insert(
+            "Ada:grok".into(),
+            "Do you trust the contents of this directory? Yes, proceed (y)".into(),
+        );
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "send-keys Ada:grok y")
+        );
+    }
+
+    #[test]
+    fn spin_up_drops_a_stale_other_vendor_route_and_keeps_a_webhook() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "thread-ada".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("ada", "assistant", "grok"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(RouteTable::load(Some(&path)).get("ada").is_none());
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "bea",
+            VendorRoute::Webhook {
+                socket_path: home.path().join("none.sock"),
+            },
+            At::from_unix_millis(1),
+        );
+        routes.save(Some(&path)).unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("bea", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert!(matches!(
+            RouteTable::load(Some(&path)).get("bea").map(|e| &e.route),
+            Some(VendorRoute::Webhook { .. })
+        ));
+    }
+
+    #[test]
+    fn antigravity_teardown_removes_conversation_files_and_a_respin_clears_the_tombstone() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let id = "11111111-1111-1111-1111-111111111111";
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let brain = home.path().join(".gemini/antigravity-cli/brain").join(id);
+        let pb_dir = home.path().join(".gemini/antigravity/conversations");
+        std::fs::create_dir_all(brain.join("logs")).unwrap();
+        std::fs::write(brain.join("logs/transcript.jsonl"), "kept-then-removed").unwrap();
+        std::fs::create_dir_all(&pb_dir).unwrap();
+        std::fs::write(pb_dir.join(format!("{id}.pb")), "pb").unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: id.into(),
+                ls_pid: None,
+                ls_address: Some("127.0.0.1:9".into()),
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home
+            .path()
+            .join(".cache")
+            .join("agent-bus")
+            .join("routes.json");
+        routes.save(Some(&path)).unwrap();
+
+        let target = SessionTarget::resolve(&store, "antigravity:ada", None).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(!brain.exists());
+        assert!(!pb_dir.join(format!("{id}.pb")).exists());
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(banned.contains(id), "{banned:?}");
+        assert!(banned.contains("antigravity:ada"), "{banned:?}");
+
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "antigravity"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let banned = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(!banned.contains(id), "{banned:?}");
+        assert!(!banned.contains("antigravity:ada"), "{banned:?}");
     }
 
     #[test]
@@ -5395,6 +5950,7 @@ mod tests {
             cwd: None,
             hydration_dispatched: false,
             runtime_spawned: spawned,
+            tombstone_ids: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
             decommission_prepared_at_ms: None,

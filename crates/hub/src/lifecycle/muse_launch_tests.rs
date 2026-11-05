@@ -368,7 +368,12 @@ fn built_in_vendors_launch_with_their_prompt() {
             vec!["--enable-auto-mode"],
         ),
         ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
-        ("grok", "grok", "FL_WIRE_GROK_BIN", vec!["--yolo"]),
+        (
+            "grok",
+            "grok",
+            "FL_WIRE_GROK_BIN",
+            vec!["--yolo", "--always-approve"],
+        ),
         (
             "antigravity",
             "agy",
@@ -429,7 +434,12 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             vec!["--enable-auto-mode"],
         ),
         ("codex", "codex", "FL_WIRE_CODEX_BIN", vec!["--yolo"]),
-        ("grok", "grok", "FL_WIRE_GROK_BIN", vec!["--yolo"]),
+        (
+            "grok",
+            "grok",
+            "FL_WIRE_GROK_BIN",
+            vec!["--yolo", "--always-approve"],
+        ),
         (
             "antigravity",
             "agy",
