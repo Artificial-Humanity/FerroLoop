@@ -86,6 +86,64 @@ describe("RosterSidebar", () => {
     },
   ];
 
+  it("embedded mode renders roster content only, in flow, without drawer chrome", () => {
+    const onClose = vi.fn();
+    const onSelectAgent = vi.fn();
+    const { rerender } = render(
+      <RosterSidebar
+        agents={[]}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{}}
+        selectedAgentName="ferris"
+        onSelectAgent={onSelectAgent}
+        isOpen={true}
+        onClose={onClose}
+        width={420}
+        onResizeStart={vi.fn()}
+        leftPanelTab="terminal"
+        consoleContent={<div data-testid="console-body-stub" />}
+        embedded
+      />,
+    );
+
+    const sidebar = screen.getByTestId("roster-sidebar");
+    expect(sidebar).toHaveAttribute("data-embedded", "true");
+    expect(sidebar).toHaveClass("fd-sidebar-embedded");
+    expect(sidebar).toHaveAttribute("data-left-panel-tab", "roster");
+    expect(sidebar.style.width).toBe("");
+    expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
+    expect(screen.queryByLabelText("Close Roster")).toBeNull();
+    expect(screen.queryByTestId("left-panel-resize-handle")).toBeNull();
+    expect(screen.queryByTestId("left-panel-header")).toBeNull();
+    expect(screen.queryByTestId("roster-triage-toggle-btn")).toBeNull();
+    expect(screen.queryByTestId("console-body-stub")).toBeNull();
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    expect(onSelectAgent).toHaveBeenCalledWith("ferris");
+
+    // Without the prop the drawer chrome is back and nothing embedded leaks through.
+    rerender(
+      <RosterSidebar
+        agents={[]}
+        routes={sampleRoutes}
+        liveness={sampleLiveness}
+        unreadByAgent={{}}
+        selectedAgentName="ferris"
+        onSelectAgent={onSelectAgent}
+        isOpen={true}
+        onClose={onClose}
+        onResizeStart={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("roster-sidebar")).not.toHaveAttribute("data-embedded");
+    expect(screen.getByTestId("roster-sidebar")).not.toHaveClass("fd-sidebar-embedded");
+    expect(screen.getByTestId("mobile-sidebar-backdrop")).toBeInTheDocument();
+    expect(screen.getByLabelText("Close Roster")).toBeInTheDocument();
+    expect(screen.getByTestId("left-panel-resize-handle")).toBeInTheDocument();
+    expect(screen.getByTestId("left-panel-header")).toBeInTheDocument();
+    expect(screen.getByTestId("roster-triage-toggle-btn")).toBeInTheDocument();
+  });
+
   it("falls back to DEFAULT_WORKSPACE_AGENTS when agents prop is empty and groups by project", () => {
     const onSelectAgent = vi.fn();
     render(
@@ -843,12 +901,14 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
     fireEvent.click(screen.getByTestId("close-agent-settings-btn"));
 
-    // On narrow mobile viewports (<= 768px), toggling left sidebar closes right split panel and vice versa
+    // Below the 1080px three-panel threshold (tablet/small desktop, here 900px), toggling the left
+    // sidebar closes the right split panel and vice versa. Phone widths (< 768px) no longer use
+    // this drawer; they render the phone shell (see PhoneShell.test.tsx).
     const prevInnerWidth = window.innerWidth;
     Object.defineProperty(window, "innerWidth", {
       writable: true,
       configurable: true,
-      value: 390,
+      value: 900,
     });
     const splitToggleBtn = screen.getByTestId("split-view-toggle");
     fireEvent.click(toggleBtn);

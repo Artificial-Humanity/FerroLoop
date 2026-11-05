@@ -26,6 +26,7 @@ import {
   type PermissionChannelKind,
   type PermissionResponseDecision,
 } from "./TriageQueuePane";
+import { PHONE_MAX_VIEWPORT_PX } from "../hooks/useDeviceLayout";
 import { ThinkingBlock } from "./ThinkingBlock";
 
 export {
@@ -1178,11 +1179,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const interruptTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchingModel, setSwitchingModel] = React.useState<boolean>(false);
   const [composerHeight, setComposerHeight] = React.useState<number>(() =>
-    typeof window !== "undefined" && window.innerWidth < 720 ? 48 : 80,
+    typeof window !== "undefined" && window.innerWidth < PHONE_MAX_VIEWPORT_PX ? 48 : 80,
   );
   const [isMobileComposer, setIsMobileComposer] = React.useState<boolean>(() => {
     if (typeof window === "undefined") return false;
-    if (window.innerWidth < 720) return true;
+    if (window.innerWidth < PHONE_MAX_VIEWPORT_PX) return true;
     if (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) return true;
     if (
       typeof window.matchMedia === "function" &&
@@ -1196,7 +1197,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     const syncMobileComposer = () => {
       if (typeof window === "undefined") return;
       const touchOrMobile =
-        window.innerWidth < 720 ||
+        window.innerWidth < PHONE_MAX_VIEWPORT_PX ||
         (typeof navigator !== "undefined" && navigator.maxTouchPoints > 0) ||
         (typeof window.matchMedia === "function" &&
           window.matchMedia("(pointer: coarse)").matches);

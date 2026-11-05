@@ -351,8 +351,15 @@ export interface RosterSidebarProps {
   onSelectLeftPanelTab?: (tab: LeftPanelTab) => void;
   consoleContent?: React.ReactNode;
   width?: number;
+  /** Minimum inline width in px when `width` is set. Defaults to 360 (the desktop panel minimum). */
+  minWidth?: number;
   onResizeStart?: (e: React.MouseEvent<HTMLDivElement>) => void;
   onTouchResizeStart?: (e: React.TouchEvent<HTMLDivElement>) => void;
+  /**
+   * Phone shell mode: roster content only, in flow at full width. No backdrop, close button,
+   * resize handle or left-panel tab strip.
+   */
+  embedded?: boolean;
 }
 
 export type LeftPanelTab =
@@ -577,11 +584,15 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onSelectLeftPanelTab,
   consoleContent,
   width,
+  minWidth = 360,
   onResizeStart,
   onTouchResizeStart,
+  embedded = false,
 }) => {
   const [internalLeftTab, setInternalLeftTab] = useState<LeftPanelTab>("roster");
-  const effectiveLeftTab: LeftPanelTab = leftPanelTab ?? internalLeftTab;
+  const effectiveLeftTab: LeftPanelTab = embedded
+    ? "roster"
+    : (leftPanelTab ?? internalLeftTab);
   const handleSelectLeftTab = (tab: LeftPanelTab) => {
     setInternalLeftTab(tab);
     onSelectLeftPanelTab?.(tab);
@@ -811,7 +822,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
 
   return (
     <>
-      {isOpen && (
+      {isOpen && !embedded && (
         <div
           className="fd-sidebar-backdrop"
           data-testid="mobile-sidebar-backdrop"
@@ -820,21 +831,23 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         />
       )}
       <aside
-        className={`fd-sidebar${isOpen ? " is-open" : ""}${isCollapsedDesktop ? " is-desktop-collapsed" : ""}`}
+        className={`fd-sidebar${embedded ? " fd-sidebar-embedded" : ""}${isOpen ? " is-open" : ""}${isCollapsedDesktop ? " is-desktop-collapsed" : ""}`}
         aria-label="Agent Roster"
         data-testid="roster-sidebar"
         data-mobile-open={isOpen ? "true" : "false"}
         data-desktop-collapsed={isCollapsedDesktop ? "true" : "false"}
         data-left-panel-tab={effectiveLeftTab}
+        data-embedded={embedded ? "true" : undefined}
         style={
-          width
+          width && !embedded
             ? {
-                width: `${Math.max(360, width)}px`,
-                minWidth: `${Math.max(360, width)}px`,
+                width: `${Math.max(minWidth, width)}px`,
+                minWidth: `${Math.max(minWidth, width)}px`,
               }
             : undefined
         }
       >
+        {!embedded && (
         <div
           data-testid="left-panel-header"
           role="tablist"
@@ -953,6 +966,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             )}
           </div>
         </div>
+        )}
 
         {effectiveLeftTab === "roster" ? (
           <>
@@ -981,15 +995,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 >
                   Agent Roster
                 </strong>
-                <button
-                  type="button"
-                  className="fd-btn"
-                  data-testid="roster-triage-toggle-btn"
-                  onClick={() => handleSelectLeftTab("triage")}
-                  style={{ padding: "2px 8px", fontSize: "11px" }}
-                >
-                  Events
-                </button>
+                {!embedded && (
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    data-testid="roster-triage-toggle-btn"
+                    onClick={() => handleSelectLeftTab("triage")}
+                    style={{ padding: "2px 8px", fontSize: "11px" }}
+                  >
+                    Events
+                  </button>
+                )}
               </div>
               <input
                 type="search"
@@ -1566,6 +1582,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           </button>
         </div>
 
+        {!embedded && onResizeStart && (
         <div
           data-testid="left-panel-resize-handle"
           role="separator"
@@ -1586,6 +1603,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
             touchAction: "none",
           }}
         />
+        )}
       </aside>
     </>
   );

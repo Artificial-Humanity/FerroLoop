@@ -1182,13 +1182,13 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     ).toBeInTheDocument();
   });
 
-  it("Record #109: enforces 3-tier viewport panel constraints (<720px single-panel, 720-1079px two-panel mutual exclusion, >=1080px three-panel)", () => {
+  it("Record #109: enforces 3-tier viewport panel constraints (<768px single-panel, 768-1079px two-panel mutual exclusion, >=1080px three-panel)", () => {
     const originalInnerWidth = window.innerWidth;
     try {
       const apiClient = makeStubApiClient();
       const wsClient = makeStubWsClient();
 
-      // Start at 900px (720px - 1079px Two-Panel Mutual-Exclusion Mode)
+      // Start at 900px (768px - 1079px Two-Panel Mutual-Exclusion Mode)
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
         writable: true,
@@ -1204,12 +1204,12 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "two-panel");
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
 
-      // Opening Right panel in 720-1079px mode automatically collapses Left panel
+      // Opening Right panel in 768-1079px mode automatically collapses Left panel
       fireEvent.click(splitToggleBtn);
       expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "true");
 
-      // Opening Left panel in 720-1079px mode automatically closes Right panel
+      // Opening Left panel in 768-1079px mode automatically closes Right panel
       fireEvent.click(leftToggleBtn);
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
       expect(screen.queryByTestId("right-split-panel")).toBeNull();
@@ -1227,8 +1227,8 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
       expect(sidebar).toHaveAttribute("data-desktop-collapsed", "false");
 
-      // Resize down to 600px (< 720px Single-Panel Mode): Left auto-collapses so at most 1 panel is onscreen,
-      // and RosterSidebar does not set inline position: relative or desktop width that would push ChatPane offscreen.
+      // Resize down to 600px (< 768px Single-Panel Mode): the phone shell replaces the three-pane
+      // cockpit, so exactly one view is onscreen and no desktop drawer, header or right dock mounts.
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
         writable: true,
@@ -1236,10 +1236,35 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       });
       fireEvent(window, new Event("resize"));
       expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "single");
-      expect(sidebar).toHaveAttribute("data-desktop-collapsed", "true");
-      expect(sidebar.style.position).toBe("");
-      expect(sidebar.style.width).toBe("");
-      expect(screen.getByTestId("tier-agent-nav").style.flexWrap).toBe("nowrap");
+      expect(cockpit).toHaveAttribute("data-device-layout", "phone");
+      expect(screen.getByTestId("phone-shell")).toBeInTheDocument();
+      expect(screen.queryByTestId("roster-sidebar")).toBeNull();
+      expect(screen.queryByTestId("tier-agent-nav")).toBeNull();
+      expect(screen.queryByTestId("right-split-panel")).toBeNull();
+      expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+
+      // The Agents tab embeds the roster in flow (no inline position or desktop width that would
+      // push the chat pane offscreen).
+      fireEvent.click(screen.getByTestId("phone-tab-agents"));
+      const embeddedSidebar = screen.getByTestId("roster-sidebar");
+      expect(embeddedSidebar).toHaveAttribute("data-embedded", "true");
+      expect(embeddedSidebar.style.position).toBe("");
+      expect(embeddedSidebar.style.width).toBe("");
+
+      // Growing back to 1280px restores the desktop arrangement left before the phone resize.
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        writable: true,
+        value: 1280,
+      });
+      fireEvent(window, new Event("resize"));
+      expect(cockpit).toHaveAttribute("data-viewport-panel-mode", "three-panel");
+      expect(screen.queryByTestId("phone-shell")).toBeNull();
+      expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
+      expect(screen.getByTestId("roster-sidebar")).toHaveAttribute(
+        "data-desktop-collapsed",
+        "false",
+      );
 
       unmount();
     } finally {
@@ -1251,7 +1276,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     }
   });
 
-  it("Record #114 & #117: disables iOS safe-area margins overlay by default on mobile (<720px, including 320px zoomed iOS viewport), toggles on from Appearance settings, and allows closing via HUD [×]", () => {
+  it("Record #114 & #117: disables iOS safe-area margins overlay by default on mobile (<768px, including 320px zoomed iOS viewport), toggles on from Appearance settings, and allows closing via HUD [×]", () => {
     const originalInnerWidth = window.innerWidth;
     try {
       window.localStorage.setItem("fd_show_safe_margins", "true");
@@ -1275,17 +1300,19 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       // Redundant header settings button is removed from ContextHeader (Record #118)
       expect(screen.queryByTestId("header-settings-btn")).toBeNull();
 
-      // Top-center agent context renders identity and meta sub-rows for vertical stacking on mobile
-      const agentNav = screen.getByTestId("tier-agent-nav");
-      expect(agentNav.querySelector(".fd-tier-agent-identity")).not.toBeNull();
-      expect(agentNav.querySelector(".fd-tier-agent-meta")).not.toBeNull();
+      // The phone top bar carries the agent identity instead of the desktop tier-agent-nav
+      expect(screen.getByTestId("phone-shell")).toBeInTheDocument();
+      expect(screen.queryByTestId("tier-agent-nav")).toBeNull();
+      expect(screen.getByTestId("phone-top-bar")).toContainElement(
+        screen.getByTestId("phone-agent-identity"),
+      );
 
       // Duplicate panel show/hide toggles are removed from ChatPane toolbar (kept only in ContextHeader)
       expect(screen.queryByTestId("chat-toolbar-left-panel-toggle")).toBeNull();
       expect(screen.queryByTestId("chat-toolbar-right-panel-toggle")).toBeNull();
 
-      // Enable via Left Sidebar -> Settings -> Appearance -> Show iOS Safe-Area Margins
-      fireEvent.click(screen.getByTestId("mobile-sidebar-toggle-btn"));
+      // Enable via Agents tab -> Settings -> Appearance -> Show iOS Safe-Area Margins
+      fireEvent.click(screen.getByTestId("phone-tab-agents"));
       fireEvent.click(screen.getByTestId("settings-modal-btn"));
       fireEvent.click(screen.getByTestId("settings-tab-appearance"));
       const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
