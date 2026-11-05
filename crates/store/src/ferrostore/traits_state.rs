@@ -8,7 +8,7 @@ use super::doc::{
     NEXT_STATE_REV, STATE_CONFLICTS, STATE_ENTRIES, STATE_KEYS, STATE_REVISION_IDS,
     STATE_REVISIONS, STATE_SYNC_CURSORS,
 };
-use crate::{FORMAT_WITH_STATE, decode, mint};
+use crate::{FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, decode, mint};
 use fl_core::agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
     RegistryEventKind, validate_agent_identity,
@@ -319,6 +319,29 @@ impl AgentRegistry for FerroStore {
         })
     }
 
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        let key =
+            validate_slug(area_key).map_err(|err| StoreError::InvalidState(err.to_string()))?;
+        self.with_write(|txn| {
+            if doc::get_json::<AreaRecord>(txn, AREAS, &key)?.is_none() {
+                return Ok(false);
+            }
+            // An older fl cannot decode the event below: it refuses the raised store instead.
+            doc::raise_format(txn, FORMAT_WITH_AREA_DELETE)?;
+            txn.delete(AREAS, &key);
+            let ev = RegistryEvent {
+                event_id: mint()?,
+                at: at.clone(),
+                by: by.to_string(),
+                kind: RegistryEventKind::AreaDelete {
+                    area_key: key.clone(),
+                },
+            };
+            append_registry_event(txn, &ev)?;
+            Ok(true)
+        })
+    }
+
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         let (name_key, display_name, email) =
             validate_agent_identity(&args.display_name, args.email.as_deref())
@@ -602,6 +625,10 @@ impl AgentRegistry for FerroStore {
                         doc::index_imported(txn, Kind::Agent, rec.id.iri())?;
                         doc::put_json(txn, AGENT_BY_NAME, &rec.name_key, &rec.id.as_str())?;
                         doc::put_json(txn, AGENTS, rec.id.as_str(), rec)?;
+                    }
+                    RegistryEventKind::AreaDelete { area_key } => {
+                        doc::raise_format(txn, FORMAT_WITH_AREA_DELETE)?;
+                        txn.delete(AREAS, area_key);
                     }
                     RegistryEventKind::AgentRetire { id } => {
                         let resolved = AgentId(doc::resolve_iri(txn, &self.label, id.iri())?);

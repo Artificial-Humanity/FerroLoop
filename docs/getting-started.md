@@ -93,8 +93,10 @@ Options:
 
 ## 2. Register a project
 
-A project is a git working tree. The tool refuses anything that isn't one, because a
-gate's provenance is a commit — there has to be a HEAD to stamp it against.
+A project is a directory. `fl project add` registers any directory, a Git repository or not.
+A gate's provenance is a commit, though, so the gate commands (`gate add`, `check`, flows,
+manifests) need the project to be a git working tree with a `HEAD` to stamp against, and say so
+when it is not. This guide's project is one.
 
 ```
 $ mkdir -p /tmp/gs-demo/project && cd /tmp/gs-demo/project
@@ -118,6 +120,120 @@ The `1` is the project's **handle**: a short name for it, local to this store. E
 below uses `--project 1`. Every item also has a full id, an IRI such as
 `urn:uuid:0199…`, which is what the store keeps and what every reference between items
 holds. A command accepts either; the handle is only there to be typed and read.
+
+### Create a project in one step: `fl project create`
+
+There are two kinds of project. A **directory-backed project** is a directory, whether or not it
+is a Git repository. A **virtual group** is a name for a set of agents, with no directory, no
+store of its own and no Git, such as `council`. FerroWire reaches its members as `@<slug>`:
+every active agent whose project or extra areas include the group. A bare `<slug>` stays the
+persona of that name, so `ops` is the persona and `@ops` the group. `@council` reaches the
+`council` group's members and also every strategist; `@all` is everyone, so a group cannot be
+named `all`. A send to `@<name>` that is not a virtual group is refused, naming the way out
+(`@area:<slug>` reaches the agents of a project with a path).
+
+```
+fl project create <name> --path <dir> [--slug <slug>] [--git-init]
+                  [--github <owner/repo>] [--credential <app|env>] [--purpose <text>]
+                  [--by <author>] [--json]
+fl project create <name> --virtual [--slug <slug>] [--purpose <text>] [--by <author>] [--json]
+fl project init   <dir>  [--name <name>] ...    the same command; the argument is the directory
+fl project add    <dir>                         register a directory in the current store
+fl project list   [--json]
+fl project delete <slug> [--reassign-to <target_slug> | --decommission-agents]
+                  [--delete-store] [--delete-dir] [--by <author>] [--json]
+```
+
+`<name>` is the name shown for the project (`"My Project"`); its **slug** is the name in
+lowercase kebab-case (`my-project`) unless `--slug` gives one. A slug is 1 to 64 of lowercase
+letters, digits, `-` and `_`, starting with a letter, and it never changes. `fl project init
+<dir>` is `create` under its earlier name: with neither `--path` nor `--virtual` the argument
+is the directory, and the slug is, in this order: `--slug`; the slug the config already gives
+that root; the slug of `--name`; the directory's lowercase name. A slug names one kind: a project cannot take a virtual
+group's slug, nor a group a project's.
+
+A directory-backed project is made in this order, leaving what is already right alone:
+
+1. **Directory.** The path is made if it does not exist. **Git is not touched** unless
+   `--git-init` is given: then a directory with no `.git` of its own gets `git init` (also when it
+   lies inside another repository, which is left alone), and a repository with no commit gets an
+   empty one, message `chore: initial commit`, authored by `--by` (default `fl`). A directory
+   with its own `HEAD` is never changed.
+2. **Stores.** The project's store `<slug>.fls` goes beside the workspace store (the
+   `[state].store` of the config, else `$XDG_DATA_HOME/fl`). It holds the project and its
+   routing map: the areas `backlog`, `code`, `design`, `product`, `security`, `tests` and `ux`,
+   all routed to the local tier, `security` marked sensitive. A map the store already has is
+   kept. The workspace store (`--db` or `$FL_DB` names another) gets the project's area, with
+   the name, the root as its path and `--purpose` (default `Project <slug>`; an existing area
+   keeps its purpose when none is given).
+3. **MCP catalog.** `<root>/.fl/mcp.toml` is written if it is absent, and never changed if it
+   exists.
+4. **Config.** A `[[project]]` block (`name` is the slug, `root`, `store`) is appended to
+   `$XDG_CONFIG_HOME/fl/config.toml`, the rest of the file untouched. The block is written last,
+   by replacing the file whole, so a failure earlier leaves the project unregistered and a re-run
+   finishes it. `--github owner/repo` adds a `[project.tracker]` with `credential` `app` (the
+   default) or `env`; `--credential` needs `--github`. A project that has no tracker gets the one
+   asked for; creating never rebinds one that has a tracker (the Hub's
+   `PATCH /api/v1/projects/<slug>` does).
+
+A virtual group is one write: its area, with no path, in the workspace store. No directory, no
+store file, no config block and no Git; `--virtual` refuses `--path`, `--git-init`, `--github`
+and `--credential`. An area made earlier with `fl agent register --create-area` has no path
+either, so it is a virtual group already; to make a directory-backed project of that slug, first
+give the area its directory with `fl agent area set <slug> --path <dir> --purpose <text> --by
+<you>`.
+
+Nothing is changed until the request is checked. fl refuses an empty path, a NUL, a path that is
+a file, a slug that another project's block already has (at another root), a root that is already
+registered under another slug, a store that holds another project, a root that contains the
+stores' directory, and a slug that is the other kind. Running the same command again changes
+nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `kind`, `path`,
+`has_git`, `purpose`, `tracker`, `store_path`, `active_agent_count`) plus `registered`, `git`
+(`null` unless `--git-init` ran), `mcp_catalog_created`, `areas` and `config`.
+
+`fl project list` shows every directory-backed project in the config and every virtual group,
+one per line: kind, slug, path (`-` for a group), tracker repository (`-` for none) and the number
+of active agents whose project or extra areas name it. With `--json` it prints the list that
+`GET /api/v1/projects` serves ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)), which
+also creates (`POST`), updates (`PATCH`) and deletes (`DELETE`) them.
+
+### Delete a project: `fl project delete`
+
+`fl project delete <slug>` removes a project's `[[project]]` block from the config and its area
+from the workspace store, and deletes no file. A virtual group loses its area only. A slug that
+names nothing is refused (exit 1).
+
+* **Agents.** A project whose active agents (project or extra areas equal the slug or the area's
+  name, ignoring case) are not dealt with is refused with exit 2, naming them, and nothing
+  changes. `--reassign-to <target_slug>` moves them to that project (a project or a virtual group
+  that exists, and not this one; a Lead is refused when the target already has one).
+  `--decommission-agents` retires them as `fl agent decommission --mode teardown` does. The two
+  flags exclude each other.
+* **`--delete-store`** also deletes the project's store file and its `<store>.sock` and
+  `<store>.migrate.lock` files. The workspace store and another project's store are refused.
+* **`--delete-dir`** also deletes the project's directory, after these checks, all made before
+  anything changes. The directory is the registered one; it must exist, be a directory and not
+  a symbolic link, resolve to a path of at least three components, and agree with the path the
+  config, the area and the workspace store record. It must not be `/`, the home directory or a
+  directory above it, the workspace root or a directory above it (the root of the current
+  directory's workspace), a directory that holds another registered project, a directory that
+  holds or lies inside the stores directory or the config directory, or one that holds a store
+  or config file. A virtual group refuses `--delete-store` and `--delete-dir`.
+
+The order is: check everything, reassign or decommission the agents, remove the config block and
+the area, delete the store files, delete the directory. A failure to delete the store files or
+the directory leaves the project unregistered and is printed as `error` (the flag that did not
+happen stays `false`). A Hub lists a project from a store file in its data directory, so it
+still lists a project deleted without `--delete-store` there, with no path. `--json` prints the
+body `DELETE /api/v1/projects/:slug` answers:
+
+```
+{"deleted":"my-project","reassigned_agents":0,"decommissioned_agents":0,
+ "store_deleted":false,"dir_deleted":false}
+```
+
+An agent started with `--project <slug>` of a virtual group (an area with no path), without
+`--cwd`, runs in the workspace root; the project of a directory is left as the request says.
 
 ## 3. Write a gate
 
