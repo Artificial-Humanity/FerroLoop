@@ -18,6 +18,9 @@ pub const METHOD_NOOP_TEST: &str = "noop-test";
 pub const METHOD_OPERATOR_PROMPT: &str = "operator-prompt";
 /// `method` reported when the model was recorded but nothing reached a CLI.
 pub const METHOD_OVERRIDE_ONLY: &str = "override-only";
+/// `method` reported when a context window was recorded and applies at the session's next
+/// launch (nothing was sent to the running CLI).
+pub const METHOD_NEXT_LAUNCH: &str = "next-launch";
 
 /// A live (model, thinking level) pair as discovery reported it for a session.
 type LivePair = (Option<String>, Option<String>);
@@ -95,6 +98,12 @@ pub fn validate_model(raw: &str) -> Result<String, String> {
 /// is sent as is.
 pub fn model_command(model: &str) -> String {
     format!("/model {model}")
+}
+
+/// The text pasted into a live Grok CLI to set its context window for the session:
+/// `/context-window <tokens>`. Grok accepts the raw token count as well as the short label.
+pub fn context_window_command(tokens: u64) -> String {
+    format!("/context-window {tokens}")
 }
 
 /// `low`, `medium` or `high` in any case, normalized to lowercase.
@@ -280,6 +289,16 @@ mod tests {
             assert_eq!(model_command(&model), format!("/model {id}"));
         }
         assert_eq!(model_command("gpt-6-sol"), "/model gpt-6-sol");
+    }
+
+    #[test]
+    fn the_context_window_command_carries_the_raw_token_count() {
+        assert_eq!(context_window_command(500_000), "/context-window 500000");
+        assert_eq!(context_window_command(1), "/context-window 1");
+        assert_eq!(
+            context_window_command(u64::MAX),
+            format!("/context-window {}", u64::MAX)
+        );
     }
 
     #[test]

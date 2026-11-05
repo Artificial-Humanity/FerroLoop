@@ -1349,6 +1349,24 @@ pub fn set_hosted_session_model<S: StateStore>(
     Ok(Some(record))
 }
 
+/// Set (`Some`) or clear (`None`) the context window on the hosted-session record that `keys`
+/// name (same lookup as [`find_hosted_session`]). The caller has validated the value. Returns
+/// the updated record, or `None` when no record matches.
+pub fn set_hosted_session_context_window<S: StateStore>(
+    store: &S,
+    keys: &[&str],
+    context_window: Option<u64>,
+    by: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let Some(mut record) = find_hosted_session(store, keys)? else {
+        return Ok(None);
+    };
+    record.context_window = context_window;
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
+    Ok(Some(record))
+}
+
 fn now_ms() -> u64 {
     stamp::now().unix_millis()
 }

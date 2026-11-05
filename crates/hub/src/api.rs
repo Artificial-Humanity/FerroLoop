@@ -97,7 +97,8 @@ use crate::nodes::{
 use crate::operators;
 use crate::records;
 use crate::session_actions::{
-    self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
+    self, METHOD_NEXT_LAUNCH, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride,
+    route_vendor,
 };
 use crate::settings;
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
@@ -4911,6 +4912,9 @@ fn handle_dynamic_api_routes(
             ("POST", "model") => {
                 return handle_post_session_model(state, authority, &session_id, req);
             }
+            ("POST", "context-window") => {
+                return handle_post_session_context_window(state, authority, &session_id, req);
+            }
             ("POST", "decommission") => {
                 return handle_post_session_decommission(state, authority, &session_id, req);
             }
@@ -6289,6 +6293,172 @@ fn handle_post_session_model(
         data["cli_model"] = json!(cli_model);
     }
     state.broadcast("sessions", "session.model_changed", data.clone());
+    HttpResponse::json(200, data)
+}
+
+/// `POST /api/v1/sessions/:id/context-window` (Local Record #134): choose a session's context
+/// window, `{ "context_window": <positive integer> | null }`. Owner only (403 for a Peer,
+/// checked before the body is read). `null` clears the choice.
+///
+/// A number is checked with [`crate::context_window::validate_context_window`] against the
+/// session's vendor and model; only Grok is selectable, and a refusal is a 400 that names the
+/// sizes on offer. The value is stored on the session's hosted record when it has one (a session
+/// without one stores nothing and the response says `persisted: false`). A Grok route is also
+/// sent `/context-window <tokens>` (`method: operator-prompt`); `null` sends nothing, because
+/// Grok has no reset, so clearing takes effect at the next launch. Any other route, or a failed
+/// send, reports `method: next-launch`.
+///
+/// The response reports what was REQUESTED. The effective window is what the vendor reports
+/// (`context_usage` on the session), which can differ if the vendor ignored the command.
+fn handle_post_session_context_window(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change a session's context window" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let requested: Option<u64> = match body.get("context_window") {
+        Some(Value::Null) => None,
+        Some(value) => match value.as_u64().filter(|&n| n > 0) {
+            Some(tokens) => Some(tokens),
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({
+                        "error": "`context_window` must be a positive integer number of tokens, or null"
+                    }),
+                );
+            }
+        },
+        None => {
+            return HttpResponse::json(
+                400,
+                json!({
+                    "error": "`context_window` is required: a positive integer number of tokens, or null"
+                }),
+            );
+        }
+    };
+
+    let snap = load_discovery_snapshot(state);
+    // Only `id`, `persona` and `adapter` are read, so skip model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
+    let trimmed = session_id.trim();
+    let matched = sessions
+        .iter()
+        .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed));
+    let (canonical_id, persona) = match matched {
+        Some(s) => (s.id.clone(), s.persona.clone()),
+        None => (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())),
+    };
+    let route = vendor_route_for_session(state, persona.as_deref(), &canonical_id).ok();
+    let hosted = hosted_record_for(state, &[trimmed, &canonical_id], persona.as_deref());
+    if matched.is_none() && route.is_none() && hosted.is_none() {
+        return HttpResponse::json(
+            404,
+            json!({ "error": format!("unknown session `{trimmed}`") }),
+        );
+    }
+    let vendor = match (&route, matched, &hosted) {
+        (Some(route), _, _) => route_vendor(route).to_string(),
+        (None, Some(s), _) => s.adapter.clone(),
+        (None, None, Some(record)) => record.vendor.clone(),
+        (None, None, None) => "unknown".to_string(),
+    };
+
+    if let Some(tokens) = requested {
+        // The model whose sizes decide: the operator's latest choice, else the hosted record's,
+        // else what discovery reads from the vendor's own files (Grok only, the only vendor
+        // whose sizes are checked).
+        let override_key = match matched {
+            Some(s) => s.id.clone(),
+            None => persona.clone().unwrap_or_else(|| canonical_id.clone()),
+        };
+        let mut model = state
+            .session_model_override(&override_key)
+            .map(|o| o.model)
+            .or_else(|| hosted.as_ref().and_then(|r| r.model.clone()));
+        if model.is_none() && vendor == "grok" {
+            model = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref())
+                .into_iter()
+                .find(|s| s.id == canonical_id)
+                .and_then(|s| s.model);
+        }
+        if let Err(why) = crate::context_window::validate_context_window(
+            &vendor,
+            model.as_deref(),
+            tokens,
+            state.config.home_override.as_deref(),
+        ) {
+            return HttpResponse::json(400, json!({ "error": why }));
+        }
+    }
+
+    let mut persisted = false;
+    if let Some(record) = &hosted {
+        match open_store_response(state) {
+            Ok(store) => {
+                // Best effort, like the model: a failed write reports `persisted: false`. The
+                // record found above is written by its own id, so a request that named the
+                // session by its vendor id (not its persona) still reaches it.
+                persisted = matches!(
+                    lifecycle::set_hosted_session_context_window(
+                        &*store,
+                        &[record.session_id.as_str()],
+                        requested,
+                        authority.actor_name(),
+                    ),
+                    Ok(Some(_))
+                );
+            }
+            Err(()) => return store_open_failure(),
+        }
+    }
+
+    let live = match (&route, requested) {
+        (Some(route @ fl_wire::identity::VendorRoute::Grok { .. }), Some(tokens)) => {
+            dispatch_operator_prompt_to_route(
+                route,
+                authority.actor_name(),
+                &session_actions::context_window_command(tokens),
+            )
+            .is_ok()
+        }
+        _ => false,
+    };
+    let method = if live {
+        METHOD_OPERATOR_PROMPT
+    } else {
+        METHOD_NEXT_LAUNCH
+    };
+    if requested.is_some() && !live && !persisted {
+        return HttpResponse::json(
+            409,
+            json!({
+                "error": "the context window was not applied: the session has no stored record to keep it on and the live command could not be sent"
+            }),
+        );
+    }
+
+    let data = json!({
+        "ok": true,
+        "session_id": canonical_id,
+        "vendor": vendor,
+        "context_window": requested,
+        "persisted": persisted,
+        "method": method,
+    });
+    state.broadcast("sessions", "session.context_window_changed", data.clone());
     HttpResponse::json(200, data)
 }
 
