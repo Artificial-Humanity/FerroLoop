@@ -472,6 +472,30 @@ fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
     .then(|| id.to_string())
 }
 
+/// The `agy --model` id for `model`. `agy models` lists every id with an effort suffix
+/// (`-low`, `-medium` or `-high`), so a bare id such as `claude-sonnet-5-5` is not accepted.
+/// A suffix already on `model` is kept unless `thinking_level` (case-insensitive `low`, `medium`
+/// or `high`; anything else is ignored) names another; with no suffix the effort is appended,
+/// `medium` by default. `gpt-oss-120b` only exists as `-medium`. The input is trimmed, and an
+/// empty model gives an empty string, which callers treat as absent.
+pub(crate) fn agy_cli_model_id(model: &str, thinking_level: Option<&str>) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        return String::new();
+    }
+    let (base, existing) = crate::discovery::split_agy_thinking_suffix(model);
+    if base == "gpt-oss-120b" {
+        return format!("{base}-medium");
+    }
+    let explicit = thinking_level
+        .map(|level| level.trim().to_ascii_lowercase())
+        .filter(|level| matches!(level.as_str(), "low" | "medium" | "high"));
+    let effort = explicit
+        .or(existing)
+        .unwrap_or_else(|| "medium".to_string());
+    format!("{base}-{effort}")
+}
+
 /// Build a launch command for built-in CLI vendors; custom vendors use prompt delivery.
 fn launch_spec_for(
     env: &LifecycleEnv<'_>,
@@ -504,6 +528,14 @@ fn launch_spec_for(
             bin,
         )];
         args.extend(flags.iter().map(|flag| (*flag).to_string()));
+        let agy_model = (vendor == "antigravity")
+            .then(|| model.map(|m| agy_cli_model_id(m, None)))
+            .flatten();
+        let model = if vendor == "antigravity" {
+            agy_model.as_deref()
+        } else {
+            model
+        };
         if let Some(model) = normalize_plain_model(model) {
             args.extend(["--model".into(), model]);
         }
@@ -3443,6 +3475,114 @@ mod tests {
         assert_eq!(
             reforge_role_label(&AgentRole::Custom("reviewer".into())),
             "reviewer"
+        );
+    }
+
+    #[test]
+    fn agy_cli_model_id_maps_to_an_effort_suffixed_id() {
+        for (model, level, want) in [
+            // A suffix on the model is kept.
+            ("claude-sonnet-5-5-high", None, "claude-sonnet-5-5-high"),
+            ("gemini-4-argon-low", None, "gemini-4-argon-low"),
+            ("gemini-3.8-flash-medium", None, "gemini-3.8-flash-medium"),
+            // An explicit effort replaces it.
+            ("claude-opus-5-5-low", Some("high"), "claude-opus-5-5-high"),
+            (
+                "claude-opus-5-5-high",
+                Some("medium"),
+                "claude-opus-5-5-medium",
+            ),
+            // No suffix: the effort is appended, `medium` by default.
+            ("claude-sonnet-5-5", None, "claude-sonnet-5-5-medium"),
+            ("claude-sonnet-5-5", Some("high"), "claude-sonnet-5-5-high"),
+            ("gemini-4-argon", Some("low"), "gemini-4-argon-low"),
+            // The effort is read without case or surrounding space; anything else is ignored.
+            ("gemini-4-argon", Some("HIGH"), "gemini-4-argon-high"),
+            ("gemini-4-argon", Some(" Low "), "gemini-4-argon-low"),
+            ("gemini-4-argon", Some("extreme"), "gemini-4-argon-medium"),
+            ("gemini-4-argon-low", Some(""), "gemini-4-argon-low"),
+            // GPT-OSS exists only as `-medium`.
+            ("gpt-oss-120b", None, "gpt-oss-120b-medium"),
+            ("gpt-oss-120b", Some("low"), "gpt-oss-120b-medium"),
+            ("gpt-oss-120b", Some("high"), "gpt-oss-120b-medium"),
+            ("gpt-oss-120b-low", None, "gpt-oss-120b-medium"),
+            ("gpt-oss-120b-high", Some("high"), "gpt-oss-120b-medium"),
+            // The model is trimmed; an empty model is absent.
+            ("  claude-sonnet-5-5  ", None, "claude-sonnet-5-5-medium"),
+            ("", Some("high"), ""),
+            ("   ", None, ""),
+            // Ids `normalize_plain_model` rejects still map to a string.
+            ("--evil", None, "--evil-medium"),
+            ("bad id", None, "bad id-medium"),
+        ] {
+            assert_eq!(agy_cli_model_id(model, level), want, "{model:?} {level:?}");
+        }
+    }
+
+    /// The argv after the binary, which `FL_WIRE_*_BIN` or `PATH` decides.
+    fn launch_args(vendor: &str, model: Option<&str>) -> Vec<String> {
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let spec = launch_spec_for(&env, vendor, "ada", model, "hello").unwrap();
+        spec.argv[1..].to_vec()
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    #[test]
+    fn antigravity_launch_maps_the_model_to_an_effort_suffixed_id() {
+        let want = |model: &[&str]| {
+            let mut args = vec!["--mode", "auto"];
+            args.extend_from_slice(model);
+            args.extend(["--prompt-interactive", "hello"]);
+            strings(&args)
+        };
+        assert_eq!(
+            launch_args("antigravity", Some("claude-sonnet-5-5")),
+            want(&["--model", "claude-sonnet-5-5-medium"])
+        );
+        assert_eq!(
+            launch_args("antigravity", Some("claude-sonnet-5-5-high")),
+            want(&["--model", "claude-sonnet-5-5-high"])
+        );
+        assert_eq!(
+            launch_args("antigravity", Some("gpt-oss-120b-high")),
+            want(&["--model", "gpt-oss-120b-medium"])
+        );
+        assert_eq!(launch_args("antigravity", None), want(&[]));
+        // Empty and option-like ids are never passed to the CLI.
+        assert_eq!(launch_args("antigravity", Some("  ")), want(&[]));
+        assert_eq!(launch_args("antigravity", Some("--evil")), want(&[]));
+    }
+
+    #[test]
+    fn other_vendors_launch_with_the_model_unchanged() {
+        assert_eq!(
+            launch_args("claude", Some("claude-sonnet-5-5")),
+            strings(&[
+                "--enable-auto-mode",
+                "--model",
+                "claude-sonnet-5-5",
+                "hello"
+            ])
+        );
+        assert_eq!(
+            launch_args("claude", None),
+            strings(&["--enable-auto-mode", "hello"])
+        );
+        assert_eq!(
+            launch_args("codex", Some("gpt-6-sol")),
+            strings(&["--yolo", "--model", "gpt-6-sol", "hello"])
+        );
+        assert_eq!(
+            launch_args("grok", Some("grok-5")),
+            strings(&["--yolo", "--model", "grok-5", "hello"])
+        );
+        assert_eq!(
+            launch_args("muse", Some("muse-2")),
+            strings(&["--model", "muse-2", "hello"])
         );
     }
 

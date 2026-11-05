@@ -456,7 +456,13 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             );
         let mut expected = vec![expected_bin];
         expected.extend(flags.into_iter().map(String::from));
-        expected.extend(["--model".into(), "Model.v2".into()]);
+        // `agy` only takes effort-suffixed ids, so its recorded model gets `-medium`.
+        let model = if vendor == "antigravity" {
+            "Model.v2-medium"
+        } else {
+            "Model.v2"
+        };
+        expected.extend(["--model".into(), model.into()]);
         if vendor == "antigravity" {
             expected.push("--prompt-interactive".into());
         }

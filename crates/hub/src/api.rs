@@ -6225,6 +6225,10 @@ fn handle_post_session_model(
             thinking_level: thinking_level.clone(),
         },
     );
+    // `agy --model` only takes effort-suffixed ids, so an Antigravity record keeps the mapped id
+    // (a restart launches with it); every other vendor keeps the model as the operator chose it.
+    let cli_model = (vendor == "antigravity")
+        .then(|| lifecycle::agy_cli_model_id(&model, thinking_level.as_deref()));
     if hosted.is_some() {
         match open_store_response(state) {
             Ok(store) => {
@@ -6232,7 +6236,7 @@ fn handle_post_session_model(
                 let _ = lifecycle::set_hosted_session_model(
                     &*store,
                     &[trimmed, &canonical_id],
-                    &model,
+                    cli_model.as_deref().unwrap_or(&model),
                     authority.actor_name(),
                 );
             }
@@ -6254,7 +6258,7 @@ fn handle_post_session_model(
         _ => METHOD_OVERRIDE_ONLY,
     };
 
-    let data = json!({
+    let mut data = json!({
         "ok": true,
         "session_id": canonical_id,
         "vendor": vendor,
@@ -6263,6 +6267,9 @@ fn handle_post_session_model(
         "switched": true,
         "method": method,
     });
+    if let Some(cli_model) = cli_model {
+        data["cli_model"] = json!(cli_model);
+    }
     state.broadcast("sessions", "session.model_changed", data.clone());
     HttpResponse::json(200, data)
 }

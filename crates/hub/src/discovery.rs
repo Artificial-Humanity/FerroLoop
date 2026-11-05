@@ -1178,7 +1178,7 @@ fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
 /// is returned whole with no thinking level.
-fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
+pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
     for level in ["low", "medium", "high"] {
         if let Some(base) = model_id.strip_suffix(&format!("-{level}"))
             && !base.is_empty()

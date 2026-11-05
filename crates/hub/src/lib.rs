@@ -6941,6 +6941,85 @@ mod tests {
     }
 
     #[test]
+    fn model_endpoint_stores_the_effort_suffixed_id_for_an_antigravity_hosted_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let hosted_model = |state: &HubState, session_id: &str| {
+            let list = call(state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+            list.json_value().unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == session_id)
+                .unwrap_or_else(|| panic!("no hosted session {session_id}"))["model"]
+                .clone()
+        };
+
+        let mut agy_body = spin_up_body("grace");
+        agy_body["vendor"] = json!("antigravity");
+        assert_eq!(spin_up(&state, &agy_body).status, 200);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5", "thinking_level": "high" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "antigravity");
+        assert_eq!(body["method"], "override-only");
+        assert_eq!(body["model"], "claude-sonnet-5-5");
+        assert_eq!(body["thinking_level"], "high");
+        assert_eq!(body["cli_model"], "claude-sonnet-5-5-high");
+        // The record holds the CLI id; the override stays as the operator chose it.
+        assert_eq!(
+            hosted_model(&state, "antigravity:grace"),
+            "claude-sonnet-5-5-high"
+        );
+        let held = state
+            .session_model_override("grace")
+            .or_else(|| state.session_model_override("antigravity:grace"))
+            .expect("override kept");
+        assert_eq!(held.model, "claude-sonnet-5-5");
+        assert_eq!(held.thinking_level.as_deref(), Some("high"));
+
+        // No effort given: `medium`.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "gpt-oss-120b" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(
+            resp.json_value().unwrap()["cli_model"],
+            "gpt-oss-120b-medium"
+        );
+        assert_eq!(
+            hosted_model(&state, "antigravity:grace"),
+            "gpt-oss-120b-medium"
+        );
+
+        // A Claude session: no `cli_model`, and the stored model is the raw one.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/claude:ada/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5", "thinking_level": "high" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "claude");
+        assert!(body.get("cli_model").is_none(), "{body}");
+        assert_eq!(hosted_model(&state, "claude:ada"), "claude-sonnet-5-5");
+    }
+
+    #[test]
     fn bulk_action_is_owner_only_validated_and_reports_each_session() {
         use fl_core::agent::{AgentRole, RegisterAgentArgs};
         use fl_core::store::AgentRegistry;
