@@ -43,6 +43,7 @@ fn codex_matrix_account_is_bound_to_credential_home() {
             available_models: vec![],
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         };
         let inputs = ProbeInputs {
             path_env: String::new(),
