@@ -1138,8 +1138,9 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
 
 /// Latest `metadata.generatorModel` in the steps of a `GetCascadeTrajectory` response
 /// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`, or
-/// `trajectory.steps`). A body cut off by the size cap is not valid JSON; the last
-/// `"generatorModel"` string in the text that did arrive is used then.
+/// `trajectory.steps`); with no such step, the user's pending model choice (complete JSON
+/// only). A body cut off by the size cap is not valid JSON; the last `"generatorModel"`
+/// string in the text that did arrive is used then, and `planModel` is not read.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
         return generator_model_from_json(&val);
@@ -1160,13 +1161,32 @@ fn parse_agy_generator_model(body: &str) -> Option<String> {
     latest
 }
 
+/// Where a `GetCascadeTrajectory` response keeps the model the user picked for the next turn,
+/// in order of precedence. A new conversation has no step yet, so this is the only place that
+/// names its model.
+const AGY_PENDING_MODEL_POINTERS: [&str; 2] = [
+    "/userInput/userConfig/plannerConfig/planModel",
+    "/userInput/lastUserConfig/plannerConfig/planModel",
+];
+
+/// The model of a complete trajectory body: the latest step's `metadata.generatorModel`, else
+/// the user's pending choice (see [`AGY_PENDING_MODEL_POINTERS`]). The value is a placeholder
+/// or an effort-suffixed id.
 fn generator_model_from_json(val: &Value) -> Option<String> {
     val.pointer("/steps")
-        .or_else(|| val.pointer("/trajectory/steps"))?
-        .as_array()?
-        .iter()
-        .rev()
-        .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+        .or_else(|| val.pointer("/trajectory/steps"))
+        .and_then(Value::as_array)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .rev()
+                .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+        })
+        .or_else(|| {
+            AGY_PENDING_MODEL_POINTERS
+                .iter()
+                .find_map(|pointer| non_empty_str(val.pointer(pointer)))
+        })
 }
 
 /// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
@@ -1189,8 +1209,11 @@ pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<Strin
     (model_id.to_string(), None)
 }
 
-/// Match a trajectory placeholder (then the config's default placeholder) against the
-/// configured models. `available_models` lists each base id once, in config order.
+/// Match the trajectory's model (then the config's default placeholder) against the
+/// configured models. The trajectory value is a placeholder, or an effort-suffixed model id
+/// (`claude-sonnet-5-5-high`) as the user's pending choice can be; an id the config does not
+/// list still keeps its base model and effort. A `MODEL_` value the config does not know is
+/// skipped. `available_models` lists each base id once, in config order.
 fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) -> SessionModelInfo {
     let mut available_models: Vec<String> = Vec::new();
     for entry in &config.models {
@@ -1199,20 +1222,24 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
             available_models.push(base);
         }
     }
+    let by_config = |wanted: &str| {
+        config.models.iter().find(|entry| {
+            entry.placeholder.as_deref() == Some(wanted)
+                || entry.model_id.eq_ignore_ascii_case(wanted)
+        })
+    };
     let matched = [placeholder, config.default_placeholder.as_deref()]
         .into_iter()
         .flatten()
-        .find_map(|wanted| {
-            config
-                .models
-                .iter()
-                .find(|entry| entry.placeholder.as_deref() == Some(wanted))
+        .find_map(|wanted| match by_config(wanted) {
+            Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
+            None if !wanted.starts_with("MODEL_") => {
+                Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+            }
+            None => None,
         });
     let (model, thinking_level) = match matched {
-        Some(entry) => {
-            let (base, level) = split_agy_thinking_suffix(&entry.model_id);
-            (Some(base), level)
-        }
+        Some((base, level)) => (Some(base), level),
         None => (None, None),
     };
     SessionModelInfo {
@@ -6173,6 +6200,175 @@ mod tests {
             Some("MODEL_PLACEHOLDER_M417")
         );
         assert!(parse_agy_generator_model("garbage").is_none());
+    }
+
+    /// A model config that names the placeholders a trajectory's pending choice can carry.
+    const AGY_PENDING_CONFIG_FIXTURE: &str = r#"{
+        "clientModelConfigs": [
+            {"modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M26"}},
+            {"modelId":"claude-sonnet-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M39"}},
+            {"modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"}},
+            {"modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}},
+            {"modelId":"gpt-oss-120b-medium","modelOrAlias":{"model":"MODEL_OPENAI_GPT_OSS_120B_MEDIUM"}}
+        ],
+        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}}
+    }"#;
+
+    fn plan_model_json(user: Option<&str>, last: Option<&str>) -> String {
+        let mut input = serde_json::Map::new();
+        for (key, value) in [("userConfig", user), ("lastUserConfig", last)] {
+            if let Some(value) = value {
+                input.insert(
+                    key.into(),
+                    serde_json::json!({ "plannerConfig": { "planModel": value } }),
+                );
+            }
+        }
+        serde_json::json!({ "userInput": input }).to_string()
+    }
+
+    #[test]
+    fn agy_trajectory_without_a_step_model_falls_back_to_the_pending_plan_model() {
+        // No steps array at all: a new conversation.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(Some("MODEL_PLACEHOLDER_M39"), None))
+                .as_deref(),
+            Some("MODEL_PLACEHOLDER_M39")
+        );
+        // userConfig wins over lastUserConfig.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(
+                Some("MODEL_PLACEHOLDER_M39"),
+                Some("MODEL_PLACEHOLDER_M26")
+            ))
+            .as_deref(),
+            Some("MODEL_PLACEHOLDER_M39")
+        );
+        // Only lastUserConfig.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(None, Some("MODEL_PLACEHOLDER_M26")))
+                .as_deref(),
+            Some("MODEL_PLACEHOLDER_M26")
+        );
+        // An empty or blank userConfig does not hide lastUserConfig.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(Some("  "), Some("claude-sonnet-5-5-high")))
+                .as_deref(),
+            Some("claude-sonnet-5-5-high")
+        );
+        // The value is trimmed.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(Some(" gpt-oss-120b-medium "), None))
+                .as_deref(),
+            Some("gpt-oss-120b-medium")
+        );
+        // Empty or blank names no model.
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(Some(""), None)),
+            None
+        );
+        assert_eq!(
+            parse_agy_generator_model(&plan_model_json(Some("   "), Some(""))),
+            None
+        );
+        assert_eq!(
+            parse_agy_generator_model(r#"{"userInput":{"userConfig":{"plannerConfig":{}}}}"#),
+            None
+        );
+        // Not a string.
+        assert_eq!(
+            parse_agy_generator_model(
+                r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":7}}}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn agy_step_model_wins_over_the_pending_plan_model() {
+        let plan = r#""userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}},"lastUserConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M26"}}}"#;
+        // Wrapped as trajectory.steps, and as root steps.
+        for body in [
+            format!(
+                r#"{{"trajectory":{{"steps":[{{"metadata":{{"generatorModel":"MODEL_PLACEHOLDER_M404"}}}}]}},{plan}}}"#
+            ),
+            format!(
+                r#"{{"steps":[{{"metadata":{{"generatorModel":"MODEL_PLACEHOLDER_M404"}}}}],{plan}}}"#
+            ),
+        ] {
+            assert_eq!(
+                parse_agy_generator_model(&body).as_deref(),
+                Some("MODEL_PLACEHOLDER_M404"),
+                "{body}"
+            );
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                Some("MODEL_PLACEHOLDER_M404")
+            );
+        }
+        // Steps present but none names a model: the pending choice is used.
+        for body in [
+            format!(
+                r#"{{"trajectory":{{"steps":[{{"metadata":{{}}}},{{"type":"USER_INPUT"}}]}},{plan}}}"#
+            ),
+            format!(r#"{{"steps":[],{plan}}}"#),
+            format!(r#"{{"trajectory":{{}},{plan}}}"#),
+        ] {
+            assert_eq!(
+                parse_agy_generator_model(&body).as_deref(),
+                Some("MODEL_PLACEHOLDER_M39"),
+                "{body}"
+            );
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                Some("MODEL_PLACEHOLDER_M39")
+            );
+        }
+    }
+
+    #[test]
+    fn agy_cut_off_bodies_ignore_the_pending_plan_model() {
+        // The string scan is for the tail-steps call; it never reads planModel.
+        let cut = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}},"trajectory":{"steps":[{"metadata":{"generatorMo"#;
+        assert_eq!(parse_agy_generator_model(cut), None);
+        assert_eq!(parse_agy_complete_generator_model(cut), None);
+        let cut_with_step = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}},"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M404"}},{"metadata":{"generatorMo"#;
+        assert_eq!(
+            parse_agy_generator_model(cut_with_step).as_deref(),
+            Some("MODEL_PLACEHOLDER_M404")
+        );
+        assert_eq!(parse_agy_complete_generator_model(cut_with_step), None);
+    }
+
+    #[test]
+    fn agy_pending_plan_model_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+        let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
+        for (value, model, level) in [
+            // Placeholders come from the model config.
+            ("MODEL_PLACEHOLDER_M26", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M39", "claude-sonnet-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M404", "claude-opus-5-5", Some("low")),
+            ("MODEL_PLACEHOLDER_M405", "gemini-3.8-flash", Some("medium")),
+            (
+                "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+                "gpt-oss-120b",
+                Some("medium"),
+            ),
+            // Effort-suffixed ids, in the config or not, keep their effort.
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
+            ("gemini-4-argon-medium", "gemini-4-argon", Some("medium")),
+            ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
+            ("Claude-Sonnet-5-5-HIGH", "claude-sonnet-5-5", Some("high")),
+            ("claude-opus-5-5-low", "claude-opus-5-5", Some("low")),
+        ] {
+            let info = resolve_agy_model_info(&config, Some(value));
+            assert_eq!(info.model.as_deref(), Some(model), "{value}");
+            assert_eq!(info.thinking_level.as_deref(), level, "{value}");
+        }
+        // An unknown placeholder still falls back to the config default.
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M9999"));
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
     }
 
     #[test]
