@@ -6,20 +6,41 @@
 //! 1. Scan the host and save the route table, so an active agent's route is registered from its
 //!    own session identity (transcript first, see `fl_wire::identity::resolve_persona`).
 //! 2. For every restored pane that runs a vendor CLI, take the persona from the pane's tmux
-//!    session name (never from an inherited `AGENT_PERSONA`). A persona that is not an active
+//!    session name (never from an inherited `AGENT_PERSONA`), or, in the shared Muse session,
+//!    from the pane's window name. A persona that is not an active
 //!    agent (retired, or not in the registry) gets no route: its route is dropped from the route
 //!    table, and the pane is reported once as a `session.restore_orphan` event. The pane is not
 //!    killed.
-//! 3. Send each active agent whose route is live one `system` message, "Host restarted", once per
-//!    boot. The boot is the host's `boot_id`; the agents already told are kept in a runtime state
-//!    entry ([`EPOCH_SLUG`]), so a hub restart in the same boot does not send again and a new
-//!    boot does. An agent without a live route is retried by the next pass; [`run`] makes at
-//!    most [`MAX_PASSES`] passes. A notice goes out only while the host is younger than
-//!    [`NOTICE_WINDOW`], so a hub that starts long after a boot, or the first start after this
-//!    rule shipped, tells nobody.
+//! 3. Send each expected agent whose route is live one `system` message, "Host restarted", once
+//!    per boot (see below for who is expected and what live means).
+//!
+//! The boot is the host's `boot_id`; the boot record ([`EPOCH_SLUG`], a runtime state entry)
+//! holds the `expected` agents (the active agents when the record was made) and the `notified`
+//! ones, so a hub restart in the same boot does not send again and a new boot does.
+//!
+//! - A saved record with another `boot_id` proves a reboot: a new record opens, whatever the
+//!   uptime, and its `expected` agents are the active agents at that moment.
+//! - With no record at all the hub cannot tell a reboot from a first start, so the uptime decides:
+//!   a host up no longer than [`NOTICE_WINDOW`] counts as just rebooted (`expected` = the active
+//!   agents now), an older host expects nobody.
+//! - A record of the same `boot_id` keeps its `expected` list: an agent registered after the
+//!   record was made is never told.
+//!
+//! A route is live for the notice only if the pre-delivery check passes ([`undeliverable`]) and it
+//! was (re)discovered after the host booted (`updated_at` at or after boot time), or a restored
+//! vendor-CLI pane of the persona exists. A route saved before the reboot proves nothing. An
+//! agent that is not live yet is retried by the next pass.
+//!
+//! The notice is at most once: the name is saved before the send and rolled back if the send
+//! fails; a name this process sent is also kept in memory across passes.
+//!
+//! [`run`] keeps making passes until no agent is pending, tmux has answered at least once and
+//! [`MIN_WINDOW`] has passed, but never more than [`MAX_PASSES`]. The orphan check runs on every
+//! pass, so a pane restored late is still found; each orphan is reported once.
 
+use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fl_core::agent::AgentStatus;
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
@@ -30,14 +51,14 @@ use fl_core::state::{
 use fl_core::store::{AgentRegistry, MessageStore, StateStore};
 use fl_core::{VendorRegistry, VendorTransport};
 use fl_exec::stamp;
-use fl_wire::identity::normalize_persona;
+use fl_wire::identity::{RouteEntry, RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::HubState;
 use crate::lifecycle::{
-    HostedSessionRecord, RouteQuery, STATUS_DECOMMISSIONING, find_route, list_hosted_sessions,
-    remove_routes, tmux_stdout, undeliverable,
+    HostedSessionRecord, MUSE_SESSION, STATUS_DECOMMISSIONING, list_hosted_sessions, remove_routes,
+    tmux_stdout, tmux_stdout_of, undeliverable,
 };
 
 /// Runtime state entry (workspace scope) that holds the boot the hub last reconciled.
@@ -48,18 +69,23 @@ pub(crate) const NOTICE_SUBJECT: &str = "Host restarted";
 pub(crate) const NOTICE_BODY: &str = "The host restarted. Resume your task from your last handoff (`fl state handoff get ...`) and reply to confirm.";
 /// The sender of the notice, as for the hub's other system messages.
 const NOTICE_SENDER: &str = "system";
-/// A notice goes out only while the host has been up no longer than this.
+/// With no boot record, the host counts as just rebooted while it has been up no longer than this.
 pub(crate) const NOTICE_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Time between the passes of [`run`].
 pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// Most passes [`run`] makes, so a route that never comes up is not waited on for ever.
 pub(crate) const MAX_PASSES: u32 = 20;
+/// [`run`] does not stop before this much time has passed, even when nothing is pending, so a
+/// pane that tmux restores late is still found.
+pub(crate) const MIN_WINDOW: Duration = Duration::from_secs(60);
 
 /// A tmux pane the host runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pane {
     pub(crate) session: String,
     pub(crate) pane_id: String,
+    /// `window_name`.
+    pub(crate) window: String,
     /// `pane_current_command`.
     pub(crate) command: String,
     /// `pane_start_command`.
@@ -72,17 +98,23 @@ pub(crate) trait PaneSource {
     fn panes(&self) -> Option<Vec<Pane>>;
 }
 
-/// The host's tmux (`FL_WIRE_TMUX_BIN`, else `tmux`).
-pub(crate) struct TmuxPanes;
+/// The host's tmux: the binary `bin`, else `FL_WIRE_TMUX_BIN`, else `tmux`. Only lists panes.
+#[derive(Default)]
+pub(crate) struct TmuxPanes {
+    pub(crate) bin: Option<std::path::PathBuf>,
+}
+
+/// The `list-panes` format [`parse_panes`] reads.
+pub(crate) const PANE_FORMAT: &str =
+    "#{session_name}\t#{pane_id}\t#{window_name}\t#{pane_current_command}\t#{pane_start_command}";
 
 impl PaneSource for TmuxPanes {
     fn panes(&self) -> Option<Vec<Pane>> {
-        let out = tmux_stdout(&[
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_id}\t#{pane_current_command}\t#{pane_start_command}",
-        ])?;
+        let args = ["list-panes", "-a", "-F", PANE_FORMAT];
+        let out = match &self.bin {
+            Some(bin) => tmux_stdout_of(bin, &args)?,
+            None => tmux_stdout(&args)?,
+        };
         Some(parse_panes(&out))
     }
 }
@@ -90,11 +122,12 @@ impl PaneSource for TmuxPanes {
 pub(crate) fn parse_panes(text: &str) -> Vec<Pane> {
     text.lines()
         .filter_map(|line| {
-            let mut f = line.splitn(4, '\t');
+            let mut f = line.splitn(5, '\t');
             let session = f.next().filter(|s| !s.is_empty())?;
             Some(Pane {
                 session: session.to_string(),
                 pane_id: f.next().unwrap_or_default().to_string(),
+                window: f.next().unwrap_or_default().to_string(),
                 command: f.next().unwrap_or_default().to_string(),
                 start_command: f.next().unwrap_or_default().to_string(),
             })
@@ -131,7 +164,10 @@ impl Host {
 pub(crate) struct OrphanPane {
     pub(crate) session: String,
     pub(crate) pane_id: String,
-    /// The persona the session name stands for, when it is a valid one.
+    /// The tmux window of the pane (the persona's window in the shared Muse session).
+    #[serde(default)]
+    pub(crate) window: String,
+    /// The persona the pane stands for, when it is a valid one.
     pub(crate) persona: Option<String>,
     /// `retired` or `unknown`.
     pub(crate) reason: String,
@@ -143,6 +179,9 @@ pub(crate) struct OrphanPane {
 pub(crate) struct EpochRecord {
     pub(crate) boot_id: String,
     pub(crate) started_at_ms: u64,
+    /// The active personas owed the notice in this boot, fixed when the record was made.
+    #[serde(default)]
+    pub(crate) expected: Vec<String>,
     /// Personas already sent the notice in this boot.
     #[serde(default)]
     pub(crate) notified: Vec<String>,
@@ -158,8 +197,24 @@ pub(crate) struct Report {
     pub(crate) orphans: Vec<OrphanPane>,
     /// Personas sent the notice by this pass.
     pub(crate) notified: Vec<String>,
-    /// Active personas still owed the notice (no live route yet).
+    /// Expected personas still owed the notice (no live route yet).
     pub(crate) pending: Vec<String>,
+    /// Whether tmux answered the pane listing in this pass.
+    pub(crate) tmux_answered: bool,
+}
+
+/// What a run of passes remembers between them, so a failed store write never resends.
+#[derive(Debug, Default)]
+pub(crate) struct Memory {
+    pub(crate) boot_id: Option<String>,
+    /// Personas this process sent the notice to in the boot `boot_id`.
+    pub(crate) notified: BTreeSet<String>,
+    /// Test hook: every save of a record that lists this persona as notified fails.
+    #[cfg(test)]
+    pub(crate) fail_save_notified: Option<String>,
+    /// Test hook: this many sends fail.
+    #[cfg(test)]
+    pub(crate) fail_sends: u32,
 }
 
 pub(crate) fn vendor_binaries() -> Vec<String> {
@@ -244,11 +299,75 @@ fn send_notice<S: MessageStore + AgentRegistry>(store: &S, persona: &str) -> Res
         .map_err(|e| e.to_string())
 }
 
-/// One reconciliation pass (see the module doc). An `Err` is a store failure; the caller logs it.
+impl Memory {
+    /// Test hook: whether this send is to fail.
+    fn take_send_failure(&mut self) -> bool {
+        #[cfg(test)]
+        if self.fail_sends > 0 {
+            self.fail_sends -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// Whose pane this is.
+enum PaneOwner {
+    /// The pane cannot be tied to one persona (a pane of the shared Muse session with no window
+    /// name): it is neither reconciled nor reported.
+    Unknown,
+    /// The persona the pane stands for; `None` when its name is not a valid persona.
+    Persona(Option<String>),
+}
+
+/// The persona of a pane: its tmux session name, except in the shared Muse session, where every
+/// agent has a window named by its persona and the session name stands for nobody.
+fn pane_owner(pane: &Pane) -> PaneOwner {
+    if pane.session.eq_ignore_ascii_case(MUSE_SESSION) {
+        return match pane.window.trim() {
+            "" => PaneOwner::Unknown,
+            window => PaneOwner::Persona(normalize_persona(window)),
+        };
+    }
+    PaneOwner::Persona(normalize_persona(&pane.session))
+}
+
+/// Whether the saved route entry of an agent proves a session that is up after this boot: the
+/// pre-delivery check passes, and the route was (re)discovered after the host booted or a
+/// restored vendor-CLI pane of the persona exists.
+fn route_is_live(entry: &RouteEntry, boot_ms: Option<u64>, pane_present: bool) -> bool {
+    if undeliverable(&entry.route).is_some() {
+        return false;
+    }
+    pane_present || boot_ms.is_some_and(|boot| entry.updated_at.unix_millis() >= boot)
+}
+
+/// The expected personas of a new record: the active agents now.
+fn active_names(agents: &[fl_core::agent::AgentRecord]) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|a| a.status == AgentStatus::Active)
+        .map(|a| a.name_key.to_ascii_lowercase())
+        .collect()
+}
+
+/// One reconciliation pass with nothing remembered from an earlier one (see the module doc).
+#[cfg(test)]
 pub(crate) fn reconcile_pass(
     state: &HubState,
     host: &Host,
     panes: &dyn PaneSource,
+) -> Result<Report, String> {
+    reconcile_pass_with(state, host, panes, &mut Memory::default())
+}
+
+/// One reconciliation pass (see the module doc). An `Err` is a failure to open the store; the
+/// caller logs it. A failed save of the record is logged and never aborts the pass.
+pub(crate) fn reconcile_pass_with(
+    state: &HubState,
+    host: &Host,
+    panes: &dyn PaneSource,
+    memory: &mut Memory,
 ) -> Result<Report, String> {
     let home = state.config.home_override.as_deref();
     let (agents, hosted, mut epoch) = {
@@ -268,17 +387,27 @@ pub(crate) fn reconcile_pass(
             .any(|a| a.name_key.eq_ignore_ascii_case(name) && a.status == AgentStatus::Retired)
     };
 
-    // A new boot starts a new record: nobody has been told yet, nothing reported yet.
+    let saved_record = epoch.clone();
+    // The boot record. Another boot_id than the saved one proves a reboot, whatever the uptime.
+    // With no record the uptime is all there is to go on.
     let mut record = match (&epoch.take(), &host.boot_id) {
         (Some(saved), Some(id)) if saved.boot_id == *id => saved.clone(),
-        (_, Some(id)) => EpochRecord {
+        (saved, Some(id)) => EpochRecord {
             boot_id: id.clone(),
             started_at_ms: stamp::now().unix_millis(),
+            expected: if saved.is_some() || host.uptime.is_some_and(|u| u <= NOTICE_WINDOW) {
+                active_names(&agents)
+            } else {
+                Vec::new()
+            },
             ..EpochRecord::default()
         },
         (saved, None) => saved.clone().unwrap_or_default(),
     };
-    let before = record.clone();
+    if memory.boot_id != host.boot_id {
+        memory.boot_id.clone_from(&host.boot_id);
+        memory.notified.clear();
+    }
     let mut report = Report::default();
 
     // 1. Register the routes the restored sessions can prove from their own identity.
@@ -286,11 +415,17 @@ pub(crate) fn reconcile_pass(
     crate::discovery::invalidate_route_discovery_cache();
 
     // 2. Restored panes whose persona is not an active agent get no route.
-    if let Some(panes) = panes.panes() {
+    let listing = panes.panes();
+    report.tmux_answered = listing.is_some();
+    let mut pane_personas: Vec<String> = Vec::new();
+    if let Some(panes) = listing {
         let binaries = vendor_binaries();
         for pane in panes.iter().filter(|p| runs_vendor_cli(p, &binaries)) {
-            let persona = normalize_persona(&pane.session);
+            let PaneOwner::Persona(persona) = pane_owner(pane) else {
+                continue;
+            };
             if persona.as_deref().is_some_and(&active) {
+                pane_personas.extend(persona);
                 continue;
             }
             if let Some(persona) = &persona {
@@ -304,6 +439,7 @@ pub(crate) fn reconcile_pass(
             let orphan = OrphanPane {
                 session: pane.session.clone(),
                 pane_id: pane.pane_id.clone(),
+                window: pane.window.clone(),
                 persona,
                 reason: reason.to_string(),
                 command: pane.command.clone(),
@@ -321,6 +457,7 @@ pub(crate) fn reconcile_pass(
                 json!({
                     "boot_id": record.boot_id,
                     "session": orphan.session,
+                    "window": orphan.window,
                     "pane_id": orphan.pane_id,
                     "persona": orphan.persona,
                     "reason": orphan.reason,
@@ -332,62 +469,123 @@ pub(crate) fn reconcile_pass(
         }
     }
 
-    // 3. One notice per active agent with a live route, once per boot.
-    let notice_open = host.boot_id.is_some() && host.uptime.is_some_and(|u| u <= NOTICE_WINDOW);
-    if notice_open {
+    // 3. One notice per expected, active agent with a live route, at most once per boot.
+    if host.boot_id.is_some() {
         let skip = decommissioning(&hosted);
-        for agent in agents.iter().filter(|a| a.status == AgentStatus::Active) {
-            let name = agent.name_key.to_ascii_lowercase();
-            if record.notified.contains(&name) || skip.contains(&name) {
+        let boot_ms = host
+            .uptime
+            .map(|u| stamp::now().unix_millis().saturating_sub(millis(u)));
+        let routes = RouteTable::load(crate::discovery::route_table_path(home).as_deref());
+        for name in record.expected.clone() {
+            if record.notified.contains(&name)
+                || memory.notified.contains(&name)
+                || skip.contains(&name)
+                || !active(&name)
+            {
                 continue;
             }
-            let live = find_route(home, RouteQuery::persona(&name, &name))
-                .is_some_and(|route| undeliverable(&route).is_none());
+            let live = routes
+                .get(&name)
+                .is_some_and(|e| route_is_live(e, boot_ms, pane_personas.contains(&name)));
             if !live {
                 report.pending.push(name);
                 continue;
             }
-            let sent = {
+            // Saved before the send: a crash or a failed save after it must not send again. A
+            // name that cannot be saved is not sent; the next pass tries again.
+            record.notified.push(name.clone());
+            if let Err(e) = persist(state, &record, memory) {
+                eprintln!("hub: the host-restart notice to `{name}` was held back: {e}");
+                record.notified.retain(|n| *n != name);
+                report.pending.push(name);
+                continue;
+            }
+            let sent = if memory.take_send_failure() {
+                Err("injected send failure".to_string())
+            } else {
                 let store = state.open_store().map_err(|e| e.to_string())?;
                 send_notice(&*store, &name)
             };
             match sent {
                 Ok(()) => {
-                    record.notified.push(name.clone());
-                    // Saved at once: a hub that dies after this send must not send it again.
-                    persist(state, &record)?;
+                    memory.notified.insert(name.clone());
                     report.notified.push(name);
                 }
                 Err(e) => {
                     eprintln!("hub: the host-restart notice to `{name}` was not sent: {e}");
+                    record.notified.retain(|n| *n != name);
+                    if let Err(e) = persist(state, &record, memory) {
+                        eprintln!("hub: the notice to `{name}` stays recorded as sent: {e}");
+                    }
                     report.pending.push(name);
                 }
             }
         }
     }
 
-    if record != before {
-        persist(state, &record)?;
+    if host.boot_id.is_some()
+        && saved_record.as_ref() != Some(&record)
+        && let Err(e) = persist(state, &record, memory)
+    {
+        eprintln!("hub: the boot record was not saved: {e}");
     }
     Ok(report)
 }
 
-fn persist(state: &HubState, record: &EpochRecord) -> Result<(), String> {
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn persist(state: &HubState, record: &EpochRecord, memory: &Memory) -> Result<(), String> {
+    #[cfg(test)]
+    if memory
+        .fail_save_notified
+        .as_ref()
+        .is_some_and(|n| record.notified.contains(n))
+    {
+        return Err("injected save failure".into());
+    }
+    let _ = memory;
     let store = state.open_store().map_err(|e| e.to_string())?;
     save_epoch(&*store, record)
 }
 
-/// The hub's start-up reconciliation: a pass now, and a bounded number of further passes while
-/// an active agent's route is not live yet. Never fails the hub; a failed pass is logged.
-pub(crate) async fn run(state: HubState) {
+/// What [`run`] works on: the host, the tmux to ask and the pacing.
+pub(crate) struct Plan {
+    /// `None`: the host as it is when the run starts ([`Host::current`]).
+    pub(crate) host: Option<Host>,
+    pub(crate) panes: std::sync::Arc<dyn PaneSource + Send + Sync>,
+    pub(crate) interval: Duration,
+    pub(crate) max_passes: u32,
+    pub(crate) min_window: Duration,
+}
+
+impl Plan {
+    /// The real host and its tmux, at the production pace.
+    pub(crate) fn host() -> Self {
+        Self {
+            host: None,
+            panes: std::sync::Arc::new(TmuxPanes::default()),
+            interval: RETRY_INTERVAL,
+            max_passes: MAX_PASSES,
+            min_window: MIN_WINDOW,
+        }
+    }
+}
+
+/// The hub's start-up reconciliation: a pass now, and further passes (see the module doc) while
+/// an expected agent's route is not live, tmux has not answered, or [`MIN_WINDOW`] has not
+/// passed. Never fails the hub; a failed pass is logged.
+pub(crate) async fn run(state: HubState, plan: Plan) -> u32 {
     run_with(
         state,
-        Host::current(),
-        std::sync::Arc::new(TmuxPanes),
-        RETRY_INTERVAL,
-        MAX_PASSES,
+        plan.host.unwrap_or_else(Host::current),
+        plan.panes,
+        plan.interval,
+        plan.max_passes,
+        plan.min_window,
     )
-    .await;
+    .await
 }
 
 /// [`run`] with its inputs given; returns the number of passes made.
@@ -397,14 +595,27 @@ pub(crate) async fn run_with(
     panes: std::sync::Arc<dyn PaneSource + Send + Sync>,
     interval: Duration,
     max_passes: u32,
+    min_window: Duration,
 ) -> u32 {
+    let started = Instant::now();
+    let memory = std::sync::Arc::new(std::sync::Mutex::new(Memory::default()));
+    let mut tmux_answered = false;
     let mut made = 0;
     while made < max_passes {
         made += 1;
-        let (st, h, p) = (state.clone(), host.clone(), panes.clone());
-        match tokio::task::spawn_blocking(move || reconcile_pass(&st, &h, p.as_ref())).await {
-            Ok(Ok(report)) if report.pending.is_empty() => return made,
-            Ok(Ok(_)) => {}
+        let (st, h, p, m) = (state.clone(), host.clone(), panes.clone(), memory.clone());
+        let pass = tokio::task::spawn_blocking(move || {
+            let mut memory = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reconcile_pass_with(&st, &h, p.as_ref(), &mut memory)
+        })
+        .await;
+        match pass {
+            Ok(Ok(report)) => {
+                tmux_answered |= report.tmux_answered;
+                if report.pending.is_empty() && tmux_answered && started.elapsed() >= min_window {
+                    return made;
+                }
+            }
             Ok(Err(e)) => eprintln!("hub: boot reconciliation pass {made} failed: {e}"),
             Err(e) => eprintln!("hub: boot reconciliation pass {made} stopped: {e}"),
         }

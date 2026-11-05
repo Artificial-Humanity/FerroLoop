@@ -136,8 +136,8 @@ pub struct HubServer {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     gates: ConnectionGates,
-    /// Whether `serve` reconciles restored tmux panes and agents after a host boot.
-    boot_reconcile: bool,
+    /// Set when `serve` reconciles restored tmux panes and agents after a host boot.
+    boot_reconcile: Option<crate::boot_reconcile::Plan>,
 }
 
 impl HubServer {
@@ -154,7 +154,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
-            boot_reconcile: false,
+            boot_reconcile: None,
         })
     }
 
@@ -175,7 +175,7 @@ impl HubServer {
             shutdown_tx,
             shutdown_rx,
             gates: ConnectionGates::new(ConnectionLimits::default()),
-            boot_reconcile: false,
+            boot_reconcile: None,
         })
     }
 
@@ -192,8 +192,23 @@ impl HubServer {
     /// only the daemon (`fl hub serve`) turns it on.
     #[must_use]
     pub fn with_boot_reconcile(mut self) -> Self {
-        self.boot_reconcile = true;
+        self.boot_reconcile = Some(crate::boot_reconcile::Plan::host());
         self
+    }
+
+    /// [`Self::with_boot_reconcile`] with the host and tmux given, so a test never reads the
+    /// real ones.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_boot_reconcile_plan(mut self, plan: crate::boot_reconcile::Plan) -> Self {
+        self.boot_reconcile = Some(plan);
+        self
+    }
+
+    /// Whether [`Self::serve`] will run the boot reconciliation.
+    #[cfg(test)]
+    pub(crate) fn boot_reconcile_enabled(&self) -> bool {
+        self.boot_reconcile.is_some()
     }
 
     /// Bound local socket address (useful when `config.listen` uses port `0`).
@@ -239,9 +254,9 @@ impl HubServer {
         } = self;
         let mut acceptor = make_acceptor(listener);
         crate::artifact_dirs::ensure_startup_dirs(&state);
-        if boot_reconcile {
+        if let Some(plan) = boot_reconcile {
             // Not awaited: the reconciliation never holds up the accept loop.
-            tokio::spawn(crate::boot_reconcile::run(state.clone()));
+            tokio::spawn(crate::boot_reconcile::run(state.clone(), plan));
         }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
