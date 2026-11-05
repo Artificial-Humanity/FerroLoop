@@ -230,6 +230,11 @@ impl HubServer {
         let mut attachment_sweep_tick =
             tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
         attachment_sweep_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pr_feedback_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + crate::pr_feedback::POLL_INTERVAL,
+            crate::pr_feedback::POLL_INTERVAL,
+        );
+        pr_feedback_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Between a failed accept and the next one the loop sleeps, but only on this arm: the
         // drain, the sweep and shutdown keep running.
         let cooldown = tokio::time::sleep(Duration::ZERO);
@@ -280,6 +285,13 @@ impl HubServer {
                     let state = state.clone();
                     drop(tokio::task::spawn_blocking(move || {
                         crate::attachments::run_attachment_sweep(&state);
+                    }));
+                }
+                _ = pr_feedback_tick.tick() => {
+                    // Not awaited: a GitHub poll never holds up the accept loop.
+                    let state = state.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        crate::pr_feedback::run_poll(&state);
                     }));
                 }
                 changed = shutdown_rx.changed() => {

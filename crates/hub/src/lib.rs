@@ -20,6 +20,7 @@ pub mod lifecycle;
 mod mcp_api;
 pub mod nodes;
 mod operators;
+mod pr_feedback;
 mod records;
 pub mod runtime_matrix;
 pub mod runtime_update;
@@ -319,6 +320,10 @@ pub struct HubState {
     pub(crate) code_sidecars: Arc<fl_store::CodeSidecarCache>,
     /// Set while an attachment sweep runs, so only one runs at a time (see [`attachments`]).
     pub(crate) attachment_sweep_running: Arc<AtomicBool>,
+    /// Notices already sent for a pull request commit (see [`pr_feedback`]).
+    pub(crate) pr_feedback: Arc<Mutex<fl_github::PrFeedbackPoller>>,
+    /// Set while a pull-request feedback poll runs, so two ticks do not double-send.
+    pub(crate) pr_feedback_running: Arc<AtomicBool>,
     /// The discovery store snapshot (agent names and every attempt row) the read-only discovery
     /// endpoints share for [`DISCOVERY_SNAPSHOT_TTL`], keyed by the store path. Any request
     /// other than a `GET` or `HEAD` drops it (see [`api::handle_http_request`]).
@@ -478,6 +483,8 @@ impl HubState {
             store_backend: None,
             code_sidecars: Arc::new(fl_store::CodeSidecarCache::default()),
             attachment_sweep_running: Arc::new(AtomicBool::new(false)),
+            pr_feedback: Arc::new(Mutex::new(fl_github::PrFeedbackPoller::default())),
+            pr_feedback_running: Arc::new(AtomicBool::new(false)),
             discovery_snapshots: Arc::new(discovery::TtlCache::new(DISCOVERY_SNAPSHOT_TTL)),
             watch_caches: Arc::new(watch_api::WatchCaches::default()),
             mcp: Arc::default(),

@@ -499,8 +499,119 @@ pub fn merge_pr(
         })
 }
 
+/// Open pull requests (`GET /repos/{owner}/{repo}/pulls?state=open`).
+pub fn list_open_prs(client: &Client, repo: &str) -> Result<Vec<PullRequestView>, StoreError> {
+    let items = get_paginated(
+        client,
+        &format!("/repos/{repo}/pulls?state=open&per_page=100"),
+    )?;
+    let mut prs = Vec::with_capacity(items.len());
+    for item in items {
+        let pr = PullRequestView::from_github_json(&item)?;
+        if pr.state.eq_ignore_ascii_case("open") && !pr.merged {
+            prs.push(pr);
+        }
+    }
+    Ok(prs)
+}
+
+/// How many check-run pages one commit may have. Past this the listing fails
+/// closed rather than silently dropping a later page.
+const MAX_CHECK_PAGES: usize = 10;
+
+/// Check runs for one commit (`GET /repos/{owner}/{repo}/commits/{sha}/check-runs`).
+pub fn list_check_runs(
+    client: &Client,
+    repo: &str,
+    sha: &str,
+) -> Result<Vec<crate::feedback::PrCheckFact>, StoreError> {
+    let mut path = format!("/repos/{repo}/commits/{sha}/check-runs?per_page=100");
+    let mut runs = Vec::new();
+    for _ in 0..MAX_CHECK_PAGES {
+        let reply = client.send(Method::Get, &path, None)?;
+        if reply.status != 200 {
+            return Err(StoreError::Backend(format!(
+                "GitHub answered {} when listing check runs for `{sha}` on `{repo}`",
+                reply.status
+            )));
+        }
+        let page = reply
+            .body
+            .get("check_runs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "GitHub listed check runs for `{sha}` on `{repo}` without `check_runs`"
+                ))
+            })?;
+        for item in page {
+            runs.push(parse_check_run(item)?);
+        }
+        match reply.next_link() {
+            Some(next) => path = next.to_string(),
+            None => return Ok(runs),
+        }
+    }
+    Err(StoreError::Backend(format!(
+        "GitHub returned more than {MAX_CHECK_PAGES} pages of check runs for `{sha}` on `{repo}`"
+    )))
+}
+
+fn parse_check_run(v: &Value) -> Result<crate::feedback::PrCheckFact, StoreError> {
+    let id = v
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| StoreError::Backend("GitHub sent a check run without `id`".into()))?;
+    let name = v
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::Backend(format!("GitHub sent check run {id} without `name`")))?
+        .to_string();
+    let conclusion = v
+        .get("conclusion")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let details_url = v
+        .get("details_url")
+        .or_else(|| v.get("html_url"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let head_sha = v
+        .get("head_sha")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(crate::feedback::PrCheckFact {
+        id,
+        name,
+        conclusion,
+        details_url,
+        head_sha,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn a_check_run_keeps_its_conclusion_and_details_url() {
+        let run = parse_check_run(&json!({
+            "id": 15,
+            "name": "test, clippy, fmt",
+            "conclusion": "failure",
+            "details_url": "https://example.test/runs/15",
+            "head_sha": "abc"
+        }))
+        .unwrap();
+        assert_eq!(run.id, 15);
+        assert_eq!(run.conclusion, "failure");
+        assert_eq!(run.details_url, "https://example.test/runs/15");
+        assert_eq!(run.head_sha, "abc");
+    }
+
     #[test]
     fn a_renamed_file_lists_its_old_path_too() {
         let items = vec![serde_json::json!({
