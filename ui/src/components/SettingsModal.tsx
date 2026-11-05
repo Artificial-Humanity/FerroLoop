@@ -1440,7 +1440,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     Record<string, ProjectArtifactsDirInfo>
   >({});
   const [artifactsDirModalTarget, setArtifactsDirModalTarget] = useState<
-    { scope: "system" } | { scope: "project"; project: string } | null
+    | { scope: "system" }
+    | { scope: "project"; project: string; label: string }
+    | null
   >(null);
   const [artifactsDirNewPath, setArtifactsDirNewPath] = useState("");
   const [artifactsDirMigrate, setArtifactsDirMigrate] = useState(true);
@@ -2170,13 +2172,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setArtifactsDirModalTarget({ scope: "system" });
   };
 
-  const openProjectArtifactsDirModal = (projectName: string) => {
+  const openProjectArtifactsDirModal = (projectName: string, label: string) => {
     const info = getProjectArtifactsDirState(projectName);
     setArtifactsDirModalError(null);
     setProjectArtifactsDirStatus(null);
     setArtifactsDirNewPath(info.effectiveDir);
     setArtifactsDirMigrate(true);
-    setArtifactsDirModalTarget({ scope: "project", project: projectName });
+    setArtifactsDirModalTarget({
+      scope: "project",
+      project: projectName,
+      label,
+    });
   };
 
   const handleConfirmChangeArtifactsDir = async (
@@ -2241,6 +2247,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setArtifactsDirModalTarget(null);
       } else {
         const projectName = artifactsDirModalTarget.project;
+        const projectLabel = artifactsDirModalTarget.label;
         const info = getProjectArtifactsDirState(projectName);
         const nextPathPayload =
           trimmed === "" || trimmed === info.defaultDir ? null : trimmed;
@@ -2284,8 +2291,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setProjectArtifactsDirStatus({
           slug: info.slug,
           message: artifactsDirMigrate
-            ? `Updated ${projectName} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
-            : `Updated ${projectName} artifacts directory to ${nextEffective}.`,
+            ? `Updated ${projectLabel} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
+            : `Updated ${projectLabel} artifacts directory to ${nextEffective}.`,
         });
         setArtifactsDirModalTarget(null);
       }
@@ -2640,6 +2647,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {initialProject && (
           <ProjectArtifactsDirRow
             slug={resolvedProjectFilter}
+            displayName={resolvedProjectFilter}
             artifactsDir={projectArtifactsDirProps}
           />
         )}
@@ -10202,6 +10210,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {artifactsDirModalTarget && (() => {
           const isSystem = artifactsDirModalTarget.scope === "system";
           const projectName = !isSystem ? artifactsDirModalTarget.project : null;
+          const projectLabel = !isSystem ? artifactsDirModalTarget.label : null;
           const projectInfo = projectName
             ? getProjectArtifactsDirState(projectName)
             : null;
@@ -10269,7 +10278,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {isSystem
                       ? "Change System Artifacts Directory"
-                      : `Change ${projectName} Artifacts Directory`}
+                      : `Change ${projectLabel} Artifacts Directory`}
                   </strong>
                   <button
                     type="button"
@@ -10295,7 +10304,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   {isSystem
                     ? "Override the hub-wide artifacts root directory, or reset to the default [home]/artifacts path."
-                    : `Override the artifacts directory for ${projectName}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
+                    : `Override the artifacts directory for ${projectLabel}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
                 </p>
 
                 <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>

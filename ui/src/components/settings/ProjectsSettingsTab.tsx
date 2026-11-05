@@ -9,7 +9,8 @@ export interface ProjectArtifactsDirView {
 
 export interface ProjectsArtifactsDirProps {
   getState: (slug: string) => ProjectArtifactsDirView;
-  onChange: (slug: string) => void;
+  /** `slug` keys lookup and API calls; `name` is the display text for the modal and banner. */
+  onChange: (slug: string, name: string) => void;
   /** Result banner of the last change, shown on the card it belongs to. */
   status: { slug: string; message: string } | null;
 }
@@ -35,9 +36,12 @@ const BUTTON_STYLE = { fontSize: "11px", padding: "3px 8px" } as const;
 
 export function ProjectArtifactsDirRow({
   slug,
+  displayName,
   artifactsDir,
 }: {
   slug: string;
+  /** Text shown to the user for this project; defaults to the slug. */
+  displayName?: string;
   artifactsDir: ProjectsArtifactsDirProps;
 }): ReactNode {
   const info = artifactsDir.getState(slug);
@@ -112,7 +116,7 @@ export function ProjectArtifactsDirRow({
           data-testid="settings-project-change-artifacts-dir-btn"
           className="fd-btn"
           style={BUTTON_STYLE}
-          onClick={() => artifactsDir.onChange(slug)}
+          onClick={() => artifactsDir.onChange(slug, displayName ?? slug)}
         >
           Change Artifacts Directory
         </button>
@@ -166,7 +170,17 @@ function ProjectCard({
           flexWrap: "wrap",
         }}
       >
-        <strong style={{ fontSize: "13px" }}>{project.name}</strong>
+        <h3
+          style={{
+            fontSize: "13px",
+            fontWeight: 700,
+            margin: 0,
+            color: "inherit",
+            lineHeight: "inherit",
+          }}
+        >
+          {project.name}
+        </h3>
         <span className="fd-badge fd-mono" style={{ fontSize: "10.5px" }}>
           {slug}
         </span>
@@ -215,12 +229,17 @@ function ProjectCard({
         </div>
       )}
 
-      <ProjectArtifactsDirRow slug={slug} artifactsDir={props.artifactsDir} />
+      <ProjectArtifactsDirRow
+        slug={slug}
+        displayName={project.name}
+        artifactsDir={props.artifactsDir}
+      />
 
       <div style={{ display: "flex", gap: "6px", justifyContent: "flex-end" }}>
         <button
           type="button"
           data-testid={`settings-project-edit-${slug}`}
+          aria-label={`Edit ${project.name}`}
           className="fd-btn"
           style={BUTTON_STYLE}
           onClick={() => props.onEdit?.(project)}
@@ -230,6 +249,7 @@ function ProjectCard({
         <button
           type="button"
           data-testid={`settings-project-view-agents-${slug}`}
+          aria-label={`View agents for ${project.name}`}
           className="fd-btn"
           style={BUTTON_STYLE}
           onClick={() => props.onViewAgents(slug)}
@@ -239,6 +259,7 @@ function ProjectCard({
         <button
           type="button"
           data-testid={`settings-project-delete-${slug}`}
+          aria-label={`Delete ${project.name}`}
           className="fd-btn"
           style={BUTTON_STYLE}
           onClick={() => props.onDelete?.(project)}

@@ -50,6 +50,22 @@ const GROUP: ProjectSummary = {
   active_agent_count: 1,
 };
 
+const LAB: ProjectSummary = {
+  id: "research-group",
+  slug: "research-group",
+  name: "Research Group",
+  kind: "project",
+  path: "/work/research",
+  has_git: false,
+  purpose: null,
+  tracker: null,
+  store_path: null,
+  active_agent_count: 0,
+  artifacts_dir: null,
+  default_artifacts_dir: "/art/research-group",
+  effective_artifacts_dir: "/art/research-group",
+};
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -235,8 +251,8 @@ describe("Settings Projects tab", () => {
   });
 
   it("opens the change modal from the card and shows the status in that card", async () => {
-    const { client, calls } = makeClient([PLAIN, GIT], (url, method, body) => {
-      if (url.endsWith("/api/v1/projects/sonora/artifacts-dir") && method === "POST") {
+    const { client, calls } = makeClient([LAB, GIT], (url, method, body) => {
+      if (url.endsWith("/api/v1/projects/research-group/artifacts-dir") && method === "POST") {
         const b = body as { new_path: string | null };
         return json({
           artifacts_dir: b.new_path,
@@ -250,17 +266,20 @@ describe("Settings Projects tab", () => {
     });
     await renderModal(client);
     await openProjectsTab();
-    const card = screen.getByTestId("settings-project-card-sonora");
+    const card = screen.getByTestId("settings-project-card-research-group");
     fireEvent.click(
       within(card).getByTestId("settings-project-change-artifacts-dir-btn"),
     );
     const modal = screen.getByTestId("change-artifacts-dir-modal");
     expect(
       within(modal).getByTestId("change-artifacts-dir-modal-title"),
-    ).toHaveTextContent("Change sonora Artifacts Directory");
+    ).toHaveTextContent("Change Research Group Artifacts Directory");
+    expect(modal).toHaveTextContent(
+      "Override the artifacts directory for Research Group, or reset",
+    );
     fireEvent.change(
       within(modal).getByTestId("change-artifacts-dir-new-path"),
-      { target: { value: "/mnt/new/sonora" } },
+      { target: { value: "/mnt/new/research" } },
     );
     fireEvent.click(
       within(modal).getByTestId("change-artifacts-dir-migrate-checkbox"),
@@ -269,17 +288,19 @@ describe("Settings Projects tab", () => {
       within(modal).getByTestId("change-artifacts-dir-confirm-btn"),
     );
     const status = await within(card).findByTestId("project-artifacts-dir-status");
-    expect(status).toHaveTextContent("/mnt/new/sonora");
+    expect(status).toHaveTextContent(
+      "Updated Research Group artifacts directory to /mnt/new/research.",
+    );
     expect(
       screen.getAllByTestId("project-artifacts-dir-status"),
     ).toHaveLength(1);
     expect(
       calls.find(
         (c) =>
-          c.url.endsWith("/api/v1/projects/sonora/artifacts-dir") &&
+          c.url.endsWith("/api/v1/projects/research-group/artifacts-dir") &&
           c.method === "POST",
       )?.body,
-    ).toEqual({ new_path: "/mnt/new/sonora", migrate: false });
+    ).toEqual({ new_path: "/mnt/new/research", migrate: false });
   });
 
   it("shows an empty state", async () => {
@@ -309,6 +330,34 @@ describe("Settings Projects tab", () => {
     );
     // One call feeds the artifacts-dir map, one feeds the Projects tab.
     expect(gets).toHaveLength(2);
+  });
+
+  it("names the card heading and labels its buttons with the project", () => {
+    render(
+      <ProjectsSettingsTab
+        projects={[LAB]}
+        loading={false}
+        error={null}
+        onViewAgents={vi.fn()}
+        artifactsDir={{
+          getState: () => ({ effectiveDir: "/x", artifactsDir: null }),
+          onChange: vi.fn(),
+          status: null,
+        }}
+      />,
+    );
+    expect(
+      screen.getByRole("heading", { level: 3, name: "Research Group" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Edit Research Group" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Delete Research Group" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "View agents for Research Group" }),
+    ).toBeInTheDocument();
   });
 
   it("passes the project to the Edit, Delete and Create callbacks", () => {

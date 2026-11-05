@@ -538,6 +538,15 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
               },
               {
                 id: "sonora",
+                slug: "sonora",
+                name: "Sonora",
+                kind: "project",
+                path: "/work/sonora",
+                has_git: false,
+                purpose: null,
+                tracker: null,
+                store_path: null,
+                active_agent_count: 0,
                 artifacts_dir: null,
                 default_artifacts_dir:
                   "/home/lmcfarlin/.local/share/fl/artifacts/sonora",
@@ -705,7 +714,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const projModal = screen.getByTestId("change-artifacts-dir-modal");
     expect(
       within(projModal).getByTestId("change-artifacts-dir-modal-title"),
-    ).toHaveTextContent("Change sonora Artifacts Directory");
+    ).toHaveTextContent("Change Sonora Artifacts Directory");
     expect(
       (
         within(projModal).getByTestId(
@@ -729,7 +738,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       "project-artifacts-dir-status",
     );
     expect(projStatus).toHaveTextContent(
-      /Updated sonora artifacts directory to \/mnt\/nvme\/sonora-artifacts/i,
+      /Updated Sonora artifacts directory to \/mnt\/nvme\/sonora-artifacts/i,
     );
     expect(
       within(sonoraCard).getByTestId("settings-project-artifacts-dir-value"),
