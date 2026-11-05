@@ -701,10 +701,10 @@ fn a_remote_client_gets_the_servers_undelivered_with_its_sequence() {
     assert_eq!(client.get_doc("docs", "b").unwrap(), Some(json!(2)));
     assert_eq!(last_seq(&client), base + 2, "each write applied once");
 
-    // Every other server error still arrives as the server's message.
+    // Other backend errors retain the server's backend detail without an extra wrapper.
     let err = client.scan_column_table("missing", &[]).unwrap_err();
     assert!(
-        matches!(&err, StoreError::Backend(msg) if msg == "backend failure: no column table `missing`"),
+        matches!(&err, StoreError::Backend(msg) if msg == "no column table `missing`"),
         "{err:?}"
     );
 

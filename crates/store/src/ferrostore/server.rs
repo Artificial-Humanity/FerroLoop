@@ -1317,6 +1317,9 @@ fn send_reply(write: &Mutex<Box<dyn JsonIo>>, id: u64, mut body: Value) -> Resul
 /// carries its detail as `cause_backend`, so it is rebuilt as that kind.
 pub(super) fn error_value(id: u64, err: &StoreError) -> Value {
     let mut body = json!({"id": id, "ok": false, "error": err.to_string()});
+    if let StoreError::Backend(detail) = err {
+        body["backend"] = json!(detail);
+    }
     if let StoreError::Undelivered { seq, cause } = err {
         body["kind"] = json!("undelivered");
         body["seq"] = json!(seq);
@@ -1346,6 +1349,9 @@ pub(super) fn response_error(frame: &Value) -> StoreError {
             seq,
             cause: Box::new(cause),
         };
+    }
+    if let Some(detail) = frame.get("backend").and_then(Value::as_str) {
+        return StoreError::Backend(detail.to_string());
     }
     backend(
         frame

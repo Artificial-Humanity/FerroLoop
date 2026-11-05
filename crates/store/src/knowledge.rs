@@ -99,9 +99,8 @@ const FALLBACK_NOTE: &str = "knowledge index unavailable; ranked with BM25";
 /// It stores hashes only, never entry text.
 const INDEX_DOC_COLLECTION: &str = "state_vec_index";
 /// Start of the engine's error for a missing vector collection. This is the
-/// local engine's wording. A Remote engine may word it differently; its
-/// missing-collection error is then not recognised, the search fails over to
-/// BM25 and the real cause is kept in [`RankedHits::cause`].
+/// local engine's wording. Older remote servers may prefix it with one or
+/// more `backend failure: ` wrappers.
 const MISSING_COLLECTION: &str = "no vector collection";
 /// Index-document `rev` meaning "a vector may exist for this id, its revision
 /// is unknown". Outside the 53-bit range of [`stamp`], so no entry hashes to it.
@@ -632,8 +631,8 @@ fn nearest<'a>(
 /// placeholder, and that final write happens on the error path too (what
 /// succeeded is finalised, what did not keeps its placeholder, then the first
 /// error is returned). A placeholder is re-upserted or deleted by the next
-/// sync. A sensitive entry the document does not list is probed once with
-/// `get_vector` and recorded as [`CLEAN_REV`], so the probe is not repeated.
+/// sync. A sensitive entry the document does not list is probed once when
+/// the collection exists, then recorded as [`CLEAN_REV`].
 pub(crate) fn sync_index(
     ferro: &FerroStore,
     embedder: &dyn Embedder,
@@ -656,10 +655,14 @@ pub(crate) fn sync_index_batched(
     let batch = batch.max(1);
     let space = stamp(&embedder.space_id());
     let index = IndexDoc::load(ferro, collection, space)?;
+    let collection_exists = ferro.has_vector_collection(collection)?;
     let mut stats = IndexStats::default();
     // Plan: nothing is written here.
     let mut deletes: Vec<&str> = Vec::new();
     let mut upserts: Vec<(&str, u64, Vec<f32>)> = Vec::new();
+    // A missing collection at planning time can be created by another writer before we
+    // publish CLEAN_REV. Recheck and clean these IDs atomically with that publication.
+    let mut unprobed_sensitive: Vec<&str> = Vec::new();
     let mut changes: HashMap<String, u64> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
     for entry in entries {
@@ -674,7 +677,10 @@ pub(crate) fn sync_index_batched(
                 None => {
                     // Not listed: a vector from before the entry turned
                     // sensitive may still exist (lost update, crash).
-                    if missing_as_none(ferro.get_vector(collection, id))?.is_some() {
+                    if !collection_exists {
+                        unprobed_sensitive.push(id);
+                        changes.insert(id.to_string(), CLEAN_REV);
+                    } else if missing_as_none(ferro.get_vector(collection, id))?.is_some() {
                         changes.insert(id.to_string(), PENDING_REV);
                         deletes.push(id);
                     } else {
@@ -700,7 +706,13 @@ pub(crate) fn sync_index_batched(
     }
     if deletes.is_empty() && upserts.is_empty() {
         if !changes.is_empty() {
-            IndexDoc::update(ferro, collection, space, &changes)?;
+            stats.deleted += IndexDoc::update_with_cleaning(
+                ferro,
+                collection,
+                space,
+                &changes,
+                &unprobed_sensitive,
+            )?;
         }
         return Ok(stats);
     }
@@ -715,7 +727,13 @@ pub(crate) fn sync_index_batched(
         }
     }
     if changes.values().any(|rev| *rev == PENDING_REV) {
-        IndexDoc::update(ferro, collection, space, &changes)?;
+        stats.deleted += IndexDoc::update_with_cleaning(
+            ferro,
+            collection,
+            space,
+            &changes,
+            &unprobed_sensitive,
+        )?;
     }
 
     // Write. Stop at the first error but still finalise what succeeded. The
@@ -758,11 +776,15 @@ pub(crate) fn sync_index_batched(
             }
         }
     }
-    let finalised = IndexDoc::update(ferro, collection, space, &changes);
+    let finalised =
+        IndexDoc::update_with_cleaning(ferro, collection, space, &changes, &unprobed_sensitive);
     checkpoint_after_bulk(ferro, stats.written);
     match (failure, finalised) {
         (Some(err), _) | (None, Err(err)) => Err(err),
-        (None, Ok(())) => Ok(stats),
+        (None, Ok(deleted)) => {
+            stats.deleted += deleted;
+            Ok(stats)
+        }
     }
 }
 
@@ -831,18 +853,45 @@ impl IndexDoc {
     /// one transaction: no other writer commits between the read and the
     /// write, so none of its entries is lost. Ids this call did not touch keep
     /// whatever another writer recorded.
+    #[cfg(test)]
     fn update(
         ferro: &FerroStore,
         collection: &str,
         space: u64,
         changes: &HashMap<String, u64>,
     ) -> Result<(), StoreError> {
+        Self::update_with_cleaning(ferro, collection, space, changes, &[]).map(|_| ())
+    }
+
+    /// Resolve an earlier missing-collection observation in the same transaction that publishes
+    /// CLEAN_REV. A concurrent creator may have inserted one of these vectors in the meantime.
+    fn update_with_cleaning(
+        ferro: &FerroStore,
+        collection: &str,
+        space: u64,
+        changes: &HashMap<String, u64>,
+        unprobed_sensitive: &[&str],
+    ) -> Result<usize, StoreError> {
         ferro.transaction(|txn| {
             let mut fresh = Self::parse(txn.get_doc(INDEX_DOC_COLLECTION, collection), space);
+            let mut present = Vec::new();
+            if !unprobed_sensitive.is_empty() && txn.has_vector_collection(collection) {
+                // Read all IDs before staging writes: a remote transaction cannot read back
+                // vectors from a collection after it has staged a write to that collection.
+                for id in unprobed_sensitive {
+                    if txn.get_vector(collection, id)?.is_some() {
+                        present.push(*id);
+                    }
+                }
+            }
+            for id in &present {
+                txn.delete_vector(collection, id)?;
+            }
             for (id, rev) in changes {
                 fresh.revs.insert(id.clone(), *rev);
             }
-            txn.put_doc(INDEX_DOC_COLLECTION, collection, &fresh.to_json(space))
+            txn.put_doc(INDEX_DOC_COLLECTION, collection, &fresh.to_json(space))?;
+            Ok(present.len())
         })
     }
 
@@ -872,7 +921,14 @@ pub(crate) fn missing_as_none<T>(result: Result<T, StoreError>) -> Result<Option
 }
 
 fn is_missing_collection(err: &StoreError) -> bool {
-    matches!(err, StoreError::Backend(msg) if msg.starts_with(MISSING_COLLECTION))
+    let StoreError::Backend(detail) = err else {
+        return false;
+    };
+    let mut detail = detail.as_str();
+    while let Some(unwrapped) = detail.strip_prefix("backend failure: ") {
+        detail = unwrapped;
+    }
+    detail.starts_with(MISSING_COLLECTION)
 }
 
 pub(crate) fn ensure_vector_collection(
@@ -1522,6 +1578,73 @@ mod tests {
     }
 
     #[test]
+    fn remote_search_creates_vector_index_when_sensitive_entry_comes_first() {
+        let dir = TempDir::new().unwrap();
+        let socket = dir.path().join("store.sock");
+        let _server =
+            crate::ferrostore::FerroStoreServer::bind_unix(&socket, FerroStore::in_memory())
+                .unwrap();
+        let ferro = FerroStore::connect_uri(&format!("unix://{}", socket.display())).unwrap();
+        let store: AnyStore = ferro.into();
+        assert!(store.is_remote());
+        let col = vector_collection_name(default_embedder());
+        let error = store
+            .as_ferro()
+            .unwrap()
+            .get_vector(&col, "missing")
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Backend(ref detail) if detail.starts_with(MISSING_COLLECTION)),
+            "{error:?}"
+        );
+        let mut sensitive = spec("secret", "private text", "hidden", 1);
+        sensitive.sensitive = true;
+        let entries = vec![
+            put_spec(&store, sensitive),
+            put(&store, "public", "build cache", "cache index", 2),
+        ];
+        let ranked = rank_state_entries(&store, &entries, "build cache", None, None, 10);
+        assert_eq!(ranked.mode, SearchMode::Knowledge, "{ranked:?}");
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .has_vector_collection(&col)
+                .unwrap()
+        );
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .get_vector(&col, entries[1].id.as_str())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .as_ferro()
+                .unwrap()
+                .get_vector(&col, entries[0].id.as_str())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_remote_missing_collection_prefixes_are_recognized() {
+        for detail in [
+            "no vector collection `x`",
+            "backend failure: no vector collection `x`",
+            "backend failure: backend failure: no vector collection `x`",
+        ] {
+            assert!(
+                is_missing_collection(&StoreError::Backend(detail.into())),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
     fn the_engines_missing_collection_message_is_pinned() {
         let d = TempDir::new().unwrap();
         let store = open_ferro(&d);
@@ -1655,6 +1778,80 @@ mod tests {
 
     fn refs(entries: &[StateEntry]) -> Vec<&StateEntry> {
         entries.iter().collect()
+    }
+
+    #[test]
+    fn a_collection_created_during_planning_cannot_hide_a_sensitive_vector() {
+        struct Interleaved<'a> {
+            ferro: &'a FerroStore,
+            collection: String,
+            secret_id: String,
+            called: std::cell::Cell<bool>,
+        }
+        impl Embedder for Interleaved<'_> {
+            fn dim(&self) -> usize {
+                default_embedder().dim()
+            }
+            fn space_id(&self) -> String {
+                default_embedder().space_id()
+            }
+            fn embed(&self, text: &str) -> Vec<f32> {
+                if !self.called.replace(true) {
+                    ensure_vector_collection(self.ferro, default_embedder(), &self.collection)
+                        .unwrap();
+                    let values = default_embedder().embed("old private content");
+                    self.ferro
+                        .upsert_vector(&self.collection, &self.secret_id, &values, None)
+                        .unwrap();
+                }
+                default_embedder().embed(text)
+            }
+        }
+        fn exercise(store: &AnyStore) {
+            let ferro = store.as_ferro().unwrap();
+            let mut secret = spec("secret", "private", "secret", 1);
+            secret.sensitive = true;
+            let entries = vec![
+                put_spec(store, secret),
+                put(store, "public", "public cache", "cache", 2),
+            ];
+            let collection = vector_collection_name(default_embedder());
+            let embedder = Interleaved {
+                ferro,
+                collection: collection.clone(),
+                secret_id: entries[0].id.as_str().to_string(),
+                called: std::cell::Cell::new(false),
+            };
+            assert!(!ferro.has_vector_collection(&collection).unwrap());
+            sync_index(ferro, &embedder, &collection, &refs(&entries), 100).unwrap();
+            assert!(
+                ferro
+                    .get_vector(&collection, entries[0].id.as_str())
+                    .unwrap()
+                    .is_none(),
+                "sensitive vector was retained"
+            );
+            let doc = IndexDoc::load(ferro, &collection, stamp(&embedder.space_id())).unwrap();
+            assert_eq!(doc.revs.get(entries[0].id.as_str()), Some(&CLEAN_REV));
+            sync_index(ferro, &embedder, &collection, &refs(&entries), 100).unwrap();
+            assert!(
+                ferro
+                    .get_vector(&collection, entries[0].id.as_str())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let dir = TempDir::new().unwrap();
+        exercise(&open_ferro(&dir));
+        let socket = dir.path().join("race.sock");
+        let _server =
+            crate::ferrostore::FerroStoreServer::bind_unix(&socket, FerroStore::in_memory())
+                .unwrap();
+        let remote: AnyStore = FerroStore::connect_uri(&format!("unix://{}", socket.display()))
+            .unwrap()
+            .into();
+        assert!(remote.is_remote());
+        exercise(&remote);
     }
 
     fn flip_sensitive(store: &AnyStore, entry: &StateEntry) -> StateEntry {
