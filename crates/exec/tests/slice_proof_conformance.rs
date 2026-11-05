@@ -466,7 +466,8 @@ fn bound_cost_is_rounded_up_to_whole_micros() {
     assert_eq!(bound.max_cost_micros, 130);
 }
 
-/// Every class of model call that the step factor of a P-B proof must include.
+/// Every class of model call that the step factor of a P-B proof is required to include
+/// (a TDD requirement; no production code checks it yet, see the test below).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepClass {
     Model,
@@ -504,9 +505,10 @@ impl StepCount {
         self.by_class.iter().sum()
     }
 }
-/// Test-local classifier (the production code has no step-counting notion yet). Every
-/// usage-bearing line is one billed step; each must carry a known class tag, so a class the
-/// counter does not know is an error rather than an uncounted step.
+/// Test-local classifier. The production code has no step-counting notion yet, and the
+/// `step_class` tag it reads is invented by this file's fake streams, not emitted by any vendor.
+/// Every usage-bearing line is one billed step; each must carry a known class tag, so a class
+/// this helper does not know is an error here rather than an uncounted step.
 fn count_steps(stream: &str) -> Result<StepCount, String> {
     let mut count = StepCount::default();
     for line in stream.lines().filter(|l| !l.trim().is_empty()) {
@@ -525,11 +527,18 @@ fn count_steps(stream: &str) -> Result<StepCount, String> {
     Ok(count)
 }
 
-/// A forced-compaction, subagent, retry and planner stream. The step factor of the proof must
-/// count all of them: the harness bills every usage line, so a counter that skips a class
-/// under-reports both the step total and the token sum the harness observed.
+/// A stream of subagent, compaction, retry and planner usage lines. This pins only two
+/// production-touching facts: the harness sums every `usage` line it sees
+/// (`counted.tokens == out.tokens_in + out.tokens_out`), and `evaluate_slice_bounds` arithmetic
+/// gives a bound sized from model-only steps that this billed usage exceeds.
+///
+/// It does NOT test a production step counter: `count_steps` and `StepClass` are test-local and
+/// the class tags are invented by this stream. That the step factor must include every class
+/// (subagent, retries, auto-compaction, planner calls) is a TDD requirement with no production
+/// check yet; nothing here enforces it.
 #[tokio::test]
-async fn subagent_compaction_retry_and_planner_steps_are_counted_in_the_step_factor() {
+async fn usage_from_subagent_compaction_retry_planner_lines_is_summed_by_the_harness_and_exceeds_a_model_only_bound()
+ {
     let stream = [
         r#"{"step_class":"planner","text":"plan","usage":{"input_tokens":20,"output_tokens":5}}"#,
         r#"{"step_class":"model","text":"a","usage":{"input_tokens":40,"output_tokens":10}}"#,
@@ -564,13 +573,14 @@ async fn subagent_compaction_retry_and_planner_steps_are_counted_in_the_step_fac
         .await
         .unwrap();
     assert_eq!(out.status, AttemptStatus::Completed, "{out:?}");
-    // The counter agrees with what the harness actually saw billed: nothing hidden, nothing extra.
+    // The test-local tally agrees with the usage the harness summed: nothing hidden, nothing extra.
     assert_eq!(counted.tokens, out.tokens_in + out.tokens_out);
     assert!(out.tokens_in + out.tokens_out <= bound.max_tokens);
     assert!(out.cost_usd_micros <= bound.max_cost_micros);
 
-    // A step factor sized from the plain model steps alone is voided by this stream: the same
-    // billed usage exceeds that smaller proof's token and cost bound.
+    // Bound arithmetic only: a proof whose step factor counts just the plain model steps yields a
+    // smaller bound, and this stream's billed usage exceeds it. No production check rejects or
+    // voids such a proof yet.
     let plain = counted.by_class[0];
     assert_eq!(plain, 2);
     let small =
@@ -579,7 +589,7 @@ async fn subagent_compaction_retry_and_planner_steps_are_counted_in_the_step_fac
 }
 
 #[test]
-fn an_unclassified_step_is_an_error_not_an_uncounted_step() {
+fn the_test_local_step_classifier_errors_on_an_unknown_or_missing_class_tag() {
     let hidden =
         r#"{"step_class":"hidden-reasoning","usage":{"input_tokens":1,"output_tokens":1}}"#;
     assert!(count_steps(hidden).unwrap_err().contains("unclassified"));
@@ -612,7 +622,14 @@ cp "$FAKE_RECEIPT" "$FAKE_MARKER"
 printf '%s\n' '{"text":"ok","usage":{"input_tokens":40,"output_tokens":10}}'"#,
             );
             ready.fetch_add(1, Ordering::SeqCst);
+            // Bounded barrier: a racer that died before `fetch_add` must fail this test, not hang it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while ready.load(Ordering::SeqCst) < RACERS {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "spin-barrier timed out after 10s: only {} of {RACERS} racers arrived",
+                    ready.load(Ordering::SeqCst)
+                );
                 tokio::task::yield_now().await;
             }
             let result = admit_then_run(&[arithmetic()], &input(), &ledger, &dir, &bin).await;

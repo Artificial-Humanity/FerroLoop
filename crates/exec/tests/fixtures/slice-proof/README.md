@@ -31,8 +31,10 @@ are bounded.
 
 `crates/exec/tests/slice_proof_live.rs` holds one `#[ignore]` test per adapter (claude, muse,
 codex, antigravity, grok, api). It is a skeleton: it spawns no vendor binary and makes no
-network call. Without `FL_LIVE_PROOF=1` each test prints a skip message and returns, so
-`cargo test` and `cargo test -p fl-exec --test slice_proof_live -- --ignored` never spend.
+network call. Without `FL_LIVE_PROOF=1` each test returns immediately, so `cargo test` and
+`cargo test -p fl-exec --test slice_proof_live -- --ignored` never spend. A skipped live test
+reports `ok` (not `ignored`); its skip message is printed to stderr and is visible only with
+`--nocapture`. A run without `FL_LIVE_PROOF=1` proves nothing.
 
 Only the Owner opts in, under an explicit experiment allocation that is separate from any
 admission budget (the whole-matrix spend budget is a placeholder in the file header):

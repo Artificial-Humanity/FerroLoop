@@ -1,7 +1,9 @@
 //! L3 live whole-slice proof experiments (Record #83 Track C). SKELETON ONLY.
 //!
 //! OWNER-RUN ONLY, NEVER CI. Every test here is `#[ignore]` and, even when run with
-//! `--ignored`, returns immediately unless `FL_LIVE_PROOF=1`. These live tests are meant to
+//! `--ignored`, returns immediately unless `FL_LIVE_PROOF=1`. A skipped live test therefore
+//! reports `ok` (not `ignored`); its skip message goes to stderr and is visible only with
+//! `--nocapture`. A run without `FL_LIVE_PROOF=1` proves nothing. These live tests are meant to
 //! spend real (tiny) money and tokens; this file in its present form spawns no vendor binary
 //! and makes no network call. The live step is `unimplemented!()` behind the gate so that
 //! `FL_LIVE_PROOF=1 cargo test -p fl-exec --test slice_proof_live -- --ignored` fails loudly
