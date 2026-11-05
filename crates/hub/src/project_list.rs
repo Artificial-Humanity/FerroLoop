@@ -30,8 +30,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::project_init::{
     CONFIG_LOCK, ConfigEntry, Credential, InitError, InitPaths, ProjectKind, Tracker,
     canonical_root, check_store_dir_overlap, checked_display_name, checked_github, checked_purpose,
-    config_entries, conflict, failed, has_git, invalid, read_config, same_root, slug_from_display,
-    write_atomic,
+    config_entries, conflict, default_purpose, failed, has_git, invalid, read_config, same_root,
+    slug_from_display, write_atomic,
 };
 
 /// One project as the list shows it. It serializes with every field present; an absent value
@@ -336,7 +336,8 @@ fn edit_block(
 /// Updates one project, in the config and the workspace registry together.
 ///
 /// - `name` is the display name (the area's name); the slug never changes.
-/// - `purpose` is the area's purpose.
+/// - `purpose` is the area's purpose; an empty or blank one resets it to the default for the
+///   project's kind.
 /// - `path` moves a directory-backed project to another existing directory, with the safety
 ///   rules creation has; a virtual group has no path and refuses it. The project's store keeps
 ///   its gates and records and is pointed at the new root.
@@ -368,7 +369,12 @@ where
         return Err(invalid("`by` is empty"));
     }
     let name = req.name.as_deref().map(checked_display_name).transpose()?;
-    let purpose = req.purpose.as_deref().map(checked_purpose).transpose()?;
+    // An empty purpose is not a purpose: it resets to the default for the project's kind.
+    let reset_purpose = req.purpose.as_deref().is_some_and(|p| p.trim().is_empty());
+    let mut purpose = match req.purpose.as_deref() {
+        Some(p) if !reset_purpose => Some(checked_purpose(p)?),
+        _ => None,
+    };
     let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
 
     let ws = open_workspace()?;
@@ -378,6 +384,10 @@ where
         return Err(InitError::NotFound(format!("no project `{slug}`")));
     };
 
+    if reset_purpose {
+        purpose = Some(default_purpose(current.kind, slug));
+    }
+
     // The area as it will be: its path is the project's root, and a virtual group has none.
     let existing = ws.get_area(slug).map_err(st)?;
     let mut area = existing.clone().unwrap_or_else(|| AreaRecord {
@@ -385,7 +395,7 @@ where
         name: current.name.clone(),
         path: current.path.clone(),
         purpose: if current.purpose.is_empty() {
-            format!("Project {slug}")
+            default_purpose(current.kind, slug)
         } else {
             current.purpose.clone()
         },

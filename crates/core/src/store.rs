@@ -505,7 +505,8 @@ where
     let routed = store.routes(id)?.is_some();
     if gates + transitions + records > 0 || routed {
         return Err(StoreError::InvalidState(format!(
-            "project {} still holds {gates} gates, {transitions} transitions and {records}              records{}, so it is not removed",
+            "project {} still holds {gates} gates, {transitions} transitions and {records} \
+             records{}, so it is not removed",
             id.iri(),
             if routed { " and a routing map" } else { "" }
         )));

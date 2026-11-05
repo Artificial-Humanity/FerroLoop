@@ -648,10 +648,13 @@ fn a_project_is_removed_only_when_nothing_hangs_on_it<S: Catalog + Tracker>(s: &
 
     // A project that holds a record or a gate stays: its record would be left with no project.
     s.add_record(&keep, "a record").unwrap();
-    assert!(matches!(
-        s.remove_project(&keep),
-        Err(StoreError::InvalidState(_))
-    ));
+    match s.remove_project(&keep) {
+        Err(StoreError::InvalidState(m)) => assert!(
+            m.contains("0 gates, 0 transitions and 1 records, so it is not removed"),
+            "one space in the refusal: {m}"
+        ),
+        other => panic!("expected InvalidState, got {other:?}"),
+    }
     assert_eq!(s.list_projects().unwrap().len(), 1);
     let other = s.add_project("/tmp/other").unwrap();
     s.add_gate(

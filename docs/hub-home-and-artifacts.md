@@ -133,7 +133,8 @@ workspace area goes into the Hub store. A group writes that area and nothing els
 ```
 
 `name` is the display name; the slug cannot change, and a `slug` field is refused. `purpose` is
-the purpose. `path` moves a directory-backed project to an existing directory, checked as `POST`
+the purpose; an empty or blank one resets it to the default (`Project <slug>`, or
+`Virtual group <slug>` for a group), the same as leaving it out on `POST`. `path` moves a directory-backed project to an existing directory, checked as `POST`
 checks a path and refused when another project has it; the project keeps its store, gates and
 records, which are pointed at the new root. A group has no path and refuses one. `github` sets or
 replaces the tracker (`""` clears it) and `credential` applies to it (the current tracker when

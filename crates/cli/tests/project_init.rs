@@ -3,6 +3,7 @@
 //! and data homes, so none reads or writes the developer's own.
 
 use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
@@ -900,11 +901,15 @@ fn delete_dir_fails_closed_when_no_workspace_root_can_be_found() {
     std::fs::remove_dir(env.home.path().join("Notes")).unwrap();
     let root = env.dir("anywhere");
     env.run_json("create", &["Anywhere", "--path", root.to_str().unwrap()]);
-    // The executable is looked at too, so it runs from a copy outside any workspace (the
-    // checkout this test runs from may be inside one).
+    // The executable is looked at too, so it runs from a link or copy outside any workspace
+    // (the checkout this test runs from may be inside one). A hard link opens no write
+    // descriptor, so a sibling test's fork cannot hold the file open for writing (ETXTBSY).
     let bin_dir = tempfile::tempdir().unwrap();
     let copy = bin_dir.path().join("fl");
-    std::fs::copy(assert_cmd::cargo::cargo_bin("fl"), &copy).unwrap();
+    let linked = std::fs::hard_link(assert_cmd::cargo::cargo_bin("fl"), &copy).is_ok();
+    if !linked {
+        std::fs::copy(assert_cmd::cargo::cargo_bin("fl"), &copy).unwrap();
+    }
     let mut cmd = Command::new(&copy);
     cmd.env("HOME", env.home.path())
         .env("XDG_CONFIG_HOME", env.home.path().join("config"))
@@ -913,7 +918,19 @@ fn delete_dir_fails_closed_when_no_workspace_root_can_be_found() {
         .env_remove("FL_STORE_BACKEND")
         .env("FL_TEST_SPINUP_NO_SPAWN", "1")
         .current_dir(env.work.path());
-    cmd.args(["project", "delete", "anywhere", "--delete-dir"])
+    cmd.args(["project", "delete", "anywhere", "--delete-dir"]);
+    // A copy (the fallback when the link crosses filesystems) was written by this process, and a
+    // sibling test's fork can hold its write descriptor for an instant: exec then fails with
+    // ETXTBSY (os error 26, "Text file busy"). That says nothing about the command, so retry.
+    let mut out = cmd.output();
+    for _ in 0..100 {
+        if linked || !matches!(&out, Err(e) if e.raw_os_error() == Some(26)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        out = cmd.output();
+    }
+    out.unwrap()
         .assert()
         .failure()
         .stderr(contains("no workspace root could be found"));

@@ -657,6 +657,14 @@ pub(crate) fn checked_purpose(raw: &str) -> Result<String, InitError> {
     validate_summary(raw).map_err(|e| invalid(format!("purpose: {e}")))
 }
 
+/// The purpose a project has when none is given, and the one an empty `purpose` resets it to.
+pub(crate) fn default_purpose(kind: ProjectKind, slug: &str) -> String {
+    match kind {
+        ProjectKind::Project => format!("Project {slug}"),
+        ProjectKind::Virtual => format!("Virtual group {slug}"),
+    }
+}
+
 /// `owner/repo` or an error naming the form.
 pub(crate) fn checked_github(raw: &str) -> Result<String, InitError> {
     let g = raw.trim();
@@ -937,7 +945,7 @@ fn upsert_project_area(
     let purpose = match (&req.purpose, &existing) {
         (Some(p), _) => checked_purpose(p)?,
         (None, Some(a)) => a.purpose.clone(),
-        (None, None) => format!("Project {}", r.slug),
+        (None, None) => default_purpose(ProjectKind::Project, &r.slug),
     };
     let path = Some(r.root.to_string_lossy().into_owned());
     if let Some(a) = &existing
@@ -1112,7 +1120,7 @@ where
     let purpose = match (&purpose, &existing) {
         (Some(p), _) => p.clone(),
         (None, Some(a)) => a.purpose.clone(),
-        (None, None) => format!("Virtual group {slug}"),
+        (None, None) => default_purpose(ProjectKind::Virtual, &slug),
     };
     if let Some(a) = &existing
         && a.name == name

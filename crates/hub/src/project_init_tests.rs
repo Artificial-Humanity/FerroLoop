@@ -1658,6 +1658,90 @@ fn an_update_changes_the_name_and_purpose_and_never_the_slug() {
 }
 
 #[test]
+fn an_empty_purpose_resets_it_to_the_default_for_the_kind_and_a_repeat_is_a_no_op() {
+    let sb = Sandbox::new();
+    let mut with_purpose = sb.request(&sb.dir("proj"));
+    with_purpose.purpose = Some("custom".into());
+    sb.init(&with_purpose).unwrap();
+    let mut group = sb.vrequest("Council");
+    group.purpose = Some("the strategists".into());
+    sb.virtual_group(&group).unwrap();
+    let config = sb.config();
+    for (slug, default) in [
+        ("proj", "Project proj"),
+        ("council", "Virtual group council"),
+    ] {
+        for blank in ["", "   "] {
+            // Put a custom purpose back first, so each blank form is a real reset.
+            let mut set = change();
+            set.purpose = Some("custom".into());
+            assert_eq!(sb.update(slug, &set).unwrap().purpose, "custom");
+            let mut reset = change();
+            reset.purpose = Some(blank.into());
+            let after = sb.update(slug, &reset).unwrap();
+            assert_eq!(after.purpose, default, "{slug} {blank:?}");
+            let area = sb.workspace().get_area(slug).unwrap().unwrap();
+            assert_eq!(area.purpose, default);
+            assert_eq!(
+                sb.list().into_iter().find(|p| p.slug == slug).unwrap(),
+                after,
+                "the list says the default"
+            );
+            // Asking again changes nothing, the stamp included.
+            assert_eq!(sb.update(slug, &reset).unwrap(), after);
+            assert_eq!(
+                sb.workspace().get_area(slug).unwrap().unwrap().updated_at,
+                area.updated_at
+            );
+        }
+    }
+    assert_eq!(sb.config(), config, "the purpose is not in the config");
+}
+
+#[test]
+fn a_non_empty_purpose_that_cannot_be_used_is_still_refused_and_changes_nothing() {
+    let sb = Sandbox::new();
+    let mut with_purpose = sb.request(&sb.dir("proj"));
+    with_purpose.purpose = Some("custom".into());
+    sb.init(&with_purpose).unwrap();
+    for bad in ["a\nb".to_string(), "x".repeat(10_000)] {
+        let mut set = change();
+        set.purpose = Some(bad);
+        assert!(matches!(
+            sb.update("proj", &set),
+            Err(InitError::Invalid(m)) if m.contains("purpose")
+        ));
+    }
+    assert_eq!(
+        sb.workspace().get_area("proj").unwrap().unwrap().purpose,
+        "custom"
+    );
+}
+
+#[test]
+fn a_failed_config_write_puts_the_previous_purpose_back_after_a_reset() {
+    let sb = Sandbox::new();
+    let mut with_purpose = sb.request(&sb.dir("proj"));
+    with_purpose.purpose = Some("custom".into());
+    sb.init(&with_purpose).unwrap();
+    let config = sb.config();
+    crate::project_delete::hooks::reset();
+    crate::project_delete::hooks::inject(crate::project_delete::hooks::Fault::WriteConfig);
+    let mut set = change();
+    set.purpose = Some(String::new());
+    set.github = Some("acme/one".into());
+    let err = sb.update("proj", &set).unwrap_err();
+    assert!(matches!(err, InitError::Failed(_)), "{err:?}");
+    assert_eq!(
+        sb.workspace().get_area("proj").unwrap().unwrap().purpose,
+        "custom",
+        "the reset is undone with the rest"
+    );
+    assert_eq!(sb.config(), config);
+    crate::project_delete::hooks::reset();
+}
+
+#[test]
 fn an_update_refuses_what_cannot_be_used_and_changes_nothing() {
     let sb = Sandbox::new();
     sb.init(&sb.request(&sb.dir("proj"))).unwrap();
@@ -2502,6 +2586,43 @@ fn patch_updates_the_name_purpose_and_tracker_and_returns_the_summary() {
         hub.patch(OWNER, "patched", &json!({ "github": "" })).status,
         200
     );
+}
+
+#[test]
+fn patch_with_an_empty_purpose_resets_it_to_the_default_for_both_kinds() {
+    let hub = Hub::new();
+    hub.post(
+        OWNER,
+        &json!({ "path": hub.work("resets"), "purpose": "before" }),
+    );
+    hub.post(
+        OWNER,
+        &json!({ "kind": "virtual", "name": "Council", "purpose": "before" }),
+    );
+    for (slug, default) in [
+        ("resets", "Project resets"),
+        ("council", "Virtual group council"),
+    ] {
+        for blank in ["", "   "] {
+            let set = hub.patch(OWNER, slug, &json!({ "purpose": "before" }));
+            assert_eq!(set.status, 200, "{}", text_of(&set));
+            assert_eq!(body_of(&set)["purpose"], "before");
+            let resp = hub.patch(OWNER, slug, &json!({ "purpose": blank }));
+            assert_eq!(resp.status, 200, "{slug} {blank:?}: {}", text_of(&resp));
+            assert_eq!(body_of(&resp)["purpose"], default);
+            assert_eq!(hub.entry(slug)["purpose"], default, "GET says the default");
+            let again = hub.patch(OWNER, slug, &json!({ "purpose": blank }));
+            assert_eq!(again.status, 200);
+            assert_eq!(body_of(&again), body_of(&resp));
+        }
+    }
+    // A purpose that cannot be used is still refused, and the default stays.
+    let bad = hub.patch(OWNER, "resets", &json!({ "purpose": "a\nb" }));
+    assert_eq!(bad.status, 400, "{}", text_of(&bad));
+    let long = hub.patch(OWNER, "council", &json!({ "purpose": "x".repeat(10_000) }));
+    assert_eq!(long.status, 400, "{}", text_of(&long));
+    assert_eq!(hub.entry("resets")["purpose"], "Project resets");
+    assert_eq!(hub.entry("council")["purpose"], "Virtual group council");
 }
 
 #[test]

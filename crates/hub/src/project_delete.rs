@@ -32,7 +32,8 @@ use toml_edit::DocumentMut;
 use crate::lifecycle::{self, LifecycleEnv, SessionTarget};
 use crate::project_init::{
     CONFIG_LOCK, ConfigEntry, InitError, InitPaths, ProjectKind, checked_slug, config_entries,
-    conflict, failed, invalid, read_config, remove_blocks, same_root, write_atomic,
+    conflict, default_purpose, failed, invalid, read_config, remove_blocks, same_root,
+    write_atomic,
 };
 use crate::project_list::{ProjectSummary, StoreHint, agent_in_project, held_slug, list_projects};
 
@@ -791,7 +792,7 @@ where
                 name: t.name.clone(),
                 path: t.path.clone(),
                 purpose: if t.purpose.is_empty() {
-                    format!("Project {}", t.slug)
+                    default_purpose(ProjectKind::Project, &t.slug)
                 } else {
                     t.purpose.clone()
                 },
