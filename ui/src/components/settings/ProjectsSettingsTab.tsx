@@ -33,6 +33,8 @@ export interface ProjectsSettingsTabProps {
   onDelete?: (project: ProjectSummary, opener: HTMLElement) => void;
   /** Result line of the last delete. */
   deleteStatus?: string | null;
+  /** The last delete unregistered the project but its cleanup failed. */
+  deleteWarning?: boolean;
 }
 
 const LABEL_STYLE = {
@@ -240,11 +242,26 @@ function ProjectCard({
         </div>
       )}
 
-      <ProjectArtifactsDirRow
-        slug={slug}
-        displayName={project.name}
-        artifactsDir={props.artifactsDir}
-      />
+      {project.store_path && (
+        <div
+          data-testid={`settings-project-store-${slug}`}
+          style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}
+        >
+          <span style={LABEL_STYLE}>Store:</span>{" "}
+          <code className="fd-mono" style={{ fontSize: "11.5px" }}>
+            {project.store_path}
+          </code>
+        </div>
+      )}
+
+      {/* A virtual group has no artifacts directory to show or change. */}
+      {!isVirtual && (
+        <ProjectArtifactsDirRow
+          slug={slug}
+          displayName={project.name}
+          artifactsDir={props.artifactsDir}
+        />
+      )}
 
       <div style={{ display: "flex", gap: "6px", justifyContent: "flex-end" }}>
         <button
@@ -337,13 +354,19 @@ export function ProjectsSettingsTab(props: ProjectsSettingsTabProps): ReactNode 
 
       {props.deleteStatus && (
         <div
-          role="status"
+          role={props.deleteWarning ? "alert" : "status"}
           data-testid="settings-projects-delete-status"
           className="fd-card"
           style={{
-            borderColor: "var(--diff-add-border)",
-            backgroundColor: "var(--diff-add-bg)",
-            color: "var(--diff-add-text)",
+            borderColor: props.deleteWarning
+              ? "var(--diff-del-border)"
+              : "var(--diff-add-border)",
+            backgroundColor: props.deleteWarning
+              ? "var(--diff-del-bg)"
+              : "var(--diff-add-bg)",
+            color: props.deleteWarning
+              ? "var(--diff-del-text)"
+              : "var(--diff-add-text)",
             fontSize: "11.5px",
             padding: "6px 10px",
           }}

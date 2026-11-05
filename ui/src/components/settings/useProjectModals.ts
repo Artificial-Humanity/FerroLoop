@@ -29,6 +29,8 @@ export function useProjectModals({
   /** True while either dialog is open (it handles its own Escape). */
   anyOpen: boolean;
   deleteStatus: string | null;
+  /** True when the last delete unregistered the project but its cleanup failed. */
+  deleteWarning: boolean;
   editOpenerRef: RefObject<HTMLElement | null>;
   deleteOpenerRef: RefObject<HTMLElement | null>;
   openEdit: (project: ProjectSummary, opener: HTMLElement) => void;
@@ -41,6 +43,7 @@ export function useProjectModals({
   const [editTarget, setEditTarget] = useState<ProjectSummary | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
   const [deleteStatus, setDeleteStatus] = useState<string | null>(null);
+  const [deleteWarning, setDeleteWarning] = useState(false);
   const editOpenerRef = useRef<HTMLElement | null>(null);
   const deleteOpenerRef = useRef<HTMLElement | null>(null);
 
@@ -50,6 +53,7 @@ export function useProjectModals({
       setEditTarget(null);
       setDeleteTarget(null);
       setDeleteStatus(null);
+      setDeleteWarning(false);
     }
   }, [isOpen]);
 
@@ -58,16 +62,19 @@ export function useProjectModals({
     deleteTarget,
     anyOpen: editTarget !== null || deleteTarget !== null,
     deleteStatus,
+    deleteWarning,
     editOpenerRef,
     deleteOpenerRef,
     openEdit: (project, opener) => {
       editOpenerRef.current = opener;
       setDeleteStatus(null);
+      setDeleteWarning(false);
       setEditTarget(project);
     },
     openDelete: (project, opener) => {
       deleteOpenerRef.current = opener;
       setDeleteStatus(null);
+      setDeleteWarning(false);
       setDeleteTarget(project);
     },
     closeEdit: () => setEditTarget(null),
@@ -100,6 +107,7 @@ export function useProjectModals({
         setSelectedProjectFilter("all");
       }
       setDeleteStatus(describeProjectDeletion(gone?.name ?? slug, response));
+      setDeleteWarning(Boolean(response.error));
       onProjectsChanged?.();
     },
   };

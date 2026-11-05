@@ -271,9 +271,10 @@ export interface ProjectSummary {
   tracker: ProjectTracker | null;
   store_path: string | null;
   active_agent_count: number;
+  /** The three artifact fields are explicit `null` for a virtual group, which has no directory. */
   artifacts_dir?: string | null;
-  default_artifacts_dir?: string;
-  effective_artifacts_dir?: string;
+  default_artifacts_dir?: string | null;
+  effective_artifacts_dir?: string | null;
   /**
    * Set by `listProjects()` on an entry an older hub served: it had no `slug`, `name` or
    * `kind`, only an `id` and artifact directories. Never sent by a hub.
@@ -315,6 +316,11 @@ export interface DeleteProjectResponse {
   decommissioned_agents: number;
   store_deleted: boolean;
   dir_deleted: boolean;
+  /**
+   * Present only when the store files or the directory could not be deleted AFTER the project
+   * was unregistered.
+   */
+  error?: string;
 }
 
 export interface HubSettings {

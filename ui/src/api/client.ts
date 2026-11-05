@@ -697,10 +697,10 @@ function normalizeProjectEntry(entry: unknown): ProjectSummary | null {
   if (e.artifacts_dir === null || typeof e.artifacts_dir === "string") {
     out.artifacts_dir = e.artifacts_dir;
   }
-  if (typeof e.default_artifacts_dir === "string") {
+  if (e.default_artifacts_dir === null || typeof e.default_artifacts_dir === "string") {
     out.default_artifacts_dir = e.default_artifacts_dir;
   }
-  if (typeof e.effective_artifacts_dir === "string") {
+  if (e.effective_artifacts_dir === null || typeof e.effective_artifacts_dir === "string") {
     out.effective_artifacts_dir = e.effective_artifacts_dir;
   }
   return out;

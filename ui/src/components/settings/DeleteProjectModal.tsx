@@ -41,11 +41,23 @@ export function describeProjectDeletion(
   res: DeleteProjectResponse,
 ): string {
   const plural = (n: number) => `${n} agent${n === 1 ? "" : "s"}`;
-  const parts = [`Deleted ${name}.`];
+  const failed = typeof res.error === "string" && res.error !== "";
+  const parts = [
+    failed
+      ? `Unregistered ${name}, but the cleanup failed: ${res.error}`
+      : `Deleted ${name}.`,
+  ];
   if (res.reassigned_agents > 0)
     parts.push(`Reassigned ${plural(res.reassigned_agents)}.`);
   if (res.decommissioned_agents > 0)
     parts.push(`Decommissioned ${plural(res.decommissioned_agents)}.`);
+  if (failed) {
+    parts.push(
+      `Store deleted: ${res.store_deleted ? "yes" : "no"}.`,
+      `Directory deleted: ${res.dir_deleted ? "yes" : "no"}.`,
+    );
+    return parts.join(" ");
+  }
   if (res.store_deleted) parts.push("Deleted the local FerroStore database.");
   if (res.dir_deleted) parts.push("Deleted the project directory.");
   return parts.join(" ");

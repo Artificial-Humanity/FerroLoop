@@ -544,4 +544,16 @@ describe("describeProjectDeletion", () => {
       "Deleted Alpha. Reassigned 2 agents. Decommissioned 1 agent. Deleted the local FerroStore database. Deleted the project directory.",
     );
   });
+
+  it("reports a partial cleanup failure with the server text", () => {
+    expect(
+      describeProjectDeletion("Alpha", {
+        ...OK,
+        store_deleted: true,
+        error: "could not remove /p/x: permission denied",
+      }),
+    ).toBe(
+      "Unregistered Alpha, but the cleanup failed: could not remove /p/x: permission denied Store deleted: yes. Directory deleted: no.",
+    );
+  });
 });

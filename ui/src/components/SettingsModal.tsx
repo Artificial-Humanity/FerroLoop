@@ -5061,6 +5061,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onEdit={projectModals.openEdit}
               onDelete={projectModals.openDelete}
               deleteStatus={projectModals.deleteStatus}
+              deleteWarning={projectModals.deleteWarning}
             />
           </div>
         )}

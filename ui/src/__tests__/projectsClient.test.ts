@@ -136,6 +136,31 @@ describe("HubApiClient projects", () => {
     expect(p.effective_artifacts_dir).toBeUndefined();
   });
 
+  it("listProjects keeps explicit null artifact fields of a virtual group", async () => {
+    const group = {
+      id: "grp",
+      slug: "grp",
+      name: "Grp",
+      kind: "virtual",
+      path: null,
+      has_git: false,
+      purpose: null,
+      tracker: null,
+      store_path: null,
+      active_agent_count: 0,
+      artifacts_dir: null,
+      default_artifacts_dir: null,
+      effective_artifacts_dir: null,
+    };
+    const { client } = makeClient(() => json({ projects: [group, FULL] }));
+    const out = await client.listProjects();
+    expect(out).toHaveLength(2);
+    expect(out[0].artifacts_dir).toBeNull();
+    expect(out[0].default_artifacts_dir).toBeNull();
+    expect(out[0].effective_artifacts_dir).toBeNull();
+    expect(out[1]).toEqual(FULL);
+  });
+
   it("listProjects returns [] on a malformed body", async () => {
     for (const body of [{}, { projects: "nope" }, { projects: null }, []]) {
       const { client } = makeClient(() => json(body));

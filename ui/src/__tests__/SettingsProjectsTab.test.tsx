@@ -197,6 +197,36 @@ describe("Settings Projects tab", () => {
     expect(within(card).queryByText("Git")).toBeNull();
   });
 
+  it("shows the store path on a card that has one and omits the row otherwise", async () => {
+    const { client } = makeClient();
+    await renderModal(client);
+    await openProjectsTab();
+    const row = screen.getByTestId("settings-project-store-ferroloop");
+    expect(row).toHaveTextContent("Store:");
+    expect(row).toHaveTextContent("/work/ferroloop/.ferro/ferroloop.fls");
+    expect(screen.queryByTestId("settings-project-store-sonora")).toBeNull();
+    expect(screen.queryByTestId("settings-project-store-research-group")).toBeNull();
+  });
+
+  it("gives a virtual group no artifacts row and a project one", async () => {
+    const nullGroup = {
+      ...GROUP,
+      artifacts_dir: null,
+      default_artifacts_dir: null,
+      effective_artifacts_dir: null,
+    } as ProjectSummary;
+    const { client } = makeClient([PLAIN, nullGroup]);
+    await renderModal(client);
+    await openProjectsTab();
+    const group = screen.getByTestId("settings-project-card-research-group");
+    expect(within(group).queryByTestId("settings-project-artifacts-dir-row")).toBeNull();
+    expect(within(group).queryByTestId("settings-project-change-artifacts-dir-btn")).toBeNull();
+    expect(group).not.toHaveTextContent("null");
+    const plain = screen.getByTestId("settings-project-card-sonora");
+    expect(within(plain).getByTestId("settings-project-artifacts-dir-row")).toBeInTheDocument();
+    expect(within(plain).getByTestId("settings-project-change-artifacts-dir-btn")).toBeInTheDocument();
+  });
+
   it("View Agents switches to the Agents tab with the filter applied", async () => {
     const { client } = makeClient();
     await renderModal(client);
@@ -906,6 +936,79 @@ describe("Settings Projects tab", () => {
       );
       // The Delete button went away with its card.
       expect(screen.getByTestId("settings-projects-create-btn")).toHaveFocus();
+    });
+
+    it("warns when the project was unregistered but the cleanup failed", async () => {
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () =>
+          json({
+            deleted: "sonora",
+            reassigned_agents: 0,
+            decommissioned_agents: 0,
+            store_deleted: false,
+            dir_deleted: false,
+            error: "could not remove /p/x: permission denied",
+          }),
+        ),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      const warning = screen.getByTestId("settings-projects-delete-status");
+      expect(warning).toHaveAttribute("role", "alert");
+      expect(warning).toHaveTextContent("Unregistered");
+      expect(warning).toHaveTextContent("cleanup failed");
+      expect(warning).toHaveTextContent("could not remove /p/x: permission denied");
+      expect(warning).toHaveTextContent("Store deleted: no");
+      expect(warning).toHaveTextContent("Directory deleted: no");
+      expect(screen.queryByTestId("settings-project-card-sonora")).toBeNull();
+    });
+
+    it("names the part of a failed cleanup that did succeed", async () => {
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () =>
+          json({
+            deleted: "sonora",
+            reassigned_agents: 0,
+            decommissioned_agents: 0,
+            store_deleted: true,
+            dir_deleted: false,
+            error: "busy",
+          }),
+        ),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      const warning = screen.getByTestId("settings-projects-delete-status");
+      expect(warning).toHaveTextContent("Store deleted: yes");
+      expect(warning).toHaveTextContent("Directory deleted: no");
+    });
+
+    it("keeps the plain status role for a clean delete", async () => {
+      const { client } = makeClient(
+        [PLAIN, GIT, GROUP],
+        deleteHandler("sonora", () =>
+          json({ ...FULL, deleted: "sonora", reassigned_agents: 0, store_deleted: false }),
+        ),
+      );
+      await renderModal(client);
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("delete-project-submit"));
+      });
+      const status = screen.getByTestId("settings-projects-delete-status");
+      expect(status).toHaveAttribute("role", "status");
+      expect(status).toHaveTextContent("Deleted Sonora.");
     });
 
     it("resets the Agents filter to all when it pointed at the deleted project", async () => {
