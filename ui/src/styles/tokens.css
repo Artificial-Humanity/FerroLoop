@@ -174,6 +174,80 @@ body,
   padding: 0;
 }
 
+/*
+ * Tablet master-detail (768 - 1023). Everything here is scoped to the tablet layout; desktop and
+ * phone rules are untouched. The cockpit carries data-tablet-master="docked" (landscape) or
+ * "overlay" (portrait).
+ */
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="docked"] .fd-sidebar:not(.fd-sidebar-embedded) {
+  min-width: 320px;
+  max-width: 360px;
+}
+
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-cockpit-body {
+  position: relative;
+}
+
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar-backdrop {
+  display: block;
+  position: absolute;
+  inset: 0;
+  background-color: rgba(5, 7, 11, 0.68);
+  z-index: 25;
+}
+
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded) {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(360px, 90vw);
+  min-width: 0;
+  max-width: min(360px, 90vw);
+  overflow-y: auto;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
+  box-shadow: 8px 0 24px rgba(0, 0, 0, 0.5);
+  z-index: 30;
+  pointer-events: none;
+}
+
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded):not(.is-open):not([data-mobile-open="true"]) {
+  display: none;
+}
+
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded).is-open,
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded)[data-mobile-open="true"] {
+  display: flex;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+/* The workspace takes the full width under the drawer. */
+.fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-main {
+  min-width: 0;
+}
+
+/* Touch targets: at least 44 px for header buttons, tabs and roster rows. */
+.fd-cockpit[data-device-layout="tablet"] .fd-header .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] .fd-tab-bar > .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] .fd-sidebar .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] .fd-sidebar [role="tab"],
+.fd-cockpit[data-device-layout="tablet"] .fd-sidebar [role="button"] {
+  min-height: 44px;
+}
+
+.fd-cockpit[data-device-layout="tablet"] .fd-header .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] .fd-tab-bar > .fd-btn {
+  min-width: 44px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded) {
+    transition: none;
+  }
+}
+
 .fd-cockpit-body {
   flex: 1;
   display: flex;

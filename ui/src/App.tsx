@@ -111,6 +111,18 @@ export const THREE_PANEL_MIN_VIEWPORT_PX = 1080;
 
 export type ViewportPanelMode = "single" | "two-panel" | "three-panel";
 
+export type TabletMaster = "docked" | "overlay";
+/** Docked tablet master (roster / console) width limits, in px. */
+export const TABLET_MASTER_MIN_WIDTH_PX = 320;
+export const TABLET_MASTER_MAX_WIDTH_PX = 360;
+
+export function resolveTabletDockedWidth(viewportWidth: number): number {
+  return Math.min(
+    TABLET_MASTER_MAX_WIDTH_PX,
+    Math.max(TABLET_MASTER_MIN_WIDTH_PX, Math.round(viewportWidth * 0.38)),
+  );
+}
+
 export function resolveViewportPanelMode(width: number): ViewportPanelMode {
   if (width < TWO_PANEL_MIN_VIEWPORT_PX) {
     return "single";
@@ -467,9 +479,18 @@ export const App: React.FC<AppProps> = ({
   const panelResizeCleanupRef = useRef<(() => void) | null>(null);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState<boolean>(false);
-  const { layout: deviceLayout } = useDeviceLayout();
+  const { layout: deviceLayout, orientation: deviceOrientation } = useDeviceLayout();
   const deviceLayoutRef = useRef(deviceLayout);
   deviceLayoutRef.current = deviceLayout;
+  // Tablet master-detail: the roster is docked in landscape and an overlay drawer in portrait.
+  const tabletMaster: TabletMaster | undefined =
+    deviceLayout === "tablet"
+      ? deviceOrientation === "portrait"
+        ? "overlay"
+        : "docked"
+      : undefined;
+  const tabletMasterRef = useRef(tabletMaster);
+  tabletMasterRef.current = tabletMaster;
   // Phone navigation state. Lives apart from the desktop arrangement (splitView, leftPanelTab,
   // mobileRosterOpen, desktopSidebarCollapsed) so rotating or resizing restores the desktop view.
   const [phoneView, setPhoneView] = useState<PhoneView>("chat");
@@ -2716,6 +2737,12 @@ export const App: React.FC<AppProps> = ({
   }, [secondaryTab, selectedAgent, leftPanelTab]);
 
   const handleToggleLeftSidebar = useCallback(() => {
+    if (tabletMasterRef.current === "overlay") {
+      // Portrait tablet: the roster is a drawer over the workspace. Opening it never changes
+      // the docked arrangement (desktopSidebarCollapsed) or the right dock.
+      setMobileRosterOpen((prev) => !prev);
+      return;
+    }
     const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
     if (vw < THREE_PANEL_MIN_VIEWPORT_PX && splitView) {
       setSplitView(false);
@@ -2755,9 +2782,26 @@ export const App: React.FC<AppProps> = ({
     typeof window !== "undefined" ? window.innerWidth : viewportWidth;
   const viewportPanelMode = resolveViewportPanelMode(currentInnerWidth);
   const isMobileViewport = deviceLayout === "phone";
-  const leftSidebarOpen = isMobileViewport
-    ? mobileRosterOpen
-    : !desktopSidebarCollapsed;
+  const isTabletOverlay = tabletMaster === "overlay";
+  const isTabletDocked = tabletMaster === "docked";
+  const tabletDockedWidth = resolveTabletDockedWidth(currentInnerWidth);
+  const leftSidebarOpen =
+    isMobileViewport || isTabletOverlay ? mobileRosterOpen : !desktopSidebarCollapsed;
+
+  // Rotating between tablet portrait and landscape keeps the selected agent and transcript;
+  // only the roster arrangement follows the mode.
+  const prevTabletMasterRef = useRef<TabletMaster | undefined>(tabletMaster);
+  useEffect(() => {
+    const prev = prevTabletMasterRef.current;
+    prevTabletMasterRef.current = tabletMaster;
+    if (prev === tabletMaster) return;
+    if (tabletMaster === "overlay") {
+      setMobileRosterOpen(false);
+    } else if (tabletMaster === "docked" && prev === "overlay") {
+      setMobileRosterOpen(false);
+      setDesktopSidebarCollapsed(splitView);
+    }
+  }, [tabletMaster, splitView]);
 
   const isPhoneLayout = deviceLayout === "phone";
 
@@ -2928,17 +2972,26 @@ export const App: React.FC<AppProps> = ({
       onToggleTheme={handleToggleTheme}
       onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
       isOpen={mobileRosterOpen}
-      isCollapsedDesktop={desktopSidebarCollapsed}
+      isCollapsedDesktop={isTabletOverlay ? false : desktopSidebarCollapsed}
       onClose={() => {
         setMobileRosterOpen(false);
-        setDesktopSidebarCollapsed(true);
+        if (!isTabletOverlay) {
+          setDesktopSidebarCollapsed(true);
+        }
       }}
       leftPanelTab={leftPanelTab}
       onSelectLeftPanelTab={handleSelectLeftPanelTab}
       consoleContent={
         leftPanelTab !== "roster" ? renderSecondaryPane(leftPanelTab) : undefined
       }
-      width={isMobileViewport ? undefined : effectiveLeftWidth}
+      width={
+        isMobileViewport || isTabletOverlay
+          ? undefined
+          : isTabletDocked
+            ? tabletDockedWidth
+            : effectiveLeftWidth
+      }
+      minWidth={isTabletDocked ? TABLET_MASTER_MIN_WIDTH_PX : undefined}
       onResizeStart={handleLeftResizeStart}
       onTouchResizeStart={handleLeftTouchResizeStart}
       embedded={embedded}
@@ -2964,6 +3017,7 @@ export const App: React.FC<AppProps> = ({
       data-testid="ferrodeck-cockpit"
       data-viewport-panel-mode={viewportPanelMode}
       data-device-layout={deviceLayout}
+      data-tablet-master={tabletMaster}
     >
       {isPhoneLayout ? (
         <PhoneShell
@@ -3025,7 +3079,11 @@ export const App: React.FC<AppProps> = ({
             onOpenMobileRoster={handleToggleLeftSidebar}
             mobileSidebarOpen={leftSidebarOpen}
             leftPanelWidth={
-              leftSidebarOpen && !isMobileViewport ? effectiveLeftWidth : undefined
+              leftSidebarOpen && !isMobileViewport && !isTabletOverlay
+                ? isTabletDocked
+                  ? tabletDockedWidth
+                  : effectiveLeftWidth
+                : undefined
             }
           />
 

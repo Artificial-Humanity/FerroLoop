@@ -351,6 +351,8 @@ export interface RosterSidebarProps {
   onSelectLeftPanelTab?: (tab: LeftPanelTab) => void;
   consoleContent?: React.ReactNode;
   width?: number;
+  /** Minimum inline width in px when `width` is set. Defaults to 360 (the desktop panel minimum). */
+  minWidth?: number;
   onResizeStart?: (e: React.MouseEvent<HTMLDivElement>) => void;
   onTouchResizeStart?: (e: React.TouchEvent<HTMLDivElement>) => void;
   /**
@@ -582,6 +584,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onSelectLeftPanelTab,
   consoleContent,
   width,
+  minWidth = 360,
   onResizeStart,
   onTouchResizeStart,
   embedded = false,
@@ -838,8 +841,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         style={
           width && !embedded
             ? {
-                width: `${Math.max(360, width)}px`,
-                minWidth: `${Math.max(360, width)}px`,
+                width: `${Math.max(minWidth, width)}px`,
+                minWidth: `${Math.max(minWidth, width)}px`,
               }
             : undefined
         }
