@@ -115,12 +115,15 @@ const MAX_UNITS: usize = 32;
 
 /// `ferrostore.service`, `ferrostore@.service`, `ferrowire.service`, `ferroloop-hub.service`,
 /// and any other `ferro*.service` in the user unit directory.
+///
+/// `:` and `\` belong in a unit name (`ferrostore@foo:bar.service`, a `\x` escape). `/` does
+/// not: `name` is one `read_dir` component and must not leave that directory.
 fn is_ferro_unit(name: &str) -> bool {
     name.starts_with("ferro")
         && name.ends_with(".service")
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '@' | '_' | '.' | '+' | '-'))
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '_' | '.' | '+' | '-' | ':' | '\\')
+        })
 }
 
 fn expand_unit_dir(shown: &str, home: Option<&Path>) -> Result<PathBuf, String> {

@@ -23,7 +23,8 @@ pub struct UnitDirectives {
 /// The `After=` / `WantedBy=` facts of one unit file.
 ///
 /// Comments and the wrong section do not count. Repeated keys are merged, which is how
-/// systemd reads them. A trailing `\` continues the line.
+/// systemd reads them. A trailing `\` continues the line; a `#` or `;` line in that gap is
+/// skipped. Whitespace around `=` is ignored.
 pub fn user_unit_directives(text: &str) -> UnitDirectives {
     let mut section = String::new();
     let mut after = false;
@@ -62,7 +63,7 @@ fn section_name(trimmed: &str) -> Option<String> {
 }
 
 fn assignment<'a>(trimmed: &'a str, key: &str) -> Option<&'a str> {
-    let rest = trimmed.strip_prefix(key)?;
+    let rest = trimmed.strip_prefix(key)?.trim_start();
     let rest = rest.strip_prefix('=')?;
     Some(rest.trim())
 }
@@ -77,8 +78,16 @@ fn mentions_default_target(value: &str) -> bool {
 fn logical_lines(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut buf = String::new();
+    let mut continued = false;
     for raw in text.lines() {
-        let continued = raw.ends_with('\\') && !raw.ends_with("\\\\");
+        // systemd skips a comment block that follows a trailing `\`, then joins the next line.
+        if continued {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+        }
+        continued = raw.ends_with('\\') && !raw.ends_with("\\\\");
         let piece = if continued {
             &raw[..raw.len() - 1]
         } else {
@@ -214,6 +223,34 @@ mod tests {
             "[Unit]\nAfter=ferrostore.service \\\n    default.target\n\n[Install]\nWantedBy=default.target\n",
         );
         assert!(d.after_default_target && d.wanted_by_default_target);
+    }
+
+    #[test]
+    fn whitespace_around_the_equals_is_still_an_assignment() {
+        let d = user_unit_directives(
+            "[Unit]\nAfter = default.target\n\n[Install]\nWantedBy = default.target\n",
+        );
+        assert!(d.after_default_target && d.wanted_by_default_target);
+    }
+
+    #[test]
+    fn a_comment_inside_a_continuation_is_not_a_token() {
+        let commented = user_unit_directives(
+            "[Unit]\nAfter=ferrostore.service \\\n# default.target\n; default.target\n    network.target\n\n[Install]\nWantedBy=default.target\n",
+        );
+        assert!(
+            !commented.after_default_target,
+            "a comment in the continuation gap is not part of the value"
+        );
+        assert!(commented.wanted_by_default_target);
+
+        let joined = user_unit_directives(
+            "[Unit]\nAfter=ferrostore.service \\\n# skipped\n; skipped too\n    default.target\n\n[Install]\nWantedBy=default.target\n",
+        );
+        assert!(
+            joined.after_default_target && joined.wanted_by_default_target,
+            "the content line after the skipped comment block is still joined"
+        );
     }
 
     #[test]

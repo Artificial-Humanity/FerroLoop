@@ -481,3 +481,28 @@ WantedBy=default.target
         detail(&r, ids::UNIT_ORDER)
     );
 }
+
+#[test]
+fn a_unit_after_default_target_named_with_colon_or_backslash_is_warned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = "\
+[Unit]
+After=default.target
+
+[Install]
+WantedBy=default.target
+";
+    let colon = "ferrostore@foo:bar.service";
+    let escaped = "ferrostore@foo\\xbar.service";
+    write_units(tmp.path(), &[(colon, bad), (escaped, bad)]);
+    let r = observe(spec(tmp.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Warn,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+    let d = detail(&r, ids::UNIT_ORDER);
+    assert!(d.contains(colon), "{d}");
+    assert!(d.contains(escaped), "{d}");
+}
