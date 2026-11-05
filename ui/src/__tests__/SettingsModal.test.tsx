@@ -1147,7 +1147,7 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     );
 
     const modal = screen.getByTestId("settings-modal");
-    expect(modal.style.minWidth).toBe("360px");
+    expect(modal.style.minWidth).toBe("0");
     expect(modal.style.width).toBe("920px");
     expect(modal.style.height).toBe("780px");
 
@@ -1315,5 +1315,91 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
         value: originalInnerWidth,
       });
     }
+  });
+
+  it("Record #120: renders full-width sub-tab <select> dropdowns across SettingsModal, hides redundant theme select and font-scale badge, and prevents horizontal scroll in settings-scroll-body", () => {
+    const apiClient = makeStubApiClient();
+    const { unmount } = render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+      />,
+    );
+
+    const tabBar = screen.getByTestId("settings-tab-bar");
+    const scrollBody = screen.getByTestId("settings-scroll-body");
+    expect(scrollBody).toHaveClass("fd-scroll");
+    expect(scrollBody.style.overflowX).toBe("hidden");
+    expect(scrollBody.style.minWidth).toBe("0");
+
+    // 0. Top-level category <select> and sub-tab selectors sit inside settings-tab-bar above settings-scroll-body
+    const topSelect = screen.getByTestId("settings-tab-select") as HTMLSelectElement;
+    expect(topSelect.style.width).toBe("100%");
+    expect(tabBar).toContainElement(topSelect);
+    expect(tabBar).toContainElement(screen.getByTestId("agents-subtab-bar"));
+    expect(tabBar).toContainElement(screen.getByTestId("system-subtab-bar"));
+    expect(tabBar).toContainElement(screen.getByTestId("products-subtab-bar"));
+
+    // 1. Agents sub-tab full-width <select>
+    const agentsSelect = screen.getByTestId("agents-subtab-select") as HTMLSelectElement;
+    expect(agentsSelect.style.width).toBe("100%");
+    fireEvent.change(agentsSelect, { target: { value: "roles" } });
+    expect(screen.getByTestId("agents-subpanel-roles")).toHaveStyle({ display: "flex" });
+    expect(screen.getByTestId("agents-subpanel-roster")).toHaveStyle({ display: "none" });
+
+    // 2. System sub-tab full-width <select> via top-level settings-tab-select
+    fireEvent.change(topSelect, { target: { value: "system" } });
+    const systemSelect = screen.getByTestId("system-subtab-select") as HTMLSelectElement;
+    expect(systemSelect.style.width).toBe("100%");
+    fireEvent.change(systemSelect, { target: { value: "storage" } });
+    expect(screen.getByTestId("system-subpanel-storage")).toHaveStyle({ display: "flex" });
+    expect(screen.getByTestId("system-subpanel-general")).toHaveStyle({ display: "none" });
+    fireEvent.change(systemSelect, { target: { value: "notifications" } });
+    expect(screen.getByTestId("system-subpanel-notifications")).toHaveStyle({ display: "flex" });
+
+    // 3. Products sub-tab full-width <select>, vertical presets, and bounded grids
+    fireEvent.change(topSelect, { target: { value: "products" } });
+    const productsSelect = screen.getByTestId("products-subtab-select") as HTMLSelectElement;
+    expect(productsSelect.style.width).toBe("100%");
+    const productsGrid = screen.getByTestId("products-cards-grid");
+    expect(productsGrid.style.gridTemplateColumns).toBe(
+      "repeat(auto-fit, minmax(min(100%, 260px), 1fr))",
+    );
+    fireEvent.change(productsSelect, { target: { value: "installer" } });
+    expect(screen.getByTestId("products-subpanel-installer")).toHaveStyle({ display: "flex" });
+    expect(screen.getByTestId("products-subpanel-catalog")).toHaveStyle({ display: "none" });
+
+    // 4. Appearance tab: settings-theme-select is visually hidden (.sr-only) and 3 theme buttons remain visible
+    fireEvent.change(topSelect, { target: { value: "appearance" } });
+    const themeSelect = screen.getByTestId("settings-theme-select");
+    expect(themeSelect).toHaveClass("sr-only");
+    expect(screen.getByTestId("theme-mode-dark")).not.toHaveClass("sr-only");
+    expect(screen.getByTestId("theme-mode-light")).not.toHaveClass("sr-only");
+    expect(screen.getByTestId("theme-mode-system")).not.toHaveClass("sr-only");
+
+    // 5. Accessibility tab: font-scale-current-badge is visually hidden (.sr-only) and 5 preset buttons remain visible
+    fireEvent.change(topSelect, { target: { value: "accessibility" } });
+    const fontScaleBadge = screen.getByTestId("font-scale-current-badge");
+    expect(fontScaleBadge).toHaveClass("sr-only");
+    expect(screen.getByTestId("font-scale-preset-100")).not.toHaveClass("sr-only");
+
+    unmount();
+
+    // 6. Project Settings sub-tab full-width <select>
+    render(
+      <SettingsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        apiClient={apiClient}
+        initialProject="FerroLoop"
+      />,
+    );
+    const projectSelect = screen.getByTestId(
+      "project-settings-subtab-select",
+    ) as HTMLSelectElement;
+    expect(projectSelect.style.width).toBe("100%");
+    fireEvent.change(projectSelect, { target: { value: "agents" } });
+    expect(screen.getByTestId("project-subpanel-agents")).toHaveStyle({ display: "flex" });
   });
 });

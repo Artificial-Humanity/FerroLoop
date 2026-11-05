@@ -2719,7 +2719,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         style={{
           width: "920px",
           maxWidth: "calc(100vw - 32px)",
-          minWidth: "360px",
+          minWidth: 0,
           height: "780px",
           maxHeight: "calc(100vh - 48px)",
           minHeight: "560px",
@@ -2768,99 +2768,527 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           data-testid="settings-tab-bar"
           style={{
             display: "flex",
-            alignItems: "center",
+            flexDirection: "column",
             gap: "6px",
-            flexWrap: "wrap",
             borderBottom: "1px solid var(--border-subtle)",
             paddingBottom: "8px",
             flexShrink: 0,
+            width: "100%",
+            minWidth: 0,
           }}
         >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeTab === "agents"}
-            data-testid="settings-tab-agents"
-            className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
-            onClick={() => setActiveTab("agents")}
+          <select
+            aria-label="Settings Categories"
+            data-testid="settings-tab-select"
+            className="fd-select"
+            value={activeTab}
+            onChange={(e) => setActiveTab(e.target.value as typeof activeTab)}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12.5px",
+              padding: "6px 10px",
+              fontWeight: 600,
+            }}
           >
-            {filteredAgents.length} Agents
-          </button>
-          {!initialProject && (
-            <>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "system"}
-                data-testid="settings-tab-system"
-                className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("system")}
-              >
-                System
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "products"}
-                data-testid="settings-tab-products"
-                className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("products")}
-              >
-                Products
-              </button>
-              {authority?.tier === "owner" && (
+            <option value="agents" data-testid="settings-tab-option-agents">
+              {filteredAgents.length} Agents
+            </option>
+            {!initialProject && (
+              <>
+                <option value="system" data-testid="settings-tab-option-system">
+                  System
+                </option>
+                <option value="products" data-testid="settings-tab-option-products">
+                  Products
+                </option>
+                {authority?.tier === "owner" && (
+                  <option value="runtimes" data-testid="settings-tab-option-runtimes">
+                    Runtimes &amp; Quotas
+                  </option>
+                )}
+                <option value="appearance" data-testid="settings-tab-option-appearance">
+                  Appearance
+                </option>
+                <option
+                  value="accessibility"
+                  data-testid="settings-tab-option-accessibility"
+                >
+                  Accessibility
+                </option>
+                <option value="auth" data-testid="settings-tab-option-auth">
+                  Auth
+                </option>
+              </>
+            )}
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === "agents"}
+              data-testid="settings-tab-agents"
+              className={`fd-btn${activeTab === "agents" ? " fd-btn-active" : ""}`}
+              onClick={() => setActiveTab("agents")}
+            >
+              {filteredAgents.length} Agents
+            </button>
+            {!initialProject && (
+              <>
                 <button
                   type="button"
                   role="tab"
-                  aria-selected={activeTab === "runtimes"}
-                  data-testid="settings-tab-runtimes"
-                  className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
-                  onClick={() => setActiveTab("runtimes")}
+                  aria-selected={activeTab === "system"}
+                  data-testid="settings-tab-system"
+                  className={`fd-btn${activeTab === "system" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("system")}
                 >
-                  Runtimes &amp; Quotas
+                  System
                 </button>
-              )}
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "appearance"}
-                data-testid="settings-tab-appearance"
-                className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("appearance")}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "products"}
+                  data-testid="settings-tab-products"
+                  className={`fd-btn${activeTab === "products" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("products")}
+                >
+                  Products
+                </button>
+                {authority?.tier === "owner" && (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeTab === "runtimes"}
+                    data-testid="settings-tab-runtimes"
+                    className={`fd-btn${activeTab === "runtimes" ? " fd-btn-active" : ""}`}
+                    onClick={() => setActiveTab("runtimes")}
+                  >
+                    Runtimes &amp; Quotas
+                  </button>
+                )}
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "appearance"}
+                  data-testid="settings-tab-appearance"
+                  className={`fd-btn${activeTab === "appearance" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("appearance")}
+                >
+                  Appearance
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "accessibility"}
+                  data-testid="settings-tab-accessibility"
+                  className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("accessibility")}
+                >
+                  Accessibility
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === "auth"}
+                  data-testid="settings-tab-auth"
+                  className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
+                  onClick={() => setActiveTab("auth")}
+                >
+                  Auth
+                </button>
+              </>
+            )}
+          </div>
+
+          {/* Sub-tab selectors pinned directly above settings-scroll-body */}
+          {initialProject ? (
+            <div
+              role="tablist"
+              aria-label="Project Settings Sub-Tabs"
+              data-testid="project-settings-subtab-bar"
+              style={{
+                display: activeTab === "agents" ? "block" : "none",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
+              <select
+                aria-label="Project Settings Section"
+                data-testid="project-settings-subtab-select"
+                className="fd-select"
+                value={projectSubTab}
+                onChange={(e) =>
+                  setProjectSubTab(
+                    e.target.value as
+                      | "overview"
+                      | "agents"
+                      | "roles"
+                      | "cloud-sessions"
+                      | "local-runtimes",
+                  )
+                }
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                  boxSizing: "border-box",
+                  fontSize: "12.5px",
+                  padding: "6px 10px",
+                }}
               >
-                Appearance
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "accessibility"}
-                data-testid="settings-tab-accessibility"
-                className={`fd-btn${activeTab === "accessibility" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("accessibility")}
+                <option value="overview" data-testid="project-subtab-option-overview">
+                  Overview &amp; Storage
+                </option>
+                <option value="agents" data-testid="project-subtab-option-agents">
+                  Agents &amp; Bulk Ops
+                </option>
+                <option value="roles" data-testid="project-subtab-option-roles">
+                  Roles
+                </option>
+                <option
+                  value="cloud-sessions"
+                  data-testid="project-subtab-option-cloud-sessions"
+                >
+                  Cloud Sessions
+                </option>
+                <option
+                  value="local-runtimes"
+                  data-testid="project-subtab-option-local-runtimes"
+                >
+                  Local &amp; API Runtimes
+                </option>
+              </select>
+              <div
+                className="sr-only"
+                style={{
+                  position: "absolute",
+                  width: "1px",
+                  height: "1px",
+                  padding: 0,
+                  margin: "-1px",
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
               >
-                Accessibility
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={activeTab === "auth"}
-                data-testid="settings-tab-auth"
-                className={`fd-btn${activeTab === "auth" ? " fd-btn-active" : ""}`}
-                onClick={() => setActiveTab("auth")}
+                {(
+                  [
+                    { id: "overview", label: "Overview & Storage" },
+                    { id: "agents", label: "Agents & Bulk Ops" },
+                    { id: "roles", label: "Roles" },
+                    { id: "cloud-sessions", label: "Cloud Sessions" },
+                    { id: "local-runtimes", label: "Local & API Runtimes" },
+                  ] as const
+                ).map((sub) => {
+                  const isSelected = projectSubTab === sub.id;
+                  return (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      data-testid={`project-tab-${sub.id}`}
+                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                      onClick={() => setProjectSubTab(sub.id)}
+                    >
+                      {sub.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <div
+              role="tablist"
+              aria-label="Agents Settings Sub-Tabs"
+              data-testid="agents-subtab-bar"
+              style={{
+                display: activeTab === "agents" ? "block" : "none",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
+              <select
+                aria-label="Agents Settings Section"
+                data-testid="agents-subtab-select"
+                className="fd-select"
+                value={agentsSubTab}
+                onChange={(e) =>
+                  setAgentsSubTab(
+                    e.target.value as
+                      | "roster"
+                      | "roles"
+                      | "cloud-sessions"
+                      | "local-runtimes",
+                  )
+                }
+                style={{
+                  width: "100%",
+                  minWidth: 0,
+                  maxWidth: "100%",
+                  boxSizing: "border-box",
+                  fontSize: "12.5px",
+                  padding: "6px 10px",
+                }}
               >
-                Auth
-              </button>
+                <option value="roster" data-testid="agents-subtab-option-roster">
+                  Roster &amp; Bulk Ops
+                </option>
+                <option value="roles" data-testid="agents-subtab-option-roles">
+                  Role Registry
+                </option>
+                <option
+                  value="cloud-sessions"
+                  data-testid="agents-subtab-option-cloud-sessions"
+                >
+                  Cloud Sessions
+                </option>
+                <option
+                  value="local-runtimes"
+                  data-testid="agents-subtab-option-local-runtimes"
+                >
+                  Local &amp; API Runtimes
+                </option>
+              </select>
+              <div
+                className="sr-only"
+                style={{
+                  position: "absolute",
+                  width: "1px",
+                  height: "1px",
+                  padding: 0,
+                  margin: "-1px",
+                  overflow: "hidden",
+                  clip: "rect(0, 0, 0, 0)",
+                  whiteSpace: "nowrap",
+                  border: 0,
+                }}
+              >
+                {(
+                  [
+                    { id: "roster", label: "Roster & Bulk Ops" },
+                    { id: "roles", label: "Role Registry" },
+                    { id: "cloud-sessions", label: "Cloud Sessions" },
+                    { id: "local-runtimes", label: "Local & API Runtimes" },
+                  ] as const
+                ).map((sub) => {
+                  const isSelected = agentsSubTab === sub.id;
+                  return (
+                    <button
+                      key={sub.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={isSelected}
+                      data-testid={`agents-subtab-${sub.id}`}
+                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                      onClick={() => setAgentsSubTab(sub.id)}
+                    >
+                      {sub.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {!initialProject && (
+            <>
+              <div
+                role="tablist"
+                aria-label="System Settings Sub-Tabs"
+                data-testid="system-subtab-bar"
+                style={{
+                  display: activeTab === "system" ? "block" : "none",
+                  width: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <select
+                  aria-label="System Settings Section"
+                  data-testid="system-subtab-select"
+                  className="fd-select"
+                  value={systemSubTab}
+                  onChange={(e) =>
+                    setSystemSubTab(
+                      e.target.value as "general" | "storage" | "notifications",
+                    )
+                  }
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                    fontSize: "12.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  <option value="general" data-testid="system-subtab-option-general">
+                    General &amp; Connectivity
+                  </option>
+                  <option value="storage" data-testid="system-subtab-option-storage">
+                    Storage &amp; Artifacts
+                  </option>
+                  <option
+                    value="notifications"
+                    data-testid="system-subtab-option-notifications"
+                  >
+                    Notifications &amp; Push
+                  </option>
+                </select>
+                <div
+                  className="sr-only"
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
+                >
+                  {(
+                    [
+                      { id: "general", label: "General & Connectivity" },
+                      { id: "storage", label: "Storage & Artifacts" },
+                      { id: "notifications", label: "Notifications & Push" },
+                    ] as const
+                  ).map((sub) => {
+                    const isSelected = systemSubTab === sub.id;
+                    return (
+                      <button
+                        key={sub.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isSelected}
+                        data-testid={`system-subtab-${sub.id}`}
+                        className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                        onClick={() => setSystemSubTab(sub.id)}
+                      >
+                        {sub.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div
+                role="tablist"
+                aria-label="Products Settings Sub-Sections"
+                data-testid="products-subtab-bar"
+                style={{
+                  display: activeTab === "products" ? "block" : "none",
+                  width: "100%",
+                  minWidth: 0,
+                }}
+              >
+                <select
+                  aria-label="Products Settings Section"
+                  data-testid="products-subtab-select"
+                  className="fd-select"
+                  value={productsSubTab}
+                  onChange={(e) =>
+                    setProductsSubTab(e.target.value as "catalog" | "installer")
+                  }
+                  style={{
+                    width: "100%",
+                    minWidth: 0,
+                    maxWidth: "100%",
+                    boxSizing: "border-box",
+                    fontSize: "12.5px",
+                    padding: "6px 10px",
+                  }}
+                >
+                  <option value="catalog" data-testid="products-subtab-option-catalog">
+                    Products &amp; Profiles
+                  </option>
+                  <option
+                    value="installer"
+                    data-testid="products-subtab-option-installer"
+                  >
+                    Installer, Doctor &amp; Releases
+                  </option>
+                </select>
+                <div
+                  className="sr-only"
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
+                >
+                  {(
+                    [
+                      {
+                        id: "catalog" as const,
+                        label: "Products & Profiles",
+                        testId: "products-subtab-catalog",
+                      },
+                      {
+                        id: "installer" as const,
+                        label: "Installer, Doctor & Releases",
+                        testId: "products-subtab-installer",
+                      },
+                    ]
+                  ).map((sub) => {
+                    const isSelected = productsSubTab === sub.id;
+                    return (
+                      <button
+                        key={sub.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={isSelected}
+                        data-testid={sub.testId}
+                        className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                        onClick={() => setProductsSubTab(sub.id)}
+                      >
+                        {sub.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </>
           )}
         </div>
 
         {/* Scrollable Middle Body */}
         <div
+          className="fd-scroll"
           data-testid="settings-scroll-body"
           style={{
             flex: 1,
             minHeight: 0,
+            minWidth: 0,
+            width: "100%",
+            boxSizing: "border-box",
             overflowY: "auto",
+            overflowX: "hidden",
             display: "flex",
             flexDirection: "column",
             gap: "12px",
@@ -2982,107 +3410,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
-          {initialProject ? (
-            <div
-              role="tablist"
-              aria-label="Project Settings Sub-Tabs"
-              data-testid="project-settings-subtab-bar"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
-                gap: "4px",
-                padding: "3px",
-                borderRadius: "6px",
-                backgroundColor: "var(--bg-elevated)",
-                border: "1px solid var(--border-subtle)",
-              }}
-            >
-              {(
-                [
-                  { id: "overview", label: "Overview & Storage" },
-                  { id: "agents", label: "Agents & Bulk Ops" },
-                  { id: "roles", label: "Roles" },
-                  { id: "cloud-sessions", label: "Cloud Sessions" },
-                  { id: "local-runtimes", label: "Local & API Runtimes" },
-                ] as const
-              ).map((sub) => {
-                const isSelected = projectSubTab === sub.id;
-                return (
-                  <button
-                    key={sub.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={isSelected}
-                    data-testid={`project-tab-${sub.id}`}
-                    className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                    style={{
-                      fontSize: "11.5px",
-                      fontWeight: isSelected ? 700 : 500,
-                      padding: "5px 8px",
-                      justifyContent: "center",
-                      textAlign: "center",
-                      whiteSpace: "nowrap",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                    onClick={() => setProjectSubTab(sub.id)}
-                  >
-                    {sub.label}
-                  </button>
-                );
-              })}
-            </div>
-          ) : (
-            <div
-              role="tablist"
-              aria-label="Agents Settings Sub-Tabs"
-              data-testid="agents-subtab-bar"
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
-                gap: "4px",
-                padding: "3px",
-                borderRadius: "6px",
-                backgroundColor: "var(--bg-elevated)",
-                border: "1px solid var(--border-subtle)",
-              }}
-            >
-              {(
-                [
-                  { id: "roster", label: "Roster & Bulk Ops" },
-                  { id: "roles", label: "Role Registry" },
-                  { id: "cloud-sessions", label: "Cloud Sessions" },
-                  { id: "local-runtimes", label: "Local & API Runtimes" },
-                ] as const
-              ).map((sub) => {
-                const isSelected = agentsSubTab === sub.id;
-                return (
-                  <button
-                    key={sub.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={isSelected}
-                    data-testid={`agents-subtab-${sub.id}`}
-                    className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                    style={{
-                      fontSize: "11.5px",
-                      fontWeight: isSelected ? 700 : 500,
-                      padding: "5px 8px",
-                      justifyContent: "center",
-                      textAlign: "center",
-                      whiteSpace: "nowrap",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                    onClick={() => setAgentsSubTab(sub.id)}
-                  >
-                    {sub.label}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
           {initialProject && (
             <div
               data-testid="project-subpanel-overview"
@@ -3876,7 +4203,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "1fr 1fr 1fr",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 160px), 1fr))",
                   gap: "6px",
                 }}
               >
@@ -4546,54 +4873,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 gap: "12px",
               }}
             >
-              <div
-                role="tablist"
-                aria-label="System Settings Sub-Tabs"
-                data-testid="system-subtab-bar"
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-                  gap: "4px",
-                  padding: "3px",
-                  borderRadius: "6px",
-                  backgroundColor: "var(--bg-elevated)",
-                  border: "1px solid var(--border-subtle)",
-                }}
-              >
-                {(
-                  [
-                    { id: "general", label: "General & Connectivity" },
-                    { id: "storage", label: "Storage & Artifacts" },
-                    { id: "notifications", label: "Notifications & Push" },
-                  ] as const
-                ).map((sub) => {
-                  const isSelected = systemSubTab === sub.id;
-                  return (
-                    <button
-                      key={sub.id}
-                      type="button"
-                      role="tab"
-                      aria-selected={isSelected}
-                      data-testid={`system-subtab-${sub.id}`}
-                      className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                      style={{
-                        fontSize: "11.5px",
-                        fontWeight: isSelected ? 700 : 500,
-                        padding: "5px 8px",
-                        justifyContent: "center",
-                        textAlign: "center",
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                      onClick={() => setSystemSubTab(sub.id)}
-                    >
-                      {sub.label}
-                    </button>
-                  );
-                })}
-              </div>
-
               <div
                 data-testid="system-subpanel-general"
                 style={{
@@ -6545,54 +6824,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             gap: "12px",
           }}
         >
-          {/* Sub-tab bar for Products Settings */}
-          <div
-            role="tablist"
-            aria-label="Products Settings Sub-Sections"
-            data-testid="products-subtab-bar"
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              flexWrap: "wrap",
-              padding: "4px",
-              borderRadius: "8px",
-              background: "var(--bg-elevated)",
-              border: "1px solid var(--border-subtle)",
-            }}
-          >
-            {(
-              [
-                {
-                  id: "catalog" as const,
-                  label: "Products & Profiles",
-                  testId: "products-subtab-catalog",
-                },
-                {
-                  id: "installer" as const,
-                  label: "Installer, Doctor & Releases",
-                  testId: "products-subtab-installer",
-                },
-              ]
-            ).map((sub) => {
-              const isSelected = productsSubTab === sub.id;
-              return (
-                <button
-                  key={sub.id}
-                  type="button"
-                  role="tab"
-                  aria-selected={isSelected}
-                  data-testid={sub.testId}
-                  className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
-                  style={{ fontSize: "11.5px", padding: "5px 12px" }}
-                  onClick={() => setProductsSubTab(sub.id)}
-                >
-                  {sub.label}
-                </button>
-              );
-            })}
-          </div>
-
           {(() => {
             const activeProfile = inferInstallProfilePreset(
               settings.subsystems,
@@ -6633,19 +6864,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: productsSubTab === "catalog" ? "flex" : "none",
                     flexDirection: "column",
                     gap: "12px",
+                    width: "100%",
+                    minWidth: 0,
                   }}
                 >
           <div
             className="fd-card"
             style={{
               display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "12px",
-              flexWrap: "wrap",
+              flexDirection: "column",
+              alignItems: "stretch",
+              gap: "10px",
+              width: "100%",
+              minWidth: 0,
+              boxSizing: "border-box",
             }}
           >
-            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px", minWidth: 0 }}>
               <h3
                 style={{
                   margin: 0,
@@ -6656,6 +6891,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   display: "inline-flex",
                   alignItems: "center",
                   gap: "8px",
+                  minWidth: 0,
                 }}
               >
                 <img
@@ -6664,9 +6900,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   width="20"
                   height="20"
                   aria-hidden="true"
-                  style={{ borderRadius: "4px", objectFit: "cover" }}
+                  style={{ borderRadius: "4px", objectFit: "cover", flexShrink: 0 }}
                 />
-                FerroLoop Installed Products &amp; Subsystem Toggles
+                <span style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+                  FerroLoop Installed Products &amp; Subsystem Toggles
+                </span>
               </h3>
               <p
                 data-testid="products-shared-cli-banner"
@@ -6679,7 +6917,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 Shared CLI included; select the services and integrations to enable.
               </p>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                flexWrap: "wrap",
+                width: "100%",
+                minWidth: 0,
+              }}
+            >
               <span
                 className="fd-badge fd-mono"
                 data-testid="active-install-profile-badge"
@@ -6705,19 +6953,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             style={{
               display: "flex",
               flexDirection: "column",
+              alignItems: "stretch",
               gap: "8px",
+              width: "100%",
+              minWidth: 0,
+              boxSizing: "border-box",
             }}
           >
             <div
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "10px",
-                flexWrap: "wrap",
+                flexDirection: "column",
+                alignItems: "stretch",
+                gap: "8px",
+                width: "100%",
+                minWidth: 0,
               }}
             >
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 700, fontSize: "12.5px" }}>
                   Installation Profile Presets (`fl install --profile`)
                 </div>
@@ -6726,7 +6979,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
               <div
-                style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
+                  gap: "6px",
+                  width: "100%",
+                  minWidth: 0,
+                }}
                 role="group"
                 aria-label="Installation Profile Presets"
               >
@@ -6769,7 +7028,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       className={
                         isSelected ? "fd-btn fd-btn-primary" : "fd-btn"
                       }
-                      style={{ fontSize: "11.5px", padding: "4px 10px" }}
+                      style={{
+                        fontSize: "11.5px",
+                        padding: "5px 10px",
+                        justifyContent: "center",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
+                      }}
                       onClick={() => {
                         setSettingsSaved(false);
                         setLabProfilePreferred(preset.id === "lab");
@@ -6810,8 +7076,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             data-testid="products-cards-grid"
             style={{
               display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 260px), 1fr))",
               gap: "12px",
+              width: "100%",
+              minWidth: 0,
             }}
           >
             {/* 1. FerroLoop (Required Core Engine) */}
@@ -7883,6 +8151,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     flexDirection: "column",
                     gap: "8px",
+                    width: "100%",
+                    minWidth: 0,
+                    boxSizing: "border-box",
                   }}
                 >
                   <div
@@ -7892,6 +8163,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       justifyContent: "space-between",
                       gap: "8px",
                       flexWrap: "wrap",
+                      minWidth: 0,
                     }}
                   >
                     <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
@@ -7910,9 +8182,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                       gap: "8px",
                       fontSize: "11.5px",
+                      width: "100%",
+                      minWidth: 0,
                     }}
                   >
                     <div
@@ -7922,6 +8196,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div
@@ -7935,7 +8211,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       >
                         Resolved Component Closure ({closure.resolvedProducts.length})
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         {closure.resolvedProducts.join(", ")}
                       </code>
                     </div>
@@ -7946,6 +8229,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div
@@ -7959,7 +8244,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       >
                         Planned Service Units ({closure.plannedUnits.length})
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         {closure.plannedUnits.length > 0
                           ? closure.plannedUnits.join(", ")
                           : "None (CLI-only / embedded)"}
@@ -7972,6 +8264,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div
@@ -7985,7 +8279,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       >
                         Planned MCP Catalog Entries ({closure.plannedMcpCatalog.length})
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         {closure.plannedMcpCatalog.length > 0
                           ? closure.plannedMcpCatalog.join(", ")
                           : "None"}
@@ -8001,6 +8302,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: productsSubTab === "installer" ? "flex" : "none",
                     flexDirection: "column",
                     gap: "12px",
+                    width: "100%",
+                    minWidth: 0,
                   }}
                 >
                 {/* Record #84 (Issue #205 Phase B): Install Receipt & Release Provenance Inspector */}
@@ -8011,6 +8314,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     flexDirection: "column",
                     gap: "8px",
+                    width: "100%",
+                    minWidth: 0,
+                    boxSizing: "border-box",
                   }}
                 >
                   <div
@@ -8020,9 +8326,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       justifyContent: "space-between",
                       gap: "8px",
                       flexWrap: "wrap",
+                      minWidth: 0,
                     }}
                   >
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", minWidth: 0 }}>
                       <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
                         Install Receipt &amp; Release Provenance (`receipt.json`)
                       </span>
@@ -8140,9 +8447,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                       gap: "8px",
                       fontSize: "11.5px",
+                      width: "100%",
+                      minWidth: 0,
                     }}
                   >
                     <div
@@ -8152,12 +8461,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
                         Release ID &amp; Source Provenance
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         {versionProvenance.release_id ?? `${versionProvenance.version}+${versionProvenance.commit_short}`} · signed_release · dirty={String(versionProvenance.dirty ?? false)}
                       </code>
                     </div>
@@ -8168,12 +8486,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
                         UI Bundle Provenance (`build-info.json`)
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         {versionProvenance.ui
                           ? `commit=${versionProvenance.ui.commit.slice(0, 12)} · v=${versionProvenance.ui.version ?? "unknown"} · dirty=${String(versionProvenance.ui.dirty ?? false)}`
                           : "build-info.json absent"}
@@ -8186,12 +8513,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         borderRadius: "6px",
                         background: "var(--bg-elevated)",
                         border: "1px solid var(--border-subtle)",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div style={{ color: "var(--text-muted)", fontSize: "10.5px" }}>
                         Atomic Layout &amp; Stable Launcher
                       </div>
-                      <code className="fd-mono" style={{ fontSize: "11px" }}>
+                      <code
+                        className="fd-mono"
+                        style={{
+                          fontSize: "11px",
+                          overflowWrap: "anywhere",
+                          wordBreak: "break-word",
+                        }}
+                      >
                         ~/.local/share/fl/current -&gt; releases/0.9.4+b0888c6bc1ed · ~/.local/bin/fl
                       </code>
                     </div>
@@ -8206,6 +8542,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     display: "flex",
                     flexDirection: "column",
                     gap: "8px",
+                    width: "100%",
+                    minWidth: 0,
+                    boxSizing: "border-box",
                   }}
                 >
                   <div
@@ -8215,6 +8554,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       justifyContent: "space-between",
                       gap: "8px",
                       flexWrap: "wrap",
+                      minWidth: 0,
                     }}
                   >
                     <div
@@ -8223,6 +8563,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         alignItems: "center",
                         gap: "8px",
                         flexWrap: "wrap",
+                        minWidth: 0,
                       }}
                     >
                       <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
@@ -8278,9 +8619,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div
                     style={{
                       display: "grid",
-                      gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                       gap: "6px",
                       fontSize: "11px",
+                      width: "100%",
+                      minWidth: 0,
                     }}
                   >
                     {doctorChecks.map((check) => {
@@ -8305,6 +8648,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             display: "flex",
                             flexDirection: "column",
                             gap: "3px",
+                            minWidth: 0,
+                            boxSizing: "border-box",
                           }}
                         >
                           <div
@@ -8313,11 +8658,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               alignItems: "center",
                               justifyContent: "space-between",
                               gap: "6px",
+                              minWidth: 0,
                             }}
                           >
                             <code
                               className="fd-mono"
-                              style={{ fontWeight: 700, fontSize: "10.5px" }}
+                              style={{
+                                fontWeight: 700,
+                                fontSize: "10.5px",
+                                overflowWrap: "anywhere",
+                                wordBreak: "break-word",
+                              }}
                             >
                               {check.id}
                             </code>
@@ -8327,6 +8678,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               style={{
                                 fontSize: "10px",
                                 color: statusColor,
+                                flexShrink: 0,
                               }}
                             >
                               {check.status}
@@ -8345,6 +8697,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             style={{
                               fontSize: "10px",
                               color: "var(--text-muted)",
+                              overflowWrap: "anywhere",
+                              wordBreak: "break-word",
                             }}
                           >
                             {check.detail}
@@ -8370,6 +8724,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         display: "flex",
                         flexDirection: "column",
                         gap: "8px",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div
@@ -8379,6 +8736,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           justifyContent: "space-between",
                           gap: "8px",
                           flexWrap: "wrap",
+                          minWidth: 0,
                         }}
                       >
                         <div
@@ -8387,6 +8745,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             alignItems: "center",
                             gap: "8px",
                             flexWrap: "wrap",
+                            minWidth: 0,
                           }}
                         >
                           <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
@@ -8424,7 +8783,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           role="status"
                           data-testid="dry-run-plan-banner"
                           className="fd-mono"
-                          style={{ fontSize: "11px", color: "#34d399" }}
+                          style={{
+                            fontSize: "11px",
+                            color: "#34d399",
+                            overflowWrap: "anywhere",
+                            wordBreak: "break-word",
+                          }}
                         >
                           {dryRunBanner}
                         </div>
@@ -8432,9 +8796,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <div
                         style={{
                           display: "grid",
-                          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                           gap: "6px",
                           fontSize: "11px",
+                          width: "100%",
+                          minWidth: 0,
                         }}
                       >
                         <div
@@ -8444,12 +8810,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             borderRadius: "6px",
                             background: "var(--bg-elevated)",
                             border: "1px solid var(--border-subtle)",
+                            minWidth: 0,
+                            boxSizing: "border-box",
                           }}
                         >
                           <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
                             Planned Files ({dryRunPlan.planned_files.length})
                           </div>
-                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                          <code
+                            className="fd-mono"
+                            style={{
+                              fontSize: "10.5px",
+                              overflowWrap: "anywhere",
+                              wordBreak: "break-word",
+                            }}
+                          >
                             {dryRunPlan.planned_files.join(", ")}
                           </code>
                         </div>
@@ -8460,12 +8835,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             borderRadius: "6px",
                             background: "var(--bg-elevated)",
                             border: "1px solid var(--border-subtle)",
+                            minWidth: 0,
+                            boxSizing: "border-box",
                           }}
                         >
                           <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
                             Planned Symlinks ({dryRunPlan.planned_symlinks.length})
                           </div>
-                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                          <code
+                            className="fd-mono"
+                            style={{
+                              fontSize: "10.5px",
+                              overflowWrap: "anywhere",
+                              wordBreak: "break-word",
+                            }}
+                          >
                             {dryRunPlan.planned_symlinks.join(" · ")}
                           </code>
                         </div>
@@ -8476,12 +8860,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             borderRadius: "6px",
                             background: "var(--bg-elevated)",
                             border: "1px solid var(--border-subtle)",
+                            minWidth: 0,
+                            boxSizing: "border-box",
                           }}
                         >
                           <div style={{ color: "var(--text-muted)", fontSize: "10px" }}>
                             Path Conflicts ({dryRunPlan.conflicts.length})
                           </div>
-                          <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                          <code
+                            className="fd-mono"
+                            style={{
+                              fontSize: "10.5px",
+                              overflowWrap: "anywhere",
+                              wordBreak: "break-word",
+                            }}
+                          >
                             {dryRunPlan.conflicts.length > 0
                               ? dryRunPlan.conflicts.join("; ")
                               : "None (Ready for atomic install)"}
@@ -8505,6 +8898,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         display: "flex",
                         flexDirection: "column",
                         gap: "8px",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
                       }}
                     >
                       <div
@@ -8514,6 +8910,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           justifyContent: "space-between",
                           gap: "8px",
                           flexWrap: "wrap",
+                          minWidth: 0,
                         }}
                       >
                         <div
@@ -8522,6 +8919,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             alignItems: "center",
                             gap: "8px",
                             flexWrap: "wrap",
+                            minWidth: 0,
                           }}
                         >
                           <span style={{ fontWeight: 700, fontSize: "12.5px" }}>
@@ -8578,7 +8976,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           role="status"
                           data-testid="release-slot-action-banner"
                           className="fd-mono"
-                          style={{ fontSize: "11px", color: "#34d399" }}
+                          style={{
+                            fontSize: "11px",
+                            color: "#34d399",
+                            overflowWrap: "anywhere",
+                            wordBreak: "break-word",
+                          }}
                         >
                           {releaseSlotBanner}
                         </div>
@@ -8586,9 +8989,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <div
                         style={{
                           display: "grid",
-                          gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                           gap: "6px",
                           fontSize: "11px",
+                          width: "100%",
+                          minWidth: 0,
                         }}
                       >
                         {releaseSlots.map((slot) => (
@@ -8605,9 +9010,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               alignItems: "center",
                               justifyContent: "space-between",
                               gap: "6px",
+                              minWidth: 0,
+                              boxSizing: "border-box",
                             }}
                           >
-                            <code className="fd-mono" style={{ fontSize: "10.5px" }}>
+                            <code
+                              className="fd-mono"
+                              style={{
+                                fontSize: "10.5px",
+                                overflowWrap: "anywhere",
+                                wordBreak: "break-word",
+                              }}
+                            >
                               {slot.slot_id}
                             </code>
                             <span
@@ -8621,6 +9035,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                     : slot.role === "previous"
                                       ? "#38bdf8"
                                       : "#fbbf24",
+                                flexShrink: 0,
                               }}
                             >
                               {slot.role}
@@ -9031,6 +9446,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 display: "flex",
                 flexDirection: "column",
                 gap: "10px",
+                width: "100%",
+                minWidth: 0,
+                boxSizing: "border-box",
               }}
             >
               <div
@@ -9040,9 +9458,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   justifyContent: "space-between",
                   gap: "12px",
                   flexWrap: "wrap",
+                  minWidth: 0,
                 }}
               >
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <h3
                     style={{
                       margin: 0,
@@ -9061,7 +9480,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <select
                   aria-label="Theme Preference"
                   data-testid="settings-theme-select"
-                  className="fd-select fd-mono"
+                  className="fd-select fd-mono sr-only"
                   value={settings.theme_preference}
                   onChange={(e) => {
                     const nextMode =
@@ -9073,7 +9492,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     }));
                     handleSelectThemeMode(nextMode);
                   }}
-                  style={{ fontSize: "12px", padding: "5px 10px" }}
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
                 >
                   <option value="dark">Dark</option>
                   <option value="light">Light</option>
@@ -9085,10 +9514,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 role="group"
                 aria-label="Color Theme Mode"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
+                  display: "grid",
+                  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
                   gap: "8px",
-                  flexWrap: "wrap",
+                  width: "100%",
+                  minWidth: 0,
                 }}
               >
                 {(
@@ -9106,7 +9536,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       data-testid={`theme-mode-${opt.id}`}
                       aria-pressed={isSelected}
                       className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
-                      onClick={() => handleSelectThemeMode(opt.id)}
+                      style={{
+                        justifyContent: "center",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
+                      }}
+                      onClick={() => {
+                        setSettingsSaved(false);
+                        setSettings((prev) => ({
+                          ...prev,
+                          theme_preference: opt.id,
+                        }));
+                        handleSelectThemeMode(opt.id);
+                      }}
                     >
                       {opt.label}
                     </button>
@@ -9192,8 +9635,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 aria-label="System Console Layout Options"
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 220px), 1fr))",
                   gap: "8px",
+                  width: "100%",
+                  minWidth: 0,
                 }}
               >
                 {SYSTEM_CONSOLE_LAYOUT_OPTIONS.map((opt) => {
@@ -9370,6 +9815,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 display: "flex",
                 flexDirection: "column",
                 gap: "10px",
+                width: "100%",
+                minWidth: 0,
+                boxSizing: "border-box",
               }}
             >
               <div
@@ -9379,9 +9827,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   justifyContent: "space-between",
                   gap: "8px",
                   flexWrap: "wrap",
+                  minWidth: 0,
                 }}
               >
-                <div>
+                <div style={{ minWidth: 0 }}>
                   <h3
                     style={{
                       margin: 0,
@@ -9399,7 +9848,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <span
                   data-testid="font-scale-current-badge"
-                  className="fd-badge fd-mono"
+                  className="fd-badge fd-mono sr-only"
+                  style={{
+                    position: "absolute",
+                    width: "1px",
+                    height: "1px",
+                    padding: 0,
+                    margin: "-1px",
+                    overflow: "hidden",
+                    clip: "rect(0, 0, 0, 0)",
+                    whiteSpace: "nowrap",
+                    border: 0,
+                  }}
                 >
                   {localFontScalePct}%
                 </span>
@@ -9409,10 +9869,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 role="group"
                 aria-label="Font Size Presets"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(56px, 1fr))",
                   gap: "6px",
-                  flexWrap: "wrap",
+                  width: "100%",
+                  minWidth: 0,
                 }}
               >
                 {FONT_SCALE_PRESETS.map((pct) => {
@@ -9424,6 +9885,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       data-testid={`font-scale-preset-${pct}`}
                       aria-pressed={isSelected}
                       className={`fd-btn fd-mono${isSelected ? " fd-btn-active" : ""}`}
+                      style={{
+                        justifyContent: "center",
+                        width: "100%",
+                        minWidth: 0,
+                        boxSizing: "border-box",
+                      }}
                       onClick={() => handleSelectFontScalePct(pct)}
                     >
                       {pct}%

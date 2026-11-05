@@ -422,6 +422,11 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           gap: "10px",
           flexWrap: "wrap",
           minWidth: 0,
+          padding: "10px 14px",
+          borderBottom: "1px solid var(--border-subtle)",
+          backgroundColor: "var(--bg-surface)",
+          boxSizing: "border-box",
+          flexShrink: 0,
         }}
       >
         <div

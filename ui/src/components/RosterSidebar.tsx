@@ -366,7 +366,7 @@ export type LeftPanelTab =
 
 export const LEFT_PANEL_TABS: Array<{ id: LeftPanelTab; label: string }> = [
   { id: "roster", label: "Agent Roster" },
-  { id: "triage", label: "Today & Incidents" },
+  { id: "triage", label: "Events" },
   { id: "terminal", label: "Terminal" },
   { id: "hub", label: "Hub & Arch" },
   { id: "gate", label: "Vault & Gate" },
@@ -988,7 +988,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                   onClick={() => handleSelectLeftTab("triage")}
                   style={{ padding: "2px 8px", fontSize: "11px" }}
                 >
-                  Today &amp; Incidents
+                  Events
                 </button>
               </div>
               <input
@@ -1143,7 +1143,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                 </div>
 
                 {!isGroupCollapsed && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: "3px" }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
                     {items.map(({ record, livenessState, activityState, adapter, unreadCount, unreadSeverity, contextEstimate }) => {
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
@@ -1218,7 +1218,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             borderRadius: "var(--radius-md)",
                             border: isSelected
                               ? "1px solid var(--border-accent)"
-                              : "1px solid transparent",
+                              : "1px solid var(--border-subtle)",
                             backgroundColor: isSelected ? "var(--accent-subtle)" : "transparent",
                             color: "var(--text-primary)",
                             cursor: "pointer",

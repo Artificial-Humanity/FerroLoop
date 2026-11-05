@@ -823,14 +823,23 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             display: "flex",
             alignItems: "center",
             gap: "6px",
-            flexWrap: "nowrap",
+            flexWrap: "wrap",
             width: "100%",
+            minWidth: 0,
           }}
         >
           <button
             type="button"
             className="fd-btn"
-            style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+            style={{
+              flex: "1 1 auto",
+              minWidth: 0,
+              justifyContent: "center",
+              minHeight: "34px",
+              fontSize: "12px",
+              padding: "6px 10px",
+              whiteSpace: "nowrap",
+            }}
             data-testid="checkpoint-btn"
             disabled={busyCheckpoint}
             onClick={() => void handleCheckpoint()}
@@ -843,7 +852,15 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 <button
                   type="button"
                   className="fd-btn fd-btn-primary"
-                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  style={{
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                    justifyContent: "center",
+                    minHeight: "34px",
+                    fontSize: "12px",
+                    padding: "6px 10px",
+                    whiteSpace: "nowrap",
+                  }}
                   data-testid="import-workspace-confirm-btn"
                   disabled={busyImport}
                   onClick={() => void handleImport()}
@@ -853,7 +870,16 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
                 <button
                   type="button"
                   className="fd-btn"
-                  style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                  style={{
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                    justifyContent: "center",
+                    minHeight: "34px",
+                    fontSize: "12px",
+                    padding: "6px 10px",
+                    whiteSpace: "nowrap",
+                  }}
+                  data-testid="import-workspace-cancel-btn"
                   onClick={() => setPendingImport(false)}
                 >
                   Cancel
@@ -863,7 +889,15 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               <button
                 type="button"
                 className="fd-btn"
-                style={{ minHeight: "34px", fontSize: "12px", padding: "6px 10px", whiteSpace: "nowrap" }}
+                style={{
+                  flex: "1 1 auto",
+                  minWidth: 0,
+                  justifyContent: "center",
+                  minHeight: "34px",
+                  fontSize: "12px",
+                  padding: "6px 10px",
+                  whiteSpace: "nowrap",
+                }}
                 data-testid="import-workspace-btn"
                 title="Import Workspace (.agents/memory & Notes)"
                 onClick={() => setPendingImport(true)}
@@ -872,26 +906,17 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
               </button>
             ))}
         </div>
-      </div>
 
-      <div
-        className="fd-scroll"
-        data-testid="ferrostate-body"
-        style={{
-          padding: "12px 16px",
-          display: "flex",
-          flexDirection: "column",
-          gap: "20px",
-          flex: 1,
-          minHeight: 0,
-          overflowY: "auto",
-          overflowX: "hidden",
-        }}
-      >
         <div
           data-testid="token-gain-bar"
           className="fd-card"
-          style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "13px" }}
+          style={{
+            display: "flex",
+            gap: "12px",
+            flexWrap: "wrap",
+            fontSize: "12px",
+            padding: "8px 10px",
+          }}
         >
           <span>
             Tokens saved:{" "}
@@ -924,30 +949,83 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
           )}
         </div>
 
-        <div role="tablist" aria-label="FerroState Views" style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subView === "explorer"}
-            className={`fd-btn${subView === "explorer" ? " fd-btn-active" : ""}`}
-            style={{ minHeight: "36px" }}
-            data-testid="subview-explorer-btn"
-            onClick={() => setSubView("explorer")}
+        <div role="tablist" aria-label="FerroState Views" style={{ width: "100%", minWidth: 0 }}>
+          <select
+            aria-label="FerroState Views"
+            data-testid="ferrostate-subview-select"
+            className="fd-select"
+            value={subView}
+            onChange={(e) => setSubView(e.target.value as "explorer" | "code")}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12px",
+              padding: "5px 8px",
+            }}
           >
-            Memory &amp; Handoffs
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subView === "code"}
-            className={`fd-btn${subView === "code" ? " fd-btn-active" : ""}`}
-            style={{ minHeight: "36px" }}
-            data-testid="subview-code-btn"
-            onClick={() => setSubView("code")}
+            <option value="explorer" data-testid="ferrostate-subview-option-explorer">
+              Memory &amp; Handoffs
+            </option>
+            <option value="code" data-testid="ferrostate-subview-option-code">
+              Code Index
+            </option>
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
           >
-            Code Index
-          </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={subView === "explorer"}
+              className={`fd-btn${subView === "explorer" ? " fd-btn-active" : ""}`}
+              style={{ minHeight: "36px" }}
+              data-testid="subview-explorer-btn"
+              onClick={() => setSubView("explorer")}
+            >
+              Memory &amp; Handoffs
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={subView === "code"}
+              className={`fd-btn${subView === "code" ? " fd-btn-active" : ""}`}
+              style={{ minHeight: "36px" }}
+              data-testid="subview-code-btn"
+              onClick={() => setSubView("code")}
+            >
+              Code Index
+            </button>
+          </div>
         </div>
+      </div>
+
+      <div
+        className="fd-scroll"
+        data-testid="ferrostate-body"
+        style={{
+          padding: "12px 16px",
+          display: "flex",
+          flexDirection: "column",
+          gap: "20px",
+          flex: 1,
+          minHeight: 0,
+          overflowY: "auto",
+          overflowX: "hidden",
+        }}
+      >
 
         {effectiveError && (
           <div role="alert" className="fd-card" style={{ color: "var(--diff-del-text)" }}>

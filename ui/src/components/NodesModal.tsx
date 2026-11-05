@@ -390,27 +390,68 @@ export const NodesModal: React.FC<NodesModalProps> = ({
           </div>
         )}
 
-        <div role="tablist" aria-label="Nodes sections" style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "12px" }}>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "nodes"}
-            className={tab === "nodes" ? "fd-btn fd-btn-primary" : "fd-btn"}
-            data-testid="nodes-tab-btn"
-            onClick={() => setTab("nodes")}
+        <div
+          role="tablist"
+          aria-label="Nodes sections"
+          style={{ width: "100%", minWidth: 0, marginBottom: "12px" }}
+        >
+          <select
+            aria-label="Nodes Section"
+            data-testid="nodes-tab-select"
+            className="fd-select"
+            value={tab}
+            onChange={(e) => setTab(e.target.value as "nodes" | "federation")}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12.5px",
+              padding: "6px 10px",
+            }}
           >
-            Nodes
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "federation"}
-            className={tab === "federation" ? "fd-btn fd-btn-primary" : "fd-btn"}
-            data-testid="federation-tab-btn"
-            onClick={() => setTab("federation")}
+            <option value="nodes" data-testid="nodes-tab-option-nodes">
+              Nodes
+            </option>
+            <option value="federation" data-testid="nodes-tab-option-federation">
+              Federation &amp; Runtime Matrix
+            </option>
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
           >
-            Federation &amp; Runtime Matrix
-          </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "nodes"}
+              className={tab === "nodes" ? "fd-btn fd-btn-primary" : "fd-btn"}
+              data-testid="nodes-tab-btn"
+              onClick={() => setTab("nodes")}
+            >
+              Nodes
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "federation"}
+              className={tab === "federation" ? "fd-btn fd-btn-primary" : "fd-btn"}
+              data-testid="federation-tab-btn"
+              onClick={() => setTab("federation")}
+            >
+              Federation &amp; Runtime Matrix
+            </button>
+          </div>
         </div>
 
         {tab === "federation" && (

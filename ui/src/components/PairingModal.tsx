@@ -212,53 +212,95 @@ export const PairingModal: React.FC<PairingModalProps> = ({
           role="tablist"
           aria-label="Authentication Mode"
           style={{
-            display: "flex",
-            gap: "6px",
-            flexWrap: "wrap",
+            width: "100%",
+            minWidth: 0,
             marginBottom: "14px",
             borderBottom: "1px solid var(--border-subtle, #1e293b)",
             paddingBottom: "10px",
           }}
         >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={authMode === "token"}
-            data-testid="auth-tab-token"
-            className={`fd-btn${authMode === "token" ? " fd-btn-active" : ""}`}
-            onClick={() => {
+          <select
+            aria-label="Authentication Mode"
+            data-testid="auth-mode-select"
+            className="fd-select"
+            value={authMode}
+            onChange={(e) => {
               setLocalError(null);
-              setAuthMode("token");
+              setAuthMode(e.target.value as "token" | "password" | "passkey");
+            }}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12.5px",
+              padding: "6px 10px",
             }}
           >
-            Token &amp; Pairing
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={authMode === "password"}
-            data-testid="auth-tab-password"
-            className={`fd-btn${authMode === "password" ? " fd-btn-active" : ""}`}
-            onClick={() => {
-              setLocalError(null);
-              setAuthMode("password");
+            <option value="token" data-testid="auth-mode-option-token">
+              Token &amp; Pairing
+            </option>
+            <option value="password" data-testid="auth-mode-option-password">
+              Password &amp; MFA
+            </option>
+            <option value="passkey" data-testid="auth-mode-option-passkey">
+              Passkey (WebAuthn)
+            </option>
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
             }}
           >
-            Password &amp; MFA
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={authMode === "passkey"}
-            data-testid="auth-tab-passkey"
-            className={`fd-btn${authMode === "passkey" ? " fd-btn-active" : ""}`}
-            onClick={() => {
-              setLocalError(null);
-              setAuthMode("passkey");
-            }}
-          >
-            Passkey (WebAuthn)
-          </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={authMode === "token"}
+              data-testid="auth-tab-token"
+              className={`fd-btn${authMode === "token" ? " fd-btn-active" : ""}`}
+              onClick={() => {
+                setLocalError(null);
+                setAuthMode("token");
+              }}
+            >
+              Token &amp; Pairing
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={authMode === "password"}
+              data-testid="auth-tab-password"
+              className={`fd-btn${authMode === "password" ? " fd-btn-active" : ""}`}
+              onClick={() => {
+                setLocalError(null);
+                setAuthMode("password");
+              }}
+            >
+              Password &amp; MFA
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={authMode === "passkey"}
+              data-testid="auth-tab-passkey"
+              className={`fd-btn${authMode === "passkey" ? " fd-btn-active" : ""}`}
+              onClick={() => {
+                setLocalError(null);
+                setAuthMode("passkey");
+              }}
+            >
+              Passkey (WebAuthn)
+            </button>
+          </div>
         </div>
 
         {displayError && (
