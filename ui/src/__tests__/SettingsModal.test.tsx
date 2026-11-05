@@ -1236,10 +1236,11 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     }
   });
 
-  it("Record #114: renders iOS safe-area margins overlay by default on <720px (including 320px zoomed iOS viewport), allows closing via HUD [×], and toggles from Appearance settings", () => {
+  it("Record #114 & #117: disables iOS safe-area margins overlay by default on mobile (<720px, including 320px zoomed iOS viewport), toggles on from Appearance settings, and allows closing via HUD [×]", () => {
     const originalInnerWidth = window.innerWidth;
     try {
-      window.localStorage.removeItem("fd_show_safe_margins");
+      window.localStorage.setItem("fd_show_safe_margins", "true");
+      window.localStorage.removeItem("fd_show_safe_margins_v2");
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
         writable: true,
@@ -1253,6 +1254,25 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       const chatPane = screen.getByTestId("chat-pane");
       expect(chatPane.style.minWidth).toBe("0");
 
+      // Disabled by default on mobile (even if legacy fd_show_safe_margins was "true")
+      expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
+
+      // Header settings button is rendered in ContextHeader when left sidebar is collapsed
+      expect(screen.getByTestId("header-settings-btn")).toBeInTheDocument();
+
+      // Chat toolbar also exposes left and right panel show/hide toggles
+      expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
+      expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
+
+      // Enable via Settings -> Appearance -> Show iOS Safe-Area Margins
+      fireEvent.click(screen.getByTestId("header-settings-btn"));
+      fireEvent.click(screen.getByTestId("settings-tab-appearance"));
+      const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
+      expect(toggle.checked).toBe(false);
+      fireEvent.click(toggle);
+      expect(toggle.checked).toBe(true);
+      expect(window.localStorage.getItem("fd_show_safe_margins_v2")).toBe("true");
+
       const overlay = screen.getByTestId("ios-safe-area-overlay");
       const hud = screen.getByTestId("ios-safe-area-hud");
       expect(overlay).toBeInTheDocument();
@@ -1262,28 +1282,12 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       // Dismiss via HUD [×] button
       fireEvent.click(screen.getByTestId("ios-safe-area-close-btn"));
       expect(screen.queryByTestId("ios-safe-area-overlay")).toBeNull();
-      expect(window.localStorage.getItem("fd_show_safe_margins")).toBe("false");
-
-      // Header settings button is rendered in ContextHeader when left sidebar is collapsed
-      expect(screen.getByTestId("header-settings-btn")).toBeInTheDocument();
-
-      // Chat toolbar also exposes left and right panel show/hide toggles
-      expect(screen.getByTestId("chat-toolbar-left-panel-toggle")).toBeInTheDocument();
-      expect(screen.getByTestId("chat-toolbar-right-panel-toggle")).toBeInTheDocument();
-
-      // Re-enable via Settings -> Appearance -> Show iOS Safe-Area Margins
-      fireEvent.click(screen.getByTestId("header-settings-btn"));
-      fireEvent.click(screen.getByTestId("settings-tab-appearance"));
-      const toggle = screen.getByTestId("toggle-ios-safe-margins") as HTMLInputElement;
-      expect(toggle.checked).toBe(false);
-      fireEvent.click(toggle);
-      expect(toggle.checked).toBe(true);
-      expect(window.localStorage.getItem("fd_show_safe_margins")).toBe("true");
-      expect(screen.getByTestId("ios-safe-area-overlay")).toBeInTheDocument();
+      expect(window.localStorage.getItem("fd_show_safe_margins_v2")).toBe("false");
 
       unmount();
     } finally {
       window.localStorage.removeItem("fd_show_safe_margins");
+      window.localStorage.removeItem("fd_show_safe_margins_v2");
       Object.defineProperty(window, "innerWidth", {
         configurable: true,
         writable: true,
