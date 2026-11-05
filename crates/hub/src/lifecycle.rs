@@ -4372,7 +4372,7 @@ mod tests {
         );
         assert_eq!(
             launch_args("grok", Some("grok-5")),
-            strings(&["--yolo", "--model", "grok-5", "hello"])
+            strings(&["--yolo", "--always-approve", "--model", "grok-5", "hello"])
         );
         assert_eq!(
             launch_args("muse", Some("muse-2")),
