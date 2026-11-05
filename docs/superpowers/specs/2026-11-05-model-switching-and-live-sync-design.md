@@ -58,6 +58,24 @@ unchanged. Without an override the default still shows. The marker is `#[serde(s
 appears in a JSON response and a payload cannot set it. Override keys by persona are matched as
 today. The override is also dropped by the existing clear/reforge/spin-up/teardown paths.
 
+**Rule: a default is not a live report.** A model that came from a default or fallback (a config
+default, a settings default, a registry default) rather than from the session itself is not a
+live report. It is marked on the in-process summary, never serialized, and the override logic
+ignores it. The fallbacks that set the marker:
+
+* Antigravity: the config's default model, when the trajectory names no usable model.
+* Muse: the registry default (`MUSE_DEFAULT_MODEL`), when the transcript has no
+  `runtime.session.metadata` record with a model id (no transcript, a failed read, or a new session).
+* Codex: `~/.codex/config.toml` `model`, when the rollout tail names no `payload.model` (a fresh
+  session, or a long turn whose tail is all tool output). A session started with `-m` differs
+  from the config.
+* Grok: `~/.grok/config.toml` `default`, when `summary.json` is missing, too large, or has no
+  `current_model_id`.
+* Claude: `~/.claude/settings.json` `model`, when the transcript carries no model signal. A
+  `settings.json` written after the transcript stays a deliberate live report and is not marked.
+
+The displayed model is unchanged in each case. Only the override decision differs.
+
 **Known limit:** a change made out-of-band *back to the baseline* before the vendor ever
 confirmed the override cannot be told apart from "not applied yet", and the override stays. This
 is the price of not inventing a timestamp the vendors do not report (`updated_at` is a string and

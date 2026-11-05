@@ -1039,15 +1039,17 @@ fn session_model_info(
 /// record, else the default. The text comes through `files`, so it has the transcript read cap.
 // Record layout per the Lead's inspection of Muse 1.4.14; unverified against a live file.
 fn muse_model_info(transcript_path: Option<&str>, files: &mut TranscriptReads) -> SessionModelInfo {
-    let model = transcript_path
+    let session_model = transcript_path
         .and_then(|path| files.raw(path))
-        .and_then(muse_transcript_model_id)
-        .unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string());
+        .and_then(muse_transcript_model_id);
     SessionModelInfo {
-        model: Some(model),
+        // Without a metadata record the default still shows, but it is no report by the session.
+        model_is_default: session_model.is_none(),
+        model: Some(
+            session_model.unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string()),
+        ),
         thinking_level: None,
         available_models: owned_strings(&crate::lifecycle::MUSE_CATALOG_MODELS),
-        model_is_default: false,
     }
 }
 
@@ -1759,27 +1761,30 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         (Some(settings), Some(transcript)) => settings > transcript,
         _ => false,
     };
-    let (model, thinking_level) = match from_transcript {
+    let (model, thinking_level, model_is_default) = match from_transcript {
         Some((signal, effort)) if settings_newer && settings_model.is_some() => {
             let model = settings_model.clone().unwrap_or_default();
             // The transcript's command effort still holds when settings.json names that model.
             let effort = settings_effort(&model).or(effort.filter(|_| signal == model));
-            (Some(model), effort)
+            // A settings.json written after the transcript is a deliberate live report.
+            (Some(model), effort, false)
         }
         Some((model, effort)) => {
             let effort = effort.or_else(|| settings_effort(&model));
-            (Some(model), effort)
+            (Some(model), effort, false)
         }
         None => {
             let effort = settings_model.as_deref().and_then(settings_effort);
-            (settings_model, effort)
+            // No transcript signal: settings.json is a default, not what the session runs.
+            let is_default = settings_model.is_some();
+            (settings_model, effort, is_default)
         }
     };
     SessionModelInfo {
         model,
         thinking_level,
         available_models: owned_strings(&CLAUDE_MODELS),
-        model_is_default: false,
+        model_is_default,
     }
 }
 
@@ -1867,16 +1872,18 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
     if available_models.is_empty() {
         available_models = owned_strings(&CODEX_DEFAULT_MODELS);
     }
+    let config_model = config.as_ref().and_then(|c| toml_non_empty_str(c, "model"));
+    // The config default stands in when the rollout tail names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model
-            .or_else(|| config.as_ref().and_then(|c| toml_non_empty_str(c, "model"))),
+        model: session_model.or(config_model),
         thinking_level: session_effort.or_else(|| {
             config
                 .as_ref()
                 .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
         }),
         available_models,
-        model_is_default: false,
+        model_is_default,
     }
 }
 
@@ -1926,11 +1933,14 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
     if available_models.is_empty() {
         available_models = owned_strings(&GROK_DEFAULT_MODELS);
     }
+    let config_model = config_str("default");
+    // The config default stands in when summary.json names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model.or_else(|| config_str("default")),
+        model: session_model.or(config_model),
         thinking_level: config_str("default_reasoning_effort"),
         available_models,
-        model_is_default: false,
+        model_is_default,
     }
 }
 
@@ -8534,6 +8544,141 @@ mod tests {
             let session = muse_session_with_transcript(lines.as_deref());
             assert_eq!(session.model.as_deref(), Some("muse-wonder-full-1.0"));
         }
+    }
+
+    #[test]
+    fn muse_default_model_is_flagged_and_a_metadata_model_is_not() {
+        let other = muse_line(
+            "runtime.session",
+            serde_json::json!({"model_id":"muse-spark-1.3"}),
+        );
+        let no_id = muse_line("runtime.session.metadata", serde_json::json!({"record":{}}));
+        // No metadata record, no model_id in it, and no transcript: the default stands in.
+        for lines in [
+            Some(vec![other]),
+            Some(vec![no_id, "not json".to_string()]),
+            None,
+        ] {
+            let session = muse_session_with_transcript(lines.as_deref());
+            assert_eq!(session.model.as_deref(), Some("muse-wonder-full-1.0"));
+            assert!(session.model_is_default);
+        }
+        // A metadata record names the session's own model, even when it equals the default.
+        for model in ["muse-spark-1.3", "muse-wonder-full-1.0"] {
+            let session = muse_session_with_transcript(Some(&[muse_metadata_line(model)]));
+            assert_eq!(session.model.as_deref(), Some(model));
+            assert!(!session.model_is_default, "{model}");
+        }
+    }
+
+    #[test]
+    fn codex_config_model_is_flagged_and_a_rollout_model_is_not() {
+        let tmp = codex_home_with_config();
+        // A rollout with no model (a fresh session), and no rollout at all.
+        let fresh = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"session_meta","payload":{"id":"t-fixture"}}"#],
+        );
+        let no_rollout = codex_model_info(None, Some(tmp.path()));
+        for info in [fresh, no_rollout] {
+            assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+            assert!(info.model_is_default);
+        }
+        // The rollout names the model, even when it equals the config's.
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+            let line = format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#);
+            let info = codex_session_info(tmp.path(), &[&line]);
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = codex_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn grok_config_default_is_flagged_and_a_summary_model_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let grok = home.join(".grok");
+        let session = grok.join("sessions").join("p").join("s1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            grok.join("config.toml"),
+            "[models]\ndefault = \"grok-4.7\"\n",
+        )
+        .unwrap();
+        let chat = session.join("chat_history.jsonl");
+        // No summary.json, then a summary without the model id: the config default stands in.
+        for summary in [None, Some(r#"{"num_messages":3}"#)] {
+            let _ = fs::remove_file(session.join("summary.json"));
+            if let Some(summary) = summary {
+                fs::write(session.join("summary.json"), summary).unwrap();
+            }
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some("grok-4.7"), "{summary:?}");
+            assert!(info.model_is_default, "{summary:?}");
+        }
+        // The summary names the session's model, even when it equals the config default.
+        for model in ["grok-4.6", "grok-4.7"] {
+            fs::write(
+                session.join("summary.json"),
+                format!(r#"{{"current_model_id":"{model}"}}"#),
+            )
+            .unwrap();
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = grok_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_default_is_flagged_but_a_newer_settings_report_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: settings.json is the default, not the session's model.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+        // A transcript with no model signal (a new session) is the same.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // The transcript names the session's model, newer than settings.json.
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(!info.model_is_default);
+
+        // settings.json written afterwards is a deliberate live report: it wins, and is real.
+        set_mtime_secs(&settings, 3_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(!info.model_is_default);
+
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = claude_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
     }
 
     #[test]

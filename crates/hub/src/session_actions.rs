@@ -106,10 +106,11 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
 /// the discovered one.
 ///
 /// The live pair is the session's discovered model and effort before the overlay. A session whose
-/// `model_is_default` is set reports no model: its model is the configured default, a guess, and
-/// counts as no live model. For each
-/// override, the first matching session that reports a model decides for every session the
-/// override matches in this call:
+/// `model_is_default` is set reports no model: its model is a default standing in for a missing
+/// report, a guess, and counts as no live model.
+///
+/// For each override, the first matching session that reports a model decides for every session
+/// the override matches in this call:
 /// - no live model anywhere: the override is left alone and overlaid;
 /// - no baseline yet: the live pair becomes the baseline; the override stays and is overlaid;
 /// - live equals the choice (the model equal ignoring case, and the effort equal ignoring case,

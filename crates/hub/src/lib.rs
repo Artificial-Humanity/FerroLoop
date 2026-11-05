@@ -6924,6 +6924,55 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_session_without_a_metadata_record_does_not_decide_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(tmp.path(), "mira", muse_route("ms-mira", None));
+        let transcript = tmp
+            .path()
+            .join(".local/share/muse/sessions/2026/10/27/ms-mira/session.jsonl");
+        let report = |model: &str| {
+            let line = json!({
+                "payload_type": "runtime.session.metadata",
+                "payload": { "record": { "model_id": model } },
+            });
+            fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            fs::write(&transcript, line.to_string()).unwrap();
+        };
+        let listed = || {
+            let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+            let sessions = listed.json_value().unwrap()["sessions"].clone();
+            let muse = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["adapter"] == "muse")
+                .expect("the muse session is listed")
+                .clone();
+            assert!(muse.get("model_is_default").is_none(), "{muse}");
+            muse
+        };
+
+        // No metadata record yet: Muse shows its default.
+        assert_eq!(listed()["model"], "muse-wonder-full-1.0");
+        let id = listed()["id"].as_str().unwrap().to_string();
+        set_model(&state, &id, "muse-spark-1.3");
+        // The default is no report: the choice shows and stays.
+        assert_eq!(listed()["model"], "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_some());
+
+        // A real report of another model is the baseline; the choice still shows. Had the default
+        // become the baseline, this report would differ from it and drop the override.
+        report("muse-wonder-1.0");
+        assert_eq!(listed()["model"], "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_some());
+        // A real report of something else supersedes the choice, as before.
+        report("muse-wonder-full-1.0");
+        assert_eq!(listed()["model"], "muse-wonder-full-1.0");
+        assert!(state.session_model_override(&id).is_none());
+    }
+
+    #[test]
     fn model_override_is_dropped_on_reset_spin_up_and_teardown() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
