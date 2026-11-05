@@ -1293,6 +1293,31 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
           <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
             Live Alerts, Subscription Quotas, Liveness &amp; Spend Rollups
           </div>
+          {summary && (
+            <div
+              data-testid="watch-mq-tier"
+              style={{ fontSize: "11px", color: "var(--text-muted)" }}
+            >
+              <strong>FerroMQ Tier</strong>{" "}
+              {summary.mq_tier_telemetry == null
+                ? "Unavailable"
+                : summary.mq_tier_telemetry.topics.length === 0
+                  ? "No active topics"
+                  : <div data-testid="watch-mq-topics" role="region" aria-label="FerroMQ topic details"
+                      tabIndex={0} style={{ maxHeight: "100px", overflowY: "auto", overflowWrap: "anywhere" }}>
+                    {summary.mq_tier_telemetry.topics.map((topic) => (
+                      <div key={topic.topic}>
+                        {topic.topic}: {topic.active_tier}; {topic.memory_messages} messages,{" "}
+                        {topic.memory_bytes} bytes; {topic.spilled_messages_total} spilled,{" "}
+                        {topic.acked_in_memory_total} acknowledged in memory; RAM{" "}
+                        {topic.available_ram_bytes ?? "unknown"} bytes; disk{" "}
+                        {topic.free_disk_bytes ?? "unknown"} bytes
+                      </div>
+                    ))}
+                  </div>
+              }
+            </div>
+          )}
         </div>
 
         {/* Summary KPI Strip */}
