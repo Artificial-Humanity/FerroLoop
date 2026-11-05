@@ -246,6 +246,83 @@ export interface ProjectsListResponse {
   projects: ProjectArtifactsDirInfo[];
 }
 
+export type ProjectKind = "project" | "virtual";
+
+export type ProjectTracker = {
+  kind: "github";
+  repo: string;
+  credential: "app" | "env";
+};
+
+/**
+ * One entry of `GET /api/v1/projects`, and the body of the `POST` and `PATCH` answers.
+ * The artifact-directory fields mirror `ProjectArtifactsDirInfo`; they are optional because an
+ * older hub may omit them. `id` always equals `slug`.
+ */
+export interface ProjectSummary {
+  id: string;
+  slug: string;
+  name: string;
+  kind: ProjectKind;
+  /** `null` for a virtual group. */
+  path: string | null;
+  has_git: boolean;
+  purpose: string | null;
+  tracker: ProjectTracker | null;
+  store_path: string | null;
+  active_agent_count: number;
+  /** The three artifact fields are explicit `null` for a virtual group, which has no directory. */
+  artifacts_dir?: string | null;
+  default_artifacts_dir?: string | null;
+  effective_artifacts_dir?: string | null;
+  /**
+   * Set by `listProjects()` on an entry an older hub served: it had no `slug`, `name` or
+   * `kind`, only an `id` and artifact directories. Never sent by a hub.
+   */
+  legacy?: boolean;
+}
+
+export interface CreateProjectRequest {
+  name: string;
+  slug?: string;
+  kind: ProjectKind;
+  path?: string | null;
+  purpose?: string;
+  git_init?: boolean;
+  /** Tracker repo, `owner/name`. Omit for none. */
+  github?: string;
+  credential?: "app" | "env";
+}
+
+export interface UpdateProjectRequest {
+  name?: string;
+  purpose?: string;
+  path?: string;
+  /** Tracker repo, `owner/name`; `""` clears the tracker on update (never send `credential` with it). */
+  github?: string;
+  credential?: "app" | "env";
+}
+
+export interface DeleteProjectRequest {
+  reassign_to?: string | null;
+  decommission_agents?: boolean;
+  delete_store?: boolean;
+  delete_dir?: boolean;
+}
+
+export interface DeleteProjectResponse {
+  deleted: string;
+  reassigned_agents: number;
+  decommissioned_agents: number;
+  store_deleted: boolean;
+  dir_deleted: boolean;
+  /**
+   * Present only when the store files or the directory could not be deleted AFTER the project
+   * was unregistered.
+   */
+  error?: string;
+}
+
 export interface HubSettings {
   theme_preference: "dark" | "light" | "system";
   timezone: string;
@@ -1760,6 +1837,16 @@ export interface WatchSummaryResponse {
   quotas: WatchQuotaWindow[];
   alerts: WatchAlert[];
   thresholds: WatchThresholds;
+  mq_tier_telemetry?: { topics: Array<{
+    topic: string;
+    active_tier: string;
+    memory_messages: number;
+    memory_bytes: number;
+    spilled_messages_total: number;
+    acked_in_memory_total: number;
+    available_ram_bytes: number | null;
+    free_disk_bytes: number | null;
+  }> } | null;
 }
 
 export interface WatchAlertsResponse {

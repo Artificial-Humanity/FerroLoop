@@ -105,7 +105,7 @@ from each:
     "vault": { "current": 1 }
   },
   "store_formats": {
-    "redb_schema": { "min": 2, "max": 8 },
+    "redb_schema": { "min": 2, "max": 9 },
     "ferrostore_container": { "min": 1, "max": 2 }
   }
 }
@@ -127,7 +127,7 @@ Version groups hold what the code checks by:
 | `schema.manifest` | `MANIFEST_FORMAT_WITHOUT_LEDGER` ..= `MANIFEST_FORMAT` | Manifest import: outside the range is refused. |
 | `schema.warrant_ledger` | `fl_gate::warrant::WARRANT_SCHEMA_VERSION` | Any other version is refused. |
 | `schema.vault` | `fl_gate::VAULT_SCHEMA_VERSION` | Any other version is refused. |
-| `store_formats.redb_schema` | `FORMAT_VERSION` ..= `FORMAT_WITH_WORKFLOW` (the ladder `check_format` accepts) | Both engines open this ladder. A new store starts at `min`; the first write of a newer kind raises it, and an older build refuses the raised store. |
+| `store_formats.redb_schema` | `FORMAT_VERSION` ..= `FORMAT_WITH_AREA_DELETE` (the ladder `check_format` accepts) | Both engines open this ladder. A new store starts at `min`; the first write of a newer kind raises it, and an older build refuses the raised store. |
 | `store_formats.ferrostore_container` | `CONTAINER_FORMAT_OLDEST` ..= `CONTAINER_FORMAT_NEWEST` | The `.fls` container: this build reads both and writes the newest. |
 
 ## `ferrostore --version`

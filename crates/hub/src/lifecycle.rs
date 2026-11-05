@@ -1003,6 +1003,31 @@ pub struct SpinUpRequest {
     pub cwd: Option<String>,
 }
 
+impl SpinUpRequest {
+    /// The request with the runtime directory it defaults to. An explicit `cwd` is kept. Without
+    /// one, an agent of a virtual scope (an area with no path, or a project no area names yet,
+    /// which spin-up makes as one) starts in `workspace_root`, the one directory such a scope
+    /// has; an agent of a directory-backed project keeps what the request said (no `cwd`).
+    /// A `workspace_root` that is not a directory on this host is not used.
+    pub fn with_default_cwd<S: AgentRegistry>(mut self, store: &S, workspace_root: &Path) -> Self {
+        if trimmed_opt(&self.cwd).is_some() {
+            return self;
+        }
+        let Ok(project) = validate_slug(self.project.trim()) else {
+            return self;
+        };
+        let virtual_scope = match store.get_area(&project) {
+            Ok(Some(area)) => area.is_virtual(),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if virtual_scope && workspace_root.is_dir() {
+            self.cwd = Some(workspace_root.to_string_lossy().into_owned());
+        }
+        self
+    }
+}
+
 /// `SpinUpRequest` after validation and defaulting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidSpinUp {

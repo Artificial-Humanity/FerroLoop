@@ -770,6 +770,9 @@ fn infer_project_area_slug(
         .and_then(|s| validate_slug(s).ok());
 
     if let Ok(areas) = registry.list_areas() {
+        // A virtual group (an area with no path) is not a project's root: a directory is not
+        // matched to it by name, and it is not "the only area" of a project.
+        let areas: Vec<_> = areas.into_iter().filter(|a| !a.is_virtual()).collect();
         if let Some(ref base) = basename
             && areas.iter().any(|a| &a.area_key == base)
         {
@@ -2405,6 +2408,45 @@ on = "pass"
                 authored_by: "ferris".into(),
             })
             .unwrap()
+    }
+
+    fn area(store: &MemStore, key: &str, path: Option<&str>) {
+        store
+            .upsert_area(fl_core::agent::AreaRecord {
+                area_key: key.into(),
+                name: key.into(),
+                path: path.map(str::to_string),
+                purpose: "p".into(),
+                updated_at: At::from_unix_millis(1),
+                by: "t".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_virtual_group_is_neither_matched_by_name_nor_the_only_area() {
+        let store = MemStore::default();
+        let def = one_step_def(&store);
+        // The only area is a virtual group: it is no project's area.
+        area(&store, "council", None);
+        assert_eq!(
+            infer_project_area_slug(&store, "/work/council", &def),
+            "council",
+            "falls back to the directory name, not to the group"
+        );
+        assert_eq!(
+            infer_project_area_slug(&store, "/work/Elsewhere", &def),
+            "elsewhere"
+        );
+        // With a directory-backed area beside it, that one is the only area.
+        area(&store, "alpha", Some("/work/alpha"));
+        assert_eq!(
+            infer_project_area_slug(&store, "/work/unrelated", &def),
+            "alpha"
+        );
+        // A name match on a directory-backed area still wins.
+        area(&store, "beta", Some("/work/beta"));
+        assert_eq!(infer_project_area_slug(&store, "/work/beta", &def), "beta");
     }
 
     /// `assign_workflow_step` rewrites the stored run, so it must wait for the run-commit lock

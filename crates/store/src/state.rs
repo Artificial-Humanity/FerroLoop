@@ -19,8 +19,8 @@ use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
-    ALIASES, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore, additive, backend,
-    decode, index_new, locate_in, mint, raise_format,
+    ALIASES, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore,
+    additive, backend, decode, index_new, locate_in, mint, raise_format,
 };
 
 pub(crate) const STATE_ENTRIES: TableDefinition<&str, &str> = TableDefinition::new("state_entries");
@@ -623,6 +623,31 @@ impl AgentRegistry for RedbStore {
         Ok(out)
     }
 
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        let key = validate_slug(area_key).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        let removed = tx
+            .open_table(AREAS)
+            .map_err(backend)?
+            .remove(key.as_str())
+            .map_err(backend)?
+            .is_some();
+        if !removed {
+            return Ok(false);
+        }
+        // An older fl cannot decode the event below: it refuses the raised store instead.
+        raise_format(&tx, FORMAT_WITH_AREA_DELETE)?;
+        let ev = RegistryEvent {
+            event_id: mint()?,
+            at,
+            by: by.to_string(),
+            kind: RegistryEventKind::AreaDelete { area_key: key },
+        };
+        self.append_registry_event_in(&tx, &ev)?;
+        tx.commit().map_err(backend)?;
+        Ok(true)
+    }
+
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         let (name_key, display_name, email) =
             validate_agent_identity(&args.display_name, args.email.as_deref())
@@ -1010,6 +1035,13 @@ impl AgentRegistry for RedbStore {
                     tx.open_table(AGENTS)
                         .map_err(backend)?
                         .insert(rec.id.as_str(), json.as_str())
+                        .map_err(backend)?;
+                }
+                RegistryEventKind::AreaDelete { area_key } => {
+                    raise_format(&tx, FORMAT_WITH_AREA_DELETE)?;
+                    tx.open_table(AREAS)
+                        .map_err(backend)?
+                        .remove(area_key.as_str())
                         .map_err(backend)?;
                 }
                 RegistryEventKind::AgentRetire { id } => {

@@ -1153,6 +1153,8 @@ delegate! {
         fn add_project(&self, root: &str) -> Result<ProjectId, StoreError>;
         fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
         fn list_projects(&self) -> Result<Vec<Project>, StoreError>;
+        fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError>;
+        fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError>;
         fn add_gate(&self, project: &ProjectId, name: &str, kind: GateKind, selector: Selector, min_population: u64, authored_at_commit: &str, authored_by: &str) -> Result<GateId, StoreError>;
         fn get_gate(&self, id: &GateId) -> Result<Option<GateDef>, StoreError>;
         fn list_gates(&self, project: &ProjectId) -> Result<Vec<GateDef>, StoreError>;
@@ -1221,6 +1223,7 @@ delegate! {
         fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError>;
         fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError>;
         fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError>;
+        fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError>;
         fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError>;
         fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError>;
         fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, StoreError>;

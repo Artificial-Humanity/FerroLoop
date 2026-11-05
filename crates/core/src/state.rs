@@ -44,7 +44,7 @@ pub enum StateError {
     #[error("memory `{0}` cannot supersede itself")]
     SelfSupersede(StateId),
     #[error(
-        "invalid wire address `{0}`: expected `<agent>`, `urn:uuid:...`, `@all`, `@area:<slug>`, `@role:<role>`, or `@area:<slug>/<role>`"
+        "invalid wire address `{0}`: expected `<agent>`, `urn:uuid:...`, `@all`, `@council`, `@<group>`, `@area:<slug>`, `@role:<role>`, or `@area:<slug>/<role>`"
     )]
     InvalidAddress(String),
     #[error("message subject must be a single non-empty line of at most 512 bytes")]

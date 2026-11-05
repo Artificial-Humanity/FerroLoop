@@ -196,7 +196,7 @@ fn run_bound<F: Fixture>(
 }
 
 /// How many cases [`catalog`] runs. Update deliberately — see [`run_suite`].
-const CATALOG_CASES: usize = 3;
+const CATALOG_CASES: usize = 5;
 /// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
 const TRACKER_CASES: usize = 14;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
@@ -212,9 +212,11 @@ const LEDGER_CACHE_CASES: usize = 6;
 /// How many cases [`escalations`] runs. Update deliberately — see [`run_suite`].
 const ESCALATION_CASES: usize = 8;
 
-pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
+pub fn catalog<S: Catalog + Tracker + crate::routing::Routes, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         a_project_round_trips::<S>,
+        a_project_root_can_be_changed_and_nothing_else::<S>,
+        a_project_is_removed_only_when_nothing_hangs_on_it::<S>,
         affirming_a_gate_moves_only_its_stamp::<S>,
         list_transitions_returns_every_transition_of_one_project_and_no_others::<S>,
     ];
@@ -600,6 +602,76 @@ fn a_project_round_trips<S: Catalog>(s: &S) {
     let id = s.add_project("/tmp/p").unwrap();
     assert_eq!(s.get_project(&id).unwrap().unwrap().root, "/tmp/p");
     assert_eq!(s.list_projects().unwrap().len(), 1);
+}
+
+fn a_project_root_can_be_changed_and_nothing_else<S: Catalog>(s: &S) {
+    let id = s.add_project("/tmp/p").unwrap();
+    let gate = s
+        .add_gate(
+            &id,
+            "fmt",
+            sample_kind(),
+            sample_selector(),
+            1,
+            "abc",
+            "owner",
+        )
+        .unwrap();
+    s.set_project_root(&id, "/tmp/q").unwrap();
+    assert_eq!(s.get_project(&id).unwrap().unwrap().root, "/tmp/q");
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+    assert_eq!(s.get_gate(&gate).unwrap().unwrap().project, id);
+    // An id that is not a project is refused, never turned into one.
+    assert!(
+        s.set_project_root(&ProjectId(entry_iri(900)), "/x")
+            .is_err()
+    );
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+}
+
+fn a_project_is_removed_only_when_nothing_hangs_on_it<S: Catalog + Tracker>(s: &S) {
+    let keep = s.add_project("/tmp/keep").unwrap();
+    let gone = s.add_project("/tmp/gone").unwrap();
+    assert!(s.remove_project(&gone).unwrap());
+    assert_eq!(s.get_project(&gone).unwrap(), None);
+    let left: Vec<_> = s
+        .list_projects()
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(left, vec![keep.clone()]);
+    // Asking again changes nothing and says so.
+    assert!(!s.remove_project(&gone).unwrap());
+    // An id that is not a project is refused, never removed.
+    assert!(s.remove_project(&ProjectId(entry_iri(900))).is_err());
+
+    // A project that holds a record or a gate stays: its record would be left with no project.
+    s.add_record(&keep, "a record").unwrap();
+    match s.remove_project(&keep) {
+        Err(StoreError::InvalidState(m)) => assert!(
+            m.contains("0 gates, 0 transitions and 1 records, so it is not removed"),
+            "one space in the refusal: {m}"
+        ),
+        other => panic!("expected InvalidState, got {other:?}"),
+    }
+    assert_eq!(s.list_projects().unwrap().len(), 1);
+    let other = s.add_project("/tmp/other").unwrap();
+    s.add_gate(
+        &other,
+        "fmt",
+        sample_kind(),
+        sample_selector(),
+        1,
+        "abc",
+        "owner",
+    )
+    .unwrap();
+    assert!(matches!(
+        s.remove_project(&other),
+        Err(StoreError::InvalidState(_))
+    ));
+    assert_eq!(s.list_projects().unwrap().len(), 2);
 }
 
 fn affirming_a_gate_moves_only_its_stamp<S: Catalog>(s: &S) {
@@ -2541,17 +2613,18 @@ impl RemoteControl for MemRemote {
 }
 
 /// How many cases [`agent_registry`] runs. Update deliberately — see [`run_suite`].
-const AGENT_REGISTRY_CASES: usize = 7;
+const AGENT_REGISTRY_CASES: usize = 8;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
-const MESSAGE_STORE_CASES: usize = 9;
+const MESSAGE_STORE_CASES: usize = 10;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
 const WORKFLOW_STORE_CASES: usize = 3;
 
 pub fn agent_registry<S: AgentRegistry + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         area_round_trips_and_normalizes_key::<S>,
+        area_delete_removes_the_area_logs_one_event_and_is_idempotent::<S>,
         register_agent_requires_existing_area_unless_create_area_is_set::<S>,
         agent_resolves_by_case_insensitive_name_and_numeric_handle::<S>,
         agent_collision_refuses_active_and_retired_without_replace_and_preserves_iri_on_replace::<S>,
@@ -2584,6 +2657,7 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
     let cases: &[fn(&S)] = &[
         direct_and_unregistered_persona_addressing_round_trips_across_registration::<S>,
         group_selectors_expand_active_agents_and_exclude_sender::<S>,
+        council_and_virtual_group_selectors_reach_their_members::<S>,
         ask_reply_and_thread_indexing_validate_and_correlate::<S>,
         receipt_transitions_and_batch_imports_converge_monotonically::<S>,
         wire_import_deduplicates_and_refuses_tampered_message::<S>,
@@ -2687,6 +2761,48 @@ fn area_round_trips_and_normalizes_key<S: AgentRegistry>(s: &S) {
     assert_eq!(a.area_key, "ferro_loop");
     assert_eq!(s.get_area("FERRO_LOOP").unwrap(), Some(a.clone()));
     assert_eq!(s.list_areas().unwrap(), vec![a]);
+}
+
+fn area_delete_removes_the_area_logs_one_event_and_is_idempotent<S: AgentRegistry>(s: &S) {
+    let area = |key: &str| crate::agent::AreaRecord {
+        area_key: key.into(),
+        name: key.into(),
+        path: None,
+        purpose: "p".into(),
+        updated_at: At::from_unix_millis(10),
+        by: "jarvis".into(),
+    };
+    s.upsert_area(area("gone")).unwrap();
+    s.upsert_area(area("kept")).unwrap();
+    let before = s.registry_events_after(0).unwrap().len();
+    assert!(
+        s.delete_area("GONE", At::from_unix_millis(11), "owner")
+            .unwrap()
+    );
+    assert_eq!(s.get_area("gone").unwrap(), None);
+    assert!(s.get_area("kept").unwrap().is_some());
+    let events = s.registry_events_after(0).unwrap();
+    assert_eq!(events.len(), before + 1);
+    assert!(matches!(
+        &events.last().unwrap().1.kind,
+        crate::agent::RegistryEventKind::AreaDelete { area_key } if area_key == "gone"
+    ));
+    // Absent: nothing changes, nothing is logged.
+    assert!(
+        !s.delete_area("gone", At::from_unix_millis(12), "owner")
+            .unwrap()
+    );
+    assert_eq!(s.registry_events_after(0).unwrap().len(), before + 1);
+    // An imported delete removes the area too, and a later upsert makes it again.
+    let mut remote = events.last().unwrap().1.clone();
+    remote.event_id = crate::ids::seq_iri(9_000_001);
+    remote.kind = crate::agent::RegistryEventKind::AreaDelete {
+        area_key: "kept".into(),
+    };
+    s.import_registry_events(&[remote]).unwrap();
+    assert_eq!(s.get_area("kept").unwrap(), None);
+    s.upsert_area(area("kept")).unwrap();
+    assert!(s.get_area("kept").unwrap().is_some());
 }
 
 fn register_agent_requires_existing_area_unless_create_area_is_set<S: AgentRegistry>(s: &S) {
@@ -3840,6 +3956,84 @@ fn group_selectors_expand_active_agents_and_exclude_sender<
         .unwrap();
     assert_eq!(role_rcpts.len(), 1);
     assert_eq!(role_rcpts[0].recipient_name, "ferris");
+}
+
+fn council_and_virtual_group_selectors_reach_their_members<
+    S: MessageStore + AgentRegistry + Catalog + Handles,
+>(
+    s: &S,
+) {
+    use crate::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    let at = |n| At::from_unix_millis(n);
+    let area = |key: &str, path: Option<&str>| AreaRecord {
+        area_key: key.into(),
+        name: key.into(),
+        path: path.map(str::to_string),
+        purpose: "p".into(),
+        updated_at: at(1),
+        by: "owner".into(),
+    };
+    s.upsert_area(area("ops", None)).unwrap();
+    s.upsert_area(area("council", None)).unwrap();
+    s.upsert_area(area("ferroloop", Some("/work/ferroloop")))
+        .unwrap();
+    let register = |name: &str, project: &str, role: AgentRole, extra: &[&str], n: u64| {
+        s.register_agent(RegisterAgentArgs {
+            display_name: name.into(),
+            email: None,
+            project: project.into(),
+            role,
+            extra_areas: extra.iter().map(|e| e.to_string()).collect(),
+            create_area: false,
+            replace: false,
+            at: at(n),
+            by: "owner".into(),
+        })
+        .unwrap()
+    };
+    register("Ada", "ops", AgentRole::Lead, &[], 10);
+    register("Bea", "ferroloop", AgentRole::Tester, &["ops"], 11);
+    register("Cy", "council", AgentRole::Journalist, &[], 12);
+    register("Di", "ferroloop", AgentRole::Strategist, &[], 13);
+    register("Ed", "ferroloop", AgentRole::Lead, &[], 14);
+    let send = |to: &str, n: u64| {
+        s.send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "owner".into(),
+            sender_host: None,
+            to: WireAddress::parse(to).unwrap(),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "S".into(),
+            body: "B".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: at(n),
+        })
+    };
+    let names = |r: Vec<crate::ferrowire::DeliveryReceipt>| -> Vec<String> {
+        r.into_iter().map(|r| r.recipient_name).collect()
+    };
+    assert_eq!(names(send("@ops", 20).unwrap().1), ["ada", "bea"]);
+    assert_eq!(names(send("@council", 21).unwrap().1), ["cy", "di"]);
+    // `@council` is the union with the strategists even though `council` is a group too.
+    assert_eq!(names(send("@role:strategist", 22).unwrap().1), ["di"]);
+    // A real project's key and an unknown key are refused, and nothing is delivered.
+    for bad in ["@ferroloop", "@nowhere"] {
+        match send(bad, 23) {
+            Err(StoreError::InvalidState(why)) => assert!(why.contains(bad), "{why}"),
+            other => panic!("{bad}: expected a refusal, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        names(send("@area:ferroloop", 24).unwrap().1),
+        ["bea", "di", "ed"]
+    );
 }
 
 fn ask_reply_and_thread_indexing_validate_and_correlate<S: MessageStore>(s: &S) {
