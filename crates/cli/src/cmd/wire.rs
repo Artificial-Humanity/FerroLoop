@@ -584,13 +584,30 @@ pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
 
 pub fn execute_send(
     env: &StateEnv<'_>,
-    args: SendWireArgs,
+    mut args: SendWireArgs,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
+    let message_id = args
+        .id
+        .get_or_insert_with(|| {
+            MessageId(
+                Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7()))
+                    .expect("a formatted UUID is a valid IRI"),
+            )
+        })
+        .clone();
     let sock = resolve_socket_path(env, None);
     if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        match client.request(&LocalRequest::Send { args })? {
+        let uncertain = |error: String| {
+            format!(
+                "message {message_id} may already be delivered; check its status before retrying: {error}"
+            )
+        };
+        match client
+            .request(&LocalRequest::Send { args })
+            .map_err(&uncertain)?
+        {
             LocalResponse::Sent { message, receipts } => return Ok((message, receipts)),
-            other => return Err(format!("unexpected daemon response: {other:?}")),
+            other => return Err(uncertain(format!("unexpected daemon response: {other:?}"))),
         }
     }
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
@@ -1739,6 +1756,188 @@ pub fn inbox_item_to_json(item: &WireInboxItem) -> Value {
 
 #[cfg(test)]
 mod tests {
+    fn test_send_args() -> SendWireArgs {
+        SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "ada".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("bob".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "hello".into(),
+            body: "test".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: now_at(),
+        }
+    }
+
+    #[test]
+    fn connected_send_without_a_response_reports_the_transmitted_id_and_does_not_open_the_store() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let rig = HookRig::new(Some("ada"));
+        let listener = UnixListener::bind(rig.dir.path().join("none.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let request: LocalRequest = serde_json::from_str(&line).unwrap();
+            let LocalRequest::Send { args } = request else {
+                panic!("expected send")
+            };
+            args.id.expect("client generated message id")
+        });
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let err = execute_send(&env, test_send_args()).unwrap_err();
+        let sent_id = server.join().unwrap();
+        assert!(err.contains(sent_id.as_str()), "{err}");
+        assert!(err.contains("may already be delivered"), "{err}");
+        assert!(!rig.db.exists());
+        assert!(!rig.db.with_extension("fls").exists());
+    }
+
+    #[test]
+    fn connected_send_timeout_preserves_caller_id_without_opening_store() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+
+        let rig = HookRig::new(Some("ada"));
+        let listener = UnixListener::bind(rig.dir.path().join("none.sock")).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let LocalRequest::Send { args } = serde_json::from_str(&line).unwrap() else {
+                panic!("expected send");
+            };
+            let id = args.id.unwrap();
+            release_rx.recv().unwrap();
+            id
+        });
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let mut args = test_send_args();
+        let id = parse_message_id("01900000-0000-7000-8000-000000000001").unwrap();
+        args.id = Some(id.clone());
+        let error = execute_send(&env, args).unwrap_err();
+        release_tx.send(()).unwrap();
+        assert_eq!(server.join().unwrap(), id);
+        assert!(error.contains(id.as_str()), "{error}");
+        assert!(error.contains("may already be delivered"), "{error}");
+        assert!(!rig.db.exists());
+        assert!(!rig.db.with_extension("fls").exists());
+    }
+
+    #[test]
+    fn connected_send_with_unexpected_response_is_ambiguous_without_opening_store() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let rig = HookRig::new(Some("ada"));
+        let listener = UnixListener::bind(rig.dir.path().join("none.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let LocalRequest::Send { args } = serde_json::from_str(&line).unwrap() else {
+                panic!("expected send");
+            };
+            stream
+                .write_all(b"{\"status\":\"route_registered\"}\n")
+                .unwrap();
+            args.id.unwrap()
+        });
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let error = execute_send(&env, test_send_args()).unwrap_err();
+        let id = server.join().unwrap();
+        assert!(error.contains(id.as_str()), "{error}");
+        assert!(error.contains("may already be delivered"), "{error}");
+        assert!(error.contains("unexpected daemon response"), "{error}");
+        assert!(!rig.db.exists());
+        assert!(!rig.db.with_extension("fls").exists());
+    }
+
+    #[test]
+    fn missing_daemon_uses_direct_store_with_caller_generated_id() {
+        let rig = HookRig::new(Some("ada"));
+        let env = StateEnv {
+            explicit_db: Some(&rig.db),
+            default_store: &rig.db,
+            cfg: &rig.cfg,
+            cwd: rig.dir.path(),
+        };
+        let (sent, _) = execute_send(&env, test_send_args()).unwrap();
+        assert!(sent.id.as_str().starts_with("urn:uuid:"));
+        assert_eq!(
+            env.open_for_scope(Some(&StateScope::Workspace))
+                .unwrap()
+                .get_wire_message(&sent.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            sent.id
+        );
+    }
+
+    #[test]
+    fn wire_and_agent_msg_send_do_not_expose_retry_id() {
+        #[derive(Parser)]
+        struct WireTestCli {
+            #[command(subcommand)]
+            cmd: WireCmd,
+        }
+        let retry_id = "01900000-0000-7000-8000-000000000001";
+        let wire = WireTestCli::try_parse_from([
+            "fl-wire", "send", "bob", "hello", "body", "--id", retry_id,
+        ]);
+        assert_eq!(
+            wire.err().unwrap().kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+        let agent = AgentMsgCli::try_parse_from([
+            "agent-msg",
+            "send",
+            "bob",
+            "hello",
+            "body",
+            "--id",
+            retry_id,
+        ]);
+        assert_eq!(
+            agent.err().unwrap().kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+        let wire =
+            WireTestCli::try_parse_from(["fl-wire", "send", "bob", "hello", "body"]).unwrap();
+        assert!(matches!(wire.cmd, WireCmd::Send { .. }));
+        let agent =
+            AgentMsgCli::try_parse_from(["agent-msg", "send", "bob", "hello", "body"]).unwrap();
+        assert!(matches!(agent.cmd, AgentMsgCmd::Send { .. }));
+    }
     #[test]
     fn a_rejected_daemon_registration_keeps_the_muse_roster_entry() {
         use std::io::{BufRead, BufReader, Write};

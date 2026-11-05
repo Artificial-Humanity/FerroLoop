@@ -30,6 +30,7 @@ tempfile.workspace = true
 toml.workspace = true
 ureq.workspace = true
 libc.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 redb.workspace = true

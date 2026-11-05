@@ -1,6 +1,18 @@
 //! Local Unix domain socket server/client (`fl-wire.sock`) and multi-peer WebSocket relay daemon (spec §3.3, §3.4).
+//!
+//! After a crash, an accepted pending message may or may not have been pushed before its
+//! receipt was updated. Startup does not scan or replay these ambiguous messages; they remain
+//! readable in the inbox for manual recovery. Push ordering applies within one daemon lifetime;
+//! cross-restart ordering and durable dispatch claims are deferred to Record #143.
+//!
+//! If a delivery is unresolved or a recipient exceeds its in-memory dispatch limit, later
+//! sends to that recipient remain in its inbox for the lifetime of this daemon. The operator
+//! can read and acknowledge them; the daemon does not replay them automatically. A separate
+//! bound limits tracked recipient queues independently of the active worker limit. Once both
+//! tracked-queue and overflow-fence metadata bounds are exhausted, new recipients remain pending
+//! too; already-tracked recipients continue to use their own queues.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -21,7 +33,7 @@ use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
 use serde::{Deserialize, Serialize};
 
-use crate::dispatcher::dispatch_message_for_store;
+use crate::dispatcher::dispatch_message_for_recipient;
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
 use crate::peer::{PeerFrame, handshake_peer};
 use crate::ws::{WsError, WsStream};
@@ -353,11 +365,48 @@ struct Subscriber {
     tx: Sender<LocalEvent>,
 }
 
+/// Limits keep a stuck vendor from causing unbounded threads or queued metadata. Messages beyond
+/// a recipient's metadata bound remain persisted in the inbox for manual recovery.
+const MAX_DISPATCH_RECIPIENTS: usize = 128;
+/// Parked queues retain current-process, never-attempted messages without consuming workers.
+const MAX_TRACKED_RECIPIENTS: usize = 512;
+const MAX_QUEUED_PER_RECIPIENT: usize = 1024;
+const MAX_OVERFLOW_RECIPIENTS: usize = 128;
+
+#[derive(Default)]
+struct RecipientDispatchQueue {
+    pending: VecDeque<(MessageId, At)>,
+    in_flight: Option<MessageId>,
+    overflowed: bool,
+    waiting_for_route: bool,
+    waiting_for_capacity: bool,
+    worker_active: bool,
+    route_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DispatchOutcome {
+    Resolved,
+    NoRoute,
+    Unconfirmed,
+}
+
 struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
     routes: Mutex<RouteTable>,
-    dispatch_gate: Mutex<()>,
+    /// Serializes only persistence and enqueue, never vendor execution.
+    enqueue_gate: Mutex<()>,
+    dispatch_queues: Mutex<BTreeMap<String, RecipientDispatchQueue>>,
+    /// Recipients that could not acquire a worker; blocked until daemon restart so later
+    /// messages cannot overtake their already-stored backlog.
+    overflow_recipients: Mutex<BTreeSet<String>>,
+    /// At the hard metadata limit we can no longer distinguish additional recipients safely.
+    overflow_capacity_exhausted: AtomicBool,
+    #[cfg(test)]
+    no_route_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
+    #[cfg(test)]
+    empty_exit_hook: Mutex<Option<(Sender<()>, Receiver<()>)>>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
     subscribers: Mutex<Vec<Subscriber>>,
     next_peer_id: Mutex<u64>,
@@ -436,19 +485,21 @@ where
         });
     }
 
-    fn dispatch_and_propagate(&self, msg: &WireMessage, now: At) {
-        // One dispatch at a time, so two threads cannot both push the same pending message. The
-        // `routes` lock is held only to copy the table out and to merge it back: pushing runs
-        // vendor CLIs, and `Status` and `RegisterRoute` must not wait behind one.
-        let _one_at_a_time = lock(&self.dispatch_gate);
+    fn dispatch_and_propagate(
+        &self,
+        msg: &WireMessage,
+        recipient: &str,
+        now: At,
+    ) -> DispatchOutcome {
         let base = lock(&self.routes).clone();
         let mut working = base.clone();
-        let updated = dispatch_message_for_store(
+        let (updated, attempted) = dispatch_message_for_recipient(
             self.store.as_ref(),
             &mut working,
             self.config.home_override.as_deref(),
             msg,
             now,
+            recipient,
         );
         // Discovery inside the dispatch also learns replaced sessions and prunes dead routes;
         // carry both back, and persist them so a restart starts from the refreshed table.
@@ -463,30 +514,311 @@ where
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
         }
+        let receipt = self
+            .store
+            .list_wire_receipts(&msg.id)
+            .ok()
+            .and_then(|receipts| {
+                receipts
+                    .into_iter()
+                    .find(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient))
+            });
+        match receipt {
+            Some(receipt)
+                if matches!(
+                    receipt.status,
+                    DeliveryStatus::Acked | DeliveryStatus::Expired
+                ) =>
+            {
+                DispatchOutcome::Resolved
+            }
+            Some(receipt)
+                if attempted == Some(false)
+                    && receipt.attempts < crate::dispatcher::MAX_DELIVER =>
+            {
+                DispatchOutcome::NoRoute
+            }
+            _ => DispatchOutcome::Unconfirmed,
+        }
     }
 
-    fn dispatch_pending_for_persona(&self, persona: &str, now: At) {
-        let filter = WireFilter {
-            recipient: Some(persona.to_string()),
-            unread_only: true,
-            thread_id: None,
-            correlation_id: None,
-            limit: None,
+    /// Start one queued worker, or retain it until an active slot becomes available.
+    /// The queue mutex is held by the caller, so a worker cannot race its admission.
+    fn start_queued_worker(
+        self: &Arc<Self>,
+        queues: &mut BTreeMap<String, RecipientDispatchQueue>,
+        recipient: &str,
+    ) -> Result<(), String> {
+        let active = queues.values().filter(|queue| queue.worker_active).count();
+        let Some(queue) = queues.get_mut(recipient) else {
+            return Ok(());
         };
-        if let Ok(items) = self.store.list_wire_inbox(&filter) {
-            for item in items {
-                self.dispatch_and_propagate(&item.message, now.clone());
+        if queue.worker_active || queue.overflowed {
+            return Ok(());
+        }
+        if active >= MAX_DISPATCH_RECIPIENTS {
+            queue.waiting_for_capacity = true;
+            return Ok(());
+        }
+        queue.waiting_for_capacity = false;
+        queue.waiting_for_route = false;
+        queue.worker_active = true;
+        let owner = Arc::clone(self);
+        let name = recipient.to_string();
+        if let Err(error) = std::thread::Builder::new()
+            .name("fl-wire-dispatch".into())
+            .spawn(move || owner.run_recipient_queue(name))
+        {
+            let queue = queues.get_mut(recipient).expect("queue exists");
+            queue.worker_active = false;
+            queue.overflowed = true;
+            queue.pending.clear();
+            return Err(format!("could not start delivery worker: {error}"));
+        }
+        Ok(())
+    }
+
+    /// A departing worker releases its slot to a queued, capacity-waiting recipient.
+    fn wake_capacity_waiters(self: &Arc<Self>) {
+        if self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut queues = lock(&self.dispatch_queues);
+        let names: Vec<_> = queues
+            .iter()
+            .filter(|(_, queue)| queue.waiting_for_capacity && !queue.overflowed)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            if queues.values().filter(|queue| queue.worker_active).count()
+                >= MAX_DISPATCH_RECIPIENTS
+            {
+                break;
+            }
+            if let Err(error) = self.start_queued_worker(&mut queues, &name) {
+                warn(&format!("{}: {error}", sanitize_for_warning(&name)));
             }
         }
     }
 
+    /// Enqueue while the caller holds `enqueue_gate`. A worker owns each persona until its
+    /// queue empties, so IDs are deduplicated even while a push is in flight.
+    fn schedule_dispatch(
+        self: &Arc<Self>,
+        msg: &WireMessage,
+        recipients: &[DeliveryReceipt],
+        now: At,
+    ) -> Result<(), String> {
+        let mut queues = lock(&self.dispatch_queues);
+        let mut blocked = lock(&self.overflow_recipients);
+        let mut errors = Vec::new();
+        for receipt in recipients {
+            if matches!(
+                receipt.status,
+                DeliveryStatus::Acked | DeliveryStatus::Expired
+            ) {
+                continue;
+            }
+            let name = receipt.recipient_name.to_ascii_lowercase();
+            if let Some(queue) = queues.get_mut(&name) {
+                if queue.in_flight.as_ref() == Some(&msg.id)
+                    || queue.pending.iter().any(|(id, _)| id == &msg.id)
+                {
+                    continue;
+                }
+                if queue.overflowed || queue.pending.len() >= MAX_QUEUED_PER_RECIPIENT {
+                    queue.overflowed = true;
+                    errors.push(name);
+                    continue;
+                }
+                queue.pending.push_back((msg.id.clone(), now.clone()));
+                // An arrival during an in-flight no-route lookup is also a wake request.
+                // Otherwise the worker can park after this arrival without observing it.
+                queue.route_generation = queue.route_generation.wrapping_add(1);
+                // A new arrival can make a previously unavailable passive route discoverable.
+                // Retry the oldest never-started item first, without reading stored history.
+                if queue.waiting_for_route
+                    && let Err(error) = self.start_queued_worker(&mut queues, &name)
+                {
+                    warn(&format!("{}: {error}", sanitize_for_warning(&name)));
+                    errors.push(name);
+                }
+                continue;
+            }
+            if blocked.contains(&name) || self.overflow_capacity_exhausted.load(Ordering::SeqCst) {
+                errors.push(name);
+                continue;
+            }
+            if queues.len() >= MAX_TRACKED_RECIPIENTS {
+                if blocked.len() < MAX_OVERFLOW_RECIPIENTS {
+                    blocked.insert(name.clone());
+                } else {
+                    self.overflow_capacity_exhausted
+                        .store(true, Ordering::SeqCst);
+                }
+                errors.push(name);
+                continue;
+            }
+            let mut queue = RecipientDispatchQueue::default();
+            queue.pending.push_back((msg.id.clone(), now.clone()));
+            queues.insert(name.clone(), queue);
+            if let Err(error) = self.start_queued_worker(&mut queues, &name) {
+                warn(&format!(
+                    "could not start delivery worker for {}: {error}",
+                    sanitize_for_warning(&name)
+                ));
+                errors.push(name);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let names = errors
+                .iter()
+                .take(WARN_MAX_LISTED_SKIPS)
+                .map(|name| sanitize_for_warning(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "message {} is stored; delivery remains pending for {} recipient(s): {names}",
+                msg.id,
+                errors.len()
+            ))
+        }
+    }
+
+    fn run_recipient_queue(self: Arc<Self>, recipient: String) {
+        loop {
+            let job = {
+                let mut queues = lock(&self.dispatch_queues);
+                if self.shutdown.load(Ordering::SeqCst) {
+                    queues.remove(&recipient);
+                    drop(queues);
+                    self.wake_capacity_waiters();
+                    return;
+                }
+                let Some(queue) = queues.get_mut(&recipient) else {
+                    return;
+                };
+                let Some((id, now)) = queue.pending.pop_front() else {
+                    #[cfg(test)]
+                    if let Some((entered, resume)) = lock(&self.empty_exit_hook).take() {
+                        let _ = entered.send(());
+                        let _ = resume.recv_timeout(Duration::from_secs(5));
+                    }
+                    if queue.overflowed {
+                        self.retain_overflow_fence(&recipient);
+                    }
+                    queues.remove(&recipient);
+                    drop(queues);
+                    self.wake_capacity_waiters();
+                    return;
+                };
+                queue.in_flight = Some(id.clone());
+                (id, now, queue.route_generation)
+            };
+            let outcome = match self.store.get_wire_message(&job.0) {
+                Ok(Some(msg)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.dispatch_and_propagate(&msg, &recipient, job.1.clone())
+                }))
+                .unwrap_or(DispatchOutcome::Unconfirmed),
+                Ok(None) | Err(_) => DispatchOutcome::Unconfirmed,
+            };
+            #[cfg(test)]
+            if matches!(outcome, DispatchOutcome::NoRoute) {
+                let hook = lock(&self.no_route_hook).take();
+                if let Some((entered, resume)) = hook {
+                    let _ = entered.send(());
+                    let _ = resume.recv_timeout(Duration::from_secs(5));
+                }
+            }
+            let mut wait_for_route = false;
+            if let Some(queue) = lock(&self.dispatch_queues).get_mut(&recipient) {
+                queue.in_flight = None;
+                match outcome {
+                    DispatchOutcome::Resolved => {}
+                    DispatchOutcome::NoRoute => {
+                        queue.pending.push_front((job.0.clone(), job.1));
+                        if queue.route_generation == job.2 {
+                            queue.waiting_for_route = true;
+                            queue.worker_active = false;
+                            wait_for_route = true;
+                        }
+                    }
+                    DispatchOutcome::Unconfirmed => {
+                        // Never let a later message overtake an unconfirmed push.
+                        queue.pending.clear();
+                        queue.overflowed = true;
+                        queue.worker_active = false;
+                    }
+                }
+            }
+            if wait_for_route {
+                self.wake_capacity_waiters();
+                return;
+            }
+            if matches!(outcome, DispatchOutcome::Unconfirmed) {
+                // Move the fence while holding the queue map lock, so a concurrent enqueue
+                // cannot start a replacement worker between removal and fencing.
+                let mut queues = lock(&self.dispatch_queues);
+                if queues.get(&recipient).is_some_and(|queue| queue.overflowed) {
+                    self.retain_overflow_fence(&recipient);
+                    queues.remove(&recipient);
+                }
+                drop(queues);
+                warn(&format!(
+                    "delivery unresolved for message {}; later messages for {} remain pending",
+                    job.0,
+                    sanitize_for_warning(&recipient)
+                ));
+                self.wake_capacity_waiters();
+                return;
+            }
+        }
+    }
+
+    /// The caller holds `dispatch_queues`; this matches `schedule_dispatch` lock order.
+    fn retain_overflow_fence(&self, recipient: &str) {
+        let mut blocked = lock(&self.overflow_recipients);
+        if blocked.contains(recipient) || blocked.len() < MAX_OVERFLOW_RECIPIENTS {
+            blocked.insert(recipient.to_string());
+        } else {
+            self.overflow_capacity_exhausted
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Wake only work admitted by this daemon instance. A pre-startup Pending receipt may
+    /// already have been delivered and must not be replayed from the store.
+    fn wake_recipient_after_registration(self: &Arc<Self>, persona: &str) {
+        let Some(recipient) = normalize_persona(persona) else {
+            return;
+        };
+        let mut queues = lock(&self.dispatch_queues);
+        let Some(queue) = queues.get_mut(&recipient) else {
+            return;
+        };
+        queue.route_generation = queue.route_generation.wrapping_add(1);
+        if !queue.waiting_for_route || queue.overflowed {
+            return;
+        }
+        if let Err(error) = self.start_queued_worker(&mut queues, &recipient) {
+            drop(queues);
+            warn(&format!(
+                "could not resume delivery worker for {}: {error}; messages remain in inbox",
+                sanitize_for_warning(&recipient)
+            ));
+        }
+    }
+
     fn handle_local_request(
-        &self,
+        self: &Arc<Self>,
         req: LocalRequest,
     ) -> (LocalResponse, Option<Receiver<LocalEvent>>) {
         let now = now_at();
         match req {
             LocalRequest::Send { mut args } => {
+                let _order = lock(&self.enqueue_gate);
                 if args.sender_host.is_none() {
                     args.sender_host = Some(self.config.host.clone());
                 }
@@ -500,13 +832,13 @@ where
                                 receipts: receipts.clone(),
                             },
                         );
-                        self.dispatch_and_propagate(&msg, now);
-                        let latest_receipts =
-                            self.store.list_wire_receipts(&msg.id).unwrap_or(receipts);
+                        if let Err(message) = self.schedule_dispatch(&msg, &receipts, now) {
+                            warn(&message);
+                        }
                         (
                             LocalResponse::Sent {
                                 message: msg,
-                                receipts: latest_receipts,
+                                receipts,
                             },
                             None,
                         )
@@ -591,6 +923,9 @@ where
                 route,
                 explicit,
             } => {
+                // Publish a route only while ordered with persistence and backlog enqueue.
+                // Otherwise a concurrent send could overtake older pending messages.
+                let _order = lock(&self.enqueue_gate);
                 {
                     let mut routes = lock(&self.routes);
                     let Some(norm) = normalize_persona(&persona) else {
@@ -640,7 +975,7 @@ where
                         );
                     }
                 }
-                self.dispatch_pending_for_persona(&persona, now);
+                self.wake_recipient_after_registration(&persona);
                 (LocalResponse::RouteRegistered, None)
             }
             LocalRequest::UnregisterRoute { persona } => {
@@ -704,7 +1039,7 @@ where
         }
     }
 
-    fn handle_peer_connection(&self, mut ws: WsStream) -> Result<(), WsError> {
+    fn handle_peer_connection(self: &Arc<Self>, mut ws: WsStream) -> Result<(), WsError> {
         let last_msg_seq = self
             .store
             .wire_messages_after(0)
@@ -835,7 +1170,7 @@ where
         }
     }
 
-    fn process_incoming_peer_frame(&self, from_peer_id: u64, frame: PeerFrame) {
+    fn process_incoming_peer_frame(self: &Arc<Self>, from_peer_id: u64, frame: PeerFrame) {
         let now = now_at();
         match frame {
             PeerFrame::SyncBatch {
@@ -843,6 +1178,7 @@ where
                 messages,
                 receipts,
             } => {
+                let _order = lock(&self.enqueue_gate);
                 if !registry_events.is_empty()
                     && let Err(e) = self.store.import_registry_events(&registry_events)
                 {
@@ -871,10 +1207,12 @@ where
                             Some(from_peer_id),
                             &PeerFrame::Publish {
                                 message: m.clone(),
-                                receipts: rcpts,
+                                receipts: rcpts.clone(),
                             },
                         );
-                        self.dispatch_and_propagate(&m, now.clone());
+                        if let Err(error) = self.schedule_dispatch(&m, &rcpts, now.clone()) {
+                            warn(&format!("peer message scheduling failed: {error}"));
+                        }
                     }
                     for r in receipts {
                         if !report.rejects(&r.message_id) {
@@ -884,6 +1222,7 @@ where
                 }
             }
             PeerFrame::Publish { message, receipts } => {
+                let _order = lock(&self.enqueue_gate);
                 let known = self
                     .store
                     .get_wire_message(&message.id)
@@ -910,10 +1249,12 @@ where
                         Some(from_peer_id),
                         &PeerFrame::Publish {
                             message: message.clone(),
-                            receipts: rcpts,
+                            receipts: rcpts.clone(),
                         },
                     );
-                    self.dispatch_and_propagate(&message, now);
+                    if let Err(error) = self.schedule_dispatch(&message, &rcpts, now) {
+                        warn(&format!("peer message scheduling failed: {error}"));
+                    }
                 }
             }
             PeerFrame::ReceiptUpdate { receipt } => {
@@ -1058,13 +1399,24 @@ where
         store,
         config: config.clone(),
         routes: Mutex::new(initial_routes),
-        dispatch_gate: Mutex::new(()),
+        enqueue_gate: Mutex::new(()),
+        dispatch_queues: Mutex::new(BTreeMap::new()),
+        overflow_recipients: Mutex::new(BTreeSet::new()),
+        overflow_capacity_exhausted: AtomicBool::new(false),
+        #[cfg(test)]
+        no_route_hook: Mutex::new(None),
+        #[cfg(test)]
+        empty_exit_hook: Mutex::new(None),
         peers: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
         next_peer_id: Mutex::new(0),
         inbound_peers: AtomicUsize::new(0),
         shutdown: AtomicBool::new(false),
     });
+
+    warn(
+        "startup: pre-restart pending messages remain readable in the inbox; delivery may be unconfirmed",
+    );
 
     // Spawn outbound peer loops
     for peer_url in config.peers.clone() {
@@ -1230,7 +1582,7 @@ mod tests {
     /// whose channel shows what the daemon forwards.
     struct Rig {
         _tmp: TempDir,
-        inner: DaemonInner<RedbStore>,
+        inner: Arc<DaemonInner<RedbStore>>,
         sender: u64,
         observed: Receiver<PeerFrame>,
         source: RedbStore,
@@ -1240,7 +1592,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
         let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
-        let inner = DaemonInner {
+        let inner = Arc::new(DaemonInner {
             store,
             config: DaemonConfig {
                 node_id: "node-b".into(),
@@ -1255,13 +1607,18 @@ mod tests {
             // The table of this rig's own `routes_path`: `load(None)` would read the machine's
             // real route table (and panics under test, see `refuse_default_route_path`).
             routes: Mutex::new(RouteTable::load(Some(&tmp.path().join("routes-b.json")))),
-            dispatch_gate: Mutex::new(()),
+            enqueue_gate: Mutex::new(()),
+            dispatch_queues: Mutex::new(BTreeMap::new()),
+            overflow_recipients: Mutex::new(BTreeSet::new()),
+            overflow_capacity_exhausted: AtomicBool::new(false),
+            no_route_hook: Mutex::new(None),
+            empty_exit_hook: Mutex::new(None),
             peers: Mutex::new(BTreeMap::new()),
             subscribers: Mutex::new(Vec::new()),
             next_peer_id: Mutex::new(0),
             inbound_peers: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
-        };
+        });
         let (tx, _unused) = mpsc::channel();
         let sender = inner.register_peer("peer-a".into(), tx);
         let (tx, observed) = mpsc::channel();
@@ -1283,6 +1640,754 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_saturated_recipient_does_not_block_another() {
+        let rig = rig();
+        let first = rig.inner.store.send_wire(mail("slow", "overflow")).unwrap();
+        let other = rig
+            .inner
+            .store
+            .send_wire(mail("other", "independent"))
+            .unwrap();
+        let mut queue = RecipientDispatchQueue::default();
+        for n in 1..=MAX_QUEUED_PER_RECIPIENT {
+            queue.pending.push_back((
+                MessageId(fl_core::ids::seq_iri(n as u64 + 10_000)),
+                now_at(),
+            ));
+        }
+        lock(&rig.inner.dispatch_queues).insert("slow".into(), queue);
+        assert!(
+            rig.inner
+                .schedule_dispatch(&first.0, &first.1, now_at())
+                .is_err()
+        );
+        assert!(
+            rig.inner
+                .schedule_dispatch(&other.0, &other.1, now_at())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_overflowed_worker_releases_its_queue_and_preserves_fence() {
+        let rig = rig();
+        lock(&rig.inner.dispatch_queues).insert(
+            "slow".into(),
+            RecipientDispatchQueue {
+                worker_active: true,
+                overflowed: true,
+                ..Default::default()
+            },
+        );
+        Arc::clone(&rig.inner).run_recipient_queue("slow".into());
+        assert!(!lock(&rig.inner.dispatch_queues).contains_key("slow"));
+        assert!(lock(&rig.inner.overflow_recipients).contains("slow"));
+    }
+
+    #[test]
+    fn enqueue_racing_empty_worker_exit_starts_a_new_worker() {
+        let rig = rig();
+        let socket = rig._tmp.path().join("empty-exit.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "live",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let (message, receipts) = rig.inner.store.send_wire(mail("live", "new")).unwrap();
+        lock(&rig.inner.dispatch_queues).insert(
+            "live".into(),
+            RecipientDispatchQueue {
+                worker_active: true,
+                ..Default::default()
+            },
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.empty_exit_hook) = Some((entered_tx, resume_rx));
+        let owner = Arc::clone(&rig.inner);
+        let exiting = std::thread::spawn(move || owner.run_recipient_queue("live".into()));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let owner = Arc::clone(&rig.inner);
+        let (starting_tx, starting_rx) = mpsc::channel();
+        let enqueue = std::thread::spawn(move || {
+            starting_tx.send(()).unwrap();
+            owner.schedule_dispatch(&message, &receipts, now_at())
+        });
+        starting_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        resume_tx.send(()).unwrap();
+        exiting.join().unwrap();
+        enqueue.join().unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if listener.accept().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "enqueue was stranded during worker exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn parked_offline_recipients_do_not_exhaust_active_worker_slots() {
+        let rig = rig();
+        for n in 0..=MAX_DISPATCH_RECIPIENTS {
+            lock(&rig.inner.dispatch_queues).insert(
+                format!("offline-{n}"),
+                RecipientDispatchQueue {
+                    waiting_for_route: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let socket = rig._tmp.path().join("live.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "live",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("live", "independent"),
+        });
+        assert!(matches!(response, LocalResponse::Sent { .. }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if listener.accept().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parked queues blocked a live recipient"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_capacity_waiter_runs_when_a_worker_slot_is_released() {
+        let rig = rig();
+        for n in 0..MAX_DISPATCH_RECIPIENTS {
+            lock(&rig.inner.dispatch_queues).insert(
+                format!("active-{n}"),
+                RecipientDispatchQueue {
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let socket = rig._tmp.path().join("capacity.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "live",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("live", "waiting"),
+        });
+        assert!(matches!(response, LocalResponse::Sent { .. }));
+        assert!(lock(&rig.inner.dispatch_queues)["live"].waiting_for_capacity);
+        lock(&rig.inner.dispatch_queues).remove("active-0");
+        rig.inner.wake_capacity_waiters();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if listener.accept().is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "capacity waiter never resumed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn unresolved_first_delivery_fences_only_its_recipient() {
+        let rig = rig();
+        let slow_socket = rig._tmp.path().join("unavailable.sock");
+        lock(&rig.inner.routes).upsert_explicit(
+            "slow",
+            VendorRoute::Webhook {
+                socket_path: slow_socket.clone(),
+            },
+            now_at(),
+        );
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("slow", "first"),
+        });
+        let LocalResponse::Sent { message: first, .. } = response else {
+            panic!("send failed: {response:?}")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while rig.inner.store.list_wire_receipts(&first.id).unwrap()[0].attempts == 0 {
+            assert!(Instant::now() < deadline, "first push never failed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let slow_listener = UnixListener::bind(&slow_socket).unwrap();
+        slow_listener.set_nonblocking(true).unwrap();
+        let fast_socket = rig._tmp.path().join("other.sock");
+        let fast_listener = UnixListener::bind(&fast_socket).unwrap();
+        fast_listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "other",
+            VendorRoute::Webhook {
+                socket_path: fast_socket,
+            },
+            now_at(),
+        );
+        let (later, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("slow", "second"),
+        });
+        assert!(matches!(later, LocalResponse::Sent { .. }));
+        let (other, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("other", "independent"),
+        });
+        assert!(matches!(other, LocalResponse::Sent { .. }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut other_received = false;
+        while Instant::now() < deadline {
+            if fast_listener.accept().is_ok() {
+                other_received = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(other_received, "unrelated recipient did not receive");
+        assert!(
+            slow_listener.accept().is_err(),
+            "second message overtook unresolved first delivery"
+        );
+        assert_eq!(
+            rig.inner.store.list_wire_receipts(&first.id).unwrap()[0].status,
+            DeliveryStatus::Pending
+        );
+    }
+
+    #[test]
+    fn saturated_send_is_acknowledged_as_stored_and_remains_readable() {
+        let rig = rig();
+        let mut queue = RecipientDispatchQueue::default();
+        for n in 1..=MAX_QUEUED_PER_RECIPIENT {
+            queue.pending.push_back((
+                MessageId(fl_core::ids::seq_iri(n as u64 + 20_000)),
+                now_at(),
+            ));
+        }
+        lock(&rig.inner.dispatch_queues).insert("slow".into(), queue);
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("slow", "stored"),
+        });
+        let LocalResponse::Sent { message, .. } = response else {
+            panic!("expected persisted message acknowledgement: {response:?}")
+        };
+        assert!(
+            rig.inner
+                .store
+                .get_wire_message(&message.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn broadcast_still_delivers_other_recipients_if_one_is_saturated() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        let rig = rig();
+        for name in ["slow", "fast"] {
+            rig.inner
+                .store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: "test".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: now_at(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let socket = rig._tmp.path().join("broadcast-fast.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "fast",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let mut queue = RecipientDispatchQueue::default();
+        for n in 1..=MAX_QUEUED_PER_RECIPIENT {
+            queue.pending.push_back((
+                MessageId(fl_core::ids::seq_iri(n as u64 + 30_000)),
+                now_at(),
+            ));
+        }
+        lock(&rig.inner.dispatch_queues).insert("slow".into(), queue);
+        let mut args = mail("slow", "broadcast");
+        args.to = WireAddress::All;
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send { args });
+        assert!(matches!(response, LocalResponse::Sent { .. }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if listener.accept().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unrelated broadcast recipient did not receive"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn startup_warns_about_inbox_recovery_without_dispatch() {
+        let tmp = TempDir::new().unwrap();
+        let socket = tmp.path().join("saved-route.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let (pending, _) = store.send_wire(mail("slow", "pending")).unwrap();
+        let (done, _) = store.send_wire(mail("slow", "already delivered")).unwrap();
+        store
+            .update_wire_receipt(&done.id, "slow", DeliveryStatus::Acked, true, now_at())
+            .unwrap();
+        store.send_wire(mail("other", "other pending")).unwrap();
+        let cfg = test_config(tmp.path(), "startup-pending");
+        let mut routes = RouteTable::load(cfg.routes_path.as_deref());
+        routes.upsert_explicit(
+            "slow",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        routes.save(cfg.routes_path.as_deref()).unwrap();
+        take_warnings();
+        let daemon_socket = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+        let warnings = take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("pre-restart pending messages remain readable in the inbox"),
+            "{warnings:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            listener.accept().is_err(),
+            "startup must not replay ambiguous messages"
+        );
+        let mut client = LocalClient::connect(&daemon_socket, Duration::from_secs(2)).unwrap();
+        client
+            .request(&LocalRequest::RegisterRoute {
+                persona: "slow".into(),
+                explicit: true,
+                route: VendorRoute::Webhook {
+                    socket_path: tmp.path().join("saved-route.sock"),
+                },
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            listener.accept().is_err(),
+            "registration must not replay pre-startup messages"
+        );
+        assert_eq!(
+            store.get_wire_message(&pending.id).unwrap().unwrap().id,
+            pending.id
+        );
+    }
+
+    #[test]
+    fn registration_wakes_only_current_process_unstarted_messages_in_fifo_order() {
+        let rig = rig();
+        let (first, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("new-route", "first"),
+        });
+        let LocalResponse::Sent { message: first, .. } = first else {
+            panic!("first send failed")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if lock(&rig.inner.dispatch_queues)
+                .get("new-route")
+                .is_some_and(|queue| queue.waiting_for_route)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first message did not wait for route"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (second, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("new-route", "second"),
+        });
+        let LocalResponse::Sent {
+            message: second, ..
+        } = second
+        else {
+            panic!("second send failed")
+        };
+        let socket = rig._tmp.path().join("late-route.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "new-route".into(),
+            explicit: true,
+            route: VendorRoute::Webhook {
+                socket_path: socket,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut ids = Vec::new();
+        while ids.len() < 2 && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                ids.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(ids, vec![first.id, second.id]);
+    }
+
+    #[test]
+    fn new_message_retries_current_process_queue_after_route_is_discovered() {
+        let rig = rig();
+        let (first, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("passive-route", "first"),
+        });
+        let LocalResponse::Sent { message: first, .. } = first else {
+            panic!("first send failed")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if lock(&rig.inner.dispatch_queues)
+                .get("passive-route")
+                .is_some_and(|queue| queue.waiting_for_route)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first message did not wait for route"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let socket = rig._tmp.path().join("passive-route.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&rig.inner.routes).upsert_explicit(
+            "passive-route",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let (second, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("passive-route", "second"),
+        });
+        let LocalResponse::Sent {
+            message: second, ..
+        } = second
+        else {
+            panic!("second send failed")
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut ids = Vec::new();
+        while ids.len() < 2 && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                ids.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(ids, vec![first.id, second.id]);
+    }
+
+    #[test]
+    fn registration_during_no_route_discovery_wakes_the_inflight_message() {
+        let rig = rig();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("racing-route", "first"),
+        });
+        let LocalResponse::Sent { message, .. } = response else {
+            panic!("send failed")
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("no-route discovery did not pause");
+        let socket = rig._tmp.path().join("racing-route.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "racing-route".into(),
+            explicit: true,
+            route: VendorRoute::Webhook {
+                socket_path: socket,
+            },
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let stream = loop {
+            if let Ok((stream, _)) = listener.accept() {
+                break stream;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "in-flight no-route message was stranded"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WireMessage>(&line).unwrap().id,
+            message.id
+        );
+    }
+
+    #[test]
+    fn arrival_during_no_route_discovery_wakes_the_inflight_message() {
+        let rig = rig();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("passive-race", "first"),
+        });
+        let LocalResponse::Sent { message: first, .. } = response else {
+            panic!("send failed")
+        };
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let socket = rig._tmp.path().join("passive-race.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // Model a route becoming passively discoverable, without RegisterRoute.
+        lock(&rig.inner.routes).upsert_explicit(
+            "passive-race",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let (response, _) = rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("passive-race", "second"),
+        });
+        let LocalResponse::Sent {
+            message: second, ..
+        } = response
+        else {
+            panic!("second send failed")
+        };
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut ids = Vec::new();
+        while ids.len() < 2 && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                ids.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(ids, [first.id, second.id]);
+    }
+
+    #[test]
+    fn blocked_no_route_work_does_not_hold_global_sequencing_gate() {
+        let rig = rig();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *lock(&rig.inner.no_route_hook) = Some((entered_tx, resume_rx));
+        rig.inner.handle_local_request(LocalRequest::Send {
+            args: mail("blocked", "first"),
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("no-route work did not pause");
+        let inner = Arc::clone(&rig.inner);
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (send, _) = inner.handle_local_request(LocalRequest::Send {
+                args: mail("other", "independent"),
+            });
+            let (register, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: "third".into(),
+                explicit: true,
+                route: VendorRoute::Codex {
+                    thread_id: "thread".into(),
+                    cwd: None,
+                },
+            });
+            done_tx.send((send, register)).unwrap();
+        });
+        let answer = done_rx.recv_timeout(Duration::from_secs(1));
+        resume_tx.send(()).unwrap();
+        thread.join().unwrap();
+        let (send, register) = answer.expect("unrelated RPCs waited on blocked no-route work");
+        assert!(matches!(send, LocalResponse::Sent { .. }));
+        assert!(matches!(register, LocalResponse::RouteRegistered));
+    }
+
+    #[test]
+    fn registration_does_not_publish_route_before_backlog_sequencing() {
+        let rig = rig();
+        let gate = lock(&rig.inner.enqueue_gate);
+        let inner = Arc::clone(&rig.inner);
+        let (started_tx, started_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: "new-persona".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "test".into(),
+                    cwd: None,
+                },
+                explicit: true,
+            })
+        });
+        started_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut published_early = false;
+        while Instant::now() < deadline {
+            if lock(&rig.inner.routes).get("new-persona").is_some() {
+                published_early = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(gate);
+        let (response, _) = thread.join().unwrap();
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        assert!(
+            !published_early,
+            "registration published its route before backlog sequencing"
+        );
+    }
+
+    #[test]
+    fn worker_limit_fences_only_the_recipient_with_persisted_overflow() {
+        let rig = rig();
+        {
+            let mut queues = lock(&rig.inner.dispatch_queues);
+            for n in 0..MAX_TRACKED_RECIPIENTS {
+                queues.insert(format!("occupied-{n}"), RecipientDispatchQueue::default());
+            }
+        }
+        let (message, receipts) = rig.inner.store.send_wire(mail("slow", "overflow")).unwrap();
+        let error = rig
+            .inner
+            .schedule_dispatch(&message, &receipts, now_at())
+            .unwrap_err();
+        assert!(error.contains(message.id.as_str()));
+        assert!(lock(&rig.inner.overflow_recipients).contains("slow"));
+        lock(&rig.inner.dispatch_queues).remove("occupied-0");
+        let (later, later_receipts) = rig.inner.store.send_wire(mail("slow", "later")).unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&later, &later_receipts, now_at())
+                .is_err()
+        );
+        let (other, other_receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("other", "independent"))
+            .unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&other, &other_receipts, now_at())
+                .is_ok()
+        );
+        assert!(
+            rig.inner
+                .store
+                .get_wire_message(&message.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn overflow_fence_survives_worker_drain() {
+        let rig = rig();
+        lock(&rig.inner.dispatch_queues).insert(
+            "slow".into(),
+            RecipientDispatchQueue {
+                overflowed: true,
+                ..Default::default()
+            },
+        );
+        Arc::clone(&rig.inner).run_recipient_queue("slow".into());
+        let (later, receipts) = rig.inner.store.send_wire(mail("slow", "later")).unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&later, &receipts, now_at())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exhausted_overflow_metadata_fails_closed_for_new_recipients() {
+        let rig = rig();
+        for n in 0..MAX_TRACKED_RECIPIENTS {
+            lock(&rig.inner.dispatch_queues)
+                .insert(format!("active-{n}"), RecipientDispatchQueue::default());
+        }
+        for n in 0..MAX_OVERFLOW_RECIPIENTS {
+            lock(&rig.inner.overflow_recipients).insert(format!("blocked-{n}"));
+        }
+        let (first, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("unknown", "overflow"))
+            .unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&first, &receipts, now_at())
+                .is_err()
+        );
+        assert!(rig.inner.overflow_capacity_exhausted.load(Ordering::SeqCst));
+        lock(&rig.inner.dispatch_queues).remove("active-0");
+        let (later, receipts) = rig
+            .inner
+            .store
+            .send_wire(mail("different", "later"))
+            .unwrap();
+        assert!(
+            rig.inner
+                .schedule_dispatch(&later, &receipts, now_at())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1876,6 +2981,10 @@ mod tests {
         request(LocalRequest::Send {
             args: mail("synthetic-recipient", "prune"),
         });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !status_personas().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             status_personas().is_empty(),
             "the pruned route must not linger in Status"
@@ -1904,7 +3013,17 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let slow = tmp.path().join("slow-codex.sh");
-        fs::write(&slow, "#!/bin/sh\nsleep 2\n").unwrap();
+        let started_file = tmp.path().join("started");
+        let done_file = tmp.path().join("done");
+        fs::write(
+            &slow,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nsleep 2\nprintf done > '{}'\n",
+                started_file.display(),
+                done_file.display()
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
         // SAFETY: serialised by CODEX_ENV_LOCK; restored below.
         let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
@@ -1927,33 +3046,67 @@ mod tests {
         .unwrap();
 
         let send_sock = sock.clone();
+        let (sent_tx, sent_rx) = mpsc::channel();
         let sender = std::thread::spawn(move || {
             let mut c = LocalClient::connect(&send_sock, Duration::from_secs(10)).unwrap();
-            c.request(&LocalRequest::Send {
-                args: mail("synthetic-recipient", "slow one"),
-            })
-            .map(|_| ())
+            let result = c
+                .request(&LocalRequest::Send {
+                    args: mail("synthetic-recipient", "slow one"),
+                })
+                .map(|_| ());
+            let _ = sent_tx.send(result);
         });
-        std::thread::sleep(Duration::from_millis(300));
+        let sent_promptly = sent_rx.recv_timeout(Duration::from_millis(400));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started_file.exists(), "slow delivery did not start");
 
         let started = Instant::now();
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe.request(&LocalRequest::Status).unwrap();
+        let other_socket = tmp.path().join("other.sock");
+        let other_listener = UnixListener::bind(&other_socket).unwrap();
+        other_listener.set_nonblocking(true).unwrap();
         // The daemon serves one request per connection.
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
         probe
             .request(&LocalRequest::RegisterRoute {
                 persona: "other".into(),
                 explicit: false,
-                route: VendorRoute::Codex {
-                    thread_id: "t2".into(),
-                    cwd: None,
+                route: VendorRoute::Webhook {
+                    socket_path: other_socket,
                 },
             })
             .unwrap();
+        let mut other = LocalClient::connect(&sock, Duration::from_secs(1)).unwrap();
+        other
+            .request(&LocalRequest::Send {
+                args: mail("other", "fast one"),
+            })
+            .unwrap();
+        let other_deadline = Instant::now() + Duration::from_millis(800);
+        let mut delivered_other = false;
+        while Instant::now() < other_deadline {
+            if other_listener.accept().is_ok() {
+                delivered_other = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            delivered_other,
+            "other recipient did not receive while slow recipient ran"
+        );
         let waited = started.elapsed();
 
-        sender.join().unwrap().unwrap();
+        sender.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done_file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(done_file.exists(), "slow delivery did not finish");
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
@@ -1961,9 +3114,196 @@ mod tests {
             }
         }
         assert!(
+            matches!(sent_promptly, Ok(Ok(()))),
+            "send waited for vendor delivery"
+        );
+        assert!(
             waited < Duration::from_millis(1200),
             "Status/RegisterRoute waited {waited:?} behind a vendor delivery"
         );
+    }
+
+    #[test]
+    fn a_recipients_blocked_delivery_preserves_fifo() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::dispatcher::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("codex.sh");
+        let log = tmp.path().join("log");
+        let release = tmp.path().join("release");
+        fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$5\" >> '{}'\ncase \"$5\" in *first*) while [ ! -e '{}' ]; do sleep 0.02; done ;; esac\n", log.display(), release.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
+        unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "fifo");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(store, cfg).unwrap();
+        LocalClient::connect(&sock, Duration::from_secs(2))
+            .unwrap()
+            .request(&LocalRequest::RegisterRoute {
+                persona: "synthetic-recipient".into(),
+                explicit: false,
+                route: VendorRoute::Codex {
+                    thread_id: "t".into(),
+                    cwd: None,
+                },
+            })
+            .unwrap();
+        for subject in ["first", "second"] {
+            LocalClient::connect(&sock, Duration::from_secs(2))
+                .unwrap()
+                .request(&LocalRequest::Send {
+                    args: mail("synthetic-recipient", subject),
+                })
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("first")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before_release = fs::read_to_string(&log).unwrap_or_default();
+        fs::write(&release, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("second")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after_release = fs::read_to_string(&log).unwrap_or_default();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_CODEX_BIN"),
+            }
+        }
+        assert!(
+            before_release.contains("first"),
+            "first delivery never began: {before_release}"
+        );
+        assert!(
+            !before_release.contains("second"),
+            "second delivery overtook the first: {before_release}"
+        );
+        assert!(
+            after_release.contains("second"),
+            "second delivery never began: {after_release}"
+        );
+        assert!(after_release.find("first") < after_release.find("second"));
+    }
+
+    #[test]
+    fn a_broadcast_delivers_to_other_recipients_while_one_is_blocked() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::dispatcher::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("codex.sh");
+        let started = tmp.path().join("started");
+        let release = tmp.path().join("release");
+        let done = tmp.path().join("done");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\ntouch '{}'\n",
+                started.display(),
+                release.display(),
+                done.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
+        unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        for name in ["slow", "fast"] {
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: name.into(),
+                    email: None,
+                    project: "test".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: false,
+                    at: At::from_unix_millis(1),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let cfg = test_config(tmp.path(), "group");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+        let fast_socket = tmp.path().join("fast.sock");
+        let listener = UnixListener::bind(&fast_socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for (persona, route) in [
+            (
+                "slow",
+                VendorRoute::Codex {
+                    thread_id: "t".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "fast",
+                VendorRoute::Webhook {
+                    socket_path: fast_socket,
+                },
+            ),
+        ] {
+            LocalClient::connect(&sock, Duration::from_secs(2))
+                .unwrap()
+                .request(&LocalRequest::RegisterRoute {
+                    persona: persona.into(),
+                    explicit: false,
+                    route,
+                })
+                .unwrap();
+        }
+        let mut args = mail("slow", "broadcast");
+        args.to = WireAddress::All;
+        LocalClient::connect(&sock, Duration::from_secs(2))
+            .unwrap()
+            .request(&LocalRequest::Send { args })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut fast_received = false;
+        while Instant::now() < deadline {
+            fast_received |= listener.accept().is_ok();
+            if fast_received && started.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let slow_started = started.exists();
+        fs::write(&release, "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_CODEX_BIN"),
+            }
+        }
+        assert!(slow_started, "slow recipient did not start");
+        assert!(
+            fast_received,
+            "broadcast fast recipient waited for slow recipient"
+        );
+        assert!(done.exists(), "slow recipient did not finish");
     }
 
     #[test]
