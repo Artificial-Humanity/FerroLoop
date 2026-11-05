@@ -740,6 +740,7 @@ import {
 import {
   FALLBACK_PROJECTS,
   findProject,
+  projectChoices,
   projectLabel,
   projectLabels,
 } from "../hooks/useProjects";
@@ -820,6 +821,10 @@ export interface SettingsModalProps {
    * time Settings opens) instead of loading its own.
    */
   refreshProjects?: () => Promise<void>;
+  /** Message of the last failed shared-list load (shared mode only). */
+  projectsError?: string | null;
+  /** True once the shared list's first load has settled (shared mode only). */
+  projectsLoaded?: boolean;
   onDecommissionAgent?: (
     targetId: string,
     mode: DecommissionMode,
@@ -1388,6 +1393,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   projects: sharedProjects = FALLBACK_PROJECTS,
   projectsFromHub = false,
   refreshProjects,
+  projectsError,
+  projectsLoaded,
   onDecommissionAgent,
   onBulkSessionAction,
   themeMode: propThemeMode,
@@ -1924,15 +1931,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
 
   // A project that leaves the shared list (deleted here or elsewhere) must not stay the
-  // active filter.
+  // active filter; a renamed one stays, under its new label. The filter holds a label, so
+  // the slug of the filtered project is remembered from the list that still had it.
+  const filterSlugRef = useRef<string | null>(null);
   const previousProjectsRef = useRef<readonly ProjectSummary[]>(sharedProjects);
   useEffect(() => {
     const previous = previousProjectsRef.current;
     previousProjectsRef.current = sharedProjects;
-    if (previous === sharedProjects) return;
     const active = selectedProjectFilter.trim();
-    if (!active || active.toLowerCase() === "all") return;
-    if (findProject(previous, active) && !findProject(sharedProjects, active)) {
+    if (!active || active.toLowerCase() === "all") {
+      filterSlugRef.current = null;
+      return;
+    }
+    const inCurrent = findProject(sharedProjects, active);
+    if (previous === sharedProjects) {
+      if (inCurrent) filterSlugRef.current = inCurrent.slug;
+      return;
+    }
+    const known = findProject(previous, active);
+    const slug = known?.slug ?? filterSlugRef.current;
+    if (inCurrent) {
+      filterSlugRef.current = inCurrent.slug;
+      return;
+    }
+    if (!slug) return;
+    const renamed = sharedProjects.find(
+      (p) => p.slug.trim().toLowerCase() === slug.trim().toLowerCase(),
+    );
+    if (renamed) {
+      filterSlugRef.current = renamed.slug;
+      setSelectedProjectFilter(projectLabel(renamed));
+    } else {
+      filterSlugRef.current = null;
       setSelectedProjectFilter("all");
     }
   }, [sharedProjects, selectedProjectFilter]);
@@ -4955,8 +4985,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           >
             <ProjectsSettingsTab
               projects={projectList}
-              loading={projectListLoading}
-              error={projectListError}
+              loading={sharedProjectList ? projectsLoaded === false : projectListLoading}
+              error={sharedProjectList ? (projectsError ?? null) : projectListError}
               onViewAgents={(slug) => {
                 setSelectedProjectFilter(slug);
                 setProjectArtifactsDirStatus(null);
@@ -10055,9 +10085,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           const key = modalAgent.name_key.toLowerCase();
           const draft = getDraftForAgent(modalAgent);
           const armedConflict = recastReplaceLeadArmed[key];
-          const projectOptions = baseProjectOptions.includes(draft.project)
-            ? baseProjectOptions
-            : [draft.project, ...baseProjectOptions];
+          // The hub takes a project slug; the dropdown shows the display name.
+          const { choices: projectOptions, value: draftProjectValue } =
+            projectChoices(sharedProjects, draft.project, [
+              {
+                value: WORKSPACE_PROJECT.toLowerCase(),
+                label: WORKSPACE_PROJECT,
+              },
+            ]);
           const hasRoleOption =
             draft.role === CREATE_CUSTOM_ROLE_VALUE ||
             RECAST_ROLE_OPTIONS.some((opt) => opt.value === draft.role);
@@ -10142,7 +10177,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       data-testid={`recast-project-select-${key}`}
                       className="fd-select fd-mono"
                       style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
-                      value={draft.project}
+                      value={draftProjectValue}
                       onChange={(e) => {
                         const nextProject = e.target.value;
                         setRecastDrafts((prev) => ({
@@ -10161,8 +10196,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }}
                     >
                       {projectOptions.map((proj) => (
-                        <option key={proj} value={proj}>
-                          {proj}
+                        <option key={proj.value} value={proj.value}>
+                          {proj.label}
                         </option>
                       ))}
                     </select>

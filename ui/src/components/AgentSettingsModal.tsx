@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import type { ProjectSummary, SessionQuotaUsage } from "../types/api";
-import { FALLBACK_PROJECTS, projectLabels } from "../hooks/useProjects";
+import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
   canonicalizeDefaultRole,
@@ -2294,10 +2294,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         </div>
 
         {recastModalOpen && (() => {
-          const knownProjects = projectLabels(projects);
-          const projectOptions = knownProjects.includes(recastProject)
-            ? knownProjects
-            : [recastProject, ...knownProjects];
+          // The hub takes a project slug; the dropdown shows the display name.
+          const { choices: projectOptions, value: recastProjectValue } =
+            projectChoices(projects, recastProject);
           const hasRoleOption =
             recastRole === CREATE_CUSTOM_ROLE_VALUE ||
             RECAST_ROLE_OPTIONS.some((opt) => opt.value === recastRole);
@@ -2387,15 +2386,15 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       data-testid={`recast-project-select-${agentKey}`}
                       className="fd-select fd-mono"
                       style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
-                      value={recastProject}
+                      value={recastProjectValue}
                       onChange={(e) => {
                         setRecastProject(e.target.value);
                         setRecastConflict(null);
                       }}
                     >
                       {projectOptions.map((proj) => (
-                        <option key={proj} value={proj}>
-                          {proj}
+                        <option key={proj.value} value={proj.value}>
+                          {proj.label}
                         </option>
                       ))}
                     </select>

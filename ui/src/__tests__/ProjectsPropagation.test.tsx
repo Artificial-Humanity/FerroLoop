@@ -70,6 +70,11 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
       }
     }
     const del = url.match(/\/api\/v1\/projects\/([^/?]+)$/);
+    if (del && method === "PATCH") {
+      const index = state.projects.findIndex((p) => p.slug === del[1]);
+      state.projects[index] = { ...state.projects[index], ...body };
+      return json(state.projects[index]);
+    }
     if (del && method === "DELETE") {
       state.projects = state.projects.filter((p) => p.slug !== del[1]);
       return json({
@@ -276,6 +281,65 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
 
     await openSpinUp();
     expect(spinUpOptions()).toEqual(["ferroloop", "sonora"]);
+  });
+
+  it("follows a renamed project in the Agents filter and resets it on delete", async () => {
+    const { client } = makeHub([FERRO, SONORA, COUNCIL]);
+    await renderApp(client);
+    await openSettings();
+    await openProjectsTab();
+
+    fireEvent.click(screen.getByTestId("settings-project-view-agents-council"));
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Council");
+    fireEvent.click(screen.getByTestId("settings-tab-projects"));
+
+    fireEvent.click(screen.getByTestId("settings-project-edit-council"));
+    fireEvent.change(screen.getByTestId("edit-project-name"), {
+      target: { value: "Round Table" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("edit-project-submit"));
+    });
+    await waitFor(() => expect(screen.queryByTestId("edit-project-modal")).toBeNull());
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-project-card-council")).toHaveTextContent(
+        "Round Table",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    await waitFor(() => expect(filterOptions()).toContain("Round Table"));
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Round Table");
+
+    fireEvent.click(screen.getByTestId("settings-tab-projects"));
+    fireEvent.click(screen.getByTestId("settings-project-delete-council"));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("delete-project-submit"));
+    });
+    fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    await waitFor(() => expect(filterOptions()).not.toContain("Round Table"));
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("all");
+  });
+
+  it("shows the load error, not the empty state, when the hub list fails", async () => {
+    const { client, state } = makeHub([FERRO, SONORA], "error");
+    await renderApp(client);
+    await openSettings();
+    await openProjectsTab();
+    expect(screen.getByTestId("settings-projects-error")).toHaveTextContent(
+      "Could not load projects",
+    );
+    expect(screen.queryByTestId("settings-projects-empty")).toBeNull();
+
+    // A later successful reload replaces the error with the cards.
+    state.mode = "ok";
+    await closeSettings();
+    await openSettings();
+    await openProjectsTab();
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-project-card-ferroloop")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("settings-projects-error")).toBeNull();
+    expect(screen.getByTestId("settings-project-card-sonora")).toBeInTheDocument();
   });
 
   it.each<[string, ProjectsMode]>([

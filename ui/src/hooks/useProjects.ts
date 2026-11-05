@@ -49,6 +49,36 @@ export function projectLabels(
   return projects.map(projectLabel);
 }
 
+/** One option of a project dropdown: the slug the hub takes, and the name shown. */
+export interface ProjectChoice {
+  value: string;
+  label: string;
+}
+
+/**
+ * The options of a project dropdown that sends a slug (`value`) and shows a name (`label`),
+ * plus the value that stands for `current`. A `current` project that is not in the list (a
+ * legacy agent project) is listed first, as itself, and kept as the raw value.
+ */
+export function projectChoices(
+  projects: readonly Pick<ProjectSummary, "name" | "slug">[],
+  current: string | null | undefined,
+  extra: readonly ProjectChoice[] = [],
+): { choices: ProjectChoice[]; value: string } {
+  const choices: ProjectChoice[] = projects.map((p) => ({
+    value: p.slug.trim().toLowerCase(),
+    label: projectLabel(p),
+  }));
+  for (const e of extra) {
+    if (!choices.some((c) => c.value === e.value)) choices.push(e);
+  }
+  const raw = current ?? "";
+  const match = choices.find((c) => c.value === raw.trim().toLowerCase());
+  if (match) return { choices, value: match.value };
+  if (raw) choices.unshift({ value: raw, label: raw });
+  return { choices, value: raw };
+}
+
 /**
  * Finds the project a free-form reference points at: a slug, a name or a label,
  * compared case-insensitively. Returns `undefined` for anything else.
@@ -113,6 +143,9 @@ export function useProjects(apiClient: ProjectsClient | undefined): ProjectsStat
         const list = await client.listProjects();
         // An empty or malformed answer is how an older hub (or a generic stub) replies;
         // a real hub always lists at least one project, so treat it as "no list".
+        // Known limitation: deleting the last hub project therefore keeps the previous
+        // list until the next non-empty reply, because `listProjects` cannot tell an
+        // empty list from a malformed one.
         if (!Array.isArray(list) || list.length === 0) {
           throw new HubApiError(404, "No project list");
         }
