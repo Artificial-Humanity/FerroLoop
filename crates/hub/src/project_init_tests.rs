@@ -2517,6 +2517,32 @@ fn a_virtual_group_has_no_records_and_no_artifacts_directory() {
 }
 
 #[test]
+fn a_project_with_a_pathless_area_still_serves_its_records() {
+    let hub = Hub::new();
+    // The default project served from the hub store, with an area that has no path (what
+    // `fl agent register --create-area` makes), and a project the hub store holds a row for.
+    hub.agent("Ada", "ferroloop", fl_core::agent::AgentRole::Assistant);
+    hub.workspace().add_project("/work/held-proj").unwrap();
+    hub.agent("Bo", "held-proj", fl_core::agent::AgentRole::Assistant);
+    for slug in ["ferroloop", "held-proj"] {
+        assert!(
+            hub.workspace()
+                .get_area(slug)
+                .unwrap()
+                .is_some_and(|a| a.is_virtual()),
+            "{slug} has a pathless area"
+        );
+        let resp = hub.get(&format!("/api/v1/records?project={slug}"));
+        assert_eq!(resp.status, 200, "{slug}: {}", text_of(&resp));
+    }
+    // A group no project row, no config block and no store file backs is still not served.
+    hub.agent("Cy", "council", fl_core::agent::AgentRole::Assistant);
+    let resp = hub.get("/api/v1/records?project=council");
+    assert_eq!(resp.status, 404, "{}", text_of(&resp));
+    assert!(error_of(&resp).contains("virtual group"));
+}
+
+#[test]
 fn a_virtual_group_does_not_appear_among_the_available_projects_of_the_records_board() {
     let hub = Hub::new();
     hub.post(OWNER, &json!({ "kind": "virtual", "name": "Council" }));

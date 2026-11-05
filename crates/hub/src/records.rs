@@ -208,11 +208,13 @@ fn open_project_store<'a>(
             let hub = state.open_store().map_err(|_| store_unavailable())?;
             // A virtual group (an area with no path) has no store and no records. Without this
             // its slug would fall through to the hub store and answer with another project's.
+            // A slug the project list shows as a project (the default project, a registered
+            // project, one the hub store holds) is not a virtual group, whatever its area says.
             if hub
                 .get_area(slug)
                 .map_err(|_| store_unavailable())?
                 .is_some_and(|a| a.is_virtual())
-                && !own_store_is_listed(state, slug)
+                && !is_listed_project(state, &hub, slug)
             {
                 return Err(error_json(
                     404,
@@ -224,16 +226,20 @@ fn open_project_store<'a>(
     }
 }
 
-/// Whether `slug` is listed as a project by its config block (a registered project beats a
-/// same-named area with no path).
-fn own_store_is_listed(state: &HubState, slug: &str) -> bool {
-    crate::project_init::user_config_path(state.config.home_override.as_deref())
+/// Whether the project list shows `slug` as a project and not as a virtual group: the same
+/// predicate [`crate::project_list::list_projects`] applies (a `[[project]]` block, a store the
+/// Hub serves such as the default project's, or a project row in `hub`'s own store).
+fn is_listed_project(state: &HubState, hub: &AnyStore, slug: &str) -> bool {
+    let entries = crate::project_init::user_config_path(state.config.home_override.as_deref())
         .and_then(|path| {
             crate::project_init::read_config(&path)
                 .ok()
                 .and_then(|doc| crate::project_init::config_entries(&doc, &path).ok())
         })
-        .is_some_and(|entries| entries.iter().any(|e| e.slug().as_deref() == Some(slug)))
+        .unwrap_or_default();
+    let hints = project_store_hints(state, hub_home_dir(state).as_deref());
+    let held = hub.list_projects().unwrap_or_default();
+    crate::project_list::is_project_slug(slug, &entries, &hints, &held)
 }
 
 /// Every project this hub can show: each project store file of the selected engine

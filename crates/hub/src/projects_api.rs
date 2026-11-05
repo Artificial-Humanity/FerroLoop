@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
 use crate::auth::HubAuthority;
 use crate::project_delete::{
-    DeleteContext, DeleteError, DeleteRequest, delete_project, locate_workspace_roots,
+    DeleteContext, DeleteError, DeleteRequest, delete_project_in, locate_workspace_roots,
 };
 use crate::project_init::{
     Credential, InitError, InitPaths, InitRequest, ProjectKind, VirtualRequest, canonical_root,
@@ -381,12 +381,9 @@ pub(crate) fn handle_delete_project(
     };
     let home = hub_home_dir(state);
     let hints = records::project_store_hints(state, home.as_deref());
-    let env_home = std::env::var_os("HOME").map(PathBuf::from);
-    let homes: Vec<&std::path::Path> = home
-        .iter()
-        .chain(env_home.iter())
-        .map(|h| h.as_path())
-        .collect();
+    // The Hub's home is its override, else `$HOME` (`hub_home_dir`): a Hub run with an override
+    // (a test, an embedded Hub) never looks at the process's own `$HOME`.
+    let homes: Vec<&std::path::Path> = home.iter().map(|h| h.as_path()).collect();
     let exe = std::env::current_exe().ok();
     let workspace_roots =
         locate_workspace_roots(&[&state.config.repo_root], &homes, exe.as_deref());
@@ -398,11 +395,12 @@ pub(crate) fn handle_delete_project(
         workspace_roots: &workspace_roots,
         lifecycle: &env,
     };
-    let result = delete_project(
+    let result = delete_project_in(
         &slug,
         &body,
         authority.actor_name(),
         &ctx,
+        home.clone(),
         open_workspace(state),
         |key| {
             state.clear_session_prompt_queue(key);
