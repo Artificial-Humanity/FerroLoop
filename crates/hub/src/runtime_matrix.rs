@@ -1367,6 +1367,7 @@ mod tests {
             available_models: Vec::new(),
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         }
     }
 

@@ -732,6 +732,11 @@ export interface SetSessionModelResponse {
   thinking_level?: string | null;
   switched: boolean;
   method: string;
+  /**
+   * Set only for Antigravity: the effort-suffixed model id stored for the next launch. A
+   * running Antigravity session keeps its model; nothing is sent to it.
+   */
+  cli_model?: string;
 }
 
 export type BulkSessionAction =

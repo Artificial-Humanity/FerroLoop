@@ -96,6 +96,11 @@ pub struct DiscoveredSessionSummary {
     /// states one. Set only by the model-info pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<String>,
+    /// True when `model` is a best guess (Antigravity's configured default, used because the
+    /// session's own trajectory named no usable model), not the model this session reported.
+    /// The model override step ignores such a model as a live report. Never serialized.
+    #[serde(skip)]
+    pub model_is_default: bool,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -862,6 +867,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -884,6 +890,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -937,6 +944,7 @@ fn discover_sessions_from_routes(
             session.model = info.model;
             session.thinking_level = info.thinking_level;
             session.available_models = info.available_models;
+            session.model_is_default = info.model_is_default;
         }
     }
 
@@ -986,6 +994,8 @@ struct SessionModelInfo {
     model: Option<String>,
     thinking_level: Option<String>,
     available_models: Vec<String>,
+    /// `model` is the configured default, not what this session's source reported.
+    model_is_default: bool,
 }
 
 fn owned_strings(list: &[&str]) -> Vec<String> {
@@ -1029,12 +1039,15 @@ fn session_model_info(
 /// record, else the default. The text comes through `files`, so it has the transcript read cap.
 // Record layout per the Lead's inspection of Muse 1.4.14; unverified against a live file.
 fn muse_model_info(transcript_path: Option<&str>, files: &mut TranscriptReads) -> SessionModelInfo {
-    let model = transcript_path
+    let session_model = transcript_path
         .and_then(|path| files.raw(path))
-        .and_then(muse_transcript_model_id)
-        .unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string());
+        .and_then(muse_transcript_model_id);
     SessionModelInfo {
-        model: Some(model),
+        // Without a metadata record the default still shows, but it is no report by the session.
+        model_is_default: session_model.is_none(),
+        model: Some(
+            session_model.unwrap_or_else(|| crate::lifecycle::MUSE_DEFAULT_MODEL.to_string()),
+        ),
         thinking_level: None,
         available_models: owned_strings(&crate::lifecycle::MUSE_CATALOG_MODELS),
     }
@@ -1136,13 +1149,15 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
     })
 }
 
-/// Latest `metadata.generatorModel` in the steps of a `GetCascadeTrajectory` response
-/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`, or
-/// `trajectory.steps`). A body cut off by the size cap is not valid JSON; the last
-/// `"generatorModel"` string in the text that did arrive is used then.
+/// The model that RUNS in a `GetCascadeTrajectory` response (`trajectory.steps`) or a
+/// `GetCascadeTrajectorySteps` response (`steps`): see [`running_model_from_json`]. This is the
+/// tail-steps parser; it never reads a requested model (`planModel`), so a window that holds
+/// only user inputs names no model and the caller falls through to the full trajectory. A body
+/// cut off by the size cap is not valid JSON; the last `"generatorModel"` string in the text
+/// that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
-        return generator_model_from_json(&val);
+        return running_model_from_json(&val);
     }
     const KEY: &str = "\"generatorModel\"";
     let mut latest = None;
@@ -1160,25 +1175,69 @@ fn parse_agy_generator_model(body: &str) -> Option<String> {
     latest
 }
 
-fn generator_model_from_json(val: &Value) -> Option<String> {
+/// The steps of a trajectory body: `steps` (a `GetCascadeTrajectorySteps` response), else
+/// `trajectory.steps` (a `GetCascadeTrajectory` response).
+fn agy_steps(val: &Value) -> Option<&Vec<Value>> {
     val.pointer("/steps")
-        .or_else(|| val.pointer("/trajectory/steps"))?
-        .as_array()?
-        .iter()
-        .rev()
-        .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+        .or_else(|| val.pointer("/trajectory/steps"))
+        .and_then(Value::as_array)
 }
 
-/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
-/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
-/// stale early model: a body that is not valid JSON names no model.
+/// Where a step says which model RAN it, in order of precedence on one step: the
+/// `generatorModel` of any planner or tool step, then the `modelUsage.model` that only a
+/// `PLANNER_RESPONSE` step carries (same placeholder form).
+const AGY_RUNNING_MODEL_POINTERS: [&str; 2] =
+    ["/metadata/generatorModel", "/metadata/modelUsage/model"];
+
+/// Where a `CORTEX_STEP_TYPE_USER_INPUT` step says which model the user REQUESTED for the turn
+/// it starts: `userConfig`, else `lastUserConfig`. The planner may keep another model (an input
+/// sent while a tool step runs, `metadata.isInterruptingStep`, is not applied to that turn).
+const AGY_REQUESTED_MODEL_POINTERS: [&str; 2] = [
+    "/userInput/userConfig/plannerConfig/planModel",
+    "/userInput/lastUserConfig/plannerConfig/planModel",
+];
+
+/// First non-blank string at any of `pointers` on the newest step that has one.
+fn newest_step_model(val: &Value, pointers: &[&str]) -> Option<String> {
+    agy_steps(val)?.iter().rev().find_map(|step| {
+        pointers
+            .iter()
+            .find_map(|pointer| non_empty_str(step.pointer(pointer)))
+    })
+}
+
+/// The model that is running: the `generatorModel` of the latest step that has one, else that
+/// step's `modelUsage.model`. Newer steps that name no model do not hide an older one. The
+/// value is a placeholder (`MODEL_PLACEHOLDER_*`).
+fn running_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_RUNNING_MODEL_POINTERS)
+}
+
+/// The model the user REQUESTED, from the newest user-input step that names one. It is only a
+/// fallback for a conversation whose planner has not answered a turn yet; once any step
+/// reports a running model, that wins (see [`complete_trajectory_model_from_json`]).
+fn requested_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_REQUESTED_MODEL_POINTERS)
+}
+
+/// The model of a complete trajectory: the running model, and only when no step has one (a
+/// conversation before its first turn) the requested model. The requested value is a
+/// placeholder or an effort-suffixed id.
+fn complete_trajectory_model_from_json(val: &Value) -> Option<String> {
+    running_model_from_json(val).or_else(|| requested_model_from_json(val))
+}
+
+/// [`parse_agy_generator_model`] for a body that must be complete, with the requested-model
+/// fallback. A `GetCascadeTrajectory` body cut off by the size cap holds the OLDEST steps, so
+/// its last `generatorModel` is a stale early model: a body that is not valid JSON names no
+/// model.
 fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
-    generator_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
+    complete_trajectory_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
 /// is returned whole with no thinking level.
-fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
+pub(crate) fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
     for level in ["low", "medium", "high"] {
         if let Some(base) = model_id.strip_suffix(&format!("-{level}"))
             && !base.is_empty()
@@ -1189,8 +1248,11 @@ fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
     (model_id.to_string(), None)
 }
 
-/// Match a trajectory placeholder (then the config's default placeholder) against the
-/// configured models. `available_models` lists each base id once, in config order.
+/// Match the trajectory's model (then the config's default placeholder) against the
+/// configured models. The trajectory value is a placeholder, or an effort-suffixed model id
+/// (`claude-sonnet-5-5-high`) as the user's pending choice can be; an id the config does not
+/// list still keeps its base model and effort. A `MODEL_` value the config does not know is
+/// skipped. `available_models` lists each base id once, in config order.
 fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) -> SessionModelInfo {
     let mut available_models: Vec<String> = Vec::new();
     for entry in &config.models {
@@ -1199,26 +1261,37 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
             available_models.push(base);
         }
     }
+    let by_config = |wanted: &str| {
+        config.models.iter().find(|entry| {
+            entry.placeholder.as_deref() == Some(wanted)
+                || entry.model_id.eq_ignore_ascii_case(wanted)
+        })
+    };
+    let mut model_is_default = false;
     let matched = [placeholder, config.default_placeholder.as_deref()]
         .into_iter()
-        .flatten()
-        .find_map(|wanted| {
-            config
-                .models
-                .iter()
-                .find(|entry| entry.placeholder.as_deref() == Some(wanted))
+        .enumerate()
+        .filter_map(|(index, wanted)| wanted.map(|wanted| (index == 1, wanted)))
+        .find_map(|(is_default, wanted)| {
+            let found = match by_config(wanted) {
+                Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
+                None if !wanted.starts_with("MODEL_") => {
+                    Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+                }
+                None => None,
+            };
+            model_is_default = found.is_some() && is_default;
+            found
         });
     let (model, thinking_level) = match matched {
-        Some(entry) => {
-            let (base, level) = split_agy_thinking_suffix(&entry.model_id);
-            (Some(base), level)
-        }
+        Some((base, level)) => (Some(base), level),
         None => (None, None),
     };
     SessionModelInfo {
         model,
         thinking_level,
         available_models,
+        model_is_default,
     }
 }
 
@@ -1227,6 +1300,7 @@ fn offline_agy_model_info() -> SessionModelInfo {
         model: None,
         thinking_level: None,
         available_models: owned_strings(&AGY_DEFAULT_MODELS),
+        model_is_default: false,
     }
 }
 
@@ -1325,8 +1399,9 @@ fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
         .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
 }
 
-/// Latest generator model from `GetCascadeTrajectorySteps`, which returns only the newest
-/// steps. `None` when no tail offset is known, the call fails, or the steps name no model.
+/// Latest running model from `GetCascadeTrajectorySteps`, which returns only the newest
+/// steps. `None` when no tail offset is known, the call fails, or the steps name no running
+/// model (a window of user inputs only is `None`: the requested model is not read here).
 fn agy_tail_generator_model(
     port: u16,
     csrf: &str,
@@ -1660,10 +1735,14 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
 }
 
 /// A Claude session's model and effort. The transcript names the session's own model (a turn's
-/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` wins
+/// `message.model`, or a `/model` command's output, whichever is newer). `settings.json` shows
 /// when it was written after the transcript: a model changed in the Claude app or in that file
 /// shows at once, before any new transcript line exists. Without a transcript signal,
 /// `settings.json` supplies the model.
+///
+/// `settings.json` is one global file shared by every Claude session, so a model that came from
+/// it is never evidence about this session: it is always flagged `model_is_default`, newer than
+/// the transcript or not. Only a transcript signal counts as a live report.
 fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
     let transcript = transcript_path.map(Path::new);
     let from_transcript = transcript
@@ -1686,26 +1765,32 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         (Some(settings), Some(transcript)) => settings > transcript,
         _ => false,
     };
-    let (model, thinking_level) = match from_transcript {
+    let (model, thinking_level, model_is_default) = match from_transcript {
         Some((signal, effort)) if settings_newer && settings_model.is_some() => {
             let model = settings_model.clone().unwrap_or_default();
             // The transcript's command effort still holds when settings.json names that model.
             let effort = settings_effort(&model).or(effort.filter(|_| signal == model));
-            (Some(model), effort)
+            // It shows, but it is the global default and says nothing about this session
+            // (any session or write may have changed the file): never a live report.
+            (Some(model), effort, true)
         }
         Some((model, effort)) => {
             let effort = effort.or_else(|| settings_effort(&model));
-            (Some(model), effort)
+            (Some(model), effort, false)
         }
         None => {
             let effort = settings_model.as_deref().and_then(settings_effort);
-            (settings_model, effort)
+            // No transcript signal: settings.json is the global default, not what this
+            // session runs, whether or not it is newer than the transcript.
+            let is_default = settings_model.is_some();
+            (settings_model, effort, is_default)
         }
     };
     SessionModelInfo {
         model,
         thinking_level,
         available_models: owned_strings(&CLAUDE_MODELS),
+        model_is_default,
     }
 }
 
@@ -1793,15 +1878,18 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
     if available_models.is_empty() {
         available_models = owned_strings(&CODEX_DEFAULT_MODELS);
     }
+    let config_model = config.as_ref().and_then(|c| toml_non_empty_str(c, "model"));
+    // The config default stands in when the rollout tail names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model
-            .or_else(|| config.as_ref().and_then(|c| toml_non_empty_str(c, "model"))),
+        model: session_model.or(config_model),
         thinking_level: session_effort.or_else(|| {
             config
                 .as_ref()
                 .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
         }),
         available_models,
+        model_is_default,
     }
 }
 
@@ -1851,10 +1939,14 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
     if available_models.is_empty() {
         available_models = owned_strings(&GROK_DEFAULT_MODELS);
     }
+    let config_model = config_str("default");
+    // The config default stands in when summary.json names no model; it is no live report.
+    let model_is_default = session_model.is_none() && config_model.is_some();
     SessionModelInfo {
-        model: session_model.or_else(|| config_str("default")),
+        model: session_model.or(config_model),
         thinking_level: config_str("default_reasoning_effort"),
         available_models,
+        model_is_default,
     }
 }
 
@@ -6175,6 +6267,408 @@ mod tests {
         assert!(parse_agy_generator_model("garbage").is_none());
     }
 
+    /// A model config that names the placeholders a trajectory's pending choice can carry, with
+    /// the mapping the language server reports: M318-M320 Gemini 3.8 Flash High/Medium/Low,
+    /// M400-M402 Claude Opus 5.5 Low/Medium/High, M403-M405 Claude Sonnet 5.5 Low/Medium/High,
+    /// M417-M419 Gemini 4 Argon High/Medium/Low.
+    const AGY_PENDING_CONFIG_FIXTURE: &str = r#"{
+        "clientModelConfigs": [
+            {"modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+            {"modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"}},
+            {"modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M419"}},
+            {"modelId":"claude-sonnet-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}},
+            {"modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"}},
+            {"modelId":"claude-sonnet-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M403"}},
+            {"modelId":"claude-opus-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M402"}},
+            {"modelId":"claude-opus-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M401"}},
+            {"modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M400"}},
+            {"modelId":"gemini-3.8-flash-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}},
+            {"modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}},
+            {"modelId":"gemini-3.8-flash-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M320"}},
+            {"modelId":"gpt-oss-120b-medium","modelOrAlias":{"model":"MODEL_OPENAI_GPT_OSS_120B_MEDIUM"}}
+        ],
+        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}}
+    }"#;
+
+    /// A `CORTEX_STEP_TYPE_USER_INPUT` step as the language server returns it: the model the
+    /// user picked sits under `userInput` on the step itself.
+    fn user_input_step(user: Option<&str>, last: Option<&str>) -> Value {
+        let mut input = serde_json::Map::new();
+        for (key, value) in [("userConfig", user), ("lastUserConfig", last)] {
+            if let Some(value) = value {
+                input.insert(
+                    key.into(),
+                    serde_json::json!({ "plannerConfig": { "planModel": value } }),
+                );
+            }
+        }
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_USER_INPUT",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "userInput": input,
+        })
+    }
+
+    fn planner_step(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": { "generatorModel": model },
+        })
+    }
+
+    /// A tool step that carries no model signal.
+    fn tool_step() -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_DONE",
+            "metadata": { "toolCall": { "name": "run_command" } },
+        })
+    }
+
+    /// The same steps as a `GetCascadeTrajectory` body and as a `GetCascadeTrajectorySteps` body.
+    fn agy_step_bodies(steps: &[Value]) -> [String; 2] {
+        [
+            serde_json::json!({
+                "trajectory": {
+                    "trajectoryId": "t1",
+                    "cascadeId": "c1",
+                    "steps": steps,
+                    "generatorMetadata": [],
+                    "metadata": {},
+                },
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "numTotalSteps": steps.len(),
+            })
+            .to_string(),
+            serde_json::json!({ "steps": steps }).to_string(),
+        ]
+    }
+
+    /// A planner or tool step with only a `modelUsage.model`, as a `PLANNER_RESPONSE` step can
+    /// carry it when `generatorModel` is absent.
+    fn model_usage_step(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "metadata": { "modelUsage": { "model": model } },
+        })
+    }
+
+    /// A tool step that ran under `model`: it has a `generatorModel` and no `modelUsage`.
+    fn tool_step_with_model(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_RUNNING",
+            "metadata": { "generatorModel": model, "toolCall": { "name": "run_command" } },
+        })
+    }
+
+    /// Assert that a step list names the RUNNING model `want` through both the tail parser and
+    /// the complete-body parser, in both body shapes.
+    fn assert_agy_steps_model(steps: &[Value], want: Option<&str>) {
+        for body in agy_step_bodies(steps) {
+            assert_eq!(parse_agy_generator_model(&body).as_deref(), want, "{body}");
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    /// Assert that a step list has no running model: the tail parser names none and the
+    /// complete-body parser falls back to the requested model `want`.
+    fn assert_agy_requested_model_only(steps: &[Value], want: Option<&str>) {
+        for body in agy_step_bodies(steps) {
+            assert_eq!(parse_agy_generator_model(&body), None, "{body}");
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                want,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn agy_a_newer_user_input_does_not_replace_the_running_model() {
+        let steps = [
+            user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+            planner_step("MODEL_PLACEHOLDER_M418"),
+            tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+            user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+        ];
+        assert_agy_steps_model(&steps, Some("MODEL_PLACEHOLDER_M418"));
+        // An input sent while a tool step runs is flagged, and the planner keeps its model.
+        let mut interrupting = user_input_step(Some("MODEL_PLACEHOLDER_M401"), None);
+        interrupting["metadata"] = serde_json::json!({ "isInterruptingStep": true });
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+                interrupting,
+            ],
+            Some("MODEL_PLACEHOLDER_M418"),
+        );
+        // A requested model on the step's own userInput never beats the step's generatorModel
+        // either, and a lastUserConfig is no different from a userConfig.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(None, Some("MODEL_PLACEHOLDER_M401")),
+            ],
+            Some("MODEL_PLACEHOLDER_M418"),
+        );
+    }
+
+    #[test]
+    fn agy_a_planner_step_after_a_user_input_shows_the_model_that_ran() {
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+                planner_step("MODEL_PLACEHOLDER_M401"),
+            ],
+            Some("MODEL_PLACEHOLDER_M401"),
+        );
+        assert_agy_steps_model(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                planner_step("MODEL_PLACEHOLDER_M400"),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+    }
+
+    #[test]
+    fn agy_the_latest_step_with_a_running_model_wins_over_newer_silent_steps() {
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                planner_step("MODEL_PLACEHOLDER_M319"),
+                tool_step(),
+                serde_json::json!({ "type": "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE" }),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M319"),
+        );
+        // A tool step with a generatorModel and no modelUsage counts.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M319"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M319"),
+        );
+        // A user input, however new, hides nothing.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                tool_step(),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+    }
+
+    #[test]
+    fn agy_model_usage_names_the_running_model_when_generator_model_is_absent() {
+        assert_agy_steps_model(
+            &[model_usage_step("MODEL_PLACEHOLDER_M420")],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // A newer step with only modelUsage beats an older generatorModel.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                model_usage_step("MODEL_PLACEHOLDER_M420"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // generatorModel is preferred when both are present on one step.
+        let both = serde_json::json!({
+            "metadata": {
+                "generatorModel": "MODEL_PLACEHOLDER_M418",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(&[both], Some("MODEL_PLACEHOLDER_M418"));
+        // A blank generatorModel falls back to the same step's modelUsage.
+        let blank = serde_json::json!({
+            "metadata": {
+                "generatorModel": "  ",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(
+            &[planner_step("MODEL_PLACEHOLDER_M418"), blank],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+    }
+
+    #[test]
+    fn agy_before_the_first_turn_the_requested_model_is_the_only_signal() {
+        // Only user inputs: the tail parser names nothing, the complete parser reads planModel.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some("MODEL_PLACEHOLDER_M405"), None)],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // lastUserConfig is used when userConfig is absent, empty or blank on the step.
+        assert_agy_requested_model_only(
+            &[user_input_step(None, Some("MODEL_PLACEHOLDER_M417"))],
+            Some("MODEL_PLACEHOLDER_M417"),
+        );
+        for blank in ["", "   "] {
+            assert_agy_requested_model_only(
+                &[user_input_step(Some(blank), Some("claude-sonnet-5-5-high"))],
+                Some("claude-sonnet-5-5-high"),
+            );
+        }
+        // userConfig wins over lastUserConfig on one step.
+        assert_agy_requested_model_only(
+            &[user_input_step(
+                Some("MODEL_PLACEHOLDER_M405"),
+                Some("MODEL_PLACEHOLDER_M417"),
+            )],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // The newest user-input step comes first, and steps with no model do not hide it.
+        assert_agy_requested_model_only(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // A newest step with only blank requests falls back to an older step's request.
+        assert_agy_requested_model_only(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+                user_input_step(Some("  "), Some("")),
+            ],
+            Some("MODEL_PLACEHOLDER_M417"),
+        );
+        // The value is trimmed.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some(" gpt-oss-120b-medium "), None)],
+            Some("gpt-oss-120b-medium"),
+        );
+    }
+
+    #[test]
+    fn agy_steps_without_a_usable_model_signal_name_no_model() {
+        assert_agy_steps_model(&[], None);
+        assert_agy_steps_model(&[tool_step(), tool_step()], None);
+        // Whitespace-only and non-string values are ignored.
+        assert_agy_steps_model(&[user_input_step(Some("  "), Some(""))], None);
+        assert_agy_steps_model(
+            &[
+                serde_json::json!({ "metadata": { "generatorModel": "  " } }),
+                serde_json::json!({ "metadata": { "modelUsage": { "model": " " } } }),
+                serde_json::json!({ "metadata": { "generatorModel": 7 } }),
+                serde_json::json!({
+                    "userInput": { "userConfig": { "plannerConfig": { "planModel": 7 } } }
+                }),
+                serde_json::json!({ "userInput": { "userConfig": { "plannerConfig": {} } } }),
+            ],
+            None,
+        );
+        // A blank signal on a newer step does not hide an older one.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                serde_json::json!({ "metadata": { "generatorModel": "" } }),
+                user_input_step(Some("  "), Some("")),
+            ],
+            Some("MODEL_PLACEHOLDER_M400"),
+        );
+        // No steps array at all.
+        assert_eq!(parse_agy_generator_model(r#"{"trajectory":{}}"#), None);
+        assert_eq!(parse_agy_generator_model(r#"{"status":"IDLE"}"#), None);
+        // `userInput` is read from steps only, never from the body root or the trajectory.
+        let misplaced = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"trajectory":{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"steps":[]}}"#;
+        assert_eq!(parse_agy_generator_model(misplaced), None);
+        assert_eq!(parse_agy_complete_generator_model(misplaced), None);
+    }
+
+    #[test]
+    fn agy_cut_off_bodies_ignore_the_requested_plan_model() {
+        // The string scan is for the tail-steps call; it never reads planModel.
+        let cut = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorMo"#;
+        assert_eq!(parse_agy_generator_model(cut), None);
+        assert_eq!(parse_agy_complete_generator_model(cut), None);
+        let cut_with_step = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M400"}},{"metadata":{"generatorMo"#;
+        assert_eq!(
+            parse_agy_generator_model(cut_with_step).as_deref(),
+            Some("MODEL_PLACEHOLDER_M400")
+        );
+        assert_eq!(parse_agy_complete_generator_model(cut_with_step), None);
+    }
+
+    #[test]
+    fn agy_requested_plan_model_from_a_step_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+        let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
+        for (value, model, level) in [
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
+            ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
+        ] {
+            let [body, _] = agy_step_bodies(&[user_input_step(Some(value), None)]);
+            let found = parse_agy_complete_generator_model(&body);
+            assert_eq!(found.as_deref(), Some(value));
+            let info = resolve_agy_model_info(&config, found.as_deref());
+            assert_eq!(info.model.as_deref(), Some(model), "{value}");
+            assert_eq!(info.thinking_level.as_deref(), level, "{value}");
+        }
+    }
+
+    #[test]
+    fn agy_pending_plan_model_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+        let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
+        for (value, model, level) in [
+            // Placeholders come from the model config.
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M400", "claude-opus-5-5", Some("low")),
+            ("MODEL_PLACEHOLDER_M319", "gemini-3.8-flash", Some("medium")),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash", Some("high")),
+            ("MODEL_PLACEHOLDER_M320", "gemini-3.8-flash", Some("low")),
+            ("MODEL_PLACEHOLDER_M401", "claude-opus-5-5", Some("medium")),
+            ("MODEL_PLACEHOLDER_M402", "claude-opus-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M403", "claude-sonnet-5-5", Some("low")),
+            (
+                "MODEL_PLACEHOLDER_M404",
+                "claude-sonnet-5-5",
+                Some("medium"),
+            ),
+            ("MODEL_PLACEHOLDER_M418", "gemini-4-argon", Some("medium")),
+            ("MODEL_PLACEHOLDER_M419", "gemini-4-argon", Some("low")),
+            (
+                "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+                "gpt-oss-120b",
+                Some("medium"),
+            ),
+            // Effort-suffixed ids, in the config or not, keep their effort.
+            ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
+            ("gemini-4-argon-medium", "gemini-4-argon", Some("medium")),
+            ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
+            ("Claude-Sonnet-5-5-HIGH", "claude-sonnet-5-5", Some("high")),
+            ("claude-opus-5-5-low", "claude-opus-5-5", Some("low")),
+        ] {
+            let info = resolve_agy_model_info(&config, Some(value));
+            assert_eq!(info.model.as_deref(), Some(model), "{value}");
+            assert_eq!(info.thinking_level.as_deref(), level, "{value}");
+        }
+        // An unknown placeholder still falls back to the config default.
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M9999"));
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+    }
+
     #[test]
     fn agy_without_a_reachable_language_server_lists_the_default_models() {
         let offline = offline_agy_model_info();
@@ -6399,6 +6893,84 @@ mod tests {
         stub.shutdown();
     }
 
+    #[test]
+    fn agy_default_model_fallback_is_flagged_and_a_trajectory_model_is_not() {
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        // The trajectory's own model, by placeholder or as a plain id: not a guess.
+        for found in [Some("MODEL_PLACEHOLDER_M417"), Some("Some-Model-Low")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert!(info.model.is_some(), "{found:?}");
+            assert!(!info.model_is_default, "{found:?}");
+        }
+        // No trajectory model, or one the config does not know: the default stands in.
+        for found in [None, Some("MODEL_PLACEHOLDER_M000")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"), "{found:?}");
+            assert!(info.model_is_default, "{found:?}");
+        }
+        // With no default either, there is no model and nothing to flag.
+        let mut bare = config.clone();
+        bare.default_placeholder = None;
+        let info = resolve_agy_model_info(&bare, None);
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn agy_discovery_flags_a_session_whose_trajectory_gave_no_model() {
+        // The config call succeeds and the trajectory body is unusable.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, "not json");
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let tmp = TempDir::new().unwrap();
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        // The default still shows, but it is marked as a guess.
+        assert_eq!(agy.model.as_deref(), Some("gemini-3.8-flash"));
+        assert!(agy.model_is_default);
+        stub.shutdown();
+
+        // A real placeholder in the trajectory is a live report.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, AGY_TRAJECTORY_FIXTURE);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert!(!agy.model_is_default);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn the_default_model_marker_never_reaches_the_json() {
+        let mut summary = muse_session_with_transcript(None);
+        summary.model_is_default = true;
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("model_is_default").is_none(), "{json}");
+        assert!(!json.to_string().contains("model_is_default"));
+        // And a payload cannot set it.
+        let mut input = json.clone();
+        input["model_is_default"] = Value::Bool(true);
+        let back: DiscoveredSessionSummary = serde_json::from_value(input).unwrap();
+        assert!(!back.model_is_default);
+    }
+
     const AGY_STEPS_FIXTURE: &str = r#"{"steps":[
         {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
         {"metadata":{}},
@@ -6574,6 +7146,83 @@ mod tests {
                 ],
                 "{cascade}: the tail call first, then the full trajectory"
             );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_live_model_reads_the_running_model_and_falls_back_to_the_requested_one_only_in_full() {
+        fn leak(body: &str) -> &'static str {
+            Box::leak(body.to_string().into_boxed_str())
+        }
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
+        let pending = user_input_step(Some("MODEL_PLACEHOLDER_M405"), None);
+        // (case, steps the tail call returns, steps the full trajectory holds, model, effort,
+        //  whether the full trajectory is asked)
+        let cases = [
+            // The tail window holds a planner step before the user input: the tail decides.
+            (
+                "tail-running",
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M400"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                vec![planner_step("MODEL_PLACEHOLDER_M417")],
+                "claude-opus-5-5",
+                "low",
+                false,
+            ),
+            // The tail window holds only a user input: no running model, so the full
+            // trajectory is asked and its planner steps name the model that runs.
+            (
+                "tail-user-input-only",
+                vec![tool_step(), pending.clone()],
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M400"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                "claude-opus-5-5",
+                "low",
+                true,
+            ),
+            // First turn: no step anywhere has a running model, so the requested one shows.
+            (
+                "first-turn",
+                vec![tool_step(), pending.clone()],
+                vec![pending],
+                "claude-sonnet-5-5",
+                "high",
+                true,
+            ),
+        ];
+        for (name, tail_steps, full_steps, model, effort, asks_full) in cases {
+            let [_, tail] = agy_step_bodies(&tail_steps);
+            let [full, _] = agy_step_bodies(&full_steps);
+            let cascade: &'static str = leak(&format!("agy-live-{name}"));
+            let stub = spawn_agy_stub_with_steps(
+                AGY_PENDING_CONFIG_FIXTURE,
+                leak(&full),
+                cascade,
+                Some((200, leak(&tail))),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
+            let mut want = vec!["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"];
+            if asks_full {
+                want.push("GetCascadeTrajectory");
+            }
+            assert_eq!(stub_paths(&stub), want, "{cascade}");
             stub.shutdown();
         }
     }
@@ -7904,6 +8553,174 @@ mod tests {
     }
 
     #[test]
+    fn muse_default_model_is_flagged_and_a_metadata_model_is_not() {
+        let other = muse_line(
+            "runtime.session",
+            serde_json::json!({"model_id":"muse-spark-1.3"}),
+        );
+        let no_id = muse_line("runtime.session.metadata", serde_json::json!({"record":{}}));
+        // No metadata record, no model_id in it, and no transcript: the default stands in.
+        for lines in [
+            Some(vec![other]),
+            Some(vec![no_id, "not json".to_string()]),
+            None,
+        ] {
+            let session = muse_session_with_transcript(lines.as_deref());
+            assert_eq!(session.model.as_deref(), Some("muse-wonder-full-1.0"));
+            assert!(session.model_is_default);
+        }
+        // A metadata record names the session's own model, even when it equals the default.
+        for model in ["muse-spark-1.3", "muse-wonder-full-1.0"] {
+            let session = muse_session_with_transcript(Some(&[muse_metadata_line(model)]));
+            assert_eq!(session.model.as_deref(), Some(model));
+            assert!(!session.model_is_default, "{model}");
+        }
+    }
+
+    #[test]
+    fn codex_config_model_is_flagged_and_a_rollout_model_is_not() {
+        let tmp = codex_home_with_config();
+        // A rollout with no model (a fresh session), and no rollout at all.
+        let fresh = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"session_meta","payload":{"id":"t-fixture"}}"#],
+        );
+        let no_rollout = codex_model_info(None, Some(tmp.path()));
+        for info in [fresh, no_rollout] {
+            assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+            assert!(info.model_is_default);
+        }
+        // The rollout names the model, even when it equals the config's.
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra"] {
+            let line = format!(r#"{{"type":"turn_context","payload":{{"model":"{model}"}}}}"#);
+            let info = codex_session_info(tmp.path(), &[&line]);
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = codex_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn grok_config_default_is_flagged_and_a_summary_model_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let grok = home.join(".grok");
+        let session = grok.join("sessions").join("p").join("s1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            grok.join("config.toml"),
+            "[models]\ndefault = \"grok-4.7\"\n",
+        )
+        .unwrap();
+        let chat = session.join("chat_history.jsonl");
+        // No summary.json, then a summary without the model id: the config default stands in.
+        for summary in [None, Some(r#"{"num_messages":3}"#)] {
+            let _ = fs::remove_file(session.join("summary.json"));
+            if let Some(summary) = summary {
+                fs::write(session.join("summary.json"), summary).unwrap();
+            }
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some("grok-4.7"), "{summary:?}");
+            assert!(info.model_is_default, "{summary:?}");
+        }
+        // The summary names the session's model, even when it equals the config default.
+        for model in ["grok-4.6", "grok-4.7"] {
+            fs::write(
+                session.join("summary.json"),
+                format!(r#"{{"current_model_id":"{model}"}}"#),
+            )
+            .unwrap();
+            let info = grok_model_info(chat.to_str(), Some(home));
+            assert_eq!(info.model.as_deref(), Some(model));
+            assert!(!info.model_is_default, "{model}");
+        }
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = grok_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_model_is_always_flagged_and_a_transcript_model_never_is() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: settings.json is the default, not the session's model.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+        // A transcript with no model signal (a new session) is the same.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // The transcript names the session's model, newer than settings.json.
+        fs::write(&transcript, assistant_line("claude-sonnet-5-5")).unwrap();
+        set_mtime_secs(&settings, 1_000);
+        set_mtime_secs(&transcript, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert!(!info.model_is_default);
+
+        // settings.json written afterwards still shows, but it is one global file shared by
+        // every session, so it is never a live report about this one: flagged.
+        set_mtime_secs(&settings, 3_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // No model anywhere: nothing to flag.
+        let bare = TempDir::new().unwrap();
+        let info = claude_model_info(None, Some(bare.path()));
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn claude_settings_model_stays_flagged_with_a_modelless_transcript_whether_newer_or_older() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude = home.join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        let settings = claude.join("settings.json");
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        let transcript = home.join("t.jsonl");
+        let tp = transcript.to_str().unwrap();
+
+        // No transcript at all: settings.json is a default.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // A transcript with no model signal, older than settings.json: the model still shows,
+        // but settings.json is a global file, so it is flagged as a default all the same.
+        fs::write(&transcript, model_command_line(serde_json::json!("hi"))).unwrap();
+        set_mtime_secs(&transcript, 1_000);
+        set_mtime_secs(&settings, 2_000);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+
+        // The same transcript, newer than settings.json: flagged too.
+        set_mtime_secs(&settings, 500);
+        let info = claude_model_info(Some(tp), Some(home));
+        assert_eq!(info.model.as_deref(), Some("claude-opus-5-5"));
+        assert!(info.model_is_default);
+    }
+
+    #[test]
     fn attempt_rows_carry_no_model_fields() {
         let tmp = TempDir::new().unwrap();
         let snap = DiscoveryStoreSnapshot {
@@ -9100,6 +9917,7 @@ mod tests {
                 available_models: vec![],
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             };
             let source = crate::runtime_matrix::QuotaSource::HOST;
             let quota = (source.session)(&session, None).unwrap();
@@ -10155,6 +10973,7 @@ mod tests {
             available_models: Vec::new(),
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         };
         let usage = |signals: serde_json::Value| {
             fs::write(session_dir.join("signals.json"), signals.to_string()).unwrap();

@@ -6156,7 +6156,12 @@ fn hosted_record_for(
 /// Owner only (403 for a Peer, checked before the body is read). The
 /// choice is kept in `HubState` and overlaid on `GET /api/v1/sessions` (in memory: gone after
 /// a hub restart), written to the hosted-session record when one exists, and sent to a live
-/// CLI as `/model <id>`. Antigravity is not sent anything: its method is `override-only`.
+/// CLI as `/model <id>`.
+///
+/// Antigravity is not sent anything. A running Antigravity session keeps its model: FerroDeck
+/// shows the choice, and the stored effort-suffixed id (`cli_model` in the response) applies
+/// when the session is next launched (restart or reforge). The response keeps `switched: true`
+/// and `method: override-only` for compatibility.
 fn handle_post_session_model(
     state: &HubState,
     authority: &HubAuthority,
@@ -6236,11 +6241,12 @@ fn handle_post_session_model(
     };
     state.set_session_model_override(
         &override_key,
-        ModelOverride {
-            model: model.clone(),
-            thinking_level: thinking_level.clone(),
-        },
+        ModelOverride::new(model.clone(), thinking_level.clone()),
     );
+    // `agy --model` only takes effort-suffixed ids, so an Antigravity record keeps the mapped id
+    // (a restart launches with it); every other vendor keeps the model as the operator chose it.
+    let cli_model = (vendor == "antigravity")
+        .then(|| lifecycle::agy_cli_model_id(&model, thinking_level.as_deref()));
     if hosted.is_some() {
         match open_store_response(state) {
             Ok(store) => {
@@ -6248,7 +6254,7 @@ fn handle_post_session_model(
                 let _ = lifecycle::set_hosted_session_model(
                     &*store,
                     &[trimmed, &canonical_id],
-                    &model,
+                    cli_model.as_deref().unwrap_or(&model),
                     authority.actor_name(),
                 );
             }
@@ -6270,7 +6276,7 @@ fn handle_post_session_model(
         _ => METHOD_OVERRIDE_ONLY,
     };
 
-    let data = json!({
+    let mut data = json!({
         "ok": true,
         "session_id": canonical_id,
         "vendor": vendor,
@@ -6279,6 +6285,9 @@ fn handle_post_session_model(
         "switched": true,
         "method": method,
     });
+    if let Some(cli_model) = cli_model {
+        data["cli_model"] = json!(cli_model);
+    }
     state.broadcast("sessions", "session.model_changed", data.clone());
     HttpResponse::json(200, data)
 }
@@ -6680,13 +6689,7 @@ pub(crate) fn run_remodel(
                 // Keyed by the persona (and the hosted id): discovery does not know the new
                 // vendor session's id yet, and `apply_model_overrides` matches the persona.
                 for key in [out.persona.to_ascii_lowercase(), out.session_id.clone()] {
-                    state.set_session_model_override(
-                        &key,
-                        ModelOverride {
-                            model: model.clone(),
-                            thinking_level: None,
-                        },
-                    );
+                    state.set_session_model_override(&key, ModelOverride::new(model.clone(), None));
                 }
             }
         }
