@@ -110,7 +110,7 @@ describe("AgentSettingsModal Execution Mode block", () => {
     expect(getSessions).toHaveBeenCalledTimes(1);
   });
 
-  it("falls back to the persona match, stays Unknown on a failed fetch, and does not fetch when the prop is given", async () => {
+  it("falls back to the persona match, stays Unknown on a failed fetch, and still refreshes when the prop is given", async () => {
     const byPersona = vi.fn().mockResolvedValue({
       sessions: [
         { id: "x", source: "route", adapter: "claude", persona: "Ferris", status: "active", execution_mode: "accept-edits" },
@@ -141,7 +141,7 @@ describe("AgentSettingsModal Execution Mode block", () => {
         {...modalProps({ executionMode: "plan", apiClient: { getSessions: unused } as unknown as HubApiClient })}
       />,
     );
-    expect(unused).not.toHaveBeenCalled();
+    await waitFor(() => expect(unused).toHaveBeenCalledTimes(1));
   });
 });
 

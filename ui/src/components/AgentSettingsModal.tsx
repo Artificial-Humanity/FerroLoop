@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import type { ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
@@ -18,7 +18,7 @@ import {
   contextAtCompactThreshold,
   formatTokenCount,
   getVendorModelOptions,
-  inferVendorFromModel,
+  resolveSessionVendor,
   isAntigravityAdapter,
   type EstimatedContextUsage,
 } from "./ChatPane";
@@ -382,6 +382,38 @@ export interface AgentSettingsModalProps {
 
 export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
 
+interface FetchedSessionState {
+  executionMode: string | null;
+  adapter: string | null;
+  model: string | null;
+  thinkingLevel: string | null;
+  availableModels: string[] | null;
+  /** Prop values in effect when the fetch was issued. */
+  props: SessionPropSnapshot;
+}
+
+interface SessionPropSnapshot {
+  adapter?: string | null;
+  model?: string;
+  thinkingLevel?: string;
+  executionMode?: string | null;
+}
+
+/** Fields whose prop value is newer than the fetched session value. */
+interface OverrideLatch {
+  model: boolean;
+  thinkingLevel: boolean;
+  executionMode: boolean;
+  adapter: boolean;
+}
+
+const NO_OVERRIDES: OverrideLatch = {
+  model: false,
+  thinkingLevel: false,
+  executionMode: false,
+  adapter: false,
+};
+
 export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   isOpen,
   onClose,
@@ -464,28 +496,49 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setPostureActionStatus(null);
     setActiveTab(initialTab);
   }, [isOpen, agentName, agentProject, agentRole, initialTab]);
-  const [fetchedExecutionMode, setFetchedExecutionMode] = useState<string | null>(null);
-  const [fetchedAdapter, setFetchedAdapter] = useState<string | null>(null);
-  const [fetchedModel, setFetchedModel] = useState<string | null>(null);
-  const [fetchedAvailableModels, setFetchedAvailableModels] = useState<string[] | null>(null);
+  // Session metadata read from the hub every time the modal opens. The hub may
+  // change a session's model, effort or mode behind the UI's back (an operator
+  // override can be superseded by what the vendor reports), so the session list
+  // is the source of truth and the props are only the initial values. `props`
+  // records the prop values at the moment the request was issued. A field is
+  // latched as overridden the first time its prop differs from that snapshot
+  // (the operator switched it, even while the request was in flight) or the
+  // operator changes it in this modal; it then keeps showing the prop until the
+  // modal reopens, the target changes or a new fetch is issued.
+  const [fetchedSession, setFetchedSession] = useState<FetchedSessionState | null>(null);
+  const [overridden, setOverridden] = useState<OverrideLatch>(NO_OVERRIDES);
+  const latestPropsRef = useRef<SessionPropSnapshot & { apiClient?: HubApiClient }>({
+    adapter,
+    model: selectedModel,
+    thinkingLevel: selectedThinkingLevel,
+    executionMode,
+  });
+  latestPropsRef.current = {
+    adapter,
+    model: selectedModel,
+    thinkingLevel: selectedThinkingLevel,
+    executionMode,
+    apiClient,
+  };
+  const requestSnapshotRef = useRef<SessionPropSnapshot>({
+    adapter,
+    model: selectedModel,
+    thinkingLevel: selectedThinkingLevel,
+    executionMode,
+  });
+  const canFetchSessions =
+    Boolean(apiClient) && typeof apiClient?.getSessions === "function";
   useEffect(() => {
-    setFetchedExecutionMode(null);
-    setFetchedAdapter(null);
-    setFetchedModel(null);
-    setFetchedAvailableModels(null);
-    const needsAdapter = !adapter || adapter.trim().toLowerCase() === "unknown";
-    if (
-      !isOpen ||
-      (executionMode !== undefined && !needsAdapter) ||
-      !apiClient ||
-      (!sessionId && !agentName) ||
-      typeof apiClient.getSessions !== "function"
-    ) {
+    setFetchedSession(null);
+    const { apiClient: client, ...propsAtRequest } = latestPropsRef.current;
+    requestSnapshotRef.current = propsAtRequest;
+    setOverridden((prev) => (prev === NO_OVERRIDES ? prev : NO_OVERRIDES));
+    if (!isOpen || !canFetchSessions || !client || (!sessionId && !agentName)) {
       return;
     }
     let cancelled = false;
     Promise.resolve()
-      .then(() => apiClient.getSessions())
+      .then(() => client.getSessions())
       .then((res) => {
         if (cancelled) return;
         const sessions = res?.sessions ?? [];
@@ -493,16 +546,46 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         const match =
           (sessionId ? sessions.find((s) => s.id === sessionId) : undefined) ??
           (wanted ? sessions.find((s) => s.persona?.trim().toLowerCase() === wanted) : undefined);
-        setFetchedExecutionMode(match?.execution_mode ?? null);
-        setFetchedAdapter(match?.adapter ?? null);
-        setFetchedModel(match?.model ?? null);
-        setFetchedAvailableModels(match?.available_models ?? null);
+        setFetchedSession({
+          executionMode: match?.execution_mode ?? null,
+          adapter: match?.adapter ?? null,
+          model: match?.model ?? null,
+          thinkingLevel: match?.thinking_level ?? null,
+          availableModels: match?.available_models ?? null,
+          props: propsAtRequest,
+        });
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [isOpen, executionMode, adapter, apiClient, sessionId, agentName]);
+  }, [isOpen, canFetchSessions, sessionId, agentName]);
+  // Declared after the fetch effect so that a new fetch resets the snapshot
+  // before this compares against it.
+  useEffect(() => {
+    if (!isOpen) return;
+    const snap = requestSnapshotRef.current;
+    const changed: OverrideLatch = {
+      model: selectedModel !== snap.model,
+      thinkingLevel: selectedThinkingLevel !== snap.thinkingLevel,
+      executionMode: executionMode !== snap.executionMode,
+      adapter: adapter !== snap.adapter,
+    };
+    setOverridden((prev) => {
+      const next = {
+        model: prev.model || changed.model,
+        thinkingLevel: prev.thinkingLevel || changed.thinkingLevel,
+        executionMode: prev.executionMode || changed.executionMode,
+        adapter: prev.adapter || changed.adapter,
+      };
+      return next.model === prev.model &&
+        next.thinkingLevel === prev.thinkingLevel &&
+        next.executionMode === prev.executionMode &&
+        next.adapter === prev.adapter
+        ? prev
+        : next;
+    });
+  }, [isOpen, adapter, selectedModel, selectedThinkingLevel, executionMode]);
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -527,22 +610,40 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
   const agentKey = (agentName || displayTarget).trim().toLowerCase();
   const targetSessionOrAgent = sessionId || agentName || "";
+  // A field is overridden once latched, and also in the render where its prop
+  // first differs from the request snapshot (before the latch effect has run).
+  const isOverridden = <K extends keyof OverrideLatch>(
+    key: K,
+    current: SessionPropSnapshot[K],
+  ): boolean =>
+    overridden[key] ||
+    (fetchedSession !== null && current !== fetchedSession.props[key]);
+  const fetchedFor = <K extends keyof OverrideLatch>(
+    key: K,
+    current: SessionPropSnapshot[K],
+    fetchedValue: string | null | undefined,
+  ): string | null => {
+    const value = (fetchedValue ?? "").trim();
+    if (!fetchedSession || !value) return null;
+    return isOverridden(key, current) ? null : value;
+  };
+  const rawSelectedModel =
+    fetchedFor("model", selectedModel, fetchedSession?.model) ?? (selectedModel ?? "").trim();
   const rawPropAdapter = (adapter ?? "").trim();
-  const rawFetchedAdapter = (fetchedAdapter ?? "").trim();
-  const rawSelectedModel = (selectedModel ?? "").trim();
-  const rawFetchedModel = (fetchedModel ?? "").trim();
-  const knownAdapter =
-    rawPropAdapter && rawPropAdapter.toLowerCase() !== "unknown"
-      ? rawPropAdapter
-      : rawFetchedAdapter && rawFetchedAdapter.toLowerCase() !== "unknown"
-        ? rawFetchedAdapter
-        : inferVendorFromModel(rawSelectedModel || rawFetchedModel) ?? "";
-  const effectiveAdapter = knownAdapter || rawPropAdapter || rawFetchedAdapter || null;
+  const rawFetchedAdapter = fetchedSession?.adapter?.trim() ?? "";
+  const chosenAdapter =
+    rawFetchedAdapter &&
+    rawFetchedAdapter.toLowerCase() !== "unknown" &&
+    !isOverridden("adapter", adapter)
+      ? rawFetchedAdapter
+      : rawPropAdapter;
+  const knownAdapter = resolveSessionVendor(chosenAdapter, rawSelectedModel);
+  const effectiveAdapter = knownAdapter || chosenAdapter || null;
   const effectiveAvailableModels =
-    Array.isArray(availableModels) && availableModels.length > 0
-      ? availableModels
-      : fetchedAvailableModels;
-  const candidateModel = rawSelectedModel || rawFetchedModel;
+    fetchedSession?.availableModels && fetchedSession.availableModels.length > 0
+      ? fetchedSession.availableModels
+      : availableModels;
+  const candidateModel = rawSelectedModel;
   const isStaleAntigravityModel =
     !isAntigravityAdapter(knownAdapter) &&
     candidateModel.toLowerCase().startsWith("gemini-") &&
@@ -555,7 +656,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     effectiveAvailableModels,
   );
   const effectiveModel = sanitizedCurrentModel || modelOptions[0] || "";
-  const effectiveThinking = (selectedThinkingLevel || "high").trim().toLowerCase();
+  const effectiveThinkingLevel =
+    fetchedFor("thinkingLevel", selectedThinkingLevel, fetchedSession?.thinkingLevel) ??
+    selectedThinkingLevel;
+  const effectiveThinking = (effectiveThinkingLevel || "high").trim().toLowerCase();
 
   const handleRecastSubmit = async (confirmOverrides = false) => {
     if (recasting || !agentKey) return;
@@ -612,7 +716,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
       ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
       : THINKING_LEVEL_OPTIONS;
   const effectiveExecutionMode =
-    executionMode !== undefined ? executionMode : fetchedExecutionMode;
+    fetchedFor("executionMode", executionMode, fetchedSession?.executionMode) ??
+    (executionMode !== undefined ? executionMode : null);
   const executionModeKey = (effectiveExecutionMode ?? "").trim().toLowerCase();
   const executionModeIsYolo = executionModeKey === "yolo";
 
@@ -961,7 +1066,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     ? `${effectiveAdapter} · `
                     : ""}
                   {effectiveModel || "default"}
-                  {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
+                  {effectiveThinkingLevel ? ` (${effectiveThinkingLevel})` : ""}
                 </span>
               </div>
               {typeof turnCount === "number" && (
@@ -1005,7 +1110,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   className="fd-select fd-mono"
                   disabled={!targetSessionOrAgent || switchingModel}
                   value={effectiveModel}
-                  onChange={(e) => onChangeModelAndThinking(e.target.value, effectiveThinking)}
+                  onChange={(e) => {
+                    setOverridden((prev) => (prev.model ? prev : { ...prev, model: true }));
+                    onChangeModelAndThinking(e.target.value, effectiveThinking);
+                  }}
                   style={{
                     width: "100%",
                     minWidth: 0,
@@ -1045,7 +1153,12 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   className="fd-select fd-mono"
                   disabled={!targetSessionOrAgent || switchingModel}
                   value={effectiveThinking}
-                  onChange={(e) => onChangeModelAndThinking(effectiveModel, e.target.value)}
+                  onChange={(e) => {
+                    setOverridden((prev) =>
+                      prev.thinkingLevel ? prev : { ...prev, thinkingLevel: true },
+                    );
+                    onChangeModelAndThinking(effectiveModel, e.target.value);
+                  }}
                   style={{
                     width: "100%",
                     minWidth: 0,

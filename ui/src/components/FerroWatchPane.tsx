@@ -256,6 +256,28 @@ export const DEFAULT_ACP_CONFORMANCE_MATRIX: AcpAdapterConformanceRow[] = [
   },
 ];
 
+/**
+ * An Antigravity hosted record stores an effort-suffixed model id
+ * (`claude-sonnet-5-5-high`) while the session reports the base id. Strip the
+ * suffix for that vendor only so the two do not show up as separate models.
+ */
+export function normalizeHostedModelForVendor(
+  vendor: string | null | undefined,
+  model: string | null | undefined,
+): string {
+  const trimmed = (model ?? "").trim();
+  const v = (vendor ?? "").trim().toLowerCase();
+  if (v !== "antigravity") return trimmed;
+  return trimmed.replace(/-(low|medium|high)$/i, "");
+}
+
+function pushModelOnce(models: string[], model: string): void {
+  const lower = model.toLowerCase();
+  if (model && !models.some((m) => m.toLowerCase() === lower)) {
+    models.push(model);
+  }
+}
+
 export interface FerroWatchPaneProps {
   authority?: HubAuthority | null;
   agents?: AgentRecord[];
@@ -855,10 +877,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       if (persona && !entry.activePersonas.includes(persona)) {
         entry.activePersonas.push(persona);
       }
-      const model = (sess.model ?? "").trim();
-      if (model && !entry.models.includes(model)) {
-        entry.models.push(model);
-      }
+      pushModelOnce(entry.models, (sess.model ?? "").trim());
     }
 
     for (const ag of summary?.health?.agents ?? []) {
@@ -869,10 +888,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         if (ag.active && persona && !entry.activePersonas.includes(persona)) {
           entry.activePersonas.push(persona);
         }
-        const model = (ag.hosted_session?.model ?? "").trim();
-        if (model && !entry.models.includes(model)) {
-          entry.models.push(model);
-        }
+        pushModelOnce(
+          entry.models,
+          normalizeHostedModelForVendor(vKey, ag.hosted_session?.model),
+        );
       }
     }
 
@@ -1166,7 +1185,11 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       if (key) {
         map.set(key, {
           vendor: ag.hosted_session?.vendor ?? ag.adapter ?? null,
-          model: ag.hosted_session?.model ?? null,
+          model:
+            normalizeHostedModelForVendor(
+              ag.hosted_session?.vendor ?? ag.adapter,
+              ag.hosted_session?.model,
+            ) || null,
         });
       }
     }

@@ -572,16 +572,17 @@ impl HubState {
         guard.get(session_id).cloned()
     }
 
-    /// Session summaries with the in-memory model overrides applied.
+    /// Session summaries with the in-memory model overrides applied. An override the vendor has
+    /// superseded (see [`session_actions::apply_model_overrides`]) is removed on the way.
     pub fn with_model_overrides(
         &self,
         mut sessions: Vec<DiscoveredSessionSummary>,
     ) -> Vec<DiscoveredSessionSummary> {
-        let guard = self
+        let mut guard = self
             .model_overrides
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        session_actions::apply_model_overrides(&mut sessions, &guard);
+        session_actions::apply_model_overrides(&mut sessions, &mut guard);
         sessions
     }
 
@@ -6449,10 +6450,7 @@ mod tests {
         );
         state.set_session_model_override(
             "webhook-felicia",
-            session_actions::ModelOverride {
-                model: "model-a".into(),
-                thinking_level: None,
-            },
+            session_actions::ModelOverride::new("model-a".into(), None),
         );
         let mut frames = state.subscribe();
 
@@ -6828,12 +6826,267 @@ mod tests {
         // A session id match wins over a persona key.
         state.set_session_model_override(
             "webhook-ada",
-            session_actions::ModelOverride {
-                model: "model-c".into(),
-                thinking_level: None,
-            },
+            session_actions::ModelOverride::new("model-c".into(), None),
         );
         assert_eq!(listed_model(&state, "webhook-ada"), "model-c");
+    }
+
+    #[test]
+    fn a_live_model_report_supersedes_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let live = |model: &str| {
+            vec![discovery::DiscoveredSessionSummary {
+                id: "claude:ada".to_string(),
+                source: "route".to_string(),
+                adapter: "claude".to_string(),
+                persona: Some("Ada".to_string()),
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model: Some(model.to_string()),
+                thinking_level: None,
+                available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
+                model_is_default: false,
+            }]
+        };
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        // The vendor still reports the old model: the choice stays and shows.
+        let shown = state.with_model_overrides(live("model-a"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        let shown = state.with_model_overrides(live("model-a"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        // The operator switched inside the vendor UI: the override is dropped.
+        let shown = state.with_model_overrides(live("model-c"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+        assert!(state.session_model_override("ada").is_none());
+        let shown = state.with_model_overrides(live("model-c"));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+    }
+
+    #[test]
+    fn a_default_model_guess_is_not_a_live_report_for_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        // `guess` marks a model that discovery filled in from a default, not the vendor.
+        let poll = |model: &str, guess: bool| {
+            vec![discovery::DiscoveredSessionSummary {
+                id: "claude:ada".to_string(),
+                source: "route".to_string(),
+                adapter: "claude".to_string(),
+                persona: Some("Ada".to_string()),
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model: Some(model.to_string()),
+                thinking_level: None,
+                available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
+                model_is_default: guess,
+            }]
+        };
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        // One bad poll names a default: the choice shows, and nothing is decided.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        assert!(
+            !serde_json::to_string(&shown)
+                .unwrap()
+                .contains("model_is_default")
+        );
+        // The real report records the baseline; the choice still shows.
+        let shown = state.with_model_overrides(poll("model-a", false));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        // Another bad poll leaves it alone as well.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        // A real report of something else supersedes the choice, as before.
+        let shown = state.with_model_overrides(poll("model-c", false));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+        assert!(state.session_model_override("ada").is_none());
+        // With no override a flagged model still shows.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("default-model"));
+    }
+
+    #[test]
+    fn a_muse_session_without_a_metadata_record_does_not_decide_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(tmp.path(), "mira", muse_route("ms-mira", None));
+        let transcript = tmp
+            .path()
+            .join(".local/share/muse/sessions/2026/10/27/ms-mira/session.jsonl");
+        let report = |model: &str| {
+            let line = json!({
+                "payload_type": "runtime.session.metadata",
+                "payload": { "record": { "model_id": model } },
+            });
+            fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            fs::write(&transcript, line.to_string()).unwrap();
+        };
+        let listed = || {
+            let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+            let sessions = listed.json_value().unwrap()["sessions"].clone();
+            let muse = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["adapter"] == "muse")
+                .expect("the muse session is listed")
+                .clone();
+            assert!(muse.get("model_is_default").is_none(), "{muse}");
+            muse
+        };
+
+        // No metadata record yet: Muse shows its default.
+        assert_eq!(listed()["model"], "muse-wonder-full-1.0");
+        let id = listed()["id"].as_str().unwrap().to_string();
+        set_model(&state, &id, "muse-spark-1.3");
+        // The default is no report: the choice shows and stays.
+        assert_eq!(listed()["model"], "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_some());
+
+        // A real report of another model is the baseline; the choice still shows. Had the default
+        // become the baseline, this report would differ from it and drop the override.
+        report("muse-wonder-1.0");
+        assert_eq!(listed()["model"], "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_some());
+        // A real report of something else supersedes the choice, as before.
+        report("muse-wonder-full-1.0");
+        assert_eq!(listed()["model"], "muse-wonder-full-1.0");
+        assert!(state.session_model_override(&id).is_none());
+    }
+
+    #[test]
+    fn the_claude_settings_model_is_never_a_live_report_for_any_operator_override() {
+        use fl_wire::identity::VendorRoute;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let project = tmp.path().join(".claude/projects/p");
+        fs::create_dir_all(&project).unwrap();
+        let settings = tmp.path().join(".claude/settings.json");
+        let set_mtime = |path: &std::path::Path, secs: u64| {
+            let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        // Each session's own transcript names the model it runs.
+        let write_transcript = |persona: &str, model: &str, secs: u64| {
+            let path = project.join(format!("cs-{persona}.jsonl"));
+            let line = json!({
+                "type": "assistant",
+                "message": { "role": "assistant", "model": model },
+            });
+            fs::write(&path, line.to_string()).unwrap();
+            set_mtime(&path, secs);
+        };
+        // ~/.claude/settings.json is one global file shared by every Claude session.
+        let write_settings = |body: Value, secs: u64| {
+            fs::write(&settings, body.to_string()).unwrap();
+            set_mtime(&settings, secs);
+        };
+        for persona in ["ada", "bea"] {
+            write_transcript(persona, "claude-opus-5-5", 1_000);
+            install_route(
+                tmp.path(),
+                persona,
+                VendorRoute::Claude {
+                    pid: 0,
+                    session_id: format!("cs-{persona}"),
+                    socket_path: tmp.path().join(format!("{persona}.sock")),
+                    key_path: None,
+                },
+            );
+        }
+        write_settings(json!({ "model": "claude-opus-4-1" }), 500);
+        let listed = |id: &str| {
+            let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+            let sessions = listed.json_value().unwrap()["sessions"].clone();
+            let session = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap_or_else(|| panic!("session {id} is listed"))
+                .clone();
+            assert!(session.get("model_is_default").is_none(), "{session}");
+            session
+        };
+        let assert_both_overrides_hold = |step: &str| {
+            let ada = listed("cs-ada");
+            assert_eq!(ada["model"], "claude-sonnet-5-5", "{step}");
+            assert_eq!(ada["thinking_level"], "low", "{step}");
+            let bea = listed("cs-bea");
+            assert_eq!(bea["model"], "claude-haiku-4-5", "{step}");
+            assert_eq!(bea["thinking_level"], "high", "{step}");
+            assert!(state.session_model_override("cs-ada").is_some(), "{step}");
+            assert!(state.session_model_override("cs-bea").is_some(), "{step}");
+        };
+
+        for (persona, model, effort) in [
+            ("ada", "claude-sonnet-5-5", "low"),
+            ("bea", "claude-haiku-4-5", "high"),
+        ] {
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{persona}/model"),
+                OWNER,
+                &json!({ "model": model, "thinking_level": effort }),
+            );
+            assert_eq!(resp.status, 200, "{persona}: {}", error_text(&resp));
+        }
+        // The transcripts are newer than settings.json: each session's own report is the
+        // baseline, and the choices show.
+        assert_both_overrides_hold("transcripts newer than settings.json");
+
+        // An unrelated settings write (the model is unchanged) makes settings.json newer than
+        // both transcripts. It says nothing about either session.
+        write_settings(
+            json!({
+                "model": "claude-opus-4-1",
+                "permissions": { "allow": ["Bash(ls)"] },
+            }),
+            2_000,
+        );
+        assert_both_overrides_hold("an unrelated settings.json key");
+        // A new `model` in settings.json (a `/model` switch in some other session or terminal)
+        // is the global default, not a report about these two sessions.
+        write_settings(json!({ "model": "claude-opus-4-0" }), 3_000);
+        assert_both_overrides_hold("a different settings.json model");
+        write_settings(
+            json!({ "model": "claude-opus-4-1", "effortLevel": "max" }),
+            4_000,
+        );
+        assert_both_overrides_hold("a different settings.json model and effort");
+
+        // One session's own transcript later names another model: that is a real report. Its
+        // override goes, and the other session keeps its choice.
+        write_transcript("ada", "claude-sonnet-4-5", 5_000);
+        let ada = listed("cs-ada");
+        assert_eq!(ada["model"], "claude-sonnet-4-5");
+        assert!(state.session_model_override("cs-ada").is_none());
+        let bea = listed("cs-bea");
+        assert_eq!(bea["model"], "claude-haiku-4-5");
+        assert_eq!(bea["thinking_level"], "high");
+        assert!(state.session_model_override("cs-bea").is_some());
     }
 
     #[test]
@@ -6949,6 +7202,85 @@ mod tests {
         let hosted = after.json_value().unwrap()["sessions"][0].clone();
         assert_eq!(hosted["session_id"], "claude:ada");
         assert_eq!(hosted["model"], "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn model_endpoint_stores_the_effort_suffixed_id_for_an_antigravity_hosted_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let hosted_model = |state: &HubState, session_id: &str| {
+            let list = call(state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+            list.json_value().unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["session_id"] == session_id)
+                .unwrap_or_else(|| panic!("no hosted session {session_id}"))["model"]
+                .clone()
+        };
+
+        let mut agy_body = spin_up_body("grace");
+        agy_body["vendor"] = json!("antigravity");
+        assert_eq!(spin_up(&state, &agy_body).status, 200);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5", "thinking_level": "high" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "antigravity");
+        assert_eq!(body["method"], "override-only");
+        assert_eq!(body["model"], "claude-sonnet-5-5");
+        assert_eq!(body["thinking_level"], "high");
+        assert_eq!(body["cli_model"], "claude-sonnet-5-5-high");
+        // The record holds the CLI id; the override stays as the operator chose it.
+        assert_eq!(
+            hosted_model(&state, "antigravity:grace"),
+            "claude-sonnet-5-5-high"
+        );
+        let held = state
+            .session_model_override("grace")
+            .or_else(|| state.session_model_override("antigravity:grace"))
+            .expect("override kept");
+        assert_eq!(held.model, "claude-sonnet-5-5");
+        assert_eq!(held.thinking_level.as_deref(), Some("high"));
+
+        // No effort given: `medium`.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/antigravity:grace/model",
+            OWNER,
+            &json!({ "model": "gpt-oss-120b" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(
+            resp.json_value().unwrap()["cli_model"],
+            "gpt-oss-120b-medium"
+        );
+        assert_eq!(
+            hosted_model(&state, "antigravity:grace"),
+            "gpt-oss-120b-medium"
+        );
+
+        // A Claude session: no `cli_model`, and the stored model is the raw one.
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/claude:ada/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5", "thinking_level": "high" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "claude");
+        assert!(body.get("cli_model").is_none(), "{body}");
+        assert_eq!(hosted_model(&state, "claude:ada"), "claude-sonnet-5-5");
     }
 
     #[test]
