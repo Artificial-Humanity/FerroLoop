@@ -233,7 +233,7 @@ fn a_refused_window_is_a_400_that_names_why_and_registers_nothing() {
         ),
         (
             spin_up_body("ada", "grok", Some("grok-unlisted"), Some(json!(256_000))),
-            "not available",
+            "is not in Grok's model list",
         ),
         (
             spin_up_body("ada", "grok", None, Some(json!(256_000))),

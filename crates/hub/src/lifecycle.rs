@@ -471,10 +471,14 @@ pub(crate) fn split_window_tag(id: &str) -> Option<(&str, &str)> {
     let open = id.rfind('[')?;
     let (base, tag) = id.split_at(open);
     let inner = tag.strip_prefix('[')?.strip_suffix(']')?;
-    let (digits, unit) = inner.split_at(inner.len().checked_sub(1)?);
-    let valid = matches!(unit, "k" | "m")
+    // Work on bytes: the last char of the tag may be multi-byte, so slicing the `str` at
+    // `len - 1` could land inside it. A valid tag is all ASCII, and any non-ASCII byte fails
+    // the checks below.
+    let bytes = inner.as_bytes();
+    let (&unit, digits) = bytes.split_last()?;
+    let valid = matches!(unit, b'k' | b'm')
         && (1..=4).contains(&digits.len())
-        && digits.bytes().all(|b| b.is_ascii_digit());
+        && digits.iter().all(u8::is_ascii_digit);
     valid.then_some((base, tag))
 }
 

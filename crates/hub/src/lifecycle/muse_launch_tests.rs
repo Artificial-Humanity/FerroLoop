@@ -381,12 +381,61 @@ fn plain_models_accept_one_window_tag_and_nothing_else_in_brackets() {
         "opus]1m[",
         "opus[1m",
         "opus1m]",
+        "a[1\u{e9}]",
+        "a[\u{e9}]",
+        "a[\u{20ac}]",
+        "a[1m\u{20ac}]",
+        "a[1m",
+        "a[]",
+        "a[1m]\u{e9}",
+        "\u{e9}[1m]",
     ] {
         assert_eq!(normalize_plain_model(Some(bad)), None, "{bad:?}");
     }
     // The 64 character limit applies to the id; the tag comes on top.
     assert!(normalize_plain_model(Some(&format!("{}[1m]", "a".repeat(64)))).is_some());
     assert!(normalize_plain_model(Some(&format!("{}[1m]", "a".repeat(65)))).is_none());
+}
+
+#[test]
+fn the_window_tag_parser_never_panics_on_multibyte_text() {
+    let samples = [
+        "\u{e9}",
+        "\u{20ac}",
+        "\u{1f600}",
+        "\u{0301}",
+        "\u{ff11}",
+        "\u{200b}",
+    ];
+    let skeleton = ["a", "[", "1", "m", "]"];
+    for sample in samples {
+        // The sample at every position of `a[1m]`, alone and next to the real characters.
+        for at in 0..=skeleton.len() {
+            let mut parts = skeleton.to_vec();
+            parts.insert(at, sample);
+            let id = parts.concat();
+            let _ = split_window_tag(&id);
+            assert_eq!(normalize_plain_model(Some(&id)), None, "{id:?}");
+            let mut parts = skeleton.to_vec();
+            parts[at.min(skeleton.len() - 1)] = sample;
+            let id = parts.concat();
+            let _ = split_window_tag(&id);
+            let _ = normalize_plain_model(Some(&id));
+        }
+    }
+    assert_eq!(split_window_tag("a[1m]"), Some(("a", "[1m]")));
+    for id in [
+        "a[1\u{e9}]",
+        "a[\u{e9}]",
+        "a[\u{20ac}]",
+        "a[1m\u{20ac}]",
+        "a[1m",
+        "a[]",
+        "[1m",
+    ] {
+        assert_eq!(split_window_tag(id), None, "{id:?}");
+    }
+    assert_eq!(split_window_tag("[1m]"), Some(("", "[1m]")));
 }
 
 #[test]

@@ -3285,15 +3285,38 @@ fn grok_catalog_windows(tpath: &Path, model_id: &str) -> Option<(Option<u64>, Ve
     grok_catalog_windows_in(grok_dir, model_id)
 }
 
-/// [`grok_catalog_windows`] for a known Grok data directory (`<home>/.grok`).
-pub(crate) fn grok_catalog_windows_in(
-    grok_dir: &Path,
-    model_id: &str,
-) -> Option<(Option<u64>, Vec<u64>)> {
+/// What Grok's `models_cache.json` says about one model id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GrokCatalogLookup {
+    /// The cache is missing, cannot be parsed, has no `models` table, or the model's entry has
+    /// no `info`.
+    Unreadable,
+    /// The cache was read and has no model with exactly this id.
+    Absent,
+    /// The model's own `context_window` and its sorted, de-duplicated `context_windows`.
+    Found {
+        window: Option<u64>,
+        offered: Vec<u64>,
+    },
+}
+
+/// Look `model_id` up in `<grok_dir>/models_cache.json`. The match is exact: case-sensitive, no
+/// alias.
+pub(crate) fn grok_catalog_lookup_in(grok_dir: &Path, model_id: &str) -> GrokCatalogLookup {
     #[cfg(test)]
     cost_counters::bump(&cost_counters::GROK_CATALOG_READS);
-    let cache = read_json_file(&grok_dir.join("models_cache.json"))?;
-    let info = cache.get("models")?.get(model_id)?.get("info")?;
+    let Some(cache) = read_json_file(&grok_dir.join("models_cache.json")) else {
+        return GrokCatalogLookup::Unreadable;
+    };
+    let Some(models) = cache.get("models") else {
+        return GrokCatalogLookup::Unreadable;
+    };
+    let Some(entry) = models.get(model_id) else {
+        return GrokCatalogLookup::Absent;
+    };
+    let Some(info) = entry.get("info") else {
+        return GrokCatalogLookup::Unreadable;
+    };
     let window = info
         .get("context_window")
         .and_then(Value::as_u64)
@@ -3303,7 +3326,21 @@ pub(crate) fn grok_catalog_windows_in(
         .and_then(Value::as_array)
         .map(|list| list.iter().filter_map(Value::as_u64).collect())
         .unwrap_or_default();
-    Some((window, normalized_windows(offered)))
+    GrokCatalogLookup::Found {
+        window,
+        offered: normalized_windows(offered),
+    }
+}
+
+/// [`grok_catalog_windows`] for a known Grok data directory (`<home>/.grok`).
+pub(crate) fn grok_catalog_windows_in(
+    grok_dir: &Path,
+    model_id: &str,
+) -> Option<(Option<u64>, Vec<u64>)> {
+    match grok_catalog_lookup_in(grok_dir, model_id) {
+        GrokCatalogLookup::Found { window, offered } => Some((window, offered)),
+        _ => None,
+    }
 }
 
 /// The Codex `models_cache.json` `context_window` of the model the rollout `raw` ran (its
@@ -11492,6 +11529,59 @@ mod tests {
             ],
         );
         assert!(fs::metadata(&path).unwrap().len() > CLAUDE_TRANSCRIPT_TAIL_BYTES);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (272_000, ContextWindowSource::Catalog)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_model_ignores_a_model_named_only_before_the_tail() {
+        let home = TempDir::new().unwrap();
+        fs::create_dir_all(home.path().join(".codex")).unwrap();
+        fs::write(
+            home.path().join(".codex/models_cache.json"),
+            codex_cache().to_string(),
+        )
+        .unwrap();
+        // `config.toml` names a model with no window.
+        fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = \"gpt-nowindow\"\n",
+        )
+        .unwrap();
+        // `gpt-x` (272000) is named only in the head, older than the tail; the tail names no
+        // model. Only the tail is read, so the model is the config's and the window is assumed.
+        // Scanning the whole text would find `gpt-x` and report 272000.
+        let padding = serde_json::json!({"type": "note", "payload": {"text": "é".repeat(300_000)}});
+        let path = codex_rollout(
+            home.path(),
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-x"}}),
+                padding,
+                codex_token_count(serde_json::json!({})),
+            ],
+        );
+        assert!(fs::metadata(&path).unwrap().len() > CLAUDE_TRANSCRIPT_TAIL_BYTES);
+        let usage = context_at(&path).unwrap();
+        assert_eq!(
+            (usage.max_tokens, usage.source),
+            (
+                fallback_context_window("codex"),
+                ContextWindowSource::Assumed
+            )
+        );
+        // The same rollout with the model inside the tail is found.
+        let path = codex_rollout(
+            home.path(),
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-nowindow"}}),
+                serde_json::json!({"type": "note", "payload": {"text": "é".repeat(300_000)}}),
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-x"}}),
+                codex_token_count(serde_json::json!({})),
+            ],
+        );
         let usage = context_at(&path).unwrap();
         assert_eq!(
             (usage.max_tokens, usage.source),

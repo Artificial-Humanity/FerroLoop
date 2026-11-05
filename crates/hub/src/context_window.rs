@@ -44,7 +44,14 @@ pub(crate) fn validate_default(vendor: &str, tokens: u64) -> Result<(), String> 
     }
 }
 
+/// Check `tokens` against the sizes Grok's cache lists for `model`. The model id is matched
+/// exactly (case-sensitive, no alias), as Phase 1's display does. The sizes on offer are the
+/// model's `context_windows` list together with the model's own `context_window` when present:
+/// a model with only `context_window` accepts exactly that size (choosing it changes nothing but
+/// is valid). A model that is absent from the cache and a cache that cannot be read are
+/// different refusals.
 fn grok_window(model: Option<&str>, tokens: u64, home: Option<&Path>) -> Result<u64, String> {
+    use crate::discovery::{GrokCatalogLookup, grok_catalog_lookup_in};
     let Some(model) = model else {
         return Err(
             "the offered sizes for grok's default model are not available: name a model"
@@ -53,8 +60,14 @@ fn grok_window(model: Option<&str>, tokens: u64, home: Option<&Path>) -> Result<
     };
     let unavailable = || format!("the offered sizes for {model} are not available");
     let grok_dir = grok_dir(home).ok_or_else(unavailable)?;
-    let (_, offered) =
-        crate::discovery::grok_catalog_windows_in(&grok_dir, model).ok_or_else(unavailable)?;
+    let (window, mut offered) = match grok_catalog_lookup_in(&grok_dir, model) {
+        GrokCatalogLookup::Unreadable => return Err(unavailable()),
+        GrokCatalogLookup::Absent => return Err(format!("{model} is not in Grok's model list")),
+        GrokCatalogLookup::Found { window, offered } => (window, offered),
+    };
+    offered.extend(window);
+    offered.sort_unstable();
+    offered.dedup();
     if offered.is_empty() {
         return Err(unavailable());
     }
@@ -78,8 +91,11 @@ fn grok_dir(home: Option<&Path>) -> Option<PathBuf> {
 /// Accept `tokens` as the context window of a `vendor` session running `model`, or refuse with
 /// a message that names the sizes on offer when they are known.
 ///
-/// * Grok: `tokens` must be in the model's `context_windows` in `<home>/.grok/models_cache.json`
-///   (`home` is the hub's `home_override`, else `$HOME`); a cache that cannot be read refuses.
+/// * Grok: `tokens` must be one of the model's sizes in `<home>/.grok/models_cache.json` (its
+///   `context_windows` plus its own `context_window`; `home` is the hub's `home_override`, else
+///   `$HOME`). The model id is matched exactly (case-sensitive, no alias), like Phase 1's
+///   `models.get(model_id)`. A model that is not in the cache and a cache that cannot be read
+///   are refused with different messages.
 /// * Any other vendor, Claude included (not verified yet): refused.
 pub(crate) fn validate_context_window(
     vendor: &str,
@@ -101,8 +117,8 @@ pub(crate) fn validate_context_window(
 }
 
 /// The hub-wide default for `vendor`, when it is valid for `model`; `None` otherwise. A stale
-/// default (a size the model no longer offers, an unreadable Grok cache) is ignored, never an
-/// error: a spin-up must not fail because of it.
+/// default (a size the model no longer offers, an unreadable Grok cache) is ignored silently,
+/// never an error and never logged: a spin-up must not fail because of it.
 pub(crate) fn applicable_default(
     defaults: &BTreeMap<String, u64>,
     vendor: &str,
@@ -110,15 +126,9 @@ pub(crate) fn applicable_default(
     home: Option<&Path>,
 ) -> Option<u64> {
     let tokens = *defaults.get(vendor)?;
-    match validate_context_window(vendor, model, tokens, home) {
-        Ok(valid) => Some(valid.tokens),
-        Err(why) => {
-            if std::env::var_os("FL_HUB_DEBUG").is_some() {
-                eprintln!("fl-hub: ignoring the {vendor} context window default {tokens}: {why}");
-            }
-            None
-        }
-    }
+    validate_context_window(vendor, model, tokens, home)
+        .ok()
+        .map(|valid| valid.tokens)
 }
 
 #[cfg(test)]
@@ -179,22 +189,58 @@ mod tests {
         let missing = grok_home(None);
         let unreadable = grok_home(None);
         std::fs::write(unreadable.path().join(".grok/models_cache.json"), "{ nope").unwrap();
-        let unlisted = grok_home(Some(cache()));
-        let no_list = grok_home(Some(cache()));
-        for (home, model) in [
-            (&missing, "grok-x"),
-            (&unreadable, "grok-x"),
-            (&unlisted, "grok-unlisted"),
-            (&no_list, "grok-none"),
-        ] {
+        let no_models = grok_home(Some(json!({"other": 1})));
+        let no_info = grok_home(Some(json!({"models": {"grok-x": {}}})));
+        let no_sizes = grok_home(Some(json!({"models": {"grok-x": {"info": {}}}})));
+        for home in [&missing, &unreadable, &no_models, &no_info, &no_sizes] {
             assert_eq!(
-                check("grok", Some(model), 256_000, home),
-                Err(format!("the offered sizes for {model} are not available"))
+                check("grok", Some("grok-x"), 256_000, home),
+                Err("the offered sizes for grok-x are not available".to_string())
             );
         }
         // Without a model there is no list to check against.
-        let err = check("grok", None, 256_000, &no_list).unwrap_err();
+        let ok = grok_home(Some(cache()));
+        let err = check("grok", None, 256_000, &ok).unwrap_err();
         assert!(err.contains("not available"), "{err}");
+    }
+
+    #[test]
+    fn grok_names_a_model_that_is_not_in_the_cache_and_matches_it_exactly() {
+        let home = grok_home(Some(cache()));
+        for model in ["grok-unlisted", "GROK-X", "grok-x "] {
+            let expect = if model.trim() == "grok-x" {
+                Ok(256_000)
+            } else {
+                Err(format!("{} is not in Grok's model list", model.trim()))
+            };
+            assert_eq!(
+                check("grok", Some(model), 256_000, &home).map(|v| v.tokens),
+                expect,
+                "{model:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_accepts_a_models_own_default_size_when_it_has_no_list() {
+        let home = grok_home(Some(cache()));
+        // `grok-none` has only `context_window`: that size is valid, nothing else is.
+        assert_eq!(
+            check("grok", Some("grok-none"), 256_000, &home),
+            Ok(ValidatedWindow {
+                tokens: 256_000,
+                launch_model: Some("grok-none".into())
+            })
+        );
+        let err = check("grok", Some("grok-none"), 500_000, &home).unwrap_err();
+        assert!(err.contains("it offers 256000"), "{err}");
+        // With a list, the own size joins it without a duplicate.
+        let own = grok_home(Some(
+            json!({"models": {"m": {"info": {"context_window": 128_000, "context_windows": [500_000, 256_000]}}}}),
+        ));
+        assert!(check("grok", Some("m"), 128_000, &own).is_ok());
+        let err = check("grok", Some("m"), 1, &own).unwrap_err();
+        assert!(err.contains("128000, 256000, 500000"), "{err}");
     }
 
     #[test]
@@ -238,6 +284,11 @@ mod tests {
         assert_eq!(get("grok", Some("grok-x")), Some(500_000));
         // The model does not offer it, or its list is unavailable.
         assert_eq!(get("grok", Some("grok-none")), None);
+        let own = BTreeMap::from([("grok".to_string(), 256_000)]);
+        assert_eq!(
+            applicable_default(&own, "grok", Some("grok-none"), Some(home.path())),
+            Some(256_000)
+        );
         assert_eq!(get("grok", None), None);
         assert_eq!(get("claude", Some("opus[1m]")), None);
         assert_eq!(get("codex", Some("m")), None);
