@@ -6140,7 +6140,12 @@ fn hosted_record_for(
 /// Owner only (403 for a Peer, checked before the body is read). The
 /// choice is kept in `HubState` and overlaid on `GET /api/v1/sessions` (in memory: gone after
 /// a hub restart), written to the hosted-session record when one exists, and sent to a live
-/// CLI as `/model <id>`. Antigravity is not sent anything: its method is `override-only`.
+/// CLI as `/model <id>`.
+///
+/// Antigravity is not sent anything. A running Antigravity session keeps its model: FerroDeck
+/// shows the choice, and the stored effort-suffixed id (`cli_model` in the response) applies
+/// when the session is next launched (restart or reforge). The response keeps `switched: true`
+/// and `method: override-only` for compatibility.
 fn handle_post_session_model(
     state: &HubState,
     authority: &HubAuthority,

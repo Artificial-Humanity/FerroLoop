@@ -49,13 +49,15 @@ impl ModelOverride {
     }
 
     /// Whether the live pair is the operator's choice: the model is equal ignoring ASCII case,
-    /// and so is the effort unless the choice has none, which any live effort satisfies.
+    /// and so is the effort unless the choice has none (any live effort satisfies it) or the
+    /// live effort is `None`. A live effort of `None` is "unknown", not a mismatch: Muse and
+    /// Claude without an effort signal never report one while the UI always sends one, so the
+    /// override stays and its effort is overlaid.
     fn matches_live(&self, live_model: &str, live_effort: Option<&str>) -> bool {
         live_model.eq_ignore_ascii_case(&self.model)
             && match (&self.thinking_level, live_effort) {
-                (None, _) => true,
+                (None, _) | (_, None) => true,
                 (Some(want), Some(have)) => want.eq_ignore_ascii_case(have),
-                (Some(_), None) => false,
             }
     }
 }
@@ -108,7 +110,9 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
 /// override matches in this call:
 /// - no live model anywhere: the override is left alone and overlaid;
 /// - no baseline yet: the live pair becomes the baseline; the override stays and is overlaid;
-/// - live equals the choice: the override is confirmed; it stays and is overlaid;
+/// - live equals the choice (the model equal ignoring case, and the effort equal ignoring case,
+///   or the choice has no effort, or the live effort is unknown): the override is confirmed; it
+///   stays and is overlaid, so the operator's effort shows even if the vendor reports none;
 /// - live differs from the choice and from the baseline: the vendor reports something newer, so
 ///   the override is removed and the live values show;
 /// - live equals the baseline and the override was confirmed: the vendor applied the choice and
@@ -570,6 +574,38 @@ mod tests {
             !map.contains_key("s"),
             "chosen/low differs from old/low and chosen/high"
         );
+    }
+
+    #[test]
+    fn a_live_model_without_an_effort_confirms_an_override_that_has_one() {
+        // Muse and Claude with no effort signal never report one, and the UI always sends one.
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        let got = apply_one(&mut map, Some("chosen"), None);
+        assert_eq!(
+            got,
+            pair("chosen", Some("high")),
+            "effort from the override"
+        );
+        assert!(map.contains_key("s"), "the override is kept");
+        assert!(map["s"].confirmed);
+        // And it stays on later reads of the same unknown effort.
+        assert_eq!(
+            apply_one(&mut map, Some("CHOSEN"), None),
+            pair("chosen", Some("high"))
+        );
+        assert!(map.contains_key("s"));
+        // A different reported effort is still not a match: chosen/low differs from the choice
+        // and from the old/None baseline, so the vendor reports something newer.
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), None);
+        apply_one(&mut map, Some("chosen"), Some("low"));
+        assert!(!map.contains_key("s"));
+        // A different model with no effort is not a match either.
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        apply_one(&mut map, Some("third"), None);
+        assert!(!map.contains_key("s"));
     }
 
     #[test]

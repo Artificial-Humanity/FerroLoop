@@ -1136,14 +1136,15 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
     })
 }
 
-/// Model of the newest step that names one in a `GetCascadeTrajectory` response
-/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`): a step's
-/// `metadata.generatorModel`, or the pending choice on a user-input step (complete JSON
-/// only). A body cut off by the size cap is not valid JSON; the last `"generatorModel"`
-/// string in the text that did arrive is used then, and `planModel` is not read.
+/// The model that RUNS in a `GetCascadeTrajectory` response (`trajectory.steps`) or a
+/// `GetCascadeTrajectorySteps` response (`steps`): see [`running_model_from_json`]. This is the
+/// tail-steps parser; it never reads a requested model (`planModel`), so a window that holds
+/// only user inputs names no model and the caller falls through to the full trajectory. A body
+/// cut off by the size cap is not valid JSON; the last `"generatorModel"` string in the text
+/// that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
-        return generator_model_from_json(&val);
+        return running_model_from_json(&val);
     }
     const KEY: &str = "\"generatorModel\"";
     let mut latest = None;
@@ -1161,37 +1162,64 @@ fn parse_agy_generator_model(body: &str) -> Option<String> {
     latest
 }
 
-/// Where a trajectory step says which model is in use, in order of precedence within one
-/// step: the model that answered it, then the model the user picked for the turn a
-/// `CORTEX_STEP_TYPE_USER_INPUT` step starts (`userConfig`, else `lastUserConfig`).
-const AGY_STEP_MODEL_POINTERS: [&str; 3] = [
-    "/metadata/generatorModel",
+/// The steps of a trajectory body: `steps` (a `GetCascadeTrajectorySteps` response), else
+/// `trajectory.steps` (a `GetCascadeTrajectory` response).
+fn agy_steps(val: &Value) -> Option<&Vec<Value>> {
+    val.pointer("/steps")
+        .or_else(|| val.pointer("/trajectory/steps"))
+        .and_then(Value::as_array)
+}
+
+/// Where a step says which model RAN it, in order of precedence on one step: the
+/// `generatorModel` of any planner or tool step, then the `modelUsage.model` that only a
+/// `PLANNER_RESPONSE` step carries (same placeholder form).
+const AGY_RUNNING_MODEL_POINTERS: [&str; 2] =
+    ["/metadata/generatorModel", "/metadata/modelUsage/model"];
+
+/// Where a `CORTEX_STEP_TYPE_USER_INPUT` step says which model the user REQUESTED for the turn
+/// it starts: `userConfig`, else `lastUserConfig`. The planner may keep another model (an input
+/// sent while a tool step runs, `metadata.isInterruptingStep`, is not applied to that turn).
+const AGY_REQUESTED_MODEL_POINTERS: [&str; 2] = [
     "/userInput/userConfig/plannerConfig/planModel",
     "/userInput/lastUserConfig/plannerConfig/planModel",
 ];
 
-/// The model of a complete trajectory body: the newest step that says anything about the
-/// model (see [`AGY_STEP_MODEL_POINTERS`]). A user-input step the planner has not answered yet
-/// gives the pending choice, which is the only signal a new conversation has; once a later
-/// step has a `generatorModel`, that wins. The value is a placeholder or an effort-suffixed id.
-fn generator_model_from_json(val: &Value) -> Option<String> {
-    val.pointer("/steps")
-        .or_else(|| val.pointer("/trajectory/steps"))
-        .and_then(Value::as_array)?
-        .iter()
-        .rev()
-        .find_map(|step| {
-            AGY_STEP_MODEL_POINTERS
-                .iter()
-                .find_map(|pointer| non_empty_str(step.pointer(pointer)))
-        })
+/// First non-blank string at any of `pointers` on the newest step that has one.
+fn newest_step_model(val: &Value, pointers: &[&str]) -> Option<String> {
+    agy_steps(val)?.iter().rev().find_map(|step| {
+        pointers
+            .iter()
+            .find_map(|pointer| non_empty_str(step.pointer(pointer)))
+    })
 }
 
-/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
-/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
-/// stale early model: a body that is not valid JSON names no model.
+/// The model that is running: the `generatorModel` of the latest step that has one, else that
+/// step's `modelUsage.model`. Newer steps that name no model do not hide an older one. The
+/// value is a placeholder (`MODEL_PLACEHOLDER_*`).
+fn running_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_RUNNING_MODEL_POINTERS)
+}
+
+/// The model the user REQUESTED, from the newest user-input step that names one. It is only a
+/// fallback for a conversation whose planner has not answered a turn yet; once any step
+/// reports a running model, that wins (see [`complete_trajectory_model_from_json`]).
+fn requested_model_from_json(val: &Value) -> Option<String> {
+    newest_step_model(val, &AGY_REQUESTED_MODEL_POINTERS)
+}
+
+/// The model of a complete trajectory: the running model, and only when no step has one (a
+/// conversation before its first turn) the requested model. The requested value is a
+/// placeholder or an effort-suffixed id.
+fn complete_trajectory_model_from_json(val: &Value) -> Option<String> {
+    running_model_from_json(val).or_else(|| requested_model_from_json(val))
+}
+
+/// [`parse_agy_generator_model`] for a body that must be complete, with the requested-model
+/// fallback. A `GetCascadeTrajectory` body cut off by the size cap holds the OLDEST steps, so
+/// its last `generatorModel` is a stale early model: a body that is not valid JSON names no
+/// model.
 fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
-    generator_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
+    complete_trajectory_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
@@ -1350,8 +1378,9 @@ fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
         .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
 }
 
-/// Latest generator model from `GetCascadeTrajectorySteps`, which returns only the newest
-/// steps. `None` when no tail offset is known, the call fails, or the steps name no model.
+/// Latest running model from `GetCascadeTrajectorySteps`, which returns only the newest
+/// steps. `None` when no tail offset is known, the call fails, or the steps name no running
+/// model (a window of user inputs only is `None`: the requested model is not read here).
 fn agy_tail_generator_model(
     port: u16,
     csrf: &str,
@@ -6267,8 +6296,26 @@ mod tests {
         ]
     }
 
-    /// Assert that every body shape yields `want`, through both the lenient and the
-    /// complete-body parser.
+    /// A planner or tool step with only a `modelUsage.model`, as a `PLANNER_RESPONSE` step can
+    /// carry it when `generatorModel` is absent.
+    fn model_usage_step(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+            "metadata": { "modelUsage": { "model": model } },
+        })
+    }
+
+    /// A tool step that ran under `model`: it has a `generatorModel` and no `modelUsage`.
+    fn tool_step_with_model(model: &str) -> Value {
+        serde_json::json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_RUNNING",
+            "metadata": { "generatorModel": model, "toolCall": { "name": "run_command" } },
+        })
+    }
+
+    /// Assert that a step list names the RUNNING model `want` through both the tail parser and
+    /// the complete-body parser, in both body shapes.
     fn assert_agy_steps_model(steps: &[Value], want: Option<&str>) {
         for body in agy_step_bodies(steps) {
             assert_eq!(parse_agy_generator_model(&body).as_deref(), want, "{body}");
@@ -6280,87 +6327,185 @@ mod tests {
         }
     }
 
+    /// Assert that a step list has no running model: the tail parser names none and the
+    /// complete-body parser falls back to the requested model `want`.
+    fn assert_agy_requested_model_only(steps: &[Value], want: Option<&str>) {
+        for body in agy_step_bodies(steps) {
+            assert_eq!(parse_agy_generator_model(&body), None, "{body}");
+            assert_eq!(
+                parse_agy_complete_generator_model(&body).as_deref(),
+                want,
+                "{body}"
+            );
+        }
+    }
+
     #[test]
-    fn agy_user_input_step_without_a_later_planner_step_gives_the_pending_model() {
-        assert_agy_steps_model(
-            &[user_input_step(Some("MODEL_PLACEHOLDER_M39"), None)],
-            Some("MODEL_PLACEHOLDER_M39"),
-        );
-        // Older conversation, then the user switched models and sent a message.
+    fn agy_a_newer_user_input_does_not_replace_the_running_model() {
+        let steps = [
+            user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
+            planner_step("MODEL_PLACEHOLDER_M418"),
+            tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+            user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+        ];
+        assert_agy_steps_model(&steps, Some("MODEL_PLACEHOLDER_M418"));
+        // An input sent while a tool step runs is flagged, and the planner keeps its model.
+        let mut interrupting = user_input_step(Some("MODEL_PLACEHOLDER_M401"), None);
+        interrupting["metadata"] = serde_json::json!({ "isInterruptingStep": true });
         assert_agy_steps_model(
             &[
-                user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
-                planner_step("MODEL_PLACEHOLDER_M26"),
-                tool_step(),
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M418"),
+                interrupting,
             ],
-            Some("MODEL_PLACEHOLDER_M39"),
+            Some("MODEL_PLACEHOLDER_M418"),
+        );
+        // A requested model on the step's own userInput never beats the step's generatorModel
+        // either, and a lastUserConfig is no different from a userConfig.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(None, Some("MODEL_PLACEHOLDER_M401")),
+            ],
+            Some("MODEL_PLACEHOLDER_M418"),
         );
     }
 
     #[test]
-    fn agy_user_input_step_prefers_user_config_then_last_user_config() {
-        // lastUserConfig is used when userConfig is absent.
+    fn agy_a_planner_step_after_a_user_input_shows_the_model_that_ran() {
         assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
+                planner_step("MODEL_PLACEHOLDER_M401"),
+            ],
+            Some("MODEL_PLACEHOLDER_M401"),
+        );
+        assert_agy_steps_model(
+            &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
+                planner_step("MODEL_PLACEHOLDER_M404"),
+            ],
+            Some("MODEL_PLACEHOLDER_M404"),
+        );
+    }
+
+    #[test]
+    fn agy_the_latest_step_with_a_running_model_wins_over_newer_silent_steps() {
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M404"),
+                planner_step("MODEL_PLACEHOLDER_M405"),
+                tool_step(),
+                serde_json::json!({ "type": "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE" }),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // A tool step with a generatorModel and no modelUsage counts.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M404"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M405"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M405"),
+        );
+        // A user input, however new, hides nothing.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M404"),
+                tool_step(),
+                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M404"),
+        );
+    }
+
+    #[test]
+    fn agy_model_usage_names_the_running_model_when_generator_model_is_absent() {
+        assert_agy_steps_model(
+            &[model_usage_step("MODEL_PLACEHOLDER_M420")],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // A newer step with only modelUsage beats an older generatorModel.
+        assert_agy_steps_model(
+            &[
+                planner_step("MODEL_PLACEHOLDER_M418"),
+                model_usage_step("MODEL_PLACEHOLDER_M420"),
+                tool_step(),
+            ],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+        // generatorModel is preferred when both are present on one step.
+        let both = serde_json::json!({
+            "metadata": {
+                "generatorModel": "MODEL_PLACEHOLDER_M418",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(&[both], Some("MODEL_PLACEHOLDER_M418"));
+        // A blank generatorModel falls back to the same step's modelUsage.
+        let blank = serde_json::json!({
+            "metadata": {
+                "generatorModel": "  ",
+                "modelUsage": { "model": "MODEL_PLACEHOLDER_M420" },
+            },
+        });
+        assert_agy_steps_model(
+            &[planner_step("MODEL_PLACEHOLDER_M418"), blank],
+            Some("MODEL_PLACEHOLDER_M420"),
+        );
+    }
+
+    #[test]
+    fn agy_before_the_first_turn_the_requested_model_is_the_only_signal() {
+        // Only user inputs: the tail parser names nothing, the complete parser reads planModel.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some("MODEL_PLACEHOLDER_M39"), None)],
+            Some("MODEL_PLACEHOLDER_M39"),
+        );
+        // lastUserConfig is used when userConfig is absent, empty or blank on the step.
+        assert_agy_requested_model_only(
             &[user_input_step(None, Some("MODEL_PLACEHOLDER_M26"))],
             Some("MODEL_PLACEHOLDER_M26"),
         );
-        // ... and when userConfig is empty or blank on the same step.
         for blank in ["", "   "] {
-            assert_agy_steps_model(
+            assert_agy_requested_model_only(
                 &[user_input_step(Some(blank), Some("claude-sonnet-5-5-high"))],
                 Some("claude-sonnet-5-5-high"),
             );
         }
         // userConfig wins over lastUserConfig on one step.
-        assert_agy_steps_model(
+        assert_agy_requested_model_only(
             &[user_input_step(
                 Some("MODEL_PLACEHOLDER_M39"),
                 Some("MODEL_PLACEHOLDER_M26"),
             )],
             Some("MODEL_PLACEHOLDER_M39"),
         );
-        // generatorModel wins over userInput within one step.
-        let mut step = user_input_step(Some("MODEL_PLACEHOLDER_M39"), None);
-        step["metadata"] = serde_json::json!({ "generatorModel": "MODEL_PLACEHOLDER_M404" });
-        assert_agy_steps_model(&[step], Some("MODEL_PLACEHOLDER_M404"));
-    }
-
-    #[test]
-    fn agy_the_newest_step_with_a_model_signal_wins() {
-        // A later planner step beats an earlier user input.
-        assert_agy_steps_model(
+        // The newest user-input step comes first, and steps with no model do not hide it.
+        assert_agy_requested_model_only(
             &[
+                user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
                 user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
-                planner_step("MODEL_PLACEHOLDER_M404"),
-            ],
-            Some("MODEL_PLACEHOLDER_M404"),
-        );
-        // A later user input beats an earlier planner step.
-        assert_agy_steps_model(
-            &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
-            ],
-            Some("MODEL_PLACEHOLDER_M39"),
-        );
-        // Newer steps that say nothing about the model do not hide an older signal.
-        assert_agy_steps_model(
-            &[
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
-                tool_step(),
-                serde_json::json!({ "type": "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE" }),
                 tool_step(),
             ],
             Some("MODEL_PLACEHOLDER_M39"),
         );
-        assert_agy_steps_model(
+        // A newest step with only blank requests falls back to an older step's request.
+        assert_agy_requested_model_only(
             &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
-                tool_step(),
-                tool_step(),
+                user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
+                user_input_step(Some("  "), Some("")),
             ],
-            Some("MODEL_PLACEHOLDER_M404"),
+            Some("MODEL_PLACEHOLDER_M26"),
+        );
+        // The value is trimmed.
+        assert_agy_requested_model_only(
+            &[user_input_step(Some(" gpt-oss-120b-medium "), None)],
+            Some("gpt-oss-120b-medium"),
         );
     }
 
@@ -6373,6 +6518,8 @@ mod tests {
         assert_agy_steps_model(
             &[
                 serde_json::json!({ "metadata": { "generatorModel": "  " } }),
+                serde_json::json!({ "metadata": { "modelUsage": { "model": " " } } }),
+                serde_json::json!({ "metadata": { "generatorModel": 7 } }),
                 serde_json::json!({
                     "userInput": { "userConfig": { "plannerConfig": { "planModel": 7 } } }
                 }),
@@ -6384,14 +6531,10 @@ mod tests {
         assert_agy_steps_model(
             &[
                 planner_step("MODEL_PLACEHOLDER_M404"),
+                serde_json::json!({ "metadata": { "generatorModel": "" } }),
                 user_input_step(Some("  "), Some("")),
             ],
             Some("MODEL_PLACEHOLDER_M404"),
-        );
-        // The value is trimmed.
-        assert_agy_steps_model(
-            &[user_input_step(Some(" gpt-oss-120b-medium "), None)],
-            Some("gpt-oss-120b-medium"),
         );
         // No steps array at all.
         assert_eq!(parse_agy_generator_model(r#"{"trajectory":{}}"#), None);
@@ -6403,7 +6546,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_cut_off_bodies_ignore_the_pending_plan_model() {
+    fn agy_cut_off_bodies_ignore_the_requested_plan_model() {
         // The string scan is for the tail-steps call; it never reads planModel.
         let cut = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}}},{"metadata":{"generatorMo"#;
         assert_eq!(parse_agy_generator_model(cut), None);
@@ -6417,7 +6560,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_pending_plan_model_from_a_step_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
+    fn agy_requested_plan_model_from_a_step_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
         let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
         for (value, model, level) in [
             ("MODEL_PLACEHOLDER_M26", "gemini-4-argon", Some("high")),
@@ -6426,7 +6569,7 @@ mod tests {
             ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
         ] {
             let [body, _] = agy_step_bodies(&[user_input_step(Some(value), None)]);
-            let found = parse_agy_generator_model(&body);
+            let found = parse_agy_complete_generator_model(&body);
             assert_eq!(found.as_deref(), Some(value));
             let info = resolve_agy_model_info(&config, found.as_deref());
             assert_eq!(info.model.as_deref(), Some(model), "{value}");
@@ -6869,36 +7012,60 @@ mod tests {
     }
 
     #[test]
-    fn agy_live_model_reads_a_pending_user_input_step_from_the_tail_and_the_full_trajectory() {
+    fn agy_live_model_reads_the_running_model_and_falls_back_to_the_requested_one_only_in_full() {
         fn leak(body: &str) -> &'static str {
             Box::leak(body.to_string().into_boxed_str())
         }
         let tmp = TempDir::new().unwrap();
         let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
         let pending = user_input_step(Some("MODEL_PLACEHOLDER_M39"), None);
-        let answered = [
-            pending.clone(),
-            planner_step("MODEL_PLACEHOLDER_M404"),
-            tool_step(),
-        ];
-        // (cascade, steps the language server returns, model, effort)
-        let cases: [(&'static str, Vec<Value>, &str, &str); 2] = [
+        // (case, steps the tail call returns, steps the full trajectory holds, model, effort,
+        //  whether the full trajectory is asked)
+        let cases = [
+            // The tail window holds a planner step before the user input: the tail decides.
             (
-                "pending",
-                vec![tool_step(), pending],
+                "tail-running",
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M404"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                vec![planner_step("MODEL_PLACEHOLDER_M26")],
+                "claude-opus-5-5",
+                "low",
+                false,
+            ),
+            // The tail window holds only a user input: no running model, so the full
+            // trajectory is asked and its planner steps name the model that runs.
+            (
+                "tail-user-input-only",
+                vec![tool_step(), pending.clone()],
+                vec![
+                    planner_step("MODEL_PLACEHOLDER_M404"),
+                    tool_step(),
+                    pending.clone(),
+                ],
+                "claude-opus-5-5",
+                "low",
+                true,
+            ),
+            // First turn: no step anywhere has a running model, so the requested one shows.
+            (
+                "first-turn",
+                vec![tool_step(), pending.clone()],
+                vec![pending],
                 "claude-sonnet-5-5",
                 "high",
+                true,
             ),
-            ("answered", answered.to_vec(), "claude-opus-5-5", "low"),
         ];
-        for (name, steps, model, effort) in cases {
-            let [full, tail] = agy_step_bodies(&steps);
-            // Tail case: the steps call answers and the full trajectory is never asked.
-            let cascade: &'static str = leak(&format!("agy-pend-tail-{name}"));
+        for (name, tail_steps, full_steps, model, effort, asks_full) in cases {
+            let [_, tail] = agy_step_bodies(&tail_steps);
+            let [full, _] = agy_step_bodies(&full_steps);
+            let cascade: &'static str = leak(&format!("agy-live-{name}"));
             let stub = spawn_agy_stub_with_steps(
                 AGY_PENDING_CONFIG_FIXTURE,
-                // The full trajectory names another model; it must not be asked.
-                r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M26"}}]}}"#,
+                leak(&full),
                 cascade,
                 Some((200, leak(&tail))),
             );
@@ -6912,40 +7079,11 @@ mod tests {
             );
             assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
             assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
-            assert_eq!(
-                stub_paths(&stub),
-                ["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"],
-                "{cascade}"
-            );
-            stub.shutdown();
-
-            // Full case: the tail call names nothing, so the full trajectory decides.
-            let cascade: &'static str = leak(&format!("agy-pend-full-{name}"));
-            let stub = spawn_agy_stub_with_steps(
-                AGY_PENDING_CONFIG_FIXTURE,
-                leak(&full),
-                cascade,
-                Some((200, r#"{"steps":[]}"#)),
-            );
-            let addr = format!("127.0.0.1:{}", stub.port);
-            let info = agy_live_model_info_for_transcript(
-                Some(&addr),
-                Some("stub-csrf"),
-                cascade,
-                Some(&transcript),
-                false,
-            );
-            assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
-            assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
-            assert_eq!(
-                stub_paths(&stub),
-                [
-                    "GetCascadeModelConfigData",
-                    "GetCascadeTrajectorySteps",
-                    "GetCascadeTrajectory"
-                ],
-                "{cascade}"
-            );
+            let mut want = vec!["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"];
+            if asks_full {
+                want.push("GetCascadeTrajectory");
+            }
+            assert_eq!(stub_paths(&stub), want, "{cascade}");
             stub.shutdown();
         }
     }
