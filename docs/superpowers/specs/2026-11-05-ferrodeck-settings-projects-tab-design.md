@@ -11,9 +11,11 @@ hard-coded canonical list, and a new project needs the CLI. Feira builds the bac
 
 Feira builds the endpoints on `feira/project-init-and-workspace-agents-310`. This is the contract
 the Lead shared on 2026-11-05. It is isolated in `ui/src/types/api.ts` and `HubApiClient`, so a
-change touches only those two files and the tab. **Verified against Feira's branch
-`feira/project-init-and-workspace-agents-310` at f1a7fb1 (2026-11-05); re-check once it is
-merged.**
+change touches only those two files and the tab. **Verified against Feira's handlers: first on
+the branch `feira/project-init-and-workspace-agents-310` at f1a7fb1, then against the merged
+`main` at 0b42850 (2026-11-05). The request and response types (`CreateProjectBody`,
+`UpdateProjectBody`, `DeleteRequest`, `DeleteOutcome`, the 409 body, `ProjectSummary`) did not
+change between the two; only a delete failure message and delete internals did.**
 
 ```ts
 type ProjectKind = "project" | "virtual";
