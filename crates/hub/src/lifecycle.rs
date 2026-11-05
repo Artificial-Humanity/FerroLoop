@@ -537,14 +537,19 @@ pub(crate) fn launch_env(persona: &str, home: Option<&Path>) -> Vec<(String, Str
 fn path_with_local_bin(home: Option<&Path>) -> Option<String> {
     let local = home?.join(".local").join("bin");
     let current = std::env::var("PATH").unwrap_or_default();
-    if std::env::split_paths(&current).any(|entry| entry == local) {
-        return Some(current);
+    Some(with_local_bin(&local, &current))
+}
+
+/// `path` unchanged when `local` is already a component; otherwise `local` first.
+fn with_local_bin(local: &Path, path: &str) -> String {
+    if std::env::split_paths(path).any(|entry| entry == local) {
+        return path.to_string();
     }
     let local = local.to_string_lossy();
-    if current.is_empty() {
-        Some(local.into_owned())
+    if path.is_empty() {
+        local.into_owned()
     } else {
-        Some(format!("{local}:{current}"))
+        format!("{local}:{path}")
     }
 }
 
@@ -4229,6 +4234,41 @@ mod tests {
     }
 
     #[test]
+    fn teardown_retires_a_persona_whose_only_sibling_is_decommissioning() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let mut other = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        other.session_id = "codex:felicity".into();
+        other.vendor = "codex".into();
+        other.tmux_target = Some("Felicity:codex".into());
+        // `decommissioning` is live to `is_live_hosted`, but it must not block retire.
+        other.status = STATUS_DECOMMISSIONING.into();
+        persist_hosted_session(&store, &other, "owner").unwrap();
+
+        let claude = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
+        teardown_session(&store, &env, &claude, "owner", Caller::Owner, |_| {}).unwrap();
+        let rec = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, STATUS_DECOMMISSIONED);
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
     fn launch_path_prepends_the_user_local_bin_once() {
         let home = TempDir::new().unwrap();
         let spec =
@@ -4240,9 +4280,20 @@ mod tests {
             .map(|(_, value)| value.as_str())
             .unwrap();
         let local = home.path().join(".local/bin");
-        assert!(path.starts_with(&local.display().to_string()), "{path}");
-        let again = path_with_local_bin(Some(home.path())).unwrap();
-        assert_eq!(again.matches(&*local.display().to_string()).count(), 1);
+        let local_bin = local.to_string_lossy();
+        assert!(path.starts_with(local_bin.as_ref()), "{path}");
+        let components = |value: &str| {
+            std::env::split_paths(value)
+                .filter(|entry| entry == &local)
+                .count()
+        };
+        assert_eq!(components(path), 1, "{path}");
+        // Process PATH is shared with other hub tests. A string that already
+        // contains this directory once must come back unchanged.
+        let seeded = format!("{local_bin}:/usr/bin");
+        let again = with_local_bin(&local, &seeded);
+        assert_eq!(again, seeded);
+        assert_eq!(components(&again), 1, "{again}");
     }
 
     #[test]
