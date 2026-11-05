@@ -15,6 +15,7 @@ import {
   formatModelOptionLabel,
   contextWindowSourceTitle,
   formatContextMax,
+  contextAtCompactThreshold,
   formatTokenCount,
   getVendorModelOptions,
   inferVendorFromModel,
@@ -1134,6 +1135,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     aria-valuemin={0}
                     aria-valuemax={100}
                     aria-valuenow={contextEstimate.percent}
+                    aria-valuetext={`${contextEstimate.percent}%${
+                      contextEstimate.source === "assumed"
+                        ? " against an assumed window"
+                        : contextEstimate.source === "reported" ||
+                            contextEstimate.source === "catalog"
+                          ? ` of a ${contextEstimate.source} window`
+                          : ""
+                    }`}
                     style={{
                       width: "100%",
                       height: "8px",
@@ -1172,6 +1181,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                           <span
                             data-testid={`context-offered-${size}`}
                             data-effective={effective ? "true" : undefined}
+                            aria-current={effective ? "true" : undefined}
                             style={
                               effective
                                 ? { fontWeight: 700, color: "var(--text-primary)" }
@@ -2294,10 +2304,10 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               data-testid="compact-context-btn"
               disabled={!canCompact}
               title={
-                contextEstimate.percent !== null && contextEstimate.percent >= 50
-                  ? "Snapshot a FerroState checkpoint, then send /compact to the session"
-                  : contextEstimate.percent === null
-                    ? "Available when the hub reports the context window and it reaches 50%"
+                contextEstimate.percent === null
+                  ? "Context window unknown \u2014 compact anyway"
+                  : contextAtCompactThreshold(contextEstimate)
+                    ? "Snapshot a FerroState checkpoint, then send /compact to the session"
                     : "Available when context reaches 50%"
               }
               onClick={onCompactContext}

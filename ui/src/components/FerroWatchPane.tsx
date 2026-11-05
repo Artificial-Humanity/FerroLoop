@@ -2421,7 +2421,10 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                     sessions.find((sess) => sess.id === hosted?.session_id)
                       ?.context_usage ??
                     sessions.find(
-                      (sess) => (sess.persona || sess.id).trim().toLowerCase() === key,
+                      (sess) =>
+                        (sess.persona || sess.id).trim().toLowerCase() === key &&
+                        (sess.adapter ?? "").trim().toLowerCase() ===
+                          (item.adapter ?? "").trim().toLowerCase(),
                     )?.context_usage ??
                     null;
 

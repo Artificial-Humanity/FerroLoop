@@ -1494,7 +1494,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   {contextPct === null
                                     ? contextEstimate.usedTokens === null
                                       ? "n/a"
-                                      : `~${formatTokenCount(contextEstimate.usedTokens)}`
+                                      : `~${formatTokenCount(contextEstimate.usedTokens)} tok`
                                     : `${contextAssumed ? "~" : ""}${contextPct}%`}
                                 </span>
                               </span>

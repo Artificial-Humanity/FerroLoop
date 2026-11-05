@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { sameContextUsage } from "../App";
@@ -6,7 +6,11 @@ import {
   AgentSettingsModal,
   type AgentSettingsModalProps,
 } from "../components/AgentSettingsModal";
-import { ChatPane, estimateSessionContextUsage } from "../components/ChatPane";
+import {
+  ChatPane,
+  estimateSessionContextUsage,
+  formatTokenCount,
+} from "../components/ChatPane";
 import { FerroWatchPane } from "../components/FerroWatchPane";
 import { RosterSidebar } from "../components/RosterSidebar";
 import { HubApiClient } from "../api/client";
@@ -114,6 +118,13 @@ describe("Agent Settings context meter", () => {
       "data-effective",
       "true",
     );
+    expect(within(offered).getByTestId("context-offered-500000")).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    expect(within(offered).getByTestId("context-offered-256000")).not.toHaveAttribute(
+      "aria-current",
+    );
     expect(within(offered).getByTestId("context-offered-256000")).not.toHaveAttribute(
       "data-effective",
     );
@@ -182,7 +193,8 @@ describe("no hard-coded vendor maximum", () => {
       expect(meter).not.toHaveTextContent(/%|\/|\d+(\.\d)?m\b|500k|200k|256k/);
       expect(screen.queryByTestId("context-max")).toBeNull();
       expect(screen.queryByRole("progressbar")).toBeNull();
-      expect(screen.getByTestId("compact-context-btn")).toBeDisabled();
+      // An unknown window does not disable Compact (see "Compact with an unknown window").
+      expect(screen.getByTestId("compact-context-btn")).not.toBeDisabled();
     },
   );
 
@@ -389,5 +401,212 @@ describe("FerroWatch context cell", () => {
     expect(screen.getByTestId("watch-liveness-context-wendy")).toHaveTextContent(
       "Context: not reported",
     );
+  });
+});
+
+describe("formatTokenCount", () => {
+  it.each([
+    [0, "0"],
+    [999, "999"],
+    [1_000, "1k"],
+    [1_234, "1.23k"],
+    [1_500, "1.5k"],
+    [200_000, "200k"],
+    [256_000, "256k"],
+    [272_000, "272k"],
+    [500_000, "500k"],
+    [828_400, "828.4k"],
+    [999_999, "1m"],
+    [1_000_000, "1m"],
+    [1_007_997, "1.01m"],
+    [1_500_000, "1.5m"],
+    [2_000_000, "2m"],
+  ])("formats %i as %s", (value, text) => {
+    expect(formatTokenCount(value)).toBe(text);
+  });
+});
+
+describe("Context meter accessibility", () => {
+  it.each([
+    ["assumed", /50%.*against an assumed window/],
+    ["reported", /50%.*reported/],
+    ["catalog", /50%.*catalog/],
+  ] as const)("gives the %s progressbar an aria-valuetext", (source, pattern) => {
+    render(
+      <AgentSettingsModal {...modalProps({ used_tokens: 500, max_tokens: 1_000, source })} />,
+    );
+    expect(screen.getByRole("progressbar")).toHaveAttribute(
+      "aria-valuetext",
+      expect.stringMatching(pattern),
+    );
+  });
+
+  it("names no source in aria-valuetext when an older hub omits it", () => {
+    render(<AgentSettingsModal {...modalProps({ used_tokens: 500, max_tokens: 1_000 })} />);
+    const text = screen.getByRole("progressbar").getAttribute("aria-valuetext") ?? "";
+    expect(text).toMatch(/50%/);
+    expect(text).not.toMatch(/assumed|reported|catalog/);
+  });
+});
+
+describe("Compact with an unknown window", () => {
+  const turns = [
+    {
+      index: 0,
+      role: "user" as const,
+      content: "Hello",
+      thinking: null,
+      tool_calls: [],
+      created_at: null,
+    },
+  ];
+
+  function renderPane(
+    usage: SessionContextUsage | null,
+    onSendPrompt: () => Promise<void> = async () => undefined,
+  ) {
+    return render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="claude"
+        sessionId="sess-1"
+        turns={turns}
+        contextUsage={usage}
+        agentSettingsOpen={true}
+        onSendPrompt={onSendPrompt}
+      />,
+    );
+  }
+
+  it("is enabled with no context_usage and says the window is unknown", () => {
+    renderPane(null);
+    const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
+    expect(btn).not.toBeDisabled();
+    expect(btn.title).toBe("Context window unknown \u2014 compact anyway");
+  });
+
+  it("is enabled when the server window is 0 (no window named)", () => {
+    renderPane({ used_tokens: 10, max_tokens: 0 });
+    expect(screen.getByTestId("compact-context-btn")).not.toBeDisabled();
+  });
+
+  it("enables at exactly 500k of an assumed 1,000,000 window and not at 499,999", () => {
+    const { unmount } = renderPane({
+      used_tokens: 499_999,
+      max_tokens: 1_000_000,
+      source: "assumed",
+    });
+    const low = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
+    expect(low).toBeDisabled();
+    expect(low.title).toBe("Available when context reaches 50%");
+    unmount();
+    renderPane({ used_tokens: 500_000, max_tokens: 1_000_000, source: "assumed" });
+    expect(screen.getByTestId("compact-context-btn")).not.toBeDisabled();
+  });
+
+  it("stays disabled below 50% of a reported window", () => {
+    renderPane({ used_tokens: 40_000, max_tokens: 200_000, source: "reported" });
+    const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
+    expect(btn).toBeDisabled();
+    expect(btn.title).toBe("Available when context reaches 50%");
+  });
+
+  it("is disabled while a compaction is in flight, even with no window", async () => {
+    const onSendPrompt = vi.fn(() => new Promise<void>(() => undefined));
+    renderPane(null, onSendPrompt);
+    fireEvent.click(screen.getByTestId("compact-context-btn"));
+    await waitFor(() => expect(onSendPrompt).toHaveBeenCalled());
+    const btn = screen.getByTestId("compact-context-btn");
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveTextContent("Compacting...");
+  });
+});
+
+describe("Roster ring with a transcript estimate", () => {
+  it("reads '~Nk tok' where a percent normally sits", () => {
+    const text = "x".repeat(4 * 12_000);
+    render(
+      <RosterSidebar
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        routes={[{ id: "s1", source: "route", adapter: "claude", persona: "ferris", status: "active" }]}
+        liveness={[]}
+        unreadByAgent={{}}
+        contextUsageByAgent={{}}
+        transcriptsByAgent={{
+          ferris: [
+            { index: 0, role: "user", content: text, thinking: null, tool_calls: [], created_at: null },
+          ],
+        }}
+        selectedAgentName="ferris"
+        onSelectAgent={vi.fn()}
+      />,
+    );
+    const ring = screen.getByTestId("context-ring-ferris");
+    expect(ring).toHaveTextContent(/^~\d+(\.\d+)?k tok$/);
+    expect(ring).not.toHaveAttribute("data-percent");
+  });
+});
+
+describe("FerroWatch persona fallback across vendors", () => {
+  it("does not show another vendor's usage for a shared persona", async () => {
+    const nowMs = Date.now();
+    const item = (agent: string, adapter: string) => ({
+      agent,
+      project: "FerroLoop",
+      adapter,
+      active: true,
+      liveness: "live",
+      verdict: { state: "alive" },
+      heartbeat_at_ms: nowMs,
+      heartbeat_age_ms: 0,
+      node: "local",
+      hosted_session: null,
+    });
+    const summary = {
+      telemetry: null,
+      health: {
+        thresholds: { stale_after_ms: 60_000, dead_after_ms: 300_000 },
+        hosted_sessions: 0,
+        hosted_sessions_undecodable: 0,
+        heartbeats_undecodable: 0,
+        agents: [item("ferris", "codex")],
+      },
+      quotas: [],
+    } as unknown as WatchSummaryResponse;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={apiClient}
+        sessions={[
+          {
+            id: "claude:ferris",
+            source: "route",
+            adapter: "claude",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 120_000, max_tokens: 1_000_000, source: "assumed" },
+          },
+          {
+            id: "codex:ferris",
+            source: "route",
+            adapter: "Codex",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 5_000, max_tokens: 272_000, source: "catalog" },
+          },
+        ]}
+      />,
+    );
+    const cell = await screen.findByTestId("watch-liveness-context-ferris");
+    expect(cell).toHaveTextContent(/^Context: 5k \/ 272k$/);
   });
 });

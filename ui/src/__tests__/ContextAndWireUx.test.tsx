@@ -242,6 +242,7 @@ describe("Compact Context button", () => {
         adapter="claude"
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "Hello" })]}
+        contextUsage={{ used_tokens: 40_000, max_tokens: 200_000, source: "reported" }}
         agentSettingsOpen={true}
         onSendPrompt={vi.fn()}
       />,

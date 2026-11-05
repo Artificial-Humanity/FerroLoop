@@ -787,14 +787,32 @@ export function estimateSessionContextUsage(
   return { ...none, usedTokens, estimated: true };
 }
 
+/**
+ * Compact token count: up to two decimals, trailing zeros trimmed ("1m", "256k", "828.4k",
+ * "1.01m"). Two decimals keep 1,007,997 ("1.01m") apart from 1,000,000 ("1m").
+ */
 export function formatTokenCount(value: number): string {
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
-  }
+  const trim = (n: number) => n.toFixed(2).replace(/\.?0+$/, "");
   if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+    const thousands = Number(trim(value / 1_000));
+    if (thousands < 1_000) {
+      return `${trim(value / 1_000)}k`;
+    }
+    return `${trim(value / 1_000_000)}m`;
   }
   return String(value);
+}
+
+/**
+ * True when the window is known and at least half used. Compares tokens, not the rounded percent,
+ * so 499,999 of 1,000,000 stays below the threshold.
+ */
+export function contextAtCompactThreshold(estimate: EstimatedContextUsage): boolean {
+  return (
+    estimate.maxTokens !== null &&
+    estimate.maxTokens > 0 &&
+    (estimate.usedTokens ?? 0) * 2 >= estimate.maxTokens
+  );
 }
 
 /** Tooltip for a context window's source; an unknown source (older hub) makes no claim. */
@@ -1356,9 +1374,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         (effectiveQuotaUsage.primary_window?.used_percent ?? 0) >= 100 ||
         (effectiveQuotaUsage.secondary_window?.used_percent ?? 0) >= 100),
   );
+  // With no known window there is no percent to compare, so the 50% rule does not gate Compact.
   const canCompact =
-    contextEstimate.percent !== null &&
-    contextEstimate.percent >= 50 &&
+    (contextEstimate.percent === null || contextAtCompactThreshold(contextEstimate)) &&
     Boolean(targetSessionOrAgent) &&
     !compacting &&
     !clearing &&
