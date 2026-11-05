@@ -47,7 +47,15 @@ Claude without an effort signal never report an effort and the UI always sends o
 this rule the override would be dropped the moment the vendor applied the model and the
 operator's chosen effort would disappear. A different reported effort is still not a match.
 
-A session with no live model leaves the override alone. Override keys by persona are matched as
+A session with no live model leaves the override alone. A model that discovery took from a
+default, not from the session itself, is no live model either: when the Antigravity trajectory
+names no usable model (the call timed out or failed, the body was too large, the negative cache
+answered, or the placeholder is unknown), `resolve_agy_model_info` falls back to the config's
+default model so the display still shows one. That model is marked `model_is_default` (carried
+from the model info onto `DiscoveredSessionSummary`), and the apply step treats such a session
+exactly like one with no model: no baseline, no confirmation, no drop, the override overlaid
+unchanged. Without an override the default still shows. The marker is `#[serde(skip)]`: it never
+appears in a JSON response and a payload cannot set it. Override keys by persona are matched as
 today. The override is also dropped by the existing clear/reforge/spin-up/teardown paths.
 
 **Known limit:** a change made out-of-band *back to the baseline* before the vendor ever

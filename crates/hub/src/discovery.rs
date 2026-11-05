@@ -96,6 +96,11 @@ pub struct DiscoveredSessionSummary {
     /// states one. Set only by the model-info pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<String>,
+    /// True when `model` is a best guess (Antigravity's configured default, used because the
+    /// session's own trajectory named no usable model), not the model this session reported.
+    /// The model override step ignores such a model as a live report. Never serialized.
+    #[serde(skip)]
+    pub model_is_default: bool,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -862,6 +867,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -884,6 +890,7 @@ fn discover_sessions_from_routes(
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             });
         }
     }
@@ -937,6 +944,7 @@ fn discover_sessions_from_routes(
             session.model = info.model;
             session.thinking_level = info.thinking_level;
             session.available_models = info.available_models;
+            session.model_is_default = info.model_is_default;
         }
     }
 
@@ -986,6 +994,8 @@ struct SessionModelInfo {
     model: Option<String>,
     thinking_level: Option<String>,
     available_models: Vec<String>,
+    /// `model` is the configured default, not what this session's source reported.
+    model_is_default: bool,
 }
 
 fn owned_strings(list: &[&str]) -> Vec<String> {
@@ -1037,6 +1047,7 @@ fn muse_model_info(transcript_path: Option<&str>, files: &mut TranscriptReads) -
         model: Some(model),
         thinking_level: None,
         available_models: owned_strings(&crate::lifecycle::MUSE_CATALOG_MODELS),
+        model_is_default: false,
     }
 }
 
@@ -1254,15 +1265,21 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
                 || entry.model_id.eq_ignore_ascii_case(wanted)
         })
     };
+    let mut model_is_default = false;
     let matched = [placeholder, config.default_placeholder.as_deref()]
         .into_iter()
-        .flatten()
-        .find_map(|wanted| match by_config(wanted) {
-            Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
-            None if !wanted.starts_with("MODEL_") => {
-                Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
-            }
-            None => None,
+        .enumerate()
+        .filter_map(|(index, wanted)| wanted.map(|wanted| (index == 1, wanted)))
+        .find_map(|(is_default, wanted)| {
+            let found = match by_config(wanted) {
+                Some(entry) => Some(split_agy_thinking_suffix(&entry.model_id)),
+                None if !wanted.starts_with("MODEL_") => {
+                    Some(split_agy_thinking_suffix(&wanted.to_ascii_lowercase()))
+                }
+                None => None,
+            };
+            model_is_default = found.is_some() && is_default;
+            found
         });
     let (model, thinking_level) = match matched {
         Some((base, level)) => (Some(base), level),
@@ -1272,6 +1289,7 @@ fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) ->
         model,
         thinking_level,
         available_models,
+        model_is_default,
     }
 }
 
@@ -1280,6 +1298,7 @@ fn offline_agy_model_info() -> SessionModelInfo {
         model: None,
         thinking_level: None,
         available_models: owned_strings(&AGY_DEFAULT_MODELS),
+        model_is_default: false,
     }
 }
 
@@ -1760,6 +1779,7 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         model,
         thinking_level,
         available_models: owned_strings(&CLAUDE_MODELS),
+        model_is_default: false,
     }
 }
 
@@ -1856,6 +1876,7 @@ fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessi
                 .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
         }),
         available_models,
+        model_is_default: false,
     }
 }
 
@@ -1909,6 +1930,7 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
         model: session_model.or_else(|| config_str("default")),
         thinking_level: config_str("default_reasoning_effort"),
         available_models,
+        model_is_default: false,
     }
 }
 
@@ -6832,6 +6854,84 @@ mod tests {
         stub.shutdown();
     }
 
+    #[test]
+    fn agy_default_model_fallback_is_flagged_and_a_trajectory_model_is_not() {
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        // The trajectory's own model, by placeholder or as a plain id: not a guess.
+        for found in [Some("MODEL_PLACEHOLDER_M417"), Some("Some-Model-Low")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert!(info.model.is_some(), "{found:?}");
+            assert!(!info.model_is_default, "{found:?}");
+        }
+        // No trajectory model, or one the config does not know: the default stands in.
+        for found in [None, Some("MODEL_PLACEHOLDER_M000")] {
+            let info = resolve_agy_model_info(&config, found);
+            assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"), "{found:?}");
+            assert!(info.model_is_default, "{found:?}");
+        }
+        // With no default either, there is no model and nothing to flag.
+        let mut bare = config.clone();
+        bare.default_placeholder = None;
+        let info = resolve_agy_model_info(&bare, None);
+        assert_eq!(info.model, None);
+        assert!(!info.model_is_default);
+    }
+
+    #[test]
+    fn agy_discovery_flags_a_session_whose_trajectory_gave_no_model() {
+        // The config call succeeds and the trajectory body is unusable.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, "not json");
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let tmp = TempDir::new().unwrap();
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        // The default still shows, but it is marked as a guess.
+        assert_eq!(agy.model.as_deref(), Some("gemini-3.8-flash"));
+        assert!(agy.model_is_default);
+        stub.shutdown();
+
+        // A real placeholder in the trajectory is a live report.
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, AGY_TRAJECTORY_FIXTURE);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            tmp.path(),
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(tmp.path());
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert!(!agy.model_is_default);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn the_default_model_marker_never_reaches_the_json() {
+        let mut summary = muse_session_with_transcript(None);
+        summary.model_is_default = true;
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("model_is_default").is_none(), "{json}");
+        assert!(!json.to_string().contains("model_is_default"));
+        // And a payload cannot set it.
+        let mut input = json.clone();
+        input["model_is_default"] = Value::Bool(true);
+        let back: DiscoveredSessionSummary = serde_json::from_value(input).unwrap();
+        assert!(!back.model_is_default);
+    }
+
     const AGY_STEPS_FIXTURE: &str = r#"{"steps":[
         {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
         {"metadata":{}},
@@ -9610,6 +9710,7 @@ mod tests {
                 available_models: vec![],
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             };
             let source = crate::runtime_matrix::QuotaSource::HOST;
             let quota = (source.session)(&session, None).unwrap();
@@ -10665,6 +10766,7 @@ mod tests {
             available_models: Vec::new(),
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         };
         let usage = |signals: serde_json::Value| {
             fs::write(session_dir.join("signals.json"), signals.to_string()).unwrap();

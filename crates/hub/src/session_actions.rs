@@ -105,7 +105,9 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
 /// second. A session with no override is untouched. An override without a thinking level keeps
 /// the discovered one.
 ///
-/// The live pair is the session's discovered model and effort before the overlay. For each
+/// The live pair is the session's discovered model and effort before the overlay. A session whose
+/// `model_is_default` is set reports no model: its model is the configured default, a guess, and
+/// counts as no live model. For each
 /// override, the first matching session that reports a model decides for every session the
 /// override matches in this call:
 /// - no live model anywhere: the override is left alone and overlaid;
@@ -168,7 +170,11 @@ pub fn apply_model_overrides(
     let mut decided: BTreeMap<String, Option<(String, Option<String>)>> = BTreeMap::new();
     for ((session, key), shadowed) in sessions.iter_mut().zip(keys).zip(shadowed) {
         let Some(key) = key else { continue };
-        let live_model = session.model.as_deref().filter(|m| !m.trim().is_empty());
+        // A default-model guess is no report from the vendor: treat it as no live model.
+        let live_model = session
+            .model
+            .as_deref()
+            .filter(|m| !m.trim().is_empty() && !session.model_is_default);
         if !decided.contains_key(&key)
             && let Some(live_model) = live_model
             && let Some(over) = overrides.get_mut(&key)
@@ -286,6 +292,7 @@ mod tests {
             available_models: Vec::new(),
             context_usage: None,
             execution_mode: None,
+            model_is_default: false,
         }
     }
 
@@ -358,6 +365,74 @@ mod tests {
 
     fn one(key: &str, o: ModelOverride) -> BTreeMap<String, ModelOverride> {
         BTreeMap::from([(key.to_string(), o)])
+    }
+
+    /// [`apply_one`] for a session whose model is the configured default, not a live report.
+    fn apply_default_guess(
+        overrides: &mut BTreeMap<String, ModelOverride>,
+        model: &str,
+        effort: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let mut flagged = live("s", None, Some(model), effort);
+        flagged.model_is_default = true;
+        let mut sessions = vec![flagged];
+        apply_model_overrides(&mut sessions, overrides);
+        (
+            sessions[0].model.clone(),
+            sessions[0].thinking_level.clone(),
+        )
+    }
+
+    #[test]
+    fn a_default_model_guess_leaves_the_override_alone_and_records_no_baseline() {
+        let mut map = one("s", over("chosen", Some("high")));
+        let got = apply_default_guess(&mut map, "guess", Some("medium"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        assert_eq!(map["s"].baseline, None);
+        assert!(!map["s"].confirmed);
+        assert_eq!(map.len(), 1);
+        // The next real report records its own pair as the baseline, not the guess.
+        let got = apply_one(&mut map, Some("old"), Some("low"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        assert_eq!(map["s"].baseline, Some(pair("old", Some("low"))));
+    }
+
+    #[test]
+    fn a_default_model_guess_does_not_drop_a_confirmed_override() {
+        let mut map = one("s", over("chosen", Some("high")));
+        apply_one(&mut map, Some("old"), Some("low"));
+        apply_one(&mut map, Some("chosen"), Some("high"));
+        assert!(map["s"].confirmed);
+        let before = map.clone();
+        // A guess that differs from the baseline and the choice would drop it as a live report.
+        let got = apply_default_guess(&mut map, "third", Some("medium"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        assert_eq!(map, before);
+        // A guess equal to the baseline would drop a confirmed override too.
+        let got = apply_default_guess(&mut map, "old", Some("low"));
+        assert_eq!(got, pair("chosen", Some("high")));
+        assert_eq!(map, before);
+        // Without an override the guess still shows.
+        let mut empty = BTreeMap::new();
+        let got = apply_default_guess(&mut empty, "guess", None);
+        assert_eq!(got, pair("guess", None));
+    }
+
+    #[test]
+    fn a_default_model_guess_does_not_decide_for_a_sibling_session_of_the_override() {
+        let mut map = one("ada", over("chosen", None));
+        let mut guess = live("claude:a", Some("Ada"), Some("guess"), None);
+        guess.model_is_default = true;
+        let real = live("claude:b", Some("Ada"), Some("old"), None);
+        let mut sessions = vec![guess, real];
+        apply_model_overrides(&mut sessions, &mut map);
+        // The first session reporting a model is the real one, so it sets the baseline.
+        assert_eq!(map["ada"].baseline, Some(pair("old", None)));
+        assert!(
+            sessions
+                .iter()
+                .all(|s| s.model.as_deref() == Some("chosen"))
+        );
     }
 
     #[test]

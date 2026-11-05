@@ -6851,6 +6851,7 @@ mod tests {
                 available_models: Vec::new(),
                 context_usage: None,
                 execution_mode: None,
+                model_is_default: false,
             }]
         };
         assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
@@ -6867,6 +6868,59 @@ mod tests {
         assert!(state.session_model_override("ada").is_none());
         let shown = state.with_model_overrides(live("model-c"));
         assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+    }
+
+    #[test]
+    fn a_default_model_guess_is_not_a_live_report_for_the_operator_override() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        // `guess` marks a model that discovery filled in from a default, not the vendor.
+        let poll = |model: &str, guess: bool| {
+            vec![discovery::DiscoveredSessionSummary {
+                id: "claude:ada".to_string(),
+                source: "route".to_string(),
+                adapter: "claude".to_string(),
+                persona: Some("Ada".to_string()),
+                status: "active".to_string(),
+                updated_at: None,
+                cwd: None,
+                record_id: None,
+                transcript_path: None,
+                quota_usage: None,
+                model: Some(model.to_string()),
+                thinking_level: None,
+                available_models: Vec::new(),
+                context_usage: None,
+                execution_mode: None,
+                model_is_default: guess,
+            }]
+        };
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        // One bad poll names a default: the choice shows, and nothing is decided.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        assert!(
+            !serde_json::to_string(&shown)
+                .unwrap()
+                .contains("model_is_default")
+        );
+        // The real report records the baseline; the choice still shows.
+        let shown = state.with_model_overrides(poll("model-a", false));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        // Another bad poll leaves it alone as well.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("model-b"));
+        assert!(state.session_model_override("ada").is_some());
+        // A real report of something else supersedes the choice, as before.
+        let shown = state.with_model_overrides(poll("model-c", false));
+        assert_eq!(shown[0].model.as_deref(), Some("model-c"));
+        assert!(state.session_model_override("ada").is_none());
+        // With no override a flagged model still shows.
+        let shown = state.with_model_overrides(poll("default-model", true));
+        assert_eq!(shown[0].model.as_deref(), Some("default-model"));
     }
 
     #[test]
