@@ -1475,30 +1475,79 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
         <div
           role="tablist"
           aria-label="FerroWatch Sections"
-          style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}
+          style={{ width: "100%", minWidth: 0 }}
         >
-          {(
-            [
-              { id: "all", label: "All Views" },
-              { id: "alerts", label: `Alerts (${alerts.length})` },
-              { id: "quotas", label: "Quotas & Balance" },
-              { id: "liveness", label: `Liveness (${healthAgents.length})` },
-              { id: "rollups", label: "Spend & Rollups" },
-            ] as Array<{ id: WatchSectionFilter; label: string }>
-          ).map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              role="tab"
-              aria-selected={sectionFilter === item.id}
-              data-testid={`watch-section-filter-${item.id}`}
-              className={`fd-btn${sectionFilter === item.id ? " fd-btn-active" : ""}`}
-              style={{ fontSize: "11px", padding: "3px 8px" }}
-              onClick={() => setSectionFilter(item.id)}
-            >
-              {item.label}
-            </button>
-          ))}
+          <select
+            aria-label="FerroWatch Sections"
+            data-testid="watch-section-select"
+            className="fd-select"
+            value={sectionFilter}
+            onChange={(e) =>
+              setSectionFilter(e.target.value as WatchSectionFilter)
+            }
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12px",
+              padding: "5px 8px",
+            }}
+          >
+            {(
+              [
+                { id: "all", label: "All Views" },
+                { id: "alerts", label: `Alerts (${alerts.length})` },
+                { id: "quotas", label: "Quotas & Balance" },
+                { id: "liveness", label: `Liveness (${healthAgents.length})` },
+                { id: "rollups", label: "Spend & Rollups" },
+              ] as Array<{ id: WatchSectionFilter; label: string }>
+            ).map((item) => (
+              <option
+                key={item.id}
+                value={item.id}
+                data-testid={`watch-section-option-${item.id}`}
+              >
+                {item.label}
+              </option>
+            ))}
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            {(
+              [
+                { id: "all", label: "All Views" },
+                { id: "alerts", label: `Alerts (${alerts.length})` },
+                { id: "quotas", label: "Quotas & Balance" },
+                { id: "liveness", label: `Liveness (${healthAgents.length})` },
+                { id: "rollups", label: "Spend & Rollups" },
+              ] as Array<{ id: WatchSectionFilter; label: string }>
+            ).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                role="tab"
+                aria-selected={sectionFilter === item.id}
+                data-testid={`watch-section-filter-${item.id}`}
+                className={`fd-btn${sectionFilter === item.id ? " fd-btn-active" : ""}`}
+                onClick={() => setSectionFilter(item.id)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 

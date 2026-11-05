@@ -451,14 +451,50 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
             </button>
           )}
         </div>
+        <select
+          aria-label="Hub & Architecture Section"
+          data-testid="hub-subtab-select"
+          className="fd-select"
+          value={subTab}
+          onChange={(e) => setSubTab(e.target.value as HubSubTab)}
+          style={{
+            width: "100%",
+            minWidth: 0,
+            maxWidth: "100%",
+            boxSizing: "border-box",
+            fontSize: "12px",
+            padding: "5px 8px",
+          }}
+        >
+          <option value="workflows" data-testid="hub-subtab-option-workflows">
+            Workflows
+          </option>
+          <option value="routines" data-testid="hub-subtab-option-routines">
+            Routines
+          </option>
+          <option value="architecture" data-testid="hub-subtab-option-architecture">
+            Architecture
+          </option>
+          <option value="stats" data-testid="hub-subtab-option-stats">
+            Telemetry
+          </option>
+        </select>
         <div
           data-testid="hub-subtab-grid"
+          className="sr-only"
           style={{
             display: "grid",
             gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
             gap: "6px",
-            width: "100%",
-            minWidth: 0,
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: 0,
           }}
         >
           <button

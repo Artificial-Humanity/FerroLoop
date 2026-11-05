@@ -280,28 +280,66 @@ export const HelpDrawer: React.FC<HelpDrawerProps> = ({
           role="navigation"
           aria-label="Help Topics"
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            flexWrap: "wrap",
+            width: "100%",
+            minWidth: 0,
           }}
         >
-          {HELP_TOPICS.map((topic) => {
-            const isSelected = selectedTopic === topic.id && !searchQuery.trim();
-            return (
-              <button
+          <select
+            aria-label="Select Help Topic"
+            data-testid="help-topic-select"
+            className="fd-select"
+            value={selectedTopic}
+            onChange={(e) => handleChooseTopic(e.target.value as HelpTopicId)}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12.5px",
+              padding: "6px 10px",
+            }}
+          >
+            {HELP_TOPICS.map((topic) => (
+              <option
                 key={topic.id}
-                type="button"
-                data-testid={`help-topic-${topic.id}`}
-                aria-pressed={isSelected}
-                className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
-                onClick={() => handleChooseTopic(topic.id)}
-                style={{ fontSize: "11.5px", padding: "4px 9px" }}
+                value={topic.id}
+                data-testid={`help-topic-option-${topic.id}`}
               >
                 {topic.shortLabel}
-              </button>
-            );
-          })}
+              </option>
+            ))}
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            {HELP_TOPICS.map((topic) => {
+              const isSelected = selectedTopic === topic.id && !searchQuery.trim();
+              return (
+                <button
+                  key={topic.id}
+                  type="button"
+                  data-testid={`help-topic-${topic.id}`}
+                  aria-pressed={isSelected}
+                  className={`fd-btn${isSelected ? " fd-btn-active" : ""}`}
+                  onClick={() => handleChooseTopic(topic.id)}
+                  style={{ fontSize: "11.5px", padding: "4px 9px" }}
+                >
+                  {topic.shortLabel}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <div

@@ -924,29 +924,66 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
           )}
         </div>
 
-        <div role="tablist" aria-label="FerroState Views" style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subView === "explorer"}
-            className={`fd-btn${subView === "explorer" ? " fd-btn-active" : ""}`}
-            style={{ minHeight: "36px" }}
-            data-testid="subview-explorer-btn"
-            onClick={() => setSubView("explorer")}
+        <div role="tablist" aria-label="FerroState Views" style={{ width: "100%", minWidth: 0 }}>
+          <select
+            aria-label="FerroState Views"
+            data-testid="ferrostate-subview-select"
+            className="fd-select"
+            value={subView}
+            onChange={(e) => setSubView(e.target.value as "explorer" | "code")}
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12px",
+              padding: "5px 8px",
+            }}
           >
-            Memory &amp; Handoffs
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subView === "code"}
-            className={`fd-btn${subView === "code" ? " fd-btn-active" : ""}`}
-            style={{ minHeight: "36px" }}
-            data-testid="subview-code-btn"
-            onClick={() => setSubView("code")}
+            <option value="explorer" data-testid="ferrostate-subview-option-explorer">
+              Memory &amp; Handoffs
+            </option>
+            <option value="code" data-testid="ferrostate-subview-option-code">
+              Code Index
+            </option>
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
           >
-            Code Index
-          </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={subView === "explorer"}
+              className={`fd-btn${subView === "explorer" ? " fd-btn-active" : ""}`}
+              style={{ minHeight: "36px" }}
+              data-testid="subview-explorer-btn"
+              onClick={() => setSubView("explorer")}
+            >
+              Memory &amp; Handoffs
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={subView === "code"}
+              className={`fd-btn${subView === "code" ? " fd-btn-active" : ""}`}
+              style={{ minHeight: "36px" }}
+              data-testid="subview-code-btn"
+              onClick={() => setSubView("code")}
+            >
+              Code Index
+            </button>
+          </div>
         </div>
 
         {effectiveError && (

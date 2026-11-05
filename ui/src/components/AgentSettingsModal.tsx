@@ -733,68 +733,99 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
             aria-label="Agent Settings Tabs"
             data-testid="agent-settings-tabs"
             style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-              gap: "4px",
-              padding: "3px",
-              borderRadius: "6px",
-              backgroundColor: "var(--bg-elevated)",
-              border: "1px solid var(--border-subtle)",
+              width: "100%",
+              minWidth: 0,
             }}
           >
-            {(
-              [
-                { id: "overview", visibleLabel: "Overview", srSuffix: " & Model" },
-                { id: "permissions", visibleLabel: "Permissions", srSuffix: " & Sandbox" },
-                { id: "runtime", visibleLabel: "MCP & Runtime", srSuffix: "" },
-              ] as const
-            ).map((tab) => {
-              const isSelected = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  id={`agent-settings-tab-${tab.id}`}
-                  type="button"
-                  role="tab"
-                  aria-selected={isSelected}
-                  aria-controls={`agent-settings-panel-${tab.id}`}
-                  data-testid={`agent-settings-tab-${tab.id}`}
-                  className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
-                  style={{
-                    fontSize: "11.5px",
-                    fontWeight: isSelected ? 700 : 500,
-                    padding: "5px 4px",
-                    justifyContent: "center",
-                    textAlign: "center",
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    minWidth: 0,
-                  }}
-                  onClick={() => setActiveTab(tab.id)}
-                >
-                  {tab.visibleLabel}
-                  {tab.srSuffix && (
-                    <span
-                      className="sr-only"
-                      style={{
-                        position: "absolute",
-                        width: "1px",
-                        height: "1px",
-                        padding: 0,
-                        margin: "-1px",
-                        overflow: "hidden",
-                        clip: "rect(0, 0, 0, 0)",
-                        whiteSpace: "nowrap",
-                        border: 0,
-                      }}
-                    >
-                      {tab.srSuffix}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
+            <select
+              aria-label="Agent Settings Section"
+              data-testid="agent-settings-tab-select"
+              className="fd-select"
+              value={activeTab}
+              onChange={(e) =>
+                setActiveTab(
+                  e.target.value as "overview" | "permissions" | "runtime",
+                )
+              }
+              style={{
+                width: "100%",
+                minWidth: 0,
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                fontSize: "12.5px",
+                padding: "6px 10px",
+              }}
+            >
+              <option value="overview" data-testid="agent-settings-tab-option-overview">
+                Overview &amp; Model
+              </option>
+              <option
+                value="permissions"
+                data-testid="agent-settings-tab-option-permissions"
+              >
+                Permissions &amp; Sandbox
+              </option>
+              <option value="runtime" data-testid="agent-settings-tab-option-runtime">
+                MCP &amp; Runtime
+              </option>
+            </select>
+            <div
+              className="sr-only"
+              style={{
+                position: "absolute",
+                width: "1px",
+                height: "1px",
+                padding: 0,
+                margin: "-1px",
+                overflow: "hidden",
+                clip: "rect(0, 0, 0, 0)",
+                whiteSpace: "nowrap",
+                border: 0,
+              }}
+            >
+              {(
+                [
+                  { id: "overview", visibleLabel: "Overview", srSuffix: " & Model" },
+                  { id: "permissions", visibleLabel: "Permissions", srSuffix: " & Sandbox" },
+                  { id: "runtime", visibleLabel: "MCP & Runtime", srSuffix: "" },
+                ] as const
+              ).map((tab) => {
+                const isSelected = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    id={`agent-settings-tab-${tab.id}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={isSelected}
+                    aria-controls={`agent-settings-panel-${tab.id}`}
+                    data-testid={`agent-settings-tab-${tab.id}`}
+                    className={`fd-btn${isSelected ? " fd-btn-primary" : ""}`}
+                    onClick={() => setActiveTab(tab.id)}
+                  >
+                    {tab.visibleLabel}
+                    {tab.srSuffix && (
+                      <span
+                        className="sr-only"
+                        style={{
+                          position: "absolute",
+                          width: "1px",
+                          height: "1px",
+                          padding: 0,
+                          margin: "-1px",
+                          overflow: "hidden",
+                          clip: "rect(0, 0, 0, 0)",
+                          whiteSpace: "nowrap",
+                          border: 0,
+                        }}
+                      >
+                        {tab.srSuffix}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         </div>
 

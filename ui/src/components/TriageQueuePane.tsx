@@ -950,36 +950,89 @@ export const TriageQueuePane: React.FC<TriageQueuePaneProps> = ({
           </div>
         </div>
 
-        {/* Category Filter Pills */}
+        {/* Category Filter Selector */}
         <div
           role="tablist"
           aria-label="Incident category filter"
           style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "4px",
-            flexWrap: "wrap",
+            width: "100%",
+            minWidth: 0,
           }}
         >
-          {(
-            ["all", "heartbeat", "review", "budget", "wire"] as TriageCategoryFilter[]
-          ).map((cat) => {
-            const isActive = categoryFilter === cat;
-            return (
-              <button
+          <select
+            aria-label="Incident category filter"
+            data-testid="triage-category-select"
+            className="fd-select"
+            value={categoryFilter}
+            onChange={(e) =>
+              setCategoryFilter(e.target.value as TriageCategoryFilter)
+            }
+            style={{
+              width: "100%",
+              minWidth: 0,
+              maxWidth: "100%",
+              boxSizing: "border-box",
+              fontSize: "12px",
+              padding: "5px 8px",
+            }}
+          >
+            {(
+              [
+                "all",
+                "heartbeat",
+                "review",
+                "budget",
+                "wire",
+              ] as TriageCategoryFilter[]
+            ).map((cat) => (
+              <option
                 key={cat}
-                type="button"
-                role="tab"
-                aria-selected={isActive}
-                data-testid={`triage-filter-${cat}`}
-                className={`fd-btn ${isActive ? "fd-btn-active" : ""}`}
-                onClick={() => setCategoryFilter(cat)}
-                style={{ padding: "3px 8px", fontSize: "11px" }}
+                value={cat}
+                data-testid={`triage-category-option-${cat}`}
               >
                 {CATEGORY_LABELS[cat]} ({countByCategory[cat]})
-              </button>
-            );
-          })}
+              </option>
+            ))}
+          </select>
+          <div
+            className="sr-only"
+            style={{
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              whiteSpace: "nowrap",
+              border: 0,
+            }}
+          >
+            {(
+              [
+                "all",
+                "heartbeat",
+                "review",
+                "budget",
+                "wire",
+              ] as TriageCategoryFilter[]
+            ).map((cat) => {
+              const isActive = categoryFilter === cat;
+              return (
+                <button
+                  key={cat}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  data-testid={`triage-filter-${cat}`}
+                  className={`fd-btn ${isActive ? "fd-btn-active" : ""}`}
+                  onClick={() => setCategoryFilter(cat)}
+                >
+                  {CATEGORY_LABELS[cat]} ({countByCategory[cat]})
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <input
