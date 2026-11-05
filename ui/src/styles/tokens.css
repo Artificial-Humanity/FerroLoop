@@ -242,6 +242,25 @@ body,
   min-width: 44px;
 }
 
+/* Touch targets in Settings and the New, Edit and Delete Project dialogs (tablet and phone). */
+.fd-cockpit[data-device-layout="tablet"] .fd-modal .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] [data-testid="new-project-modal"] .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] [data-testid="edit-project-modal"] .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] [data-testid="delete-project-modal"] .fd-btn,
+.fd-cockpit[data-device-layout="tablet"] [data-testid^="settings-project-card-"] .fd-btn {
+  min-height: 44px;
+}
+
+@media (max-width: 767px) {
+  .fd-cockpit .fd-modal .fd-btn,
+  .fd-cockpit [data-testid="new-project-modal"] .fd-btn,
+  .fd-cockpit [data-testid="edit-project-modal"] .fd-btn,
+  .fd-cockpit [data-testid="delete-project-modal"] .fd-btn,
+  .fd-cockpit [data-testid^="settings-project-card-"] .fd-btn {
+    min-height: 44px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .fd-cockpit[data-device-layout="tablet"][data-tablet-master="overlay"] .fd-sidebar:not(.fd-sidebar-embedded) {
     transition: none;
