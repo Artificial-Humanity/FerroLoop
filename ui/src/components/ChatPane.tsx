@@ -8,6 +8,7 @@ import {
   type InterruptSessionResponse,
   type PromptAttachment,
   type PromptRequest,
+  type ProjectSummary,
   type PromptResponse,
   type QueuedOperatorPrompt,
   type QuotaWindowUsage,
@@ -971,6 +972,8 @@ function clearSessionDraft(targetKey: string): void {
 }
 
 export interface ChatPaneProps {
+  /** The shared project list, passed on to the agent settings modal. */
+  projects?: readonly ProjectSummary[];
   agentName?: string | null;
   agentDisplayName?: string | null;
   agentRole?: string | null;
@@ -1109,6 +1112,7 @@ export const COMPOSER_MIN_HEIGHT_PX = 36;
 export const COMPOSER_MAX_HEIGHT_PX = 420;
 
 export const ChatPane: React.FC<ChatPaneProps> = ({
+  projects,
   agentName,
   agentDisplayName,
   agentRole = null,
@@ -4313,6 +4317,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       )}
 
       <AgentSettingsModal
+        projects={projects}
         isOpen={effectiveAgentSettingsOpen}
         onClose={handleCloseAgentSettings}
         agentName={agentName}

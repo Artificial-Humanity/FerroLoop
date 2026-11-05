@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
-import type { SessionQuotaUsage } from "../types/api";
+import type { ProjectSummary, SessionQuotaUsage } from "../types/api";
+import { FALLBACK_PROJECTS, projectChoices } from "../hooks/useProjects";
 import { PinIcon, togglePinnedAgent, usePinnedState } from "./RosterSidebar";
 import {
-  CANONICAL_PROJECTS,
   canonicalizeDefaultRole,
   CREATE_CUSTOM_ROLE_VALUE,
   extractRecastConflict,
@@ -373,6 +373,8 @@ export interface AgentSettingsModalProps {
   /** Record #109: Breadcrumb label and callback to return to originating SettingsModal (Project Settings or Fleet Settings). */
   returnToSettingsLabel?: string | null;
   onReturnToSettings?: () => void;
+  /** The shared project list for the Re-Cast project dropdown. Defaults to the built-in list. */
+  projects?: readonly ProjectSummary[];
 }
 
 export type AgentSettingsTabId = "overview" | "permissions" | "runtime";
@@ -442,6 +444,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   initialTab = "overview",
   returnToSettingsLabel = null,
   onReturnToSettings,
+  projects = FALLBACK_PROJECTS,
 }) => {
   const { pinnedAgents } = usePinnedState();
   const [activeTab, setActiveTab] = useState<AgentSettingsTabId>(initialTab);
@@ -663,8 +666,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
     setRecastStatusBanner(null);
     try {
       const client = apiClient ?? new HubApiClient();
+      // Send what the select shows: the slug of the matched project, else the raw value.
       const res = await client.recastAgent(agentKey, {
-        project: recastProject,
+        project: projectChoices(projects, recastProject).value,
         role: effectiveRole,
         replace_lead: confirmOverrides
           ? (recastConflict ? recastConflict.replaceLead : true)
@@ -2404,9 +2408,9 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
         </div>
 
         {recastModalOpen && (() => {
-          const projectOptions = CANONICAL_PROJECTS.includes(recastProject)
-            ? CANONICAL_PROJECTS
-            : [recastProject, ...CANONICAL_PROJECTS];
+          // The hub takes a project slug; the dropdown shows the display name.
+          const { choices: projectOptions, value: recastProjectValue } =
+            projectChoices(projects, recastProject);
           const hasRoleOption =
             recastRole === CREATE_CUSTOM_ROLE_VALUE ||
             RECAST_ROLE_OPTIONS.some((opt) => opt.value === recastRole);
@@ -2496,15 +2500,15 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       data-testid={`recast-project-select-${agentKey}`}
                       className="fd-select fd-mono"
                       style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
-                      value={recastProject}
+                      value={recastProjectValue}
                       onChange={(e) => {
                         setRecastProject(e.target.value);
                         setRecastConflict(null);
                       }}
                     >
                       {projectOptions.map((proj) => (
-                        <option key={proj} value={proj}>
-                          {proj}
+                        <option key={proj.value} value={proj.value}>
+                          {proj.label}
                         </option>
                       ))}
                     </select>
