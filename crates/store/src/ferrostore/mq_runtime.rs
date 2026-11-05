@@ -306,6 +306,202 @@ mod tests {
     }
 
     #[test]
+    fn memory_ack_is_not_reported_as_the_unrelated_undelivered_spill() {
+        struct Failing;
+        impl SyncAdapter for Failing {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), StoreError> {
+                Err(StoreError::Backend("offline".into()))
+            }
+        }
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                MqTierPolicy {
+                    max_memory_lag: Duration::from_secs(1),
+                    ..Default::default()
+                },
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let ephemeral = store
+            .publish_mq_with("a", "one", &json!(1), MqDurability::Ephemeral)
+            .unwrap();
+        store
+            .publish_mq_with("b", "old", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        lock_mutex(&store.mq_runtime)
+            .topics
+            .get_mut("b")
+            .unwrap()
+            .messages
+            .get_mut(&1)
+            .unwrap()
+            .at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap();
+        store
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Failing))
+            .unwrap();
+        assert!(matches!(
+            store.ack_mq_with_detail("a", "g", ephemeral),
+            Ok(None)
+        ));
+        assert!(
+            store
+                .get_doc("mq_ack:a:g", &ephemeral.to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_doc("mq:b", "1").unwrap().is_some());
+        assert!(store.has_pending_sync());
+    }
+
+    #[test]
+    fn adapter_cannot_attach_during_ephemeral_admission_that_spills_another_topic() {
+        struct Failing;
+        impl SyncAdapter for Failing {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), StoreError> {
+                Err(StoreError::Backend("offline".into()))
+            }
+        }
+        let store = Arc::new(FerroStore::in_memory());
+        store
+            .configure_mq(
+                MqTierPolicy {
+                    max_memory_messages: 2,
+                    ..Default::default()
+                },
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        store
+            .publish_mq_with("a", "old", &json!(1), MqDurability::Adaptive)
+            .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let publisher = Arc::clone(&store);
+        let thread = std::thread::spawn(move || {
+            BEFORE_MQ_SPILL.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }))
+            });
+            publisher.publish_mq_with("b", "ephemeral", &json!(2), MqDurability::Ephemeral)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let attach_result = store.attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Failing));
+        resume_tx.send(()).unwrap();
+        let result = thread.join().unwrap();
+        assert!(
+            attach_result.is_err(),
+            "adapter attached while non-durable admission was in flight"
+        );
+        assert_eq!(result.unwrap(), 1);
+        assert!(store.get_doc("mq:a", "1").unwrap().is_some());
+        assert!(store.get_doc("mq:b", "1").unwrap().is_none());
+        assert!(!store.has_pending_sync());
+    }
+
+    #[test]
+    fn durable_ack_returns_its_own_sequence_when_later_spill_is_undelivered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct FailSecond(AtomicUsize);
+        impl SyncAdapter for FailSecond {
+            fn name(&self) -> &str {
+                "fail-second"
+            }
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), StoreError> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(StoreError::Backend("offline".into()))
+                }
+            }
+        }
+        let store = FerroStore::in_memory();
+        store
+            .configure_mq(
+                MqTierPolicy {
+                    max_memory_lag: Duration::from_secs(1),
+                    ..Default::default()
+                },
+                false,
+                Arc::new(Resources),
+            )
+            .unwrap();
+        let durable = store.publish_mq("a", "one", &json!(1)).unwrap();
+        store
+            .publish_mq_with("b", "old", &json!(2), MqDurability::Adaptive)
+            .unwrap();
+        lock_mutex(&store.mq_runtime)
+            .topics
+            .get_mut("b")
+            .unwrap()
+            .messages
+            .get_mut(&1)
+            .unwrap()
+            .at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap();
+        let before = store.last_seq().unwrap();
+        store
+            .attach_sync_adapter(
+                SyncMode::WriteThrough,
+                Arc::new(FailSecond(AtomicUsize::new(0))),
+            )
+            .unwrap();
+        assert_eq!(
+            store.ack_mq_with_detail("a", "g", durable).unwrap(),
+            Some(before + 1)
+        );
+        assert!(
+            store
+                .get_doc("mq_ack:a:g", &durable.to_string())
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.has_pending_sync());
+        assert_eq!(store.last_seq().unwrap(), before + 2);
+    }
+
+    #[test]
+    fn durable_ack_still_reports_its_own_undelivered_commit() {
+        struct Failing;
+        impl SyncAdapter for Failing {
+            fn name(&self) -> &str {
+                "fail"
+            }
+            fn on_commit(&self, _: &SyncBatch) -> Result<(), StoreError> {
+                Err(StoreError::Backend("offline".into()))
+            }
+        }
+        let store = FerroStore::in_memory();
+        let id = store.publish_mq("a", "one", &json!(1)).unwrap();
+        let before = store.last_seq().unwrap();
+        store
+            .attach_sync_adapter(SyncMode::WriteThrough, Arc::new(Failing))
+            .unwrap();
+        let error = store.ack_mq_with_detail("a", "g", id).unwrap_err();
+        assert!(matches!(error, StoreError::Undelivered { seq, .. } if seq == before + 1));
+        assert!(
+            store
+                .get_doc("mq_ack:a:g", &id.to_string())
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.has_pending_sync());
+    }
+
+    #[test]
     fn durable_ack_also_maintains_expired_adaptive_work() {
         let store = FerroStore::in_memory();
         let policy = MqTierPolicy {

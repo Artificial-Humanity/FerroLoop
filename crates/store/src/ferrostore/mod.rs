@@ -236,7 +236,7 @@ struct SyncSlot {
     notify_in_flight: bool,
     /// Thread that set `notify_in_flight`. Cleared with the flag.
     notify_owner: Option<ThreadId>,
-    /// A remote MQ flush is in flight without an attached client adapter.
+    /// An unadapted MQ operation is in flight; attaching an adapter must wait.
     mq_remote_flush_in_flight: bool,
 }
 
@@ -1364,6 +1364,11 @@ struct BodyGuard<'a> {
 
 /// Retains the owner-local transition marker without holding the MQ mutex across I/O or callbacks.
 struct MqBusyGuard<'a>(&'a FerroStore);
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MQ_SPILL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
 
 impl Drop for MqBusyGuard<'_> {
     fn drop(&mut self) {
@@ -2679,7 +2684,7 @@ impl FerroStore {
         let resources = probe.probe(self.mq_storage_path());
         // The gate orders the first memory admission against an already-started durable publish.
         let gate = lock_mutex(&self.commit_gate);
-        let sync = lock_mutex(&self.sync);
+        let mut sync = lock_mutex(&self.sync);
         if sync.adapter.is_some() {
             if durability == MqDurability::Ephemeral {
                 return Err(backend("Ephemeral MQ is unavailable with a SyncAdapter"));
@@ -2835,10 +2840,25 @@ impl FerroStore {
                 },
             );
         }
+        // An Ephemeral candidate is not part of this durable spill. Prevent an adapter
+        // attaching between admission and the commit, which would otherwise make an
+        // unrelated spill error falsely claim that the candidate is durable.
+        let fence_adapter = durability == MqDurability::Ephemeral;
+        if fence_adapter {
+            sync.mq_remote_flush_in_flight = true;
+        }
         drop(mq);
         drop(sync);
         drop(gate);
         let _claim = MqBusyGuard(self);
+        // Drop this before `_claim` so a new MQ admission cannot overlap the marker's release.
+        let _sync_claim = fence_adapter.then(|| MqRemoteFlushGuard(self));
+        #[cfg(test)]
+        BEFORE_MQ_SPILL.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let result = self.mq_persist_snapshots(&snapshots, None);
         let committed = result.is_ok() || matches!(&result, Err(StoreError::Undelivered { .. }));
         if committed {
@@ -3280,8 +3300,10 @@ impl FerroStore {
                 // only after releasing the MQ mutex; a pressure/probe failure must not undo
                 // the ACK or prevent consumers from reducing memory pressure.
                 drop(mq);
-                if let Err(error @ StoreError::Undelivered { .. }) = self.maintain_mq() {
-                    return Err(error);
+                if let Err(error) = self.maintain_mq() {
+                    eprintln!(
+                        "ferrostore: ACK accepted; opportunistic MQ maintenance failed: {error}"
+                    );
                 }
                 return Ok(None);
             }
@@ -3292,10 +3314,10 @@ impl FerroStore {
             Ok(())
         })?;
         // The durable ACK has already committed. A best-effort maintenance failure cannot
-        // undo that ACK; retain buffered work for an explicit retry, except that a committed
-        // spill whose sync delivery failed must report its Undelivered receipt.
-        if let Err(error @ StoreError::Undelivered { .. }) = self.maintain_mq() {
-            return Err(error);
+        // undo that ACK. A separate spill's Undelivered receipt names the spill, not this ACK;
+        // the sync queue retains it for retry and the diagnostic keeps the failure visible.
+        if let Err(error) = self.maintain_mq() {
+            eprintln!("ferrostore: ACK committed; opportunistic MQ maintenance failed: {error}");
         }
         Ok(commit)
     }
