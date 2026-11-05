@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient, HubApiError, generatePasskeyCredentialId } from "../api/client";
 import {
   FONT_SCALE_MAX_PCT,
@@ -44,6 +44,15 @@ import {
   type AgentMcpPostureInput,
   type AgentMcpPostureReport,
 } from "./AgentSettingsModal";
+import {
+  ProjectArtifactsDirRow,
+  ProjectsSettingsTab,
+  type ProjectsArtifactsDirProps,
+} from "./settings/ProjectsSettingsTab";
+import { NewProjectModal } from "./settings/NewProjectModal";
+import { EditProjectModal } from "./settings/EditProjectModal";
+import { DeleteProjectModal } from "./settings/DeleteProjectModal";
+import { useProjectModals } from "./settings/useProjectModals";
 
 export {
   ACP_CONFORMANCE_OPERATIONS,
@@ -725,11 +734,20 @@ import {
   type OperatorAccount,
   type OperatorRole,
   type ProjectArtifactsDirInfo,
+  type ProjectSummary,
   type TotpEnrollmentResponse,
 } from "../types/api";
+import {
+  FALLBACK_PROJECTS,
+  findProject,
+  projectChoices,
+  projectLabel,
+  projectLabels,
+} from "../hooks/useProjects";
 
 export type SettingsTabId =
   | "agents"
+  | "projects"
   | "system"
   | "products"
   | "runtimes"
@@ -789,6 +807,29 @@ export interface SettingsModalProps {
   ) => void;
   onLogout?: () => void;
   onAgentsUpdated?: () => void;
+  /** Called after a project or virtual group is created, edited or deleted. */
+  onProjectsChanged?: () => void;
+  /**
+   * The shared project list that feeds the project filter and the project dropdowns. Defaults
+   * to the built-in list.
+   */
+  projects?: readonly ProjectSummary[];
+  /** True when `projects` came from the hub rather than the built-in fallback. */
+  projectsFromHub?: boolean;
+  /**
+   * Reloads the shared list. When given, the Projects tab uses the shared list (reloaded each
+   * time Settings opens) instead of loading its own.
+   */
+  refreshProjects?: () => Promise<void>;
+  /** Message of the last failed shared-list load (shared mode only). */
+  projectsError?: string | null;
+  /** True once the shared list's first load has settled (shared mode only). */
+  projectsLoaded?: boolean;
+  /**
+   * Whether the hub can create, edit and delete projects (shared mode only; standalone mode
+   * derives it from its own load). Defaults to `available`.
+   */
+  projectManagement?: "available" | "unsupported";
   onDecommissionAgent?: (
     targetId: string,
     mode: DecommissionMode,
@@ -814,16 +855,8 @@ export interface SettingsModalProps {
   doctorChecks?: DoctorCheckItem[];
 }
 
-export const CANONICAL_PROJECTS = [
-  "AI-Lab-AMD",
-  "FerroLoop",
-  "Kaggle-Gemma4",
-  "Lucida",
-  "Prosodia",
-  "Sonora",
-  "Website",
-  "Workspace",
-];
+/** Always offered next to the project list: agents without a project land here. */
+const WORKSPACE_PROJECT = "Workspace";
 
 export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 1, label: "1 day" },
@@ -835,9 +868,40 @@ export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 0, label: "Never (0)" },
 ] as const;
 
+const DEFAULT_PROJECT_OPTIONS: readonly string[] = [
+  ...projectLabels(FALLBACK_PROJECTS),
+  WORKSPACE_PROJECT,
+];
+
+/** The option strings a project list gives the filter and the project dropdowns. */
+function projectOptionLabels(projects: readonly ProjectSummary[]): string[] {
+  const out = projectLabels(projects);
+  if (!out.some((o) => o.toLowerCase() === WORKSPACE_PROJECT.toLowerCase())) {
+    out.push(WORKSPACE_PROJECT);
+  }
+  return out;
+}
+
+/** The artifact-directory fields a project summary carries, or `undefined` when it has none. */
+function artifactsDirInfoFromProject(
+  project: ProjectSummary | undefined,
+): Partial<ProjectArtifactsDirInfo> | undefined {
+  if (!project) return undefined;
+  const info: Partial<ProjectArtifactsDirInfo> = {};
+  if (project.artifacts_dir !== undefined) info.artifacts_dir = project.artifacts_dir;
+  if (project.default_artifacts_dir) {
+    info.default_artifacts_dir = project.default_artifacts_dir;
+  }
+  if (project.effective_artifacts_dir) {
+    info.effective_artifacts_dir = project.effective_artifacts_dir;
+  }
+  return Object.keys(info).length > 0 ? info : undefined;
+}
+
 export function resolveProjectFilterValue(
   rawProject: string | null | undefined,
-  options: readonly string[] = CANONICAL_PROJECTS,
+  options: readonly string[] = DEFAULT_PROJECT_OPTIONS,
+  projects?: readonly ProjectSummary[],
 ): string {
   const trimmed = (rawProject ?? "").trim();
   if (!trimmed || trimmed.toLowerCase() === "all") {
@@ -845,7 +909,10 @@ export function resolveProjectFilterValue(
   }
   const lower = trimmed.toLowerCase();
   const matched = options.find((opt) => opt.toLowerCase() === lower);
-  return matched ?? trimmed;
+  if (matched) return matched;
+  // A slug stands for its project's display name.
+  const bySlug = projects ? findProject(projects, trimmed) : undefined;
+  return bySlug ? projectLabel(bySlug) : trimmed;
 }
 
 export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
@@ -943,16 +1010,16 @@ const ACTION_LABELS: Record<BulkSessionAction, string> = {
   compact: "Compact All",
   clear: "Clear All",
   reforge: "Reforge All",
-  prepare: "Prepare All",
-  teardown: "Tear Down All",
+  prepare: "Prepare All for Decommission",
+  teardown: "Decommission All",
 };
 
 const ACTION_VERBS: Record<BulkSessionAction, string> = {
   compact: "Compact",
   clear: "Clear",
   reforge: "Reforge",
-  prepare: "Prepare",
-  teardown: "Tear Down",
+  prepare: "Prepare for Decommission",
+  teardown: "Decommission",
 };
 
 const ACTION_DESCRIPTIONS: Record<BulkSessionAction, string> = {
@@ -1343,6 +1410,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onOpenAgentSettings,
   onLogout,
   onAgentsUpdated,
+  onProjectsChanged,
+  projects: sharedProjects = FALLBACK_PROJECTS,
+  projectsFromHub = false,
+  refreshProjects,
+  projectsError,
+  projectsLoaded,
+  projectManagement: sharedProjectManagement = "available",
   onDecommissionAgent,
   onBulkSessionAction,
   themeMode: propThemeMode,
@@ -1407,11 +1481,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => propFontScalePct ?? getInitialFontScalePct(),
   );
   const { pinnedProjects } = usePinnedState();
+  const baseProjectOptions = useMemo(
+    () => projectOptionLabels(sharedProjects),
+    [sharedProjects],
+  );
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
     () =>
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
   );
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<Set<string>>(
@@ -1433,7 +1512,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     Record<string, ProjectArtifactsDirInfo>
   >({});
   const [artifactsDirModalTarget, setArtifactsDirModalTarget] = useState<
-    { scope: "system" } | { scope: "project"; project: string } | null
+    | { scope: "system" }
+    | { scope: "project"; project: string; label: string }
+    | null
   >(null);
   const [artifactsDirNewPath, setArtifactsDirNewPath] = useState("");
   const [artifactsDirMigrate, setArtifactsDirMigrate] = useState(true);
@@ -1444,9 +1525,75 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [systemArtifactsDirStatus, setSystemArtifactsDirStatus] = useState<
     string | null
   >(null);
-  const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<
-    string | null
-  >(null);
+  const [projectArtifactsDirStatus, setProjectArtifactsDirStatus] = useState<{
+    slug: string;
+    message: string;
+  } | null>(null);
+  // The Projects tab edits a local copy (so a create or delete shows at once); the shared
+  // list overwrites it whenever the hub gave a fresh one.
+  const sharedProjectList = refreshProjects !== undefined;
+  const [projectList, setProjectList] = useState<ProjectSummary[]>(() =>
+    sharedProjectList && projectsFromHub ? [...sharedProjects] : [],
+  );
+  useEffect(() => {
+    if (sharedProjectList && projectsFromHub) setProjectList([...sharedProjects]);
+  }, [sharedProjectList, projectsFromHub, sharedProjects]);
+  // One list for the filter and slug resolution: the shared list in its order, each entry
+  // replaced by the modal's own (fresher after a create or rename), then entries only the
+  // modal knows. The shared list lags until its refresh lands and is absent when standalone.
+  const effectiveProjects = useMemo<ProjectSummary[]>(() => {
+    const own = new Map(
+      projectList.map((p) => [p.slug.trim().toLowerCase(), p] as const),
+    );
+    const seen = new Set<string>();
+    const out: ProjectSummary[] = [];
+    for (const p of sharedProjects) {
+      const key = p.slug.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(own.get(key) ?? p);
+    }
+    for (const p of projectList) {
+      const key = p.slug.trim().toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(p);
+    }
+    return out;
+  }, [sharedProjects, projectList]);
+  const [projectListLoading, setProjectListLoading] = useState(false);
+  const [projectListError, setProjectListError] = useState<string | null>(null);
+  const [ownProjectManagement, setOwnProjectManagement] = useState<
+    "available" | "unsupported"
+  >("available");
+  const projectManagement = sharedProjectList
+    ? sharedProjectManagement
+    : ownProjectManagement;
+  const refreshProjectsRef = useRef(refreshProjects);
+  refreshProjectsRef.current = refreshProjects;
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const newProjectOpenerRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    // Closing Settings must not leave the New Project modal armed for reopen.
+    if (!isOpen) setNewProjectOpen(false);
+  }, [isOpen]);
+  const projectModals = useProjectModals({
+    isOpen,
+    projectList,
+    setProjectList,
+    selectedProjectFilter,
+    setSelectedProjectFilter,
+    onProjectsChanged,
+  });
+  const mergeProjectArtifactsDirs = (project: ProjectSummary) => {
+    const info = artifactsDirInfoFromProject(project);
+    if (!info) return;
+    const key = project.slug.trim().toLowerCase();
+    setProjectsArtifactsDirs((prev) => ({
+      ...prev,
+      [key]: { ...prev[key], id: key, ...info } as ProjectArtifactsDirInfo,
+    }));
+  };
   const [dedicatedArtifactLayout, setDedicatedArtifactLayout] =
     useState<DedicatedArtifactLayoutState>(
       () => DEFAULT_DEDICATED_ARTIFACT_LAYOUT,
@@ -1599,7 +1746,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedProjectFilter(
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
     );
     if (initialProject) {
@@ -1629,7 +1777,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedProjectFilter(
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
     );
     setActiveTab(initialProject ? "agents" : initialTab);
@@ -1710,6 +1859,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         });
     }
 
+    if (sharedProjectList) {
+      // The shared list is reloaded each time Settings opens.
+      void refreshProjectsRef.current?.();
+    } else if (typeof client.listProjects === "function") {
+      setProjectListLoading(true);
+      setProjectListError(null);
+      client
+        .listProjects()
+        .then((list) => {
+          if (cancelled) return;
+          const entries = Array.isArray(list) ? list : [];
+          // An older hub lists only `{id, artifact dirs}` entries: it cannot manage projects.
+          const legacy = entries.length > 0 && entries.every((p) => p.legacy === true);
+          setOwnProjectManagement(legacy ? "unsupported" : "available");
+          setProjectList(legacy ? [] : entries);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          if (
+            err instanceof HubApiError &&
+            (err.status === 404 || err.status === 405)
+          ) {
+            setOwnProjectManagement("unsupported");
+            return;
+          }
+          setOwnProjectManagement("available");
+          setProjectListError(
+            err instanceof Error ? err.message : "Failed to load projects",
+          );
+        })
+        .finally(() => {
+          if (!cancelled) setProjectListLoading(false);
+        });
+    }
+
     return () => {
       cancelled = true;
     };
@@ -1719,6 +1903,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      // The New Project, Edit and Delete dialogs handle their own Escape.
+      if (newProjectOpen || projectModals.anyOpen) return;
       if (artifactsDirModalTarget) {
         if (!changingArtifactsDir) {
           setArtifactsDirModalTarget(null);
@@ -1745,6 +1931,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
   }, [
     isOpen,
+    newProjectOpen,
+    projectModals.anyOpen,
     artifactsDirModalTarget,
     changingArtifactsDir,
     recastModalAgentKey,
@@ -1776,13 +1964,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [propAgents, loadedAgents]);
 
   const projectOptions = useMemo<string[]>(() => {
-    const out: string[] = [...CANONICAL_PROJECTS];
+    const out: string[] = projectOptionLabels(effectiveProjects);
     const addProjectOption = (raw?: string | null) => {
       const trimmed = (raw ?? "").trim();
       if (!trimmed || trimmed.toLowerCase() === "all") return;
-      const lower = trimmed.toLowerCase();
+      // An agent's project is a slug; list it under the project's display name.
+      const known = findProject(effectiveProjects, trimmed);
+      const label = known ? projectLabel(known) : trimmed;
+      const lower = label.toLowerCase();
       if (!out.some((opt) => opt.toLowerCase() === lower)) {
-        out.push(trimmed);
+        out.push(label);
       }
     };
     for (const ag of effectiveAgents) {
@@ -1791,22 +1982,75 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     addProjectOption(initialProject);
     addProjectOption(selectedProjectFilter);
     return out;
-  }, [effectiveAgents, initialProject, selectedProjectFilter]);
+  }, [
+    effectiveProjects,
+    effectiveAgents,
+    initialProject,
+    selectedProjectFilter,
+  ]);
 
   const resolvedProjectFilter = useMemo<string>(
-    () => resolveProjectFilterValue(selectedProjectFilter, projectOptions),
-    [selectedProjectFilter, projectOptions],
+    () =>
+      resolveProjectFilterValue(
+        selectedProjectFilter,
+        projectOptions,
+        effectiveProjects,
+      ),
+    [selectedProjectFilter, projectOptions, effectiveProjects],
   );
+
+  // A project that leaves the shared list (deleted here or elsewhere) must not stay the
+  // active filter; a renamed one stays, under its new label. The filter holds a label, so
+  // the slug of the filtered project is remembered from the list that still had it.
+  const filterSlugRef = useRef<string | null>(null);
+  const previousProjectsRef = useRef<readonly ProjectSummary[]>(effectiveProjects);
+  useEffect(() => {
+    const previous = previousProjectsRef.current;
+    previousProjectsRef.current = effectiveProjects;
+    const active = selectedProjectFilter.trim();
+    if (!active || active.toLowerCase() === "all") {
+      filterSlugRef.current = null;
+      return;
+    }
+    const inCurrent = findProject(effectiveProjects, active);
+    if (previous === effectiveProjects) {
+      if (inCurrent) filterSlugRef.current = inCurrent.slug;
+      return;
+    }
+    const known = findProject(previous, active);
+    const slug = known?.slug ?? filterSlugRef.current;
+    if (inCurrent) {
+      filterSlugRef.current = inCurrent.slug;
+      return;
+    }
+    if (!slug) return;
+    const renamed = effectiveProjects.find(
+      (p) => p.slug.trim().toLowerCase() === slug.trim().toLowerCase(),
+    );
+    if (renamed) {
+      filterSlugRef.current = renamed.slug;
+      setSelectedProjectFilter(projectLabel(renamed));
+    } else {
+      filterSlugRef.current = null;
+      setSelectedProjectFilter("all");
+    }
+  }, [effectiveProjects, selectedProjectFilter]);
 
   const filteredAgents = useMemo<AgentRecord[]>(() => {
     if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
       return effectiveAgents;
     }
-    const target = resolvedProjectFilter.toLowerCase();
-    return effectiveAgents.filter(
-      (ag) => (ag.project || "Workspace").toLowerCase() === target,
+    // Agents carry the project slug; the filter holds the display name.
+    const known = findProject(effectiveProjects, resolvedProjectFilter);
+    const targets = new Set<string>([resolvedProjectFilter.toLowerCase()]);
+    if (known) {
+      targets.add(known.slug.trim().toLowerCase());
+      targets.add(projectLabel(known).toLowerCase());
+    }
+    return effectiveAgents.filter((ag) =>
+      targets.has((ag.project || "Workspace").toLowerCase()),
     );
-  }, [effectiveAgents, resolvedProjectFilter]);
+  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects]);
 
   const allFilteredSelected = useMemo(() => {
     if (filteredAgents.length === 0) return false;
@@ -1917,8 +2161,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const armedConflict = recastReplaceLeadArmed[key];
     try {
       const client = apiClient ?? new HubApiClient();
+      // Send what the select shows: the slug of the matched project, else the raw value.
       const res = await client.recastAgent(key, {
-        project: draft.project,
+        project: projectChoices(effectiveProjects, draft.project, [
+          { value: WORKSPACE_PROJECT.toLowerCase(), label: WORKSPACE_PROJECT },
+        ]).value,
         role: effectiveRole,
         replace_lead: confirmOverrides
           ? (armedConflict ? armedConflict.replaceLead : true)
@@ -2110,7 +2357,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const getProjectArtifactsDirState = (projectName: string) => {
     const slug = projectName.trim().toLowerCase();
-    const record = projectsArtifactsDirs[slug];
+    // The artifacts list is fetched once when Settings opens; a project made since then has
+    // no record there, so its own list entry (the hub sends the fields on every summary,
+    // including the create and edit replies) seeds the state.
+    const record =
+      projectsArtifactsDirs[slug] ??
+      artifactsDirInfoFromProject(
+        effectiveProjects.find((p) => p.slug.trim().toLowerCase() === slug),
+      );
     const overrideFromSettings = settings.project_artifacts_dirs?.[slug] ?? null;
     const artifactsDir =
       record?.artifacts_dir !== undefined
@@ -2137,13 +2391,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setArtifactsDirModalTarget({ scope: "system" });
   };
 
-  const openProjectArtifactsDirModal = (projectName: string) => {
+  const openProjectArtifactsDirModal = (projectName: string, label: string) => {
     const info = getProjectArtifactsDirState(projectName);
     setArtifactsDirModalError(null);
     setProjectArtifactsDirStatus(null);
     setArtifactsDirNewPath(info.effectiveDir);
     setArtifactsDirMigrate(true);
-    setArtifactsDirModalTarget({ scope: "project", project: projectName });
+    setArtifactsDirModalTarget({
+      scope: "project",
+      project: projectName,
+      label,
+    });
   };
 
   const handleConfirmChangeArtifactsDir = async (
@@ -2208,6 +2466,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         setArtifactsDirModalTarget(null);
       } else {
         const projectName = artifactsDirModalTarget.project;
+        const dirLabel = artifactsDirModalTarget.label;
         const info = getProjectArtifactsDirState(projectName);
         const nextPathPayload =
           trimmed === "" || trimmed === info.defaultDir ? null : trimmed;
@@ -2248,11 +2507,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         });
         const migratedFiles = res?.migrated_files ?? 0;
         const migratedBytes = res?.migrated_bytes ?? 0;
-        setProjectArtifactsDirStatus(
-          artifactsDirMigrate
-            ? `Updated ${projectName} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
-            : `Updated ${projectName} artifacts directory to ${nextEffective}.`,
-        );
+        setProjectArtifactsDirStatus({
+          slug: info.slug,
+          message: artifactsDirMigrate
+            ? `Updated ${dirLabel} artifacts directory to ${nextEffective} (migrated ${migratedFiles} file${migratedFiles === 1 ? "" : "s"}, ${migratedBytes} bytes).`
+            : `Updated ${dirLabel} artifacts directory to ${nextEffective}.`,
+        });
         setArtifactsDirModalTarget(null);
       }
     } catch (err) {
@@ -2412,6 +2672,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const isProjectScoped =
     Boolean(initialProject) || resolvedProjectFilter !== "all";
+  const scopedProject = findProject(effectiveProjects, resolvedProjectFilter);
   const scopedProjectName =
     resolvedProjectFilter !== "all"
       ? resolvedProjectFilter
@@ -2453,6 +2714,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const projectArtifactsDirProps: ProjectsArtifactsDirProps = {
+    getState: (slug) => {
+      const info = getProjectArtifactsDirState(slug);
+      return { effectiveDir: info.effectiveDir, artifactsDir: info.artifactsDir };
+    },
+    onChange: openProjectArtifactsDirModal,
+    status: projectArtifactsDirStatus,
   };
 
   const projectSummaryCardNode =
@@ -2593,118 +2863,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Project Artifacts Directory row (Issue #207) */}
-        {(() => {
-          const projArtifactsInfo = getProjectArtifactsDirState(
-            resolvedProjectFilter,
-          );
-          return (
-            <div
-              data-testid="settings-project-artifacts-dir-row"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "6px",
-                paddingTop: "8px",
-                borderTop: "1px solid var(--border-subtle)",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    flexWrap: "wrap",
-                    minWidth: 0,
-                  }}
-                >
-                  <span
-                    style={{
-                      fontSize: "11.5px",
-                      fontWeight: 600,
-                      color: "var(--text-secondary)",
-                    }}
-                  >
-                    Artifacts Directory:
-                  </span>
-                  <code
-                    data-testid="settings-project-artifacts-dir-value"
-                    className="fd-badge fd-mono"
-                    title={projArtifactsInfo.effectiveDir}
-                    style={{
-                      fontSize: "11px",
-                      maxWidth: "100%",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                    }}
-                  >
-                    {projArtifactsInfo.effectiveDir}
-                  </code>
-                  <span
-                    data-testid="settings-project-artifacts-hierarchy-badge"
-                    className="fd-badge fd-mono"
-                    title="Default project hierarchy under [home]/artifacts/[project-name]"
-                    style={{
-                      fontSize: "10px",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    [home]/artifacts/[project-name]
-                  </span>
-                  {projArtifactsInfo.artifactsDir && (
-                    <span
-                      data-testid="settings-project-artifacts-dir-override-badge"
-                      className="fd-badge fd-mono"
-                      style={{
-                        fontSize: "10px",
-                        color: "var(--accent-primary, #f59e0b)",
-                      }}
-                    >
-                      Override
-                    </span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  data-testid="settings-project-change-artifacts-dir-btn"
-                  className="fd-btn"
-                  style={{ fontSize: "11px", padding: "3px 8px" }}
-                  onClick={() =>
-                    openProjectArtifactsDirModal(resolvedProjectFilter)
-                  }
-                >
-                  Change Artifacts Directory
-                </button>
-              </div>
-
-              {projectArtifactsDirStatus && (
-                <div
-                  role="status"
-                  data-testid="project-artifacts-dir-status"
-                  className="fd-card"
-                  style={{
-                    borderColor: "var(--diff-add-border)",
-                    backgroundColor: "var(--diff-add-bg)",
-                    color: "var(--diff-add-text)",
-                    fontSize: "11.5px",
-                    padding: "6px 10px",
-                  }}
-                >
-                  {projectArtifactsDirStatus}
-                </div>
-              )}
-            </div>
-          );
-        })()}
+        {/* Project-scoped Settings has no Projects tab, so the row stays here (Issue #207) */}
+        {initialProject && scopedProject?.kind !== "virtual" && (
+          <ProjectArtifactsDirRow
+            slug={scopedProject?.slug ?? resolvedProjectFilter}
+            displayName={resolvedProjectFilter}
+            artifactsDir={projectArtifactsDirProps}
+          />
+        )}
       </div>
     ) : null;
 
@@ -2805,6 +2971,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               Agents
             </option>
             {!initialProject && (
+              <option value="projects" data-testid="settings-tab-option-projects">
+                Projects
+              </option>
+            )}
+            {!initialProject && (
               <>
                 <option value="system" data-testid="settings-tab-option-system">
                   System
@@ -2856,6 +3027,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             >
               {filteredAgents.length} Agents
             </button>
+            {!initialProject && (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "projects"}
+                data-testid="settings-tab-projects"
+                className={`fd-btn${activeTab === "projects" ? " fd-btn-active" : ""}`}
+                onClick={() => setActiveTab("projects")}
+              >
+                Projects
+              </button>
+            )}
             {!initialProject && (
               <>
                 <button
@@ -4868,6 +5051,41 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         </div>
 
+        {/* TAB: Projects */}
+        {!initialProject && (
+          <div
+            role="tabpanel"
+            aria-label="Projects Panel"
+            data-testid="settings-panel-projects"
+            style={{
+              display: activeTab === "projects" ? "flex" : "none",
+              flexDirection: "column",
+              gap: "12px",
+            }}
+          >
+            <ProjectsSettingsTab
+              projects={projectList}
+              loading={sharedProjectList ? projectsLoaded === false : projectListLoading}
+              error={sharedProjectList ? (projectsError ?? null) : projectListError}
+              projectManagement={projectManagement}
+              onViewAgents={(slug) => {
+                setSelectedProjectFilter(slug);
+                setProjectArtifactsDirStatus(null);
+                setActiveTab("agents");
+              }}
+              artifactsDir={projectArtifactsDirProps}
+              onCreate={(opener) => {
+                newProjectOpenerRef.current = opener;
+                setNewProjectOpen(true);
+              }}
+              onEdit={projectModals.openEdit}
+              onDelete={projectModals.openDelete}
+              deleteStatus={projectModals.deleteStatus}
+              deleteWarning={projectModals.deleteWarning}
+            />
+          </div>
+        )}
+
         {/* TAB 2: System */}
         {!initialProject && (
           <>
@@ -6667,7 +6885,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   style={{ fontSize: "11px" }}
                 >
                   <option value="all">Scope: All Projects</option>
-                  {CANONICAL_PROJECTS.map((proj) => (
+                  {baseProjectOptions.map((proj) => (
                     <option key={proj} value={proj}>
                       Scope: {proj}
                     </option>
@@ -9949,9 +10167,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           const key = modalAgent.name_key.toLowerCase();
           const draft = getDraftForAgent(modalAgent);
           const armedConflict = recastReplaceLeadArmed[key];
-          const projectOptions = CANONICAL_PROJECTS.includes(draft.project)
-            ? CANONICAL_PROJECTS
-            : [draft.project, ...CANONICAL_PROJECTS];
+          // The hub takes a project slug; the dropdown shows the display name.
+          const { choices: projectOptions, value: draftProjectValue } =
+            projectChoices(effectiveProjects, draft.project, [
+              {
+                value: WORKSPACE_PROJECT.toLowerCase(),
+                label: WORKSPACE_PROJECT,
+              },
+            ]);
           const hasRoleOption =
             draft.role === CREATE_CUSTOM_ROLE_VALUE ||
             RECAST_ROLE_OPTIONS.some((opt) => opt.value === draft.role);
@@ -10036,7 +10259,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       data-testid={`recast-project-select-${key}`}
                       className="fd-select fd-mono"
                       style={{ width: "100%", fontSize: "12px", padding: "6px 8px" }}
-                      value={draft.project}
+                      value={draftProjectValue}
                       onChange={(e) => {
                         const nextProject = e.target.value;
                         setRecastDrafts((prev) => ({
@@ -10055,8 +10278,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       }}
                     >
                       {projectOptions.map((proj) => (
-                        <option key={proj} value={proj}>
-                          {proj}
+                        <option key={proj.value} value={proj.value}>
+                          {proj.label}
                         </option>
                       ))}
                     </select>
@@ -10217,10 +10440,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           );
         })()}
 
+        <NewProjectModal
+          isOpen={newProjectOpen}
+          apiClient={apiClient ?? new HubApiClient()}
+          existingSlugs={projectList.map((p) => p.slug)}
+          returnFocusTo={newProjectOpenerRef}
+          onClose={() => setNewProjectOpen(false)}
+          onCreated={(created) => {
+            mergeProjectArtifactsDirs(created);
+            setProjectList((prev) =>
+              prev.some((p) => p.slug === created.slug)
+                ? prev.map((p) => (p.slug === created.slug ? created : p))
+                : [...prev, created],
+            );
+            onProjectsChanged?.();
+          }}
+        />
+        <EditProjectModal
+          isOpen={projectModals.editTarget !== null}
+          project={projectModals.editTarget}
+          apiClient={apiClient ?? new HubApiClient()}
+          returnFocusTo={projectModals.editOpenerRef}
+          onClose={projectModals.closeEdit}
+          onSaved={(saved) => {
+            mergeProjectArtifactsDirs(saved);
+            projectModals.onSaved(saved);
+          }}
+        />
+        <DeleteProjectModal
+          isOpen={projectModals.deleteTarget !== null}
+          project={projectModals.deleteTarget}
+          otherProjects={projectList}
+          apiClient={apiClient ?? new HubApiClient()}
+          returnFocusTo={projectModals.deleteOpenerRef}
+          onClose={projectModals.closeDelete}
+          onDeleted={projectModals.onDeleted}
+        />
+
         {/* System / Project Change Artifacts Directory Sub-Modal (Issue #207) */}
         {artifactsDirModalTarget && (() => {
           const isSystem = artifactsDirModalTarget.scope === "system";
           const projectName = !isSystem ? artifactsDirModalTarget.project : null;
+          const dirLabel = !isSystem ? artifactsDirModalTarget.label : null;
           const projectInfo = projectName
             ? getProjectArtifactsDirState(projectName)
             : null;
@@ -10288,7 +10549,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   >
                     {isSystem
                       ? "Change System Artifacts Directory"
-                      : `Change ${projectName} Artifacts Directory`}
+                      : `Change ${dirLabel} Artifacts Directory`}
                   </strong>
                   <button
                     type="button"
@@ -10314,7 +10575,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   {isSystem
                     ? "Override the hub-wide artifacts root directory, or reset to the default [home]/artifacts path."
-                    : `Override the artifacts directory for ${projectName}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
+                    : `Override the artifacts directory for ${dirLabel}, or reset to the default [artifacts]/${projectInfo?.slug ?? ""} path.`}
                 </p>
 
                 <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>

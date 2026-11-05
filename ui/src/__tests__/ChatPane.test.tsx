@@ -1198,7 +1198,7 @@ describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
 });
 
 describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
-  it("opens the Cancel | Tear Down | Prepare & Decommission modal and auto-hides the ? help popover after 6 seconds", () => {
+  it("opens the Cancel | Decommission | Prepare for Decommission modal and auto-hides the ? help popover after 6 seconds", () => {
     vi.useFakeTimers();
     try {
       render(
@@ -1221,18 +1221,21 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
       expect(modal).toHaveAttribute("role", "dialog");
       expect(modal).toHaveAttribute("aria-modal", "true");
       expect(screen.getByTestId("decommission-cancel-btn")).toHaveTextContent("Cancel");
-      expect(screen.getByTestId("decommission-teardown-btn")).toHaveTextContent("Tear Down");
+      expect(screen.getByTestId("decommission-teardown-btn")).toHaveTextContent(/^Decommission$/);
       expect(screen.getByTestId("decommission-prepare-btn")).toHaveTextContent(
-        "Prepare & Decommission",
+        /^Prepare for Decommission$/,
       );
+      expect(document.body).not.toHaveTextContent(/Tear Down/);
+      expect(document.body).not.toHaveTextContent(/Prepare & Decommission/);
 
       expect(screen.queryByTestId("decommission-help-popover")).toBeNull();
       fireEvent.click(screen.getByTestId("decommission-help-btn"));
 
       const popover = screen.getByTestId("decommission-help-popover");
-      expect(popover).toHaveTextContent(/Prepare & Decommission:/);
+      expect(popover).toHaveTextContent(/Prepare for Decommission:/);
       expect(popover).toHaveTextContent(/STATE\.md\/FerroState/);
-      expect(popover).toHaveTextContent(/Tear Down:/);
+      expect(popover).toHaveTextContent(/Decommission:/);
+      expect(popover).not.toHaveTextContent(/Tear Down/);
       expect(popover).toHaveTextContent(/unregisters the persona/i);
 
       act(() => {
@@ -1274,17 +1277,18 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
     });
     expect(screen.queryByTestId("decommission-modal")).toBeNull();
     expect(await screen.findByTestId("compact-feedback")).toHaveTextContent(
-      "Prepared decommission",
+      "Prepared for decommission",
     );
 
     fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
 
     await waitFor(() => {
       expect(onDecommissionSession).toHaveBeenCalledWith("teardown");
     });
     expect(await screen.findByTestId("compact-feedback")).toHaveTextContent(
-      "Tore down session",
+      "Decommissioned session",
     );
     unmount();
 
@@ -1373,6 +1377,7 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
 
     fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
 
     await waitFor(() => {
       expect(decommCalls).toEqual([
@@ -1384,6 +1389,204 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
       expect(screen.queryByText("Standalone transcript turn")).toBeNull();
     });
     expect(transcriptCalls).toEqual([]);
+  });
+});
+
+describe("ChatPane Decommission asks for a second confirmation (Record #128)", () => {
+  function renderPane(onDecommissionSession = vi.fn(async () => undefined)) {
+    render(
+      <ChatPane
+        agentName="kacey"
+        agentDisplayName="Kacey"
+        adapter="claude"
+        sessionId="sess-kacey-01"
+        turns={[]}
+        agentSettingsOpen={true}
+        onDecommissionSession={onDecommissionSession}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    return onDecommissionSession;
+  }
+
+  it("does not decommission when Decommission is clicked; it opens the confirmation naming the agent", () => {
+    const onDecommissionSession = renderPane();
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+
+    expect(onDecommissionSession).not.toHaveBeenCalled();
+    const dialog = screen.getByTestId("decommission-confirm-dialog");
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(dialog).toHaveTextContent(/Are you sure you want to decommission\s+Kacey\?/);
+    expect(dialog).toHaveTextContent(
+      "This immediately stops the runtime session, clears queues and routes, and unregisters the persona.",
+    );
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toHaveTextContent("Cancel");
+    expect(screen.getByTestId("decommission-confirm-submit-btn")).toHaveTextContent(
+      "Yes, Decommission",
+    );
+    // The choices dialog is replaced, not stacked under the confirmation.
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    // The safe button takes the focus so a stray Enter does not decommission.
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toHaveFocus();
+  });
+
+  it("Cancel returns to the choices without decommissioning", () => {
+    const onDecommissionSession = renderPane();
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-cancel-btn"));
+
+    expect(onDecommissionSession).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+  });
+
+  it("Escape and a backdrop click leave the confirmation one step at a time without decommissioning", () => {
+    const onDecommissionSession = renderPane();
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    const backdrop = screen.getByTestId("decommission-confirm-dialog").parentElement as HTMLElement;
+    fireEvent.click(backdrop);
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+
+    // A second Escape closes the choices dialog itself.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    expect(onDecommissionSession).not.toHaveBeenCalled();
+  });
+
+  it("Yes, Decommission calls teardown exactly once and closes both dialogs", async () => {
+    const onDecommissionSession = renderPane();
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+
+    await waitFor(() => {
+      expect(onDecommissionSession).toHaveBeenCalledTimes(1);
+    });
+    expect(onDecommissionSession).toHaveBeenCalledWith("teardown");
+    await waitFor(() => {
+      expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+  });
+
+  it("Prepare for Decommission still acts in one step, with no confirmation", async () => {
+    const onDecommissionSession = renderPane();
+    fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
+
+    await waitFor(() => {
+      expect(onDecommissionSession).toHaveBeenCalledWith("prepare");
+    });
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+  });
+
+  it("reopening the modal after a cancelled confirmation starts at the choices", () => {
+    renderPane();
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("decommission-cancel-btn"));
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+  });
+
+  it("focuses the safe Cancel button when the choices open and when returning from the confirmation", () => {
+    renderPane();
+    expect(screen.getByTestId("decommission-cancel-btn")).toHaveFocus();
+
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toHaveFocus();
+    fireEvent.click(screen.getByTestId("decommission-confirm-cancel-btn"));
+    expect(screen.getByTestId("decommission-cancel-btn")).toHaveFocus();
+  });
+
+  function paneElement(
+    agentName: string,
+    sessionId: string,
+    onDecommissionSession: (mode: "prepare" | "teardown") => Promise<unknown>,
+  ) {
+    return (
+      <ChatPane
+        agentName={agentName}
+        agentDisplayName={agentName}
+        adapter="claude"
+        sessionId={sessionId}
+        turns={[]}
+        agentSettingsOpen={true}
+        onDecommissionSession={onDecommissionSession as never}
+      />
+    );
+  }
+
+  it("switching the target agent while the confirmation is open closes everything and reopens at the choices", () => {
+    const onDecommissionSession = vi.fn(async () => undefined);
+    const { rerender } = render(paneElement("kacey", "sess-kacey-01", onDecommissionSession));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+
+    rerender(paneElement("ferris", "sess-ferris-01", onDecommissionSession));
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+    expect(screen.getByTestId("decommission-modal")).toBeInTheDocument();
+    expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    expect(onDecommissionSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps the confirmation open and both buttons disabled while the teardown is in flight", async () => {
+    let resolveTeardown: () => void = () => undefined;
+    const onDecommissionSession = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveTeardown = resolve;
+      }),
+    );
+    renderPane(onDecommissionSession as never);
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("decommission-confirm-submit-btn")).toBeDisabled();
+    });
+    expect(screen.getByTestId("decommission-confirm-cancel-btn")).toBeDisabled();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    const backdrop = screen.getByTestId("decommission-confirm-dialog").parentElement as HTMLElement;
+    fireEvent.click(backdrop);
+    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+    expect(onDecommissionSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveTeardown();
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+  });
+
+  it("closes both dialogs and shows the error when the teardown fails", async () => {
+    const onDecommissionSession = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    renderPane(onDecommissionSession);
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("decommission-confirm-dialog")).toBeNull();
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("boom");
   });
 });
 

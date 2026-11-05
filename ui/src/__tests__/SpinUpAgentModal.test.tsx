@@ -286,6 +286,10 @@ describe("SpinUpAgentModal", () => {
     fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
     fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+    // Decommission asks for a second confirmation before it stops the session (Record #128).
+    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+    expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
 
     await waitFor(() => {
       expect(
