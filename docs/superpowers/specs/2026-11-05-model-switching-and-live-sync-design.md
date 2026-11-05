@@ -101,8 +101,9 @@ there.
 Showing a requested-but-different model as "pending" next to the running one is a follow-up and
 NOT part of this record.
 
-The value may be a placeholder (`MODEL_PLACEHOLDER_M26`, `M39`, `M404`, `M405`,
-`MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) or an effort-suffixed id; both resolve through the existing
+The value may be a placeholder (the families `MODEL_PLACEHOLDER_M318` to `M320` (Gemini 3.8 Flash
+High/Medium/Low), `M400` to `M405` (Claude Opus 5.5 and Claude Sonnet 5.5, Low/Medium/High each),
+`M417` to `M419` (Gemini 4 Argon High/Medium/Low), and `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) or an effort-suffixed id; both resolve through the existing
 `resolve_agy_model_info` and `split_agy_thinking_suffix`, which must handle both. The
 truncated-body path (`parse_agy_generator_model`) keeps its string scan and never reads
 `planModel`; the per-step read applies only to complete JSON.

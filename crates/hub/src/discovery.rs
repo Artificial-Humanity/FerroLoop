@@ -6251,16 +6251,27 @@ mod tests {
         assert!(parse_agy_generator_model("garbage").is_none());
     }
 
-    /// A model config that names the placeholders a trajectory's pending choice can carry.
+    /// A model config that names the placeholders a trajectory's pending choice can carry, with
+    /// the mapping the language server reports: M318-M320 Gemini 3.8 Flash High/Medium/Low,
+    /// M400-M402 Claude Opus 5.5 Low/Medium/High, M403-M405 Claude Sonnet 5.5 Low/Medium/High,
+    /// M417-M419 Gemini 4 Argon High/Medium/Low.
     const AGY_PENDING_CONFIG_FIXTURE: &str = r#"{
         "clientModelConfigs": [
-            {"modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M26"}},
-            {"modelId":"claude-sonnet-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M39"}},
-            {"modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"}},
-            {"modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}},
+            {"modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+            {"modelId":"gemini-4-argon-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M418"}},
+            {"modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M419"}},
+            {"modelId":"claude-sonnet-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}},
+            {"modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"}},
+            {"modelId":"claude-sonnet-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M403"}},
+            {"modelId":"claude-opus-5-5-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M402"}},
+            {"modelId":"claude-opus-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M401"}},
+            {"modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M400"}},
+            {"modelId":"gemini-3.8-flash-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M318"}},
+            {"modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}},
+            {"modelId":"gemini-3.8-flash-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M320"}},
             {"modelId":"gpt-oss-120b-medium","modelOrAlias":{"model":"MODEL_OPENAI_GPT_OSS_120B_MEDIUM"}}
         ],
-        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M405"}}
+        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M319"}}
     }"#;
 
     /// A `CORTEX_STEP_TYPE_USER_INPUT` step as the language server returns it: the model the
@@ -6365,7 +6376,7 @@ mod tests {
     #[test]
     fn agy_a_newer_user_input_does_not_replace_the_running_model() {
         let steps = [
-            user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
+            user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
             planner_step("MODEL_PLACEHOLDER_M418"),
             tool_step_with_model("MODEL_PLACEHOLDER_M418"),
             user_input_step(Some("MODEL_PLACEHOLDER_M401"), None),
@@ -6405,10 +6416,10 @@ mod tests {
         );
         assert_agy_steps_model(
             &[
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
-                planner_step("MODEL_PLACEHOLDER_M404"),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
+                planner_step("MODEL_PLACEHOLDER_M400"),
             ],
-            Some("MODEL_PLACEHOLDER_M404"),
+            Some("MODEL_PLACEHOLDER_M400"),
         );
     }
 
@@ -6416,32 +6427,32 @@ mod tests {
     fn agy_the_latest_step_with_a_running_model_wins_over_newer_silent_steps() {
         assert_agy_steps_model(
             &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
-                planner_step("MODEL_PLACEHOLDER_M405"),
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                planner_step("MODEL_PLACEHOLDER_M319"),
                 tool_step(),
                 serde_json::json!({ "type": "CORTEX_STEP_TYPE_EPHEMERAL_MESSAGE" }),
                 tool_step(),
             ],
-            Some("MODEL_PLACEHOLDER_M405"),
+            Some("MODEL_PLACEHOLDER_M319"),
         );
         // A tool step with a generatorModel and no modelUsage counts.
         assert_agy_steps_model(
             &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
-                tool_step_with_model("MODEL_PLACEHOLDER_M405"),
+                planner_step("MODEL_PLACEHOLDER_M400"),
+                tool_step_with_model("MODEL_PLACEHOLDER_M319"),
                 tool_step(),
             ],
-            Some("MODEL_PLACEHOLDER_M405"),
+            Some("MODEL_PLACEHOLDER_M319"),
         );
         // A user input, however new, hides nothing.
         assert_agy_steps_model(
             &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
+                planner_step("MODEL_PLACEHOLDER_M400"),
                 tool_step(),
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
                 tool_step(),
             ],
-            Some("MODEL_PLACEHOLDER_M404"),
+            Some("MODEL_PLACEHOLDER_M400"),
         );
     }
 
@@ -6485,13 +6496,13 @@ mod tests {
     fn agy_before_the_first_turn_the_requested_model_is_the_only_signal() {
         // Only user inputs: the tail parser names nothing, the complete parser reads planModel.
         assert_agy_requested_model_only(
-            &[user_input_step(Some("MODEL_PLACEHOLDER_M39"), None)],
-            Some("MODEL_PLACEHOLDER_M39"),
+            &[user_input_step(Some("MODEL_PLACEHOLDER_M405"), None)],
+            Some("MODEL_PLACEHOLDER_M405"),
         );
         // lastUserConfig is used when userConfig is absent, empty or blank on the step.
         assert_agy_requested_model_only(
-            &[user_input_step(None, Some("MODEL_PLACEHOLDER_M26"))],
-            Some("MODEL_PLACEHOLDER_M26"),
+            &[user_input_step(None, Some("MODEL_PLACEHOLDER_M417"))],
+            Some("MODEL_PLACEHOLDER_M417"),
         );
         for blank in ["", "   "] {
             assert_agy_requested_model_only(
@@ -6502,27 +6513,27 @@ mod tests {
         // userConfig wins over lastUserConfig on one step.
         assert_agy_requested_model_only(
             &[user_input_step(
-                Some("MODEL_PLACEHOLDER_M39"),
-                Some("MODEL_PLACEHOLDER_M26"),
+                Some("MODEL_PLACEHOLDER_M405"),
+                Some("MODEL_PLACEHOLDER_M417"),
             )],
-            Some("MODEL_PLACEHOLDER_M39"),
+            Some("MODEL_PLACEHOLDER_M405"),
         );
         // The newest user-input step comes first, and steps with no model do not hide it.
         assert_agy_requested_model_only(
             &[
-                user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
-                user_input_step(Some("MODEL_PLACEHOLDER_M39"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M405"), None),
                 tool_step(),
             ],
-            Some("MODEL_PLACEHOLDER_M39"),
+            Some("MODEL_PLACEHOLDER_M405"),
         );
         // A newest step with only blank requests falls back to an older step's request.
         assert_agy_requested_model_only(
             &[
-                user_input_step(Some("MODEL_PLACEHOLDER_M26"), None),
+                user_input_step(Some("MODEL_PLACEHOLDER_M417"), None),
                 user_input_step(Some("  "), Some("")),
             ],
-            Some("MODEL_PLACEHOLDER_M26"),
+            Some("MODEL_PLACEHOLDER_M417"),
         );
         // The value is trimmed.
         assert_agy_requested_model_only(
@@ -6552,17 +6563,17 @@ mod tests {
         // A blank signal on a newer step does not hide an older one.
         assert_agy_steps_model(
             &[
-                planner_step("MODEL_PLACEHOLDER_M404"),
+                planner_step("MODEL_PLACEHOLDER_M400"),
                 serde_json::json!({ "metadata": { "generatorModel": "" } }),
                 user_input_step(Some("  "), Some("")),
             ],
-            Some("MODEL_PLACEHOLDER_M404"),
+            Some("MODEL_PLACEHOLDER_M400"),
         );
         // No steps array at all.
         assert_eq!(parse_agy_generator_model(r#"{"trajectory":{}}"#), None);
         assert_eq!(parse_agy_generator_model(r#"{"status":"IDLE"}"#), None);
         // `userInput` is read from steps only, never from the body root or the trajectory.
-        let misplaced = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}},"trajectory":{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}},"steps":[]}}"#;
+        let misplaced = r#"{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"trajectory":{"userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}},"steps":[]}}"#;
         assert_eq!(parse_agy_generator_model(misplaced), None);
         assert_eq!(parse_agy_complete_generator_model(misplaced), None);
     }
@@ -6570,13 +6581,13 @@ mod tests {
     #[test]
     fn agy_cut_off_bodies_ignore_the_requested_plan_model() {
         // The string scan is for the tail-steps call; it never reads planModel.
-        let cut = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}}},{"metadata":{"generatorMo"#;
+        let cut = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorMo"#;
         assert_eq!(parse_agy_generator_model(cut), None);
         assert_eq!(parse_agy_complete_generator_model(cut), None);
-        let cut_with_step = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M39"}}}},{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M404"}},{"metadata":{"generatorMo"#;
+        let cut_with_step = r#"{"trajectory":{"steps":[{"type":"CORTEX_STEP_TYPE_USER_INPUT","userInput":{"userConfig":{"plannerConfig":{"planModel":"MODEL_PLACEHOLDER_M405"}}}},{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M400"}},{"metadata":{"generatorMo"#;
         assert_eq!(
             parse_agy_generator_model(cut_with_step).as_deref(),
-            Some("MODEL_PLACEHOLDER_M404")
+            Some("MODEL_PLACEHOLDER_M400")
         );
         assert_eq!(parse_agy_complete_generator_model(cut_with_step), None);
     }
@@ -6585,8 +6596,8 @@ mod tests {
     fn agy_requested_plan_model_from_a_step_resolves_as_a_placeholder_or_an_effort_suffixed_id() {
         let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
         for (value, model, level) in [
-            ("MODEL_PLACEHOLDER_M26", "gemini-4-argon", Some("high")),
-            ("MODEL_PLACEHOLDER_M39", "claude-sonnet-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
             ("claude-sonnet-5-5-high", "claude-sonnet-5-5", Some("high")),
             ("gpt-oss-120b-medium", "gpt-oss-120b", Some("medium")),
         ] {
@@ -6604,10 +6615,22 @@ mod tests {
         let config = parse_agy_model_config(AGY_PENDING_CONFIG_FIXTURE).expect("config parses");
         for (value, model, level) in [
             // Placeholders come from the model config.
-            ("MODEL_PLACEHOLDER_M26", "gemini-4-argon", Some("high")),
-            ("MODEL_PLACEHOLDER_M39", "claude-sonnet-5-5", Some("high")),
-            ("MODEL_PLACEHOLDER_M404", "claude-opus-5-5", Some("low")),
-            ("MODEL_PLACEHOLDER_M405", "gemini-3.8-flash", Some("medium")),
+            ("MODEL_PLACEHOLDER_M417", "gemini-4-argon", Some("high")),
+            ("MODEL_PLACEHOLDER_M405", "claude-sonnet-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M400", "claude-opus-5-5", Some("low")),
+            ("MODEL_PLACEHOLDER_M319", "gemini-3.8-flash", Some("medium")),
+            ("MODEL_PLACEHOLDER_M318", "gemini-3.8-flash", Some("high")),
+            ("MODEL_PLACEHOLDER_M320", "gemini-3.8-flash", Some("low")),
+            ("MODEL_PLACEHOLDER_M401", "claude-opus-5-5", Some("medium")),
+            ("MODEL_PLACEHOLDER_M402", "claude-opus-5-5", Some("high")),
+            ("MODEL_PLACEHOLDER_M403", "claude-sonnet-5-5", Some("low")),
+            (
+                "MODEL_PLACEHOLDER_M404",
+                "claude-sonnet-5-5",
+                Some("medium"),
+            ),
+            ("MODEL_PLACEHOLDER_M418", "gemini-4-argon", Some("medium")),
+            ("MODEL_PLACEHOLDER_M419", "gemini-4-argon", Some("low")),
             (
                 "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
                 "gpt-oss-120b",
@@ -7118,7 +7141,7 @@ mod tests {
         }
         let tmp = TempDir::new().unwrap();
         let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
-        let pending = user_input_step(Some("MODEL_PLACEHOLDER_M39"), None);
+        let pending = user_input_step(Some("MODEL_PLACEHOLDER_M405"), None);
         // (case, steps the tail call returns, steps the full trajectory holds, model, effort,
         //  whether the full trajectory is asked)
         let cases = [
@@ -7126,11 +7149,11 @@ mod tests {
             (
                 "tail-running",
                 vec![
-                    planner_step("MODEL_PLACEHOLDER_M404"),
+                    planner_step("MODEL_PLACEHOLDER_M400"),
                     tool_step(),
                     pending.clone(),
                 ],
-                vec![planner_step("MODEL_PLACEHOLDER_M26")],
+                vec![planner_step("MODEL_PLACEHOLDER_M417")],
                 "claude-opus-5-5",
                 "low",
                 false,
@@ -7141,7 +7164,7 @@ mod tests {
                 "tail-user-input-only",
                 vec![tool_step(), pending.clone()],
                 vec![
-                    planner_step("MODEL_PLACEHOLDER_M404"),
+                    planner_step("MODEL_PLACEHOLDER_M400"),
                     tool_step(),
                     pending.clone(),
                 ],

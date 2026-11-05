@@ -26,8 +26,8 @@ and `cargo fmt --check` before each commit. UI task: `cd ui && npx tsc --noEmit 
    so a window of user inputs only falls through to the full trajectory. Nothing is read from the
    body root or `/trajectory`. The structure was confirmed against the live Antigravity language
    server by the Lead on 2026-11-05, not by this branch's tests.
-2. Make sure the value resolves for placeholders (`MODEL_PLACEHOLDER_M26/M39/M404/M405`,
-   `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) and effort-suffixed ids through the existing
+2. Make sure the value resolves for placeholders (`MODEL_PLACEHOLDER_M318` to `M320`, `M400` to `M405`,
+   `M417` to `M419`, `MODEL_OPENAI_GPT_OSS_120B_MEDIUM`) and effort-suffixed ids through the existing
    `resolve_agy_model_info` / `split_agy_thinking_suffix`; add the missing handling.
 3. Tests with JSON shaped like the real response (steps with `"type":
    "CORTEX_STEP_TYPE_USER_INPUT"` etc.), under `/steps` and `/trajectory/steps`: a newest `USER_INPUT`
