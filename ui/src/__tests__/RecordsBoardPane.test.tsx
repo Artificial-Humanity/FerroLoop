@@ -96,8 +96,33 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
       expect(listSpy).toHaveBeenCalledWith("ferroloop");
     });
 
-    expect(screen.getByTestId("records-board-pane")).toBeInTheDocument();
+    const boardPane = screen.getByTestId("records-board-pane");
+    expect(boardPane).toBeInTheDocument();
+    expect(boardPane.style.overflowY).toBe("auto");
+    expect(boardPane.style.overflowX).toBe("hidden");
     expect(screen.getByTestId("board-project-select")).toHaveValue("ferroloop");
+
+    const projectActionsRow = screen.getByTestId("board-project-actions-row");
+    expect(
+      within(projectActionsRow).getByTestId("board-project-select"),
+    ).toBeInTheDocument();
+    const actionsGroup = within(projectActionsRow).getByTestId(
+      "board-actions-group",
+    );
+    const newRecordBtn = within(actionsGroup).getByTestId("board-new-record-btn");
+    const refreshBtn = within(actionsGroup).getByTestId("board-refresh-btn");
+    expect(newRecordBtn).toHaveAttribute("aria-label", "+ New Record");
+    expect(newRecordBtn.querySelector("svg")).not.toBeNull();
+    expect(refreshBtn).toHaveAttribute("aria-label", "Refresh");
+    expect(refreshBtn.querySelector("svg")).not.toBeNull();
+
+    const swimlanesGrid = screen.getByTestId("board-swimlanes-grid");
+    expect(swimlanesGrid.style.overflow).toBe("");
+    const todoSwimlane = screen.getByTestId("swimlane-todo");
+    expect(todoSwimlane.style.overflow).toBe("");
+    expect(todoSwimlane.style.minHeight).toBe("");
+    const todoCardsList = screen.getByTestId("swimlane-cards-todo");
+    expect(todoCardsList.style.overflowY).toBe("");
 
     const metricsStrip = screen.getByTestId("board-metrics-strip");
     expect(metricsStrip).toHaveTextContent(/Todo:\s*1/i);
@@ -116,7 +141,7 @@ describe("Wave B UI — Record 1: RecordsBoardPane Kanban Swimlanes & Velocity S
     expect(countsGroup).toHaveTextContent(/Total:\s*3/i);
     expect(countsGroup.style.display).toBe("grid");
     expect(countsGroup.style.gridTemplateColumns).toBe(
-      "repeat(4, minmax(0, 1fr))",
+      "repeat(2, minmax(0, 1fr))",
     );
     expect(countsGroup.style.gridColumn).toBe("1 / -1");
 

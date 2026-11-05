@@ -2994,9 +2994,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 borderRadius: "6px",
                 backgroundColor: "var(--bg-elevated)",
                 border: "1px solid var(--border-subtle)",
-                position: "sticky",
-                top: 0,
-                zIndex: 2,
               }}
             >
               {(
@@ -3047,9 +3044,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 borderRadius: "6px",
                 backgroundColor: "var(--bg-elevated)",
                 border: "1px solid var(--border-subtle)",
-                position: "sticky",
-                top: 0,
-                zIndex: 2,
               }}
             >
               {(
@@ -3261,8 +3255,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 display: "flex",
                 flexDirection: "column",
                 gap: "8px",
-                maxHeight: "340px",
-                overflowY: "auto",
                 paddingRight: "2px",
               }}
             >
@@ -3297,7 +3289,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           display: "flex",
                           alignItems: "center",
                           gap: "8px",
-                          minWidth: "150px",
+                          flexWrap: "wrap",
+                          minWidth: 0,
                         }}
                       >
                         <input
@@ -3793,8 +3786,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 display: "grid",
                 gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
                 gap: "6px",
-                maxHeight: "220px",
-                overflowY: "auto",
               }}
             >
               {roleRegistry.map((roleRec) => (
@@ -4021,9 +4012,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 : "none",
               flexDirection: "column",
               gap: "12px",
-              overflowY: "auto",
               minHeight: 0,
-              maxHeight: "100%",
             }}
           >
           {/* Record #71: Manage Vendor Cloud Sessions in FerroDeck */}
@@ -4034,7 +4023,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               display: "flex",
               flexDirection: "column",
               gap: "10px",
-              overflowY: "auto",
               minHeight: 0,
             }}
           >
@@ -4284,9 +4272,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 : "none",
               flexDirection: "column",
               gap: "12px",
-              overflowY: "auto",
               minHeight: 0,
-              maxHeight: "100%",
             }}
           >
           {/* Record #72: Local Model & API-Key Agent Lifecycle (Ollama, Lemonade, OpenAI-Compatible) */}
@@ -4297,7 +4283,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               display: "flex",
               flexDirection: "column",
               gap: "10px",
-              overflowY: "auto",
               minHeight: 0,
             }}
           >
@@ -4572,9 +4557,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   borderRadius: "6px",
                   backgroundColor: "var(--bg-elevated)",
                   border: "1px solid var(--border-subtle)",
-                  position: "sticky",
-                  top: 0,
-                  zIndex: 2,
                 }}
               >
                 {(

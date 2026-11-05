@@ -859,8 +859,17 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     expect(tabBar).toHaveStyle({ flexShrink: "0" });
     expect(scrollBody).toHaveStyle({ overflowY: "auto" });
 
-    // 1. Agents sub-tabs
-    expect(screen.getByTestId("agents-subtab-bar")).toBeInTheDocument();
+    // 1. Agents sub-tabs (non-sticky sub-tab bar and unified single scroll container without nested overflowY: auto)
+    const agentsSubTabBar = screen.getByTestId("agents-subtab-bar");
+    expect(agentsSubTabBar).toBeInTheDocument();
+    expect(agentsSubTabBar.style.position).toBe("");
+    const agentsList = screen.getByTestId("settings-agents-list");
+    expect(agentsList.style.maxHeight).toBe("");
+    expect(agentsList.style.overflowY).toBe("");
+    const roleRegistryList = screen.getByTestId("role-registry-list");
+    expect(roleRegistryList.style.maxHeight).toBe("");
+    expect(roleRegistryList.style.overflowY).toBe("");
+
     const rosterSubTab = screen.getByTestId("agents-subtab-roster");
     const rolesSubTab = screen.getByTestId("agents-subtab-roles");
     const cloudSessionsSubTab = screen.getByTestId("agents-subtab-cloud-sessions");
@@ -870,6 +879,10 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
     const rolesPanel = screen.getByTestId("agents-subpanel-roles");
     const cloudSessionsPanel = screen.getByTestId("agents-subpanel-cloud-sessions");
     const localRuntimesPanel = screen.getByTestId("agents-subpanel-local-runtimes");
+    expect(cloudSessionsPanel.style.overflowY).toBe("");
+    expect(cloudSessionsPanel.style.maxHeight).toBe("");
+    expect(localRuntimesPanel.style.overflowY).toBe("");
+    expect(localRuntimesPanel.style.maxHeight).toBe("");
 
     expect(rosterSubTab).toHaveAttribute("aria-selected", "true");
     expect(rolesSubTab).toHaveAttribute("aria-selected", "false");
@@ -906,7 +919,9 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
 
     // 2. System sub-tabs
     fireEvent.click(screen.getByTestId("settings-tab-system"));
-    expect(screen.getByTestId("system-subtab-bar")).toBeInTheDocument();
+    const systemSubTabBar = screen.getByTestId("system-subtab-bar");
+    expect(systemSubTabBar).toBeInTheDocument();
+    expect(systemSubTabBar.style.position).toBe("");
 
     const sysGeneralTab = screen.getByTestId("system-subtab-general");
     const sysStorageTab = screen.getByTestId("system-subtab-storage");
@@ -969,9 +984,9 @@ describe("SettingsModal Accessibility tab & UI Polish Pass", () => {
       />,
     );
 
-    expect(
-      screen.getByTestId("project-settings-subtab-bar"),
-    ).toBeInTheDocument();
+    const projectSubTabBar = screen.getByTestId("project-settings-subtab-bar");
+    expect(projectSubTabBar).toBeInTheDocument();
+    expect(projectSubTabBar.style.position).toBe("");
 
     const overviewTab = screen.getByTestId("project-tab-overview");
     const agentsTab = screen.getByTestId("project-tab-agents");
