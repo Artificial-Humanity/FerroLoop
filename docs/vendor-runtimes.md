@@ -14,7 +14,9 @@ peer credentials, or request ids into this document or into tests.
 
 ## What Hub exposes
 
-`SessionContextUsage` is `used_tokens` and `max_tokens`.
+`SessionContextUsage` is `used_tokens` and `max_tokens`, plus `source` (`reported`, `catalog` or
+`assumed`: how the window was found; absent in older reports) and `offered_windows` (the sizes the
+model offers, when the vendor lists them).
 
 `SessionQuotaUsage` is optional on each discovered route session and on
 `GET /api/v1/sessions/:id/transcript` next to `context_usage`:

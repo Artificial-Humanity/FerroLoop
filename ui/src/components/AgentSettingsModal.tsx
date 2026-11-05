@@ -13,6 +13,9 @@ import {
 } from "./SettingsModal";
 import {
   formatModelOptionLabel,
+  contextWindowSourceTitle,
+  formatContextMax,
+  contextAtCompactThreshold,
   formatTokenCount,
   getVendorModelOptions,
   resolveSessionVendor,
@@ -1209,39 +1212,106 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   >
                     Context Window Usage
                   </span>
-                  <span className="fd-mono" style={{ fontSize: "12px", color: "var(--text-primary)" }}>
-                    Context: {formatTokenCount(contextEstimate.usedTokens)} /{" "}
-                    {formatTokenCount(contextEstimate.maxTokens)} ({contextEstimate.percent}%)
+                  <span
+                    data-testid="context-level-text"
+                    className="fd-mono"
+                    style={{ fontSize: "12px", color: "var(--text-primary)" }}
+                  >
+                    {contextEstimate.maxTokens === null ? (
+                      <>
+                        Context:{" "}
+                        {contextEstimate.usedTokens === null
+                          ? "no data"
+                          : `${contextEstimate.estimated ? "about " : ""}${formatTokenCount(contextEstimate.usedTokens)} used`}
+                        {contextEstimate.usedTokens !== null ? ", window not reported" : ""}
+                      </>
+                    ) : (
+                      <>
+                        Context: {formatTokenCount(contextEstimate.usedTokens ?? 0)} /{" "}
+                        <span
+                          data-testid="context-max"
+                          data-source={contextEstimate.source ?? "unknown"}
+                          title={contextWindowSourceTitle(contextEstimate.source)}
+                          style={
+                            contextEstimate.source === "assumed"
+                              ? { fontStyle: "italic", cursor: "help" }
+                              : undefined
+                          }
+                        >
+                          {formatContextMax(contextEstimate.maxTokens, contextEstimate.source)}
+                        </span>{" "}
+                        ({contextEstimate.percent}%)
+                      </>
+                    )}
                   </span>
                 </div>
-                <div
-                  role="progressbar"
-                  aria-label="Context level"
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={contextEstimate.percent}
-                  style={{
-                    width: "100%",
-                    height: "8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-input)",
-                    border: "1px solid var(--border-subtle)",
-                    overflow: "hidden",
-                  }}
-                >
+                {contextEstimate.percent !== null && (
                   <div
+                    role="progressbar"
+                    aria-label="Context level"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={contextEstimate.percent}
+                    aria-valuetext={`${contextEstimate.percent}%${
+                      contextEstimate.source === "assumed"
+                        ? " against an assumed window"
+                        : contextEstimate.source === "reported" ||
+                            contextEstimate.source === "catalog"
+                          ? ` of a ${contextEstimate.source} window`
+                          : ""
+                    }`}
                     style={{
-                      width: `${contextEstimate.percent}%`,
-                      height: "100%",
-                      backgroundColor:
-                        contextEstimate.percent >= 80
-                          ? "var(--status-danger)"
-                          : contextEstimate.percent >= 50
-                            ? "var(--status-stale)"
-                            : "var(--status-alive)",
+                      width: "100%",
+                      height: "8px",
+                      borderRadius: "4px",
+                      backgroundColor: "var(--bg-input)",
+                      border: "1px solid var(--border-subtle)",
+                      overflow: "hidden",
                     }}
-                  />
-                </div>
+                  >
+                    <div
+                      style={{
+                        width: `${contextEstimate.percent}%`,
+                        height: "100%",
+                        backgroundColor:
+                          contextEstimate.percent >= 80
+                            ? "var(--status-danger)"
+                            : contextEstimate.percent >= 50
+                              ? "var(--status-stale)"
+                              : "var(--status-alive)",
+                      }}
+                    />
+                  </div>
+                )}
+                {(contextEstimate.offeredWindows?.length ?? 0) > 0 && (
+                  <div
+                    data-testid="context-offered-windows"
+                    className="fd-mono"
+                    style={{ fontSize: "11px", color: "var(--text-muted)" }}
+                  >
+                    Offered:{" "}
+                    {(contextEstimate.offeredWindows ?? []).map((size, index) => {
+                      const effective = size === contextEstimate.maxTokens;
+                      return (
+                        <React.Fragment key={size}>
+                          {index > 0 ? ", " : ""}
+                          <span
+                            data-testid={`context-offered-${size}`}
+                            data-effective={effective ? "true" : undefined}
+                            aria-current={effective ? "true" : undefined}
+                            style={
+                              effective
+                                ? { fontWeight: 700, color: "var(--text-primary)" }
+                                : undefined
+                            }
+                          >
+                            {formatTokenCount(size)}
+                          </span>
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               <div
@@ -2351,9 +2421,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               data-testid="compact-context-btn"
               disabled={!canCompact}
               title={
-                contextEstimate.percent >= 50
-                  ? "Snapshot a FerroState checkpoint, then send /compact to the session"
-                  : "Available when context reaches 50%"
+                contextEstimate.percent === null
+                  ? "Context window unknown \u2014 compact anyway"
+                  : contextAtCompactThreshold(contextEstimate)
+                    ? "Snapshot a FerroState checkpoint, then send /compact to the session"
+                    : "Available when context reaches 50%"
               }
               onClick={onCompactContext}
             >

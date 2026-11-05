@@ -606,9 +606,20 @@ export interface TranscriptTurn {
   created_at?: string | null;
 }
 
+/**
+ * How the hub found a context window: `reported` (the session or the vendor said it for this
+ * session), `catalog` (the vendor's model catalog lists it) or `assumed` (a default: nothing says
+ * it).
+ */
+export type ContextWindowSource = "reported" | "catalog" | "assumed";
+
 export interface SessionContextUsage {
   used_tokens: number;
   max_tokens: number;
+  /** How `max_tokens` was found. Absent from an older hub: treat as unknown. */
+  source?: ContextWindowSource;
+  /** Window sizes the model offers, ascending; absent when no vendor file lists them. */
+  offered_windows?: number[];
 }
 
 export interface SessionTranscriptResponse {
