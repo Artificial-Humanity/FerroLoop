@@ -170,6 +170,28 @@ fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     }
 }
 
+/// Kill the child and, on unix, every process in its group (the engine runs in its own group,
+/// so its helpers die with it), then reap the child.
+fn kill_tree(child: &mut std::process::Child) {
+    kill_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Send SIGKILL to the process group led by `pid` (a no-op off unix).
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: `killpg` only sends a signal. A group that still has a member keeps its id
+        // from being reused, so this cannot reach an unrelated process group.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Run `cmd` with piped output until it exits, `timeout` passes (the process is killed) or its
 /// output passes `stdout_cap`.
 fn run_bounded(
@@ -180,7 +202,13 @@ fn run_bounded(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = spawn_retrying(&mut cmd).map_err(RunError::Spawn)?;
+    let pid = child.id();
     let mut out = child.stdout.take().expect("piped stdout");
     let mut err = child.stderr.take().expect("piped stderr");
     let overflow = Arc::new(AtomicBool::new(false));
@@ -209,19 +237,16 @@ fn run_bounded(
             Ok(Some(s)) => break s,
             Ok(None) => {}
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 return Err(RunError::Spawn(e));
             }
         }
         if overflow.load(Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Err(RunError::Overflow);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return Err(RunError::Timeout);
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -239,6 +264,8 @@ fn run_bounded(
     }
     let stdout = stdout.unwrap_or_default();
     if stdout.len() > stdout_cap {
+        // The engine can have died of the closed pipe while its helpers still run.
+        kill_group(pid);
         return Err(RunError::Overflow);
     }
     Ok(Captured {
@@ -301,6 +328,17 @@ pub fn dump_dom(
         .map_err(|e| {
             BrowseError::EngineFailed(format!("could not make a scratch directory: {e}"))
         })?;
+    // A file left at the path by an earlier run must not pass for this run's screenshot.
+    if let Some(p) = screenshot
+        && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
+    {
+        std::fs::remove_file(p).map_err(|e| {
+            BrowseError::EngineFailed(format!(
+                "could not remove the old screenshot {}: {e}",
+                p.display()
+            ))
+        })?;
+    }
     let mut cmd = Command::new(&engine.path);
     cmd.args(dump_args(scratch.path(), viewport, screenshot, target_url))
         .env_clear()
@@ -638,6 +676,127 @@ echo '<p>ok</p>'"#,
         .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(10));
         assert!(e.to_string().contains("killed"), "{e}");
+    }
+
+    /// Whether process `pid` is gone (or only a zombie waiting to be reaped).
+    fn process_gone(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z"))
+    }
+
+    fn helper_pid(file: &Path) -> i32 {
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn assert_helper_dies(file: &Path) {
+        let pid = helper_pid(file);
+        let until = Instant::now() + Duration::from_secs(5);
+        while !process_gone(pid) {
+            assert!(Instant::now() < until, "helper {pid} outlived the engine");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_timeout_kills_the_engines_helpers_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("helper.pid");
+        let p = script(
+            dir.path(),
+            "chromium",
+            &format!("sleep 60 &\necho $! > '{}'\nwait", pidfile.display()),
+        );
+        let e = dump_dom(
+            &info(p, false),
+            "http://x/",
+            VP,
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("killed"), "{e}");
+        assert_helper_dies(&pidfile);
+    }
+
+    #[test]
+    fn runaway_output_kills_the_engines_helpers_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("helper.pid");
+        let p = script(
+            dir.path(),
+            "chromium",
+            &format!(
+                "sleep 60 &\necho $! > '{}'\nexec yes '<p>spam</p>'",
+                pidfile.display()
+            ),
+        );
+        let e = dump_dom(
+            &info(p, false),
+            "http://x/",
+            VP,
+            None,
+            Duration::from_secs(20),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("more than"), "{e}");
+        assert_helper_dies(&pidfile);
+    }
+
+    #[test]
+    fn a_stale_screenshot_does_not_pass_for_a_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("out.png");
+        std::fs::write(&shot, "stale").unwrap();
+        // An engine that writes nothing fails although a file was there before.
+        let lazy = script(dir.path(), "lazy", "echo '<p>ok</p>'");
+        let e = dump_dom(
+            &info(lazy, false),
+            "http://127.0.0.1:1/",
+            VP,
+            Some(&shot),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("did not write the screenshot"),
+            "{e}"
+        );
+        assert!(!shot.exists(), "the stale file was removed first");
+        // An engine that does write replaces it.
+        std::fs::write(&shot, "stale").unwrap();
+        let writer = script(
+            dir.path(),
+            "writer",
+            r#"for a in "$@"; do case "$a" in --screenshot=*) printf fresh > "${a#--screenshot=}";; esac; done
+echo '<p>ok</p>'"#,
+        );
+        dump_dom(
+            &info(writer, false),
+            "http://127.0.0.1:1/",
+            VP,
+            Some(&shot),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&shot).unwrap(), b"fresh");
+        // A directory at the path is not removed.
+        let d = dir.path().join("adir");
+        std::fs::create_dir(&d).unwrap();
+        let _ = dump_dom(
+            &info(script(dir.path(), "lazy2", "echo '<p>ok</p>'"), false),
+            "http://127.0.0.1:1/",
+            VP,
+            Some(&d),
+            Duration::from_secs(10),
+        );
+        assert!(d.is_dir());
     }
 
     #[test]

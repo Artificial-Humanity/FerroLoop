@@ -480,4 +480,28 @@ mod tests {
         );
         assert!(r.error_count >= 1);
     }
+
+    #[test]
+    fn a_missing_head_end_tag_does_not_hide_unlabeled_controls() {
+        for html in [
+            "<html><head><title>T</title><meta name=viewport content=width=device-width>\
+             <body><button></button><input></body></html>",
+            "<html><head><title>T</title><meta name=viewport content=width=device-width>\
+             <button></button><input>",
+        ] {
+            let r = audit_html(html, VP);
+            let handles: Vec<_> = r
+                .findings
+                .iter()
+                .filter(|f| f.code == UNLABELED_CONTROL)
+                .map(|f| f.handle.clone())
+                .collect();
+            assert_eq!(
+                handles,
+                vec![Some("@e1".to_string()), Some("@e2".to_string())],
+                "{html}"
+            );
+            assert!(!r.passed(false), "{html}");
+        }
+    }
 }

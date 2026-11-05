@@ -286,6 +286,10 @@ impl Builder {
     }
 
     fn text(&mut self, text: &str) {
+        // Text other than whitespace ends the head, as it does in a browser.
+        if !text.bytes().all(is_ws) {
+            self.close_head();
+        }
         let parent = self.current();
         self.text_to(parent, text);
     }
@@ -327,7 +331,29 @@ impl Builder {
         }
     }
 
+    /// Pop an open `head` when it is the innermost open element. A document without `</head>`
+    /// would otherwise nest the whole page in it.
+    fn close_head(&mut self) {
+        if self.is_open("head") && self.tag_of(self.current()) == "head" {
+            self.pop();
+        }
+    }
+
     fn auto_close(&mut self, tag: &str) {
+        if !matches!(
+            tag,
+            "head"
+                | "title"
+                | "meta"
+                | "link"
+                | "style"
+                | "script"
+                | "base"
+                | "noscript"
+                | "template"
+        ) {
+            self.close_head();
+        }
         match tag {
             "li" => self.close_implied(&["li"], &["ul", "ol", "menu"]),
             "dt" | "dd" => self.close_implied(&["dt", "dd"], &["dl"]),
@@ -1068,5 +1094,53 @@ mod tests {
             }
             let _ = parse(&s);
         }
+    }
+
+    fn tags_under<'a>(d: &'a Document, parent: &str) -> Vec<&'a str> {
+        let p = d
+            .ids()
+            .find(|&i| d.element(i).is_some_and(|e| e.tag == parent))
+            .unwrap_or_else(|| panic!("no <{parent}>"));
+        d.children(p)
+            .iter()
+            .filter_map(|&c| d.element(c).map(|e| e.tag.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_head_without_an_end_tag_is_closed_by_the_body() {
+        let d =
+            parse("<html><head><title>T</title><meta name=a><body><button></button></body></html>");
+        assert_eq!(tags_under(&d, "head"), vec!["title", "meta"]);
+        assert_eq!(tags_under(&d, "body"), vec!["button"]);
+    }
+
+    #[test]
+    fn a_head_without_an_end_tag_is_closed_by_the_first_content() {
+        let d =
+            parse("<head><title>T</title><link rel=x><script>1</script><div>a<input></div><p>b");
+        assert_eq!(tags_under(&d, "head"), vec!["title", "link", "script"]);
+        let input = d
+            .ids()
+            .find(|&i| d.element(i).is_some_and(|e| e.tag == "input"))
+            .unwrap();
+        assert_eq!(d.ancestor(input, |e| e.tag == "head"), None);
+        // Text ends the head too.
+        let t = parse("<head><title>T</title>hello<b>x</b>");
+        assert_eq!(tags_under(&t, "head"), vec!["title"]);
+    }
+
+    #[test]
+    fn a_well_formed_head_is_unchanged() {
+        let d = parse(
+            "<html><head>\n<title>T</title>\n<noscript><img src=a></noscript><template><p>t</p></template>\
+             </head><body><p>x</p></body></html>",
+        );
+        assert_eq!(
+            tags_under(&d, "head"),
+            vec!["title", "noscript", "template"]
+        );
+        assert_eq!(tags_under(&d, "body"), vec!["p"]);
+        assert_eq!(tags_under(&d, "html"), vec!["head", "body"]);
     }
 }

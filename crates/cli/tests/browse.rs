@@ -426,6 +426,35 @@ fn check_fails_a_bad_page_with_exit_1_and_names_each_finding() {
 }
 
 #[test]
+fn a_page_without_a_head_end_tag_is_still_read() {
+    let env = Env::new();
+    let page = env.write(
+        "nohead.html",
+        "<html><head><title>T</title><meta name=\"viewport\" content=\"width=device-width\">\
+         <body><button></button><input></body></html>",
+    );
+    let out = env
+        .fl()
+        .args(["browse", "check"])
+        .arg(&page)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("unlabeled-control\t@e1"), "{text}");
+    assert!(text.contains("unlabeled-control\t@e2"), "{text}");
+    let snap = env
+        .fl()
+        .args(["browse", "snapshot"])
+        .arg(&page)
+        .output()
+        .unwrap();
+    let text = stdout(&snap);
+    assert!(text.contains("@e1\tbutton\tbutton"), "{text}");
+    assert!(text.contains("@e2\tinput\ttextbox"), "{text}");
+}
+
+#[test]
 fn check_json_has_the_documented_shape() {
     let env = Env::new();
     let page = env.write("bad.html", BAD);

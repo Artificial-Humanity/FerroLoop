@@ -41,6 +41,7 @@
 
 use crate::html::{Document, Element, MAX_DEPTH, NodeId, NodeKind};
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 /// The longest accessible name, heading or attribute value kept, in characters.
@@ -49,6 +50,8 @@ pub const MAX_NAME_CHARS: usize = 160;
 const MAX_LABELLEDBY_IDS: usize = 16;
 /// The most bytes of raw text gathered while computing one name.
 const NAME_GATHER_BYTES: usize = 4096;
+/// The most nodes visited while computing one name, so a subtree of empty elements ends too.
+const NAME_GATHER_NODES: usize = 2048;
 
 /// Roles that make an element interactive whatever its tag.
 pub const INTERACTIVE_ROLES: &[&str] = &[
@@ -204,7 +207,13 @@ fn declarations(style: &str) -> Vec<(String, String)> {
         .filter_map(|d| {
             let (k, v) = d.split_once(':')?;
             let v = v.trim().to_ascii_lowercase();
-            let v = v.strip_suffix("!important").map_or(v.as_str(), str::trim);
+            // Strip from the first `!` when what follows is `important` (`! important` too).
+            let v = match v.split_once('!') {
+                Some((value, flag)) if flag.trim().eq_ignore_ascii_case("important") => {
+                    value.trim()
+                }
+                _ => v.as_str(),
+            };
             Some((k.trim().to_ascii_lowercase(), v.to_string()))
         })
         .collect()
@@ -360,6 +369,8 @@ struct Scanner<'d> {
     doc: &'d Document,
     ids: HashMap<&'d str, NodeId>,
     labels: HashMap<&'d str, NodeId>,
+    /// The text of a subtree, by node: each subtree is gathered once.
+    texts: RefCell<HashMap<NodeId, String>>,
     out: Scan,
 }
 
@@ -369,7 +380,18 @@ impl<'d> Scanner<'d> {
         let mut labels = HashMap::new();
         let mut title = None;
         let mut viewport_meta = None;
+        // Whether a node lies inside a template, a script, a style, an svg or math subtree, or a
+        // hidden one. Parents come before children. The real `<head>` does not count.
+        let mut inert = vec![false; doc.len()];
         for id in doc.ids() {
+            if let Some(p) = doc.node(id).parent {
+                inert[id] = inert[p]
+                    || doc.element(p).is_some_and(|pe| {
+                        is_hidden(pe)
+                            || (pe.tag != "head" && is_non_content(&pe.tag))
+                            || matches!(pe.tag.as_str(), "svg" | "math")
+                    });
+            }
             let Some(e) = doc.element(id) else { continue };
             if let Some(v) = e.attr("id")
                 && !v.is_empty()
@@ -382,7 +404,7 @@ impl<'d> Scanner<'d> {
                         labels.entry(f).or_insert(id);
                     }
                 }
-                "title" if title.is_none() => {
+                "title" if title.is_none() && !inert[id] => {
                     let mut raw = String::new();
                     for &c in doc.children(id) {
                         if let NodeKind::Text(t) = &doc.node(c).kind {
@@ -393,6 +415,7 @@ impl<'d> Scanner<'d> {
                 }
                 "meta"
                     if viewport_meta.is_none()
+                        && !inert[id]
                         && e.attr("name")
                             .is_some_and(|n| n.trim().eq_ignore_ascii_case("viewport")) =>
                 {
@@ -405,6 +428,7 @@ impl<'d> Scanner<'d> {
             doc,
             ids,
             labels,
+            texts: RefCell::new(HashMap::new()),
             out: Scan {
                 title,
                 viewport_meta,
@@ -417,10 +441,11 @@ impl<'d> Scanner<'d> {
         }
     }
 
-    /// Append the text of the subtree to `buf` (a bounded gather). Returns false once the
-    /// bound is reached.
-    fn gather(&self, id: NodeId, buf: &mut String, depth: usize) -> bool {
-        if buf.len() >= NAME_GATHER_BYTES || depth > MAX_DEPTH {
+    /// Append the text of the subtree to `buf` (a gather bounded in bytes and in nodes
+    /// visited). Returns false once a bound is reached.
+    fn gather(&self, id: NodeId, buf: &mut String, depth: usize, visits: &mut usize) -> bool {
+        *visits += 1;
+        if buf.len() >= NAME_GATHER_BYTES || depth > MAX_DEPTH || *visits > NAME_GATHER_NODES {
             return false;
         }
         match &self.doc.node(id).kind {
@@ -451,7 +476,7 @@ impl<'d> Scanner<'d> {
                     buf.push(' ');
                 }
                 for &c in self.doc.children(id) {
-                    if !self.gather(c, buf, depth + 1) {
+                    if !self.gather(c, buf, depth + 1, visits) {
                         return false;
                     }
                 }
@@ -465,9 +490,14 @@ impl<'d> Scanner<'d> {
     }
 
     fn text_of(&self, id: NodeId) -> String {
+        if let Some(t) = self.texts.borrow().get(&id) {
+            return t.clone();
+        }
         let mut buf = String::new();
-        self.gather(id, &mut buf, 0);
-        normalize(&buf, MAX_NAME_CHARS)
+        self.gather(id, &mut buf, 0, &mut 0);
+        let text = normalize(&buf, MAX_NAME_CHARS);
+        self.texts.borrow_mut().insert(id, text.clone());
+        text
     }
 
     /// The text of the elements `aria-labelledby` names.
@@ -476,7 +506,16 @@ impl<'d> Scanner<'d> {
             return String::new();
         };
         let mut parts = Vec::new();
-        for r in refs.split_whitespace().take(MAX_LABELLEDBY_IDS) {
+        let mut seen: Vec<&str> = Vec::new();
+        for r in refs.split_whitespace() {
+            // An id named twice counts once.
+            if seen.contains(&r) {
+                continue;
+            }
+            if seen.len() >= MAX_LABELLEDBY_IDS {
+                break;
+            }
+            seen.push(r);
             let Some(&target) = self.ids.get(r) else {
                 continue;
             };
@@ -1154,5 +1193,102 @@ mod tests {
         let s = snap(&html);
         assert!(s.elements.len() >= 100);
         assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_missing_head_end_tag_does_not_hide_the_page() {
+        let with_body = "<html><head><title>T</title><meta name=\"viewport\" \
+            content=\"width=device-width\"><body><button></button><input></body></html>";
+        let no_body = "<html><head><title>T</title><meta name=viewport content=width=device-width>\
+            <button></button><input>";
+        for html in [with_body, no_body] {
+            let s = snap(html);
+            assert_eq!(
+                names(&s),
+                vec![("@e1", "button", ""), ("@e2", "textbox", "")],
+                "{html}"
+            );
+            assert_eq!(s.title.as_deref(), Some("T"));
+            assert!(s.viewport_meta.is_some());
+        }
+    }
+
+    #[test]
+    fn important_may_be_separated_by_whitespace_and_any_case() {
+        let s = snap(
+            "<div style='display:none ! important'><button>a</button></div>\
+             <div style='display: none !  IMPORTANT ;'><button>b</button></div>\
+             <button>c</button>",
+        );
+        assert_eq!(names(&s), vec![("@e1", "button", "c")]);
+        let sc = scan(&crate::html::parse(
+            "<div style='min-width:900px ! important'></div>\
+             <div style='min-width:800px!Important'></div>\
+             <div style='min-width:700px !importantx'></div>",
+        ));
+        let px: Vec<f64> = sc.min_widths.iter().map(|m| m.px).collect();
+        assert_eq!(px, vec![900.0, 800.0]);
+    }
+
+    #[test]
+    fn title_and_viewport_meta_ignore_templates_and_hidden_subtrees() {
+        let s = snap(
+            "<template><title>no</title><meta name=viewport content=width=device-width></template>\
+             <div hidden><title>no</title><meta name=viewport content=x></div>\
+             <svg><title>icon</title></svg>\
+             <head><title>Real</title><meta name=viewport content='width=device-width'></head>",
+        );
+        assert_eq!(s.title.as_deref(), Some("Real"));
+        assert_eq!(s.viewport_meta.as_deref(), Some("width=device-width"));
+        // Only the ignored ones: nothing is found.
+        let none = snap(
+            "<template><title>no</title><meta name=viewport content=width=device-width></template>",
+        );
+        assert_eq!(none.title, None);
+        assert_eq!(none.viewport_meta, None);
+    }
+
+    #[test]
+    fn labelledby_is_memoised_deduplicated_and_budgeted() {
+        // Ordinary cases still name correctly, including a repeated id and a second use.
+        let s = snap(
+            "<span id=a>First</span><span id=b>Second</span>\
+             <button aria-labelledby='a b a'></button><a href=/x aria-labelledby='b a b'></a>\
+             <input aria-labelledby=a>",
+        );
+        assert_eq!(
+            names(&s),
+            vec![
+                ("@e1", "button", "First Second"),
+                ("@e2", "link", "Second First"),
+                ("@e3", "textbox", "First"),
+            ]
+        );
+        // A hostile page: one target holding very many empty elements, named by many links
+        // that each repeat its id.
+        let refs = vec!["x"; 16].join(" ");
+        let mut html = String::from("<div id=x>");
+        html.push_str(&"<i></i>".repeat(20_000));
+        html.push_str("</div><div id=y>Label</div>");
+        for _ in 0..6_000 {
+            html.push_str(&format!("<a href=/p aria-labelledby='{refs} y'>z</a>"));
+        }
+        let start = std::time::Instant::now();
+        let first = snap(&html);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(first.elements.len(), 6_000);
+        assert!(first.elements.iter().all(|e| e.name == "Label"));
+        assert_eq!(first.render_body(), snap(&html).render_body());
+        // Empty nodes end a gather: a name found after more than the node budget is dropped.
+        let deep = format!(
+            "<div id=t>{}text</div><button aria-labelledby=t aria-label=fallback></button>",
+            "<i></i>".repeat(NAME_GATHER_NODES + 10)
+        );
+        let s = snap(&deep);
+        assert_eq!(names(&s), vec![("@e1", "button", "fallback")]);
     }
 }
