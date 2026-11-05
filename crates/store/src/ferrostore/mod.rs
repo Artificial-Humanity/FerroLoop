@@ -13,6 +13,7 @@ mod inspect;
 mod layout;
 mod manifest_ops;
 mod migrate;
+mod mq_tier;
 mod remote_txn;
 mod retry;
 mod server;
@@ -99,6 +100,7 @@ pub use inspect::{
     VectorCollectionReport, inspect_at,
 };
 pub use migrate::migrate_redb_to_ferrostore;
+pub use mq_tier::{MqDurability, MqTierDecision, MqTierObservation, MqTierPolicy};
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};

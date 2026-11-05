@@ -46,9 +46,9 @@ pub use code_knowledge::{
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
     ConnectOptions, EnvelopeKind, FerroStore, FerroStoreServer, Fusion, GateRunRollup,
-    KnowledgeHit, RecordEnvelope, ServerAuth, SyncAdapter, SyncBatch, SyncMode, SyncOp,
-    Transaction, VectorHit, VectorMetric, VectorStorage, ZoneMap, default_socket_path_for_store,
-    migrate_redb_to_ferrostore,
+    KnowledgeHit, MqDurability, MqTierDecision, MqTierObservation, MqTierPolicy, RecordEnvelope,
+    ServerAuth, SyncAdapter, SyncBatch, SyncMode, SyncOp, Transaction, VectorHit, VectorMetric,
+    VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
 };
 pub use governor_store::{
     FAILOVER_JOURNAL_CAP, FAILOVER_JOURNAL_SLUG, GOVERNOR_STATE_SLUG, PersistentGovernorStore,
