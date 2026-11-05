@@ -114,8 +114,8 @@ pub use feedback::{
 pub use ferrostate::{
     GitRepoProbe, MAX_CHECKPOINT_DIRTY_ENTRIES, StateCheckpointReport, WorkspaceImportReport,
     WorkspaceImportScan, apply_workspace_import, build_checkpoint_upsert, create_state_checkpoint,
-    create_state_checkpoint_from_probe, derive_import_slug, probe_git_repo,
-    resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
+    create_state_checkpoint_from_probe, derive_import_slug, find_workspace_root, is_workspace_root,
+    probe_git_repo, resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
 };
 pub use ferrowire::{
     DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,

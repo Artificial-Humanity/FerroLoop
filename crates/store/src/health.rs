@@ -13,7 +13,7 @@
 
 use crate::any::{BackendKind, choose_backend, is_redb_busy, physical_path};
 use crate::ferrostore::inspect_at;
-use crate::{BACKEND_ENV, FORMAT_WITH_WORKFLOW, RedbStore, check_format};
+use crate::{BACKEND_ENV, FORMAT_WITH_AREA_DELETE, RedbStore, check_format};
 use fl_core::StoreError;
 use fl_core::doctor::StoreOutcome;
 use std::path::Path;
@@ -113,14 +113,14 @@ fn format_outcome(engine: &str, found: Option<u64>) -> StoreOutcome {
         None if engine == "fls" => StoreOutcome::Verified {
             engine: engine.into(),
             format: None,
-            newest: FORMAT_WITH_WORKFLOW,
+            newest: FORMAT_WITH_AREA_DELETE,
             backup_beside: false,
         },
         found => match check_format(found) {
             Ok(()) => StoreOutcome::Verified {
                 engine: engine.into(),
                 format: found,
-                newest: FORMAT_WITH_WORKFLOW,
+                newest: FORMAT_WITH_AREA_DELETE,
                 backup_beside: false,
             },
             Err(e) => StoreOutcome::Unsupported {
@@ -203,7 +203,7 @@ mod tests {
             StoreOutcome::Unsupported { .. }
         ));
         assert!(matches!(
-            format_outcome("redb", Some(FORMAT_WITH_WORKFLOW)),
+            format_outcome("redb", Some(FORMAT_WITH_AREA_DELETE)),
             StoreOutcome::Verified { .. }
         ));
     }

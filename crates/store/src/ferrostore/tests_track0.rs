@@ -3,7 +3,7 @@
 
 use super::layout::{self, FORMAT_V1, FORMAT_V2, SLOT_LEN, SlotRead, Superblock};
 use super::{FerroStore, FerroStoreServer, latest_superblock};
-use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
+use crate::{FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
 use fl_core::StoreError;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
@@ -371,6 +371,78 @@ fn a_new_store_starts_at_the_newest_schema_and_keeps_it() {
     );
 }
 
+fn area(key: &str) -> fl_core::agent::AreaRecord {
+    fl_core::agent::AreaRecord {
+        area_key: key.into(),
+        name: key.into(),
+        path: None,
+        purpose: "p".into(),
+        updated_at: fl_core::At::from_unix_millis(1),
+        by: "tester".into(),
+    }
+}
+
+#[test]
+fn the_first_area_delete_raises_the_schema_and_nothing_before_it_does() {
+    use fl_core::store::AgentRegistry;
+    const { assert!(FORMAT_WITH_AREA_DELETE > FORMAT_WITH_WORKFLOW) };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("area.fls");
+    let store = FerroStore::open(&path).unwrap();
+    store.upsert_area(area("kept")).unwrap();
+    store.upsert_area(area("gone")).unwrap();
+    assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+    // Deleting what is not there changes nothing, the schema included.
+    assert!(
+        !store
+            .delete_area("nothere", fl_core::At::from_unix_millis(2), "tester")
+            .unwrap()
+    );
+    assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+    assert!(
+        store
+            .delete_area("gone", fl_core::At::from_unix_millis(3), "tester")
+            .unwrap()
+    );
+    assert_eq!(
+        store.format_version().unwrap(),
+        Some(FORMAT_WITH_AREA_DELETE)
+    );
+    drop(store);
+    // This build opens it; a build whose ladder ends at `FORMAT_WITH_WORKFLOW` refuses it.
+    let store = FerroStore::open(&path).unwrap();
+    assert!(store.get_area("gone").unwrap().is_none());
+    assert_eq!(
+        store.format_version().unwrap(),
+        Some(FORMAT_WITH_AREA_DELETE)
+    );
+}
+
+#[test]
+fn importing_an_area_delete_raises_the_schema() {
+    use fl_core::store::AgentRegistry;
+    let source = FerroStore::in_memory();
+    source.upsert_area(area("gone")).unwrap();
+    source
+        .delete_area("gone", fl_core::At::from_unix_millis(2), "tester")
+        .unwrap();
+    let events: Vec<_> = source
+        .registry_events_after(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    let dest = FerroStore::in_memory();
+    dest.import_registry_events(&events[..1]).unwrap();
+    assert_eq!(dest.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
+    dest.import_registry_events(&events[1..]).unwrap();
+    assert_eq!(
+        dest.format_version().unwrap(),
+        Some(FORMAT_WITH_AREA_DELETE)
+    );
+    assert!(dest.get_area("gone").unwrap().is_none());
+}
+
 #[test]
 fn a_schema_newer_than_this_build_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -381,7 +453,7 @@ fn a_schema_newer_than_this_build_is_refused() {
             .put_doc_unchecked(
                 "__meta",
                 "schema_version",
-                &json!(FORMAT_WITH_WORKFLOW + 1),
+                &json!(FORMAT_WITH_AREA_DELETE + 1),
                 false,
             )
             .unwrap();
@@ -393,8 +465,8 @@ fn a_schema_newer_than_this_build_is_refused() {
     assert!(
         matches!(
             err,
-            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_WORKFLOW }
-                if v == FORMAT_WITH_WORKFLOW + 1
+            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_DELETE }
+                if v == FORMAT_WITH_AREA_DELETE + 1
         ),
         "{err:?}"
     );
@@ -588,7 +660,10 @@ fn ensure_superblock_says_when_it_initialized_the_file() {
 
 mod reserved {
     use super::super::{DocState, FerroStore, Inner, Op, SyncAdapter, SyncBatch, SyncMode, SyncOp};
-    use crate::{FORMAT_VERSION, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE, FORMAT_WITH_WORKFLOW};
+    use crate::{
+        FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE,
+        FORMAT_WITH_WORKFLOW,
+    };
     use fl_core::StoreError;
     use fl_core::routing::RoutingMap;
     use fl_core::store::Catalog;
@@ -854,7 +929,7 @@ mod reserved {
     #[test]
     fn an_inbound_schema_newer_than_this_build_is_refused() {
         let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
-        let newer = FORMAT_WITH_WORKFLOW + 1;
+        let newer = FORMAT_WITH_AREA_DELETE + 1;
         pulled(
             &recorder,
             vec![
@@ -869,7 +944,7 @@ mod reserved {
             assert!(
                 matches!(
                     err,
-                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_WORKFLOW }
+                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_DELETE }
                         if v == newer
                 ),
                 "{err:?}"

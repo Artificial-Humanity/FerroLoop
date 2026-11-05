@@ -439,6 +439,24 @@ pub trait Catalog {
     fn add_project(&self, root: &str) -> Result<ProjectId, StoreError>;
     fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
     fn list_projects(&self) -> Result<Vec<Project>, StoreError>;
+    /// Points the project at another root, changing nothing else about it (its id, gates,
+    /// records and routing stay). A store that cannot do this refuses with
+    /// [`StoreError::InvalidState`].
+    fn set_project_root(&self, _id: &ProjectId, _root: &str) -> Result<(), StoreError> {
+        Err(StoreError::InvalidState(
+            "this store cannot change a project's root".to_string(),
+        ))
+    }
+    /// Removes the project row `id`; `true` when there was one, `false` when there was none.
+    /// The id stays minted and is never reused. A project that holds gates, transitions,
+    /// records or a routing map is refused with [`StoreError::InvalidState`]: removing the row
+    /// would leave them behind with no project. A store that cannot do this refuses the same
+    /// way.
+    fn remove_project(&self, _id: &ProjectId) -> Result<bool, StoreError> {
+        Err(StoreError::InvalidState(
+            "this store cannot remove a project".to_string(),
+        ))
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn add_gate(
@@ -473,6 +491,27 @@ pub trait Catalog {
     /// if it never held it. A split binding asks this to check a reference
     /// that crosses into another store (GitHub tracker spec §1.3).
     fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError>;
+}
+
+/// The refusal [`Catalog::remove_project`] gives when `id` still holds gates, transitions,
+/// records or a routing map. One check for every store, so the three engines agree.
+pub fn check_project_removable<S>(store: &S, id: &ProjectId) -> Result<(), StoreError>
+where
+    S: Catalog + Tracker + crate::routing::Routes + ?Sized,
+{
+    let gates = store.list_gates(id)?.len();
+    let transitions = store.list_transitions(id)?.len();
+    let records = store.list_records(id)?.len();
+    let routed = store.routes(id)?.is_some();
+    if gates + transitions + records > 0 || routed {
+        return Err(StoreError::InvalidState(format!(
+            "project {} still holds {gates} gates, {transitions} transitions and {records} \
+             records{}, so it is not removed",
+            id.iri(),
+            if routed { " and a routing map" } else { "" }
+        )));
+    }
+    Ok(())
 }
 
 /// Mutable state that people discuss: records and findings.
@@ -709,6 +748,10 @@ pub trait AgentRegistry {
     fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError>;
     fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError>;
     fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError>;
+    /// Removes the area `area_key` and logs an `AreaDelete` registry event. `true` when there
+    /// was one; asking for one that is absent changes nothing and logs nothing. Agents are not
+    /// touched: the caller moves or retires them first.
+    fn delete_area(&self, area_key: &str, at: At, by: &str) -> Result<bool, StoreError>;
 
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError>;
     fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError>;

@@ -1152,7 +1152,8 @@ where
                 let mut line = serde_json::to_string(ev).unwrap();
                 line.push('\n');
                 match ev.kind {
-                    fl_core::agent::RegistryEventKind::AreaUpsert(_) => {
+                    fl_core::agent::RegistryEventKind::AreaUpsert(_)
+                    | fl_core::agent::RegistryEventKind::AreaDelete { .. } => {
                         next_snapshot
                             .areas_events_raw
                             .extend_from_slice(line.as_bytes());

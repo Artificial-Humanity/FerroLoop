@@ -8,8 +8,8 @@ use super::layout::{self};
 use super::{FerroStore, latest_superblock};
 use crate::health::verify_read_only;
 use crate::{
-    BackendKind, FORMAT_KEY, FORMAT_VERSION, FORMAT_WITH_STATE, FORMAT_WITH_WORKFLOW, META,
-    RedbStore,
+    BackendKind, FORMAT_KEY, FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE,
+    FORMAT_WITH_WORKFLOW, META, RedbStore,
 };
 use fl_core::doctor::StoreOutcome;
 use serde_json::json;
@@ -102,7 +102,7 @@ fn a_fls_store_is_verified_at_its_recorded_format() {
         StoreOutcome::Verified {
             engine: "fls".into(),
             format: Some(FORMAT_WITH_WORKFLOW),
-            newest: FORMAT_WITH_WORKFLOW,
+            newest: FORMAT_WITH_AREA_DELETE,
             backup_beside: false
         }
     );
@@ -130,7 +130,7 @@ fn a_fls_store_is_verified_at_its_recorded_format() {
 fn a_fls_newer_or_off_the_ladder_is_unsupported() {
     let tmp = tempfile::tempdir().unwrap();
     for (name, schema) in [
-        ("newer.fls", FORMAT_WITH_WORKFLOW + 1),
+        ("newer.fls", FORMAT_WITH_AREA_DELETE + 1),
         ("old.fls", FORMAT_VERSION - 1),
     ] {
         let path = tmp.path().join(name);
@@ -228,7 +228,7 @@ fn a_redb_newer_than_supported_is_unsupported_even_when_it_would_migrate() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("fl.redb");
     drop(RedbStore::open(&path).unwrap());
-    set_redb_format(&path, FORMAT_WITH_WORKFLOW + 1);
+    set_redb_format(&path, FORMAT_WITH_AREA_DELETE + 1);
     for forced in [None, Some(BackendKind::Redb)] {
         match verify(&path, forced) {
             StoreOutcome::Unsupported { reason } => {

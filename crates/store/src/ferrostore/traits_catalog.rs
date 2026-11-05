@@ -110,6 +110,39 @@ impl Catalog for FerroStore {
         self.with_read(|txn| doc::scan_json(txn, PROJECTS))
     }
 
+    fn set_project_root(&self, id: &ProjectId, root: &str) -> Result<(), StoreError> {
+        let root = root.to_string();
+        self.with_write(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            let Some(mut held) = doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?
+            else {
+                return Err(StoreError::InvalidState(format!("no project {}", id.iri())));
+            };
+            held.root = root.clone();
+            doc::put_json(txn, PROJECTS, id.iri().as_str(), &held)?;
+            Ok(())
+        })
+    }
+
+    fn remove_project(&self, id: &ProjectId) -> Result<bool, StoreError> {
+        let held = self.with_read(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            Ok(doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?.is_some())
+        })?;
+        if !held {
+            return Ok(false);
+        }
+        fl_core::store::check_project_removable(self, id)?;
+        self.with_write(|txn| {
+            doc::check_kind(txn, &self.label, id.iri(), Kind::Project)?;
+            let held = doc::get_owned::<Project>(txn, &self.label, PROJECTS, id.iri())?.is_some();
+            if held {
+                txn.delete(PROJECTS, id.iri().as_str());
+            }
+            Ok(held)
+        })
+    }
+
     fn add_gate(
         &self,
         project: &ProjectId,

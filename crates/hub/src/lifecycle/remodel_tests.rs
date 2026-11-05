@@ -2,8 +2,8 @@
 //! is all or nothing. Each test runs in its own store and home with runtime spawning off.
 
 use super::*;
-use fl_core::MemStore;
 use fl_core::at::At;
+use fl_core::{Catalog, MemStore};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -13,6 +13,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         spawn_runtime: false,
         runtime: &TmuxRuntime,
         key_probe: &ProvisionedKeys,
+        workspace_root: None,
     }
 }
 
@@ -1036,6 +1037,9 @@ impl AgentRegistry for FaultyStore {
     fn list_areas(&self) -> Result<Vec<fl_core::agent::AreaRecord>, StoreError> {
         self.inner.list_areas()
     }
+    fn delete_area(&self, key: &str, at: At, by: &str) -> Result<bool, StoreError> {
+        self.inner.delete_area(key, at, by)
+    }
     fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
         self.inner.register_agent(args)
     }
@@ -1168,6 +1172,69 @@ impl StateStore for FaultyStore {
     }
     fn set_sync_cursor(&self, cursor: fl_core::state::StateSyncCursor) -> Result<(), StoreError> {
         self.inner.set_sync_cursor(cursor)
+    }
+}
+
+impl Catalog for FaultyStore {
+    fn add_project(&self, root: &str) -> Result<fl_core::ProjectId, StoreError> {
+        self.inner.add_project(root)
+    }
+    fn get_project(&self, id: &fl_core::ProjectId) -> Result<Option<fl_core::Project>, StoreError> {
+        self.inner.get_project(id)
+    }
+    fn list_projects(&self) -> Result<Vec<fl_core::Project>, StoreError> {
+        self.inner.list_projects()
+    }
+    fn add_gate(
+        &self,
+        project: &fl_core::ProjectId,
+        name: &str,
+        kind: fl_core::GateKind,
+        selector: fl_core::Selector,
+        min_population: u64,
+        authored_at_commit: &str,
+        authored_by: &str,
+    ) -> Result<fl_core::GateId, StoreError> {
+        self.inner.add_gate(
+            project,
+            name,
+            kind,
+            selector,
+            min_population,
+            authored_at_commit,
+            authored_by,
+        )
+    }
+    fn get_gate(&self, id: &fl_core::GateId) -> Result<Option<fl_core::GateDef>, StoreError> {
+        self.inner.get_gate(id)
+    }
+    fn list_gates(
+        &self,
+        project: &fl_core::ProjectId,
+    ) -> Result<Vec<fl_core::GateDef>, StoreError> {
+        self.inner.list_gates(project)
+    }
+    fn update_gate(&self, def: &fl_core::GateDef) -> Result<(), StoreError> {
+        self.inner.update_gate(def)
+    }
+    fn add_transition(&self, transition: fl_core::Transition) -> Result<(), StoreError> {
+        self.inner.add_transition(transition)
+    }
+    fn get_transition(
+        &self,
+        project: &fl_core::ProjectId,
+        name: &str,
+    ) -> Result<Option<fl_core::Transition>, StoreError> {
+        self.inner.get_transition(project, name)
+    }
+    fn list_transitions(
+        &self,
+        project: &fl_core::ProjectId,
+    ) -> Result<Vec<fl_core::Transition>, StoreError> {
+        self.inner.list_transitions(project)
+    }
+    fn kind_of(&self, id: &fl_core::Iri) -> Result<fl_core::Kind, StoreError> {
+        self.inner.kind_of(id)
     }
 }
 
