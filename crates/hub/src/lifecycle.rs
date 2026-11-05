@@ -1738,12 +1738,36 @@ fn send_tmux_keys(target: &str, keys: &str) -> bool {
 /// The text Grok Build 1.0.70 prints when `--yolo` is not enough for a new directory.
 const GROK_DIRECTORY_TRUST_PROMPT: &str = "Do you trust the contents of this directory";
 
+/// How many times a fresh Grok pane is read for [`GROK_DIRECTORY_TRUST_PROMPT`]. The prompt
+/// is not on screen the instant `tmux new-session -d` returns.
+const GROK_TRUST_CAPTURES: u32 = 10;
+
 fn accept_grok_directory_trust(runtime: &dyn SessionRuntime, target: &str) {
-    if runtime
-        .capture(target)
-        .contains(GROK_DIRECTORY_TRUST_PROMPT)
-    {
-        let _ = runtime.send_keys(target, "y");
+    poll_grok_directory_trust(
+        runtime.settle_delay(),
+        || runtime.capture(target),
+        |keys| {
+            let _ = runtime.send_keys(target, keys);
+        },
+    );
+}
+
+/// Reads `capture` up to [`GROK_TRUST_CAPTURES`] times, [`SessionRuntime::settle_delay`] apart
+/// after a miss. A zero delay does not sleep. Sends `y` on the first capture that contains
+/// [`GROK_DIRECTORY_TRUST_PROMPT`] and then returns. Ten misses send nothing.
+fn poll_grok_directory_trust(
+    delay: Duration,
+    mut capture: impl FnMut() -> String,
+    mut send_keys: impl FnMut(&str),
+) {
+    for attempt in 0..GROK_TRUST_CAPTURES {
+        if capture().contains(GROK_DIRECTORY_TRUST_PROMPT) {
+            send_keys("y");
+            return;
+        }
+        if attempt + 1 < GROK_TRUST_CAPTURES && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
     }
 }
 
@@ -4757,6 +4781,39 @@ mod tests {
                 .iter()
                 .any(|call| call == "send-keys Ada:grok y")
         );
+    }
+
+    #[test]
+    fn grok_trust_poll_sends_y_once_after_two_misses_and_nothing_after_ten() {
+        let mut seen = 0u32;
+        let mut sent = Vec::new();
+        poll_grok_directory_trust(
+            Duration::ZERO,
+            || {
+                seen += 1;
+                if seen <= 2 {
+                    String::new()
+                } else {
+                    "Do you trust the contents of this directory?".into()
+                }
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(seen, 3, "a hit stops the poll");
+        assert_eq!(sent, ["y".to_string()]);
+
+        let mut misses = 0u32;
+        let mut sent = Vec::new();
+        poll_grok_directory_trust(
+            Duration::ZERO,
+            || {
+                misses += 1;
+                String::new()
+            },
+            |keys| sent.push(keys.to_string()),
+        );
+        assert_eq!(misses, 10);
+        assert!(sent.is_empty());
     }
 
     #[test]

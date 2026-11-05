@@ -758,6 +758,31 @@ fn a_muse_route_without_a_session_id_matches_no_session_id() {
     assert!(crate::api::route_matches_session_id(&with_id, "muse-abc"));
 }
 
+#[test]
+fn a_grok_route_without_a_session_id_matches_no_session_id() {
+    let route = VendorRoute::Grok {
+        session_id: String::new(),
+        cwd: None,
+        tmux_target: Some("Ada:grok".into()),
+        tmux_pane: None,
+    };
+    for raw in ["", " ", "grok-", "grok-ada", "ada"] {
+        assert!(
+            !crate::api::route_matches_session_id(&route, raw),
+            "matched `{raw}`"
+        );
+        assert!(!route_serves_session(&route, raw), "serves `{raw}`");
+    }
+    let with_id = VendorRoute::Grok {
+        session_id: "abc".into(),
+        cwd: None,
+        tmux_target: None,
+        tmux_pane: None,
+    };
+    assert!(crate::api::route_matches_session_id(&with_id, "abc"));
+    assert!(crate::api::route_matches_session_id(&with_id, "grok-abc"));
+}
+
 // ------------------------------------------------------------------- end to end
 
 /// A fake `tmux` that lists `windows` and reports every target live, with tmux discovery opted

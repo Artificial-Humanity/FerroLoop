@@ -5217,8 +5217,12 @@ pub(crate) fn route_matches_session_id(
                 && (session_id == trimmed
                     || trimmed.strip_prefix("muse-") == Some(session_id.as_str()))
         }
+        // A Grok route made from a live tmux window has an empty id until its first transcript;
+        // it matches no session id, not even an empty one.
         fl_wire::identity::VendorRoute::Grok { session_id, .. } => {
-            session_id == trimmed || trimmed.strip_prefix("grok-") == Some(session_id.as_str())
+            !session_id.is_empty()
+                && (session_id == trimmed
+                    || trimmed.strip_prefix("grok-") == Some(session_id.as_str()))
         }
         fl_wire::identity::VendorRoute::Webhook { .. } => false,
     }

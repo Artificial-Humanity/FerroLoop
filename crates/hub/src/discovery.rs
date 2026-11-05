@@ -753,9 +753,13 @@ fn route_session_id(persona: &str, route: &VendorRoute) -> String {
         } if session_id.trim().is_empty() => {
             format!("claude-{persona}-{pid}")
         }
-        VendorRoute::Claude { session_id, .. } | VendorRoute::Grok { session_id, .. } => {
-            session_id.clone()
+        VendorRoute::Claude { session_id, .. } => session_id.clone(),
+        // A live Grok window has no transcript yet, so its route stores an empty id. An empty
+        // id would collapse every such window onto one `seen_ids` entry.
+        VendorRoute::Grok { session_id, .. } if session_id.is_empty() => {
+            format!("grok-{persona}")
         }
+        VendorRoute::Grok { session_id, .. } => session_id.clone(),
         VendorRoute::Agy {
             conversation_id, ..
         } => conversation_id.clone(),
@@ -899,8 +903,10 @@ fn discover_sessions_from_routes(
             VendorRoute::Grok {
                 session_id, cwd, ..
             } => {
+                // An empty id is the live-window placeholder, not a transcript name.
                 let tpath = home
                     .as_deref()
+                    .filter(|_| !session_id.is_empty())
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
                 ("grok", cwd.as_ref().map(|p| p.display().to_string()), tpath)
             }
@@ -8009,6 +8015,49 @@ mod tests {
             sessions.iter().any(|session| session.adapter == "webhook"),
             "{sessions:?}"
         );
+    }
+
+    #[test]
+    fn two_live_grok_placeholders_with_empty_ids_are_both_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        for (persona, target) in [("felicia", "Felicia:grok"), ("ada", "Ada:grok")] {
+            routes.upsert(
+                persona,
+                VendorRoute::Grok {
+                    session_id: String::new(),
+                    cwd: None,
+                    tmux_target: Some(target.into()),
+                    tmux_pane: None,
+                },
+                fl_core::at::At::from_unix_millis(1),
+            );
+        }
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: Vec::new(),
+            decommissioned_session_ids: BTreeSet::new(),
+        };
+        let (sessions, costs) = cost_counters::measure(|| {
+            discover_route_sessions_without_model_info(&snap, Some(home))
+        });
+        let grok: Vec<_> = sessions
+            .iter()
+            .filter(|session| session.adapter == "grok")
+            .collect();
+        assert_eq!(grok.len(), 2, "{sessions:?}");
+        for (persona, id) in [("felicia", "grok-felicia"), ("ada", "grok-ada")] {
+            let session = grok
+                .iter()
+                .find(|session| session.persona.as_deref() == Some(persona))
+                .unwrap_or_else(|| panic!("missing {persona}: {sessions:?}"));
+            assert_eq!(session.id, id);
+            assert_eq!(session.transcript_path, None);
+        }
+        assert_eq!(costs.transcript_finds, 0, "an empty id is not a transcript");
     }
 
     #[test]
