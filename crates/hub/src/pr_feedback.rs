@@ -26,32 +26,47 @@ use crate::github_pr::{ClientError, HubGithub};
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Read the configured repositories and deliver any new notices.
+///
+/// Every repository is read before the store is opened. The poller lock is
+/// taken only for delivery, after the store is open, and is skipped when
+/// there is nothing to send.
 pub fn poll_configured_prs(state: &HubState) -> Result<usize, String> {
     let github = &state.config.github;
     if !github_ready(github) {
         return Ok(0);
     }
-    let store = state.open_store().map_err(|e| e.to_string())?;
-    let mut poller = state.pr_feedback.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sent = 0;
+    let mut snapshots = Vec::new();
+    let mut unusable: Option<String> = None;
     for (project, repo) in &github.repos {
         let client = match github.reader(repo) {
             Ok(client) => client,
             Err(ClientError::Missing(_)) => continue,
             Err(ClientError::Unusable) => {
-                return Err(format!(
-                    "the GitHub credential for project `{project}` is unusable"
-                ));
-            }
-        };
-        let snapshots = match load_snapshots(github, &client, repo) {
-            Ok(snapshots) => snapshots,
-            Err(e) => {
-                eprintln!("hub: pull-request feedback for `{repo}`: {e}");
+                if unusable.is_none() {
+                    unusable = Some(format!(
+                        "the GitHub credential for project `{project}` is unusable"
+                    ));
+                }
                 continue;
             }
         };
-        sent += deliver_pr_feedback(&store, &mut poller, &snapshots).map_err(|e| e.to_string())?;
+        match load_snapshots(github, &client, repo) {
+            Ok(loaded) => snapshots.extend(loaded),
+            Err(e) => eprintln!("hub: pull-request feedback for `{repo}`: {e}"),
+        }
+    }
+    let sent = if snapshots.is_empty() {
+        0
+    } else {
+        let store = state.open_store().map_err(|e| e.to_string())?;
+        let mut poller = state.pr_feedback.lock().unwrap_or_else(|e| e.into_inner());
+        let sent =
+            deliver_pr_feedback(&store, &mut poller, &snapshots).map_err(|e| e.to_string())?;
+        drop(poller);
+        sent
+    };
+    if let Some(err) = unusable {
+        return Err(err);
     }
     Ok(sent)
 }
@@ -82,6 +97,7 @@ fn load_snapshots(
         let number = pr.number;
         let head_sha = pr.head_sha.clone();
         snapshots.push(snapshot_from_parts(
+            repo,
             number,
             pr.head_ref,
             head_sha.clone(),
@@ -94,6 +110,7 @@ fn load_snapshots(
 }
 
 fn snapshot_from_parts(
+    repo: &str,
     number: u64,
     branch: String,
     head_sha: String,
@@ -102,6 +119,7 @@ fn snapshot_from_parts(
     reviews: Result<Vec<PrReviewSummary>, StoreError>,
 ) -> PrFeedbackSnapshot {
     PrFeedbackSnapshot {
+        repo: repo.to_string(),
         number,
         branch,
         head_sha,
@@ -295,6 +313,7 @@ mod tests {
 
     fn failing(head: &str) -> PrFeedbackSnapshot {
         PrFeedbackSnapshot {
+            repo: "acme/widgets".into(),
             number: 88,
             branch: "felicia/ci-and-pr-feedback-routing-88".into(),
             head_sha: head.into(),
@@ -382,6 +401,7 @@ mod tests {
             .unwrap();
         let head = sha('b');
         let snap = PrFeedbackSnapshot {
+            repo: "acme/widgets".into(),
             number: 88,
             branch: "ferris/topic".into(),
             head_sha: head.clone(),
@@ -446,6 +466,7 @@ mod tests {
             commit_id: Some(head.clone()),
         };
         let snap = snapshot_from_parts(
+            "acme/widgets",
             88,
             "ferris/topic".into(),
             head.clone(),
@@ -522,6 +543,7 @@ mod tests {
         );
         assert!(failed.is_err());
         let snap = snapshot_from_parts(
+            "acme/widgets",
             88,
             "ferris/topic".into(),
             sha('e'),

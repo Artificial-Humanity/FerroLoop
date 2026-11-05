@@ -2,12 +2,15 @@
 //! authored the pull request.
 //!
 //! This module does no I/O. A caller supplies the pull-request facts and the
-//! names of active agents, and keeps the [`PrFeedbackPoller`] so one failing
-//! check or one review is announced once per commit.
+//! names of active agents, and keeps the [`PrFeedbackPoller`] so the latest
+//! failing check of each name, and each reviewer's open change request, is
+//! announced once per commit.
 
-use fl_core::pr_policy::{PrCommitSummary, PrReviewSummary, parse_co_authors};
+use fl_core::pr_policy::{
+    FlReviewMarker, PrCommitSummary, PrReviewSummary, extract_review_marker, parse_co_authors,
+};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One completed check run on a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +27,8 @@ pub struct PrCheckFact {
 /// The facts one poll saw for one open pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrFeedbackSnapshot {
+    /// `owner/repo` this pull request belongs to.
+    pub repo: String,
     pub number: u64,
     pub branch: String,
     pub head_sha: String,
@@ -66,7 +71,7 @@ pub struct PrFeedbackIntent {
 pub struct FeedbackNotice {
     /// Registered agent `name_key`.
     pub persona: String,
-    /// `(pr_number, head_sha, check_or_review_id)`.
+    /// `{repo}:{number}:{head_sha}:check:{id}` or `:review:{id}`.
     pub dedup_key: String,
     pub subject: String,
     pub body: String,
@@ -76,10 +81,15 @@ const INTENT: &str = "github.pr_feedback";
 const CI_REMEDIATION: &str = "Read the failing check, fix the cause, and push a new commit on this branch. A later green run of an older commit does not clear this failure.";
 const REVIEW_REMEDIATION: &str = "Read the review, apply the accepted findings, push a new commit on this branch, and ask the reviewer for a scoped re-review.";
 
-/// Remembers which `(pull request, commit, check or review)` triples were already sent.
+/// How many delivered keys are kept. A later notice pushes the oldest out.
+const MAX_SEEN_KEYS: usize = 4096;
+
+/// Remembers which `(repo, pull request, commit, check or review)` notices were sent.
+/// At most 4096 keys are kept; the oldest is forgotten first.
 #[derive(Debug, Default, Clone)]
 pub struct PrFeedbackPoller {
     seen: HashSet<String>,
+    order: VecDeque<String>,
 }
 
 impl PrFeedbackPoller {
@@ -98,9 +108,18 @@ impl PrFeedbackPoller {
         notices
     }
 
-    /// Record a notice that was delivered.
+    /// Record a notice that was delivered. A key already recorded is left where it is.
     pub fn remember(&mut self, dedup_key: &str) {
-        self.seen.insert(dedup_key.to_string());
+        let key = dedup_key.to_string();
+        if !self.seen.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > MAX_SEEN_KEYS
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
     }
 }
 
@@ -114,11 +133,38 @@ fn route_one(
     };
     let head = pr.head_sha.to_ascii_lowercase();
     let mut notices = Vec::new();
+    notices.extend(ci_notices(pr, &persona, &head, seen));
+    notices.extend(review_notices(pr, &persona, &head, seen));
+    notices
+}
+
+/// The highest id of each check name on `head`. A later success suppresses an earlier failure.
+fn ci_notices(
+    pr: &PrFeedbackSnapshot,
+    persona: &str,
+    head: &str,
+    seen: &HashSet<String>,
+) -> Vec<FeedbackNotice> {
+    let mut latest: HashMap<&str, &PrCheckFact> = HashMap::new();
     for check in &pr.checks {
-        if !failing_on_head(check, &head) {
+        if !check_on_head(check, head) {
             continue;
         }
-        let key = dedup_key(pr.number, &head, &format!("check:{}", check.id));
+        latest
+            .entry(check.name.as_str())
+            .and_modify(|current| {
+                if check.id > current.id {
+                    *current = check;
+                }
+            })
+            .or_insert(check);
+    }
+    let mut notices = Vec::new();
+    for check in latest.into_values() {
+        if !failing_conclusion(&check.conclusion) {
+            continue;
+        }
+        let key = dedup_key(&pr.repo, pr.number, head, "check", check.id);
         if seen.contains(&key) {
             continue;
         }
@@ -130,34 +176,75 @@ fn route_one(
         };
         notices.push(notice(
             pr,
-            &persona,
+            persona,
             key,
             &format!("PR #{} CI failed: {}", pr.number, check.name),
             event,
             CI_REMEDIATION,
         ));
     }
-    for review in &pr.reviews {
-        if !changes_on_head(review, &head) {
+    notices
+}
+
+struct ReviewPick<'a> {
+    review: &'a PrReviewSummary,
+    marker: Option<FlReviewMarker>,
+}
+
+/// The last state-changing review per reviewer. `COMMENTED` and `PENDING` do not count.
+/// A newer review that is not on `head` still supersedes an older one that is.
+fn review_notices(
+    pr: &PrFeedbackSnapshot,
+    persona: &str,
+    head: &str,
+    seen: &HashSet<String>,
+) -> Vec<FeedbackNotice> {
+    let mut ordered: Vec<&PrReviewSummary> = pr.reviews.iter().collect();
+    ordered.sort_by_key(|review| review.id);
+    let mut latest: HashMap<String, ReviewPick<'_>> = HashMap::new();
+    for review in ordered {
+        if ignored_review_state(&review.state) {
             continue;
         }
-        let key = dedup_key(pr.number, &head, &format!("review:{}", review.id));
+        let marker = extract_review_marker(&review.body);
+        let key = match &marker {
+            Some(marker) => format!("agent:{}", marker.reviewer.to_ascii_lowercase()),
+            None => format!("login:{}", review.author_login.trim().to_ascii_lowercase()),
+        };
+        latest.insert(key, ReviewPick { review, marker });
+    }
+    let mut notices = Vec::new();
+    for pick in latest.into_values() {
+        if !pick.review.state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
+            continue;
+        }
+        if !commit_on_head(pick.review, head) {
+            continue;
+        }
+        if let Some(marker) = &pick.marker
+            && !marker.head_sha.eq_ignore_ascii_case(head)
+        {
+            continue;
+        }
+        let key = dedup_key(&pr.repo, pr.number, head, "review", pick.review.id);
         if seen.contains(&key) {
             continue;
         }
+        let reviewer = pick
+            .marker
+            .as_ref()
+            .map(|marker| marker.reviewer.as_str())
+            .unwrap_or(pick.review.author_login.as_str());
         let event = PrFeedbackEvent::ChangesRequested {
-            review_id: review.id,
-            reviewer: review.author_login.clone(),
-            excerpt: excerpt(&review.body),
+            review_id: pick.review.id,
+            reviewer: reviewer.to_string(),
+            excerpt: excerpt(&pick.review.body),
         };
         notices.push(notice(
             pr,
-            &persona,
+            persona,
             key,
-            &format!(
-                "PR #{} changes requested by {}",
-                pr.number, review.author_login
-            ),
+            &format!("PR #{} changes requested by {reviewer}", pr.number),
             event,
             REVIEW_REMEDIATION,
         ));
@@ -189,8 +276,8 @@ fn notice(
     }
 }
 
-fn dedup_key(number: u64, head_sha: &str, id: &str) -> String {
-    format!("{number}:{head_sha}:{id}")
+fn dedup_key(repo: &str, number: u64, head_sha: &str, kind: &str, id: u64) -> String {
+    format!("{repo}:{number}:{head_sha}:{kind}:{id}")
 }
 
 fn clip_subject(subject: &str) -> String {
@@ -207,21 +294,23 @@ fn clip_subject(subject: &str) -> String {
     out
 }
 
-fn failing_on_head(check: &PrCheckFact, head: &str) -> bool {
+fn check_on_head(check: &PrCheckFact, head: &str) -> bool {
     let check_head = check.head_sha.to_ascii_lowercase();
-    if !check_head.is_empty() && check_head != head {
-        return false;
-    }
+    !check_head.is_empty() && check_head == head
+}
+
+fn failing_conclusion(conclusion: &str) -> bool {
     matches!(
-        check.conclusion.to_ascii_lowercase().as_str(),
+        conclusion.to_ascii_lowercase().as_str(),
         "failure" | "timed_out"
     )
 }
 
-fn changes_on_head(review: &PrReviewSummary, head: &str) -> bool {
-    if !review.state.eq_ignore_ascii_case("CHANGES_REQUESTED") {
-        return false;
-    }
+fn ignored_review_state(state: &str) -> bool {
+    state.eq_ignore_ascii_case("COMMENTED") || state.eq_ignore_ascii_case("PENDING")
+}
+
+fn commit_on_head(review: &PrReviewSummary, head: &str) -> bool {
     review
         .commit_id
         .as_deref()
@@ -248,8 +337,14 @@ pub fn author_persona(pr: &PrFeedbackSnapshot, active_agents: &HashSet<String>) 
     None
 }
 
+const REVIEW_MARKER_PREFIX: &str = "<!-- fl-review:";
+
 fn excerpt(body: &str) -> String {
-    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let prose = match body.rfind(REVIEW_MARKER_PREFIX) {
+        Some(at) => &body[..at],
+        None => body,
+    };
+    let flat = prose.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::new();
     for c in flat.chars() {
         if out.len() + c.len_utf8() > 240 {
@@ -268,6 +363,9 @@ fn excerpt(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_core::agent::AgentRole;
+    use fl_core::at::At;
+    use fl_core::pr_policy::{FlReviewMarker, ReviewVerdict, format_review_body};
 
     fn agents(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| n.to_ascii_lowercase()).collect()
@@ -309,6 +407,7 @@ mod tests {
 
     fn pr(branch: &str, head: &str, message: &str) -> PrFeedbackSnapshot {
         PrFeedbackSnapshot {
+            repo: "acme/widgets".into(),
             number: 327,
             branch: branch.into(),
             head_sha: head.into(),
@@ -316,6 +415,39 @@ mod tests {
             checks: vec![],
             reviews: vec![],
         }
+    }
+
+    fn review_by(id: u64, author: &str, state: &str, commit: &str, body: &str) -> PrReviewSummary {
+        PrReviewSummary {
+            id,
+            author_login: author.into(),
+            author_id: Some(7),
+            state: state.into(),
+            body: body.into(),
+            commit_id: Some(commit.into()),
+        }
+    }
+
+    fn marked(prose: &str, reviewer: &str, verdict: ReviewVerdict, head: &str) -> String {
+        format_review_body(
+            prose,
+            &FlReviewMarker {
+                reviewer: reviewer.into(),
+                role: AgentRole::Lead,
+                project: "ferroloop".into(),
+                head_sha: head.into(),
+                verdict,
+                at: At::from_unix_millis(1),
+            },
+        )
+    }
+
+    fn with_author(branch: &str, head: &str) -> PrFeedbackSnapshot {
+        pr(
+            branch,
+            head,
+            "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>\n",
+        )
     }
 
     #[test]
@@ -446,5 +578,242 @@ mod tests {
         );
         poller.remember(&notices[0].dedup_key);
         assert!(poller.poll(&[snap], &registered).is_empty());
+    }
+
+    #[test]
+    fn a_newer_approval_from_the_same_login_supersedes_changes_requested() {
+        let head = sha('a');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.reviews.push(review(2, "APPROVED", &head, "ship it"));
+        snap.reviews
+            .push(review(1, "CHANGES_REQUESTED", &head, "fix it"));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn a_newer_bot_approval_supersedes_changes_from_the_same_marker_reviewer() {
+        let head = sha('a');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.reviews.push(review_by(
+            11,
+            "ferroloop[bot]",
+            "APPROVED",
+            &head,
+            &marked("looks good", "ferris", ReviewVerdict::Approved, &head),
+        ));
+        snap.reviews.push(review_by(
+            10,
+            "ferroloop[bot]",
+            "CHANGES_REQUESTED",
+            &head,
+            &marked(
+                "fix the router",
+                "ferris",
+                ReviewVerdict::ChangesRequested,
+                &head,
+            ),
+        ));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn a_bot_review_reports_the_marker_reviewer_and_strips_the_marker() {
+        let head = sha('b');
+        let mut snap = pr("felicia/topic", &head, "feat: x\n");
+        // The marker verdict is not required to match the GitHub review state.
+        snap.reviews.push(review_by(
+            7,
+            "ferroloop[bot]",
+            "CHANGES_REQUESTED",
+            &head,
+            &marked(
+                "Please fix the cycle.",
+                "ferris",
+                ReviewVerdict::Approved,
+                &head.to_ascii_uppercase(),
+            ),
+        ));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].persona, "felicia");
+        assert!(notices[0].subject.contains("ferris"));
+        assert!(!notices[0].subject.contains("ferroloop"));
+        let body: serde_json::Value = serde_json::from_str(&notices[0].body).unwrap();
+        assert_eq!(body["kind"], "changes_requested");
+        assert_eq!(body["reviewer"], "ferris");
+        assert_eq!(body["review_id"], 7);
+        assert_eq!(body["excerpt"], "Please fix the cycle.");
+        assert!(!notices[0].body.contains("fl-review"));
+        assert_eq!(
+            excerpt(&marked(
+                "",
+                "ferris",
+                ReviewVerdict::ChangesRequested,
+                &head
+            )),
+            "(no review text)"
+        );
+    }
+
+    #[test]
+    fn a_comment_after_changes_requested_does_not_clear_the_notice() {
+        let head = sha('a');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.reviews
+            .push(review(1, "CHANGES_REQUESTED", &head, "fix it"));
+        snap.reviews
+            .push(review(2, "COMMENTED", &head, "one more note"));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert_eq!(notices.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&notices[0].body).unwrap();
+        assert_eq!(body["review_id"], 1);
+        assert_eq!(body["reviewer"], "ferris");
+    }
+
+    #[test]
+    fn a_marker_for_another_commit_produces_no_notice() {
+        let head = sha('a');
+        let other = sha('b');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.reviews.push(review_by(
+            3,
+            "ferroloop[bot]",
+            "CHANGES_REQUESTED",
+            &head,
+            &marked("fix it", "ferris", ReviewVerdict::ChangesRequested, &other),
+        ));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn a_newer_review_off_the_head_supersedes_an_older_change_request() {
+        let head = sha('a');
+        let old = sha('0');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.reviews
+            .push(review(1, "CHANGES_REQUESTED", &head, "fix it"));
+        snap.reviews
+            .push(review(2, "APPROVED", &old, "approved an older commit"));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn the_same_pull_request_in_two_repos_notifies_twice() {
+        let head = sha('a');
+        let mut left = with_author("felicia/topic", &head);
+        left.repo = "acme/widgets".into();
+        left.checks.push(check(1, "failure", &head));
+        let mut right = left.clone();
+        right.repo = "acme/other".into();
+        let notices = PrFeedbackPoller::default().poll(&[left, right], &agents(&["felicia"]));
+        assert_eq!(notices.len(), 2);
+        assert_ne!(notices[0].dedup_key, notices[1].dedup_key);
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.dedup_key == format!("acme/widgets:327:{head}:check:1"))
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.dedup_key == format!("acme/other:327:{head}:check:1"))
+        );
+    }
+
+    #[test]
+    fn remember_forgets_the_oldest_key_past_the_cap() {
+        let head = sha('a');
+        let mut oldest = with_author("felicia/topic", &head);
+        oldest.repo = "acme/old".into();
+        oldest.number = 1;
+        oldest.checks.push(check(1, "failure", &head));
+        let mut newest = oldest.clone();
+        newest.repo = "acme/new".into();
+        newest.number = 2;
+        newest.checks[0].id = 2;
+
+        let registered = agents(&["felicia"]);
+        let mut poller = PrFeedbackPoller::default();
+        let found = poller.poll(&[oldest.clone(), newest.clone()], &registered);
+        assert_eq!(found.len(), 2);
+        let oldest_key = found
+            .iter()
+            .find(|n| n.dedup_key.starts_with("acme/old:"))
+            .unwrap()
+            .dedup_key
+            .clone();
+        let newest_key = found
+            .iter()
+            .find(|n| n.dedup_key.starts_with("acme/new:"))
+            .unwrap()
+            .dedup_key
+            .clone();
+
+        poller.remember(&oldest_key);
+        for n in 1..MAX_SEEN_KEYS {
+            poller.remember(&format!("pad:{n}"));
+        }
+        poller.remember(&oldest_key);
+        assert!(
+            poller
+                .poll(std::slice::from_ref(&oldest), &registered)
+                .is_empty()
+        );
+
+        poller.remember(&newest_key);
+        let again = poller.poll(&[oldest, newest], &registered);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].dedup_key, oldest_key);
+        assert_ne!(again[0].dedup_key, newest_key);
+    }
+
+    #[test]
+    fn an_empty_check_head_is_not_on_the_pull_request_head() {
+        let head = sha('a');
+        let mut snap = with_author("felicia/topic", &head);
+        snap.checks.push(check(1, "failure", ""));
+        let notices = PrFeedbackPoller::default().poll(&[snap], &agents(&["felicia"]));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn the_latest_check_of_a_name_suppresses_an_earlier_failure() {
+        let head = sha('a');
+        let registered = agents(&["felicia"]);
+
+        let mut suppressed = with_author("felicia/topic", &head);
+        suppressed.checks.push(check(2, "success", &head));
+        suppressed.checks.push(check(1, "failure", &head));
+        assert!(
+            PrFeedbackPoller::default()
+                .poll(&[suppressed], &registered)
+                .is_empty()
+        );
+
+        let mut failed = with_author("felicia/topic", &head);
+        failed.checks.push(check(2, "failure", &head));
+        failed.checks.push(check(1, "success", &head));
+        let notices = PrFeedbackPoller::default().poll(&[failed], &registered);
+        assert_eq!(notices.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&notices[0].body).unwrap();
+        assert_eq!(body["check_id"], 2);
+        assert_eq!(
+            notices[0].dedup_key,
+            format!("acme/widgets:327:{head}:check:2")
+        );
+
+        let mut both = with_author("felicia/topic", &head);
+        both.checks.push(check(1, "failure", &head));
+        let mut lint = check(4, "timed_out", &head);
+        lint.name = "lint".into();
+        both.checks.push(lint);
+        let notices = PrFeedbackPoller::default().poll(&[both], &registered);
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|n| n.dedup_key.ends_with(":check:1")));
+        assert!(notices.iter().any(|n| n.dedup_key.ends_with(":check:4")));
     }
 }
