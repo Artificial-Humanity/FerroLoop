@@ -1,4 +1,4 @@
-//! `GET /api/v1/doctor`: Owner only, the six `G7.*` checks in order, the contract FerroDeck
+//! `GET /api/v1/doctor`: Owner only, the seven `G7.*` checks in order, the contract FerroDeck
 //! reads, and nothing written.
 
 use std::collections::BTreeMap;
@@ -14,13 +14,14 @@ use crate::{HttpRequest, HubServerConfig, HubState, handle_http_request};
 
 const OWNER: &str = "owner-tok-secret";
 const PEER: &str = "peer-tok-secret";
-const IDS: [&str; 6] = [
+const IDS: [&str; 7] = [
     "G7.release-identity",
     "G7.receipt-integrity",
     "G7.path-ownership",
     "G7.store-health",
     "G7.vault-perms",
     "G7.code-ui-agree",
+    "G7.unit-order",
 ];
 
 /// The environment variables the doctor consults. A developer's real vault, install root or
@@ -179,7 +180,7 @@ fn only_the_owner_may_read_the_doctor() {
 }
 
 #[test]
-fn the_body_is_the_six_ids_in_order_in_the_shape_ferrodeck_reads() {
+fn the_body_is_the_check_ids_in_order_in_the_shape_ferrodeck_reads() {
     let _env = clean_env();
     let tmp = TempDir::new().unwrap();
     let (status, v) = get(&hub(&tmp, false), Some(OWNER));

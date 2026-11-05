@@ -203,6 +203,12 @@ fn a_real_install_passes_and_the_tree_is_untouched() {
         detail(&r, ids::PATH_OWNERSHIP)
     );
     assert_eq!(status(&r, ids::RELEASE_IDENTITY), CheckStatus::Pass);
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
     // No store, no vault, no UI bundle here.
     assert_eq!(status(&r, ids::STORE_HEALTH), CheckStatus::NotInstalled);
     assert_eq!(status(&r, ids::VAULT_PERMS), CheckStatus::NotInstalled);
@@ -363,4 +369,275 @@ fn a_missing_home_makes_the_receipt_unlocatable_not_absent() {
     let r = observe(o);
     assert_eq!(status(&r, ids::RECEIPT_INTEGRITY), CheckStatus::Unsupported);
     assert!(detail(&r, ids::RECEIPT_INTEGRITY).contains("HOME"));
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Unsupported);
+    assert!(detail(&r, ids::UNIT_ORDER).contains("HOME"));
+}
+
+const CLEAN_TEMPLATES: [(&str, &str); 4] = [
+    (
+        "ferrostore.service",
+        include_str!("../../../contrib/units/ferrostore.service"),
+    ),
+    (
+        "ferrostore@.service",
+        include_str!("../../../contrib/units/ferrostore@.service"),
+    ),
+    (
+        "ferrowire.service",
+        include_str!("../../../contrib/units/ferrowire.service"),
+    ),
+    (
+        "ferroloop-hub.service",
+        include_str!("../../../contrib/units/ferroloop-hub.service"),
+    ),
+];
+
+fn write_units(root: &Path, files: &[(&str, &str)]) -> PathBuf {
+    let dir = root.join(".config/systemd/user");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_unit_after_default_target_and_wanted_by_it_is_caught_and_clean_templates_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = "\
+[Unit]
+Description=stale header
+After=default.target
+
+[Install]
+WantedBy=default.target
+";
+    write_units(tmp.path(), &[("ferrostore.service", bad)]);
+    std::fs::write(
+        tmp.path().join(".config/systemd/user/notferro.service"),
+        bad,
+    )
+    .unwrap();
+    let before = tree(tmp.path());
+    let r = observe(spec(tmp.path(), StoreFacts::default()));
+    assert_eq!(tree(tmp.path()), before, "reading units wrote something");
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&r, ids::UNIT_ORDER);
+    assert!(d.contains("ferrostore.service"), "{d}");
+    assert!(d.contains("systemd --user boot ordering cycle"), "{d}");
+    assert!(d.contains("`fl install`"), "{d}");
+    assert!(d.contains("remove `After=default.target`"), "{d}");
+    assert!(!d.contains("notferro.service"), "{d}");
+
+    let clean = tempfile::tempdir().unwrap();
+    write_units(clean.path(), &CLEAN_TEMPLATES);
+    let r = observe(spec(clean.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+
+    let commented = tempfile::tempdir().unwrap();
+    write_units(
+        commented.path(),
+        &[(
+            "ferrowire.service",
+            "# After=default.target\n[Install]\nWantedBy=default.target\n",
+        )],
+    );
+    let r = observe(spec(commented.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Pass,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+
+    let link = tempfile::tempdir().unwrap();
+    let dir = write_units(link.path(), &[]);
+    let outside = link.path().join("secret-unit.txt");
+    std::fs::write(&outside, "SENTINEL-UNIT\n[Unit]\nAfter=default.target\n").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("ferrostore.service")).unwrap();
+    let r = observe(spec(link.path(), StoreFacts::default()));
+    assert_eq!(status(&r, ids::UNIT_ORDER), CheckStatus::Warn);
+    assert!(detail(&r, ids::UNIT_ORDER).contains("ferrostore.service"));
+    assert!(!r.to_json().contains("SENTINEL-UNIT"));
+
+    // The unit directory itself may be a symlink. The files inside still are not followed.
+    let via = tempfile::tempdir().unwrap();
+    let real = via.path().join("real-units");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("ferrostore.service"), bad).unwrap();
+    let linked = via.path().join(".config/systemd/user");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let r = observe(spec(via.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Warn,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+}
+
+const CYCLE: &str = "\
+[Unit]
+After=default.target
+
+[Install]
+WantedBy=default.target
+";
+
+fn owned_unit(name: &str, path: &Path) -> OwnedUnit {
+    OwnedUnit {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        sha256: "a".repeat(64),
+        release: "0.1.0+0123456789ab".into(),
+    }
+}
+
+#[test]
+fn an_explicit_prefix_reads_units_from_the_receipt_unit_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path().join("prefix");
+    let unit_dir = tmp.path().join("real-units");
+    std::fs::create_dir_all(&unit_dir).unwrap();
+    std::fs::write(unit_dir.join("ferrostore.service"), CYCLE).unwrap();
+    let mut r = receipt();
+    r.layout.unit_dir = unit_dir.display().to_string();
+    std::fs::create_dir_all(&prefix).unwrap();
+    std::fs::write(prefix.join("receipt.json"), r.to_json()).unwrap();
+    let mut o = spec(tmp.path(), StoreFacts::default());
+    o.layout = Layout::explicit(prefix.to_str().unwrap()).unwrap();
+    assert!(
+        o.layout.unit_dir.ends_with("/units"),
+        "explicit layout unit dir is the prefix units dir, not the receipt's"
+    );
+    let before = tree(tmp.path());
+    let report = observe(o);
+    assert_eq!(tree(tmp.path()), before, "observing wrote something");
+    assert_eq!(status(&report, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&report, ids::UNIT_ORDER);
+    assert!(d.contains("ferrostore.service"), "{d}");
+}
+
+#[test]
+fn a_receipt_owned_unit_outside_the_listed_directory_is_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let listed = root.join(".config/systemd/user");
+    std::fs::create_dir_all(&listed).unwrap();
+    let elsewhere = root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let ferro = elsewhere.join("ferrostore.service");
+    std::fs::write(&ferro, CYCLE).unwrap();
+    let other = elsewhere.join("notferro.service");
+    std::fs::write(
+        &other,
+        "SENTINEL-NOT-FERRO\n[Unit]\nAfter=default.target\n\n[Install]\nWantedBy=default.target\n",
+    )
+    .unwrap();
+    let mut r = receipt();
+    let show = |p: &Path| p.display().to_string();
+    r.layout.prefix = show(&root.join(".local/share/fl"));
+    r.layout.bin_dir = show(&root.join(".local/bin"));
+    r.layout.unit_dir = show(&listed);
+    r.units = vec![
+        owned_unit("ferrostore.service", &ferro),
+        owned_unit("notferro.service", &other),
+    ];
+    let prefix = root.join(".local/share/fl");
+    std::fs::create_dir_all(&prefix).unwrap();
+    std::fs::write(prefix.join("receipt.json"), r.to_json()).unwrap();
+    let before = tree(root);
+    let report = observe(spec(root, StoreFacts::default()));
+    assert_eq!(tree(root), before, "observing wrote something");
+    assert_eq!(status(&report, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&report, ids::UNIT_ORDER);
+    assert!(d.contains("ferrostore.service"), "{d}");
+    assert!(!d.contains("notferro.service"), "{d}");
+    let all = report.to_json() + &report.render_text();
+    assert!(!all.contains("SENTINEL-NOT-FERRO"), "{all}");
+}
+
+#[test]
+fn a_malformed_receipt_falls_back_to_the_layout_unit_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_units(root, &[("ferrostore.service", CYCLE)]);
+    let other = root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("ferrowire.service"), CYCLE).unwrap();
+    let prefix = root.join(".local/share/fl");
+    std::fs::create_dir_all(&prefix).unwrap();
+    std::fs::write(prefix.join("receipt.json"), b"{ not json").unwrap();
+    let before = tree(root);
+    let report = observe(spec(root, StoreFacts::default()));
+    assert_eq!(tree(root), before, "observing wrote something");
+    assert_eq!(status(&report, ids::UNIT_ORDER), CheckStatus::Warn);
+    let d = detail(&report, ids::UNIT_ORDER);
+    assert!(d.contains("ferrostore.service"), "{d}");
+    assert!(!d.contains("ferrowire.service"), "{d}");
+}
+
+#[test]
+fn a_zero_budget_stops_the_unit_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_units(tmp.path(), &[("ferrostore.service", CYCLE)]);
+    let mut o = spec(tmp.path(), StoreFacts::default());
+    o.budget = Duration::ZERO;
+    let before = tree(tmp.path());
+    let report = observe(o);
+    assert_eq!(tree(tmp.path()), before, "observing wrote something");
+    let d = detail(&report, ids::UNIT_ORDER);
+    assert_ne!(status(&report, ids::UNIT_ORDER), CheckStatus::Pass, "{d}");
+    assert!(d.contains("time budget exceeded"), "{d}");
+}
+
+#[test]
+fn a_unit_directory_scan_stops_at_4096_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".config/systemd/user");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..4096 {
+        std::fs::write(dir.join(format!("dummy-{i:04}")), b"x").unwrap();
+    }
+    std::fs::write(dir.join("ferrostore.service"), CYCLE).unwrap();
+    let before = tree(tmp.path());
+    let report = observe(spec(tmp.path(), StoreFacts::default()));
+    assert_eq!(tree(tmp.path()), before, "observing wrote something");
+    let d = detail(&report, ids::UNIT_ORDER);
+    assert!(
+        d.contains("unit directory scan stopped at 4096 entries"),
+        "{d}"
+    );
+    assert_ne!(status(&report, ids::UNIT_ORDER), CheckStatus::Pass, "{d}");
+}
+
+#[test]
+fn a_unit_after_default_target_named_with_colon_or_backslash_is_warned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bad = "\
+[Unit]
+After=default.target
+
+[Install]
+WantedBy=default.target
+";
+    let colon = "ferrostore@foo:bar.service";
+    let escaped = "ferrostore@foo\\xbar.service";
+    write_units(tmp.path(), &[(colon, bad), (escaped, bad)]);
+    let r = observe(spec(tmp.path(), StoreFacts::default()));
+    assert_eq!(
+        status(&r, ids::UNIT_ORDER),
+        CheckStatus::Warn,
+        "{}",
+        detail(&r, ids::UNIT_ORDER)
+    );
+    let d = detail(&r, ids::UNIT_ORDER);
+    assert!(d.contains(colon), "{d}");
+    assert!(d.contains(escaped), "{d}");
 }

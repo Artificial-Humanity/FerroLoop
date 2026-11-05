@@ -39,7 +39,7 @@ File naming in this directory follows
   allow), the `vault://NAME[#pem]` reference syntax, the policy-checked RS256 JWT signer, the
   observational `GET /api/v1/gate/vault-consumers` (configuration facts only), and where the
   protection ends.
-* [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the six observational
+* [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the seven observational
   `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
 * [browse.md](browse.md) — `fl browse`: a token-efficient accessibility snapshot of a web page
   (`snapshot`), a UI and accessibility gate that `fl gate` can run (`check`), and the two

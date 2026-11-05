@@ -2,7 +2,8 @@
 //!
 //! It reads: the install receipt, `lstat`/`readlink` and bounded hashes of the paths the
 //! receipt owns, the stores (opened read-only, never migrated, see `fl_store::health`), the
-//! vault files' modes (their contents are never read) and the UI bundle's `build-info.json`.
+//! vault files' modes (their contents are never read), the UI bundle's `build-info.json`,
+//! and the `After=` / `WantedBy=` lines of installed `ferro*.service` user units.
 //! It writes nothing, takes no write lock, makes no network call, starts no process, loads no
 //! model, generates no key and prints no secret.
 //!
