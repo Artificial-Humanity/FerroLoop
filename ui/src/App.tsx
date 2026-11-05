@@ -2315,6 +2315,9 @@ export const App: React.FC<AppProps> = ({
               }
               setSelectedAgentName(nameKey);
               setSelectedSessionId(null);
+              if (deviceLayoutRef.current === "phone") {
+                setPhoneView("chat");
+              }
               void refreshSessionsAndTranscript();
             }}
             onSelectSession={(sessionId) => {
@@ -2328,6 +2331,9 @@ export const App: React.FC<AppProps> = ({
                 setSessionQuotaUsage(null);
               }
               setSelectedSessionId(sessionId);
+              if (deviceLayoutRef.current === "phone") {
+                setPhoneView("chat");
+              }
               void refreshSessionsAndTranscript(sessionId);
             }}
             onSelectTab={(tab) => handleSelectTab(tab)}
@@ -2594,6 +2600,15 @@ export const App: React.FC<AppProps> = ({
         setSelectedAgentName(nameKey);
         setSelectedSessionId(null);
       }
+      if (deviceLayoutRef.current === "phone") {
+        // Agent settings render inside ChatPane, so show Chat without touching desktop state.
+        setPhoneView("chat");
+        setAgentSettingsOpen(true);
+        if (switchedAgent) {
+          void refreshSessionsAndTranscript();
+        }
+        return;
+      }
       if (!splitView && activeTab !== "chat") {
         setActiveTab("chat");
       }
@@ -2770,12 +2785,16 @@ export const App: React.FC<AppProps> = ({
     void refreshSessionsAndTranscript(sessionId);
   };
 
+  // Wire Mail needs an agent; without one the phone falls back to Artifacts, as the desktop does.
+  const effectivePhoneView: PhoneView =
+    !selectedAgent && phoneView === "mail" ? "artifacts" : phoneView;
+
   const phoneHelpTopic: HelpTopicId =
-    phoneView === "agents" || phoneView === "watch"
+    effectivePhoneView === "agents" || effectivePhoneView === "watch"
       ? "chat"
-      : phoneView === "events"
+      : effectivePhoneView === "events"
         ? "hub"
-        : phoneView;
+        : effectivePhoneView;
 
   const chatPaneElement = (
     <ChatPane
@@ -2817,7 +2836,7 @@ export const App: React.FC<AppProps> = ({
         isPhoneLayout ? () => navigatePhone("roster") : handleToggleLeftSidebar
       }
       mobileSidebarOpen={
-        isPhoneLayout ? phoneView === "agents" : leftSidebarOpen
+        isPhoneLayout ? effectivePhoneView === "agents" : leftSidebarOpen
       }
       onRefresh={() => {
         void refreshSessionsAndTranscript();
@@ -2874,8 +2893,9 @@ export const App: React.FC<AppProps> = ({
         setSelectedSessionId(null);
         if (deviceLayoutRef.current === "phone") {
           setPhoneView("chat");
+        } else {
+          setMobileRosterOpen(false);
         }
-        setMobileRosterOpen(false);
         void refreshSessionsAndTranscript();
       }}
       onOpenAgentSettings={(nameKey) => {
@@ -2926,7 +2946,7 @@ export const App: React.FC<AppProps> = ({
   );
 
   const renderPhoneView = (): React.ReactNode => {
-    switch (phoneView) {
+    switch (effectivePhoneView) {
       case "chat":
         return chatPaneElement;
       case "agents":
@@ -2934,7 +2954,7 @@ export const App: React.FC<AppProps> = ({
       case "events":
         return renderSecondaryPane("triage");
       default:
-        return renderSecondaryPane(phoneView);
+        return renderSecondaryPane(effectivePhoneView);
     }
   };
 
@@ -2947,7 +2967,8 @@ export const App: React.FC<AppProps> = ({
     >
       {isPhoneLayout ? (
         <PhoneShell
-          view={phoneView}
+          view={effectivePhoneView}
+          hasAgent={Boolean(selectedAgent)}
           onNavigate={setPhoneView}
           onBack={() => navigatePhone("chat")}
           selectedAgent={selectedAgent}

@@ -4,6 +4,7 @@ import App, { THEME_STORAGE_KEY } from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { PhoneBottomNav } from "../components/phone/PhoneBottomNav";
+import { PhoneMoreSheet } from "../components/phone/PhoneMoreSheet";
 import {
   PHONE_PRIMARY_TABS,
   PHONE_TOOL_VIEWS,
@@ -48,6 +49,18 @@ function resizeTo(width: number, height: number) {
 function renderAt(width: number, height: number) {
   setViewport(width, height);
   return render(<App apiClient={makeStubApiClient()} wsClient={makeStubWsClient()} />);
+}
+
+function makeRoutedApiClient(routes: Record<string, unknown>): HubApiClient {
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    const hit = Object.entries(routes).find(([fragment]) => url.includes(fragment));
+    return new Response(JSON.stringify(hit ? hit[1] : {}), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  });
+  return new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 }
 
 const PANE_TEST_IDS: Record<string, string> = {
@@ -343,5 +356,170 @@ describe("Phone shell (< 768px)", () => {
     const roster = screen.getByTestId("roster-sidebar");
     expect(roster).toHaveAttribute("data-left-panel-tab", "roster");
     expect(roster).toHaveAttribute("data-desktop-collapsed", "false");
+  });
+  it("opens agent settings from the Settings modal on the Chat view without writing desktop state", async () => {
+    // Desktop arrangement to preserve: Terminal in the left panel with the roster open.
+    renderAt(1280, 800);
+    fireEvent.click(within(screen.getByTestId("cockpit-tab-bar")).getByRole("tab", { name: "Terminal" }));
+    expect(screen.getByTestId("roster-sidebar")).toHaveAttribute("data-mobile-open", "true");
+
+    resizeTo(390, 844);
+    fireEvent.click(screen.getByTestId("phone-tab-board"));
+    expect(screen.getByTestId("records-board-pane")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("phone-tab-more"));
+    fireEvent.click(screen.getByTestId("phone-more-action-settings"));
+    fireEvent.click(screen.getByTestId("settings-tab-agents"));
+    const cog = document.querySelector("[data-testid^='settings-agent-cog-btn-']") as HTMLElement | null;
+    expect(cog).not.toBeNull();
+    await act(async () => {
+      fireEvent.click(cog!);
+    });
+
+    expect(screen.getByTestId("phone-shell")).toHaveAttribute("data-phone-view", "chat");
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+    expect(screen.queryByTestId("records-board-pane")).toBeNull();
+
+    resizeTo(1280, 800);
+    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute("aria-pressed", "false");
+    const roster = screen.getByTestId("roster-sidebar");
+    expect(roster).toHaveAttribute("data-left-panel-tab", "terminal");
+    expect(roster).toHaveAttribute("data-mobile-open", "true");
+    expect(roster).toHaveAttribute("data-desktop-collapsed", "false");
+  });
+
+  it("keeps the roster open state untouched when an agent is chosen in the Agents view", () => {
+    renderAt(1280, 800);
+    fireEvent.click(within(screen.getByTestId("cockpit-tab-bar")).getByRole("tab", { name: "Terminal" }));
+    resizeTo(390, 844);
+    fireEvent.click(screen.getByTestId("phone-tab-agents"));
+    const agentRow = screen
+      .getByTestId("roster-sidebar")
+      .querySelector("[data-testid^='agent-row-']") as HTMLElement;
+    fireEvent.click(agentRow);
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+    resizeTo(1280, 800);
+    expect(screen.getByTestId("roster-sidebar")).toHaveAttribute("data-mobile-open", "true");
+  });
+
+  it("opens Chat when an Events incident selects an agent", async () => {
+    const apiClient = makeRoutedApiClient({
+      "/agents/liveness": {
+        liveness: [
+          {
+            agent: "felix",
+            project: "FerroLoop",
+            role: "developer",
+            has_route: true,
+            adapter: "claude",
+            verdict: { state: "stale", reason: "Heartbeat stale for 48s" },
+          },
+        ],
+      },
+    });
+    setViewport(390, 844);
+    render(<App apiClient={apiClient} wsClient={makeStubWsClient()} />);
+    openMoreItem("events");
+    expect(screen.getByTestId("triage-queue-pane")).toBeInTheDocument();
+    const incident = await screen.findByTestId("triage-incident-heartbeat-agent-felix");
+    await act(async () => {
+      fireEvent.click(incident);
+    });
+    expect(screen.getByTestId("phone-shell")).toHaveAttribute("data-phone-view", "chat");
+    expect(screen.getByTestId("chat-pane")).toBeInTheDocument();
+  });
+
+  it("falls back from Wire Mail to Artifacts when no agent is selected, and hides Wire Mail in More", () => {
+    setViewport(390, 844);
+    render(
+      <App
+        apiClient={makeStubApiClient()}
+        wsClient={makeStubWsClient()}
+        initialSelectedAgentName={null}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("phone-tab-more"));
+    expect(screen.queryByTestId("phone-more-item-mail")).toBeNull();
+    expect(screen.getByTestId("phone-more-item-artifacts")).toBeInTheDocument();
+  });
+});
+
+describe("PhoneMoreSheet", () => {
+  const baseActions = { themeMode: "dark" as const };
+
+  it("shows Wire Mail only when an agent is selected", () => {
+    const { rerender } = render(
+      <PhoneMoreSheet view="chat" actions={baseActions} onNavigate={vi.fn()} onClose={vi.fn()} />,
+    );
+    expect(screen.getByTestId("phone-more-item-mail")).toBeInTheDocument();
+    rerender(
+      <PhoneMoreSheet
+        view="chat"
+        hasAgent={false}
+        actions={baseActions}
+        onNavigate={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("phone-more-item-mail")).toBeNull();
+  });
+
+  it("wraps Tab and Shift+Tab inside the sheet", () => {
+    render(
+      <PhoneMoreSheet view="chat" actions={baseActions} onNavigate={vi.fn()} onClose={vi.fn()} />,
+    );
+    const sheet = screen.getByTestId("phone-more-sheet");
+    const buttons = within(sheet).getAllByRole("button");
+    const first = buttons[0];
+    const last = buttons[buttons.length - 1];
+    expect(sheet).toHaveFocus();
+
+    // Shift+Tab from the sheet itself wraps to the last item.
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(last).toHaveFocus();
+    // Tab from the last item wraps to the first.
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(first).toHaveFocus();
+    // Shift+Tab from the first wraps back to the last.
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(last).toHaveFocus();
+    // Focus that escaped the sheet is pulled back in.
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(first).toHaveFocus();
+    outside.remove();
+  });
+});
+
+describe("Phone More sheet focus handling", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  it("makes the background inert while open and restores it on close", () => {
+    renderAt(390, 844);
+    const background = ["phone-top-bar", "phone-view", "phone-bottom-nav"].map((id) =>
+      screen.getByTestId(id),
+    );
+    fireEvent.click(screen.getByTestId("phone-tab-more"));
+    for (const el of background) expect(el).toHaveAttribute("inert");
+    expect(screen.getByTestId("phone-more-sheet")).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("phone-more-sheet")).toHaveFocus();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    for (const el of background) expect(el).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("phone-tab-more")).toHaveFocus();
+  });
+
+  it("does not pull focus back to the More tab when an action opens a modal", () => {
+    renderAt(390, 844);
+    fireEvent.click(screen.getByTestId("phone-tab-more"));
+    fireEvent.click(screen.getByTestId("phone-more-action-help"));
+    expect(screen.queryByTestId("phone-more-sheet")).toBeNull();
+    expect(screen.getByTestId("contextual-help-drawer")).toBeInTheDocument();
+    expect(screen.getByTestId("phone-tab-more")).not.toHaveFocus();
+    expect(screen.getByTestId("phone-view")).not.toHaveAttribute("inert");
   });
 });
