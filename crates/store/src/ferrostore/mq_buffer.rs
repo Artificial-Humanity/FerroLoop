@@ -9,6 +9,10 @@ use std::time::Duration;
 enum MqBufferError {
     #[error("topic already exists")]
     AlreadySeeded,
+    #[error("topic must be seeded from the durable high-water first")]
+    NotSeeded,
+    #[error("buffered messages or acknowledgments must be flushed first")]
+    PendingFlush,
     #[error("sequence overflow")]
     SequenceOverflow,
     #[error("sequence must increase")]
@@ -40,6 +44,7 @@ struct BufferStats {
 
 #[derive(Debug, Default)]
 struct Topic {
+    seeded: bool,
     high_water: u64,
     persisted_high_water: u64,
     revision: u128,
@@ -76,23 +81,30 @@ impl MqBuffer {
     }
 
     fn seed(&mut self, topic: &str, high_water: u64) -> Result<(), MqBufferError> {
-        if self.topics.contains_key(topic) {
+        let state = self.topics.entry(topic.to_owned()).or_default();
+        if state.seeded {
             return Err(MqBufferError::AlreadySeeded);
         }
-        self.topics.insert(
-            topic.to_owned(),
-            Topic {
-                high_water,
-                persisted_high_water: high_water,
-                ..Topic::default()
-            },
-        );
+        state.seeded = true;
+        state.high_water = high_water;
+        state.persisted_high_water = high_water;
         Ok(())
     }
 
     /// Record a sequence the durable store has already committed. This method does no I/O.
     fn observe_durable(&mut self, topic: &str, seq: u64) -> Result<(), MqBufferError> {
         let state = self.topics.entry(topic.to_owned()).or_default();
+        if !state.seeded {
+            return Err(MqBufferError::NotSeeded);
+        }
+        if state
+            .messages
+            .values()
+            .any(|message| message.durability == MqDurability::Adaptive)
+            || !state.pending_acks.is_empty()
+        {
+            return Err(MqBufferError::PendingFlush);
+        }
         if seq <= state.high_water {
             return Err(MqBufferError::SequenceNotIncreasing);
         }
@@ -131,6 +143,9 @@ impl MqBuffer {
             })
             .ok_or(MqBufferError::SizeOverflow)?;
         let state = self.topics.entry(topic.to_owned()).or_default();
+        if !state.seeded {
+            return Err(MqBufferError::NotSeeded);
+        }
         let seq = state
             .high_water
             .checked_add(1)
@@ -225,6 +240,9 @@ impl MqBuffer {
 
     fn snapshot(&self, topic: &str) -> Option<FlushSnapshot> {
         let state = self.topics.get(topic)?;
+        if !state.seeded {
+            return None;
+        }
         Some(FlushSnapshot {
             topic: topic.to_owned(),
             high_water: state.high_water,
@@ -282,6 +300,63 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn durable_observation_refuses_unflushed_adaptive_messages_or_acks() {
+        let mut q = MqBuffer::new(true);
+        q.seed("events", 40).unwrap();
+        let seq = q
+            .push(
+                "events",
+                "key",
+                json!(1),
+                MqDurability::Adaptive,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(q.observe_durable("events", 42).is_err());
+        assert_eq!(q.persisted_high_water("events"), Some(40));
+        assert!(q.ack("events", "group", seq));
+        assert!(
+            q.observe_durable("events", 42).is_err(),
+            "evicted payload still has an unflushed acknowledgment"
+        );
+        let snapshot = q.snapshot("events").unwrap();
+        q.confirm_flush(&snapshot).unwrap();
+        q.observe_durable("events", 42).unwrap();
+    }
+
+    #[test]
+    fn persisted_ack_before_seed_preserves_ack_and_uses_disk_high_water() {
+        let mut q = MqBuffer::new(false);
+        q.observe_persisted_ack("events", "group", 41);
+        assert!(q.snapshot("events").is_none());
+        assert!(
+            q.push(
+                "events",
+                "unseeded",
+                json!(1),
+                MqDurability::Adaptive,
+                Duration::ZERO
+            )
+            .is_err()
+        );
+        assert!(q.observe_durable("events", 41).is_err());
+        q.seed("events", 40).unwrap();
+        assert_eq!(
+            q.push(
+                "events",
+                "key",
+                json!(1),
+                MqDurability::Adaptive,
+                Duration::ZERO
+            )
+            .unwrap(),
+            41
+        );
+        assert!(q.poll("events", "group", 10).is_empty());
+        assert_eq!(q.poll("events", "other", 10)[0].seq, 41);
+    }
+
+    #[test]
     fn seeded_and_supplied_sequences_are_monotonic_across_durability_modes() {
         let mut q = MqBuffer::new(false);
         q.seed("events", 40).unwrap();
@@ -307,6 +382,8 @@ mod tests {
             .unwrap(),
             42
         );
+        let snapshot = q.snapshot("events").unwrap();
+        q.confirm_flush(&snapshot).unwrap();
         q.observe_durable("events", 43).unwrap();
         assert!(q.observe_durable("events", 42).is_err());
         assert_eq!(
@@ -347,6 +424,7 @@ mod tests {
     #[test]
     fn groups_ack_independently_and_default_does_not_evict() {
         let mut q = MqBuffer::new(false);
+        q.seed("events", 0).unwrap();
         let seq = q
             .push(
                 "events",
@@ -369,6 +447,7 @@ mod tests {
     fn an_earlier_persisted_unknown_ack_filters_a_later_memory_sequence() {
         let mut q = MqBuffer::new(false);
         q.observe_persisted_ack("events", "group-a", 1);
+        q.seed("events", 0).unwrap();
         assert_eq!(
             q.push(
                 "events",
@@ -387,6 +466,7 @@ mod tests {
     #[test]
     fn first_ack_eviction_is_explicit_and_ephemeral_records_can_be_evicted() {
         let mut q = MqBuffer::new(true);
+        q.seed("events", 0).unwrap();
         let adaptive = q
             .push(
                 "events",
@@ -420,6 +500,7 @@ mod tests {
     #[test]
     fn snapshot_and_confirm_retain_high_water_and_group_acks() {
         let mut q = MqBuffer::new(false);
+        q.seed("events", 0).unwrap();
         let a = q
             .push(
                 "events",
@@ -461,6 +542,7 @@ mod tests {
     #[test]
     fn mutation_during_flush_refuses_stale_snapshot_without_dropping_records() {
         let mut q = MqBuffer::new(false);
+        q.seed("events", 0).unwrap();
         let a = q
             .push(
                 "events",
@@ -482,6 +564,7 @@ mod tests {
     #[test]
     fn bytes_and_group_lag_are_deterministic_and_clock_safe() {
         let mut q = MqBuffer::new(false);
+        q.seed("events", 0).unwrap();
         let a = q
             .push(
                 "events",
