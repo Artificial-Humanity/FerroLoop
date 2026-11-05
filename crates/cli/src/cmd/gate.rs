@@ -168,7 +168,7 @@ pub fn run(store: &AnyStore, cmd: Cmd) -> Result<i32> {
             };
             let head = fl_exec::git::Git::head(std::path::Path::new(&proj.root)).map_err(|e| {
                 anyhow::anyhow!(
-                    "{e}. A project must be a git working tree, because a gate's provenance is a commit."
+                    "{e}. A gate needs the project to be a git working tree with a commit, because a gate's provenance is a commit: run `fl project create <path> --git-init` or `git init` and commit."
                 )
             })?;
             let id = store.add_gate(

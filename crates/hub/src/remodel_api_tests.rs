@@ -126,7 +126,9 @@ fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
         ("model", json!("gpt-6-sol")),
         ("node_id", json!("ai-lab-0")),
         ("hosted", json!(true)),
-        ("cwd", Value::Null),
+        // `FerroLoop` is no area with a directory here, so its agent started in the workspace
+        // root (this hub's repo root), and the remodel keeps it.
+        ("cwd", json!(tmp.path())),
         ("status", json!("running")),
         ("handshake_dispatched", json!(false)),
         ("hydration_dispatched", json!(false)),

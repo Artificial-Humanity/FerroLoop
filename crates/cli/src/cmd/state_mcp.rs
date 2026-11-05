@@ -1542,7 +1542,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "send_message",
-            "description": "Send a FerroWire message to an agent persona, AgentId URN, or group selector (@all, @area:<slug>, @role:<role>, @area:<slug>/<role>).",
+            "description": "Send a FerroWire message to an agent persona, AgentId URN, or group selector (@all, @council, @<group>, @area:<slug>, @role:<role>, @area:<slug>/<role>).",
             "inputSchema": {
                 "type": "object",
                 "required": ["to", "subject", "body"],

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 /// the code opens stores by, never typed here.
 ///
 /// - `redb_schema`: the schema ladder both engines share, oldest to newest this build opens
-///   (`FORMAT_VERSION` ..= `FORMAT_WITH_WORKFLOW`). A new store starts at the oldest and a
+///   (`FORMAT_VERSION` ..= `FORMAT_WITH_AREA_DELETE`). A new store starts at the oldest and a
 ///   first write of a newer kind raises it; an older build refuses a raised store.
 /// - `ferrostore_container`: the `.fls` container format (`CONTAINER_FORMAT_OLDEST` ..=
 ///   `CONTAINER_FORMAT_NEWEST`); every slot this build writes is the newest.
@@ -14,7 +14,7 @@ pub fn store_formats() -> Value {
     json!({
         "redb_schema": {
             "min": crate::FORMAT_VERSION,
-            "max": crate::FORMAT_WITH_WORKFLOW,
+            "max": crate::FORMAT_WITH_AREA_DELETE,
         },
         "ferrostore_container": {
             "min": crate::ferrostore::CONTAINER_FORMAT_OLDEST,
