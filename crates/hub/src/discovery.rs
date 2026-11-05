@@ -6869,6 +6869,88 @@ mod tests {
     }
 
     #[test]
+    fn agy_live_model_reads_a_pending_user_input_step_from_the_tail_and_the_full_trajectory() {
+        fn leak(body: &str) -> &'static str {
+            Box::leak(body.to_string().into_boxed_str())
+        }
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
+        let pending = user_input_step(Some("MODEL_PLACEHOLDER_M39"), None);
+        let answered = [
+            pending.clone(),
+            planner_step("MODEL_PLACEHOLDER_M404"),
+            tool_step(),
+        ];
+        // (cascade, steps the language server returns, model, effort)
+        let cases: [(&'static str, Vec<Value>, &str, &str); 2] = [
+            (
+                "pending",
+                vec![tool_step(), pending],
+                "claude-sonnet-5-5",
+                "high",
+            ),
+            ("answered", answered.to_vec(), "claude-opus-5-5", "low"),
+        ];
+        for (name, steps, model, effort) in cases {
+            let [full, tail] = agy_step_bodies(&steps);
+            // Tail case: the steps call answers and the full trajectory is never asked.
+            let cascade: &'static str = leak(&format!("agy-pend-tail-{name}"));
+            let stub = spawn_agy_stub_with_steps(
+                AGY_PENDING_CONFIG_FIXTURE,
+                // The full trajectory names another model; it must not be asked.
+                r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M26"}}]}}"#,
+                cascade,
+                Some((200, leak(&tail))),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                ["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"],
+                "{cascade}"
+            );
+            stub.shutdown();
+
+            // Full case: the tail call names nothing, so the full trajectory decides.
+            let cascade: &'static str = leak(&format!("agy-pend-full-{name}"));
+            let stub = spawn_agy_stub_with_steps(
+                AGY_PENDING_CONFIG_FIXTURE,
+                leak(&full),
+                cascade,
+                Some((200, r#"{"steps":[]}"#)),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some(model), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some(effort), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                [
+                    "GetCascadeModelConfigData",
+                    "GetCascadeTrajectorySteps",
+                    "GetCascadeTrajectory"
+                ],
+                "{cascade}"
+            );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
     fn agy_live_model_goes_straight_to_the_full_trajectory_without_a_step_offset() {
         let tmp = TempDir::new().unwrap();
         let young = write_agy_transcript(tmp.path(), "{\"step_index\":3}\n");
