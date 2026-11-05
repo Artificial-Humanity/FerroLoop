@@ -2729,7 +2729,10 @@ fn area_delete_removes_the_area_logs_one_event_and_is_idempotent<S: AgentRegistr
     s.upsert_area(area("gone")).unwrap();
     s.upsert_area(area("kept")).unwrap();
     let before = s.registry_events_after(0).unwrap().len();
-    assert!(s.delete_area("GONE", At::from_unix_millis(11), "owner").unwrap());
+    assert!(
+        s.delete_area("GONE", At::from_unix_millis(11), "owner")
+            .unwrap()
+    );
     assert_eq!(s.get_area("gone").unwrap(), None);
     assert!(s.get_area("kept").unwrap().is_some());
     let events = s.registry_events_after(0).unwrap();
@@ -2739,7 +2742,10 @@ fn area_delete_removes_the_area_logs_one_event_and_is_idempotent<S: AgentRegistr
         crate::agent::RegistryEventKind::AreaDelete { area_key } if area_key == "gone"
     ));
     // Absent: nothing changes, nothing is logged.
-    assert!(!s.delete_area("gone", At::from_unix_millis(12), "owner").unwrap());
+    assert!(
+        !s.delete_area("gone", At::from_unix_millis(12), "owner")
+            .unwrap()
+    );
     assert_eq!(s.registry_events_after(0).unwrap().len(), before + 1);
     // An imported delete removes the area too, and a later upsert makes it again.
     let mut remote = events.last().unwrap().1.clone();

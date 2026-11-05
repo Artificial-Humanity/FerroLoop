@@ -953,6 +953,13 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cli {
             db,
+            command: Command::Project(cmd::project::Cmd::Delete(args)),
+        } => {
+            let default_store = default_state_store_path()?;
+            return cmd::project::delete(args, &cfg, &cwd, explicit_db(db), &default_store);
+        }
+        Cli {
+            db,
             command: Command::Agent { cmd },
         } => {
             let explicit = explicit_db(db);

@@ -27,8 +27,8 @@ File naming in this directory follows
   why.
 * [hub-home-and-artifacts.md](hub-home-and-artifacts.md) — where the Hub keeps its data and
   artifact registry, the per-project directories, and the Owner-only endpoints that relocate
-  them, with migration, and that list, create and update projects
-  (`GET`, `POST` and `PATCH /api/v1/projects`).
+  them, with migration, and that list, create, update and delete projects
+  (`GET`, `POST`, `PATCH` and `DELETE /api/v1/projects`).
 * [build-provenance.md](build-provenance.md) — how a binary says what it was built from:
   `fl --version [--json]`, `fl version`, `ferrostore --version [--json]`, the Hub's
   `GET /api/v1/version`, the UI bundle's `build-info.json`, and the build-time stamps behind

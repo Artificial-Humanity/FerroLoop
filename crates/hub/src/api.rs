@@ -5002,9 +5002,13 @@ fn handle_dynamic_api_routes(
         && segments[0] == "api"
         && segments[1] == "v1"
         && segments[2] == "projects"
-        && method == "PATCH"
+        && matches!(method, "PATCH" | "DELETE")
     {
-        return crate::projects_api::handle_patch_project(state, authority, segments[3], req);
+        return if method == "PATCH" {
+            crate::projects_api::handle_patch_project(state, authority, segments[3], req)
+        } else {
+            crate::projects_api::handle_delete_project(state, authority, segments[3], req)
+        };
     }
     // /api/v1/projects/:id/artifacts-dir. The merge routes below have six or more segments.
     if segments.len() == 5
@@ -6390,6 +6394,9 @@ fn handle_post_session_spin_up(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
+    // A virtual scope has no directory of its own: its agents start in the workspace root.
+    let payload =
+        payload.with_default_cwd(&*store, &resolve_workspace_root(&state.config.repo_root));
     match lifecycle::spin_up(
         &*store,
         &lifecycle_env(state),

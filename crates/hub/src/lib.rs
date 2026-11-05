@@ -21,6 +21,7 @@ mod mcp_api;
 pub mod nodes;
 mod operators;
 mod pr_feedback;
+pub mod project_delete;
 pub mod project_init;
 pub mod project_list;
 mod projects_api;
@@ -1144,6 +1145,9 @@ mod runtime_update_tests;
 
 #[cfg(test)]
 mod artifact_dirs_tests;
+
+#[cfg(test)]
+mod project_delete_tests;
 
 #[cfg(test)]
 mod project_init_tests;

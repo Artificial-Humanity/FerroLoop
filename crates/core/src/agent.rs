@@ -296,10 +296,14 @@ pub fn validate_agent_identity(
 pub enum RegistryEventKind {
     AreaUpsert(AreaRecord),
     AgentUpsert(AgentRecord),
-    AgentRetire { id: AgentId },
+    AgentRetire {
+        id: AgentId,
+    },
     /// The area is gone (a project or virtual group was deleted). A later `AreaUpsert` makes it
     /// again.
-    AreaDelete { area_key: String },
+    AreaDelete {
+        area_key: String,
+    },
 }
 
 crate::wire::wire_tags!(RegistryEventKind as registry_event_kind_wire {

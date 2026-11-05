@@ -1,4 +1,5 @@
-//! `GET /api/v1/projects`, `POST /api/v1/projects` and `PATCH /api/v1/projects/:slug`.
+//! `GET /api/v1/projects`, `POST /api/v1/projects`, `PATCH /api/v1/projects/:slug` and
+//! `DELETE /api/v1/projects/:slug`.
 //!
 //! One shape describes a project everywhere (`ProjectSummary` in [`crate::project_list`], plus
 //! the artifacts-directory fields the Settings screen reads): the list, a creation and an
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
 use crate::auth::HubAuthority;
+use crate::project_delete::{DeleteContext, DeleteError, DeleteRequest, delete_project};
 use crate::project_init::{
     Credential, InitError, InitPaths, InitRequest, ProjectKind, VirtualRequest, canonical_root,
     create_virtual, init_project, user_config_path,
@@ -343,5 +345,69 @@ pub(crate) fn handle_patch_project(
             HttpResponse::json(200, summary)
         }
         Err(resp) => resp,
+    }
+}
+
+/// `DELETE /api/v1/projects/:slug`. Owner only. The body (empty means all defaults) is
+/// `{"reassign_to"?, "decommission_agents"?, "delete_store"?, "delete_dir"?}`; see
+/// [`crate::project_delete`] for the order and the safety rules. `409` with the active agents
+/// when some are assigned and the request says nothing about them; `404` for an unknown project.
+pub(crate) fn handle_delete_project(
+    state: &HubState,
+    authority: &HubAuthority,
+    raw_slug: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return error_response(403, "only Owner authority may delete projects");
+    }
+    let decoded = percent_decode(raw_slug);
+    if decoded.trim().is_empty() {
+        return error_response(400, "project slug is empty");
+    }
+    let slug = match records::normalize_project(Some(&decoded)) {
+        Ok(s) => s,
+        Err(e) => return error_response(400, e),
+    };
+    let body: DeleteRequest = match req.json() {
+        Ok(body) => body,
+        Err(e) => return error_response(400, &e),
+    };
+    let paths = match hub_paths(state) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let home = hub_home_dir(state);
+    let hints = records::project_store_hints(state, home.as_deref());
+    let workspace_root = fl_core::resolve_workspace_root(&state.config.repo_root);
+    let env = crate::api::lifecycle_env(state);
+    let ctx = DeleteContext {
+        paths: &paths,
+        stores: &hints,
+        home: home.as_deref(),
+        workspace_root: &workspace_root,
+        lifecycle: &env,
+    };
+    let result = delete_project(
+        &slug,
+        &body,
+        authority.actor_name(),
+        &ctx,
+        open_workspace(state),
+        |key| {
+            state.clear_session_prompt_queue(key);
+            state.clear_session_model_override(key);
+        },
+    );
+    match result {
+        Ok(outcome) => {
+            let data = serde_json::to_value(&outcome).unwrap_or(Value::Null);
+            state.broadcast("projects", "project.deleted", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(DeleteError::ActiveAgents { agents }) => {
+            HttpResponse::json(409, DeleteError::active_agents_body(&agents))
+        }
+        Err(DeleteError::Init(e)) => init_error_response(&e),
     }
 }

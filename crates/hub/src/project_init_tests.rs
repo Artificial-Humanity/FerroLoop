@@ -2481,3 +2481,232 @@ fn a_virtual_group_does_not_appear_among_the_available_projects_of_the_records_b
     let board = body_of(&hub.get("/api/v1/records"));
     assert_eq!(board["available_projects"], json!(["ferroloop", "real"]));
 }
+
+// --- DELETE /api/v1/projects/:slug ------------------------------------------------------------
+
+impl Hub {
+    fn delete(&self, token: &str, slug: &str, body: Option<&Value>) -> HttpResponse {
+        self.send(
+            "DELETE",
+            &format!("/api/v1/projects/{slug}"),
+            Some(token),
+            body,
+        )
+    }
+
+    fn data_file(&self, name: &str) -> PathBuf {
+        self.base.join("home/.local/share/fl").join(name)
+    }
+
+    fn agent(&self, name: &str, project: &str, role: fl_core::agent::AgentRole) {
+        self.workspace()
+            .register_agent(fl_core::agent::RegisterAgentArgs {
+                display_name: name.into(),
+                email: None,
+                project: project.into(),
+                role,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: fl_core::At::from_unix_millis(5),
+                by: "tester".into(),
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn delete_with_no_body_unregisters_and_deletes_no_file() {
+    let hub = Hub::new();
+    let root = hub.work("doomed");
+    hub.post(OWNER, &json!({ "path": root }));
+    hub.post(OWNER, &json!({ "path": hub.work("kept") }));
+    let mut frames = hub.state.subscribe();
+
+    let resp = hub.delete(OWNER, "doomed", None);
+    assert_eq!(resp.status, 200, "{}", text_of(&resp));
+    assert_eq!(
+        body_of(&resp),
+        json!({
+            "deleted": "doomed",
+            "reassigned_agents": 0,
+            "decommissioned_agents": 0,
+            "store_deleted": false,
+            "dir_deleted": false,
+        })
+    );
+    let frame = frames.try_recv().unwrap();
+    assert_eq!(frame.event, "project.deleted");
+    let config = fs::read_to_string(hub.config()).unwrap();
+    assert!(
+        !config.contains("doomed") && config.contains("kept"),
+        "{config}"
+    );
+    assert!(hub.workspace().get_area("doomed").unwrap().is_none());
+    assert!(root.join(".fl/mcp.toml").is_file(), "the directory stays");
+    assert!(hub.data_file("doomed.fls").is_file(), "the store stays");
+    // The Hub lists a project from a store file in its data directory, so the slug is still
+    // listed, with no path, until the store file is deleted too.
+    assert_eq!(hub.entry("doomed")["path"], Value::Null);
+    assert_eq!(hub.delete(OWNER, "nosuch", None).status, 404);
+
+    // An empty object is the same request, and deleting the store removes the slug.
+    let resp = hub.delete(OWNER, "doomed", Some(&json!({ "delete_store": true })));
+    assert_eq!(resp.status, 200, "{}", text_of(&resp));
+    assert_eq!(body_of(&resp)["store_deleted"], true);
+    assert!(!hub.data_file("doomed.fls").exists());
+    assert_eq!(hub.entry("doomed"), Value::Null);
+    assert_eq!(hub.delete(OWNER, "doomed", Some(&json!({}))).status, 404);
+}
+
+#[test]
+fn delete_answers_409_with_the_active_agents_and_changes_nothing() {
+    let hub = Hub::new();
+    hub.post(OWNER, &json!({ "path": hub.work("busy") }));
+    hub.agent("Ada", "busy", fl_core::agent::AgentRole::Assistant);
+    hub.agent("Bo", "busy", fl_core::agent::AgentRole::Assistant);
+    let config = fs::read_to_string(hub.config()).unwrap();
+
+    let resp = hub.delete(OWNER, "busy", Some(&json!({ "delete_dir": true })));
+    assert_eq!(resp.status, 409, "{}", text_of(&resp));
+    let mut body = body_of(&resp);
+    body["active_agents"]
+        .as_array_mut()
+        .unwrap()
+        .sort_by_key(|a| a.to_string());
+    assert_eq!(
+        body,
+        json!({
+            "error": "project has active agents",
+            "active_agent_count": 2,
+            "active_agents": ["Ada", "Bo"],
+        })
+    );
+    assert_eq!(fs::read_to_string(hub.config()).unwrap(), config);
+    assert!(hub.workspace().get_area("busy").unwrap().is_some());
+    assert!(hub.work("busy").is_dir() && hub.data_file("busy.fls").is_file());
+    assert_eq!(hub.entry("busy")["active_agent_count"], 2);
+}
+
+#[test]
+fn delete_can_reassign_or_decommission_the_agents_but_not_both() {
+    let hub = Hub::new();
+    for name in ["one", "two", "three"] {
+        hub.post(OWNER, &json!({ "path": hub.work(name) }));
+    }
+    hub.agent("Ada", "one", fl_core::agent::AgentRole::Assistant);
+    hub.agent("Bo", "two", fl_core::agent::AgentRole::Assistant);
+
+    let both = hub.delete(
+        OWNER,
+        "one",
+        Some(&json!({ "reassign_to": "three", "decommission_agents": true })),
+    );
+    assert_eq!(both.status, 400, "{}", text_of(&both));
+    assert!(hub.workspace().get_area("one").unwrap().is_some());
+    let unknown = hub.delete(OWNER, "one", Some(&json!({ "reassign_to": "nosuch" })));
+    assert_eq!(unknown.status, 404);
+    let same = hub.delete(OWNER, "one", Some(&json!({ "reassign_to": "one" })));
+    assert_eq!(same.status, 400);
+    assert!(hub.workspace().get_area("one").unwrap().is_some());
+
+    let moved = hub.delete(OWNER, "one", Some(&json!({ "reassign_to": "three" })));
+    assert_eq!(moved.status, 200, "{}", text_of(&moved));
+    assert_eq!(body_of(&moved)["reassigned_agents"], 1);
+    assert_eq!(hub.entry("three")["active_agent_count"], 1);
+
+    let retired = hub.delete(OWNER, "two", Some(&json!({ "decommission_agents": true })));
+    assert_eq!(retired.status, 200, "{}", text_of(&retired));
+    assert_eq!(body_of(&retired)["decommissioned_agents"], 1);
+    let bo = hub.workspace().agent_by_name("bo").unwrap().unwrap();
+    assert_eq!(bo.status, fl_core::agent::AgentStatus::Retired);
+}
+
+#[test]
+fn delete_dir_removes_only_the_registered_directory_inside_the_hubs_home() {
+    let hub = Hub::new();
+    let root = hub.work("scrap");
+    hub.post(OWNER, &json!({ "path": root }));
+    hub.post(OWNER, &json!({ "path": hub.work("sibling") }));
+    let resp = hub.delete(OWNER, "scrap", Some(&json!({ "delete_dir": true })));
+    assert_eq!(resp.status, 200, "{}", text_of(&resp));
+    assert_eq!(body_of(&resp)["dir_deleted"], true);
+    assert!(!root.exists());
+    assert!(hub.work("sibling").is_dir() && hub.base.join("work").is_dir());
+}
+
+#[test]
+fn delete_dir_is_refused_for_the_hubs_home_and_changes_nothing() {
+    let hub = Hub::new();
+    let config = hub.config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let home = hub.base.join("home");
+    fs::write(
+        &config,
+        format!(
+            "[[project]]\nname = \"homeish\"\nroot = \"{}\"\n",
+            home.display()
+        ),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&config).unwrap();
+    let resp = hub.delete(OWNER, "homeish", Some(&json!({ "delete_dir": true })));
+    assert_eq!(resp.status, 400, "{}", text_of(&resp));
+    assert!(
+        error_of(&resp).contains("home directory"),
+        "{}",
+        error_of(&resp)
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    assert!(home.join(".config/fl/config.toml").is_file());
+}
+
+#[test]
+fn delete_removes_a_virtual_group_and_refuses_store_and_dir_for_it() {
+    let hub = Hub::new();
+    hub.post(OWNER, &json!({ "kind": "virtual", "name": "Council" }));
+    for body in [
+        json!({ "delete_dir": true }),
+        json!({ "delete_store": true }),
+    ] {
+        assert_eq!(hub.delete(OWNER, "council", Some(&body)).status, 400);
+        assert_ne!(hub.entry("council"), Value::Null);
+    }
+    let resp = hub.delete(OWNER, "council", Some(&json!({})));
+    assert_eq!(resp.status, 200, "{}", text_of(&resp));
+    assert_eq!(body_of(&resp)["deleted"], "council");
+    assert_eq!(hub.entry("council"), Value::Null);
+    assert!(hub.workspace().get_area("council").unwrap().is_none());
+    assert!(!hub.config().exists());
+}
+
+#[test]
+fn only_the_owner_may_delete_a_project() {
+    let hub = Hub::new();
+    hub.post(OWNER, &json!({ "path": hub.work("guarded") }));
+    assert_eq!(
+        hub.send("DELETE", "/api/v1/projects/guarded", None, None)
+            .status,
+        401
+    );
+    let resp = hub.delete(PEER, "guarded", None);
+    assert_eq!(resp.status, 403);
+    assert!(error_of(&resp).contains("Owner"));
+    assert_eq!(
+        hub.delete(PEER, "nosuch", None).status,
+        403,
+        "refused before the project is looked up"
+    );
+    assert_ne!(hub.entry("guarded"), Value::Null);
+    assert!(hub.work("guarded").is_dir());
+}
+
+#[test]
+fn delete_refuses_an_unknown_field_and_a_bad_slug() {
+    let hub = Hub::new();
+    hub.post(OWNER, &json!({ "path": hub.work("p") }));
+    let resp = hub.delete(OWNER, "p", Some(&json!({ "delete_everything": true })));
+    assert_eq!(resp.status, 400, "{}", text_of(&resp));
+    assert_eq!(hub.delete(OWNER, "Not%20A%20Slug", None).status, 400);
+    assert_ne!(hub.entry("p"), Value::Null);
+}

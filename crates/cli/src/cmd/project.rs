@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
+use fl_hub::lifecycle::LifecycleEnv;
+use fl_hub::project_delete::{self, DeleteContext, DeleteError, DeleteRequest};
 use fl_hub::project_init::{self, Credential, InitError, InitPaths, InitRequest, VirtualRequest};
 use fl_hub::project_list;
 use fl_store::AnyStore;
@@ -29,6 +31,44 @@ pub enum Cmd {
     /// without `--path` or `--virtual` the argument is the path.
     #[command(alias = "init")]
     Create(CreateArgs),
+    /// Delete a project or virtual group: its `[[project]]` block in the config and its area
+    /// in the workspace store. Nothing on disk is deleted unless asked: `--delete-store`
+    /// removes the project's store file (and its `.sock` and `.migrate.lock` siblings),
+    /// `--delete-dir` the project directory, after safety checks (it must be the registered
+    /// directory, deeper than two levels, and not `/`, the home directory, the workspace root,
+    /// a parent of either, another project, or a store or config directory). A project with
+    /// active agents is refused unless `--reassign-to` moves them or `--decommission-agents`
+    /// retires them.
+    Delete(DeleteArgs),
+}
+
+/// The arguments of `fl project delete`.
+#[derive(Args)]
+pub struct DeleteArgs {
+    /// The slug of the project or virtual group.
+    slug: String,
+    /// Move the project's active agents to this project (it must exist).
+    #[arg(
+        long,
+        value_name = "TARGET_SLUG",
+        conflicts_with = "decommission_agents"
+    )]
+    reassign_to: Option<String>,
+    /// Retire the project's active agents and tear their sessions down.
+    #[arg(long)]
+    decommission_agents: bool,
+    /// Also delete the project's store file and its `.sock` and `.migrate.lock` siblings.
+    #[arg(long)]
+    delete_store: bool,
+    /// Also delete the project's directory (after the safety checks).
+    #[arg(long)]
+    delete_dir: bool,
+    /// Author recording the deletion. Default: `fl`.
+    #[arg(long)]
+    by: Option<String>,
+    /// Print the outcome as JSON, the body `DELETE /api/v1/projects/:slug` answers.
+    #[arg(long)]
+    json: bool,
 }
 
 /// The arguments of `fl project create` (alias `init`).
@@ -102,16 +142,16 @@ impl Cmd {
     pub fn root(&self) -> Option<&std::path::Path> {
         match self {
             Cmd::Add { path } => Some(std::path::Path::new(path)),
-            Cmd::List { .. } | Cmd::Create(_) => None,
+            Cmd::List { .. } | Cmd::Create(_) | Cmd::Delete(_) => None,
         }
     }
 }
 
 pub fn run(store: &AnyStore, cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Create(_) | Cmd::List { .. } => {
+        Cmd::Create(_) | Cmd::List { .. } | Cmd::Delete(_) => {
             bail!(
-                "`fl project create` and `fl project list` open their own stores; they are not run on a bound one"
+                "`fl project create`, `list` and `delete` open their own stores; they are not run on a bound one"
             )
         }
         Cmd::Add { path } => {
@@ -356,6 +396,79 @@ pub fn list(
                 p.active_agent_count
             );
         }
+    }
+    Ok(0)
+}
+
+/// `fl project delete`: [`project_delete::delete_project`] with this machine's config file and
+/// stores, the flow `DELETE /api/v1/projects/:slug` runs. Exit 0 when the project was
+/// unregistered (a failed file deletion is on stderr and in `error`), 2 when active agents
+/// refuse it, 1 for any other refusal.
+pub fn delete(
+    args: DeleteArgs,
+    cfg: &Config,
+    cwd: &Path,
+    explicit_db: Option<PathBuf>,
+    default_store: &Path,
+) -> Result<i32> {
+    let paths = places(cfg, cwd, explicit_db, default_store)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let workspace_root = fl_core::resolve_workspace_root(cwd);
+    let env = LifecycleEnv::new(None);
+    let ctx = DeleteContext {
+        paths: &paths,
+        stores: &[],
+        home: home.as_deref(),
+        workspace_root: &workspace_root,
+        lifecycle: &env,
+    };
+    let request = DeleteRequest {
+        reassign_to: args.reassign_to.clone(),
+        decommission_agents: args.decommission_agents,
+        delete_store: args.delete_store,
+        delete_dir: args.delete_dir,
+    };
+    let by = args.by.clone().unwrap_or_else(|| "fl".to_string());
+    let outcome = match project_delete::delete_project(
+        &args.slug,
+        &request,
+        &by,
+        &ctx,
+        || open_workspace(&paths.workspace_store),
+        |_| {},
+    ) {
+        Ok(outcome) => outcome,
+        Err(DeleteError::ActiveAgents { agents }) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&DeleteError::active_agents_body(&agents))?
+                );
+            }
+            eprintln!(
+                "project `{}` has active agents ({}): pass --reassign-to <slug> or \
+                 --decommission-agents",
+                args.slug.trim(),
+                agents.join(", ")
+            );
+            return Ok(2);
+        }
+        Err(DeleteError::Init(e)) => return Err(anyhow::anyhow!("{e}")),
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+    } else {
+        println!(
+            "deleted\t{}\treassigned={}\tdecommissioned={}\tstore_deleted={}\tdir_deleted={}",
+            outcome.deleted,
+            outcome.reassigned_agents,
+            outcome.decommissioned_agents,
+            outcome.store_deleted,
+            outcome.dir_deleted
+        );
+    }
+    if let Some(error) = &outcome.error {
+        eprintln!("error: {error}");
     }
     Ok(0)
 }

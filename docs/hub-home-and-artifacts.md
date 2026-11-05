@@ -32,7 +32,7 @@ Anything else is dropped and the default applies, field by field.
 
 ## Endpoints
 
-Every route needs authentication. Every `POST` and `PATCH` route is **Owner only**: a Peer names itself, so
+Every route needs authentication. Every `POST`, `PATCH` and `DELETE` route is **Owner only**: a Peer names itself, so
 no finer tier can be trusted, and a Peer gets `403`.
 
 ### `GET /api/v1/settings`, `PUT /api/v1/settings`
@@ -69,9 +69,9 @@ It broadcasts `settings.updated`. Errors:
 | `409` | another relocation is running, the settings file is damaged, or (with `migrate`) a name already exists in the target |
 | `500` | a move failed; the setting is not changed and the message says how many files had moved |
 
-### `GET /api/v1/projects`, `POST /api/v1/projects`, `PATCH /api/v1/projects/:slug`
+### `GET /api/v1/projects`, `POST /api/v1/projects`, `PATCH /api/v1/projects/:slug`, `DELETE /api/v1/projects/:slug`
 
-One shape describes a project in all three: the list, a creation and an update. There are two
+One shape describes a project in the first three: the list, a creation and an update. There are two
 kinds ([getting-started.md](getting-started.md#create-a-project-in-one-step-fl-project-create)):
 a directory-backed project (`"kind": "project"`) and a virtual group (`"kind": "virtual"`), an
 area with no path that names a set of agents.
@@ -146,9 +146,54 @@ config block can be renamed but not moved or given a tracker. It broadcasts `pro
 | --- | --- |
 | `400` | the body is not valid, nothing is asked for, or the slug, name, path, repository or credential cannot be used, or the path is somewhere the Hub refuses |
 | `403` | the caller is not the Owner |
-| `404` | (`PATCH`) no project has that slug |
+| `404` | (`PATCH`, `DELETE`) no project has that slug (`DELETE`: or no `reassign_to` project) |
 | `409` | the slug is registered at another root, the root under another slug, the slug is the other kind (a project's slug for a group, or the reverse), the path is another project's, the tracker is a different one (`POST`), or the store holds another project |
 | `500` | git, a store or the config file failed |
+
+`DELETE /api/v1/projects/:slug` deletes a project or a virtual group, with the flow of
+`fl project delete` run by the Hub. **Owner only** (`403` before the slug is looked at). The body
+is optional (empty means all defaults); unknown fields are refused:
+
+```json
+{ "reassign_to": "other-project", "decommission_agents": false,
+  "delete_store": false, "delete_dir": false }
+```
+
+The order is fixed: validate everything, then reassign or decommission the active agents, then
+unregister (the `[[project]]` block, written atomically, and the area), then delete the store
+files, then the directory.
+
+* **Agents.** Active agents are those whose project or extra areas equal the slug or the area's
+  name, ignoring case. With some, and neither `reassign_to` nor `decommission_agents: true`, the
+  answer is `409` and nothing changes:
+  `{"error":"project has active agents","active_agent_count":2,"active_agents":["Ada","Bo"]}`.
+  `reassign_to` moves them to that project (a project or virtual group that exists, not this
+  slug; `404` for an unknown one, `409` when a Lead would meet the target's Lead).
+  `decommission_agents` tears their sessions down and retires them (`POST
+  /api/v1/sessions/:id/decommission`, mode `teardown`). Both together are `400`.
+* **Default.** Only the `[[project]]` block and the area go; no file is deleted. The Hub lists a
+  project from a store file in `$HOME/.local/share/fl`, so the slug is still listed, with a
+  `null` path, until `delete_store` removes the file as well.
+* **`delete_store: true`** deletes `<slug>.fls` and its `<slug>.fls.sock` and
+  `<slug>.fls.migrate.lock` files. The workspace store and another project's store are refused.
+* **`delete_dir: true`** deletes the project's registered directory, after these checks, all made
+  before anything changes (`400`, with the reason, when one fails): it exists, is a directory and
+  not a symbolic link, resolves to at least three path components, and is the path the config,
+  the area and the workspace store record; it is not `/`, the Hub's home directory or one above
+  it, the workspace root or one above it, a directory holding another registered project, one
+  holding or inside the stores or config directory, or one holding a store or config file.
+* A virtual group refuses `delete_store` and `delete_dir` (`400`). An unknown slug is `404`,
+  so a repeat is `404`.
+
+A `200` answers, and broadcasts `project.deleted` on the `projects` channel:
+
+```json
+{ "deleted": "my-project", "reassigned_agents": 0, "decommissioned_agents": 0,
+  "store_deleted": false, "dir_deleted": false }
+```
+
+A failure to delete the store files or the directory happens after the unregistration, which is
+not undone: the answer is still `200`, the flag stays `false`, and an `error` field says why.
 
 A virtual group has no store and no records: `GET /api/v1/records?project=<slug>` and the
 per-project artifacts-directory routes below answer `404` for it.

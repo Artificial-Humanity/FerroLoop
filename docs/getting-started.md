@@ -140,6 +140,8 @@ fl project create <name> --virtual [--slug <slug>] [--purpose <text>] [--by <aut
 fl project init   <dir>  [--name <name>] ...    the same command; the argument is the directory
 fl project add    <dir>                         register a directory in the current store
 fl project list   [--json]
+fl project delete <slug> [--reassign-to <target_slug> | --decommission-agents]
+                  [--delete-store] [--delete-dir] [--by <author>] [--json]
 ```
 
 `<name>` is the name shown for the project (`"My Project"`); its **slug** is the name in
@@ -192,7 +194,45 @@ nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `kind`
 one per line: kind, slug, path (`-` for a group), tracker repository (`-` for none) and the number
 of active agents whose project or extra areas name it. With `--json` it prints the list that
 `GET /api/v1/projects` serves ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)), which
-also creates (`POST`) and updates (`PATCH`) them.
+also creates (`POST`), updates (`PATCH`) and deletes (`DELETE`) them.
+
+### Delete a project: `fl project delete`
+
+`fl project delete <slug>` removes a project's `[[project]]` block from the config and its area
+from the workspace store, and deletes no file. A virtual group loses its area only. A slug that
+names nothing is refused (exit 1).
+
+* **Agents.** A project whose active agents (project or extra areas equal the slug or the area's
+  name, ignoring case) are not dealt with is refused with exit 2, naming them, and nothing
+  changes. `--reassign-to <target_slug>` moves them to that project (a project or a virtual group
+  that exists, and not this one; a Lead is refused when the target already has one).
+  `--decommission-agents` retires them as `fl agent decommission --mode teardown` does. The two
+  flags exclude each other.
+* **`--delete-store`** also deletes the project's store file and its `<store>.sock` and
+  `<store>.migrate.lock` files. The workspace store and another project's store are refused.
+* **`--delete-dir`** also deletes the project's directory, after these checks, all made before
+  anything changes. The directory is the registered one; it must exist, be a directory and not
+  a symbolic link, resolve to a path of at least three components, and agree with the path the
+  config, the area and the workspace store record. It must not be `/`, the home directory or a
+  directory above it, the workspace root or a directory above it (the root of the current
+  directory's workspace), a directory that holds another registered project, a directory that
+  holds or lies inside the stores directory or the config directory, or one that holds a store
+  or config file. A virtual group refuses `--delete-store` and `--delete-dir`.
+
+The order is: check everything, reassign or decommission the agents, remove the config block and
+the area, delete the store files, delete the directory. A failure to delete the store files or
+the directory leaves the project unregistered and is printed as `error` (the flag that did not
+happen stays `false`). A Hub lists a project from a store file in its data directory, so it
+still lists a project deleted without `--delete-store` there, with no path. `--json` prints the
+body `DELETE /api/v1/projects/:slug` answers:
+
+```
+{"deleted":"my-project","reassigned_agents":0,"decommissioned_agents":0,
+ "store_deleted":false,"dir_deleted":false}
+```
+
+An agent started with `--project <slug>` of a virtual group (an area with no path), without
+`--cwd`, runs in the workspace root; the project of a directory is left as the request says.
 
 ## 3. Write a gate
 

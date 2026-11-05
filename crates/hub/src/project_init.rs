@@ -356,28 +356,59 @@ pub(crate) fn config_entries(
             path.display()
         )));
     };
-    let text = |t: &Table, key: &str| t.get(key).and_then(Item::as_str).map(str::to_string);
-    Ok(blocks
-        .iter()
-        .filter_map(|t| {
-            let root = text(t, "root")?;
-            let tracker = t
-                .get("tracker")
-                .and_then(Item::as_table_like)
-                .and_then(|tr| {
-                    Some((
-                        tr.get("github")?.as_str()?.to_string(),
-                        tr.get("credential")?.as_str()?.to_string(),
-                    ))
-                });
-            Some(ConfigEntry {
-                name: text(t, "name"),
-                root,
-                store: text(t, "store"),
-                tracker,
-            })
-        })
-        .collect())
+    Ok(blocks.iter().filter_map(entry_of).collect())
+}
+
+/// One `[[project]]` table as an entry; `None` for a table with no `root`.
+fn entry_of(t: &Table) -> Option<ConfigEntry> {
+    let text = |key: &str| t.get(key).and_then(Item::as_str).map(str::to_string);
+    let root = text("root")?;
+    let tracker = t
+        .get("tracker")
+        .and_then(Item::as_table_like)
+        .and_then(|tr| {
+            Some((
+                tr.get("github")?.as_str()?.to_string(),
+                tr.get("credential")?.as_str()?.to_string(),
+            ))
+        });
+    Some(ConfigEntry {
+        name: text("name"),
+        root,
+        store: text("store"),
+        tracker,
+    })
+}
+
+/// Removes every `[[project]]` block that names `slug` (by [`ConfigEntry::slug`]) and returns
+/// how many it removed. The `project` key goes with its last block. A table with no `root`
+/// is no entry and stays.
+pub(crate) fn remove_blocks(doc: &mut DocumentMut, slug: &str) -> usize {
+    let Some(blocks) = doc
+        .get_mut("project")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut index = 0;
+    while index < blocks.len() {
+        let named = blocks
+            .get(index)
+            .and_then(entry_of)
+            .and_then(|e| e.slug())
+            .is_some_and(|s| s == slug);
+        if named {
+            blocks.remove(index);
+            removed += 1;
+        } else {
+            index += 1;
+        }
+    }
+    if blocks.is_empty() {
+        doc.remove("project");
+    }
+    removed
 }
 
 /// Whether two roots name one directory: equal as written, or the same after resolving links.

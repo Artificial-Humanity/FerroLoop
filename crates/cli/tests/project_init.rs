@@ -39,6 +39,7 @@ impl Env {
             .env("XDG_DATA_HOME", self.home.path().join("data"))
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
+            .env("FL_TEST_SPINUP_NO_SPAWN", "1")
             .current_dir(cwd);
         c
     }
@@ -600,4 +601,266 @@ fn list_shows_both_kinds_with_the_tracker_and_the_active_agents() {
             ))
             .and(contains("virtual\tcouncil\t-\t-\t2\n")),
         );
+}
+
+// --- fl project delete ------------------------------------------------------------------------
+
+impl Env {
+    fn register_agent(&self, name: &str, project: &str) {
+        self.fl(self.work.path())
+            .args([
+                "agent",
+                "register",
+                name,
+                "--project",
+                project,
+                "--role",
+                "assistant",
+                "--create-area",
+                "--by",
+                "owner",
+            ])
+            .assert()
+            .success();
+    }
+
+    fn projects(&self) -> Vec<Value> {
+        let out = self
+            .fl(self.work.path())
+            .args(["project", "list", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn slugs(&self) -> Vec<String> {
+        self.projects()
+            .iter()
+            .map(|p| p["slug"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn agent_status(&self, name: &str) -> String {
+        let out = self
+            .fl(self.work.path())
+            .args(["agent", "roster", "--include-retired", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let all: Vec<Value> = serde_json::from_slice(&out).unwrap();
+        let agent = all.iter().find(|a| a["name_key"] == name).unwrap();
+        agent["status"].as_str().unwrap().to_string()
+    }
+}
+
+#[test]
+fn delete_unregisters_by_default_and_prints_the_hubs_body() {
+    let env = Env::new();
+    let root = env.dir("doomed");
+    let created = env.run_json("create", &["Doomed", "--path", root.to_str().unwrap()]);
+    let store = PathBuf::from(created["store_path"].as_str().unwrap());
+    env.run_json(
+        "create",
+        &["Kept", "--path", env.dir("kept").to_str().unwrap()],
+    );
+    assert!(store.is_file());
+
+    let out = env
+        .fl(env.work.path())
+        .args(["project", "delete", "doomed", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "deleted": "doomed",
+            "reassigned_agents": 0,
+            "decommissioned_agents": 0,
+            "store_deleted": false,
+            "dir_deleted": false,
+        })
+    );
+    assert_eq!(env.slugs(), ["kept"]);
+    assert!(!env.config().contains("doomed") && env.config().contains("kept"));
+    assert!(root.join(".fl/mcp.toml").is_file(), "no file is deleted");
+    assert!(store.is_file());
+    env.fl(env.work.path())
+        .args(["project", "delete", "doomed"])
+        .assert()
+        .failure()
+        .stderr(contains("no project `doomed`"));
+}
+
+#[test]
+fn delete_store_and_dir_remove_exactly_those() {
+    let env = Env::new();
+    let root = env.dir("scrap");
+    let created = env.run_json("create", &["Scrap", "--path", root.to_str().unwrap()]);
+    let store = PathBuf::from(created["store_path"].as_str().unwrap());
+    let other = env.dir("other");
+    env.run_json("create", &["Other", "--path", other.to_str().unwrap()]);
+
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "delete",
+            "scrap",
+            "--delete-store",
+            "--delete-dir",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("store_deleted=true").and(contains("dir_deleted=true")));
+    assert!(!store.exists() && !root.exists());
+    assert!(other.is_dir());
+    assert_eq!(env.slugs(), ["other"]);
+}
+
+#[test]
+fn delete_refuses_a_project_with_active_agents_until_they_are_reassigned_or_retired() {
+    let env = Env::new();
+    for name in ["busy", "target", "third"] {
+        env.run_json("create", &[name, "--path", env.dir(name).to_str().unwrap()]);
+    }
+    env.register_agent("ada", "busy");
+    env.register_agent("bo", "busy");
+    let config = env.config();
+
+    let out = env
+        .fl(env.work.path())
+        .args(["project", "delete", "busy", "--delete-dir", "--json"])
+        .assert()
+        .code(2)
+        .stderr(contains("active agents"))
+        .get_output()
+        .stdout
+        .clone();
+    let body: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(body["error"], "project has active agents");
+    assert_eq!(body["active_agent_count"], 2);
+    assert_eq!(env.config(), config);
+    assert!(env.dir("busy").is_dir());
+
+    // The two ways out exclude each other.
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "delete",
+            "busy",
+            "--reassign-to",
+            "target",
+            "--decommission-agents",
+        ])
+        .assert()
+        .failure();
+    env.fl(env.work.path())
+        .args(["project", "delete", "busy", "--reassign-to", "nosuch"])
+        .assert()
+        .failure()
+        .stderr(contains("no project `nosuch`"));
+    assert!(env.slugs().contains(&"busy".to_string()));
+
+    let moved = env
+        .fl(env.work.path())
+        .args([
+            "project",
+            "delete",
+            "busy",
+            "--reassign-to",
+            "target",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let moved: Value = serde_json::from_slice(&moved).unwrap();
+    assert_eq!(moved["reassigned_agents"], 2);
+    let target = env
+        .projects()
+        .into_iter()
+        .find(|p| p["slug"] == "target")
+        .unwrap();
+    assert_eq!(target["active_agent_count"], 2);
+
+    env.register_agent("cy", "third");
+    let retired = env
+        .fl(env.work.path())
+        .args([
+            "project",
+            "delete",
+            "third",
+            "--decommission-agents",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let retired: Value = serde_json::from_slice(&retired).unwrap();
+    assert_eq!(retired["decommissioned_agents"], 1);
+    assert_eq!(env.agent_status("cy"), "retired");
+    assert_eq!(env.agent_status("ada"), "active");
+}
+
+#[test]
+fn delete_removes_a_virtual_group_and_refuses_files_for_it() {
+    let env = Env::new();
+    env.run_json("create", &["Council", "--virtual"]);
+    env.fl(env.work.path())
+        .args(["project", "delete", "council", "--delete-dir"])
+        .assert()
+        .failure()
+        .stderr(contains("virtual group"));
+    assert_eq!(env.slugs(), ["council"]);
+    env.fl(env.work.path())
+        .args(["project", "delete", "council"])
+        .assert()
+        .success();
+    assert!(env.slugs().is_empty());
+}
+
+#[test]
+fn delete_dir_refuses_the_home_directory_and_changes_nothing() {
+    let env = Env::new();
+    // The project is the directory `fl` sees as $HOME.
+    let home = env.dir("me");
+    env.run_json("create", &["Me", "--path", home.to_str().unwrap()]);
+    std::fs::write(home.join("precious"), "x").unwrap();
+    let config = env.config();
+    env.fl(env.work.path())
+        .env("HOME", &home)
+        .args(["project", "delete", "me", "--delete-dir"])
+        .assert()
+        .failure()
+        .stderr(contains("refusing to delete").and(contains("home directory")));
+    assert_eq!(env.config(), config);
+    assert!(home.join("precious").is_file());
+    assert_eq!(env.slugs(), ["me"]);
+}
+
+#[test]
+fn delete_dir_refuses_the_current_workspace_root() {
+    let env = Env::new();
+    let root = env.dir("ws");
+    env.run_json("create", &["Ws", "--path", root.to_str().unwrap()]);
+    // Run from inside the project: with no workspace markers above, it is the workspace root.
+    env.fl(&root)
+        .args(["project", "delete", "ws", "--delete-dir"])
+        .assert()
+        .failure()
+        .stderr(contains("workspace root"));
+    assert!(root.join(".fl/mcp.toml").is_file());
+    assert_eq!(env.slugs(), ["ws"]);
 }
