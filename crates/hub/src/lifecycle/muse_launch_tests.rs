@@ -456,9 +456,9 @@ fn restart_launches_other_built_in_vendors_with_the_recorded_model() {
             );
         let mut expected = vec![expected_bin];
         expected.extend(flags.into_iter().map(String::from));
-        // `agy` only takes effort-suffixed ids, so its recorded model gets `-medium`.
+        // `agy` only takes effort-suffixed, lowercase ids, so its recorded model gets `-medium`.
         let model = if vendor == "antigravity" {
-            "Model.v2-medium"
+            "model.v2-medium"
         } else {
             "Model.v2"
         };

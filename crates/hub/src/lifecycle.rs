@@ -476,14 +476,14 @@ fn normalize_plain_model(requested: Option<&str>) -> Option<String> {
 /// (`-low`, `-medium` or `-high`), so a bare id such as `claude-sonnet-5-5` is not accepted.
 /// A suffix already on `model` is kept unless `thinking_level` (case-insensitive `low`, `medium`
 /// or `high`; anything else is ignored) names another; with no suffix the effort is appended,
-/// `medium` by default. `gpt-oss-120b` only exists as `-medium`. The input is trimmed, and an
+/// `medium` by default. `gpt-oss-120b` only exists as `-medium`. The input is trimmed and lowercased, and an
 /// empty model gives an empty string, which callers treat as absent.
 pub(crate) fn agy_cli_model_id(model: &str, thinking_level: Option<&str>) -> String {
-    let model = model.trim();
+    let model = model.trim().to_ascii_lowercase();
     if model.is_empty() {
         return String::new();
     }
-    let (base, existing) = crate::discovery::split_agy_thinking_suffix(model);
+    let (base, existing) = crate::discovery::split_agy_thinking_suffix(&model);
     if base == "gpt-oss-120b" {
         return format!("{base}-medium");
     }
@@ -3511,6 +3511,11 @@ mod tests {
             ("  claude-sonnet-5-5  ", None, "claude-sonnet-5-5-medium"),
             ("", Some("high"), ""),
             ("   ", None, ""),
+            // The model, suffix included, is read without case.
+            ("Claude-Sonnet-5-5-HIGH", None, "claude-sonnet-5-5-high"),
+            ("Gemini-4-Argon-Low", None, "gemini-4-argon-low"),
+            ("Claude-Opus-5-5-LOW", Some("high"), "claude-opus-5-5-high"),
+            ("GPT-OSS-120B-High", None, "gpt-oss-120b-medium"),
             // Ids `normalize_plain_model` rejects still map to a string.
             ("--evil", None, "--evil-medium"),
             ("bad id", None, "bad id-medium"),
