@@ -27,6 +27,41 @@ fn git(root: &Path, args: &[&str]) -> Result<String, ExecError> {
         .to_string())
 }
 
+/// Runs git in `root` with the variables that would point it at another repository removed
+/// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`), and, when `identity` is given, that name as
+/// author and committer.
+fn git_clean_env(root: &Path, args: &[&str], identity: Option<&str>) -> Result<String, ExecError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    if let Some(name) = identity {
+        let local: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let email = format!("{local}@fl.local");
+        cmd.env("GIT_AUTHOR_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", &email)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_COMMITTER_EMAIL", &email);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| ExecError::Git(format!("could not run git: {e}")))?;
+    if !out.status.success() {
+        return Err(ExecError::Git(format!(
+            "git {} failed in {}: {}",
+            args.join(" "),
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// A revision, object id, remote or branch name that is safe to put on a git command line.
 ///
 /// Such a value is passed as a positional argument, so one starting with `-` would be read as an
@@ -45,6 +80,49 @@ fn plain_arg<'a>(what: &str, value: &'a str) -> Result<&'a str, ExecError> {
 impl Git {
     pub fn head(root: &Path) -> Result<String, ExecError> {
         git(root, &["rev-parse", "HEAD"])
+    }
+
+    /// [`Git::head`] with the variables that would point git at another repository removed
+    /// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`). Like `head`, it finds the repository
+    /// that holds `root`, which may lie above it; a caller that means `root`'s own repository
+    /// looks for `root/.git` first.
+    pub fn head_scrubbed(root: &Path) -> Result<String, ExecError> {
+        git_clean_env(root, &["rev-parse", "HEAD"], None)
+    }
+
+    /// `git init` in `root`, which must exist. An existing repository is
+    /// reinitialised harmlessly by git, but callers only call this for a
+    /// directory with no repository of its own.
+    pub fn init(root: &Path) -> Result<(), ExecError> {
+        git_clean_env(root, &["init", "--quiet"], None).map(|_| ())
+    }
+
+    /// An empty commit with `message` on the current branch of `root`,
+    /// authored and committed as `by` (`fl` when blank), without hooks or
+    /// signing, so it succeeds on a machine with no git identity and
+    /// whatever the user's hooks do. Returns the new `HEAD`.
+    pub fn commit_empty(root: &Path, message: &str, by: &str) -> Result<String, ExecError> {
+        let author = if by.trim().is_empty() {
+            "fl"
+        } else {
+            by.trim()
+        };
+        git_clean_env(
+            root,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-verify",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+            Some(author),
+        )?;
+        Self::head_scrubbed(root)
     }
 
     /// Whether `rel` (relative to `root`) is tracked and has no uncommitted

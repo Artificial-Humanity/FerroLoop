@@ -383,6 +383,7 @@ fn handle_summary(
                 "quotas": summary.quotas,
                 "alerts": summary.alerts,
                 "thresholds": summary.thresholds,
+                "mq_tier_telemetry": summary.mq_tier_telemetry,
             }),
         )
     } else {
@@ -461,7 +462,14 @@ mod tests {
         assert_eq!(status, 200, "{v}");
         assert_eq!(
             keys(&v),
-            vec!["alerts", "health", "quotas", "telemetry", "thresholds"]
+            vec![
+                "alerts",
+                "health",
+                "mq_tier_telemetry",
+                "quotas",
+                "telemetry",
+                "thresholds"
+            ]
         );
         assert_eq!(v["telemetry"]["totals"]["attempts"], 3);
         assert_eq!(v["telemetry"]["totals"]["crashed"], 1);

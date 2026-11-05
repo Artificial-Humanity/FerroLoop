@@ -2,16 +2,16 @@
 
 use super::FerroStore;
 use super::doc::{
-    self, AGENT_BY_NAME, AGENTS, IDS, NEXT_WIRE_MSG_SEQ, NEXT_WIRE_RCPT_SEQ, WIRE_INBOX,
+    self, AGENT_BY_NAME, AGENTS, AREAS, IDS, NEXT_WIRE_MSG_SEQ, NEXT_WIRE_RCPT_SEQ, WIRE_INBOX,
     WIRE_MESSAGES, WIRE_MSG_LOG, WIRE_MSG_SEQ, WIRE_RCPT_LOG, WIRE_REPLIES, WIRE_THREADS,
 };
 use crate::{FORMAT_WITH_WIRE, decode, mint};
-use fl_core::agent::{AgentRecord, AgentStatus};
+use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord};
 use fl_core::at::At;
 use fl_core::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
-    validate_sender_name, validate_subject, validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, check_group_address,
+    resolve_recipients, validate_sender_name, validate_subject, validate_wire_body,
 };
 use fl_core::ids::{Kind, MessageId};
 use fl_core::iri::Iri;
@@ -251,11 +251,14 @@ impl MessageStore for FerroStore {
             };
             msg.validate()
                 .map_err(|err| StoreError::InvalidState(err.to_string()))?;
+            let areas = doc::scan_json::<AreaRecord>(txn, AREAS)?;
+            check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
             let recipients = resolve_recipients(
                 &msg.to,
                 msg.sender_id.as_ref(),
                 &msg.sender_name,
                 &all_agents,
+                &areas,
             );
             append_wire_message(txn, &msg)?;
             let mut receipts = Vec::with_capacity(recipients.len());
@@ -495,6 +498,7 @@ impl MessageStore for FerroStore {
             let mut report = WireImportReport::default();
             doc::raise_format(txn, FORMAT_WITH_WIRE)?;
             let all_agents = doc::scan_json::<AgentRecord>(txn, AGENTS)?;
+            let areas = doc::scan_json::<AreaRecord>(txn, AREAS)?;
             for msg in &messages {
                 // Each message stands or falls alone: a skip writes nothing for it.
                 if let Err(err) = msg.validate() {
@@ -539,6 +543,7 @@ impl MessageStore for FerroStore {
                     msg.sender_id.as_ref(),
                     &msg.sender_name,
                     &all_agents,
+                    &areas,
                 );
                 for (rec_id, rec_name) in resolved {
                     let in_incoming = receipts.iter().any(|rcpt| {

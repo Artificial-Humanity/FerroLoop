@@ -73,8 +73,8 @@ The goal is to install, uninstall, or install component by component. Today the 
 building from source.
 
 * Rust 1.98+ (edition 2024) and Cargo
-* git: `fl project add` refuses a directory that is not a git working tree with at least one
-  commit
+* git: a project is any directory, a repository or not. Gates, flows and manifests stamp a
+  commit, so they need the project to be a git working tree with at least one commit
 * Optional: an execution CLI (`claude`, `codex`, `agy`, `muse` or `grok`), for `fl attempt` and
   `fl flow`
 * Optional: Node.js and npm, to build the FerroDeck bundle in `ui/` (the `Dockerfile` builds it

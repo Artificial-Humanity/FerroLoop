@@ -1100,22 +1100,7 @@ fn new_vendor_descriptor(id: &str, cfg: &VendorConfig) -> Result<VendorDescripto
     })
 }
 
-/// Whether `s` names a repository as `owner/repo`: exactly two non-empty
-/// parts of `[A-Za-z0-9._-]`, neither `.` nor `..`. The config's `github = …` and a typed
-/// `owner/repo#41` follow the same rule.
-pub fn is_owner_repo(s: &str) -> bool {
-    // Each part is spliced into API URLs and IRIs, so it is limited to the
-    // characters GitHub names use; `.`/`..` would traverse and `?#%` would
-    // rewrite the request.
-    let part = |p: &str| {
-        !p.is_empty()
-            && p != "."
-            && p != ".."
-            && p.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    };
-    s.split('/').count() == 2 && s.split('/').all(part)
-}
+pub use fl_github::is_owner_repo;
 
 /// Canonicalize `path`. A path that does not exist is not an error here —
 /// `Ok(None)` — that is simply a project root (or a `cwd`) not yet created.

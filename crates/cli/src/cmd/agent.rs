@@ -10,7 +10,7 @@ use fl_core::agent::{
 use fl_core::at::At;
 use fl_core::ids::{AgentId, Kind, RecordId};
 use fl_core::state::{StateConcern, StatePayload, StateScope, validate_slug};
-use fl_core::store::{AgentRegistry, Handles, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, Catalog, Handles, StateStore, StoreError};
 use fl_core::telemetry::{
     AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, LivenessVerdict, evaluate_liveness,
     liveness_agent_slug, liveness_record_slug,
@@ -482,7 +482,7 @@ pub fn sync_registry_markdown<S: AgentRegistry>(store: &S, start: &Path) -> Opti
     Some(candidate)
 }
 
-pub fn run<S: AgentRegistry + Handles + StateStore>(
+pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
     store: &S,
     cmd: AgentCmd,
 ) -> Result<(), (i32, String)> {
@@ -622,7 +622,11 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                 node_id,
                 hosted: Some(hosted),
                 cwd,
-            };
+            }
+            .with_default_cwd(
+                store,
+                &fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default()),
+            );
             let out = lifecycle::spin_up(
                 store,
                 &LifecycleEnv::new(None),

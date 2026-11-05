@@ -1837,6 +1837,16 @@ export interface WatchSummaryResponse {
   quotas: WatchQuotaWindow[];
   alerts: WatchAlert[];
   thresholds: WatchThresholds;
+  mq_tier_telemetry?: { topics: Array<{
+    topic: string;
+    active_tier: string;
+    memory_messages: number;
+    memory_bytes: number;
+    spilled_messages_total: number;
+    acked_in_memory_total: number;
+    available_ram_bytes: number | null;
+    free_disk_bytes: number | null;
+  }> } | null;
 }
 
 export interface WatchAlertsResponse {

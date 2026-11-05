@@ -580,7 +580,10 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
         ("POST", "/api/v1/settings/artifacts-dir") => {
             crate::artifact_dirs::handle_post_system_dir(state, &authority, req)
         }
-        ("GET", "/api/v1/projects") => crate::artifact_dirs::handle_get_projects(state),
+        ("GET", "/api/v1/projects") => crate::projects_api::handle_get_projects(state),
+        ("POST", "/api/v1/projects") => {
+            crate::projects_api::handle_post_projects(state, &authority, req)
+        }
         ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
         ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
@@ -4994,6 +4997,19 @@ fn handle_dynamic_api_routes(
             _ => {}
         }
     }
+    // /api/v1/projects/:slug
+    if segments.len() == 4
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "projects"
+        && matches!(method, "PATCH" | "DELETE")
+    {
+        return if method == "PATCH" {
+            crate::projects_api::handle_patch_project(state, authority, segments[3], req)
+        } else {
+            crate::projects_api::handle_delete_project(state, authority, segments[3], req)
+        };
+    }
     // /api/v1/projects/:id/artifacts-dir. The merge routes below have six or more segments.
     if segments.len() == 5
         && segments[0] == "api"
@@ -6355,7 +6371,9 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 }
 
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
-    LifecycleEnv::new(state.config.home_override.as_deref())
+    let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
+    env.workspace_root = state.config.repo_root.parent();
+    env
 }
 
 fn caller_of(authority: &HubAuthority) -> lifecycle::Caller {
@@ -6378,6 +6396,9 @@ fn handle_post_session_spin_up(
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
+    // A virtual scope has no directory of its own: its agents start in the workspace root.
+    let payload =
+        payload.with_default_cwd(&*store, &resolve_workspace_root(&state.config.repo_root));
     match lifecycle::spin_up(
         &*store,
         &lifecycle_env(state),

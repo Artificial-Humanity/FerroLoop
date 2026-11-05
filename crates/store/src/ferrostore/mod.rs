@@ -2042,7 +2042,7 @@ impl FerroStore {
     /// The schema version the store records, `None` for a store with no
     /// version document (a FerroStore written before schema versioning), the
     /// same meaning as [`crate::RedbStore::format_version`]. The value is on
-    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_WORKFLOW`.
+    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_AREA_DELETE`.
     pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
         self.with_read(doc::schema_version)
     }
@@ -4917,8 +4917,10 @@ fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<
     Ok(offset)
 }
 
-/// The documents a new store starts with: its schema version, the newest on
-/// the ladder. They sit in the snapshot at sequence 0, so a new store still
+/// The documents a new store starts with: its schema version, [`crate::FORMAT_WITH_WORKFLOW`].
+/// That is the format every write but the first area deletion needs; deleting an area raises
+/// it to [`crate::FORMAT_WITH_AREA_DELETE`], so an older fl keeps opening a store that never
+/// deleted one. They sit in the snapshot at sequence 0, so a new store still
 /// has `last_seq` 0 and no WAL frame.
 fn new_store_docs() -> Docs {
     let mut docs = Docs::default();

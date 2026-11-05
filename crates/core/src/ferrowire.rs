@@ -1,7 +1,7 @@
 //! FerroWire agent messaging domain types, recipient addressing, envelopes,
 //! and delivery receipts (spec §1).
 
-use crate::agent::{AgentRecord, AgentRole, AgentStatus};
+use crate::agent::{AgentRecord, AgentRole, AgentStatus, AreaRecord};
 use crate::at::At;
 use crate::ids::{AgentId, MessageId};
 use crate::iri::Iri;
@@ -43,7 +43,17 @@ pub enum WireAddress {
     Role(AgentRole),
     /// Combined area and role selector (`"@area:<slug>/<role>"`, e.g. `"@area:ferroloop/lead"`).
     AreaRole { area: String, role: AgentRole },
+    /// The Council (`"@council"`): every active agent that covers the `council` area or has
+    /// the `strategist` role, in any project. Each agent is a recipient once.
+    Council,
+    /// A virtual group (`"@<area_key>"`, e.g. `"@ops"`): every active agent whose project or
+    /// extra areas include that area, when the area is virtual (has no path). A bare
+    /// `ops` stays the persona `ops`; `@council` and `@all` are never groups.
+    Group(String),
 }
+
+/// The area whose agents `@council` reaches, besides every strategist.
+pub const COUNCIL_AREA: &str = "council";
 
 impl WireAddress {
     pub fn parse(raw: &str) -> Result<Self, StateError> {
@@ -53,6 +63,10 @@ impl WireAddress {
         }
         if trimmed.eq_ignore_ascii_case("@all") || trimmed.eq_ignore_ascii_case("all") {
             return Ok(Self::All);
+        }
+        // Only the `@` form is the selector: a bare `council` stays a persona name.
+        if trimmed.eq_ignore_ascii_case("@council") {
+            return Ok(Self::Council);
         }
         if let Some(rest) = trimmed.strip_prefix("urn:fl:agent:") {
             let key =
@@ -81,8 +95,12 @@ impl WireAddress {
                 .map_err(|_| StateError::InvalidAddress(raw.to_string()))?;
             return Ok(Self::Role(role));
         }
-        if trimmed.starts_with('@') {
-            return Err(StateError::InvalidAddress(raw.to_string()));
+        if let Some(group) = trimmed.strip_prefix('@') {
+            // `@<area_key>`: a virtual group. `@all` and `@council` were taken above, and a
+            // selector with a `:` or `/` is not a slug.
+            let key =
+                validate_slug(group).map_err(|_| StateError::InvalidAddress(raw.to_string()))?;
+            return Ok(Self::Group(key));
         }
         let key =
             validate_slug(trimmed).map_err(|_| StateError::InvalidAddress(raw.to_string()))?;
@@ -97,6 +115,8 @@ impl WireAddress {
             Self::Area(a) => format!("@area:{a}"),
             Self::Role(r) => format!("@role:{}", r.as_wire()),
             Self::AreaRole { area, role } => format!("@area:{area}/{}", role.as_wire()),
+            Self::Council => "@council".to_string(),
+            Self::Group(g) => format!("@{g}"),
         }
     }
 }
@@ -427,11 +447,15 @@ impl WireImportReport {
 
 /// Resolve `to` against the current `AgentRegistry` roster (spec §1.2).
 /// Returns `(recipient_id, recipient_name)` pairs in deterministic order.
+///
+/// `areas` is the registry's areas: a [`WireAddress::Group`] reaches its members only when the
+/// area it names is there and is virtual, so a mistyped or non-virtual `@name` reaches no one.
 pub fn resolve_recipients(
     to: &WireAddress,
     sender_id: Option<&AgentId>,
     sender_name: &str,
     all_agents: &[AgentRecord],
+    areas: &[AreaRecord],
 ) -> Vec<(Iri, String)> {
     let is_sender = |a: &AgentRecord| -> bool {
         sender_id.is_some_and(|sid| sid == &a.id) || a.name_key == sender_name
@@ -481,6 +505,31 @@ pub fn resolve_recipients(
             out.sort_by(|a, b| a.1.cmp(&b.1));
             out
         }
+        WireAddress::Council => {
+            let mut out: Vec<(Iri, String)> = all_agents
+                .iter()
+                .filter(|a| {
+                    a.status == AgentStatus::Active
+                        && (a.covers_area(COUNCIL_AREA) || a.role == AgentRole::Strategist)
+                        && !is_sender(a)
+                })
+                .map(|a| (a.id.0.clone(), a.name_key.clone()))
+                .collect();
+            out.sort_by(|a, b| a.1.cmp(&b.1));
+            out
+        }
+        WireAddress::Group(key) => {
+            if !areas.iter().any(|a| &a.area_key == key && a.is_virtual()) {
+                return Vec::new();
+            }
+            let mut out: Vec<(Iri, String)> = all_agents
+                .iter()
+                .filter(|a| a.status == AgentStatus::Active && a.covers_area(key) && !is_sender(a))
+                .map(|a| (a.id.0.clone(), a.name_key.clone()))
+                .collect();
+            out.sort_by(|a, b| a.1.cmp(&b.1));
+            out
+        }
         WireAddress::AreaRole { area, role } => {
             let mut out: Vec<(Iri, String)> = all_agents
                 .iter()
@@ -495,6 +544,23 @@ pub fn resolve_recipients(
             out.sort_by(|a, b| a.1.cmp(&b.1));
             out
         }
+    }
+}
+
+/// Refuses a send to `@<area_key>` when that is not a virtual area of `areas`: a typo or a real
+/// project's key would otherwise be a send to no one. Every other address passes.
+pub fn check_group_address(to: &WireAddress, areas: &[AreaRecord]) -> Result<(), String> {
+    let WireAddress::Group(key) = to else {
+        return Ok(());
+    };
+    match areas.iter().find(|a| &a.area_key == key) {
+        Some(a) if a.is_virtual() => Ok(()),
+        Some(_) => Err(format!(
+            "`@{key}` is not a virtual group: `{key}` is an area with a path. Use `@area:{key}`"
+        )),
+        None => Err(format!(
+            "`@{key}` names no virtual group: create one with `fl project create {key} --virtual`"
+        )),
     }
 }
 
@@ -583,6 +649,20 @@ mod tests {
             ),
             ("@all", WireAddress::All, "@all"),
             ("all", WireAddress::All, "@all"),
+            ("@council", WireAddress::Council, "@council"),
+            ("@Council", WireAddress::Council, "@council"),
+            ("  @COUNCIL ", WireAddress::Council, "@council"),
+            (
+                "council",
+                WireAddress::AgentName("council".into()),
+                "council",
+            ),
+            ("@ops", WireAddress::Group("ops".into()), "@ops"),
+            ("@Ops_2", WireAddress::Group("ops_2".into()), "@ops_2"),
+            ("ops", WireAddress::AgentName("ops".into()), "ops"),
+            // A selector name that is not a prefix form stays a group, never a selector.
+            ("@area", WireAddress::Group("area".into()), "@area"),
+            ("@role", WireAddress::Group("role".into()), "@role"),
             (
                 "@area:FerroLoop",
                 WireAddress::Area("ferroloop".into()),
@@ -649,12 +729,210 @@ mod tests {
         assert_eq!(by_id, WireAddress::AgentId(AgentId(agent_iri.clone())));
         assert_eq!(by_id.as_wire(), agent_iri.as_str());
 
-        for bad in ["", "@unknown", "@area:", "@role:", "@area:bad/123", "123"] {
+        for bad in [
+            "",
+            "@",
+            "@1ops",
+            "@o ps",
+            "@ops/lead",
+            "@ops:x",
+            "@area:",
+            "@role:",
+            "@area:bad/123",
+            "123",
+        ] {
             assert!(
                 matches!(WireAddress::parse(bad), Err(StateError::InvalidAddress(_))),
                 "expected InvalidAddress for {bad:?}"
             );
         }
+    }
+
+    fn seat(n: u64, name: &str, role: AgentRole, project: &str, extra: &[&str]) -> AgentRecord {
+        AgentRecord {
+            id: AgentId(seq_iri(n)),
+            name_key: name.to_ascii_lowercase(),
+            display_name: name.into(),
+            email: format!("{}@artificialhumanity.io", name.to_ascii_lowercase()),
+            project: project.into(),
+            role,
+            extra_areas: extra.iter().map(|s| s.to_string()).collect(),
+            status: AgentStatus::Active,
+            updated_at: At::from_unix_millis(n),
+            by: "owner".into(),
+        }
+    }
+
+    fn names(to: &str, agents: &[AgentRecord], sender: &str) -> Vec<String> {
+        let to = WireAddress::parse(to).unwrap();
+        resolve_recipients(&to, None, sender, agents, &[])
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    #[test]
+    fn at_council_reaches_the_council_area_and_every_strategist_once() {
+        let mut retired_strategist = seat(6, "gone", AgentRole::Strategist, "ferroloop", &[]);
+        retired_strategist.status = AgentStatus::Retired;
+        let mut retired_member = seat(7, "left", AgentRole::Tester, "council", &[]);
+        retired_member.status = AgentStatus::Retired;
+        let agents = vec![
+            // A strategist in a project, and one inside the council area: both in, once each.
+            seat(1, "ada", AgentRole::Strategist, "ferroloop", &[]),
+            seat(2, "bea", AgentRole::Strategist, "council", &[]),
+            // A non-strategist in the council area, by project and by extra area.
+            seat(3, "cy", AgentRole::Journalist, "council", &[]),
+            seat(4, "di", AgentRole::Assistant, "ferroloop", &["council"]),
+            // Neither: other roles and areas.
+            seat(5, "ed", AgentRole::Lead, "ferroloop", &[]),
+            retired_strategist,
+            retired_member,
+        ];
+        assert_eq!(
+            names("@council", &agents, "owner"),
+            ["ada", "bea", "cy", "di"]
+        );
+        // Selectors are case-insensitive, as `@all` and `@area:` are.
+        assert_eq!(
+            names("@Council", &agents, "owner"),
+            names("@council", &agents, "owner")
+        );
+        // The sender is not a recipient of its own message.
+        assert_eq!(names("@council", &agents, "bea"), ["ada", "cy", "di"]);
+        // It contains `@role:strategist` and adds the council area.
+        let strategists = names("@role:strategist", &agents, "owner");
+        assert_eq!(strategists, ["ada", "bea"]);
+        assert!(
+            strategists
+                .iter()
+                .all(|n| names("@council", &agents, "owner").contains(n))
+        );
+    }
+
+    fn virtual_area(key: &str) -> AreaRecord {
+        AreaRecord {
+            area_key: key.into(),
+            name: key.into(),
+            path: None,
+            purpose: "p".into(),
+            updated_at: At::from_unix_millis(1),
+            by: "owner".into(),
+        }
+    }
+
+    fn real_area(key: &str) -> AreaRecord {
+        AreaRecord {
+            path: Some(format!("/work/{key}")),
+            ..virtual_area(key)
+        }
+    }
+
+    fn group_names(
+        to: &str,
+        agents: &[AgentRecord],
+        areas: &[AreaRecord],
+        sender: &str,
+    ) -> Vec<String> {
+        let to = WireAddress::parse(to).unwrap();
+        resolve_recipients(&to, None, sender, agents, areas)
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    #[test]
+    fn at_area_key_reaches_the_members_of_a_virtual_area_only() {
+        let mut gone = seat(6, "gone", AgentRole::Tester, "ops", &[]);
+        gone.status = AgentStatus::Retired;
+        let agents = vec![
+            seat(1, "ada", AgentRole::Lead, "ops", &[]),
+            // A member through an extra area, and one with a different role.
+            seat(2, "bea", AgentRole::Tester, "ferroloop", &["ops"]),
+            seat(3, "cy", AgentRole::Strategist, "ops", &[]),
+            // Not members.
+            seat(4, "di", AgentRole::Lead, "ferroloop", &[]),
+            seat(5, "ed", AgentRole::Strategist, "ferroloop", &[]),
+            gone,
+        ];
+        let areas = [virtual_area("ops"), real_area("ferroloop")];
+        assert_eq!(
+            group_names("@ops", &agents, &areas, "owner"),
+            ["ada", "bea", "cy"]
+        );
+        assert_eq!(
+            group_names("@OPS", &agents, &areas, "owner"),
+            ["ada", "bea", "cy"]
+        );
+        // The sender is left out, as for `@area:`.
+        assert_eq!(group_names("@ops", &agents, &areas, "ada"), ["bea", "cy"]);
+        // `@area:ops` reaches the same agents: the group is the virtual spelling of it.
+        assert_eq!(
+            group_names("@area:ops", &agents, &areas, "owner"),
+            group_names("@ops", &agents, &areas, "owner")
+        );
+        // A real project's key, an unknown key and a registry without areas reach no one.
+        assert!(group_names("@ferroloop", &agents, &areas, "owner").is_empty());
+        assert!(group_names("@nowhere", &agents, &areas, "owner").is_empty());
+        assert!(group_names("@ops", &agents, &[], "owner").is_empty());
+    }
+
+    #[test]
+    fn a_persona_named_like_an_area_key_is_the_bare_name_and_the_group_is_the_at_form() {
+        let agents = vec![
+            seat(1, "ops", AgentRole::Tester, "ferroloop", &[]),
+            seat(2, "ada", AgentRole::Lead, "ops", &[]),
+        ];
+        let areas = [virtual_area("ops")];
+        // Bare: the persona (not a member of the area, still the only recipient) ...
+        assert_eq!(group_names("ops", &agents, &areas, "owner"), ["ops"]);
+        // ... `@ops`: the group's members, not the persona.
+        assert_eq!(group_names("@ops", &agents, &areas, "owner"), ["ada"]);
+    }
+
+    #[test]
+    fn at_council_wins_over_a_virtual_council_group_and_keeps_the_strategists() {
+        let agents = vec![
+            seat(1, "ada", AgentRole::Strategist, "ferroloop", &[]),
+            seat(2, "bea", AgentRole::Tester, "council", &[]),
+        ];
+        let areas = [virtual_area("council")];
+        assert_eq!(
+            group_names("@council", &agents, &areas, "owner"),
+            ["ada", "bea"]
+        );
+        assert_eq!(
+            WireAddress::parse("@council").unwrap(),
+            WireAddress::Council
+        );
+        // `all` is never a group: `@all` is everyone.
+        assert_eq!(WireAddress::parse("@all").unwrap(), WireAddress::All);
+    }
+
+    #[test]
+    fn a_send_to_an_unknown_or_real_area_key_is_refused_with_a_way_out() {
+        let areas = [virtual_area("ops"), real_area("ferroloop")];
+        let check = |to: &str| check_group_address(&WireAddress::parse(to).unwrap(), &areas);
+        assert!(check("@ops").is_ok());
+        assert!(check("ops").is_ok());
+        assert!(check("@all").is_ok() && check("@council").is_ok());
+        assert!(check("@area:ferroloop").is_ok());
+        let real = check("@ferroloop").unwrap_err();
+        assert!(real.contains("@area:ferroloop"), "{real}");
+        let unknown = check("@nowhere").unwrap_err();
+        assert!(unknown.contains("--virtual"), "{unknown}");
+    }
+
+    #[test]
+    fn at_council_is_not_shadowed_by_an_agent_named_council() {
+        let agents = vec![
+            seat(1, "council", AgentRole::Tester, "ferroloop", &[]),
+            seat(2, "ada", AgentRole::Strategist, "ferroloop", &[]),
+        ];
+        // `@council` is the group (the persona has neither the area nor the role) ...
+        assert_eq!(names("@council", &agents, "owner"), ["ada"]);
+        // ... and a bare `council` is still the persona.
+        assert_eq!(names("council", &agents, "owner"), ["council"]);
     }
 
     #[test]
