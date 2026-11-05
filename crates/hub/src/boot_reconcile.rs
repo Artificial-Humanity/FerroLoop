@@ -424,14 +424,14 @@ pub(crate) fn reconcile_pass_with(
             let PaneOwner::Persona(persona) = pane_owner(pane) else {
                 continue;
             };
-            if persona.as_deref().is_some_and(&active) {
+            if persona.as_deref().is_some_and(active) {
                 pane_personas.extend(persona);
                 continue;
             }
             if let Some(persona) = &persona {
                 remove_routes(home, &[persona.as_str()], &[]);
             }
-            let reason = if persona.as_deref().is_some_and(&retired) {
+            let reason = if persona.as_deref().is_some_and(retired) {
                 "retired"
             } else {
                 "unknown"
