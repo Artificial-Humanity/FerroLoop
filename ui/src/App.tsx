@@ -532,11 +532,20 @@ export const App: React.FC<AppProps> = ({
     };
   }, []);
 
+  const lastResizeWidthRef = useRef<number>(
+    typeof window !== "undefined" ? window.innerWidth : 1200,
+  );
   useEffect(() => {
     if (typeof window === "undefined") return;
     const handleResize = () => {
       const vw = window.innerWidth;
       setViewportWidth(vw);
+      // Height-only resizes (soft keyboard, collapsing address bar) must not rearrange panels.
+      const widthChanged = vw !== lastResizeWidthRef.current;
+      lastResizeWidthRef.current = vw;
+      if (!widthChanged) {
+        return;
+      }
       // The phone shell keeps its own navigation state and never edits the desktop arrangement,
       // so a phone-width resize leaves split view and the left panel exactly as they were.
       if (vw < TWO_PANEL_MIN_VIEWPORT_PX) {
@@ -2992,8 +3001,10 @@ export const App: React.FC<AppProps> = ({
             : effectiveLeftWidth
       }
       minWidth={isTabletDocked ? TABLET_MASTER_MIN_WIDTH_PX : undefined}
-      onResizeStart={handleLeftResizeStart}
-      onTouchResizeStart={handleLeftTouchResizeStart}
+      onResizeStart={isTabletDocked || isTabletOverlay ? undefined : handleLeftResizeStart}
+      onTouchResizeStart={
+        isTabletDocked || isTabletOverlay ? undefined : handleLeftTouchResizeStart
+      }
       embedded={embedded}
     />
   );

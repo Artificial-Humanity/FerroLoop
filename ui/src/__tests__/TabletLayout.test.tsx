@@ -202,4 +202,31 @@ describe("Tablet master-detail (768 - 1023)", () => {
     expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
     expect(roster()).toHaveAttribute("data-desktop-collapsed", "true");
   });
+
+  it("renders no left resize handle on tablet in either orientation", () => {
+    const { unmount } = renderAt(900, 700);
+    expect(screen.queryByTestId("left-panel-resize-handle")).toBeNull();
+    unmount();
+    renderAt(800, 1100);
+    expect(screen.queryByTestId("left-panel-resize-handle")).toBeNull();
+  });
+
+  it("keeps the right dock resize handle on tablet because its width is honored", () => {
+    renderAt(900, 700);
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    expect(screen.getByTestId("right-panel-resize-handle")).toBeInTheDocument();
+  });
+
+  it("keeps an open portrait drawer open when only the viewport height changes", () => {
+    renderAt(800, 1100);
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
+    fireEvent.click(toggle());
+    expect(roster()).toHaveAttribute("data-mobile-open", "true");
+    // Soft keyboard / address bar: height changes, width does not.
+    resizeTo(800, 850);
+    expect(cockpit()).toHaveAttribute("data-tablet-master", "overlay");
+    expect(roster()).toHaveAttribute("data-mobile-open", "true");
+    expect(screen.getByTestId("right-split-panel")).toBeInTheDocument();
+  });
 });

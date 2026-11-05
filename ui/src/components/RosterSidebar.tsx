@@ -1582,7 +1582,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           </button>
         </div>
 
-        {!embedded && (
+        {!embedded && onResizeStart && (
         <div
           data-testid="left-panel-resize-handle"
           role="separator"
