@@ -15,6 +15,7 @@ import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { PHONE_MAX_VIEWPORT_PX, useDeviceLayout } from "./hooks/useDeviceLayout";
+import { useProjects } from "./hooks/useProjects";
 import { PhoneShell } from "./components/phone/PhoneShell";
 import { mapToPhoneView, type PhoneView } from "./components/phone/phoneNavigation";
 import { RecordsBoardPane } from "./components/RecordsBoardPane";
@@ -426,6 +427,12 @@ export const App: React.FC<AppProps> = ({
   initialSelectedAgentName,
 }) => {
   const apiClient = useMemo(() => propApiClient ?? new HubApiClient(), [propApiClient]);
+  // One project list for the switcher, the roster, Spin-Up and the settings dropdowns.
+  const {
+    projects,
+    fromHub: projectsFromHub,
+    refresh: refreshProjects,
+  } = useProjects(apiClient);
   const wsClientRef = useRef<HubWsClient | null>(null);
   if (!wsClientRef.current) {
     wsClientRef.current =
@@ -2448,6 +2455,7 @@ export const App: React.FC<AppProps> = ({
       case "board":
         return (
           <RecordsBoardPane
+            projects={projects}
             selectedProject={selectedAgent?.project ?? null}
             apiClient={apiClient}
           />
@@ -2805,6 +2813,7 @@ export const App: React.FC<AppProps> = ({
 
   const chatPaneElement = (
     <ChatPane
+      projects={projects}
       agentName={selectedAgent?.name_key ?? null}
       agentDisplayName={selectedAgent?.display_name ?? null}
       agentRole={selectedAgent?.role ?? null}
@@ -2867,6 +2876,8 @@ export const App: React.FC<AppProps> = ({
 
   const renderRosterSidebar = (embedded: boolean) => (
     <RosterSidebar
+      projects={projects}
+      showEmptyProjects={projectsFromHub}
       agents={agents}
       routes={mergedRoutes}
       sessions={sessions}
@@ -3156,6 +3167,7 @@ export const App: React.FC<AppProps> = ({
           setSpinUpInitialProject(null);
         }}
         initialProject={spinUpInitialProject}
+        projects={projects}
         nodes={nodes}
         onSpinUp={handleSpinUpSession}
         apiClient={apiClient}
@@ -3197,6 +3209,10 @@ export const App: React.FC<AppProps> = ({
         }}
         onLogout={handleLogout}
         onAgentsUpdated={() => void refreshWireAndRoster()}
+        projects={projects}
+        projectsFromHub={projectsFromHub}
+        refreshProjects={refreshProjects}
+        onProjectsChanged={() => void refreshProjects()}
         onDecommissionAgent={async (targetId, mode) => {
           const res = await apiClient.decommissionSession(targetId, mode);
           await Promise.all([

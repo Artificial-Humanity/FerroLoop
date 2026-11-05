@@ -737,6 +737,12 @@ import {
   type ProjectSummary,
   type TotpEnrollmentResponse,
 } from "../types/api";
+import {
+  FALLBACK_PROJECTS,
+  findProject,
+  projectLabel,
+  projectLabels,
+} from "../hooks/useProjects";
 
 export type SettingsTabId =
   | "agents"
@@ -802,6 +808,18 @@ export interface SettingsModalProps {
   onAgentsUpdated?: () => void;
   /** Called after a project or virtual group is created, edited or deleted. */
   onProjectsChanged?: () => void;
+  /**
+   * The shared project list that feeds the project filter and the project dropdowns. Defaults
+   * to the built-in list.
+   */
+  projects?: readonly ProjectSummary[];
+  /** True when `projects` came from the hub rather than the built-in fallback. */
+  projectsFromHub?: boolean;
+  /**
+   * Reloads the shared list. When given, the Projects tab uses the shared list (reloaded each
+   * time Settings opens) instead of loading its own.
+   */
+  refreshProjects?: () => Promise<void>;
   onDecommissionAgent?: (
     targetId: string,
     mode: DecommissionMode,
@@ -827,16 +845,8 @@ export interface SettingsModalProps {
   doctorChecks?: DoctorCheckItem[];
 }
 
-export const CANONICAL_PROJECTS = [
-  "AI-Lab-AMD",
-  "FerroLoop",
-  "Kaggle-Gemma4",
-  "Lucida",
-  "Prosodia",
-  "Sonora",
-  "Website",
-  "Workspace",
-];
+/** Always offered next to the project list: agents without a project land here. */
+const WORKSPACE_PROJECT = "Workspace";
 
 export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 1, label: "1 day" },
@@ -848,9 +858,24 @@ export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 0, label: "Never (0)" },
 ] as const;
 
+const DEFAULT_PROJECT_OPTIONS: readonly string[] = [
+  ...projectLabels(FALLBACK_PROJECTS),
+  WORKSPACE_PROJECT,
+];
+
+/** The option strings a project list gives the filter and the project dropdowns. */
+function projectOptionLabels(projects: readonly ProjectSummary[]): string[] {
+  const out = projectLabels(projects);
+  if (!out.some((o) => o.toLowerCase() === WORKSPACE_PROJECT.toLowerCase())) {
+    out.push(WORKSPACE_PROJECT);
+  }
+  return out;
+}
+
 export function resolveProjectFilterValue(
   rawProject: string | null | undefined,
-  options: readonly string[] = CANONICAL_PROJECTS,
+  options: readonly string[] = DEFAULT_PROJECT_OPTIONS,
+  projects?: readonly ProjectSummary[],
 ): string {
   const trimmed = (rawProject ?? "").trim();
   if (!trimmed || trimmed.toLowerCase() === "all") {
@@ -858,7 +883,10 @@ export function resolveProjectFilterValue(
   }
   const lower = trimmed.toLowerCase();
   const matched = options.find((opt) => opt.toLowerCase() === lower);
-  return matched ?? trimmed;
+  if (matched) return matched;
+  // A slug stands for its project's display name.
+  const bySlug = projects ? findProject(projects, trimmed) : undefined;
+  return bySlug ? projectLabel(bySlug) : trimmed;
 }
 
 export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
@@ -1357,6 +1385,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onLogout,
   onAgentsUpdated,
   onProjectsChanged,
+  projects: sharedProjects = FALLBACK_PROJECTS,
+  projectsFromHub = false,
+  refreshProjects,
   onDecommissionAgent,
   onBulkSessionAction,
   themeMode: propThemeMode,
@@ -1421,11 +1452,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => propFontScalePct ?? getInitialFontScalePct(),
   );
   const { pinnedProjects } = usePinnedState();
+  const baseProjectOptions = useMemo(
+    () => projectOptionLabels(sharedProjects),
+    [sharedProjects],
+  );
   const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
     () =>
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
   );
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<Set<string>>(
@@ -1464,9 +1500,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     slug: string;
     message: string;
   } | null>(null);
-  const [projectList, setProjectList] = useState<ProjectSummary[]>([]);
+  // The Projects tab edits a local copy (so a create or delete shows at once); the shared
+  // list overwrites it whenever the hub gave a fresh one.
+  const sharedProjectList = refreshProjects !== undefined;
+  const [projectList, setProjectList] = useState<ProjectSummary[]>(() =>
+    sharedProjectList && projectsFromHub ? [...sharedProjects] : [],
+  );
+  useEffect(() => {
+    if (sharedProjectList && projectsFromHub) setProjectList([...sharedProjects]);
+  }, [sharedProjectList, projectsFromHub, sharedProjects]);
   const [projectListLoading, setProjectListLoading] = useState(false);
   const [projectListError, setProjectListError] = useState<string | null>(null);
+  const refreshProjectsRef = useRef(refreshProjects);
+  refreshProjectsRef.current = refreshProjects;
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const newProjectOpenerRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
@@ -1633,7 +1679,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedProjectFilter(
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
     );
     if (initialProject) {
@@ -1663,7 +1710,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedProjectFilter(
       resolveProjectFilterValue(
         initialProjectFilter ?? initialProject,
-        CANONICAL_PROJECTS,
+        baseProjectOptions,
+        sharedProjects,
       ),
     );
     setActiveTab(initialProject ? "agents" : initialTab);
@@ -1744,7 +1792,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         });
     }
 
-    if (typeof client.listProjects === "function") {
+    if (sharedProjectList) {
+      // The shared list is reloaded each time Settings opens.
+      void refreshProjectsRef.current?.();
+    } else if (typeof client.listProjects === "function") {
       setProjectListLoading(true);
       setProjectListError(null);
       client
@@ -1836,13 +1887,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [propAgents, loadedAgents]);
 
   const projectOptions = useMemo<string[]>(() => {
-    const out: string[] = [...CANONICAL_PROJECTS];
+    const out: string[] = [...baseProjectOptions];
     const addProjectOption = (raw?: string | null) => {
       const trimmed = (raw ?? "").trim();
       if (!trimmed || trimmed.toLowerCase() === "all") return;
-      const lower = trimmed.toLowerCase();
+      // An agent's project is a slug; list it under the project's display name.
+      const known = findProject(sharedProjects, trimmed);
+      const label = known ? projectLabel(known) : trimmed;
+      const lower = label.toLowerCase();
       if (!out.some((opt) => opt.toLowerCase() === lower)) {
-        out.push(trimmed);
+        out.push(label);
       }
     };
     for (const ag of effectiveAgents) {
@@ -1851,22 +1905,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     addProjectOption(initialProject);
     addProjectOption(selectedProjectFilter);
     return out;
-  }, [effectiveAgents, initialProject, selectedProjectFilter]);
+  }, [
+    baseProjectOptions,
+    sharedProjects,
+    effectiveAgents,
+    initialProject,
+    selectedProjectFilter,
+  ]);
 
   const resolvedProjectFilter = useMemo<string>(
-    () => resolveProjectFilterValue(selectedProjectFilter, projectOptions),
-    [selectedProjectFilter, projectOptions],
+    () =>
+      resolveProjectFilterValue(
+        selectedProjectFilter,
+        projectOptions,
+        sharedProjects,
+      ),
+    [selectedProjectFilter, projectOptions, sharedProjects],
   );
+
+  // A project that leaves the shared list (deleted here or elsewhere) must not stay the
+  // active filter.
+  const previousProjectsRef = useRef<readonly ProjectSummary[]>(sharedProjects);
+  useEffect(() => {
+    const previous = previousProjectsRef.current;
+    previousProjectsRef.current = sharedProjects;
+    if (previous === sharedProjects) return;
+    const active = selectedProjectFilter.trim();
+    if (!active || active.toLowerCase() === "all") return;
+    if (findProject(previous, active) && !findProject(sharedProjects, active)) {
+      setSelectedProjectFilter("all");
+    }
+  }, [sharedProjects, selectedProjectFilter]);
 
   const filteredAgents = useMemo<AgentRecord[]>(() => {
     if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
       return effectiveAgents;
     }
-    const target = resolvedProjectFilter.toLowerCase();
-    return effectiveAgents.filter(
-      (ag) => (ag.project || "Workspace").toLowerCase() === target,
+    // Agents carry the project slug; the filter holds the display name.
+    const known = findProject(sharedProjects, resolvedProjectFilter);
+    const targets = new Set<string>([resolvedProjectFilter.toLowerCase()]);
+    if (known) {
+      targets.add(known.slug.trim().toLowerCase());
+      targets.add(projectLabel(known).toLowerCase());
+    }
+    return effectiveAgents.filter((ag) =>
+      targets.has((ag.project || "Workspace").toLowerCase()),
     );
-  }, [effectiveAgents, resolvedProjectFilter]);
+  }, [effectiveAgents, resolvedProjectFilter, sharedProjects]);
 
   const allFilteredSelected = useMemo(() => {
     if (filteredAgents.length === 0) return false;
@@ -6688,7 +6773,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   style={{ fontSize: "11px" }}
                 >
                   <option value="all">Scope: All Projects</option>
-                  {CANONICAL_PROJECTS.map((proj) => (
+                  {baseProjectOptions.map((proj) => (
                     <option key={proj} value={proj}>
                       Scope: {proj}
                     </option>
@@ -9970,9 +10055,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           const key = modalAgent.name_key.toLowerCase();
           const draft = getDraftForAgent(modalAgent);
           const armedConflict = recastReplaceLeadArmed[key];
-          const projectOptions = CANONICAL_PROJECTS.includes(draft.project)
-            ? CANONICAL_PROJECTS
-            : [draft.project, ...CANONICAL_PROJECTS];
+          const projectOptions = baseProjectOptions.includes(draft.project)
+            ? baseProjectOptions
+            : [draft.project, ...baseProjectOptions];
           const hasRoleOption =
             draft.role === CREATE_CUSTOM_ROLE_VALUE ||
             RECAST_ROLE_OPTIONS.some((opt) => opt.value === draft.role);
