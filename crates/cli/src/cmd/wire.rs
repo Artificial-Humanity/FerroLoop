@@ -23,7 +23,7 @@ use fl_wire::daemon::{
 use fl_wire::dispatcher::dispatch_message_for_store;
 use fl_wire::identity::{
     PersonaSource, RouteTable, VendorRoute, capture_current_env_route, grok_session_is_headless,
-    resolve_claude_key_path, resolve_persona_with_source,
+    resolve_claude_key_path, resolve_persona_with_source, scan_transcript_for_persona,
 };
 use serde_json::{Value, json};
 
@@ -555,7 +555,13 @@ pub fn record_caller_route_checked(
         env,
         persona,
         route,
-        matches!(source, PersonaSource::Explicit | PersonaSource::Env),
+        // A session's own transcript is as explicit as AGENT_PERSONA. Codex sessions share
+        // one app-server, so the process environment names whoever started the daemon.
+        // The transcript has to be able to take its own thread id back from that alias.
+        matches!(
+            source,
+            PersonaSource::Explicit | PersonaSource::Env | PersonaSource::Transcript
+        ),
     ) {
         eprintln!("fl wire: could not register route: {error}");
         return false;
@@ -1316,8 +1322,18 @@ fn vendor_hook_response(
         return Ok(json!({}));
     }
 
-    let (persona, persona_source) =
-        resolve_caller_with_source(&hook_env, None, transcript_path.as_deref());
+    // Codex 0.166 shares one app-server daemon. That process keeps AGENT_PERSONA from
+    // whichever session started it, so the hook environment is not the session that fired.
+    // The rollout names the session. Read it before the process environment.
+    let (persona, persona_source) = if is_codex
+        && let Some(found) = transcript_path
+            .as_deref()
+            .and_then(|tp| scan_transcript_for_persona(tp, 50))
+    {
+        (found, PersonaSource::Transcript)
+    } else {
+        resolve_caller_with_source(&hook_env, None, transcript_path.as_deref())
+    };
     if persona == "unknown" {
         return Ok(json!({}));
     }
@@ -2153,6 +2169,75 @@ mod tests {
             rig.route_of("jarvis"),
             Some(VendorRoute::Grok { session_id, .. }) if session_id == "sid-new"
         ));
+    }
+
+    #[test]
+    fn codex_hook_prefers_the_transcript_persona_over_the_daemon_environment() {
+        let rig = HookRig::new(Some("fiona"));
+        let transcript = rig.dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Freya\"}\n",
+        )
+        .unwrap();
+        rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "thread-freya",
+                "cwd": "/tmp/freya",
+                "transcript_path": transcript,
+            }),
+        );
+        assert!(
+            matches!(
+                rig.route_of("freya"),
+                Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "thread-freya"
+            ),
+            "{:?}",
+            rig.route_of("freya")
+        );
+        assert!(rig.route_of("fiona").is_none());
+    }
+
+    #[test]
+    fn codex_transcript_claims_a_thread_held_by_an_explicit_alias() {
+        let rig = HookRig::new(Some("fiona"));
+        let path = rig.routes_path();
+        let mut table = RouteTable::load(Some(&path));
+        table.upsert_explicit(
+            "fiona",
+            VendorRoute::Codex {
+                thread_id: "thread-freya".into(),
+                cwd: None,
+            },
+            now_at(),
+        );
+        table.save(Some(&path)).unwrap();
+        let transcript = rig.dir.path().join(".codex-rollout.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"content\":\"agent-msg register Freya\"}\n",
+        )
+        .unwrap();
+        rig.run(
+            "codex",
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "thread-freya",
+                "transcript_path": transcript,
+            }),
+        );
+        assert!(
+            rig.route_of("fiona").is_none(),
+            "{:?}",
+            rig.route_of("fiona")
+        );
+        assert!(matches!(
+            rig.route_of("freya"),
+            Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "thread-freya"
+        ));
+        assert!(RouteTable::load(Some(&path)).get("freya").unwrap().explicit);
     }
 
     #[test]

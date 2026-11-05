@@ -1747,15 +1747,30 @@ fn collect_codex_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>)
     }
 }
 
+/// A Codex subagent rollout is not its own session. `source.subagent` is an object,
+/// `thread_source` is `"subagent"`, or `parent_thread_id` is present.
+fn codex_rollout_is_subagent(val: &serde_json::Value) -> bool {
+    val.pointer("/payload/source/subagent")
+        .is_some_and(serde_json::Value::is_object)
+        || val
+            .pointer("/payload/thread_source")
+            .and_then(|v| v.as_str())
+            == Some("subagent")
+        || val.pointer("/payload/parent_thread_id").is_some()
+}
+
 fn extract_codex_rollout_meta(path: &Path) -> (String, Option<PathBuf>) {
     let fallback_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let mut thread_id = String::new();
     let mut cwd = None;
-    if let Ok(text) = fs::read_to_string(path) {
+    if let Some(text) = read_head_lines(path, 20) {
         for line in text.lines().take(20) {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
+            if codex_rollout_is_subagent(&val) {
+                return (String::new(), None);
+            }
             let is_response_item =
                 val.get("type").and_then(|v| v.as_str()) == Some("response_item");
             if thread_id.is_empty()
@@ -2354,8 +2369,7 @@ fn is_tool_output_type(kind: Option<&str>) -> bool {
 }
 
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    scan_text_for_persona(&text, max_lines)
+    scan_text_for_persona(&read_head_lines(path, max_lines)?, max_lines)
 }
 
 /// The most bytes [`read_head_lines`] reads for a transcript head.
@@ -6529,6 +6543,77 @@ mod tests {
         table.discover_routes(Some(tmp.path()), At::from_unix_millis(5));
         let (session_id, _, _) = muse_parts(&muse_route_of(&table, "kacey").unwrap());
         assert_eq!(session_id, MUSE_SESSION_A);
+    }
+
+    #[test]
+    fn a_codex_subagent_rollout_has_no_thread_id_and_a_scan_reads_only_the_head() {
+        let tmp = TempDir::new().unwrap();
+        let day = tmp.path().join(".codex/sessions/2026/11/05");
+        fs::create_dir_all(&day).unwrap();
+        let thread_id = "01a0a9ce-1111-7222-8333-ea40058ed587";
+        let sub = day.join(format!("rollout-2026-11-05T00-00-00-{thread_id}.jsonl"));
+        fs::write(
+            &sub,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "cwd": "/tmp/sub",
+                    "thread_source": "subagent",
+                    "parent_thread_id": "parent-thread",
+                    "source": { "subagent": { "id": "child" } }
+                }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(extract_codex_rollout_meta(&sub).0, "");
+
+        let source_only = day.join("source-only.jsonl");
+        fs::write(
+            &source_only,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"source\":{\"subagent\":{}}}}\n",
+        )
+        .unwrap();
+        assert_eq!(extract_codex_rollout_meta(&source_only).0, "");
+
+        let parent_only = day.join("parent-only.jsonl");
+        fs::write(
+            &parent_only,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"parented\",\"parent_thread_id\":\"parent-thread\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(extract_codex_rollout_meta(&parent_only).0, "");
+
+        let source_kind = day.join("thread-source-only.jsonl");
+        fs::write(
+            &source_kind,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"sourced\",\"thread_source\":\"subagent\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(extract_codex_rollout_meta(&source_kind).0, "");
+
+        let head = day.join("head.jsonl");
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&head).unwrap();
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "user",
+                    "content": "agent-msg register Freya"
+                })
+            )
+            .unwrap();
+            file.write_all(&vec![0xff; 2_000_000]).unwrap();
+        }
+        assert!(fs::read_to_string(&head).is_err());
+        assert_eq!(
+            scan_transcript_for_persona(&head, 50).as_deref(),
+            Some("freya")
+        );
     }
 
     #[test]
