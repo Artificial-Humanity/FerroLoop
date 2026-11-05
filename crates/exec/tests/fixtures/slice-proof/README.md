@@ -26,3 +26,21 @@ alone does not establish a proof or authorize production work. Codex's captured
 turn schema exposes `input` and `threadId` but no `maxOutputTokens` or `maxSteps`
 property. None of these observations establishes whether internal calls or spend
 are bounded.
+
+## L3 live experiments (owner-run, never CI)
+
+`crates/exec/tests/slice_proof_live.rs` holds one `#[ignore]` test per adapter (claude, muse,
+codex, antigravity, grok, api). It is a skeleton: it spawns no vendor binary and makes no
+network call. Without `FL_LIVE_PROOF=1` each test prints a skip message and returns, so
+`cargo test` and `cargo test -p fl-exec --test slice_proof_live -- --ignored` never spend.
+
+Only the Owner opts in, under an explicit experiment allocation that is separate from any
+admission budget (the whole-matrix spend budget is a placeholder in the file header):
+
+```sh
+FL_LIVE_PROOF=1 cargo test -p fl-exec --test slice_proof_live live_muse -- --ignored
+```
+
+Today that run fails loudly with `unimplemented!`, by design, until a reviewed PR implements
+the live step. A live run corroborates a reviewed pre-dispatch proof; it never replaces one,
+and an overrun or missing telemetry is recorded as ManualOnly.
