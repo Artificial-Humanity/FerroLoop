@@ -82,6 +82,14 @@ impl Git {
         git(root, &["rev-parse", "HEAD"])
     }
 
+    /// [`Git::head`] with the variables that would point git at another repository removed
+    /// (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`). Like `head`, it finds the repository
+    /// that holds `root`, which may lie above it; a caller that means `root`'s own repository
+    /// looks for `root/.git` first.
+    pub fn head_scrubbed(root: &Path) -> Result<String, ExecError> {
+        git_clean_env(root, &["rev-parse", "HEAD"], None)
+    }
+
     /// `git init` in `root`, which must exist. An existing repository is
     /// reinitialised harmlessly by git, but callers only call this for a
     /// directory with no repository of its own.
@@ -114,7 +122,7 @@ impl Git {
             ],
             Some(author),
         )?;
-        Self::head(root)
+        Self::head_scrubbed(root)
     }
 
     /// Whether `rel` (relative to `root`) is tracked and has no uncommitted

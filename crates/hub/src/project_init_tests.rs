@@ -989,6 +989,49 @@ fn git_init_runs_git_only_when_asked_and_a_repeat_changes_nothing() {
 }
 
 #[test]
+fn git_init_gives_a_directory_nested_in_another_repository_its_own_repository() {
+    let sb = Sandbox::new();
+    let parent = sb.dir("parent");
+    fs::create_dir_all(&parent).unwrap();
+    git(&parent, &["init", "-q"]);
+    git(
+        &parent,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "parent",
+        ],
+    );
+    let parent_head = git(&parent, &["rev-parse", "HEAD"]);
+    let nested = parent.join("child");
+    let out = sb.init(&sb.request(&nested)).unwrap();
+    let outcome = out.git.unwrap();
+    assert!(
+        outcome.initialized && outcome.initial_commit,
+        "the nested directory got its own repository: {outcome:?}"
+    );
+    assert!(nested.join(".git").exists());
+    assert_ne!(outcome.head, parent_head);
+    assert_eq!(commit_count(&nested), 1);
+    assert_eq!(
+        commit_count(&parent),
+        1,
+        "the parent repository is untouched"
+    );
+    assert_eq!(git(&parent, &["rev-parse", "HEAD"]), parent_head);
+    // A repeat changes nothing.
+    let again = sb.init(&sb.request(&nested)).unwrap().git.unwrap();
+    assert!(!again.initialized && !again.initial_commit);
+    assert_eq!(again.head, outcome.head);
+}
+
+#[test]
 fn has_git_sees_a_repository_with_or_without_a_commit_and_changes_nothing() {
     let tmp = TempDir::new().unwrap();
     let base = fs::canonicalize(tmp.path()).unwrap();

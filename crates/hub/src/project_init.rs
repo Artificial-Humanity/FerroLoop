@@ -795,29 +795,39 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
 
 // --- the work ---------------------------------------------------------------------------------
 
+/// The repository of `root` itself: its own `.git`, never one of a parent directory (a project
+/// nested in another repository gets its own). Every git call runs with the variables that
+/// would point it elsewhere removed.
 fn ensure_git(root: &Path, by: &str) -> Result<GitOutcome, InitError> {
     let git = |e: fl_exec::population::ExecError| failed(e.to_string());
-    if let Ok(head) = Git::head(root) {
-        return Ok(GitOutcome {
-            initialized: false,
-            initial_commit: false,
-            head,
-        });
-    }
-    let initialized = match std::fs::symlink_metadata(root.join(".git")) {
-        Ok(_) => false,
+    match std::fs::symlink_metadata(root.join(".git")) {
+        Ok(_) => {
+            if let Ok(head) = Git::head_scrubbed(root) {
+                return Ok(GitOutcome {
+                    initialized: false,
+                    initial_commit: false,
+                    head,
+                });
+            }
+            // A repository with no commit yet.
+            let head = Git::commit_empty(root, INITIAL_COMMIT_MESSAGE, by).map_err(git)?;
+            Ok(GitOutcome {
+                initialized: false,
+                initial_commit: true,
+                head,
+            })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Git::init(root).map_err(git)?;
-            true
+            let head = Git::commit_empty(root, INITIAL_COMMIT_MESSAGE, by).map_err(git)?;
+            Ok(GitOutcome {
+                initialized: true,
+                initial_commit: true,
+                head,
+            })
         }
-        Err(e) => return Err(failed(format!("could not look for .git in the root: {e}"))),
-    };
-    let head = Git::commit_empty(root, INITIAL_COMMIT_MESSAGE, by).map_err(git)?;
-    Ok(GitOutcome {
-        initialized,
-        initial_commit: true,
-        head,
-    })
+        Err(e) => Err(failed(format!("could not look for .git in the root: {e}"))),
+    }
 }
 
 /// Puts the project in its store (once) and gives it the default routing map (if it has none).
